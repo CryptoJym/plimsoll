@@ -7,9 +7,11 @@ import { GATE_ENTRY, proofCiCoverage, type CoverageInput, type CoverageReport } 
  *
  * Each fixture edits a copy of the real inputs the way a careless (or clever)
  * change could, and states what a correct gate must conclude. `reviewer`
- * fixtures reproduce the independent review of PR #397 (input/review-r1):
- * every one fooled the textual gate at 496e34bc. The same edits can be written
- * to a checkout (`files`, `workflowText`) to replay them against any gate.
+ * fixtures reproduce the first independent review of PR #397 (every one
+ * fooled the textual gate at 496e34bc); `review2` fixtures reproduce the
+ * second review's false greens against the execution model at e683d895. The
+ * same edits can be written to a checkout (`files`) to replay them against
+ * any gate.
  */
 
 export const FIXTURE_WORKFLOW = ".github/workflows/proof.yml";
@@ -26,7 +28,7 @@ export type FixtureCase = {
 
 export type Fixture = {
   name: string;
-  origin: "reviewer" | "gate";
+  origin: "reviewer" | "review2" | "gate";
   /** The verdict a correct gate reaches on the edited repository. */
   expectGateGreen: boolean;
   describe: string;
@@ -155,6 +157,17 @@ const withExceptions = (input: CoverageInput, edit: (exceptions: Record<string, 
   edit(exceptions);
   return { ...input, exceptions };
 };
+const withSuites = (input: CoverageInput, edit: (suites: Record<string, string[]>) => void) => {
+  const suites = JSON.parse(JSON.stringify(input.suites ?? {})) as Record<string, string[]>;
+  edit(suites);
+  return { ...input, suites };
+};
+/** The first suite scripts/proof-suites.json declares, and its sub-proofs. */
+function firstSuite(input: CoverageInput) {
+  const [suite, children] = Object.entries((input.suites ?? {}) as Record<string, string[]>)[0] ?? [];
+  if (!suite || !children?.length) throw new Error("fixtures need a suite in scripts/proof-suites.json");
+  return { suite, children };
+}
 
 const RENAMED_PROOF = "scripts/review-renamed-proof.ts";
 const renamedProofFile = { [RENAMED_PROOF]: 'throw new Error("this proof must run, but CI never runs it");\n' };
@@ -482,18 +495,54 @@ export const FIXTURES: Fixture[] = [
     replayableOnTextualGate: false,
   },
   {
-    name: "runs_inside_parent_does_not_run_it",
+    name: "review2_suite_sub_proof_dropped",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "a sub-proof is dropped from its suite's run list (the suite still names it elsewhere)",
+    build: (input) => {
+      const { suite, children } = firstSuite(input);
+      const dropped = children.at(-2) ?? children[0]!;
+      return {
+        input: withSuites(input, (suites) => {
+          suites[suite] = children.filter((child) => child !== dropped);
+        }),
+        uncovered: [dropped],
+      };
+    },
+    replayableOnTextualGate: false,
+  },
+  {
+    name: "suite_not_run_in_ci",
     origin: "gate",
     expectGateGreen: false,
-    describe: "a runs-inside entry points at a parent that never names the child",
+    describe: "a sub-proof is declared under a suite CI does not run",
     build: (input) => {
-      const [t] = fixtureTargets(input);
+      const { suite, children } = firstSuite(input);
+      const parent = Object.keys((input.exceptions as { localOnly?: object }).localOnly ?? {})[0];
+      if (!parent) throw new Error("fixture needs a local-only proof");
       return {
-        input: withExceptions(input, (exceptions) => {
-          const first = Object.keys(exceptions.runsInside ?? {})[0]!;
-          exceptions.runsInside![first] = { ...exceptions.runsInside![first]!, parent: t!.unit };
+        input: withSuites(input, (suites) => {
+          suites[suite] = children.slice(1);
+          suites[parent] = [children[0]!];
         }),
-        error: /does not name/,
+        uncovered: [children[0]!],
+        error: /not run by CI, so none of its sub-proofs are/,
+      };
+    },
+    replayableOnTextualGate: false,
+  },
+  {
+    name: "suite_declares_a_missing_file",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a suite declares a sub-proof file that does not exist",
+    build: (input) => {
+      const { suite, children } = firstSuite(input);
+      return {
+        input: withSuites(input, (suites) => {
+          suites[suite] = [...children, "scripts/no-such-sub-proof.ts"];
+        }),
+        error: /no-such-sub-proof\.ts is not a proof file on disk/,
       };
     },
     replayableOnTextualGate: false,

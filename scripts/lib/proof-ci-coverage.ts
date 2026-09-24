@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { modelWorkflow } from "./ci-workflow-model";
+import { PROOF_SUITES, readProofSuites } from "./proof-suites";
 import { analyzeErrexitScript, analyzePackageScript } from "./shell-commands";
 
 /**
@@ -14,7 +15,8 @@ import { analyzeErrexitScript, analyzePackageScript } from "./shell-commands";
  * file any package script runs, and every proof-named file under scripts/.
  * A unit is covered only when a workflow step that provably runs on every
  * successful push/PR to main executes a command that reaches it (directly, by
- * entry file, or through package-script aliases whose failure propagates).
+ * entry file, or through package-script aliases whose failure propagates), or
+ * when scripts/proof-suites.json declares it as a sub-proof of a suite CI runs.
  * Every other unit needs a reviewed entry in scripts/proof-local-only.json.
  */
 
@@ -33,6 +35,8 @@ export type CoverageInput = {
   scripts: Record<string, string>;
   workflows: Array<{ path: string; text: string }>;
   exceptions: unknown;
+  /** scripts/proof-suites.json: suite file -> the sub-proof files it runs. */
+  suites: unknown;
   /** Proof entry files present under scripts/ (repo-relative). */
   proofFiles: string[];
   /** Repository file text, or null when absent. */
@@ -226,11 +230,41 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
     }
   }
 
-  // 3. Reviewed exceptions.
+  for (const unit of units.values()) {
+    if (unit.covered.length > 0) unit.status = "ci";
+  }
+
+  // 3. Suites: a sub-proof runs in CI only as a declared entry of a suite CI runs.
+  const suites = isRecord(input.suites) ? input.suites : {};
+  if (!isRecord(input.suites)) errors.push(`${PROOF_SUITES}: not a mapping of suite files to sub-proof files`);
+  const suiteOf = new Map<string, string>();
+  for (const [suite, declared] of Object.entries(suites)) {
+    const where = `${PROOF_SUITES} \`${suite}\``;
+    if (!units.has(suite)) {
+      errors.push(`${where}: not a proof file in the inventory`);
+      continue;
+    }
+    if (!Array.isArray(declared) || declared.length === 0 || !declared.every((file) => typeof file === "string")) {
+      errors.push(`${where}: must list at least one sub-proof file`);
+      continue;
+    }
+    for (const child of declared as string[]) {
+      if (!units.has(child)) errors.push(`${where}: sub-proof ${child} is not a proof file on disk`);
+      else if (Object.hasOwn(suites, child)) errors.push(`${where}: sub-proof ${child} is itself a suite`);
+      else if (suiteOf.has(child)) errors.push(`${where}: sub-proof ${child} is also declared by ${suiteOf.get(child)}`);
+      else suiteOf.set(child, suite);
+    }
+    if (units.get(suite)!.status !== "ci") errors.push(`${where}: the suite is not run by CI, so none of its sub-proofs are`);
+  }
+
+  // 4. Reviewed exceptions.
   const exceptions = isRecord(input.exceptions) ? input.exceptions : {};
-  const sections = ["localOnly", "quarantined", "runsInside"] as const;
+  const sections = ["localOnly", "quarantined"] as const;
   for (const key of Object.keys(exceptions)) {
-    if (!(sections as readonly string[]).includes(key)) errors.push(`${PROOF_EXCEPTIONS}: unknown section \`${key}\``);
+    if (!(sections as readonly string[]).includes(key)) {
+      const hint = key === "runsInside" ? ` (sub-proofs are declared in ${PROOF_SUITES})` : "";
+      errors.push(`${PROOF_EXCEPTIONS}: unknown section \`${key}\`${hint}`);
+    }
   }
   const claimed = new Map<string, string>();
   for (const section of sections) {
@@ -251,19 +285,23 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         continue;
       }
       claimed.set(unitId, section);
+      if (unit.status === "ci") {
+        errors.push(`${where}: CI already runs it (remove the entry)`);
+        continue;
+      }
+      if (suiteOf.has(unitId)) {
+        errors.push(`${where}: ${PROOF_SUITES} declares it as a sub-proof of ${suiteOf.get(unitId)} (remove one)`);
+        continue;
+      }
       if (!isRecord(raw) || Object.values(raw).some((value) => typeof value !== "string")) {
         errors.push(`${where}: entry must be a mapping of strings`);
         continue;
       }
       const entry = raw as Record<string, string>;
-      const required = section === "localOnly" ? ["reason", "owner"] : section === "quarantined" ? ["reason", "owner", "expires"] : ["parent", "reason"];
+      const required = section === "localOnly" ? ["reason", "owner"] : ["reason", "owner", "expires"];
       const missing = required.filter((field) => !entry[field]?.trim());
       if (missing.length > 0) {
         errors.push(`${where}: missing ${missing.join(", ")}`);
-        continue;
-      }
-      if (unit.covered.length > 0) {
-        errors.push(`${where}: CI already runs it (remove the entry)`);
         continue;
       }
       if (section === "quarantined") {
@@ -276,26 +314,15 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           continue;
         }
       }
-      if (section === "runsInside") {
-        const parent = units.get(entry.parent!);
-        const parentText = input.readFile(entry.parent!);
-        const stem = path.posix.basename(unitId).replace(/\.[cm]?[jt]s$/, "");
-        const quoted = new RegExp(`['"\`][^'"\`\\n]*\\b${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\.[cm]?[jt]s)?['"\`]`);
-        if (!parent || parent.covered.length === 0) {
-          errors.push(`${where}: parent ${entry.parent} is not run by CI`);
-          continue;
-        }
-        if (!parentText || !quoted.test(parentText)) {
-          errors.push(`${where}: parent ${entry.parent} does not name ${stem} in a string literal`);
-          continue;
-        }
-      }
       unit.exception = { section, ...entry };
-      unit.status = section === "localOnly" ? "local-only" : section === "quarantined" ? "quarantined" : "runs-inside";
+      unit.status = section === "localOnly" ? "local-only" : "quarantined";
     }
   }
-  for (const unit of units.values()) {
-    if (unit.covered.length > 0) unit.status = "ci";
+  for (const [child, suite] of suiteOf) {
+    const unit = units.get(child)!;
+    if (unit.status !== "uncovered" || units.get(suite)!.status !== "ci") continue;
+    unit.exception = { section: "suite", suite };
+    unit.status = "runs-inside";
   }
   const sorted = [...units.values()].sort((a, b) => a.unit.localeCompare(b.unit));
   return {
@@ -340,6 +367,7 @@ export function readCoverageInput(repoRoot: string, today = new Date().toISOStri
     scripts: pkg.scripts ?? {},
     workflows,
     exceptions: fs.existsSync(exceptionsPath) ? JSON.parse(fs.readFileSync(exceptionsPath, "utf8")) : {},
+    suites: readProofSuites(repoRoot),
     proofFiles: listProofFiles(repoRoot),
     readFile: (file) => {
       const full = path.join(repoRoot, file);
@@ -364,7 +392,7 @@ export function gateFirstProblem(report: CoverageReport): string | null {
   return null;
 }
 
-/** Proof entry files every successful push/PR run executes, directly or inside a covered parent. */
+/** Proof entry files every successful push/PR run executes, directly or inside a suite CI runs. */
 export function proofFilesRunInCi(report: CoverageReport) {
   return new Set(report.units.filter((unit) => unit.status === "ci" || unit.status === "runs-inside").map((unit) => unit.unit));
 }

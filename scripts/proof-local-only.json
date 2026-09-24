@@ -19,35 +19,5 @@
       "expires": "2026-10-07",
       "reason": "Known red since d749a43 moved capture discovery to fs.opendirSync: the resource proof's directory observer wraps only fs.readdirSync, so it counts 0 entries and this proof's 2,000-entry floor fails. Lane eco-6hoxj.163.31 is repairing it; the fix also changes the no_change_constant_work receipt that the system-e2e support contract pins. The gate fails after the expiry date until the proof is repaired and wired or the quarantine is renewed in review."
     }
-  },
-  "runsInside": {
-    "scripts/jsonl-read-generation-proof.ts": {
-      "parent": "scripts/oversized-continuation-suite-proof.ts",
-      "reason": "The oversized continuation suite (proof:oversized-continuation) runs it as one of its named sub-proofs and checks its receipt."
-    },
-    "scripts/oversized-continuation-boundary-proof.ts": {
-      "parent": "scripts/oversized-continuation-suite-proof.ts",
-      "reason": "The oversized continuation suite (proof:oversized-continuation) runs it as one of its named sub-proofs and checks its receipt."
-    },
-    "scripts/oversized-continuation-cadence-proof.ts": {
-      "parent": "scripts/oversized-continuation-suite-proof.ts",
-      "reason": "The oversized continuation suite (proof:oversized-continuation) runs it as one of its named sub-proofs and checks its receipt."
-    },
-    "scripts/oversized-continuation-provider-proof.ts": {
-      "parent": "scripts/oversized-continuation-suite-proof.ts",
-      "reason": "The oversized continuation suite (proof:oversized-continuation) runs it as one of its named sub-proofs and checks its receipt."
-    },
-    "scripts/oversized-continuation-ready-proof.ts": {
-      "parent": "scripts/oversized-continuation-suite-proof.ts",
-      "reason": "The oversized continuation suite (proof:oversized-continuation) runs it as one of its named sub-proofs and checks its receipt."
-    },
-    "scripts/oversized-continuation-state-proof.ts": {
-      "parent": "scripts/oversized-continuation-suite-proof.ts",
-      "reason": "The oversized continuation suite (proof:oversized-continuation) runs it as one of its named sub-proofs and checks its receipt."
-    },
-    "scripts/oversized-continuation-transaction-proof.ts": {
-      "parent": "scripts/oversized-continuation-suite-proof.ts",
-      "reason": "The oversized continuation suite (proof:oversized-continuation) runs it as one of its named sub-proofs and checks its receipt."
-    }
   }
 }
