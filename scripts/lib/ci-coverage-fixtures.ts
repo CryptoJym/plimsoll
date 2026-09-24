@@ -45,9 +45,21 @@ export type Fixture = {
 
 type Target = { line: string; script: string; unit: string };
 
+// Fixture builders only copy their inputs. Reuse the real checkout's coverage
+// model instead of parsing the same workflow again for every target lookup.
+const coverageCache = new WeakMap<CoverageInput, CoverageReport>();
+function coverage(input: CoverageInput): CoverageReport {
+  let report = coverageCache.get(input);
+  if (!report) {
+    report = proofCiCoverage(input);
+    coverageCache.set(input, report);
+  }
+  return report;
+}
+
 /** The workflow whose step runs the gate (counted or not, as an edit may have changed that): the one the fixtures edit. */
 export function fixtureWorkflow(input: CoverageInput) {
-  const gate = proofCiCoverage(input).units.find((unit) => unit.unit === GATE_ENTRY);
+  const gate = coverage(input).units.find((unit) => unit.unit === GATE_ENTRY);
   const invocation = gate?.covered[0] ?? gate?.ignored[0];
   if (!invocation) throw new Error(`no workflow step runs ${GATE_ENTRY}, so the fixtures have no workflow to edit`);
   return invocation.workflow;
@@ -62,7 +74,7 @@ export function fixtureTargets(input: CoverageInput): Target[] {
   const workflow = fixtureWorkflow(input);
   const text = workflowText(input);
   const targets: Target[] = [];
-  for (const unit of proofCiCoverage(input).units) {
+  for (const unit of coverage(input).units) {
     if (unit.status !== "ci") continue;
     for (const invocation of unit.covered) {
       const script = /^pnpm (proof:[\w:.-]+)$/.exec(invocation.command.trim())?.[1];
@@ -98,7 +110,7 @@ function workflowText(input: CoverageInput) {
 /** Resolve a fixture's target from this checkout's workflow, including pnpm run and run-proof forms. */
 function proofLine(input: CoverageInput, unit: string) {
   const workflow = fixtureWorkflow(input);
-  const line = proofCiCoverage(input).units.find((candidate) => candidate.unit === unit)?.covered
+  const line = coverage(input).units.find((candidate) => candidate.unit === unit)?.covered
     .find((invocation) => invocation.workflow === workflow)?.command;
   if (!line) throw new Error(`fixture target ${unit} is not covered in ${workflow}`);
   return line;
@@ -510,7 +522,7 @@ export const FIXTURES: Fixture[] = [
     describe: "a proof runs before the gate in the gate's own step",
     build: (input) => {
       const [t] = fixtureTargets(input);
-      const gateLine = proofCiCoverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0]?.command;
+      const gateLine = coverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0]?.command;
       if (!gateLine) throw new Error("the gate is not run by CI");
       return { input: editRun(input, gateLine, (line) => [line.replace(gateLine, t!.line), line]), gateNotFirst: true };
     },
@@ -1025,7 +1037,7 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: `the gate's own CI invocation cannot pass ${argument}`,
     build: (input) => {
-      const gate = proofCiCoverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0];
+      const gate = coverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0];
       if (!gate) throw new Error("the gate is not run by CI");
       return { input: editRun(input, gate.command, (line) => [`${line} ${argument}`]), error: /passes arguments to .*ci-coverage-proof/ };
     },
