@@ -1087,10 +1087,12 @@ function exerciseDependentAdmission() {
       store.recordWorkEpisode(parent);
       const rejected = store.recordWorkEpisode(child);
       check("full_episode_table_rejects_child_before_evicting_sole_parent",
-        rejected.dropped === true && rejected.dropReason === "stale_reference" &&
+        rejected.dropped === true && rejected.dropReason === "protected_reference_at_capacity" &&
         store.episodeById(parent.episodeId) !== undefined &&
         store.status().tables.work_episode_facts.rowCount === 1 &&
-        store.status().tables.work_episode_facts.evictedCount === 0, { rejected, status: store.status() });
+        store.status().tables.work_episode_facts.evictedCount === 0 &&
+        runtimeFactDropCounters(db).some(row => row.reason === "protected_reference_at_capacity" &&
+          row.droppedCount === 1), { rejected, status: store.status() });
       assertCounts(db, "rejected_child_preserves_parent_count");
     } finally { db.close(); }
   }
@@ -1104,9 +1106,11 @@ function exerciseDependentAdmission() {
       store.recordToolSignal(parent);
       const rejected = store.recordToolSignal(child);
       check("full_attempt_table_rejects_retry_before_evicting_sole_target",
-        rejected.dropped === true && rejected.dropReason === "retry_target_missing" &&
+        rejected.dropped === true && rejected.dropReason === "protected_reference_at_capacity" &&
         store.attempts().length === 1 && store.attempts()[0].operationId === parent.operationId &&
-        store.status().tables.tool_attempt_facts.evictedCount === 0,
+        store.status().tables.tool_attempt_facts.evictedCount === 0 &&
+        runtimeFactDropCounters(db).some(row => row.reason === "protected_reference_at_capacity" &&
+          row.droppedCount === 1),
         { rejected, status: store.status() });
       assertCounts(db, "rejected_retry_preserves_target_count");
     } finally { db.close(); }
@@ -1181,7 +1185,7 @@ function exerciseAtomicInstantKeyUpgrade(root: string) {
     new LearningFactStore(seed, { attempts: 10 });
     const insert = rawAttemptInsert(seed);
     for (const [index, at] of [
-      "2026-09-01T00:00:00Z", "2026-08-31T18:00:10-06:00",
+      "2026-09-01t00:00:00Z", "2026-08-31T18:00:10-06:00",
       "2026-09-01T00:00:20Z",
     ].entries()) {
       insert.run(rawAttemptId(index), `key-upgrade-${index}`, at, at, at);
@@ -1190,6 +1194,7 @@ function exerciseAtomicInstantKeyUpgrade(root: string) {
     // proof. Existing rows and the count triggers stay in place.
     seed.transaction(() => {
       for (const table of Object.keys(DEFAULT_TABLE_COUNTS)) {
+        seed.exec(`drop trigger learning_fact_retention_${table}_insert`);
         seed.exec(`drop index idx_${table}_retention_ms`);
         seed.exec(`alter table ${table} drop column retention_ms`);
       }
@@ -1267,6 +1272,31 @@ function exerciseNestedEpisodeRollback() {
   } finally {db.close();}
 }
 
+function exerciseTimestampProperty(root: string) {
+  const probe = path.join(repoRoot, "scripts/learning-facts-timestamp-probe.ts");
+  const result = spawnSync(process.execPath,
+    [path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"), probe,
+      "direct-new", path.join(root, "timestamp-property.sqlite")],
+    { cwd: repoRoot, encoding: "utf8", timeout: 30_000 });
+  check("seeded_admitted_timestamp_grammar_matches_date_parse_and_instant_order",
+    result.status === 0, { status: result.status, stdout: result.stdout, stderr: result.stderr });
+}
+
+function exerciseInvalidLegacyTimestamp() {
+  const db = new Database(":memory:");
+  try {
+    new LearningFactStore(db, { attempts: 10 });
+    const at = "not-a-date";
+    rawAttemptInsert(db).run(rawAttemptId(999), "invalid-legacy", at, at, at);
+    const reopened = new LearningFactStore(db, { attempts: 10 });
+    check("unrankable_legacy_row_is_counted_and_removed_without_blocking_open",
+      reopened.attempts().length === 0 &&
+      reopened.status().tables.tool_attempt_facts.rowCount === 0 &&
+      runtimeFactDropCounters(db).some(row => row.reason === "invalid_retention_timestamp" &&
+        row.droppedCount === 1), { status: reopened.status() });
+  } finally { db.close(); }
+}
+
 async function main() {
   if (process.argv[2] === "--write-crash-child") {
     const db = new Database(process.argv[3]);
@@ -1315,6 +1345,8 @@ async function main() {
     "instant-key-edges": exerciseInstantKeyEdges,
     "dependent-admission": exerciseDependentAdmission,
     "instant-key-upgrade": () => exerciseAtomicInstantKeyUpgrade(root),
+    "timestamp-property": () => exerciseTimestampProperty(root),
+    "invalid-legacy-timestamp": exerciseInvalidLegacyTimestamp,
     migration: exerciseInterruptedUpgradeDowngrade,
     "migration-recount": exerciseMissingTriggers,
     production: exerciseProductionStage,
