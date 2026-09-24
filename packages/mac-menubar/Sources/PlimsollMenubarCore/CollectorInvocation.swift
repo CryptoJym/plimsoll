@@ -13,11 +13,12 @@ public struct CollectorInvocation: Equatable, Sendable {
             self.executablePath = binary
             self.arguments = ["status"]
         } else if let repository = Self.nonEmpty(environment["PLIMSOLL_COLLECTOR_REPO"]) {
+            // --silent keeps pnpm's "> @plimsoll/monorepo collector" banner
+            // off stdout, which must be the status JSON alone.
+            let pnpmArguments = ["--silent", "--dir", repository, "collector", "status"]
             let pnpm = Self.nonEmpty(environment["PLIMSOLL_PNPM_BIN"])
             self.executablePath = pnpm ?? "/usr/bin/env"
-            self.arguments = pnpm == nil
-                ? ["pnpm", "--dir", repository, "collector", "status"]
-                : ["--dir", repository, "collector", "status"]
+            self.arguments = pnpm == nil ? ["pnpm"] + pnpmArguments : pnpmArguments
         } else {
             return nil
         }

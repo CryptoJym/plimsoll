@@ -31,8 +31,9 @@ PLIMSOLL_COLLECTOR_REPO=/absolute/path/to/plimsoll \
 ```
 
 In checkout mode, `PLIMSOLL_PNPM_BIN` is optional. When omitted, the app runs
-`/usr/bin/env pnpm --dir <repo> collector status` with fixed argument
-boundaries. `status` is the only collector command the app runs.
+`/usr/bin/env pnpm --silent --dir <repo> collector status` with fixed argument
+boundaries (`--silent` keeps pnpm's script banner out of the status JSON).
+`status` is the only collector command the app runs.
 
 Status reads the collector's local `status` JSON. Running/stopped is a separate
 loopback-only `GET /healthz` probe; the probe does not expose or send ledger

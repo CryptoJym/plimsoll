@@ -23,7 +23,7 @@ struct PlimsollMenubarCoreTests {
         )
 
         #expect(invocation.executablePath == "/tmp/pnpm")
-        #expect(invocation.arguments == ["--dir", "/tmp/plimsoll checkout", "collector", "status"])
+        #expect(invocation.arguments == ["--silent", "--dir", "/tmp/plimsoll checkout", "collector", "status"])
     }
 
     @Test func checkoutInvocationWithoutPnpmPathResolvesPnpmThroughEnv() throws {
@@ -32,7 +32,24 @@ struct PlimsollMenubarCoreTests {
         )
 
         #expect(invocation.executablePath == "/usr/bin/env")
-        #expect(invocation.arguments == ["pnpm", "--dir", "/tmp/plimsoll", "collector", "status"])
+        #expect(invocation.arguments == ["pnpm", "--silent", "--dir", "/tmp/plimsoll", "collector", "status"])
+    }
+
+    /// What `pnpm --dir <repo> collector status` printed without --silent.
+    @Test func statusOutputThatIsNotJSONIsRejected() throws {
+        let invocation = try #require(
+            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_REPO": "/tmp/plimsoll"])
+        )
+        let banner = "\n> @plimsoll/monorepo@0.1.0 collector /tmp/plimsoll\n> tsx packages/collector-cli/src/cli.ts status\n\n"
+        for stdout in [banner + #"{"port":48271,"stats":null}"#, "", "not json", "[]"] {
+            let client = CollectorClient(
+                invocation: invocation,
+                execute: { _ in CollectorExecutionResult(standardOutput: stdout, standardError: "", exitCode: 0) },
+                probeLiveness: { _ in true }
+            )
+
+            #expect(throws: CollectorClientError.invalidStatusOutput) { try client.snapshot() }
+        }
     }
 
     @Test func noConfiguredCollectorBuildsNoInvocation() {
