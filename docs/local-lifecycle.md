@@ -265,11 +265,13 @@ existed before it: no snapshot, runtime, trash entry or display receipt (the
 `receipts/` directory is otherwise trimmed to its newest 32). Its receipt
 records `retention.status: "skipped"` with `skippedReason:
 "skipped_by_operator"` and `wouldRemove`, what retention would have removed at
-that moment (absent only when that read-only preview failed). Managed rollout
+that moment (absent when that read-only preview was blocked or failed). Managed rollout
 windows use it so that an update never deletes a host's history; removing old
 snapshots stays a separate, explicit `snapshots prune --apply`. The flag takes
 exactly `keep-all`; a missing or other value, a repeated or `=`-joined flag,
-or the flag on any other lifecycle command fails before any change.
+or the flag on any other lifecycle command fails before any change. `update`
+and `rollback` also refuse any option they do not take, so a misspelled flag
+such as `--keep-all` or `--retension keep-all` fails instead of pruning.
 
 To free space on a host that already holds many snapshots (for example before
 an update window that refuses for disk), run the new release's command
@@ -375,8 +377,9 @@ the trash is finished by the next prune; dry runs and listings change
 nothing; and the real CLI update path clones. Keep-all updates and rollbacks,
 through the manager and the real CLI, leave every earlier entry, the trash
 and a full receipts directory in place, record exactly what a prune would
-remove, and a later prune removes exactly that; a misused `--retention`
-changes nothing.
+remove, and a later prune removes exactly that; a misused or misspelled
+`--retention` changes nothing, and a keep-all update that fails readiness
+rolls back without trimming receipts or touching the trash.
 
 The data-safety proof covers the worst cases: a writer that stays attached
 through an update, or attaches after the snapshot, never ends up writing to

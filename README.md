@@ -568,8 +568,10 @@ immutable, version-pinned runtime
 ```bash
 # Pin the running packaged bundle as the immutable runtime and repoint the
 # owned LaunchAgent manifest at it; any readiness failure restores the
-# previous runtime, config, database, and manifest automatically.
-npx -y @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self
+# previous runtime, config, database, and manifest automatically. After a
+# healthy update it keeps the two newest update snapshots and removes older
+# ones; add --retention keep-all to remove nothing and prune later.
+npx -y @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self --retention keep-all
 
 # Restart the daemon on the new immutable runtime (explicit, never automatic):
 npx -y @plimsoll/cli@<version> load-launch-agent

@@ -191,7 +191,7 @@ export type LifecycleRetentionRecord = {
   /**
    * Only with `skipped_by_operator` (`--retention keep-all`): what retention
    * would have removed at that moment, of which nothing was. Absent when that
-   * read-only preview itself could not be computed.
+   * read-only preview was blocked or could not be computed.
    */
   wouldRemove?: LifecycleRemovedItem[];
 };

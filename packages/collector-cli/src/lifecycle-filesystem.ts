@@ -1222,7 +1222,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       // Removes and recovers nothing; the read-only preview only informs the receipt.
       let wouldRemove: LifecycleRemovedItem[] | undefined;
       try {
-        wouldRemove = (await this.retainSnapshots({ ...input, apply: false })).removed;
+        const preview = await this.retainSnapshots({ ...input, apply: false });
+        // A blocked preview removes nothing for a reason; "would remove nothing" would hide it.
+        if (preview.status === "preview") wouldRemove = preview.removed;
       } catch {
         wouldRemove = undefined;
       }
