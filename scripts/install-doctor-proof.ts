@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
@@ -110,6 +111,31 @@ function backupCount(directory: string) {
   return fs.readdirSync(directory).filter((name) => name.includes(".plimsoll-backup-")).length;
 }
 
+/** Reserve, release, then verify an unreachable proof-owned IPv4 port. */
+async function closedLoopbackPort() {
+  const holder = net.createServer();
+  await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", resolve));
+  const port = (holder.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => holder.close(() => resolve()));
+  if (port === 48271) throw new Error("proof selected the live collector port");
+  await new Promise<void>((resolve, reject) => {
+    const probe = net.connect(port, "127.0.0.1");
+    probe.once("connect", () => { probe.destroy(); reject(new Error("proof port is listening")); });
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNREFUSED") resolve();
+      else reject(error);
+    });
+  });
+  return port;
+}
+
+function seedUnreachableCollectorConfig(home: string, port: number) {
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(home, "collector.config.json"),
+    `${JSON.stringify(collectorConfigSchema.parse({ port }))}\n`, { mode: 0o600 });
+  return digestTree(home);
+}
+
 async function main() {
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   check("proof_runs_on_node_22", nodeMajor === 22, {
@@ -157,7 +183,9 @@ async function main() {
   // here carries the managed-config contract into each spawned `setup`.
   const guardFixture = useFixtureRoot(sandbox, { home: path.join(sandbox, "guard-fixture-home") });
   const packagedCli = path.join(root, "packages", "collector-cli", "dist", "install-doctor-proof-cli.mjs");
+  const guardCli = path.join(root, "packages", "collector-cli", "dist", "install-doctor-proof-guard.mjs");
   let server: http.Server | undefined;
+  let defaultGuard: http.Server | undefined;
 
   try {
   fs.mkdirSync(path.dirname(packagedCli), { recursive: true });
@@ -178,16 +206,10 @@ async function main() {
 
   const neutralCwd = path.join(sandbox, "neutral-cwd");
   const stubBin = path.join(sandbox, "stub-bin");
-  const unreachableFetchFixture = path.join(sandbox, "unreachable-fetch.mjs");
   const commandLog = path.join(sandbox, "commands.log");
   const launchctlLog = path.join(sandbox, "launchctl.log");
   fs.mkdirSync(neutralCwd, { recursive: true });
   fs.mkdirSync(stubBin, { recursive: true });
-  fs.writeFileSync(
-    unreachableFetchFixture,
-    "globalThis.fetch = async () => { throw new TypeError('synthetic unreachable'); };\n",
-    { mode: 0o600 },
-  );
   fs.symlinkSync(process.execPath, path.join(stubBin, "node"));
   writeExecutable(
     path.join(stubBin, "launchctl"),
@@ -328,8 +350,18 @@ esac
     );
   }
 
+  let defaultRequests = 0;
+  defaultGuard = http.createServer((_request, response) => {
+    defaultRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  await new Promise<void>((resolve) => defaultGuard!.listen(0, "127.0.0.1", resolve));
+  const standInDefaultPort = (defaultGuard.address() as AddressInfo).port;
   const blankHome = path.join(sandbox, "blank-home");
   const blankPlimsoll = path.join(sandbox, "blank-plimsoll");
+  const unreachablePort = await closedLoopbackPort();
+  const blankBefore = seedUnreachableCollectorConfig(blankPlimsoll, unreachablePort);
   const doctorBaseEnv = {
     ...process.env,
     HOME: blankHome,
@@ -341,9 +373,7 @@ esac
   };
   const blankDoctorEnv = {
     ...doctorBaseEnv,
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${unreachableFetchFixture}`]
-      .filter(Boolean)
-      .join(" "),
+    NODE_OPTIONS: "",
   };
   const blankDoctor = await command(
     process.execPath,
@@ -368,13 +398,14 @@ esac
   check("blank_doctor_fails", blankDoctor.code !== 0 && blankReceipt.ok === false, blankReceipt);
   check("blank_doctor_reports_not_installed", blankReceipt.readiness === "not_installed", blankReceipt);
   check(
-    "blank_doctor_creates_no_home_or_plimsoll_directory",
-    !fs.existsSync(blankHome) && !fs.existsSync(blankPlimsoll),
-    { blankHome, blankPlimsoll },
+    "blank_doctor_does_not_mutate_fixture_or_probe_live_collector",
+    !fs.existsSync(blankHome) && digestTree(blankPlimsoll) === blankBefore,
+    { blankHome, blankPlimsoll, unreachablePort },
   );
 
   const packagedBlankHome = path.join(sandbox, "packaged-blank-home");
   const packagedBlankPlimsoll = path.join(sandbox, "packaged-blank-plimsoll");
+  const packagedBlankBefore = seedUnreachableCollectorConfig(packagedBlankPlimsoll, unreachablePort);
   const packagedBlankDoctor = await command(
     process.execPath,
     [packagedCli, "doctor", "--read-only", "--json"],
@@ -393,9 +424,27 @@ esac
     packagedBlankDoctor.code !== 0 &&
       packagedBlankReceipt.readiness === "not_installed" &&
       !fs.existsSync(packagedBlankHome) &&
-      !fs.existsSync(packagedBlankPlimsoll),
+      digestTree(packagedBlankPlimsoll) === packagedBlankBefore,
     packagedBlankReceipt,
   );
+
+  // Replace the default port only in a disposable copy of the bundled CLI.
+  // The listener models a live collector without ever using port 48271.
+  const packagedBytes = fs.readFileSync(packagedCli, "utf8");
+  if (!packagedBytes.includes("48271")) throw new Error("packaged default port unavailable for stand-in test");
+  fs.writeFileSync(guardCli, packagedBytes.replaceAll("48271", String(standInDefaultPort)));
+  const guardedDoctor = await command(process.execPath,
+    [guardCli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: blankDoctorEnv });
+  const guardedReceipt = guardedDoctor.stdout.trim() ? parseJson(guardedDoctor.stdout) : null;
+  check("blank_doctor_never_contacts_stand_in_default_listener",
+    guardedDoctor.code !== 0 && defaultRequests === 0 &&
+      guardedReceipt?.readiness === "not_installed",
+    { defaultRequests, standInDefaultPort, unreachablePort, code: guardedDoctor.code,
+      stderr: guardedDoctor.stderr.slice(-1000), guardedReceipt });
+  defaultGuard.closeAllConnections();
+  await new Promise<void>((resolve) => defaultGuard!.close(() => resolve()));
+  defaultGuard = undefined;
 
   const cleanSetupHome = path.join(sandbox, "clean-setup-home");
   const cleanSetupPlimsoll = path.join(sandbox, "clean-setup-plimsoll");
@@ -1127,11 +1176,16 @@ esac
   );
   console.log(JSON.stringify(receipt, null, 2));
   } finally {
+    if (defaultGuard) {
+      defaultGuard.closeAllConnections();
+      await new Promise<void>((resolve) => defaultGuard!.close(() => resolve()));
+    }
     if (server) {
       await new Promise<void>((resolve) => server!.close(() => resolve()));
     }
     guardFixture.restore();
     fs.rmSync(packagedCli, { force: true });
+    fs.rmSync(guardCli, { force: true });
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 }
