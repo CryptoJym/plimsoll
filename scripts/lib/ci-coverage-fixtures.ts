@@ -984,6 +984,19 @@ export const FIXTURES: Fixture[] = [
       return { input: editRun(input, gate.command, (line) => [`${line} ${argument}`]), error: /passes arguments to .*ci-coverage-proof/ };
     },
   })),
+  {
+    name: "gate_direct_node_flag",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "the gate may not be bundled into a disposable root",
+    build: (input) => {
+      const gate = proofLine(input, GATE_ENTRY);
+      return {
+        input: editRun(input, gate, () => [gate.replace(GATE_ENTRY, `--direct-node ${GATE_ENTRY}`)]),
+        error: /passes arguments to .*ci-coverage-proof/,
+      };
+    },
+  },
   ...(["none", "busy"] as const).map((value): Fixture => ({
     name: `otlp_only_env_prefix_${value === "none" ? "none" : "one_stage"}`,
     origin: "gate",

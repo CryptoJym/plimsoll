@@ -46,6 +46,7 @@
  *   quarantine expiry against another date. These options are local-only: the
  *   CI invocation must use this file with no arguments.
  */
+import fs from "node:fs";
 import path from "node:path";
 
 import { FIXTURES, fixtureHolds } from "./lib/ci-coverage-fixtures";
@@ -60,6 +61,9 @@ import {
 } from "./lib/proof-ci-coverage";
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+if (process.env.CI && (process.argv.slice(2).length > 0 || fs.realpathSync(process.cwd()) !== fs.realpathSync(repoRoot))) {
+  throw new Error("CI coverage must audit its checkout from that checkout with no arguments");
+}
 const rootFlag = process.argv.indexOf("--root");
 const auditRoot = rootFlag === -1 ? repoRoot : path.resolve(process.argv[rootFlag + 1] ?? "");
 const selfTests = rootFlag === -1 && !process.argv.includes("--audit-only");
@@ -115,6 +119,8 @@ console.log(
       schema: "plimsoll.ci-coverage-proof.v3",
       status: failed.length === 0 ? "passed" : "failed",
       audited: path.relative(repoRoot, auditRoot) || ".",
+      root: fs.realpathSync(auditRoot),
+      forwardedArgs: process.argv.slice(2),
       workflows: report.workflows,
       proofEntries: report.units.length,
       runInCi: count("ci"),

@@ -301,7 +301,7 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
       const resolved = resolve(name);
       if ("problem" in resolved) errors.push(`package.json "${name}" is not a canonical proof command: ${resolved.problem}`);
       else {
-        if (resolved.file === GATE_ENTRY && resolved.args.length > 0) {
+        if (resolved.file === GATE_ENTRY && (resolved.args.length > 0 || resolved.via.some((script) => input.scripts[script]?.includes("--direct-node")))) {
           errors.push(`package.json "${name}" passes arguments to ${GATE_ENTRY}; the CI gate script must use its exact invocation so audit dates and roots cannot be pinned`);
         }
         addUnit(resolved.file, "proof script leaf", name);
@@ -428,7 +428,7 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
             if (namesProof(line.text) && !reported) errors.push(`${where} line ${line.number}: ${problem}: ${line.text}`);
             continue;
           }
-          if (reached.file === GATE_ENTRY && (reached.args.length > 0 || workflowExtraArgs.length > 0)) {
+          if (reached.file === GATE_ENTRY && (reached.args.length > 0 || workflowExtraArgs.length > 0 || line.text.includes("--direct-node") || reached.via.some((script) => input.scripts[script]?.includes("--direct-node")))) {
             errors.push(`${where} line ${line.number} passes arguments to ${GATE_ENTRY}; the CI gate line must use its exact invocation so audit dates and roots cannot be pinned`);
           }
           const source = input.readFile(reached.file) ?? "";
