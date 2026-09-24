@@ -1,15 +1,41 @@
 /**
  * eco-6hoxj.163.23 — every proof runs in CI or is reviewed local-only.
  *
- * Audits this checkout with the execution model in scripts/lib/proof-ci-coverage.ts:
- * every proof entry file (named `proof`/`proof:*` leaves, proof files any
- * package script runs, and proof files under scripts/) must be executed by a
+ * Audits this checkout with scripts/lib/proof-ci-coverage.ts: every proof
+ * entry file (named `proof`/`proof:*` leaves, proof files any package script
+ * names, and proof files under scripts/) must be run by a canonical line in a
  * workflow step that provably runs on every successful push and pull request
- * to main, or carry a reviewed entry in scripts/proof-local-only.json (with an
- * owner, and an expiry for quarantined red proofs). The gate must also be the
- * first proof step in its job. Then every adversarial fixture in
- * scripts/lib/ci-coverage-fixtures.ts, including each case from the PR #397
- * review, must reach the verdict a correct gate reaches.
+ * to main, or be a declared sub-proof of a suite CI runs
+ * (scripts/proof-suites.json), or carry a reviewed entry in
+ * scripts/proof-local-only.json (local-only with the input CI lacks, or
+ * quarantined for at most 30 days). The gate must also be the first proof
+ * step in its job. Then every adversarial fixture in
+ * scripts/lib/ci-coverage-fixtures.ts, including each case from both reviews
+ * of PR #397, must reach the verdict a correct gate reaches.
+ *
+ * What the gate is for (threat model). It is a hygiene gate: it stops a proof
+ * from being switched off by accident or by a lazy edit (a commented or
+ * echoed line, `|| true`, a "temporarily disabled" script, a false `if:`, a
+ * matrix that skips a step, an environment variable or pnpm setting that
+ * turns a run into a no-op, a local-only list that quietly grows). Its rule
+ * is an allow-list: anything it cannot read exactly the way GitHub, bash and
+ * pnpm will is a failure, not a guess. It is not a security boundary against
+ * someone who can edit the workflows, who could just as well edit the proofs.
+ * It reads files and cannot see:
+ * - its own step: `continue-on-error`, a false `if:` or a job setting that
+ *   stops the gate from starting leaves CI green however red the gate is, so
+ *   branch protection must require the proof job;
+ * - what allowed commands do when they run: a package script, proof, action
+ *   or install hook that exits early, edits files or writes $GITHUB_ENV
+ *   itself;
+ * - what `pnpm install` installs (the lockfile, a replaced tsx), and user
+ *   configuration under HOME or XDG_CONFIG_HOME (the workflow points both at
+ *   fresh directories; the gate does not check where they point);
+ * - a name assembled at run time (such as NODE_ + OPTIONS), or an expression
+ *   in an allowed action's inputs;
+ * - whether a suite really runs what its receipt names, or whether a
+ *   local-only proof really needs the input it declares;
+ * - GitHub settings: repository variables, rulesets and required checks.
  *
  * CI runs it with node (`node ./node_modules/tsx/dist/cli.mjs
  * ./scripts/ci-coverage-proof.ts`), not pnpm, so no pnpm setting can turn the
@@ -81,7 +107,7 @@ const failed = checks.filter((check) => !check.passed);
 console.log(
   JSON.stringify(
     {
-      schema: "plimsoll.ci-coverage-proof.v2",
+      schema: "plimsoll.ci-coverage-proof.v3",
       status: failed.length === 0 ? "passed" : "failed",
       audited: path.relative(repoRoot, auditRoot) || ".",
       workflows: report.workflows,

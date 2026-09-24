@@ -12,9 +12,13 @@ import { GATE_ENTRY, MAX_QUARANTINE_DAYS, proofCiCoverage, type CoverageInput, t
  * second review's false greens against the execution model at e683d895. The
  * same edits can be written to a checkout (`files`) to replay them against
  * any gate.
+ *
+ * Fixtures edit the workflow whose step runs the gate, and pick script and
+ * file names the repository does not use yet, so a legitimate change (a
+ * renamed workflow, a new script that happens to share a fixture's name)
+ * cannot turn the real gate red.
  */
 
-export const FIXTURE_WORKFLOW = ".github/workflows/proof.yml";
 const PREFERRED_TARGETS = ["proof:usage-dedupe", "proof:enrollment-privacy", "proof:performance-layer"];
 
 /** A fixture's edited inputs plus what a correct gate must conclude about them. */
@@ -41,19 +45,28 @@ export type Fixture = {
 
 type Target = { line: string; script: string; unit: string };
 
+/** The workflow whose step runs the gate (counted or not, as an edit may have changed that): the one the fixtures edit. */
+export function fixtureWorkflow(input: CoverageInput) {
+  const gate = proofCiCoverage(input).units.find((unit) => unit.unit === GATE_ENTRY);
+  const invocation = gate?.covered[0] ?? gate?.ignored[0];
+  if (!invocation) throw new Error(`no workflow step runs ${GATE_ENTRY}, so the fixtures have no workflow to edit`);
+  return invocation.workflow;
+}
+
 /**
- * Proofs CI runs from a one-line `run: pnpm proof:…` step of the fixture
+ * Proofs CI runs from a one-line `run: pnpm proof:…` step of the gate's own
  * workflow, the reviewer's three first; fixtures edit these, so they keep
  * working when any single CI line changes.
  */
 export function fixtureTargets(input: CoverageInput): Target[] {
+  const workflow = fixtureWorkflow(input);
   const text = workflowText(input);
   const targets: Target[] = [];
   for (const unit of proofCiCoverage(input).units) {
     if (unit.status !== "ci") continue;
     for (const invocation of unit.covered) {
       const script = /^pnpm (proof:[\w:.-]+)$/.exec(invocation.command.trim())?.[1];
-      if (!script || invocation.workflow !== FIXTURE_WORKFLOW || invocation.via.join() !== script) continue;
+      if (!script || invocation.workflow !== workflow || invocation.via.join() !== script) continue;
       if (text.split("\n").filter((line) => line.trim() === `run: pnpm ${script}`).length !== 1) continue;
       if (unit.unit === GATE_ENTRY || targets.some((target) => target.script === script)) continue;
       targets.push({ line: `pnpm ${script}`, script, unit: unit.unit });
@@ -61,7 +74,7 @@ export function fixtureTargets(input: CoverageInput): Target[] {
   }
   const rank = (target: Target) => (PREFERRED_TARGETS.includes(target.script) ? PREFERRED_TARGETS.indexOf(target.script) : PREFERRED_TARGETS.length);
   targets.sort((a, b) => rank(a) - rank(b) || a.script.localeCompare(b.script));
-  if (targets.length < 3) throw new Error(`fixtures need three one-line proof steps in ${FIXTURE_WORKFLOW}`);
+  if (targets.length < 3) throw new Error(`fixtures need three one-line proof steps in ${workflow}`);
   return targets;
 }
 
@@ -78,15 +91,15 @@ export function fixtureHolds(fixtureCase: FixtureCase, report: CoverageReport, g
 }
 
 function workflowText(input: CoverageInput) {
-  const workflow = input.workflows.find((candidate) => candidate.path === FIXTURE_WORKFLOW);
-  if (!workflow) throw new Error(`fixture workflow ${FIXTURE_WORKFLOW} missing`);
-  return workflow.text;
+  const path = fixtureWorkflow(input);
+  return input.workflows.find((candidate) => candidate.path === path)!.text;
 }
 
-function withWorkflowText(input: CoverageInput, text: string, path = FIXTURE_WORKFLOW): CoverageInput {
+function withWorkflowText(input: CoverageInput, text: string, path = fixtureWorkflow(input)): CoverageInput {
+  const current = fixtureWorkflow(input);
   return {
     ...input,
-    workflows: input.workflows.map((workflow) => (workflow.path === FIXTURE_WORKFLOW ? { path, text } : workflow)),
+    workflows: input.workflows.map((workflow) => (workflow.path === current ? { path, text } : workflow)),
   };
 }
 
@@ -115,7 +128,7 @@ function findStep(document: Document, line: string) {
       }
     }
   }
-  throw new Error(`fixture target \`${line}\` not found in ${FIXTURE_WORKFLOW}`);
+  throw new Error(`fixture target \`${line}\` not found in the gate's workflow`);
 }
 
 function block(document: Document, text: string) {
@@ -206,10 +219,15 @@ function syntheticSuite(input: CoverageInput) {
 
 const RENAMED_PROOF = "scripts/review-renamed-proof.ts";
 const renamedProofFile = { [RENAMED_PROOF]: 'throw new Error("this proof must run, but CI never runs it");\n' };
-const withRenamedProof = (input: CoverageInput) => ({
-  ...withScripts(input, { "verify:renamed-proof": `tsx ${RENAMED_PROOF}` }),
-  proofFiles: [...input.proofFiles, RENAMED_PROOF],
-});
+/** A proof file the repository does not have yet, run only by a new non-proof package script. */
+function withRenamedProof(input: CoverageInput) {
+  let file = RENAMED_PROOF;
+  for (let suffix = 2; input.proofFiles.includes(file) || input.readFile(file) !== null; suffix += 1) {
+    file = RENAMED_PROOF.replace(/-proof\.ts$/, `-${suffix}-proof.ts`);
+  }
+  const script = unusedScriptName(input.scripts, "verify:renamed-proof");
+  return { input: { ...withScripts(input, { [script]: `tsx ${file}` }), proofFiles: [...input.proofFiles, file] }, file };
+}
 
 /** A case built on the first fixture target. */
 function onTarget(edit: (input: CoverageInput, target: Target) => CoverageInput, expect: "uncovered" | "covered") {
@@ -241,7 +259,10 @@ export const FIXTURES: Fixture[] = [
     origin: "reviewer",
     expectGateGreen: false,
     describe: "an unwired package script `verify:renamed-proof` runs a proof file",
-    build: (input) => ({ input: withRenamedProof(input), uncovered: [RENAMED_PROOF] }),
+    build: (input) => {
+      const renamed = withRenamedProof(input);
+      return { input: renamed.input, uncovered: [renamed.file] };
+    },
     files: renamedProofFile,
   },
   {
@@ -302,10 +323,10 @@ export const FIXTURES: Fixture[] = [
     origin: "reviewer",
     expectGateGreen: true,
     describe: "CI runs `pnpm ci:alias`, a package script whose only command is the proof's",
-    build: onTarget(
-      (input, t) => editRun(withScripts(input, { "ci:alias": t.line }), t.line, (line) => [line.replace(t.line, "pnpm ci:alias")]),
-      "covered",
-    ),
+    build: onTarget((input, t) => {
+      const alias = unusedScriptName(input.scripts, "ci:alias");
+      return editRun(withScripts(input, { [alias]: t.line }), t.line, (line) => [line.replace(t.line, `pnpm ${alias}`)]);
+    }, "covered"),
   },
   {
     name: "reviewer_commented_out_reference",
@@ -328,8 +349,12 @@ export const FIXTURES: Fixture[] = [
     name: "reviewer_renamed_workflow",
     origin: "reviewer",
     expectGateGreen: true,
-    describe: "proof.yml is renamed verify.yml",
-    build: (input) => ({ input: withWorkflowText(input, workflowText(input), ".github/workflows/verify.yml"), covered: [GATE_ENTRY] }),
+    describe: "the gate's workflow file is renamed",
+    build: (input) => {
+      const current = fixtureWorkflow(input);
+      const renamed = current.replace(/[^/]+$/, (name) => `renamed-${name}`);
+      return { input: withWorkflowText(input, workflowText(input), renamed), covered: [GATE_ENTRY] };
+    },
   },
   {
     name: "reviewer_real_entrypoint_combined",
@@ -342,7 +367,8 @@ export const FIXTURES: Fixture[] = [
       edited = setStepKey(edited, first!.line, "if", "${{ matrix.run_usage }}");
       edited = setStepKey(edited, second!.line, "if", "${{ matrix.run_enrollment }}");
       edited = editRun(edited, third!.line, (line) => [line.replace("pnpm", "echo pnpm")]);
-      return { input: withRenamedProof(edited), uncovered: [first!.unit, second!.unit, third!.unit, RENAMED_PROOF] };
+      const renamed = withRenamedProof(edited);
+      return { input: renamed.input, uncovered: [first!.unit, second!.unit, third!.unit, renamed.file] };
     },
     files: renamedProofFile,
   },
