@@ -1115,6 +1115,7 @@ export function createCollectorServer(
       privacy: collectorPrivacyReadiness(config),
       retentionDays: config.retentionDays,
       retention: refreshControl ? buffer.retentionProgressStatus(config.retentionDays) : cachedControl?.retention ?? null,
+      learningFacts: refreshControl ? buffer.learningFacts.status() : cachedControl?.learningFacts ?? null,
       enrollment: { futureOnlyEnrollment: true, inspection: "not_inspected", quarantinedHistoryRows: null },
       stats,
       otlpAdmission: {
@@ -1191,6 +1192,7 @@ export function createCollectorServer(
       privacyMode: "metadata_only",
       privacy: collectorPrivacyReadiness(config),
       retentionDays: config.retentionDays,
+      learningFacts: buffer.learningFacts.status(),
       retention: {
         inspection: "not_inspected",
         policy: { retentionDays: config.retentionDays, cutoffAt: null },
@@ -1362,6 +1364,7 @@ export function createCollectorServer(
             privacyMode: "metadata_only",
             privacy: collectorPrivacyReadiness(config),
             retentionDays: config.retentionDays,
+            learningFacts: null,
             retention: {
               inspection: "not_inspected",
               policy: { retentionDays: config.retentionDays, cutoffAt: null },

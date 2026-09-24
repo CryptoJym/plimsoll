@@ -24,6 +24,7 @@ import {
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
+import { DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH } from "./learning-facts";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
@@ -36,7 +37,13 @@ const CAPTURE_COVERAGE_CHECK_KEY = "capture_coverage_checked_at";
 const CAPTURE_COVERAGE_TURN_MARGIN_MS = 25;
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
-const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
+const REPAIR_STAGES = [
+  "projection",
+  "reconciliation",
+  "repricing",
+  "repo_context_suppression",
+  "learning_facts",
+] as const;
 const AUTOMATIC_CAPTURE_FAIRNESS_KEY = "automatic_capture_fairness_v1";
 type CaptureSource = "codex" | "claude_code" | "grok";
 type RepairStage = typeof REPAIR_STAGES[number];
@@ -75,11 +82,30 @@ export type AutomaticCaptureTurn = {
 };
 
 export function automaticRepairServiceStatus(database: Database.Database): RepairService {
-  const stored = maintenanceState(database, REPAIR_SERVICE_KEY);
-  if (stored) return JSON.parse(stored) as RepairService;
-  return { next: 0, cycles: 0, stages: Object.fromEntries(REPAIR_STAGES.map(stage => [stage, {
+  const emptyStages = () => Object.fromEntries(REPAIR_STAGES.map(stage => [stage, {
     attempts: 0, completed: 0, failures: 0, rowsVisited: 0, lastSuccessAt: null,
-  }])) as RepairService["stages"] };
+  }])) as RepairService["stages"];
+  const stored = maintenanceState(database, REPAIR_SERVICE_KEY);
+  if (stored) {
+    const parsed = JSON.parse(stored) as Partial<RepairService>;
+    const stages = emptyStages();
+    for (const stage of REPAIR_STAGES) {
+      const prior = parsed.stages?.[stage];
+      if (prior) stages[stage] = { ...stages[stage], ...prior };
+    }
+    const next = typeof parsed.next === "number" && Number.isSafeInteger(parsed.next) && parsed.next >= 0
+      ? parsed.next
+      : 0;
+    const cycles = typeof parsed.cycles === "number" && Number.isSafeInteger(parsed.cycles) && parsed.cycles >= 0
+      ? parsed.cycles
+      : 0;
+    return {
+      next,
+      cycles,
+      stages,
+    };
+  }
+  return { next: 0, cycles: 0, stages: emptyStages() };
 }
 
 export function automaticCaptureFairnessStatus(database: Database.Database): AutomaticCaptureFairness {
@@ -963,6 +989,11 @@ export class CollectorMaintenance {
               break;
             case "repo_context_suppression":
               rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
+              break;
+            case "learning_facts":
+              rows = this.buffer.learningFacts.runMaintenance(
+                DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH,
+              ).evicted;
               break;
           }
           counter.completed += 1;

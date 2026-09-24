@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { recordRuntimeFactDrop, type RuntimeFactDropReason } from "./runtime-fact-drops";
 
 import {
   aiInteractionEventSchema,
@@ -43,7 +44,115 @@ export const DEFAULT_LEARNING_FACT_LIMITS: LearningFactLimits = {
   techniqueIdentities: 256,
 };
 
+export const DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH = 256;
+
+export type LearningFactTableName =
+  | "tool_attempt_facts"
+  | "work_episode_facts"
+  | "technique_exposure_facts"
+  | "technique_identity_registry";
+
+export type LearningFactTableStatus = {
+  rowCount: number;
+  limit: number;
+  fillRatio: number;
+  evictedCount: number;
+  maintenanceNeeded: boolean;
+};
+
+export type LearningFactStatus = {
+  tables: Record<LearningFactTableName, LearningFactTableStatus>;
+  totalRows: number;
+  totalLimit: number;
+  totalEvicted: number;
+  maintenanceNeeded: boolean;
+};
+
+export type LearningFactMaintenanceResult = {
+  /** Maximum oldest roots selected per table; dependent rows are additional. */
+  requested: number;
+  selectedRoots: number;
+  evicted: number;
+  bounded: boolean;
+  tables: Array<{
+    table: LearningFactTableName;
+    evicted: number;
+    rowCount: number;
+    limit: number;
+  }>;
+};
+
+export type LearningFactWriteResult<T> = {
+  inserted: boolean;
+  /** Null only when the write was intentionally dropped. */
+  fact: T | null;
+  dropped?: boolean;
+  dropReason?: RuntimeFactDropReason;
+};
+
+type LearningFactTableDefinition = {
+  name: LearningFactTableName;
+  limit: keyof LearningFactLimits;
+  idColumn: string;
+  retentionColumn: string;
+};
+
+type LearningFactEvictionCounts = Record<LearningFactTableName, number>;
+type CapacityDecision = "admit" | "outside_retention_window" | "required_reference";
+
+const LEARNING_FACT_TABLES: readonly LearningFactTableDefinition[] = [
+  {
+    name: "tool_attempt_facts",
+    limit: "attempts",
+    idColumn: "operation_id",
+    retentionColumn: "started_at",
+  },
+  {
+    name: "work_episode_facts",
+    limit: "episodes",
+    idColumn: "episode_id",
+    retentionColumn: "started_at",
+  },
+  {
+    name: "technique_exposure_facts",
+    limit: "exposures",
+    idColumn: "exposure_id",
+    retentionColumn: "exposed_at",
+  },
+  {
+    name: "technique_identity_registry",
+    limit: "techniqueIdentities",
+    idColumn: "technique_key",
+    retentionColumn: "first_seen_at",
+  },
+];
+
 const MAX_SOURCE_OPERATION_KEY_BYTES = 1_024;
+
+// SQLite's %f rounds fractions; Date.parse (the fact schema's clock) truncates
+// them to milliseconds. Extract the first three fractional digits instead so
+// both sides rank .0009Z, .5Z and .500Z exactly the same way. strftime('%s')
+// handles the timezone offset and supplies the whole UTC second.
+function retentionInstantExpression(timestampColumn: string) {
+  return `cast(strftime('%s', ${timestampColumn}) as integer) * 1000 +
+    case when instr(${timestampColumn}, '.') = 0 then 0 else
+      cast(substr(
+        substr(${timestampColumn}, instr(${timestampColumn}, '.') + 1,
+          length(${timestampColumn}) - instr(${timestampColumn}, '.') -
+          case when substr(${timestampColumn}, -1) = 'Z' then 1 else 6 end
+        ) || '000', 1, 3
+      ) as integer)
+    end`;
+}
+
+// Fact validation uses Date.parse, not SQLite's narrower date grammar. Keep
+// this as the sole clock for public writes and legacy-row backfill.
+function retentionInstant(timestamp: string): number | null {
+  const value = timestamp.trim();
+  if (!value || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) ? milliseconds : null;
+}
 
 function boundedDimensionId(value: string, name: string) {
   const trimmed = value.trim();
@@ -274,7 +383,8 @@ export class LearningFactStore {
   }
 
   private ensureSchema() {
-    this.db.exec(`
+    const migrate = this.db.transaction(() => {
+      this.db.exec(`
       create table if not exists work_episode_facts (
         episode_id text primary key,
         source text not null,
@@ -287,7 +397,8 @@ export class LearningFactStore {
         duration_ms integer check(duration_ms is null or duration_ms between 0 and 2592000000),
         created_at text not null,
         check((ended_at is null) = (duration_ms is null))
-      );      create table if not exists tool_attempt_facts (
+      );
+      create table if not exists tool_attempt_facts (
         operation_id text primary key,
         source text not null,
         session_id text not null check(length(session_id) between 1 and 96),
@@ -329,6 +440,18 @@ export class LearningFactStore {
         content_digest text,
         first_seen_at text not null
       );
+      create table if not exists learning_fact_table_state (
+        table_name text primary key check(table_name in (
+          'tool_attempt_facts',
+          'work_episode_facts',
+          'technique_exposure_facts',
+          'technique_identity_registry'
+        )),
+        row_count integer not null check(row_count >= 0),
+        evicted_count integer not null default 0 check(evicted_count >= 0),
+        maintenance_needed integer not null default 0 check(maintenance_needed in (0, 1)),
+        updated_at text not null
+      );
       create index if not exists idx_attempt_session_time
         on tool_attempt_facts(session_id, started_at);
       create index if not exists idx_attempt_episode_time
@@ -357,37 +480,470 @@ export class LearningFactStore {
           exposed_at,
           mode
         );
+      create index if not exists idx_attempt_retention
+        on tool_attempt_facts(started_at, operation_id);
+      create index if not exists idx_episode_retention
+        on work_episode_facts(started_at, episode_id);
+      create index if not exists idx_exposure_retention
+        on technique_exposure_facts(exposed_at, exposure_id);
+      create index if not exists idx_technique_identity_retention
+        on technique_identity_registry(first_seen_at, technique_key);
     `);
-    // Existing ledgers created before optional episode parent linkage keep
-    // their original table shape; add the column in place (new-only data).
-    const workEpisodeColumns = new Set(
-      (this.db.pragma("table_info(work_episode_facts)") as Array<{ name: string }>)
-        .map((column) => column.name),
-    );
-    if (!workEpisodeColumns.has("parent_episode_id")) {
-      this.db.exec(`alter table work_episode_facts add column parent_episode_id text`);
+      // The previous VIRTUAL expression used SQLite's narrower timestamp
+      // grammar, so accepted spellings such as a lowercase 't' could block the
+      // entire upgrade. Replace it with a nullable stored key. The old binary
+      // writes explicit column lists and can still insert after a downgrade;
+      // we repair any such NULL keys before the first retention decision on
+      // every subsequent open.
+      for (const definition of LEARNING_FACT_TABLES) {
+        const column = (this.db.pragma(`table_xinfo(${definition.name})`) as
+          Array<{ name: string; hidden: number }>).find((entry) => entry.name === "retention_ms");
+        if (column?.hidden) {
+          this.db.exec(`drop index if exists idx_${definition.name}_retention_ms`);
+          this.db.exec(`alter table ${definition.name} drop column retention_ms`);
+        }
+        if (!column || column.hidden) {
+          this.db.exec(`alter table ${definition.name} add column retention_ms integer`);
+        }
+        // NULL means the key came from an old/raw writer, or predates this
+        // verification marker. A SQLite trigger key is only provisional until
+        // the same TypeScript fact validator used by public writes checks it.
+        const verifiedColumn = (this.db.pragma(`table_xinfo(${definition.name})`) as
+          Array<{ name: string }>).some((entry) => entry.name === "retention_verified");
+        if (!verifiedColumn) {
+          this.db.exec(`alter table ${definition.name} add column retention_verified integer`);
+        }
+        this.db.exec(`create index if not exists idx_${definition.name}_retention_ms
+          on ${definition.name}(retention_ms, ${definition.idColumn})`);
+        this.db.exec(`create index if not exists idx_${definition.name}_retention_unverified
+          on ${definition.name}(${definition.idColumn}) where retention_verified is null`);
+        // Compatibility for raw SQL and old collectors' ordinary uppercase-T
+        // ISO writes, including offsets. Do not use SQLite's parser for the
+        // broader admitted grammar: the next open backfills those with
+        // Date.parse. Public writes always supply the key directly.
+        // This trigger never rejects an old writer's accepted timestamp.
+        this.db.exec(`create trigger if not exists learning_fact_retention_${definition.name}_insert
+          after insert on ${definition.name}
+          when new.retention_ms is null and
+               substr(new.${definition.retentionColumn}, 5, 1) = '-' and
+               substr(new.${definition.retentionColumn}, 8, 1) = '-' and
+               substr(new.${definition.retentionColumn}, 11, 1) = 'T' and
+               substr(new.${definition.retentionColumn}, 14, 1) = ':' and
+               substr(new.${definition.retentionColumn}, 17, 1) = ':' and
+               strftime('%s', new.${definition.retentionColumn}) is not null
+          begin
+            update ${definition.name}
+               set retention_ms = ${retentionInstantExpression(definition.retentionColumn)}
+             where ${definition.idColumn} = new.${definition.idColumn};
+          end`);
+      }
+      // Existing ledgers created before optional episode parent linkage keep
+      // their original table shape; add the column in the same transaction as
+      // the state and trigger upgrade.
+      const workEpisodeColumns = new Set(
+        (this.db.pragma("table_info(work_episode_facts)") as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      if (!workEpisodeColumns.has("parent_episode_id")) {
+        this.db.exec(`alter table work_episode_facts add column parent_episode_id text`);
+      }
+      this.db.exec(`
+        create index if not exists idx_episode_parent
+          on work_episode_facts(parent_episode_id, episode_id)
+      `);
+
+      const stateColumns = new Set(
+        (this.db.pragma("table_info(learning_fact_table_state)") as Array<{ name: string }>)
+          .map((column) => column.name),
+      );
+      let requiresRecount = false;
+      if (!stateColumns.has("evicted_count")) {
+        this.db.exec(
+          `alter table learning_fact_table_state add column evicted_count integer not null default 0`,
+        );
+        requiresRecount = true;
+      }
+      if (!stateColumns.has("maintenance_needed")) {
+        this.db.exec(
+          `alter table learning_fact_table_state add column maintenance_needed integer not null default 0`,
+        );
+        requiresRecount = true;
+      }
+      if (!stateColumns.has("updated_at")) {
+        this.db.exec(
+          `alter table learning_fact_table_state add column updated_at text not null default ''`,
+        );
+        requiresRecount = true;
+      }
+
+      const triggerNames = new Set(
+        (this.db.prepare(
+          `select name from sqlite_master
+             where type = 'trigger' and name like 'learning_fact_state_%'`,
+        ).all() as Array<{ name: string }>).map((row) => row.name),
+      );
+      const triggersComplete = LEARNING_FACT_TABLES.every((definition) => {
+        const prefix = `learning_fact_state_${definition.name}`;
+        return triggerNames.has(`${prefix}_insert`) && triggerNames.has(`${prefix}_delete`);
+      });
+      if (!triggersComplete) requiresRecount = true;
+
+      for (const definition of LEARNING_FACT_TABLES) {
+        const existing = this.db
+          .prepare(`select 1 from learning_fact_table_state where table_name = ?`)
+          .get(definition.name);
+        if (!existing) {
+          // A zero placeholder lets the trigger set be installed before the
+          // authoritative startup recount. This entire operation is one
+          // transaction, so no writer can observe the placeholder.
+          this.db.prepare(
+            `insert into learning_fact_table_state
+               (table_name, row_count, evicted_count, maintenance_needed, updated_at)
+             values (?, 0, 0, 0, ?)`,
+          ).run(definition.name, new Date().toISOString());
+          requiresRecount = true;
+        }
+      }
+
+      // State creation, trigger installation, and reconciliation deliberately
+      // share this transaction. If a process dies during trigger creation,
+      // SQLite rolls the whole upgrade back; the next open sees missing
+      // triggers and recounts before trusting state.
+      for (const definition of LEARNING_FACT_TABLES) {
+        const triggerPrefix = `learning_fact_state_${definition.name}`;
+        this.db.exec(`
+          create trigger if not exists ${triggerPrefix}_insert
+          after insert on ${definition.name}
+          begin
+            update learning_fact_table_state
+               set row_count = row_count + 1,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             where table_name = '${definition.name}';
+          end;
+          create trigger if not exists ${triggerPrefix}_delete
+          after delete on ${definition.name}
+          begin
+            update learning_fact_table_state
+               set row_count = max(0, row_count - 1),
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             where table_name = '${definition.name}';
+          end;
+        `);
+      }
+
+      if (requiresRecount) {
+        for (const definition of LEARNING_FACT_TABLES) {
+          const rowCount = (
+            this.db
+              .prepare(`select count(*) as n from ${definition.name}`)
+              .get() as { n: number }
+          ).n;
+          const limit = this.limits[definition.limit];
+          this.db.prepare(
+            `update learning_fact_table_state
+                set row_count = ?,
+                    maintenance_needed = case when ? > ? then 1 else 0 end,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+              where table_name = ?`,
+          ).run(rowCount, rowCount, limit, definition.name);
+        }
+      }
+
+      // An indexed pass verifies all old/raw rows, including those that the
+      // SQLite compatibility trigger gave a non-NULL but wrong key. This and
+      // the subsequent trim share the IMMEDIATE transaction; no invalid row
+      // can evict a valid one during startup.
+      this.verifyRetentionKeys();
+
+      // A ledger written by an older version may already be over a configured
+      // limit. Restore the hard bound before the first post-upgrade write.
+      this.trimOverCapacity();
+    });
+    migrate.immediate();
+  }
+
+  private emptyEvictionCounts(): LearningFactEvictionCounts {
+    return {
+      tool_attempt_facts: 0,
+      work_episode_facts: 0,
+      technique_exposure_facts: 0,
+      technique_identity_registry: 0,
+    };
+  }
+
+  private verifyRetentionKeys() {
+    for (const definition of LEARNING_FACT_TABLES) {
+      const select = this.db.prepare(
+        `select ${definition.idColumn} as id, ${definition.retentionColumn} as timestamp
+           from ${definition.name} where retention_verified is null limit 256`,
+      );
+      const update = this.db.prepare(
+        `update ${definition.name} set retention_ms = ?, retention_verified = 1
+          where ${definition.idColumn} = ?`,
+      );
+      while (true) {
+        const rows = select.all() as Array<{ id: string; timestamp: string }>;
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          const valid = this.unverifiedFactValid(definition, row.id);
+          if (valid === null) continue; // Removed with an earlier graph root.
+          const milliseconds = retentionInstant(row.timestamp);
+          if (!valid || milliseconds === null) {
+            // A raw legacy row can bypass fact validation. Discard its whole
+            // graph, rather than letting it poison the index or abort startup.
+            this.evictByIds(definition, [row.id], false);
+            recordRuntimeFactDrop(this.db, "invalid_retention_timestamp");
+          } else {
+            update.run(milliseconds, row.id);
+          }
+        }
+      }
     }
   }
 
-  private assertCapacity(
-    table: string,
-    idColumn: string,
-    id: string,
-    limit: number,
-  ) {
-    const existing = this.db
-      .prepare(`select 1 from ${table} where ${idColumn} = ?`)
-      .get(id);
-    if (existing) return;
-    const count = (
-      this.db.prepare(`select count(*) as n from ${table}`).get() as { n: number }
-    ).n;
-    if (count >= limit) throw new Error(`LearningFactCapacityExceeded:${table}`);
+  private unverifiedFactValid(definition: LearningFactTableDefinition, id: string): boolean | null {
+    try {
+      if (definition.name === "tool_attempt_facts") {
+        const row = this.db.prepare(`${ATTEMPT_SELECT} where operation_id = ?`)
+          .get(id) as AttemptRow | undefined;
+        if (!row) return null;
+        attemptFromRow(row);
+      } else if (definition.name === "work_episode_facts") {
+        const row = this.db.prepare(`select episode_id as episodeId, source,
+          session_id as sessionId, work_class as workClass,
+          complexity_band as complexityBand, parent_episode_id as parentEpisodeId,
+          started_at as startedAt, ended_at as endedAt, duration_ms as durationMs
+          from work_episode_facts where episode_id = ?`).get(id) as Record<string, unknown> | undefined;
+        if (!row) return null;
+        workEpisodeFactSchema.parse({ ...row,
+          parentEpisodeId: row.parentEpisodeId ?? undefined,
+          endedAt: row.endedAt ?? undefined, durationMs: row.durationMs ?? undefined });
+      } else if (definition.name === "technique_exposure_facts") {
+        const row = this.db.prepare(`select exposure_id as exposureId, episode_id as episodeId,
+          technique_id as techniqueId, technique_version as techniqueVersion,
+          content_digest as contentDigest, assignment_id as assignmentId,
+          work_class as workClass, complexity_band as complexityBand,
+          exposed_at as exposedAt, mode, assertion
+          from technique_exposure_facts where exposure_id = ?`).get(id) as Record<string, unknown> | undefined;
+        if (!row) return null;
+        techniqueExposureFactSchema.parse({ ...row,
+          techniqueVersion: row.techniqueVersion ?? undefined,
+          contentDigest: row.contentDigest ?? undefined });
+      } else {
+        const exists = this.db.prepare(`select 1 from technique_identity_registry where technique_key = ?`).get(id);
+        if (!exists) return null;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  recordToolSignal(input: unknown): { inserted: boolean; fact: ToolAttemptFact } {
+  private verifyPendingRetentionKeys() {
+    if (!LEARNING_FACT_TABLES.some((definition) => this.db.prepare(
+      `select 1 from ${definition.name} where retention_verified is null limit 1`,
+    ).get())) return;
+    const reconcile = this.db.transaction(() => {
+      this.verifyRetentionKeys();
+    });
+    reconcile.immediate();
+  }
+
+  private markMaintenance(definition: LearningFactTableDefinition) {
+    const limit = this.limits[definition.limit];
+    this.db.prepare(
+      `update learning_fact_table_state
+          set maintenance_needed = case when row_count > ? then 1 else 0 end,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        where table_name = ?`,
+    ).run(limit, definition.name);
+  }
+
+  private addEvictionCounts(counts: LearningFactEvictionCounts) {
+    for (const definition of LEARNING_FACT_TABLES) {
+      const evicted = counts[definition.name];
+      if (evicted > 0) {
+        this.db.prepare(
+          `update learning_fact_table_state
+              set evicted_count = evicted_count + ?,
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            where table_name = ?`,
+        ).run(evicted, definition.name);
+      }
+      if (evicted > 0) this.markMaintenance(definition);
+    }
+  }
+
+  private deleteEpisodeGraph(rootIds: string[], countEviction = true): LearningFactEvictionCounts {
+    const counts = this.emptyEvictionCounts();
+    const episodeIds = new Set(rootIds);
+    const pending = [...rootIds];
+    const findChildren = this.db.prepare(
+      `select episode_id as episodeId from work_episode_facts where parent_episode_id = ?`,
+    );
+    while (pending.length > 0) {
+      const parentId = pending.pop()!;
+      const children = findChildren.all(parentId) as Array<{ episodeId: string }>;
+      for (const child of children) {
+        if (episodeIds.has(child.episodeId)) continue;
+        episodeIds.add(child.episodeId);
+        pending.push(child.episodeId);
+      }
+    }
+
+    const removeAttempts = this.db.prepare(`delete from tool_attempt_facts where episode_id = ?`);
+    const removeExposures = this.db.prepare(`delete from technique_exposure_facts where episode_id = ?`);
+    const removeEpisodes = this.db.prepare(`delete from work_episode_facts where episode_id = ?`);
+    // Remove dependent facts and child episodes in the same transaction.
+    for (const episodeId of [...episodeIds].reverse()) {
+      counts.tool_attempt_facts += removeAttempts.run(episodeId).changes;
+      counts.technique_exposure_facts += removeExposures.run(episodeId).changes;
+      counts.work_episode_facts += removeEpisodes.run(episodeId).changes;
+    }
+    if (countEviction) this.addEvictionCounts(counts);
+    else for (const definition of LEARNING_FACT_TABLES) this.markMaintenance(definition);
+    return counts;
+  }
+
+  private evictOldest(
+    definition: LearningFactTableDefinition,
+    requested: number,
+  ): LearningFactEvictionCounts {
+    if (requested <= 0) return this.emptyEvictionCounts();
+    const ids = this.db.prepare(
+      `select ${definition.idColumn} as id
+         from ${definition.name}
+        order by retention_ms, ${definition.idColumn}
+        limit ?`,
+    ).all(requested) as Array<{ id: string }>;
+    return this.evictByIds(definition, ids.map((row) => row.id));
+  }
+
+  private evictByIds(
+    definition: LearningFactTableDefinition,
+    victimIds: string[],
+    countEviction = true,
+  ): LearningFactEvictionCounts {
+    const counts = this.emptyEvictionCounts();
+    if (victimIds.length === 0) return counts;
+    if (definition.name === "work_episode_facts") {
+      return this.deleteEpisodeGraph(victimIds, countEviction);
+    }
+    const ids = victimIds.map((id) => ({ id }));
+    // Retry links are local references too. Evict descendants of a removed
+    // attempt using the retry index, never leave a dangling retained retry.
+    if (definition.name === "tool_attempt_facts") {
+      const seen = new Set(ids.map((row) => row.id));
+      const children = this.db.prepare(`select operation_id as id from tool_attempt_facts where retry_of = ?`);
+      for (let index = 0; index < ids.length; index += 1) {
+        for (const child of children.all(ids[index].id) as Array<{ id: string }>) {
+          if (!seen.has(child.id)) { seen.add(child.id); ids.push(child); }
+        }
+      }
+    }
+    const remove = this.db.prepare(
+      `delete from ${definition.name} where ${definition.idColumn} = ?`,
+    );
+    for (const row of ids) counts[definition.name] += remove.run(row.id).changes;
+    if (countEviction) this.addEvictionCounts(counts);
+    else for (const table of LEARNING_FACT_TABLES) this.markMaintenance(table);
+    return counts;
+  }
+
+  private trimOverCapacity() {
+    for (const definition of LEARNING_FACT_TABLES) {
+      const state = this.db.prepare(
+        `select row_count as rowCount from learning_fact_table_state where table_name = ?`,
+      ).get(definition.name) as { rowCount: number } | undefined;
+      if (!state) throw new Error(`LearningFactStateMissing:${definition.name}`);
+      const over = state.rowCount - this.limits[definition.limit];
+      if (over > 0) this.evictOldest(definition, over);
+      this.markMaintenance(definition);
+    }
+  }
+
+  private evictionWouldRemoveRequired(
+    table: "tool_attempt_facts" | "work_episode_facts",
+    victimId: string,
+    requiredId: string,
+  ): boolean {
+    // Follow only the graph that this victim's eviction would delete. An
+    // ancestor/retry target anywhere in that graph must survive if the new
+    // dependent is to be admitted. Both child lookups use existing indexes.
+    const children = table === "work_episode_facts"
+      ? this.db.prepare(`select episode_id as id from work_episode_facts where parent_episode_id = ?`)
+      : this.db.prepare(`select operation_id as id from tool_attempt_facts where retry_of = ?`);
+    const pending = [victimId];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const id = pending.pop()!;
+      if (id === requiredId) return true;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      for (const child of children.all(id) as Array<{ id: string }>) pending.push(child.id);
+    }
+    return false;
+  }
+
+  private capacityPressure(
+    table: LearningFactTableName,
+    id: string,
+    retentionMs: number,
+    requiredId?: string,
+  ): CapacityDecision {
+    const definition = LEARNING_FACT_TABLES.find((entry) => entry.name === table)!;
+    const existing = this.db
+      .prepare(`select 1 from ${definition.name} where ${definition.idColumn} = ?`)
+      .get(id);
+    if (existing) return "admit";
+    const state = this.db
+      .prepare(
+        `select row_count as rowCount
+           from learning_fact_table_state where table_name = ?`,
+      )
+      .get(definition.name) as { rowCount: number } | undefined;
+    if (!state) throw new Error(`LearningFactStateMissing:${definition.name}`);
+    const limit = this.limits[definition.limit];
+    if (state.rowCount > limit) {
+      // A legacy/raw writer can leave overflow. Repair only those rows before
+      // comparing the new candidate, so even a rejected write leaves a bound.
+      this.evictOldest(definition, state.rowCount - limit);
+      state.rowCount = (this.db.prepare(
+        `select row_count as rowCount from learning_fact_table_state where table_name = ?`,
+      ).get(definition.name) as { rowCount: number }).rowCount;
+    }
+    if (state.rowCount < limit) return "admit";
+    const oldest = this.db.prepare(
+      `select ${definition.idColumn} as id, retention_ms as retentionMs
+         from ${definition.name}
+        order by retention_ms, ${definition.idColumn}
+        limit 1`,
+    ).get() as { id: string; retentionMs: number } | undefined;
+    if (!oldest) throw new Error(`LearningFactStateMismatch:${definition.name}`);
+    // Retain the greatest (UTC millisecond, identity) tuple. Comparing raw ISO
+    // strings would misorder offset-bearing timestamps at day boundaries.
+    if (retentionMs < oldest.retentionMs ||
+        (retentionMs === oldest.retentionMs && id < oldest.id)) {
+      return "outside_retention_window";
+    }
+    if (requiredId &&
+        (table === "tool_attempt_facts" || table === "work_episode_facts") &&
+        this.evictionWouldRemoveRequired(table, oldest.id, requiredId)) {
+      return "required_reference";
+    }
+    this.evictOldest(definition, 1);
+    return "admit";
+  }
+
+  private dropFact<T>(reason: RuntimeFactDropReason = "stale_reference"): LearningFactWriteResult<T> {
+    recordRuntimeFactDrop(this.db, reason);
+    return { inserted: false, fact: null, dropped: true, dropReason: reason };
+  }
+
+  recordToolSignal(input: unknown): LearningFactWriteResult<ToolAttemptFact> {
     const signal = input as ToolAttemptSignal;
     return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
       if (signal?.kind === "attempt") {
         const start = toolAttemptStartSignalSchema.parse(signal);
         const existing = this.db
@@ -419,7 +975,7 @@ export class LearningFactStore {
               startedAt: string;
               endedAt: string | null;
             } | undefined;
-          if (!episode) throw new Error("ToolAttemptEpisodeMissing");
+          if (!episode) return this.dropFact<ToolAttemptFact>();
           if (episode.source !== start.source || episode.sessionId !== start.sessionId) {
             throw new Error("ToolAttemptEpisodeIdentityConflict");
           }
@@ -448,26 +1004,36 @@ export class LearningFactStore {
             throw new Error("ToolAttemptRetryTargetConflict");
           }
         }
-        this.assertCapacity(
-          "tool_attempt_facts",
-          "operation_id",
-          start.operationId,
-          this.limits.attempts,
+        const retentionMs = retentionInstant(start.startedAt);
+        if (retentionMs === null) return this.dropFact<ToolAttemptFact>("invalid_retention_timestamp");
+        const admission = this.capacityPressure(
+          "tool_attempt_facts", start.operationId, retentionMs, start.retryOf,
         );
+        if (admission !== "admit") {
+          return this.dropFact<ToolAttemptFact>(
+            admission === "required_reference" ? "protected_reference_at_capacity" : "outside_retention_window",
+          );
+        }
+        if (start.retryOf && !this.db.prepare(
+          `select 1 from tool_attempt_facts where operation_id = ?`,
+        ).get(start.retryOf)) {
+          return this.dropFact<ToolAttemptFact>("retry_target_missing");
+        }
         const now = new Date().toISOString();
         this.db.prepare(
           `insert into tool_attempt_facts
             (operation_id, source, session_id, episode_id, tool_class, tool_name,
              started_at, ended_at, duration_ms, result_status, error_category,
-             retry_of, created_at, updated_at)
+             retry_of, created_at, updated_at, retention_ms, retention_verified)
            values
             (@operationId, @source, @sessionId, @episodeId, @toolClass, @toolName,
-             @startedAt, null, null, 'unknown', 'unknown', @retryOf, @now, @now)`,
+             @startedAt, null, null, 'unknown', 'unknown', @retryOf, @now, @now, @retentionMs, 1)`,
         ).run({
           ...start,
           episodeId: start.episodeId ?? null,
           retryOf: start.retryOf ?? null,
           now,
+          retentionMs,
         });
         const row = this.db
           .prepare(`${ATTEMPT_SELECT} where operation_id = ?`)
@@ -479,7 +1045,7 @@ export class LearningFactStore {
       const existing = this.db
         .prepare(`${ATTEMPT_SELECT} where operation_id = ?`)
         .get(result.operationId) as AttemptRow | undefined;
-      if (!existing) throw new Error("ToolAttemptStartMissing");
+      if (!existing) return this.dropFact<ToolAttemptFact>("unpaired_result");
       const current = attemptFromRow(existing);
       if (current.source !== result.source || current.sessionId !== result.sessionId) {
         throw new Error("ToolAttemptResultIdentityConflict");
@@ -499,7 +1065,7 @@ export class LearningFactStore {
             `select ended_at as endedAt from work_episode_facts where episode_id = ?`,
           )
           .get(current.episodeId) as { endedAt: string | null } | undefined;
-        if (!episode) throw new Error("ToolAttemptEpisodeMissing");
+        if (!episode) return this.dropFact<ToolAttemptFact>();
         if (
           episode.endedAt !== null &&
           Date.parse(result.endedAt) > Date.parse(episode.endedAt)
@@ -533,9 +1099,10 @@ export class LearningFactStore {
     })();
   }
 
-  recordWorkEpisode(input: unknown): { inserted: boolean; fact: WorkEpisodeFact } {
+  recordWorkEpisode(input: unknown): LearningFactWriteResult<WorkEpisodeFact> {
     const fact = workEpisodeFactSchema.parse(input);
     return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
       if (fact.parentEpisodeId) {
         const parent = this.db
           .prepare(
@@ -547,7 +1114,7 @@ export class LearningFactStore {
             sessionId: string;
             startedAt: string;
           } | undefined;
-        if (!parent) throw new Error("WorkEpisodeParentMissing");
+        if (!parent) return this.dropFact<WorkEpisodeFact>();
         if (parent.source !== fact.source || parent.sessionId !== fact.sessionId) {
           throw new Error("WorkEpisodeParentIdentityConflict");
         }
@@ -579,25 +1146,39 @@ export class LearningFactStore {
         }
         return { inserted: false, fact: existing };
       }
-      this.assertCapacity(
-        "work_episode_facts",
-        "episode_id",
-        fact.episodeId,
-        this.limits.episodes,
+      const retentionMs = retentionInstant(fact.startedAt);
+      if (retentionMs === null) return this.dropFact<WorkEpisodeFact>("invalid_retention_timestamp");
+      const admission = this.capacityPressure(
+        "work_episode_facts", fact.episodeId, retentionMs, fact.parentEpisodeId,
       );
+      if (admission !== "admit") {
+        return this.dropFact<WorkEpisodeFact>(
+          admission === "required_reference" ? "protected_reference_at_capacity" : "outside_retention_window",
+        );
+      }
+      if (fact.parentEpisodeId) {
+        const parentStillExists = this.db
+          .prepare(`select 1 from work_episode_facts where episode_id = ?`)
+          .get(fact.parentEpisodeId);
+        // The parent may itself have been the oldest graph root. Do not write
+        // a child that would be orphaned by the same bounded eviction.
+        if (!parentStillExists) return this.dropFact<WorkEpisodeFact>();
+      }
       this.db.prepare(
         `insert into work_episode_facts
           (episode_id, source, session_id, work_class, complexity_band,
-           parent_episode_id, started_at, ended_at, duration_ms, created_at)
+           parent_episode_id, started_at, ended_at, duration_ms, created_at,
+           retention_ms, retention_verified)
          values
           (@episodeId, @source, @sessionId, @workClass, @complexityBand,
-           @parentEpisodeId, @startedAt, @endedAt, @durationMs, @createdAt)`,
+           @parentEpisodeId, @startedAt, @endedAt, @durationMs, @createdAt, @retentionMs, 1)`,
       ).run({
         ...fact,
         parentEpisodeId: fact.parentEpisodeId ?? null,
         endedAt: fact.endedAt ?? null,
         durationMs: fact.durationMs ?? null,
         createdAt: new Date().toISOString(),
+        retentionMs,
       });
       return { inserted: true, fact };
     })();
@@ -606,9 +1187,10 @@ export class LearningFactStore {
   recordTechniqueExposure(
     input: unknown,
     options: { outcomeObservedAt?: string } = {},
-  ): { inserted: boolean; fact: TechniqueExposureFact } {
+  ): LearningFactWriteResult<TechniqueExposureFact> {
     const fact = validateTechniqueExposureFactIdentity(input);
     return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
       if (options.outcomeObservedAt !== undefined) {
         const outcomeMs = Date.parse(options.outcomeObservedAt);
         if (
@@ -633,7 +1215,7 @@ export class LearningFactStore {
           startedAt: string;
           endedAt: string | null;
         } | undefined;
-      if (!episode) throw new Error("TechniqueExposureEpisodeMissing");
+      if (!episode) return this.dropFact<TechniqueExposureFact>();
       if (
         episode.workClass !== fact.workClass ||
         episode.complexityBand !== fact.complexityBand
@@ -641,6 +1223,7 @@ export class LearningFactStore {
         throw new Error("TechniqueExposureEpisodeDimensionsConflict");
       }
       const exposureMs = Date.parse(fact.exposedAt);
+      if (!Number.isFinite(exposureMs)) return this.dropFact<TechniqueExposureFact>("invalid_retention_timestamp");
       if (
         exposureMs < Date.parse(episode.startedAt) ||
         (episode.endedAt !== null && exposureMs > Date.parse(episode.endedAt))
@@ -668,68 +1251,170 @@ export class LearningFactStore {
         }
         return { inserted: false, fact: stored };
       }
-      this.assertCapacity(
-        "technique_exposure_facts",
-        "exposure_id",
-        fact.exposureId,
-        this.limits.exposures,
-      );
+      if (this.capacityPressure("technique_exposure_facts", fact.exposureId, exposureMs) !== "admit") {
+        return this.dropFact<TechniqueExposureFact>("outside_retention_window");
+      }
       const techniqueKey = deterministicLearningFactId([
         fact.techniqueId,
         fact.techniqueVersion ?? "",
         fact.contentDigest ?? "",
       ]);
-      this.assertCapacity(
-        "technique_identity_registry",
-        "technique_key",
-        techniqueKey,
-        this.limits.techniqueIdentities,
-      );
       const now = new Date().toISOString();
-      this.db.prepare(
+      const nowMs = retentionInstant(now);
+      if (nowMs === null) return this.dropFact<TechniqueExposureFact>("invalid_retention_timestamp");
+      if (this.capacityPressure("technique_identity_registry", techniqueKey, nowMs) === "admit") {
+        this.db.prepare(
         `insert or ignore into technique_identity_registry
-          (technique_key, technique_id, technique_version, content_digest, first_seen_at)
-         values (@techniqueKey, @techniqueId, @techniqueVersion, @contentDigest, @now)`,
-      ).run({
-        techniqueKey,
-        techniqueId: fact.techniqueId,
-        techniqueVersion: fact.techniqueVersion ?? null,
-        contentDigest: fact.contentDigest ?? null,
-        now,
-      });
+          (technique_key, technique_id, technique_version, content_digest, first_seen_at,
+           retention_ms, retention_verified)
+         values (@techniqueKey, @techniqueId, @techniqueVersion, @contentDigest,
+           @now, @nowMs, 1)`,
+        ).run({
+          techniqueKey,
+          techniqueId: fact.techniqueId,
+          techniqueVersion: fact.techniqueVersion ?? null,
+          contentDigest: fact.contentDigest ?? null,
+          now,
+          nowMs,
+        });
+      } else {
+        recordRuntimeFactDrop(this.db, "outside_retention_window");
+      }
       this.db.prepare(
         `insert into technique_exposure_facts
           (exposure_id, episode_id, technique_id, technique_version, content_digest,
-           assignment_id, work_class, complexity_band, exposed_at, mode, assertion, created_at)
+           assignment_id, work_class, complexity_band, exposed_at, mode, assertion,
+           created_at, retention_ms, retention_verified)
          values
           (@exposureId, @episodeId, @techniqueId, @techniqueVersion, @contentDigest,
-           @assignmentId, @workClass, @complexityBand, @exposedAt, @mode, @assertion, @createdAt)`,
+           @assignmentId, @workClass, @complexityBand, @exposedAt, @mode, @assertion,
+           @createdAt, @exposureMs, 1)`,
       ).run({
         ...fact,
         techniqueVersion: fact.techniqueVersion ?? null,
         contentDigest: fact.contentDigest ?? null,
         createdAt: now,
+        exposureMs,
       });
       return { inserted: true, fact };
     })();
   }
 
+  status(): LearningFactStatus {
+    const stateRows = this.db.prepare(
+      `select table_name as tableName, row_count as rowCount,
+          evicted_count as evictedCount, maintenance_needed as maintenanceNeeded
+         from learning_fact_table_state order by table_name`,
+    ).all() as Array<{
+      tableName: LearningFactTableName;
+      rowCount: number;
+      evictedCount: number;
+      maintenanceNeeded: number;
+    }>;
+    const states = new Map(stateRows.map((row) => [row.tableName, row]));
+    const tables = {} as Record<LearningFactTableName, LearningFactTableStatus>;
+    let totalRows = 0;
+    let totalLimit = 0;
+    let totalEvicted = 0;
+    let maintenanceNeeded = false;
+    for (const definition of LEARNING_FACT_TABLES) {
+      const row = states.get(definition.name);
+      if (!row) throw new Error(`LearningFactStateMissing:${definition.name}`);
+      const limit = this.limits[definition.limit];
+      const needsMaintenance = row.maintenanceNeeded === 1 || row.rowCount > limit;
+      tables[definition.name] = {
+        rowCount: row.rowCount,
+        limit,
+        fillRatio: row.rowCount / limit,
+        evictedCount: row.evictedCount,
+        maintenanceNeeded: needsMaintenance,
+      };
+      totalRows += row.rowCount;
+      totalLimit += limit;
+      totalEvicted += row.evictedCount;
+      maintenanceNeeded ||= needsMaintenance;
+    }
+    return { tables, totalRows, totalLimit, totalEvicted, maintenanceNeeded };
+  }
+
+  /**
+   * Fair repair for overflow left by older writers or changed limits. Each
+   * table gets a bounded root budget; deleting an episode/retry also removes
+   * its dependent facts atomically. Normal writes already enforce the cap.
+   */
+  runMaintenance(
+    maxRows = DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH,
+  ): LearningFactMaintenanceResult {
+    const requested = Number.isSafeInteger(maxRows) && maxRows > 0
+      ? Math.min(maxRows, 4_096)
+      : DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH;
+    return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
+      // The budget is per table. A shared counter lets a sustained attempt
+      // backlog starve the smaller episode/exposure/identity tables; bounded
+      // per-table turns guarantee progress for every over-cap table.
+      const evictedByTable = this.emptyEvictionCounts();
+      let selectedRoots = 0;
+      for (const definition of LEARNING_FACT_TABLES) {
+        const state = this.db.prepare(
+          `select row_count as rowCount from learning_fact_table_state where table_name = ?`,
+        ).get(definition.name) as { rowCount: number } | undefined;
+        if (!state) throw new Error(`LearningFactStateMissing:${definition.name}`);
+        const limit = this.limits[definition.limit];
+        const over = Math.max(0, state.rowCount - limit);
+        if (over > 0) {
+          const roots = Math.min(over, requested);
+          selectedRoots += roots;
+          const counts = this.evictOldest(definition, roots);
+          for (const table of LEARNING_FACT_TABLES) {
+            evictedByTable[table.name] += counts[table.name];
+          }
+        }
+        this.markMaintenance(definition);
+      }
+      const tables = LEARNING_FACT_TABLES.map((definition) => {
+        const after = this.db.prepare(
+          `select row_count as rowCount from learning_fact_table_state where table_name = ?`,
+        ).get(definition.name) as { rowCount: number };
+        return {
+          table: definition.name,
+          evicted: evictedByTable[definition.name],
+          rowCount: after.rowCount,
+          limit: this.limits[definition.limit],
+        };
+      });
+      const evicted = tables.reduce((total, table) => total + table.evicted, 0);
+      return {
+        requested,
+        selectedRoots,
+        evicted,
+        // `requested` bounds the number of selected roots per table. Episode
+        // graph cleanup can additionally remove related rows, which is
+        // intentionally included in the aggregate receipt and counters.
+        bounded: selectedRoots <= requested * LEARNING_FACT_TABLES.length,
+        tables,
+      };
+    })();
+  }
+
   attempts(): ToolAttemptFact[] {
+    this.verifyPendingRetentionKeys();
     return (
       this.db
-        .prepare(`${ATTEMPT_SELECT} order by started_at, operation_id`)
+        .prepare(`${ATTEMPT_SELECT} order by retention_ms, operation_id`)
         .all() as AttemptRow[]
     ).map(attemptFromRow);
   }
 
   episodes(): WorkEpisodeFact[] {
+    this.verifyPendingRetentionKeys();
     return (
       this.db.prepare(
         `select episode_id as episodeId, source, session_id as sessionId,
            work_class as workClass, complexity_band as complexityBand,
            parent_episode_id as parentEpisodeId,
            started_at as startedAt, ended_at as endedAt, duration_ms as durationMs
-         from work_episode_facts order by started_at, episode_id`,
+         from work_episode_facts order by retention_ms, episode_id`,
       ).all() as Array<Record<string, unknown>>
     ).map((row) =>
       workEpisodeFactSchema.parse({
@@ -742,6 +1427,7 @@ export class LearningFactStore {
   }
 
   episodeById(episodeId: string): WorkEpisodeFact | undefined {
+    this.verifyPendingRetentionKeys();
     const row = this.db
       .prepare(
         `select episode_id as episodeId, source, session_id as sessionId,
@@ -762,6 +1448,7 @@ export class LearningFactStore {
   }
 
   exposures(): TechniqueExposureFact[] {
+    this.verifyPendingRetentionKeys();
     return (
       this.db.prepare(
         `select exposure_id as exposureId, episode_id as episodeId,
@@ -769,7 +1456,7 @@ export class LearningFactStore {
            content_digest as contentDigest, assignment_id as assignmentId,
            work_class as workClass, complexity_band as complexityBand,
            exposed_at as exposedAt, mode, assertion
-         from technique_exposure_facts order by exposed_at, exposure_id`,
+         from technique_exposure_facts order by retention_ms, exposure_id`,
       ).all() as Array<Record<string, unknown>>
     ).map((row) =>
       techniqueExposureFactSchema.parse({
