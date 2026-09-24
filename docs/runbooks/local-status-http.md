@@ -17,12 +17,17 @@ GET /healthz HTTP/1.1
 Host: 127.0.0.1:<port>
 
 HTTP/1.1 200
-{"ok":true}
+{"ok":true,"instanceId":"<random v4 UUID, new on every collector start>"}
 ```
 
 That body is the leak-gate: `scripts/authenticated-ingestion-proof.ts` requires
-the key set to be exactly `ok`. This rollout does not add `version` or any
-other field. Package version is on `plimsoll status` (`appVersion`) and
+the key set to be exactly `instanceId` and `ok`. `instanceId`
+(eco-6hoxj.163.34) is drawn at random once per collector run. It names no
+host, user, path or credential, and is not uploaded. It lets a local reader,
+such as the macOS menubar, tell this collector from any other service that
+answers on the port; the collector writes the same value to its private
+`status-summary.json`. No `version` or any other field is added. Package
+version is on `plimsoll status` (`appVersion`) and
 `plimsoll doctor --read-only --json` (`version`).
 
 Full status remains one of:

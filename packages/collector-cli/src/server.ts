@@ -706,6 +706,9 @@ export function createCollectorServer(
 ) {
   assertCollectorPrivacyMode(config, "collector server");
 
+  // A random id per server run (eco-6hoxj.163.34). It names no host, user,
+  // path or credential, and changes on every start.
+  const instanceId = crypto.randomUUID();
   const localAuth = options.localAuth ?? null;
   const authEnforced = localAuth !== null;
   // Keep one bounded read result, not another persistent ledger or worker.
@@ -1293,9 +1296,11 @@ export function createCollectorServer(
       // Issue 0056 (#104) / eco-6hoxj.154: the only unauthenticated surface.
       // Minimal by construction — no version, runtime identity, counters,
       // delivery, or ledger state. Fleet liveness is this route; /status stays
-      // behind the management credential.
+      // behind the management credential. `instanceId` is this run's random
+      // id (eco-6hoxj.163.34): it lets a local reader tell this daemon from
+      // any other service answering on the port.
       if (request.method === "GET" && request.url === "/healthz") {
-        sendJson(response, { ok: true });
+        sendJson(response, { ok: true, instanceId });
         return;
       }
 
@@ -2063,6 +2068,7 @@ export function createCollectorServer(
   // reaped mid-request.
   httpServer.keepAliveTimeout = 0;
   const server = httpServer as CollectorServer;
+  server.plimsollInstanceId = instanceId;
   server.plimsollHttpDiagnostics = {
     // Shutdown flush closes the intake-spool window too, so a daemon going
     // down does not take an open count with it. Its line shape is not a

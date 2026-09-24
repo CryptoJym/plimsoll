@@ -546,4 +546,6 @@ export type CollectorServerDiagnostics = Pick<
 
 export type CollectorServer = http.Server & {
   plimsollHttpDiagnostics: CollectorServerDiagnostics;
+  /** This run's random id, as GET /healthz returns it. */
+  plimsollInstanceId: string;
 };
