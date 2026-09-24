@@ -48,6 +48,7 @@ function uuid(index: number) {
 function insertRaw(
   buffer: LocalEventBuffer,
   input: {
+    rowid?: number;
     id: string;
     sessionId: string;
     observedAt: string;
@@ -62,12 +63,13 @@ function insertRaw(
 ) {
   buffer.database.prepare(`
     insert into buffered_events
-      (id, source, event_type, data_mode, observed_at, payload_json,
+      (rowid, id, source, event_type, data_mode, observed_at, payload_json,
        suppressed_fields_json, created_at, session_id, input_tokens, output_tokens,
        cost_usd, repo_hash, branch_hash, account_hash, workspace_id,
        privacy_generation)
-    values (?, 'codex', 'assistant_response', 'metadata', ?, '{}', '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    values (?, ?, 'codex', 'assistant_response', 'metadata', ?, '{}', '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
+    input.rowid ?? null,
     input.id,
     input.observedAt,
     input.createdAt,
@@ -145,7 +147,7 @@ async function reviewRegressions() {
     "first_read_insert", "fallback_checkpoint", "missing_dirty_marker", "privacy_before_send",
     "unrelated_revision", "retry_erasure", "hard_bounds", "session_id_paging",
     "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
-    "interleaved_initial_insert",
+    "interleaved_initial_insert", "trigger_upgrade",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -362,6 +364,37 @@ async function reviewRegressions() {
         const final = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
         assert.equal(final.complete, true);
         assert.deepEqual(final.snapshot, collectSessionSnapshots(buffer.database, {
+          until, sessionIds: [sessionId],
+        })[0]);
+      } else if (name === "trigger_upgrade") {
+        buffer.database.exec(`
+          drop trigger trg_session_summary_raw_insert;
+          create trigger trg_session_summary_raw_insert
+          after insert on buffered_events
+          when new.session_id is not null and exists (
+            select 1 from session_sync_summary_state where session_id = new.session_id
+          )
+          begin
+            insert or ignore into session_sync_summary_rows (raw_rowid, session_id, created_at)
+              values (new.rowid, new.session_id, new.created_at);
+          end;
+        `);
+        ensureSessionSummarySchema(buffer.database);
+        const sparse = (index: number, rowid: number) => insertRaw(buffer, {
+          rowid, id: uuid(520 + index), sessionId,
+          observedAt: `2026-09-20T02:${String(index).padStart(2, "0")}:00.000Z`,
+          createdAt: "2026-09-20T02:00:00.000Z", inputTokens: 1, outputTokens: 1,
+        });
+        sparse(5, 100);
+        sparse(10, 200);
+        const first = await updateSessionSummary(buffer.database, sessionId, until, {
+          read: directRead, maxRows: 1,
+        });
+        assert.equal(first.highWater, 100);
+        sparse(1, 150);
+        const resumed = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        assert.equal(resumed.fullRecompute, true);
+        assert.deepEqual(resumed.snapshot, collectSessionSnapshots(buffer.database, {
           until, sessionIds: [sessionId],
         })[0]);
       }
