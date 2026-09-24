@@ -207,39 +207,56 @@ async function main() {
     const exp=deliveryExpectation(raw,installKey);
     return new Response(JSON.stringify({ok:true,ack:deliveryAcknowledgement(exp,exp.itemIds)}));
   }) as typeof fetch;
-  const uploadPaths:Record<string,{target:string;run:(url:string,fetchImpl:typeof fetch)=>Promise<boolean>}>={
-    upload:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+  type UploadConfig=typeof pinCfg;
+  const uploadPaths:Record<string,{target:string;run:(cfg:UploadConfig,url:string,fetchImpl:typeof fetch)=>Promise<boolean>}>={
+    upload:{target:sameOriginOverride,run:async(cfg,url,fetchImpl)=>{
       const {buffer}=pinLedger();
-      try{return (await uploadBufferedEvents(pinCfg,buffer,{url,fetchImpl})).uploadedEvents===1;}finally{buffer.close();}
+      try{return (await uploadBufferedEvents(cfg,buffer,{url,fetchImpl})).uploadedEvents===1;}finally{buffer.close();}
     }},
-    upload_history:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+    upload_history:{target:sameOriginOverride,run:async(cfg,url,fetchImpl)=>{
       const {buffer,file}=pinLedger();buffer.close();
-      return (await runWorkspaceHistoryUpload(pinCfg,{ledgerPath:file,statePath:`${file}.state.json`,url,fetchImpl,...quiet})).ok;
+      return (await runWorkspaceHistoryUpload(cfg,{ledgerPath:file,statePath:`${file}.state.json`,url,fetchImpl,...quiet})).ok;
     }},
-    repair_attribution:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+    repair_attribution:{target:sameOriginOverride,run:async(cfg,url,fetchImpl)=>{
       const {buffer,file}=pinLedger();buffer.close();
-      return (await runAttributionRepair(pinCfg,{ledgerPath:file,url,fetchImpl,...quiet})).ok;
+      return (await runAttributionRepair(cfg,{ledgerPath:file,url,fetchImpl,...quiet})).ok;
     }},
-    session_sync:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+    session_sync:{target:sameOriginOverride,run:async(cfg,url,fetchImpl)=>{
       const {buffer}=pinLedger();
-      try{return (await runSessionSync(pinCfg,{ledgerDb:buffer.database,url,fetchImpl,...quiet})).ok;}finally{buffer.close();}
+      try{return (await runSessionSync(cfg,{ledgerDb:buffer.database,url,fetchImpl,...quiet})).ok;}finally{buffer.close();}
     }},
-    repo_labels:{target:`${workspace}/api/work-intelligence/repo-labels`,run:async(url,fetchImpl)=>
-      (await pushRepoLabels(pinCfg,[{source:'repo_label',provider:'github',owner:'fixture',name:'outcomes',remoteUrlHash:repoHash}],{url,fetchImpl,log:()=>{}})).pushed===1},
-    sync_outcomes:{target:`${workspace}/api/work-intelligence/github-outcomes`,run:async(url,fetchImpl)=>{
+    repo_labels:{target:`${workspace}/api/work-intelligence/repo-labels`,run:async(cfg,url,fetchImpl)=>
+      (await pushRepoLabels(cfg,[{source:'repo_label',provider:'github',owner:'fixture',name:'outcomes',remoteUrlHash:repoHash}],{url,fetchImpl,log:()=>{}})).pushed===1},
+    sync_outcomes:{target:`${workspace}/api/work-intelligence/github-outcomes`,run:async(cfg,url,fetchImpl)=>{
       const {buffer}=pinLedger();
-      try{return (await runOutcomesSync(pinCfg,{repository:'fixture/outcomes',ledgerDb:buffer.database,url,fetchImpl,log:()=>{}})).ok;}finally{buffer.close();}
+      try{return (await runOutcomesSync(cfg,{repository:'fixture/outcomes',ledgerDb:buffer.database,url,fetchImpl,log:()=>{}})).ok;}finally{buffer.close();}
     }},
   };
   for (const [name,entry] of Object.entries(uploadPaths)) await check(`url_override_pinned_to_workspace_origin_${name}`,async()=>{
     for (const foreign of foreignOverrides) {
       let requests=0;
-      await assert.rejects(entry.run(foreign,(async()=>{requests++;return new Response('{}');}) as typeof fetch),/same origin as the configured workspace audience/);
+      await assert.rejects(entry.run(pinCfg,foreign,(async()=>{requests++;return new Response('{}');}) as typeof fetch),/same origin as the configured workspace audience/);
       assert.equal(requests,0);
     }
     const posted:string[]=[];
-    assert.equal(await entry.run(sameOriginOverride,workspaceFetch(posted)),true);
+    assert.equal(await entry.run(pinCfg,sameOriginOverride,workspaceFetch(posted)),true);
     assert.ok(posted.length>0&&posted.every(url=>url===entry.target),JSON.stringify(posted));
+  });
+  // Without a joined workspace there is no origin to pin to: an override is refused before any
+  // request unless the documented local-development opt-in is set.
+  const optIn='PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL';
+  const unjoinedCfg=collectorConfigSchema.parse({tenantId,installKey,delivery:{requestTimeoutSeconds:1}});
+  for (const [name,entry] of Object.entries(uploadPaths)) await check(`unjoined_url_override_needs_dev_opt_in_${name}`,async()=>{
+    delete process.env[optIn];
+    let requests=0;
+    await assert.rejects(entry.run(unjoinedCfg,sameOriginOverride,(async()=>{requests++;return new Response('{}');}) as typeof fetch),/needs a joined workspace/);
+    assert.equal(requests,0);
+    process.env[optIn]='1';
+    try {
+      const posted:string[]=[];
+      assert.equal(await entry.run(unjoinedCfg,sameOriginOverride,workspaceFetch(posted)),true);
+      assert.ok(posted.length>0&&posted.every(url=>url===entry.target),JSON.stringify(posted));
+    } finally {delete process.env[optIn];}
   });
 }
 let completed=false;

@@ -118,6 +118,16 @@ request. For a private repository, set
 pull request titles, bodies, diffs and file paths are not, and branch names
 travel only as hashes.
 
+## Upload URL overrides
+
+`upload`, `upload-history` (including `--sessions` and `--repair-attribution`),
+`push-repo-labels` and `sync-outcomes` accept `--url` to send to another path
+on the joined workspace. Every request carries that workspace's install key
+and signature, so a `--url` on any other origin is refused before anything is
+sent. Without a joined workspace, `--url` is refused as well unless
+`PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL=1` is set; that is for local
+development against a test server only.
+
 ## What leaves your machine
 
 Nothing, unless you configure an upload target. Identifying values are

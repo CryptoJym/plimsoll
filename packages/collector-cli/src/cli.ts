@@ -412,6 +412,9 @@ Config tools:
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|gemini-cli|grok|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
+      --url here and on upload-history, push-repo-labels and sync-outcomes must be on the
+      joined workspace's origin. Without a joined workspace it is refused unless
+      PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL=1 is set (local development only).
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
       Default resumes from the local watermark (workspace-backfill-state.json) and scopes
       to rows created at-or-before the run start. --full re-walks everything (re-runs are

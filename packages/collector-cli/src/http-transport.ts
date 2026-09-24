@@ -37,10 +37,25 @@ export function validatedTransportUrl(raw: string, _label: string) {
   throw new TransportError("insecure_url");
 }
 
+/** Local development only: lets a --url override stand in for a workspace
+ * that was never joined (no configured uploadUrl). */
+const UNJOINED_UPLOAD_URL_OPT_IN = "PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL";
+
 /** An upload URL override (--url) may pick another path on the configured
  * workspace, never another origin: every upload carries that workspace's
- * install key and signature. Returns the chosen URL unchanged. */
-export function pinnedUploadUrl(configuredUrl: string | undefined, overrideUrl: string | undefined) {
+ * install key and signature. Without a joined workspace there is no origin to
+ * pin to, so an override is refused unless the local-development opt-in is
+ * set. Returns the chosen URL unchanged. */
+export function pinnedUploadUrl(
+  configuredUrl: string | undefined,
+  overrideUrl: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  if (overrideUrl && !configuredUrl && env[UNJOINED_UPLOAD_URL_OPT_IN] !== "1") {
+    throw new Error(
+      `Upload URL override needs a joined workspace; run plimsoll join first (${UNJOINED_UPLOAD_URL_OPT_IN}=1 is for local development only).`,
+    );
+  }
   if (overrideUrl && configuredUrl && validatedTransportUrl(overrideUrl, "Upload URL").origin !==
       validatedTransportUrl(configuredUrl, "Configured upload URL").origin) {
     throw new Error("Upload URL must use the same origin as the configured workspace audience.");
