@@ -599,6 +599,7 @@ export type OutcomesSyncOptions = {
   until?: string;
   dryRun?: boolean;
   url?: string;
+  developmentLoopbackUrl?: boolean;
   appVersion?: string;
   ledgerPath?: string;
   ledgerDb?: Database.Database;
@@ -647,7 +648,7 @@ export async function runOutcomesSync(
   const fetchImpl = options.fetchImpl ?? fetch;
   const startedAt = Date.now();
 
-  const baseUrl = pinnedUploadUrl(config.uploadUrl, options.url);
+  const baseUrl = pinnedUploadUrl(config.uploadUrl, options.url, { developmentLoopback: options.developmentLoopbackUrl, log });
   if (!baseUrl) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +

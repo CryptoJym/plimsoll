@@ -240,6 +240,7 @@ export async function pushRepoLabels(
   candidates: RepoLabelCandidate[],
   options: {
     url?: string;
+    developmentLoopbackUrl?: boolean;
     appVersion?: string;
     fetchImpl?: typeof fetch;
     log?: (line: string) => void;
@@ -251,7 +252,7 @@ export async function pushRepoLabels(
   const log = options.log ?? ((line: string) => console.log(line));
   const fetchImpl = options.fetchImpl ?? fetch;
 
-  const baseUrl = pinnedUploadUrl(config.uploadUrl, options.url);
+  const baseUrl = pinnedUploadUrl(config.uploadUrl, options.url, { developmentLoopback: options.developmentLoopbackUrl, log });
   if (!baseUrl) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +

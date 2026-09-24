@@ -252,8 +252,8 @@ function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "no
   return "remote_contract";
 }
 
-function validatedUploadUrl(config: CollectorConfig, override?: string) {
-  const raw = pinnedUploadUrl(config.uploadUrl, override);
+function validatedUploadUrl(config: CollectorConfig, override?: string, developmentLoopback?: boolean) {
+  const raw = pinnedUploadUrl(config.uploadUrl, override, { developmentLoopback });
   if (!raw) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
   return validatedTransportUrl(raw, "Upload URL").href;
 }
@@ -263,7 +263,7 @@ async function uploadStateless(
   buffer: LocalEventBuffer,
   options: UploadOptions,
 ) {
-  const url = validatedUploadUrl(config, options.url);
+  const url = validatedUploadUrl(config, options.url, options.developmentLoopbackUrl);
   // Examine a bounded snapshot independently of the transient request cap so
   // one locally oversized row cannot hide a later eligible row in no-mark
   // mode. This mode intentionally mutates no retry or upload state.
@@ -338,6 +338,7 @@ export type UploadOptions = {
   markUploaded?: boolean;
   signingSecret?: string;
   url?: string;
+  developmentLoopbackUrl?: boolean;
   fetchImpl?: typeof fetch;
   now?: () => Date;
   leaseId?: string;
@@ -360,7 +361,7 @@ export async function uploadBufferedEvents(
   options: UploadOptions = {},
 ) {
   assertCollectorPrivacyMode(config, "upload");
-  const url = validatedUploadUrl(config, options.url);
+  const url = validatedUploadUrl(config, options.url, options.developmentLoopbackUrl);
   if (options.markUploaded === false) {
     buffer.useWorkspace(config.tenantId, config.deviceId);
     return uploadStateless(config, buffer, options);

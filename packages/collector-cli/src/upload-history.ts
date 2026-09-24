@@ -533,6 +533,7 @@ export type WorkspaceHistoryUploadOptions = {
   /** Audit only: walk + normalize + reconcile, zero network, zero state writes. */
   dryRun?: boolean;
   url?: string;
+  developmentLoopbackUrl?: boolean;
   appVersion?: string;
   ledgerPath?: string;
   statePath?: string;
@@ -686,7 +687,7 @@ export async function runWorkspaceHistoryUpload(
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? (() => new Date());
 
-  const url = pinnedUploadUrl(config.uploadUrl, options.url);
+  const url = pinnedUploadUrl(config.uploadUrl, options.url, { developmentLoopback: options.developmentLoopbackUrl, log });
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
@@ -1152,6 +1153,7 @@ export async function runAttributionRepair(
     delayMs?: number;
     dryRun?: boolean;
     url?: string;
+    developmentLoopbackUrl?: boolean;
     appVersion?: string;
     ledgerPath?: string;
     fetchImpl?: typeof fetch;
@@ -1168,7 +1170,7 @@ export async function runAttributionRepair(
   const sleep = options.sleep ?? defaultSleep;
   const fetchImpl = options.fetchImpl ?? fetch;
 
-  const url = pinnedUploadUrl(config.uploadUrl, options.url);
+  const url = pinnedUploadUrl(config.uploadUrl, options.url, { developmentLoopback: options.developmentLoopbackUrl, log });
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +

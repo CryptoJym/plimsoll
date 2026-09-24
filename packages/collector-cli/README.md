@@ -124,9 +124,16 @@ travel only as hashes.
 `push-repo-labels` and `sync-outcomes` accept `--url` to send to another path
 on the joined workspace. Every request carries that workspace's install key
 and signature, so a `--url` on any other origin is refused before anything is
-sent. Without a joined workspace, `--url` is refused as well unless
-`PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL=1` is set; that is for local
-development against a test server only.
+sent. Without a joined workspace, `--url` is refused as well.
+
+For local development against a test server on this machine, add
+`--dev-loopback-url` to that one command. It allows only a plainly written
+`http://` or `https://` URL on `localhost`, `127.x.x.x` or `[::1]`, and
+refuses user info, look-alike or encoded host names, and other names that
+merely resolve to this machine. Every use prints a warning to stderr and a
+`development_upload_url_used` line in the command's output. It is a
+command-line flag, not a setting, so it never carries over to other commands
+or processes.
 
 ## What leaves your machine
 
