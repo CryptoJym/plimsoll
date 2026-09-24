@@ -531,7 +531,7 @@ async function main() {
     const livePlan = await primary.manager().preflightUpdate();
     check("preflight_predicts_a_clone_that_needs_no_copy_space",
       livePlan.method === "clone" && livePlan.cloneCapable && livePlan.requiredFreeBytes === 0 && livePlan.ok &&
-      livePlan.requiredFreeBytesIfInUse === livePlan.ledgerBytes + livePlan.headroomBytes, livePlan);
+      livePlan.requiredFreeBytesIfInUse === 2 * livePlan.ledgerBytes + livePlan.headroomBytes, livePlan);
     const tightPlan = await primary.manager(tight).preflightUpdate();
     check("preflight_refuses_a_full_copy_without_room_before_the_service_is_stopped",
       tightPlan.method === "online_backup" && !tightPlan.ok && tightPlan.reason === "insufficient_free_space" &&

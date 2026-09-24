@@ -186,6 +186,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-retention
 
+      - name: Prove lifecycle rollback and retention are data-safe (eco-6hoxj.163.30 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-data-safety
+
       - name: Prove bounded nonblocking Git metadata maintenance
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:git-context

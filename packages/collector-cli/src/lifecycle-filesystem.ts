@@ -14,6 +14,7 @@ import {
   type LifecycleReadiness,
   type LifecycleReceipt,
   type LifecycleRemovedItem,
+  type LifecycleRestoreRecord,
   type LifecycleRetentionInput,
   type LifecycleRetentionRecord,
   type LifecycleSnapshotInventory,
@@ -64,12 +65,20 @@ export type LifecycleDatabaseSnapshot = {
   cloneFallback: LifecycleCloneFallback | null;
 };
 
+export type LifecycleDatabaseRestore = {
+  method: "clone" | "copy";
+  cloneFallback: "clone_unsupported" | null;
+  databaseBytes: number;
+};
+
 /** SQLite implementations must use the online backup API or an equivalent
  * quiesced snapshot. Copying a live WAL database is not a compatible backup.
- * A bare boolean result (present or absent) records no snapshot method. */
+ * A bare boolean result (present or absent) records no snapshot method.
+ * Restore must leave the live ledger untouched unless the restored copy is
+ * complete and valid; it may report how the copy was made. */
 export type LifecycleDatabaseAdapter = {
   snapshot(input: { source: string; destination: string }): Promise<boolean | LifecycleDatabaseSnapshot>;
-  restore(input: { source: string; destination: string }): Promise<void>;
+  restore(input: { source: string; destination: string }): Promise<void | LifecycleDatabaseRestore>;
   /** Update --preflight. May clone the source to `probe` to test the volume; always removes it. */
   plan?(input: { source: string; probe: string }): Promise<LifecycleSnapshotPlan>;
 };
@@ -608,6 +617,31 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     assertNoSymlink(metadataPath, snapshot);
     const metadata = readJson<SnapshotMetadata>(metadataPath);
     if (!isSnapshotMetadata(metadata)) throw new Error("rollback snapshot is missing");
+    // The ledger goes first: its restore may refuse (no room for a byte copy,
+    // a copy that fails its integrity check), and a refusal must leave the
+    // config, runtime pointer and service exactly as they were.
+    const databaseSnapshot = path.join(snapshot, "database");
+    assertNoSymlink(databaseSnapshot, snapshot);
+    assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
+    let record: LifecycleRestoreRecord | undefined = { method: "none", cloneFallback: null, databaseBytes: 0 };
+    if (metadata.present.database) {
+      const databaseSource = lstatIfPresent(databaseSnapshot);
+      if (!databaseSource?.isFile()) throw new Error("rollback database snapshot must be a regular file");
+      const outcome = await this.database.restore({
+        source: databaseSnapshot,
+        destination: this.paths.database,
+      });
+      assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
+      const restoredDatabase = lstatIfPresent(this.paths.database);
+      if (!restoredDatabase?.isFile()) throw new Error("restored database must be a regular file");
+      record = outcome
+        ? { method: outcome.method, cloneFallback: outcome.cloneFallback, databaseBytes: outcome.databaseBytes }
+        : undefined;
+    } else {
+      fs.rmSync(this.paths.database, { force: true });
+      fs.rmSync(`${this.paths.database}-wal`, { force: true });
+      fs.rmSync(`${this.paths.database}-shm`, { force: true });
+    }
     const restoreFile = (label: "config" | "service", destination: string) => {
       const source = path.join(snapshot, label);
       assertNoSymlink(source, snapshot);
@@ -621,24 +655,6 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       }
     };
     restoreFile("config", this.paths.collectorConfig);
-    const databaseSnapshot = path.join(snapshot, "database");
-    assertNoSymlink(databaseSnapshot, snapshot);
-    assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
-    if (metadata.present.database) {
-      const databaseSource = lstatIfPresent(databaseSnapshot);
-      if (!databaseSource?.isFile()) throw new Error("rollback database snapshot must be a regular file");
-      await this.database.restore({
-        source: databaseSnapshot,
-        destination: this.paths.database,
-      });
-      assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
-      const restoredDatabase = lstatIfPresent(this.paths.database);
-      if (!restoredDatabase?.isFile()) throw new Error("restored database must be a regular file");
-    } else {
-      fs.rmSync(this.paths.database, { force: true });
-      fs.rmSync(`${this.paths.database}-wal`, { force: true });
-      fs.rmSync(`${this.paths.database}-shm`, { force: true });
-    }
     if (metadata.currentVersion && metadata.currentExecutable) {
       assertAbsoluteOwnedPath(metadata.currentExecutable, this.versionsRoot, "snapshot runtime");
       assertNoSymlink(metadata.currentExecutable, this.versionsRoot);
@@ -664,6 +680,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     // is authoritative, including a legacy source install with no version
     // pointer and a managed install's prior Node path and environment.
     restoreFile("service", this.paths.serviceManifest);
+    return record;
   }
 
   async persistReceipt(receipt: LifecycleReceipt) {

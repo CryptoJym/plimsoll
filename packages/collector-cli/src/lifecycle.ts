@@ -114,6 +114,24 @@ export type LifecycleSnapshotRecord = {
   databaseBytes: number;
 };
 
+/**
+ * How a rollback put the snapshot's ledger back: an APFS clone of it, or a
+ * byte copy that first had to fit next to the live ledger. "none": the
+ * snapshot held no ledger, so any live ledger was removed.
+ */
+export type LifecycleRestoreRecord = {
+  method: "clone" | "copy" | "none";
+  cloneFallback: "clone_unsupported" | null;
+  databaseBytes: number;
+};
+
+/** Why a rollback left the live ledger untouched instead of restoring it. */
+export type LifecycleRestoreRefusalRecord = {
+  reason: "insufficient_free_space" | "integrity_check_failed";
+  requiredFreeBytes: number | null;
+  freeBytes: number | null;
+};
+
 export type LifecycleRefusal = {
   reason: "insufficient_free_space";
   method: "online_backup";
@@ -131,7 +149,7 @@ export type LifecycleSnapshotPlan = {
   ledgerBytes: number;
   headroomBytes: number;
   requiredFreeBytes: number;
-  /** What a full copy needs if the ledger is still in use at snapshot time. */
+  /** What a full copy (snapshot plus a rollback's byte copy) needs if the ledger is still in use at snapshot time. */
   requiredFreeBytesIfInUse: number;
   freeBytes: number;
   ok: boolean;
@@ -243,6 +261,10 @@ export type LifecycleReceipt = {
   retention?: LifecycleRetentionRecord;
   /** Refused update/rollback: why nothing was changed. */
   refusal?: LifecycleRefusal;
+  /** Rolled-back update/rollback: how the ledger was restored. */
+  restore?: LifecycleRestoreRecord;
+  /** Rollback still required: why the restore left the live ledger untouched. */
+  restoreRefusal?: LifecycleRestoreRefusalRecord;
 };
 
 export type LifecycleSupportSnapshot = {
@@ -287,7 +309,8 @@ export type LifecycleAdapter = {
   stage(artifact: RuntimeArtifact): Promise<void>;
   switchTo(artifact: RuntimeArtifact): Promise<void>;
   readiness(expectedVersion: string, input: { signal: AbortSignal; deadlineMs: number }): Promise<LifecycleReadiness>;
-  restore(snapshotId: string): Promise<void>;
+  /** Adapters that know how the ledger was restored return it for the receipt. */
+  restore(snapshotId: string): Promise<void | LifecycleRestoreRecord>;
   persistReceipt(receipt: LifecycleReceipt): Promise<void>;
   uninstallOwned(input: { apply: boolean }): Promise<readonly string[]>;
   purgeOwnedData(input: { apply: boolean; confirmation: string | null }): Promise<readonly string[]>;
@@ -319,10 +342,23 @@ export class LifecycleSnapshotRefusal extends Error {
     super(
       `lifecycle update refused before any change: the ledger could not be cloned ` +
       `(${refusal.cloneFallback ?? "no clone"}) and a full copy needs ${refusal.requiredFreeBytes} bytes free ` +
-      `(ledger ${refusal.ledgerBytes} + headroom ${refusal.headroomBytes}) but ${refusal.freeBytes} are free; ` +
+      `(the ledger ${refusal.ledgerBytes} twice, for the snapshot and for a rollback's copy, plus headroom ` +
+      `${refusal.headroomBytes}) but ${refusal.freeBytes} are free; ` +
       "free space (plimsoll lifecycle snapshots prune --apply) or stop the collector so the ledger can be cloned, " +
       "then retry the same operation ID",
     );
+  }
+}
+
+/** Thrown by a ledger restore that changed nothing live; the rollback stays resumable. */
+export class LifecycleRestoreRefusal extends Error {
+  readonly code = "LIFECYCLE_RESTORE_REFUSED";
+
+  constructor(readonly refusal: LifecycleRestoreRefusalRecord) {
+    super(refusal.reason === "insufficient_free_space"
+      ? `ledger restore refused before any change: the snapshot could not be cloned and a byte copy needs ` +
+        `${refusal.requiredFreeBytes} bytes free beside the live ledger but ${refusal.freeBytes} are free`
+      : "ledger restore refused before any change: the restored copy failed PRAGMA integrity_check");
   }
 }
 
@@ -570,7 +606,11 @@ export class LifecycleManager {
     return record ? { snapshot: record } : {};
   }
 
-  private async rollbackReceipt(journal: LifecycleJournal, status: "rolled_back" | "rollback_required"): Promise<LifecycleReceipt> {
+  private async rollbackReceipt(
+    journal: LifecycleJournal,
+    status: "rolled_back" | "rollback_required",
+    outcome: { restore?: LifecycleRestoreRecord; restoreRefusal?: LifecycleRestoreRefusalRecord } = {},
+  ): Promise<LifecycleReceipt> {
     return {
       schemaVersion: LIFECYCLE_SCHEMA_VERSION,
       toolVersion: PLIMSOLL_VERSION,
@@ -586,18 +626,23 @@ export class LifecycleManager {
       purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
       preserved: ["ledger", "history", "credentials", "workspace_membership"],
       ...await this.snapshotRecord(journal.snapshotId),
+      ...outcome,
     };
   }
 
   private async finishRequiredRollback(journal: LifecycleJournal, operationId: string) {
+    let restored: LifecycleRestoreRecord | undefined;
     if (journal.phase === "rollback_required") {
       await this.fence(operationId);
       try {
-        await this.adapter.restore(journal.snapshotId);
-      } catch {
-        const blocked = await this.rollbackReceipt(journal, "rollback_required");
+        restored = await this.adapter.restore(journal.snapshotId) ?? undefined;
+      } catch (error) {
+        const refusal = error instanceof LifecycleRestoreRefusal ? error.refusal : undefined;
+        const blocked = await this.rollbackReceipt(journal, "rollback_required", refusal ? { restoreRefusal: refusal } : {});
         await this.adapter.persistReceipt(blocked);
-        throw new Error("rollback required: restore failed; retry the same operationId");
+        throw new Error(refusal
+          ? `rollback required: ${(error as Error).message}; the live ledger was left untouched; retry the same operationId`
+          : "rollback required: restore failed; retry the same operationId");
       }
       journal.phase = "rollback_complete";
       await this.adapter.writeJournal(journal);
@@ -605,7 +650,7 @@ export class LifecycleManager {
     if (journal.phase !== "rollback_complete") {
       throw new Error("rollback recovery state is invalid");
     }
-    const receipt = await this.rollbackReceipt(journal, "rolled_back");
+    const receipt = await this.rollbackReceipt(journal, "rolled_back", restored ? { restore: restored } : {});
     await this.adapter.persistReceipt(receipt);
     await this.adapter.clearJournal(journal.operationId);
     return receipt;

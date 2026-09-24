@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -26,12 +26,14 @@ import { defaultLifecycleAuthorityRoot, LifecycleMutationAuthority } from "./lif
 import {
   FilesystemLifecycleAdapter,
   type LifecycleDatabaseAdapter,
+  type LifecycleDatabaseRestore,
   type LifecycleDatabaseSnapshot,
   type LifecycleServiceAdapter,
   type ManagedLifecyclePaths,
 } from "./lifecycle-filesystem";
 import {
   LIFECYCLE_SCHEMA_VERSION,
+  LifecycleRestoreRefusal,
   LifecycleSnapshotRefusal,
   snapshotHeadroomBytes,
   validateRuntimeArtifact,
@@ -705,9 +707,129 @@ function removeSqliteFiles(database: string) {
   fs.rmSync(database, { force: true });
 }
 
+/**
+ * A full-copy snapshot needs room for itself and for the byte copy its
+ * rollback would make: a restore builds the restored ledger beside the live
+ * one before replacing it, so neither copy can reuse the other's space.
+ */
+function fullCopyRequiredFreeBytes(ledgerBytes: number, headroomBytes: number) {
+  return 2 * ledgerBytes + headroomBytes;
+}
+
 function volumeFreeBytes(directory: string) {
   const stat = fs.statfsSync(directory);
   return stat.bavail * stat.bsize;
+}
+
+function fsyncFile(file: string) {
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function fsyncDirectory(directory: string) {
+  const descriptor = fs.openSync(directory, "r");
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+/** Restore temporaries live beside the ledger: `<ledger>.restore-<nonce>`. */
+const RESTORE_TEMPORARY = /^(.+)\.restore-[0-9a-f]{12}$/;
+
+/** Removes temporaries an interrupted earlier restore of `destination` left behind. */
+function removeRestoreTemporaries(destination: string) {
+  const directory = path.dirname(destination);
+  for (const name of fs.readdirSync(directory)) {
+    const base = RESTORE_TEMPORARY.exec(name.replace(/-(wal|shm|journal)$/, ""))?.[1];
+    if (base !== path.basename(destination)) continue;
+    const stat = fs.lstatSync(path.join(directory, name));
+    if (stat.isFile()) fs.rmSync(path.join(directory, name), { force: true });
+  }
+}
+
+/**
+ * Opens a database file in EXCLUSIVE locking mode and takes the write lock
+ * without waiting. The mode is set before the first read, so SQLite keeps
+ * the WAL index in heap memory and never creates a -shm file; the lock is
+ * held until close.
+ */
+function openExclusive(file: string) {
+  const connection = new Database(file, { fileMustExist: true, timeout: 0 });
+  try {
+    connection.pragma("locking_mode = EXCLUSIVE");
+    connection.exec("BEGIN EXCLUSIVE");
+    connection.exec("COMMIT");
+    return connection;
+  } catch (error) {
+    connection.close();
+    throw error;
+  }
+}
+
+/**
+ * Restores a ledger snapshot without ever leaving the destination without a
+ * complete, valid database. The restored copy is built beside the
+ * destination (an APFS clone when possible; otherwise a byte copy, and only
+ * when the volume has room for it while the live ledger still exists, since a
+ * clone snapshot shares its blocks with the live ledger and deleting the live
+ * name would free little), made durable, and must pass PRAGMA
+ * integrity_check. Only then does one atomic rename replace the destination.
+ * Any failure before the rename leaves the live ledger exactly as it was.
+ */
+async function restoreLedger(
+  input: { source: string; destination: string },
+  options: { clone: FileCloner; freeBytes: (directory: string) => number },
+): Promise<LifecycleDatabaseRestore> {
+  const stat = fs.lstatSync(input.source);
+  if (!stat.isFile()) throw new Error("database restore source must be a regular file");
+  removeRestoreTemporaries(input.destination);
+  const temporary = `${input.destination}.restore-${randomBytes(6).toString("hex")}`;
+  let method: LifecycleDatabaseRestore["method"] = "clone";
+  let check: InstanceType<typeof Database> | null = null;
+  try {
+    if (!(options.clone(input.source, temporary) && isCloneResult(input.source, temporary))) {
+      fs.rmSync(temporary, { force: true });
+      method = "copy";
+      const headroomBytes = snapshotHeadroomBytes(stat.size);
+      const freeBytes = options.freeBytes(path.dirname(input.destination));
+      if (freeBytes < stat.size + headroomBytes) {
+        throw new LifecycleRestoreRefusal({
+          reason: "insufficient_free_space",
+          requiredFreeBytes: stat.size + headroomBytes,
+          freeBytes,
+        });
+      }
+      fs.copyFileSync(input.source, temporary, fs.constants.COPYFILE_EXCL);
+    }
+    fs.chmodSync(temporary, 0o600);
+    fsyncFile(temporary);
+    check = openExclusive(temporary);
+    if (check.pragma("integrity_check", { simple: true }) !== "ok") {
+      throw new LifecycleRestoreRefusal({ reason: "integrity_check_failed", requiredFreeBytes: null, freeBytes: null });
+    }
+    check.close();
+    check = null;
+    fs.rmSync(`${temporary}-wal`, { force: true });
+    fs.rmSync(`${temporary}-shm`, { force: true });
+    fs.renameSync(temporary, input.destination);
+    fsyncDirectory(path.dirname(input.destination));
+    // The replaced ledger's sidecars must never be paired with the restored one.
+    fs.rmSync(`${input.destination}-wal`, { force: true });
+    fs.rmSync(`${input.destination}-shm`, { force: true });
+    fs.rmSync(`${input.destination}-journal`, { force: true });
+    return { method, cloneFallback: method === "clone" ? null : "clone_unsupported", databaseBytes: stat.size };
+  } catch (error) {
+    check?.close();
+    removeSqliteFiles(temporary);
+    fs.rmSync(`${temporary}-journal`, { force: true });
+    throw error;
+  }
 }
 
 /**
@@ -795,14 +917,15 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
     const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
     const freeBytes = this.freeBytes(path.dirname(input.destination));
-    if (freeBytes < ledgerBytes + headroomBytes) {
+    const requiredFreeBytes = fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes);
+    if (freeBytes < requiredFreeBytes) {
       throw new LifecycleSnapshotRefusal({
         reason: "insufficient_free_space",
         method: "online_backup",
         cloneFallback,
         ledgerBytes,
         headroomBytes,
-        requiredFreeBytes: ledgerBytes + headroomBytes,
+        requiredFreeBytes,
         freeBytes,
       });
     }
@@ -810,16 +933,8 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     return { present: true, method: "online_backup", quiesced: "connection" in quiesced, cloneFallback };
   }
 
-  /** Same bytes as a copy; a clone when the volume allows it, so a rollback needs no free space. */
-  async restore(input: { source: string; destination: string }): Promise<void> {
-    const stat = fs.lstatSync(input.source);
-    if (!stat.isFile()) throw new Error("database restore source must be a regular file");
-    removeSqliteFiles(input.destination);
-    if (!(this.clone(input.source, input.destination) && isCloneResult(input.source, input.destination))) {
-      fs.rmSync(input.destination, { force: true });
-      fs.copyFileSync(input.source, input.destination);
-    }
-    fs.chmodSync(input.destination, 0o600);
+  restore(input: { source: string; destination: string }): Promise<LifecycleDatabaseRestore> {
+    return restoreLedger(input, { clone: this.clone, freeBytes: this.freeBytes });
   }
 
   /**
@@ -843,7 +958,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     }
     const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
     const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
-    const requiredFreeBytes = cloneCapable ? 0 : ledgerBytes + headroomBytes;
+    const requiredFreeBytes = cloneCapable ? 0 : fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes);
     const ok = freeBytes >= requiredFreeBytes;
     return {
       method: cloneCapable ? "clone" : "online_backup",
@@ -851,7 +966,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
       ledgerBytes,
       headroomBytes,
       requiredFreeBytes,
-      requiredFreeBytesIfInUse: ledgerBytes + headroomBytes,
+      requiredFreeBytesIfInUse: fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes),
       freeBytes,
       ok,
       reason: ok ? null : "insufficient_free_space",
@@ -878,16 +993,8 @@ export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
     })();
   }
 
-  restore(input: { source: string; destination: string }): Promise<void> {
-    return (async () => {
-      const stat = fs.lstatSync(input.source);
-      if (!stat.isFile()) throw new Error("database restore source must be a regular file");
-      fs.rmSync(`${input.destination}-wal`, { force: true });
-      fs.rmSync(`${input.destination}-shm`, { force: true });
-      fs.rmSync(input.destination, { force: true });
-      fs.copyFileSync(input.source, input.destination);
-      fs.chmodSync(input.destination, 0o600);
-    })();
+  restore(input: { source: string; destination: string }): Promise<LifecycleDatabaseRestore> {
+    return restoreLedger(input, { clone: cloneFileOrFail, freeBytes: volumeFreeBytes });
   }
 }
 
