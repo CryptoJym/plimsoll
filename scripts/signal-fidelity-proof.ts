@@ -1,6 +1,6 @@
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 110);
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 111);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -4102,6 +4102,48 @@ async function main() {
         Object.values(invalidRepositoryRefused).every(Boolean) &&
         Object.values(validRepositoryAccepted).every(Boolean),
       JSON.stringify({ invalidRepositoryRequests, refused: invalidRepositoryRefused, accepted: validRepositoryAccepted }),
+    );
+    // One --repository value against the fixture: refused, and requests made first.
+    const repositoryVerdict = async (repository: string) => {
+      let requests = 0;
+      try {
+        await runOutcomesSync(d2Config, {
+          repository,
+          until: d2Until,
+          ledgerDb: d2Ledger,
+          fetchImpl: (async (input, init) => {
+            requests += 1;
+            return d2Fetch(input, init);
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+        return { refused: false, requests };
+      } catch (error) {
+        return { refused: /--repository expects/.test(String(error)), requests };
+      }
+    };
+    // Non-ASCII never becomes a name: parts are checked as ASCII before
+    // lowercasing (U+212A KELVIN SIGN lowercases to 'k'), and invisible
+    // non-ASCII around them is not trimmed away. Fullwidth letters, dotless i,
+    // combining marks and zero-width characters stay refused too.
+    const unicodeVerdicts: Record<string, { refused: boolean; requests: number }> = {};
+    for (const [label, repository] of Object.entries({
+      kelvin_sign: "acme/Kidgets",
+      kelvin_sign_in_owner: "acKme/widgets",
+      leading_zero_width_no_break_space: "﻿acme/widgets",
+      trailing_no_break_space: "acme/widgets ",
+      trailing_ideographic_space: "acme/widgets　",
+      fullwidth_letter: "acme/Ｗidgets",
+      dotless_i: "acme/wıdgets",
+      combining_dot_above: "acme/wi̇dgets",
+      inner_zero_width_space: "acme/wid​gets",
+    })) {
+      unicodeVerdicts[label] = await repositoryVerdict(repository);
+    }
+    check(
+      "outcomes_repository_non_ascii_refused_before_case_folding",
+      Object.values(unicodeVerdicts).every((verdict) => verdict.refused && verdict.requests === 0),
+      JSON.stringify(unicodeVerdicts),
     );
     d2Ledger.close();
 
