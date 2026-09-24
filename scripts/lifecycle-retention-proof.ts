@@ -13,8 +13,9 @@ const completion = createProofCompletion("lifecycle-retention", 63);
  * runtimes; an unfinished operation's snapshot is never pruned; rollback
  * after pruning still restores; a quiesced snapshot is an APFS clone that
  * costs ~0 free space and passes integrity_check while the lock holds out
- * other processes; forced and live-writer fallbacks use the online backup;
- * a full copy without room is refused before any change; a crash in the
+ * other processes; a forced clone failure uses the online backup; a ledger
+ * another process has open is refused before any change (r2), and so is a
+ * full copy without room; a crash in the
  * middle of pruning resumes safely; `snapshots prune` dry runs change nothing.
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -444,7 +445,7 @@ async function main() {
       killedWith === "SIGKILL" && walBeforeU6 > 0 && inspectSnapshotDatabase(primary, "u6").digest === beforeU6 &&
       walBytes(primary.ledger) === 0, { killedWith, walBeforeU6, walAfter: walBytes(primary.ledger) });
 
-    // ---- Forced and live-writer fallbacks use the online backup -----------
+    // ---- Forced clone failure uses the online backup; a live writer is refused
     const fallbackSamples: Array<{ method: string | null; consumed: number }> = [];
     appendRow(primary, "before-u7");
     const beforeU7 = ledgerDigest(primary.ledger);
@@ -471,16 +472,22 @@ async function main() {
       writer.stdout!.once("data", () => resolve());
       writer.once("exit", () => reject(new Error("live writer exited early")));
     });
-    let u8: LifecycleReceipt;
+    let inUse: (Error & { code?: string }) | null;
     try {
-      u8 = await primary.manager().update({ operationId: "u8", artifact: primary.artifact("1.0.7") });
+      inUse = await rejection(() => primary.manager().update({ operationId: "u8", artifact: primary.artifact("1.0.7") }));
     } finally {
       writer.stdin!.end();
       await new Promise((resolve) => writer.once("exit", resolve));
     }
+    // r2 (B1): a ledger another process has open is refused before any change,
+    // never copied: a rollback would have to replace it under that process.
+    const inUseReceipt = primary.receipt("u8");
     check("ledger_open_in_another_process_is_never_cloned",
-      u8.snapshot?.method === "online_backup" && u8.snapshot.quiesced === false && u8.snapshot.cloneFallback === "ledger_in_use",
-      u8.snapshot);
+      inUse?.code === "LIFECYCLE_SNAPSHOT_REFUSED" && inUseReceipt.status === "refused" &&
+      inUseReceipt.refusal?.reason === "ledger_in_use" && inUseReceipt.refusal.cloneFallback === "ledger_in_use" &&
+      !primary.snapshots().includes("u8") && !primary.versions().includes("1.0.7"),
+      { message: inUse?.message, receipt: inUseReceipt });
+    const u8 = await primary.manager().update({ operationId: "u8", artifact: primary.artifact("1.0.7") });
     const u8Inspection = inspectSnapshotDatabase(primary, "u8");
     const u8HasWriterRow = (() => {
       const scratch = fs.mkdtempSync(path.join(ROOT, "inspect-"));
@@ -497,7 +504,8 @@ async function main() {
       }
     })();
     check("live_writer_snapshot_is_consistent_and_includes_committed_rows",
-      u8Inspection.integrity === "ok" && u8HasWriterRow);
+      u8.snapshot?.method === "clone" && u8.snapshot.quiesced === true && u8Inspection.integrity === "ok" && u8HasWriterRow,
+      u8.snapshot);
     check("retention_stays_bounded_across_clone_and_full_copy_snapshots",
       same(primary.snapshots(), ["u7", "u8"]) && same(primary.versions(), ["1.0.5", "1.0.6", "1.0.7"]),
       { snapshots: primary.snapshots(), versions: primary.versions() });
@@ -531,7 +539,7 @@ async function main() {
     const livePlan = await primary.manager().preflightUpdate();
     check("preflight_predicts_a_clone_that_needs_no_copy_space",
       livePlan.method === "clone" && livePlan.cloneCapable && livePlan.requiredFreeBytes === 0 && livePlan.ok &&
-      livePlan.requiredFreeBytesIfInUse === 2 * livePlan.ledgerBytes + livePlan.headroomBytes, livePlan);
+      livePlan.requiredFreeBytesIfCloneFails === 2 * livePlan.ledgerBytes + livePlan.headroomBytes, livePlan);
     const tightPlan = await primary.manager(tight).preflightUpdate();
     check("preflight_refuses_a_full_copy_without_room_before_the_service_is_stopped",
       tightPlan.method === "online_backup" && !tightPlan.ok && tightPlan.reason === "insufficient_free_space" &&

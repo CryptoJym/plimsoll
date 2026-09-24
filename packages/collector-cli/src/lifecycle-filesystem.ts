@@ -79,6 +79,12 @@ export type LifecycleDatabaseRestore = {
 export type LifecycleDatabaseAdapter = {
   snapshot(input: { source: string; destination: string }): Promise<boolean | LifecycleDatabaseSnapshot>;
   restore(input: { source: string; destination: string }): Promise<void | LifecycleDatabaseRestore>;
+  /**
+   * Removes the live ledger for a snapshot taken when no ledger existed, only
+   * when no other connection has it open. Adapters without it get a plain
+   * removal of the ledger files.
+   */
+  discard?(input: { destination: string }): Promise<void>;
   /** Update --preflight. May clone the source to `probe` to test the volume; always removes it. */
   plan?(input: { source: string; probe: string }): Promise<LifecycleSnapshotPlan>;
 };
@@ -617,9 +623,10 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     assertNoSymlink(metadataPath, snapshot);
     const metadata = readJson<SnapshotMetadata>(metadataPath);
     if (!isSnapshotMetadata(metadata)) throw new Error("rollback snapshot is missing");
-    // The ledger goes first: its restore may refuse (no room for a byte copy,
-    // a copy that fails its integrity check), and a refusal must leave the
-    // config, runtime pointer and service exactly as they were.
+    // The ledger goes first: its restore may refuse (another process still
+    // has the ledger open, no room for a byte copy, a copy that fails its
+    // integrity check), and a refusal must leave the config, runtime pointer
+    // and service exactly as they were.
     const databaseSnapshot = path.join(snapshot, "database");
     assertNoSymlink(databaseSnapshot, snapshot);
     assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
@@ -637,6 +644,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       record = outcome
         ? { method: outcome.method, cloneFallback: outcome.cloneFallback, databaseBytes: outcome.databaseBytes }
         : undefined;
+    } else if (this.database.discard) {
+      await this.database.discard({ destination: this.paths.database });
     } else {
       fs.rmSync(this.paths.database, { force: true });
       fs.rmSync(`${this.paths.database}-wal`, { force: true });

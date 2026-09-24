@@ -701,6 +701,15 @@ function isCloneResult(source: string, destination: string) {
   }
 }
 
+function lstatIfPresent(file: string) {
+  try {
+    return fs.lstatSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 function removeSqliteFiles(database: string) {
   fs.rmSync(`${database}-wal`, { force: true });
   fs.rmSync(`${database}-shm`, { force: true });
@@ -772,15 +781,90 @@ function openExclusive(file: string) {
   }
 }
 
+/** The live ledger held exclusively for replacement, with our own descriptor on its inode. */
+type LiveLedgerLock = { connection: InstanceType<typeof Database>; descriptor: number };
+
+function sqliteBusy(error: unknown) {
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^SQLITE_(BUSY|LOCKED)/.test(code);
+}
+
+/**
+ * Proves no other connection in any process has the live ledger open and
+ * keeps it that way until released: every attached WAL connection holds a
+ * shared lock on the database file for its whole life, so the exclusive lock
+ * is refused (SQLITE_BUSY, no waiting) while one exists. Holding it, a
+ * TRUNCATE checkpoint leaves nothing the connection could write back into the
+ * file after it is replaced. Null when there is no live ledger.
+ */
+function lockLiveLedger(destination: string): LiveLedgerLock | null {
+  const before = lstatIfPresent(destination);
+  if (!before) return null;
+  if (!before.isFile()) throw new Error("the live ledger must be a regular file");
+  let connection: InstanceType<typeof Database>;
+  try {
+    connection = openExclusive(destination);
+  } catch (error) {
+    throw new LifecycleRestoreRefusal({
+      reason: sqliteBusy(error) ? "ledger_in_use" : "quiescence_unproven",
+      requiredFreeBytes: null,
+      freeBytes: null,
+    });
+  }
+  let descriptor: number | null = null;
+  try {
+    if (connection.pragma("journal_mode", { simple: true }) === "wal") {
+      const [checkpoint] = connection.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
+      if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== 0) throw new Error("live ledger WAL did not empty");
+    }
+    descriptor = fs.openSync(destination, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(descriptor);
+    if (opened.ino !== before.ino || opened.dev !== before.dev) throw new Error("the live ledger changed while locking");
+    return { connection, descriptor };
+  } catch (error) {
+    // Close the connection before our own descriptor: closing any descriptor
+    // on the file drops this process's POSIX locks on it.
+    connection.close();
+    if (descriptor !== null) fs.closeSync(descriptor);
+    if (error instanceof LifecycleRestoreRefusal) throw error;
+    throw new LifecycleRestoreRefusal({ reason: "quiescence_unproven", requiredFreeBytes: null, freeBytes: null });
+  }
+}
+
+/**
+ * Releases a live ledger that a rename or unlink has just replaced. While the
+ * exclusive lock still holds, no connection can be attached to the old file,
+ * but a process could have opened it an instant before and be waiting for
+ * the lock. Zeroing the old file's header (it has no name left) makes such a
+ * late opener fail with "not a database" instead of writing to an unlinked
+ * file, and removing the old -wal/-shm/-journal names keeps it from pairing
+ * with the new ledger's sidecars. A file that is still linked elsewhere is
+ * never written.
+ */
+function releaseReplacedLedger(live: LiveLedgerLock, destination: string) {
+  try {
+    if (fs.fstatSync(live.descriptor).nlink === 0) fs.writeSync(live.descriptor, Buffer.alloc(16), 0, 16, 0);
+    fs.rmSync(`${destination}-wal`, { force: true });
+    fs.rmSync(`${destination}-shm`, { force: true });
+    fs.rmSync(`${destination}-journal`, { force: true });
+  } finally {
+    live.connection.close();
+    fs.closeSync(live.descriptor);
+  }
+}
+
 /**
  * Restores a ledger snapshot without ever leaving the destination without a
- * complete, valid database. The restored copy is built beside the
+ * complete, valid database, and without replacing a database that another
+ * connection could keep using. The restored copy is built beside the
  * destination (an APFS clone when possible; otherwise a byte copy, and only
  * when the volume has room for it while the live ledger still exists, since a
  * clone snapshot shares its blocks with the live ledger and deleting the live
  * name would free little), made durable, and must pass PRAGMA
- * integrity_check. Only then does one atomic rename replace the destination.
- * Any failure before the rename leaves the live ledger exactly as it was.
+ * integrity_check. Then, holding exclusive locks on both the restored copy
+ * and the live ledger (refused if any other connection has the live ledger
+ * open), one atomic rename replaces the destination. Any failure before the
+ * rename leaves the live ledger exactly as it was.
  */
 async function restoreLedger(
   input: { source: string; destination: string },
@@ -791,7 +875,8 @@ async function restoreLedger(
   removeRestoreTemporaries(input.destination);
   const temporary = `${input.destination}.restore-${randomBytes(6).toString("hex")}`;
   let method: LifecycleDatabaseRestore["method"] = "clone";
-  let check: InstanceType<typeof Database> | null = null;
+  let restored: InstanceType<typeof Database> | null = null;
+  let live: LiveLedgerLock | null = null;
   try {
     if (!(options.clone(input.source, temporary) && isCloneResult(input.source, temporary))) {
       fs.rmSync(temporary, { force: true });
@@ -809,26 +894,78 @@ async function restoreLedger(
     }
     fs.chmodSync(temporary, 0o600);
     fsyncFile(temporary);
-    check = openExclusive(temporary);
-    if (check.pragma("integrity_check", { simple: true }) !== "ok") {
+    // Held until the swap is done, so nothing can open the restored ledger
+    // under its final name before the replaced one is released.
+    restored = openExclusive(temporary);
+    if (restored.pragma("integrity_check", { simple: true }) !== "ok") {
       throw new LifecycleRestoreRefusal({ reason: "integrity_check_failed", requiredFreeBytes: null, freeBytes: null });
     }
-    check.close();
-    check = null;
-    fs.rmSync(`${temporary}-wal`, { force: true });
-    fs.rmSync(`${temporary}-shm`, { force: true });
-    fs.renameSync(temporary, input.destination);
-    fsyncDirectory(path.dirname(input.destination));
-    // The replaced ledger's sidecars must never be paired with the restored one.
-    fs.rmSync(`${input.destination}-wal`, { force: true });
-    fs.rmSync(`${input.destination}-shm`, { force: true });
-    fs.rmSync(`${input.destination}-journal`, { force: true });
+    live = lockLiveLedger(input.destination);
+    if (live) {
+      const replaced = live;
+      live = null;
+      try {
+        fs.renameSync(temporary, input.destination);
+      } catch (error) {
+        replaced.connection.close();
+        fs.closeSync(replaced.descriptor);
+        throw error;
+      }
+      try {
+        fsyncDirectory(path.dirname(input.destination));
+      } finally {
+        releaseReplacedLedger(replaced, input.destination);
+      }
+    } else {
+      // No live ledger: create the name without replacing one that appeared
+      // meanwhile, and never pair the new ledger with stale sidecars.
+      for (const suffix of ["-wal", "-shm", "-journal"]) fs.rmSync(`${input.destination}${suffix}`, { force: true });
+      try {
+        fs.linkSync(temporary, input.destination);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        throw new LifecycleRestoreRefusal({ reason: "ledger_in_use", requiredFreeBytes: null, freeBytes: null });
+      }
+      fs.unlinkSync(temporary);
+      fsyncDirectory(path.dirname(input.destination));
+    }
+    restored.close();
+    restored = null;
+    removeSqliteFiles(temporary);
     return { method, cloneFallback: method === "clone" ? null : "clone_unsupported", databaseBytes: stat.size };
   } catch (error) {
-    check?.close();
+    if (live) {
+      live.connection.close();
+      fs.closeSync(live.descriptor);
+    }
+    restored?.close();
     removeSqliteFiles(temporary);
     fs.rmSync(`${temporary}-journal`, { force: true });
     throw error;
+  }
+}
+
+/**
+ * Removes the live ledger for a snapshot taken before any ledger existed,
+ * under the same proof that no other connection has it open.
+ */
+async function discardLedger(destination: string) {
+  const live = lockLiveLedger(destination);
+  if (!live) {
+    for (const suffix of ["-wal", "-shm", "-journal"]) fs.rmSync(`${destination}${suffix}`, { force: true });
+    return;
+  }
+  try {
+    fs.unlinkSync(destination);
+  } catch (error) {
+    live.connection.close();
+    fs.closeSync(live.descriptor);
+    throw error;
+  }
+  try {
+    fsyncDirectory(path.dirname(destination));
+  } finally {
+    releaseReplacedLedger(live, destination);
   }
 }
 
@@ -867,10 +1004,7 @@ function quiesceLedger(source: string):
     return { connection };
   } catch (error) {
     connection.close();
-    const code = (error as { code?: unknown }).code;
-    return {
-      fallback: typeof code === "string" && /^SQLITE_(BUSY|LOCKED)/.test(code) ? "ledger_in_use" : "quiescence_unproven",
-    };
+    return { fallback: sqliteBusy(error) ? "ledger_in_use" : "quiescence_unproven" };
   }
 }
 
@@ -899,6 +1033,20 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     }
     removeSqliteFiles(input.destination);
     const quiesced = quiesceLedger(input.source);
+    if ("fallback" in quiesced && (quiesced.fallback === "ledger_in_use" || quiesced.fallback === "quiescence_unproven")) {
+      // A rollback of this update would have to replace the ledger while that
+      // connection could keep writing to the replaced file. Refuse first.
+      const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
+      throw new LifecycleSnapshotRefusal({
+        reason: quiesced.fallback,
+        method: null,
+        cloneFallback: quiesced.fallback,
+        ledgerBytes,
+        headroomBytes: snapshotHeadroomBytes(ledgerBytes),
+        requiredFreeBytes: 0,
+        freeBytes: this.freeBytes(path.dirname(input.destination)),
+      });
+    }
     let cloneFallback: LifecycleCloneFallback;
     if ("connection" in quiesced) {
       try {
@@ -937,6 +1085,10 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     return restoreLedger(input, { clone: this.clone, freeBytes: this.freeBytes });
   }
 
+  discard(input: { destination: string }): Promise<void> {
+    return discardLedger(input.destination);
+  }
+
   /**
    * Predicts the snapshot of an update run after the collector stops: a clone
    * when the ledger can be cloned onto the lifecycle volume (probed with a
@@ -947,7 +1099,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     if (!fs.existsSync(input.source)) {
       return {
         method: "none", cloneCapable: false, ledgerBytes: 0, headroomBytes: 0,
-        requiredFreeBytes: 0, requiredFreeBytesIfInUse: 0, freeBytes, ok: true, reason: null,
+        requiredFreeBytes: 0, requiredFreeBytesIfCloneFails: 0, freeBytes, ok: true, reason: null,
       };
     }
     let cloneCapable = false;
@@ -966,7 +1118,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
       ledgerBytes,
       headroomBytes,
       requiredFreeBytes,
-      requiredFreeBytesIfInUse: fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes),
+      requiredFreeBytesIfCloneFails: fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes),
       freeBytes,
       ok,
       reason: ok ? null : "insufficient_free_space",
@@ -995,6 +1147,10 @@ export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
 
   restore(input: { source: string; destination: string }): Promise<LifecycleDatabaseRestore> {
     return restoreLedger(input, { clone: cloneFileOrFail, freeBytes: volumeFreeBytes });
+  }
+
+  discard(input: { destination: string }): Promise<void> {
+    return discardLedger(input.destination);
   }
 }
 

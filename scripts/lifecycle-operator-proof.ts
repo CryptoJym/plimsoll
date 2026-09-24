@@ -1,13 +1,14 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-operator", 79);
+const completion = createProofCompletion("lifecycle-operator", 80);
 /**
  * Issue #103/#158 packaged lifecycle operator proof.
  *
  * Drives the REAL packaged CLI process (`node dist/cli.mjs lifecycle …`)
  * end to end against a disposable HOME: self-artifact pinning with vendored
  * native companions, digest-verified immutable staging, transactional
- * manifest activation, failed-readiness auto-rollback over a LIVE WAL
- * ledger, preview-default uninstall/purge, support bundles, and the shared
+ * manifest activation, refusal while another connection holds the ledger,
+ * failed-readiness auto-rollback over a WAL ledger whose last commit exists
+ * only in the WAL, preview-default uninstall/purge, support bundles, and the shared
  * mutation-authority fence. A stubbed `launchctl` on PATH counts invocations;
  * the contract asserts ZERO service-manager calls. Only an owned loopback
  * listener is contacted; no live collector or credentials outside the fixture home.
@@ -17,6 +18,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
@@ -182,6 +184,23 @@ async function main(): Promise<void> {
     env: childEnv, encoding: "utf8", timeout: 10_000,
   });
   check("launchctl_stub_armed", probeLaunchctl.status === 3 && launchctlInvocationCount() === 1);
+
+  // --- A ledger another connection holds open is refused before any change -----
+  // (eco-6hoxj.163.30 r2, B1). A rollback would have to replace the ledger
+  // while that connection could keep writing to the replaced file. The managed
+  // update window stops the collector first; this proof closes its connection.
+  const busy = expectFailure(["lifecycle", "update", "--operation-id", "op-busy", "--artifact", "self"],
+    /another process has the ledger open/);
+  const busyReceipt = JSON.parse(readFileIfExists(path.join(LIFECYCLE_ROOT, "receipts", "op-busy-update.json")) ?? "{}") as
+    { status?: string; refusal?: { reason?: string } };
+  check("update_refused_while_another_connection_holds_the_ledger",
+    busy.matched && busyReceipt.status === "refused" && busyReceipt.refusal?.reason === "ledger_in_use" &&
+      !fs.existsSync(path.join(LIFECYCLE_ROOT, "journal.json")) &&
+      !fs.existsSync(path.join(LIFECYCLE_ROOT, "completed-operations", "op-busy.json")) &&
+      !fs.existsSync(path.join(LIFECYCLE_ROOT, "state.json")),
+    { stderr: busy.combined.slice(-400), receipt: busyReceipt });
+  liveLedger.close();
+  liveLedger = null;
 
   // --- Self-pinned update -----------------------------------------------------
   const update = cliJson(["lifecycle", "update", "--operation-id", "op-u1", "--artifact", "self"]);
@@ -379,8 +398,18 @@ syncBuiltinESMExports();
     rollbackReceipt.toolVersion === PLIMSOLL_VERSION &&
     supportReceipt.toolVersion === PLIMSOLL_VERSION);
 
-  // --- Failed readiness auto-restores over a LIVE WAL ledger ---------------------
-  liveLedger.prepare("insert or replace into operator_proof_probe (id, payload) values ('pre-failure', 'written-under-open-wal')").run();
+  // --- Failed readiness auto-restores a WAL ledger ------------------------------
+  // The writer dies without closing, so its committed row exists only in the
+  // WAL when the update quiesces and snapshots the ledger.
+  const crashedWriter = spawnSync(process.execPath, ["-e", `
+    const Database = require(${JSON.stringify(createRequire(import.meta.url).resolve("better-sqlite3"))});
+    const db = new Database(${JSON.stringify(collectorBufferPath(fixtureHome))});
+    db.pragma("wal_autocheckpoint = 0");
+    db.prepare("insert or replace into operator_proof_probe (id, payload) values ('pre-failure', 'written-under-open-wal')").run();
+    process.kill(process.pid, "SIGKILL");`], { timeout: 60_000 });
+  if (crashedWriter.signal !== "SIGKILL" || !(fs.statSync(`${collectorBufferPath(fixtureHome)}-wal`).size > 0)) {
+    throw new Error("the crashed writer must leave its commit in the WAL");
+  }
   fs.writeFileSync(collectorConfigPath(fixtureHome), "{corrupted", { mode: 0o600 });
   const failed = cli(["lifecycle", "update", "--operation-id", "op-f1", "--artifact", "self"]);
   check("failed_readiness_fails_the_command", failed.code !== 0, failed.stderrText.slice(0, 300));
@@ -402,8 +431,6 @@ syncBuiltinESMExports();
     readFileIfExists(collectorConfigPath(fixtureHome)) === "{corrupted");
   check("journal_cleared_after_auto_rollback",
     !fs.existsSync(path.join(LIFECYCLE_ROOT, "journal.json")));
-  liveLedger.close();
-  liveLedger = null;
   const reopened = new Database(collectorBufferPath(fixtureHome), { readonly: true });
   const sentinel = reopened.prepare("select payload from operator_proof_probe where id = 'sentinel'").get() as { payload: string } | undefined;
   const preFailure = reopened.prepare("select payload from operator_proof_probe where id = 'pre-failure'").get() as { payload: string } | undefined;

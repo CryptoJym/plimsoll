@@ -127,14 +127,20 @@ export type LifecycleRestoreRecord = {
 
 /** Why a rollback left the live ledger untouched instead of restoring it. */
 export type LifecycleRestoreRefusalRecord = {
-  reason: "insufficient_free_space" | "integrity_check_failed";
+  reason: "insufficient_free_space" | "integrity_check_failed" | "ledger_in_use" | "quiescence_unproven";
   requiredFreeBytes: number | null;
   freeBytes: number | null;
 };
 
+/**
+ * Why an update or rollback changed nothing. A ledger that another process
+ * has open (or that cannot be locked exclusively) is refused outright: a
+ * rollback would have to replace a database that process could keep using.
+ */
 export type LifecycleRefusal = {
-  reason: "insufficient_free_space";
-  method: "online_backup";
+  reason: "insufficient_free_space" | "ledger_in_use" | "quiescence_unproven";
+  /** The full copy that would not fit; null when the ledger was not quiesced. */
+  method: "online_backup" | null;
   cloneFallback: LifecycleCloneFallback | null;
   ledgerBytes: number;
   headroomBytes: number;
@@ -149,8 +155,11 @@ export type LifecycleSnapshotPlan = {
   ledgerBytes: number;
   headroomBytes: number;
   requiredFreeBytes: number;
-  /** What a full copy (snapshot plus a rollback's byte copy) needs if the ledger is still in use at snapshot time. */
-  requiredFreeBytesIfInUse: number;
+  /**
+   * What a full copy (snapshot plus a rollback's byte copy) needs if cloning
+   * fails at update time. A ledger still in use then is refused, not copied.
+   */
+  requiredFreeBytesIfCloneFails: number;
   freeBytes: number;
   ok: boolean;
   reason: "insufficient_free_space" | null;
@@ -334,31 +343,53 @@ export class LifecycleInterruption extends Error {
   readonly code = "LIFECYCLE_INTERRUPTED";
 }
 
-/** Thrown before any copy when a full ledger copy would not fit; nothing was changed. */
+function snapshotRefusalMessage(refusal: LifecycleRefusal) {
+  if (refusal.reason === "ledger_in_use") {
+    return "lifecycle update refused before any change: another process has the ledger open (the collector " +
+      "service or another plimsoll command); stop it so the update can prove the ledger is quiesced, then retry " +
+      "the same operation ID";
+  }
+  if (refusal.reason === "quiescence_unproven") {
+    return "lifecycle update refused before any change: the ledger could not be locked exclusively (it may be " +
+      "unreadable or not a SQLite database), so a rollback could not safely replace it; repair it, then retry " +
+      "the same operation ID";
+  }
+  return `lifecycle update refused before any change: the ledger could not be cloned ` +
+    `(${refusal.cloneFallback ?? "no clone"}) and a full copy needs ${refusal.requiredFreeBytes} bytes free ` +
+    `(the ledger ${refusal.ledgerBytes} twice, for the snapshot and for a rollback's copy, plus headroom ` +
+    `${refusal.headroomBytes}) but ${refusal.freeBytes} are free; ` +
+    "free space (plimsoll lifecycle snapshots prune --apply) or stop the collector so the ledger can be cloned, " +
+    "then retry the same operation ID";
+}
+
+/**
+ * Thrown before any change when the ledger is in use, cannot be locked, or a
+ * needed full copy would not fit; nothing was changed.
+ */
 export class LifecycleSnapshotRefusal extends Error {
   readonly code = "LIFECYCLE_SNAPSHOT_REFUSED";
 
   constructor(readonly refusal: LifecycleRefusal) {
-    super(
-      `lifecycle update refused before any change: the ledger could not be cloned ` +
-      `(${refusal.cloneFallback ?? "no clone"}) and a full copy needs ${refusal.requiredFreeBytes} bytes free ` +
-      `(the ledger ${refusal.ledgerBytes} twice, for the snapshot and for a rollback's copy, plus headroom ` +
-      `${refusal.headroomBytes}) but ${refusal.freeBytes} are free; ` +
-      "free space (plimsoll lifecycle snapshots prune --apply) or stop the collector so the ledger can be cloned, " +
-      "then retry the same operation ID",
-    );
+    super(snapshotRefusalMessage(refusal));
   }
 }
+
+const RESTORE_REFUSAL_MESSAGES: Record<Exclude<LifecycleRestoreRefusalRecord["reason"], "insufficient_free_space">, string> = {
+  integrity_check_failed: "the restored copy failed PRAGMA integrity_check",
+  ledger_in_use: "another process has the live ledger open and could keep writing to the replaced file " +
+    "(ledger_in_use); stop the collector service and every plimsoll command",
+  quiescence_unproven: "the live ledger could not be locked exclusively (quiescence_unproven)",
+};
 
 /** Thrown by a ledger restore that changed nothing live; the rollback stays resumable. */
 export class LifecycleRestoreRefusal extends Error {
   readonly code = "LIFECYCLE_RESTORE_REFUSED";
 
   constructor(readonly refusal: LifecycleRestoreRefusalRecord) {
-    super(refusal.reason === "insufficient_free_space"
-      ? `ledger restore refused before any change: the snapshot could not be cloned and a byte copy needs ` +
-        `${refusal.requiredFreeBytes} bytes free beside the live ledger but ${refusal.freeBytes} are free`
-      : "ledger restore refused before any change: the restored copy failed PRAGMA integrity_check");
+    super(`ledger restore refused before any change: ${refusal.reason === "insufficient_free_space"
+      ? `the snapshot could not be cloned and a byte copy needs ${refusal.requiredFreeBytes} bytes free beside ` +
+        `the live ledger but ${refusal.freeBytes} are free`
+      : RESTORE_REFUSAL_MESSAGES[refusal.reason]}`);
   }
 }
 
