@@ -88,6 +88,7 @@
     "proof:session-sync-worker-parity": "tsx scripts/session-sync-worker-parity-proof.ts",
     "proof:session-sync-liveness": "tsx scripts/session-sync-liveness-proof.ts",
     "proof:studio0-writer-contention": "tsx scripts/studio0-writer-contention-proof.ts",
+    "proof:studio0-main-thread-turns": "tsx scripts/studio0-main-thread-turns-proof.ts",
     "proof:upload-timer-bounds": "tsx scripts/upload-timer-bounds-proof.ts",
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:codex-producer-token": "tsx scripts/codex-producer-token-proof.ts",
