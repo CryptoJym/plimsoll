@@ -82,9 +82,13 @@ export async function runProof(entry: string, options: { directNode?: boolean; a
       receipt.counts.passed === receipt.checks.length && receipt.counts.failed === 0 &&
       receipt.checks.every((c: any) => typeof c.name === "string" && c.passed === true) &&
       (receipt.expectedChecks === null || receipt.expectedChecks === receipt.checks.length);
+    // eco-6hoxj.163.32 reads this wrapper from the checkout. Its final CI
+    // step accepts only a passed, checkout-rooted gate with no forwarded
+    // arguments, directNode false, and the expected fixture-plus-audit count.
     outcome = { schema: "plimsoll.proof-run.v1", status: child.status === 0 && valid && suiteComplete && nodeUnchanged && sentinelUnchanged && sourceUnchanged ? "passed" : "failed",
       entry: path.relative(repoRoot, absoluteEntry), root: fs.realpathSync(repoRoot), forwardedArgs: options.args ?? [],
       entrySha256: entryBefore, runnerSha256: runnerBefore, sourceUnchanged, directNode: Boolean(options.directNode),
+      expectedChecks: typeof receipt?.expectedChecks === "number" ? receipt.expectedChecks : null,
       ...(declaredSubProofs ? { declaredSubProofs, suiteComplete } : {}),
       runtime: { node: process.versions.node, abi: process.versions.modules, platform: process.platform, arch: process.arch, sha256: nodeBefore },
       exitCode: child.status, signal: child.signal, error: child.error?.message ?? null,
