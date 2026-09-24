@@ -40,7 +40,10 @@ import { PROOF_SUITES, readProofSuites } from "./proof-suites";
  * may not configure how pnpm runs scripts (script-shell, node-options, a
  * pnpmfile). A counted proof may not receive a variable it reads from a
  * workflow assignment or workflow/job/step `env:`; the explicit allow-list is
- * `PLIMSOLL_PROOF_HOME` and `REJECTION_PROOF_SCALE`. Runtime pnpm/npm config
+ * `PLIMSOLL_PROOF_HOME`, `REJECTION_PROOF_SCALE`, and the reviewed
+ * `PROJECTION_PUBLICATION_COST_SCALE` input. Both scale inputs are bounded by
+ * their proof contracts to 0.01 through 1.0 inclusive. `DEVELOPER_DIR` is a
+ * non-proof toolchain selector used by the macOS menubar tests. Runtime pnpm/npm config
  * writes are refused through the last proof. Every other unit needs a reviewed entry in
  * scripts/proof-local-only.json.
  */
@@ -60,10 +63,14 @@ const EXECUTION_WORD = new RegExp(`(?<![A-Za-z0-9_])(?:${EXECUTION_ENV.join("|")
 const CONFIG_WORD = /(?<![A-Za-z0-9_])p?npm_config_\w*/i;
 const BENIGN_NODE_OPTIONS = /^--max-old-space-size=[1-9][0-9]*$/;
 /** Proof-specific settings that are intentionally permitted on a counted line. */
-export const PROOF_ENV_ALLOWLIST = new Set(["PLIMSOLL_PROOF_HOME", "REJECTION_PROOF_SCALE"]);
+export const PROOF_ENV_ALLOWLIST = new Set([
+  "PLIMSOLL_PROOF_HOME",
+  "REJECTION_PROOF_SCALE",
+  "PROJECTION_PUBLICATION_COST_SCALE",
+]);
 const WORKFLOW_ENV_ALLOWLIST = new Set([
   ...PROOF_ENV_ALLOWLIST, "HOME", "USERPROFILE", "PLIMSOLL_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
-  "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR",
+  "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR", "DEVELOPER_DIR",
 ]);
 const allowedWorkflowEnvironment = (name: string, value?: unknown) =>
   WORKFLOW_ENV_ALLOWLIST.has(name) || (name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim()));
