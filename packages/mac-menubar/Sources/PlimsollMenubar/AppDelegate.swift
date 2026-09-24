@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import PlimsollMenubarCore
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let client: CollectorClient?
     private var statusItem: NSStatusItem?

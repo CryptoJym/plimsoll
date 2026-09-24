@@ -3,6 +3,7 @@ import PlimsollMenubarCore
 
 @main
 enum PlimsollMenubarMain {
+    @MainActor
     static func main() {
         if CommandLine.arguments.contains("--doctor") {
             do {
