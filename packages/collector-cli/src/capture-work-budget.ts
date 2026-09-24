@@ -7,7 +7,9 @@ export const AUTOMATIC_CAPTURE_LIMITS = Object.freeze({
   sliceRecords: 64,
 });
 
-export type CaptureBudgetLimits = typeof AUTOMATIC_CAPTURE_LIMITS;
+export type CaptureBudgetLimits = {
+  [Key in keyof typeof AUTOMATIC_CAPTURE_LIMITS]: number;
+};
 
 export type CaptureBudgetStatus = {
   maxBytes: number;
@@ -22,6 +24,14 @@ export type CaptureBudgetStatus = {
   elapsedWallMs: number;
   exhausted: boolean;
   exhaustedBy: "bytes" | "records" | "events" | "wall" | null;
+};
+
+type BudgetExhaustion = CaptureBudgetStatus["exhaustedBy"];
+
+type BudgetScopeOptions = Partial<CaptureBudgetLimits>;
+type BudgetScopePolicy = {
+  /** Permit a reserved source slice after an earlier synchronous wall overrun. */
+  allowWallOverrun?: boolean;
 };
 
 /**
@@ -41,11 +51,59 @@ export class CaptureWorkBudget {
 
   constructor(
     private readonly limits: CaptureBudgetLimits = AUTOMATIC_CAPTURE_LIMITS,
+    private readonly parent: CaptureWorkBudget | null = null,
+    private readonly policy: BudgetScopePolicy = {},
   ) {}
+
+  /**
+   * Create a source-local view of this budget.
+   *
+   * Automatic maintenance has several independent producers sharing one
+   * cadence. A producer which reaches the global wall/byte/event ceiling first
+   * must not consume the allowance reserved for the producers that follow it.
+   * A scoped budget keeps the parent ceilings as a hard upper bound while
+   * enforcing the supplied per-source caps. Accounting is charged to both
+   * views, so the existing aggregate receipt remains unchanged.
+   */
+  scoped(overrides: BudgetScopeOptions, policy: BudgetScopePolicy = {}): CaptureWorkBudget {
+    const maxBytes = Math.max(2_048, Math.min(
+      Math.trunc(overrides.maxBytes ?? this.remainingByteBudget()),
+      Math.max(2_048, this.remainingByteBudget()),
+    ));
+    const maxRecords = Math.max(1, Math.min(
+      Math.trunc(overrides.maxRecords ?? this.remainingRecordSlots()),
+      Math.max(1, this.remainingRecordSlots()),
+    ));
+    const maxEvents = Math.max(1, Math.min(
+      Math.trunc(overrides.maxEvents ?? this.remainingEventSlots()),
+      Math.max(1, this.remainingEventSlots()),
+    ));
+    const parentWallRemaining = policy.allowWallOverrun ? Number.MAX_SAFE_INTEGER : this.remainingWallMs();
+    const maxWallMs = Math.max(1, Math.min(
+      Math.trunc(overrides.maxWallMs ?? (policy.allowWallOverrun
+        ? this.limits.maxWallMs
+        : this.remainingWallMs())),
+      Math.max(1, parentWallRemaining),
+    ));
+    const sliceBytes = Math.max(2_048, Math.min(
+      Math.trunc(overrides.sliceBytes ?? this.limits.sliceBytes), maxBytes,
+    ));
+    const sliceRecords = Math.max(1, Math.min(
+      Math.trunc(overrides.sliceRecords ?? this.limits.sliceRecords), maxRecords, maxEvents,
+    ));
+    return new CaptureWorkBudget({
+      maxBytes,
+      maxRecords,
+      maxEvents,
+      maxWallMs,
+      sliceBytes,
+      sliceRecords,
+    }, this, policy);
+  }
 
   remainingSlice(retryOversizedRecord = false) {
     if (!this.canContinue()) return null;
-    const remainingBytes = this.limits.maxBytes - this.bytesRead;
+    const remainingBytes = this.remainingByteBudget();
     if (remainingBytes < 2_048) return null;
     return {
       maxBytes: Math.max(
@@ -59,46 +117,98 @@ export class CaptureWorkBudget {
         1,
         Math.min(
           this.limits.sliceRecords,
-          this.limits.maxRecords - this.recordsParsed,
-          this.limits.maxEvents - this.eventsAppended,
+          this.remainingRecordSlots(),
+          this.remainingEventSlots(),
         ),
       ),
     };
   }
 
-  canContinue() {
-    return this.exhaustedBy() === null;
+  canContinue(): boolean {
+    const parentCanContinue = this.parent
+      ? (this.policy.allowWallOverrun
+        ? this.parent.countersCanContinue()
+        : this.parent.canContinue())
+      : true;
+    return parentCanContinue && this.localExhaustedBy() === null;
   }
 
   recordSlice(input: { bytesRead: number; recordsParsed: number; eventsAppended: number }) {
-    this.bytesRead += Math.max(0, input.bytesRead);
-    this.recordsParsed += Math.max(0, input.recordsParsed);
-    this.eventsAppended += Math.max(0, input.eventsAppended);
+    const bytesRead = Math.max(0, input.bytesRead);
+    const recordsParsed = Math.max(0, input.recordsParsed);
+    const eventsAppended = Math.max(0, input.eventsAppended);
+    this.bytesRead += bytesRead;
+    this.recordsParsed += recordsParsed;
+    this.eventsAppended += eventsAppended;
     this.slices += 1;
+    this.parent?.recordSlice({ bytesRead, recordsParsed, eventsAppended });
   }
 
   recordYield() {
     this.yields += 1;
+    this.parent?.recordYield();
   }
 
-  elapsedWallMs() {
-    return Math.max(0, performance.now() - this.startedAt);
+  elapsedWallMs(): number {
+    return this.parent?.elapsedWallMs() ?? Math.max(0, performance.now() - this.startedAt);
   }
 
-  remainingWallMs() {
-    return Math.max(0, this.limits.maxWallMs - this.elapsedWallMs());
+  remainingWallMs(): number {
+    const local = Math.max(0, this.limits.maxWallMs - (performance.now() - this.startedAt));
+    return this.policy.allowWallOverrun
+      ? local
+      : Math.min(local, this.parent?.remainingWallMs() ?? local);
   }
 
   canStart(minimumWallMs = 1) {
     return this.canContinue() && this.remainingWallMs() >= Math.max(0, minimumWallMs);
   }
 
-  remainingEventSlots() {
-    return Math.max(0, this.limits.maxEvents - this.eventsAppended);
+  remainingEventSlots(): number {
+    return Math.min(
+      Math.max(0, this.limits.maxEvents - this.eventsAppended),
+      this.parent?.remainingEventSlots() ?? Number.MAX_SAFE_INTEGER,
+    );
+  }
+
+  remainingRecordSlots(): number {
+    return Math.min(
+      Math.max(0, this.limits.maxRecords - this.recordsParsed),
+      this.parent?.remainingRecordSlots() ?? Number.MAX_SAFE_INTEGER,
+    );
+  }
+
+  remainingByteBudget(): number {
+    return Math.min(
+      Math.max(0, this.limits.maxBytes - this.bytesRead),
+      this.parent?.remainingByteBudget() ?? Number.MAX_SAFE_INTEGER,
+    );
   }
 
   status(): CaptureBudgetStatus {
-    const exhaustedBy = this.exhaustedBy();
+    const aggregate = this.parent?.status() ?? this.rootStatus();
+    const exhaustedBy = aggregate.exhaustedBy ?? this.localExhaustedBy();
+    return {
+      // Source receipts retain the aggregate ceilings/counters. This keeps
+      // the existing dashboard and worker contract stable while canContinue()
+      // still observes the narrower source-local share.
+      maxBytes: aggregate.maxBytes,
+      maxRecords: aggregate.maxRecords,
+      maxEvents: aggregate.maxEvents,
+      maxWallMs: aggregate.maxWallMs,
+      bytesRead: aggregate.bytesRead,
+      recordsParsed: aggregate.recordsParsed,
+      eventsAppended: aggregate.eventsAppended,
+      slices: aggregate.slices,
+      yields: aggregate.yields,
+      elapsedWallMs: aggregate.elapsedWallMs,
+      exhausted: exhaustedBy !== null,
+      exhaustedBy,
+    };
+  }
+
+  private rootStatus(): CaptureBudgetStatus {
+    const exhaustedBy = this.localExhaustedBy();
     return {
       maxBytes: this.limits.maxBytes,
       maxRecords: this.limits.maxRecords,
@@ -115,11 +225,16 @@ export class CaptureWorkBudget {
     };
   }
 
-  private exhaustedBy(): CaptureBudgetStatus["exhaustedBy"] {
+  private localExhaustedBy(): BudgetExhaustion {
     if (this.limits.maxBytes - this.bytesRead < 2_048) return "bytes";
     if (this.recordsParsed >= this.limits.maxRecords) return "records";
     if (this.eventsAppended >= this.limits.maxEvents) return "events";
-    if (this.elapsedWallMs() >= this.limits.maxWallMs) return "wall";
+    if (performance.now() - this.startedAt >= this.limits.maxWallMs) return "wall";
     return null;
+  }
+
+  private countersCanContinue(): boolean {
+    return this.remainingByteBudget() >= 2_048 &&
+      this.remainingRecordSlots() > 0 && this.remainingEventSlots() > 0;
   }
 }

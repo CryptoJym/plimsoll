@@ -12,7 +12,11 @@ import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
 import type { GrokUsageScanResult, GrokUsageTailer } from "./grok-usage-tailer";
 import { captureBaselineStatus } from "./capture-baseline";
-import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
+import {
+  AUTOMATIC_CAPTURE_LIMITS,
+  CaptureWorkBudget,
+  type CaptureBudgetStatus,
+} from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
 
@@ -25,6 +29,11 @@ const AUTOMATIC_CAPTURE_SOURCE_TURN_KEY = "automatic_capture_source_turn";
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
 const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
+/** Leave a small cooperative wall-time floor for every capture source. */
+// Grok's own discovery wall is 50 ms. Keep at least one complete discovery
+// quantum available even when a preceding synchronous call overran the
+// aggregate 200 ms clock.
+const SOURCE_MIN_WALL_MS = 50;
 type RepairStage = typeof REPAIR_STAGES[number];
 type RepairService = { next: number; cycles: number; stages: Record<RepairStage, {
   attempts: number; completed: number; failures: number; rowsVisited: number; lastSuccessAt: string | null;
@@ -747,6 +756,23 @@ export class CollectorMaintenance {
     const firstRepair = repairService.next % REPAIR_STAGES.length;
     repairService.cycles += 1;
     const captureFirst = repairService.cycles % 2 === 0;
+    const sourceOrder = this.grokTailer
+      ? ["codex", "claude_code", "grok"] as const
+      : ["codex", "claude_code"] as const;
+    // Keep the pre-Grok two-source cadence byte-for-byte compatible. The
+    // reserved floor is needed only when the third producer is installed.
+    const captureReserveWallMs = this.grokTailer ? sourceOrder.length * SOURCE_MIN_WALL_MS : 0;
+    // Rotate before any repair or source work can fail or overrun. A failed
+    // repair must not pin the next cadence to the same capture producer.
+    const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
+    const storedIndex = (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex");
+    const firstIndex = storedIndex >= 0 ? storedIndex : 0;
+    const runOrder = sourceOrder.map((_, offset) => sourceOrder[(firstIndex + offset) % sourceOrder.length]!);
+    setMaintenanceState(
+      this.buffer.database,
+      AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
+      sourceOrder[(firstIndex + 1) % sourceOrder.length]!,
+    );
     let repairTurnAdvanced = false;
     const saveRepairService = () => setMaintenanceState(this.buffer.database,
       REPAIR_SERVICE_KEY, JSON.stringify(repairService));
@@ -775,6 +801,7 @@ export class CollectorMaintenance {
       for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
         const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
         if (this.signal?.aborted || !budget.canStart(5) ||
+            (!captureFirst && budget.remainingWallMs() <= captureReserveWallMs) ||
             (offset > 0 && performance.now() - repairStarted >= 75)) {
           postCaptureDeferred.push(stage);
           continue;
@@ -837,26 +864,34 @@ export class CollectorMaintenance {
     const phase = baselineAtStart.sources.every((source) => source.status === "complete")
       ? "capture" as const
       : "baseline" as const;
-    // Advance before admitted capture, including a possible slow-source kill.
-    // An exhausted repair turn cannot spend the next source's turn. With a
-    // Grok usage tailer the turn rotates over three sources, so each one
-    // leads the shared allowance every third cadence.
-    const sourceOrder = this.grokTailer
-      ? ["codex", "claude_code", "grok"] as const
-      : ["codex", "claude_code"] as const;
-    const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
-    const firstIndex = Math.max(0, (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex"));
-    const runOrder = sourceOrder.map((_, offset) => sourceOrder[(firstIndex + offset) % sourceOrder.length]!);
-    if (budget.canContinue()) setMaintenanceState(
-      this.buffer.database,
-      AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
-      sourceOrder[(firstIndex + 1) % sourceOrder.length]!,
-    );
+    // Divide each still-available global allowance among the sources that have
+    // not had their turn yet. The parent budget remains a hard cap; the child
+    // view prevents an early, slow source from spending the later source's
+    // byte/record/event/wall share. Unused capacity naturally flows to the
+    // following source because the divisor shrinks after every turn.
+    const sourceBudget = (remainingSources: number) => {
+      const divisor = Math.max(1, remainingSources);
+      const bytes = Math.max(2_048, Math.floor(budget.remainingByteBudget() / divisor));
+      const records = Math.max(1, Math.floor(budget.remainingRecordSlots() / divisor));
+      const events = Math.max(1, Math.floor(budget.remainingEventSlots() / divisor));
+      const wall = Math.max(SOURCE_MIN_WALL_MS, Math.floor(budget.remainingWallMs() / divisor));
+      return budget.scoped({
+        maxBytes: bytes,
+        maxRecords: records,
+        maxEvents: events,
+        maxWallMs: wall,
+        sliceBytes: Math.min(AUTOMATIC_CAPTURE_LIMITS.sliceBytes, bytes),
+        sliceRecords: Math.min(AUTOMATIC_CAPTURE_LIMITS.sliceRecords, records, events),
+      }, { allowWallOverrun: true });
+    };
+    const scopedCaptureBudget = (remainingSources: number) => this.grokTailer
+      ? sourceBudget(remainingSources)
+      : budget;
     const startedAt = new Date().toISOString();
     let rollout: RolloutScanResult | undefined;
     let transcript: TranscriptScanResult | undefined;
     let grok: GrokUsageScanResult | undefined;
-    const runRollout = async () => {
+    const runRollout = async (sourceBudget: CaptureWorkBudget) => {
       this.current = { phase, source: "codex", startedAt, budget };
       const sourceAccepted = options.onProgress?.({
         source: "codex",
@@ -867,19 +902,19 @@ export class CollectorMaintenance {
       return this.rolloutTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
-        automatic: { phase, budget },
+        automatic: { phase, budget: sourceBudget },
         signal: this.signal,
         quarantine: options.quarantine?.source === "codex" && options.quarantine.candidateHash
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "codex", ...progress }) ?? true,
-        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
+        deferredBeforeIo: !sourceBudget.canContinue() || !sourceAccepted ||
           (options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan"),
       }).finally(() => {
         codexCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
     };
-    const runTranscript = async () => {
+    const runTranscript = async (sourceBudget: CaptureWorkBudget) => {
       this.current = { phase, source: "claude_code", startedAt, budget };
       const sourceAccepted = options.onProgress?.({
         source: "claude_code",
@@ -890,19 +925,19 @@ export class CollectorMaintenance {
       return this.transcriptTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
-        automatic: { phase, budget },
+        automatic: { phase, budget: sourceBudget },
         signal: this.signal,
         quarantine: options.quarantine?.source === "claude_code" && options.quarantine.candidateHash
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "claude_code", ...progress }) ?? true,
-        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
+        deferredBeforeIo: !sourceBudget.canContinue() || !sourceAccepted ||
           (options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan"),
       }).finally(() => {
         claudeCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
     };
-    const runGrok = async (tailer: GrokUsageTailer) => {
+    const runGrok = async (tailer: GrokUsageTailer, sourceBudget: CaptureWorkBudget) => {
       this.current = { phase, source: "grok", startedAt, budget };
       // Announce the source before any filesystem work, as the other two do,
       // so a stall inside the Grok scan is held against Grok's own stage and
@@ -913,18 +948,20 @@ export class CollectorMaintenance {
         candidateHash: null,
       }) !== false;
       return tailer.scan({
-        budget,
+        budget: sourceBudget,
         now: new Date(startedAt),
         signal: this.signal,
-        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
+        deferredBeforeIo: !sourceBudget.canContinue() || !sourceAccepted ||
           (options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan"),
       });
     };
     try {
-      for (const source of runOrder) {
-        if (source === "codex") rollout = await runRollout();
-        else if (source === "claude_code") transcript = await runTranscript();
-        else if (this.grokTailer) grok = await runGrok(this.grokTailer);
+      for (let index = 0; index < runOrder.length; index += 1) {
+        const source = runOrder[index]!;
+        const scoped = scopedCaptureBudget(runOrder.length - index);
+        if (source === "codex") rollout = await runRollout(scoped);
+        else if (source === "claude_code") transcript = await runTranscript(scoped);
+        else if (this.grokTailer) grok = await runGrok(this.grokTailer, scoped);
       }
       this.lastBudget = budget.status();
       if (this.signal?.aborted || rollout?.aborted || transcript?.aborted || grok?.aborted) {
