@@ -206,6 +206,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-budget
 
+      - name: Prove Grok usage capture from Grok's own usage files (eco-6hoxj.163.20)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:grok-usage
+
       - name: Prove maintenance lock conflict rolls back for retry
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sqlite-lock
