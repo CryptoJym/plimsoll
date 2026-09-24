@@ -985,6 +985,20 @@ export const FIXTURES: Fixture[] = [
       error: /proof-owned CI settings/,
     }),
   })),
+  ...(["step", "job", "workflow"] as const).map((level): Fixture => ({
+    name: `otlp_only_${level}_env_none`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `the ${level} env sets OTLP_SPOOL_PROOF_ONLY=none for the counted OTLP proof`,
+    build: (input) => {
+      const line = "pnpm proof:otlp-intake-spool";
+      const env = { OTLP_SPOOL_PROOF_ONLY: "none" };
+      const edited = level === "step" ? setStepKey(input, line, "env", env)
+        : level === "job" ? setJobKey(input, line, "env", env)
+        : editWorkflow(input, (document) => document.set("env", env));
+      return { input: edited, error: /proof-owned CI settings/ };
+    },
+  })),
   {
     name: "pnpm_config_set_script_shell_line",
     origin: "gate",

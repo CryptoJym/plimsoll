@@ -39,7 +39,7 @@ import { PROOF_SUITES, readProofSuites } from "./proof-suites";
  * unknown action before its proofs or run in a container, and the repository
  * may not configure how pnpm runs scripts (script-shell, node-options, a
  * pnpmfile). A counted proof may not receive a variable it reads from a
- * workflow assignment or step `env:`; the explicit allow-list is
+ * workflow assignment or workflow/job/step `env:`; the explicit allow-list is
  * `PLIMSOLL_PROOF_HOME` and `REJECTION_PROOF_SCALE`. Runtime pnpm/npm config
  * writes are refused through the last proof. Every other unit needs a reviewed entry in
  * scripts/proof-local-only.json.
@@ -70,9 +70,11 @@ function readsProcessEnvironment(source: string, name: string) {
   return new RegExp("process\\.env(?:\\." + escaped + "(?![A-Za-z0-9_])|\\[\\s*[\"'`]" + escaped + "[\"'`]\\s*\\])").test(source);
 }
 
-function proofOwnedEnvironmentProblems(source: string, names: string[], where: string) {
+function proofOwnedEnvironmentProblems(source: string, names: string[], where: string, values?: Record<string, unknown> | null) {
   return names
-    .filter((name) => !PROOF_ENV_ALLOWLIST.has(name) && readsProcessEnvironment(source, name))
+    .filter((name) => !PROOF_ENV_ALLOWLIST.has(name) &&
+      !(name === "NODE_OPTIONS" && !changesExecution(name, values?.[name])) &&
+      readsProcessEnvironment(source, name))
     .map((name) => `${where} sets ${name}, which is read by the counted proof; proof-owned CI settings are not allowed (allow-list: ${[...PROOF_ENV_ALLOWLIST].join(", ")})`);
 }
 
@@ -395,7 +397,9 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           }
           const source = input.readFile(reached.file) ?? "";
           errors.push(...proofOwnedEnvironmentProblems(source, line.form.assignments, `${where} line ${line.number}`));
-          errors.push(...proofOwnedEnvironmentProblems(source, step.env ?? [], `${where} env`));
+          errors.push(...proofOwnedEnvironmentProblems(source, model.env ?? [], `${model.path} env`, model.envValues));
+          errors.push(...proofOwnedEnvironmentProblems(source, model.jobs[job]?.env ?? [], `${model.path} job "${job}" env`, model.jobs[job]?.envValues));
+          errors.push(...proofOwnedEnvironmentProblems(source, step.env ?? [], `${where} env`, step.envValues));
           const unit = units.get(reached.file);
           if (!unit) continue;
           const invocation = { workflow: model.path, job, step: step.name, stepIndex: step.stepIndex, position, line: step.line, command: line.text, via: reached.via };
