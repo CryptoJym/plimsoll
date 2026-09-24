@@ -493,10 +493,12 @@ Config tools:
       Sanitized, bounded diagnostics: versions, coarse readiness, counters,
       aggregate log codes. No paths, prompts, tokens, or secrets.
   lifecycle update --preflight
-      Read-only check to run BEFORE stopping the collector for an update: the
-      snapshot method the update will use and the free space it needs. Exits 1
-      when a full ledger copy is needed and the volume lacks the ledger size
-      plus max(2 GiB, 5%). Clone-capable volumes need no copy space.
+      Read-only check (writes nothing) to run BEFORE stopping the collector for
+      an update: the snapshot method the update will use and the free space it
+      needs. Exits 1 when a full ledger copy is needed and the volume lacks
+      twice the ledger size (snapshot plus a rollback's copy) plus
+      max(2 GiB, 5%). Clone-capable volumes need no copy space. The update
+      itself refuses while any other process has the ledger open.
   lifecycle snapshots list [--keep N] [--json]
       Every update snapshot and runtime version: created, size, method, the
       operation's state, and whether retention keeps it. Read-only.
@@ -504,8 +506,10 @@ Config tools:
       Preview (default, changes nothing) or remove what retention does not
       keep: the N (default 2) newest completed update snapshots, the newest
       one that restores the previous runtime, anything an unfinished or
-      unknown operation owns, and the runtimes those restore. Every completed
-      update also applies this with the default count.
+      unknown operation owns, anything whose completion order cannot be
+      proved, and the runtimes those restore. Every removal is recorded
+      durably before it happens. Every completed update also applies this
+      with the default count.
 `);
 }
 

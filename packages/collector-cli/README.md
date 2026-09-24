@@ -67,9 +67,10 @@ npx @plimsoll/cli@<version> lifecycle update --preflight
 ```
 
 `lifecycle update --artifact self` refuses to run from a source checkout or a
-shell shim; it pins only a real packaged bundle. With the collector stopped
-on APFS, its ledger snapshot is a clone that costs no disk when taken; every
-completed update keeps only the two newest completed snapshots and the
+shell shim; it pins only a real packaged bundle. It refuses while any other
+process has the ledger open, so stop the collector first. With the collector
+stopped on APFS, its ledger snapshot is a clone that costs no disk when taken;
+every completed update keeps only the two newest completed snapshots and the
 runtimes they restore (see `docs/local-lifecycle.md`). Every operation prints one
 JSON receipt naming exactly what it owns, what it retained, and what only a
 separate purge may remove.
