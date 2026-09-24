@@ -183,6 +183,7 @@ import {
   resolveSelfArtifact,
 } from "./lifecycle-adapters";
 import { PURGE_CONFIRMATION } from "./lifecycle";
+import { startStatusSummaryWriter } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
 import {
   applyCodexConfig,
@@ -3302,6 +3303,15 @@ async function main() {
         return;
       }
       ownership.release();
+      // eco-6hoxj.163.34: the private summary local readers (the menubar)
+      // read instead of running `plimsoll status`. Stopped with the timers.
+      timers.push(startStatusSummaryWriter({
+        home: collectorHome(),
+        instanceId: server.plimsollInstanceId,
+        collectorVersion: PLIMSOLL_VERSION,
+        port: config.port,
+        stats: server.plimsollCachedStats,
+      }));
       console.log(
         JSON.stringify({
           status: "active",

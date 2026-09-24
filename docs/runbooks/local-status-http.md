@@ -60,6 +60,27 @@ intended gate: `curl http://127.0.0.1:<port>/status` →
 | LaunchAgent load readiness / `observeCollectorListener` | Already credentialed | Unchanged: `lifecycleProbeHeaders()` presents the management credential |
 | `scripts/install-artifact-proof.ts`, `scripts/packaged-runtime-proof.ts` | Already `/healthz` | Unchanged |
 | Isolated proofs without `localAuth` | Legacy unauthenticated `/status` | Unchanged on purpose: credentials absent means the legacy loopback boundary |
+| macOS menubar (`packages/mac-menubar`) | Ran `plimsoll status` per refresh | Reads `status-summary.json` (below) and checks `GET /healthz` names the same `instanceId`; runs no `plimsoll` command |
+
+## Status summary file
+
+The running collector writes `status-summary.json` in its home every 15 s
+and once as soon as it listens (eco-6hoxj.163.34). It writes a temp file
+(mode 0600) and fsyncs it before renaming it into place, so a reader never
+sees a partial file. It holds exactly:
+
+```json
+{"schema":"plimsoll.status-summary/v1","instanceId":"<the /healthz value>",
+ "collectorVersion":"<package version>","port":48271,"updatedAt":"<ISO time>",
+ "stats":{"count":0,"tokenAttributedEvents":0,"totalInputTokens":0,"totalOutputTokens":0}}
+```
+
+`stats` are the lifetime counters from the daemon's `/status` cache; the
+write reads no ledger row, so it costs the same on any ledger size. It is
+`null` until the projection is ready. The file names no credential, path,
+account or event. It stays after the collector stops, so a reader must
+compare `instanceId` with `GET /healthz` before calling the collector
+running.
 
 ## Operator commands
 
@@ -91,3 +112,7 @@ persists across two reads at least 10 s apart.
   credential.
 - `pnpm proof:status-http-rollout` — repeats that contract and runs the
   migrated fleet reader against `/healthz` only.
+- `pnpm proof:status-summary` — the summary file is private, exactly shaped,
+  atomic for a concurrent reader, written without a SQL statement, free of
+  credentials and paths, and names the same run as `/healthz`; a real
+  `plimsoll start` daemon writes it.

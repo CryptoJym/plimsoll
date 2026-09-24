@@ -548,4 +548,6 @@ export type CollectorServer = http.Server & {
   plimsollHttpDiagnostics: CollectorServerDiagnostics;
   /** This run's random id, as GET /healthz returns it. */
   plimsollInstanceId: string;
+  /** The lifetime stats from the /status cache; never reads the ledger. */
+  plimsollCachedStats: () => unknown;
 };

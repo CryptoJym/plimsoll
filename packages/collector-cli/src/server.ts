@@ -2069,6 +2069,8 @@ export function createCollectorServer(
   httpServer.keepAliveTimeout = 0;
   const server = httpServer as CollectorServer;
   server.plimsollInstanceId = instanceId;
+  // The lifetime stats /status serves from its cache: memory only, no ledger read.
+  server.plimsollCachedStats = () => lastCoherentStatus?.body.stats ?? null;
   server.plimsollHttpDiagnostics = {
     // Shutdown flush closes the intake-spool window too, so a daemon going
     // down does not take an open count with it. Its line shape is not a

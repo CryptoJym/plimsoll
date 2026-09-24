@@ -384,6 +384,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm docs:privacy --check
 
+      - name: Prove the private status summary and the /healthz run identity (eco-6hoxj.163.34)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:status-summary
+
       # Independent of the TypeScript typecheck. The cache holds the SDK module
       # cache that dominates a cold build (~32 s of ~38 s on an M-series Mac).
       # That cache records its absolute path and fails, not rebuilds, when
