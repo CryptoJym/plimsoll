@@ -122,10 +122,11 @@ struct PlimsollMenubarCoreTests {
         guard case .running = CollectorMonitor.state(home: home.url, now: written + 5, isLive: { _ in true }) else {
             Issue.record("a live collector with a fresh summary is running"); return
         }
+        let summary = try SummaryFile.read(home: home.url).get()
         #expect(CollectorMonitor.state(home: home.url, now: written + 600, isLive: { _ in true })
-            == .notUpdating(try SummaryFile.read(home: home.url).get(), age: 600))
+            == .notUpdating(summary, age: 600))
         #expect(CollectorMonitor.state(home: home.url, now: written + 7_200, isLive: { _ in false })
-            == .stopped(try SummaryFile.read(home: home.url).get(), age: 7_200))
+            == .stopped(summary, age: 7_200))
         #expect(CollectorMonitor.state(home: nil, isLive: { _ in true }) == .unavailable(.invalidHome))
     }
 
