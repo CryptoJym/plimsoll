@@ -1020,7 +1020,7 @@ export class RolloutTailer {
             const next = readJsonlContinuation(candidate.file, candidate.stat, cursor, limits, this.io, {
               database: this.buffer.database, provider: "codex", cursorKey: this.cursorKey(candidate.file), root: root ?? undefined,
               directory: root?.directory ?? this.sessionsDir,
-              deadline: performance.now() + (automatic?.budget.remainingWallMs() ?? 200),
+              deadline: automatic ? automatic.budget.unitDeadline() : performance.now() + 200,
               eligible: () => {
                 if (options.signal?.aborted) return false;
                 if (this.inventoryConfigured && !root) return false;

@@ -12,11 +12,7 @@ import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
 import type { GrokUsageScanResult, GrokUsageTailer } from "./grok-usage-tailer";
 import { captureBaselineStatus } from "./capture-baseline";
-import {
-  AUTOMATIC_CAPTURE_LIMITS,
-  CaptureWorkBudget,
-  type CaptureBudgetStatus,
-} from "./capture-work-budget";
+import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
 
@@ -29,15 +25,37 @@ const AUTOMATIC_CAPTURE_SOURCE_TURN_KEY = "automatic_capture_source_turn";
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
 const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
-/** Leave a small cooperative wall-time floor for every capture source. */
-// Grok's own discovery wall is 50 ms. Keep at least one complete discovery
-// quantum available even when a preceding synchronous call overran the
-// aggregate 200 ms clock.
-const SOURCE_MIN_WALL_MS = 50;
+const AUTOMATIC_CAPTURE_FAIRNESS_KEY = "automatic_capture_fairness_v1";
+const CAPTURE_SOURCES = ["codex", "claude_code", "grok"] as const;
 type RepairStage = typeof REPAIR_STAGES[number];
 type RepairService = { next: number; cycles: number; stages: Record<RepairStage, {
   attempts: number; completed: number; failures: number; rowsVisited: number; lastSuccessAt: string | null;
 }> };
+type CaptureSource = typeof CAPTURE_SOURCES[number];
+
+/**
+ * Durable capture debt (eco-6hoxj.163.42). `owed` counts, per source, the
+ * cadences in a row in which the source had (or, unadmitted, may have had)
+ * due work and committed nothing. The most-owed source leads the next
+ * cadence. `captureFirst` hands the next cadence to capture after a
+ * repair-first cadence left a capture source unadmitted. Path- and
+ * content-free.
+ */
+export type AutomaticCaptureFairness = {
+  version: 1;
+  owed: Record<CaptureSource, number>;
+  captureFirst: boolean;
+};
+
+/** One cadence's capture turn, for receipts and proofs. */
+export type AutomaticCaptureTurn = {
+  captureFirst: boolean;
+  order: CaptureSource[];
+  admitted: Partial<Record<CaptureSource, boolean>>;
+  progressed: Partial<Record<CaptureSource, boolean>>;
+  owedBefore: Record<CaptureSource, number>;
+  owedAfter: Record<CaptureSource, number>;
+};
 
 export function automaticRepairServiceStatus(database: Database.Database): RepairService {
   const stored = maintenanceState(database, REPAIR_SERVICE_KEY);
@@ -45,6 +63,25 @@ export function automaticRepairServiceStatus(database: Database.Database): Repai
   return { next: 0, cycles: 0, stages: Object.fromEntries(REPAIR_STAGES.map(stage => [stage, {
     attempts: 0, completed: 0, failures: 0, rowsVisited: 0, lastSuccessAt: null,
   }])) as RepairService["stages"] };
+}
+
+export function automaticCaptureFairnessStatus(database: Database.Database): AutomaticCaptureFairness {
+  const fairness: AutomaticCaptureFairness = {
+    version: 1, owed: { codex: 0, claude_code: 0, grok: 0 }, captureFirst: false,
+  };
+  try {
+    const stored = JSON.parse(maintenanceState(database, AUTOMATIC_CAPTURE_FAIRNESS_KEY) ?? "null") as
+      Partial<AutomaticCaptureFairness> | null;
+    if (stored?.version !== 1) return fairness;
+    for (const source of CAPTURE_SOURCES) {
+      const owed = stored.owed?.[source];
+      if (Number.isSafeInteger(owed) && owed! > 0) fairness.owed[source] = Math.min(owed!, 1_000_000);
+    }
+    fairness.captureFirst = stored.captureFirst === true;
+  } catch {
+    // An unreadable debt is no debt: the rotation alone still serves everyone.
+  }
+  return fairness;
 }
 
 function ensureAutomaticCaptureRuntimeState(database: Database.Database) {
@@ -589,6 +626,8 @@ export type CollectorMaintenanceRunResult = {
   captureAdvanced?: boolean;
   postCaptureDeferred?: string[];
   repairService?: RepairService;
+  /** Capture order, admission, progress and debt of this cadence. */
+  captureTurn?: AutomaticCaptureTurn;
   stageTimings?: MaintenanceStageTimings;
 };
 
@@ -751,23 +790,30 @@ export class CollectorMaintenance {
     // overruns the allowance cannot exhaust every cadence before any tailer
     // reads. Repairs on a capture-first cadence use only what capture leaves.
     // Persist the choice before work; neither restarts nor busy sources may
-    // starve either consumer on the intervening turns.
+    // starve either consumer on the intervening turns. The alternation is
+    // not trusted alone: a repair-first cadence that left a capture source
+    // unadmitted hands the next cadence to capture, whatever its parity.
     const repairService = automaticRepairServiceStatus(this.buffer.database);
     const firstRepair = repairService.next % REPAIR_STAGES.length;
     repairService.cycles += 1;
-    const captureFirst = repairService.cycles % 2 === 0;
+    const fairness = automaticCaptureFairnessStatus(this.buffer.database);
+    const captureFirst = repairService.cycles % 2 === 0 || fairness.captureFirst;
     const sourceOrder = this.grokTailer
       ? ["codex", "claude_code", "grok"] as const
       : ["codex", "claude_code"] as const;
-    // Keep the pre-Grok two-source cadence byte-for-byte compatible. The
-    // reserved floor is needed only when the third producer is installed.
-    const captureReserveWallMs = this.grokTailer ? sourceOrder.length * SOURCE_MIN_WALL_MS : 0;
     // Rotate before any repair or source work can fail or overrun. A failed
     // repair must not pin the next cadence to the same capture producer.
     const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
     const storedIndex = (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex");
     const firstIndex = storedIndex >= 0 ? storedIndex : 0;
-    const runOrder = sourceOrder.map((_, offset) => sourceOrder[(firstIndex + offset) % sourceOrder.length]!);
+    // The source owed the most cadences leads. The rotation breaks ties (the
+    // sort is stable), so a host with no capture debt runs exactly the
+    // rotation. Admission alone is not the goal: debt only clears when the
+    // source commits, so a source admitted every cadence but never
+    // committing keeps climbing until it leads.
+    const runOrder: CaptureSource[] = sourceOrder
+      .map((_, offset) => sourceOrder[(firstIndex + offset) % sourceOrder.length]!)
+      .sort((left, right) => fairness.owed[right] - fairness.owed[left]);
     setMaintenanceState(
       this.buffer.database,
       AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
@@ -801,7 +847,6 @@ export class CollectorMaintenance {
       for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
         const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
         if (this.signal?.aborted || !budget.canStart(5) ||
-            (!captureFirst && budget.remainingWallMs() <= captureReserveWallMs) ||
             (offset > 0 && performance.now() - repairStarted >= 75)) {
           postCaptureDeferred.push(stage);
           continue;
@@ -864,29 +909,23 @@ export class CollectorMaintenance {
     const phase = baselineAtStart.sources.every((source) => source.status === "complete")
       ? "capture" as const
       : "baseline" as const;
-    // Divide each still-available global allowance among the sources that have
-    // not had their turn yet. The parent budget remains a hard cap; the child
-    // view prevents an early, slow source from spending the later source's
-    // byte/record/event/wall share. Unused capacity naturally flows to the
-    // following source because the divisor shrinks after every turn.
-    const sourceBudget = (remainingSources: number) => {
-      const divisor = Math.max(1, remainingSources);
-      const bytes = Math.max(2_048, Math.floor(budget.remainingByteBudget() / divisor));
-      const records = Math.max(1, Math.floor(budget.remainingRecordSlots() / divisor));
-      const events = Math.max(1, Math.floor(budget.remainingEventSlots() / divisor));
-      const wall = Math.max(SOURCE_MIN_WALL_MS, Math.floor(budget.remainingWallMs() / divisor));
-      return budget.scoped({
-        maxBytes: bytes,
-        maxRecords: records,
-        maxEvents: events,
-        maxWallMs: wall,
-        sliceBytes: Math.min(AUTOMATIC_CAPTURE_LIMITS.sliceBytes, bytes),
-        sliceRecords: Math.min(AUTOMATIC_CAPTURE_LIMITS.sliceRecords, records, events),
-      }, { allowWallOverrun: true });
-    };
-    const scopedCaptureBudget = (remainingSources: number) => this.grokTailer
-      ? sourceBudget(remainingSources)
+    // Each source's turn is a scope of the one shared budget. Every aggregate
+    // ceiling, the wall clock included, stays hard: a source whose turn comes
+    // after the allowance is spent is not admitted, and becomes owed. The
+    // remaining wall is shared among the sources still to run, so one busy
+    // source cannot take a whole cadence; unused time flows to the next. An
+    // admitted turn is progress, not just admission: its first bounded unit
+    // is admitted on the aggregate clock even past its share, and allowed to
+    // finish (`CaptureWorkBudget.unitDeadline`) instead of being abandoned
+    // after its slow read was already paid for. Bytes, records and events
+    // are not divided: a byte share would starve any Grok usage file larger
+    // than one share. The pre-Grok two-source cadence (callers without a
+    // Grok tailer) keeps its budget unchanged.
+    const scopedCaptureBudget = (sourcesLeft: number) => this.grokTailer
+      ? budget.scoped({ maxWallMs: Math.floor(budget.remainingWallMs() / Math.max(1, sourcesLeft)) },
+        { progressUnit: true })
       : budget;
+    const admitted: Partial<Record<CaptureSource, boolean>> = {};
     const startedAt = new Date().toISOString();
     let rollout: RolloutScanResult | undefined;
     let transcript: TranscriptScanResult | undefined;
@@ -908,8 +947,8 @@ export class CollectorMaintenance {
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "codex", ...progress }) ?? true,
-        deferredBeforeIo: !sourceBudget.canContinue() || !sourceAccepted ||
-          (options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan"),
+        deferredBeforeIo: !(admitted.codex = sourceBudget.canContinue() && sourceAccepted &&
+          !(options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan")),
       }).finally(() => {
         codexCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
@@ -931,8 +970,8 @@ export class CollectorMaintenance {
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "claude_code", ...progress }) ?? true,
-        deferredBeforeIo: !sourceBudget.canContinue() || !sourceAccepted ||
-          (options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan"),
+        deferredBeforeIo: !(admitted.claude_code = sourceBudget.canContinue() && sourceAccepted &&
+          !(options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan")),
       }).finally(() => {
         claudeCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
@@ -951,17 +990,16 @@ export class CollectorMaintenance {
         budget: sourceBudget,
         now: new Date(startedAt),
         signal: this.signal,
-        deferredBeforeIo: !sourceBudget.canContinue() || !sourceAccepted ||
-          (options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan"),
+        deferredBeforeIo: !(admitted.grok = sourceBudget.canContinue() && sourceAccepted &&
+          !(options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan")),
       });
     };
     try {
-      for (let index = 0; index < runOrder.length; index += 1) {
-        const source = runOrder[index]!;
-        const scoped = scopedCaptureBudget(runOrder.length - index);
-        if (source === "codex") rollout = await runRollout(scoped);
-        else if (source === "claude_code") transcript = await runTranscript(scoped);
-        else if (this.grokTailer) grok = await runGrok(this.grokTailer, scoped);
+      for (const [index, source] of runOrder.entries()) {
+        const sourceBudget = scopedCaptureBudget(runOrder.length - index);
+        if (source === "codex") rollout = await runRollout(sourceBudget);
+        else if (source === "claude_code") transcript = await runTranscript(sourceBudget);
+        else if (this.grokTailer) grok = await runGrok(this.grokTailer, sourceBudget);
       }
       this.lastBudget = budget.status();
       if (this.signal?.aborted || rollout?.aborted || transcript?.aborted || grok?.aborted) {
@@ -977,6 +1015,35 @@ export class CollectorMaintenance {
       this.current = null;
     }
     if (!rollout || !transcript) throw new Error("automatic_maintenance_result_missing");
+    // Settle capture debt before anything else can fail. A durable commit
+    // (records, a checkpoint, a Grok document or sweep step) clears it; an
+    // unadmitted source, or an admitted one with backlog that committed
+    // nothing, owes one more cadence and moves toward the lead.
+    const jsonlProgressed = (result: RolloutScanResult | TranscriptScanResult) =>
+      result.slicesCommitted > 0 || (result.recordsCommitted ?? 0) > 0 ||
+      (result.continuationBytesAdvanced ?? 0) > 0;
+    const progressed: Partial<Record<CaptureSource, boolean>> = {
+      codex: jsonlProgressed(rollout),
+      claude_code: jsonlProgressed(transcript),
+      ...(grok ? { grok: grok.recordsCommitted > 0 || grok.filesParsed > 0 || grok.activity.discoveryEntries > 0 } : {}),
+    };
+    const due: Partial<Record<CaptureSource, boolean>> = {
+      codex: !admitted.codex || rollout.deferredGenerations > 0,
+      claude_code: !admitted.claude_code || transcript.deferredGenerations > 0,
+      ...(grok ? { grok: !admitted.grok || grok.deferredGenerations > 0 || grok.activity.truncated } : {}),
+    };
+    const owedAfter = { ...fairness.owed };
+    for (const source of runOrder) {
+      owedAfter[source] = progressed[source] || !due[source] ? 0 : Math.min(fairness.owed[source] + 1, 1_000_000);
+    }
+    setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY, JSON.stringify({
+      version: 1,
+      owed: owedAfter,
+      captureFirst: !captureFirst && runOrder.some((source) => !admitted[source]),
+    } satisfies AutomaticCaptureFairness));
+    const captureTurn: AutomaticCaptureTurn = {
+      captureFirst, order: runOrder, admitted, progressed, owedBefore: fairness.owed, owedAfter,
+    };
     if (rollout.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
     }
@@ -1028,6 +1095,7 @@ export class CollectorMaintenance {
         (grok?.recordsCommitted ?? 0) > 0,
       postCaptureDeferred,
       repairService,
+      captureTurn,
       stageTimings: {
         codexCaptureMs,
         claudeCaptureMs,

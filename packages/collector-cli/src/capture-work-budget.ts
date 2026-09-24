@@ -30,8 +30,13 @@ type BudgetExhaustion = CaptureBudgetStatus["exhaustedBy"];
 
 type BudgetScopeOptions = Partial<CaptureBudgetLimits>;
 type BudgetScopePolicy = {
-  /** Permit a reserved source slice after an earlier synchronous wall overrun. */
-  allowWallOverrun?: boolean;
+  /**
+   * This scope is one source's turn. Until it records its first unit, the
+   * scope's own wall share does not stop it (the aggregate clock still
+   * does), and that unit is bounded by its byte/record slice instead of the
+   * wall clock (see `unitDeadline`).
+   */
+  progressUnit?: boolean;
 };
 
 /**
@@ -40,6 +45,10 @@ type BudgetScopePolicy = {
  * SQLite commits all consume the same cadence allowance. A single synchronous
  * filesystem/SQLite call can still overrun the deadline; every call site must
  * check before starting the next bounded unit.
+ *
+ * The wall ceiling is an admission ceiling and it is hard: once the aggregate
+ * clock is spent, neither the root nor any scope admits another unit, so the
+ * budgeted work of a cadence ends at most one bounded unit past `maxWallMs`.
  */
 export class CaptureWorkBudget {
   private readonly startedAt = performance.now();
@@ -59,11 +68,12 @@ export class CaptureWorkBudget {
    * Create a source-local view of this budget.
    *
    * Automatic maintenance has several independent producers sharing one
-   * cadence. A producer which reaches the global wall/byte/event ceiling first
-   * must not consume the allowance reserved for the producers that follow it.
-   * A scoped budget keeps the parent ceilings as a hard upper bound while
-   * enforcing the supplied per-source caps. Accounting is charged to both
-   * views, so the existing aggregate receipt remains unchanged.
+   * cadence. A producer which reaches the global byte/record/event ceiling
+   * first must not consume the allowance reserved for the producers that
+   * follow it. A scoped budget keeps every parent ceiling, the wall clock
+   * included, as a hard upper bound while enforcing the supplied per-source
+   * caps. Accounting is charged to both views, so the existing aggregate
+   * receipt remains unchanged.
    */
   scoped(overrides: BudgetScopeOptions, policy: BudgetScopePolicy = {}): CaptureWorkBudget {
     const maxBytes = Math.max(2_048, Math.min(
@@ -78,12 +88,10 @@ export class CaptureWorkBudget {
       Math.trunc(overrides.maxEvents ?? this.remainingEventSlots()),
       Math.max(1, this.remainingEventSlots()),
     ));
-    const parentWallRemaining = policy.allowWallOverrun ? Number.MAX_SAFE_INTEGER : this.remainingWallMs();
-    const maxWallMs = Math.max(1, Math.min(
-      Math.trunc(overrides.maxWallMs ?? (policy.allowWallOverrun
-        ? this.limits.maxWallMs
-        : this.remainingWallMs())),
-      Math.max(1, parentWallRemaining),
+    // A scope may narrow the parent's wall clock, never extend it.
+    const maxWallMs = Math.max(0, Math.min(
+      Math.trunc(overrides.maxWallMs ?? Number.MAX_SAFE_INTEGER),
+      this.remainingWallMs(),
     ));
     const sliceBytes = Math.max(2_048, Math.min(
       Math.trunc(overrides.sliceBytes ?? this.limits.sliceBytes), maxBytes,
@@ -125,12 +133,31 @@ export class CaptureWorkBudget {
   }
 
   canContinue(): boolean {
-    const parentCanContinue = this.parent
-      ? (this.policy.allowWallOverrun
-        ? this.parent.countersCanContinue()
-        : this.parent.canContinue())
-      : true;
-    return parentCanContinue && this.localExhaustedBy() === null;
+    if (!(this.parent?.canContinue() ?? true)) return false;
+    const local = this.localExhaustedBy();
+    return local === null || (local === "wall" && this.awaitingFirstUnit());
+  }
+
+  /**
+   * Deadline for the reads inside the next bounded unit. Admission is decided
+   * before the unit starts (`canContinue`/`remainingSlice`); this deadline
+   * only stops a started unit from issuing further reads.
+   *
+   * Until a progress scope records its first unit, that unit gets no wall
+   * deadline. It is still bounded by its byte and record slice, and it was
+   * admitted while the aggregate clock was open. Abandoning it after its slow
+   * synchronous call has been paid for would pay that call again on the next
+   * cadence and never commit: the eco-6hoxj.163.42 review watched two sources
+   * be admitted on every tick and commit nothing.
+   */
+  unitDeadline(): number {
+    return this.awaitingFirstUnit()
+      ? Number.POSITIVE_INFINITY
+      : performance.now() + this.remainingWallMs();
+  }
+
+  private awaitingFirstUnit() {
+    return this.policy.progressUnit === true && this.slices === 0;
   }
 
   recordSlice(input: { bytesRead: number; recordsParsed: number; eventsAppended: number }) {
@@ -155,9 +182,7 @@ export class CaptureWorkBudget {
 
   remainingWallMs(): number {
     const local = Math.max(0, this.limits.maxWallMs - (performance.now() - this.startedAt));
-    return this.policy.allowWallOverrun
-      ? local
-      : Math.min(local, this.parent?.remainingWallMs() ?? local);
+    return Math.min(local, this.parent?.remainingWallMs() ?? local);
   }
 
   canStart(minimumWallMs = 1) {
@@ -231,10 +256,5 @@ export class CaptureWorkBudget {
     if (this.eventsAppended >= this.limits.maxEvents) return "events";
     if (performance.now() - this.startedAt >= this.limits.maxWallMs) return "wall";
     return null;
-  }
-
-  private countersCanContinue(): boolean {
-    return this.remainingByteBudget() >= 2_048 &&
-      this.remainingRecordSlots() > 0 && this.remainingEventSlots() > 0;
   }
 }
