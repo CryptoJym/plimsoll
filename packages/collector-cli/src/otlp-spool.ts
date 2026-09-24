@@ -297,7 +297,7 @@ export type OtlpSpoolHooks = {
   beforeRemove?: (ids: string[]) => void;
 };
 
-function sha256Hex(text: string) {
+function spoolSha256Hex(text: string) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
 
@@ -488,7 +488,7 @@ async function readEnvelope(file: string, stem: string): Promise<ReadResult> {
   }
   // The digest is over the batch exactly as the intake serialized it; JSON
   // round-trips these plain values byte for byte.
-  if (`sha256:${sha256Hex(JSON.stringify(parsed.batch))}` !== parsed.digest) {
+  if (`sha256:${spoolSha256Hex(JSON.stringify(parsed.batch))}` !== parsed.digest) {
     return { ok: false, reason: "spool_digest_mismatch" };
   }
   const batch = validatedBatch(parsed.batch);
@@ -802,7 +802,7 @@ export class OtlpIntakeSpool {
         cause: input.cause,
         committedChunks: input.committedChunks,
         repoContextDropped,
-        digest: `sha256:${sha256Hex(batchText)}`,
+        digest: `sha256:${spoolSha256Hex(batchText)}`,
       });
       content = `${head.slice(0, -1)},"batch":${batchText}}`;
     } catch {
