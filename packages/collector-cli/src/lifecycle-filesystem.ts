@@ -399,12 +399,21 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
    * handful of concurrent lifecycle operations. */
   private readonly fences = new Map<string, LifecycleMutationLease>();
 
+  /**
+   * `--retention keep-all`: this adapter removes nothing an earlier operation
+   * left. Retention only previews (recorded as skipped_by_operator), trash
+   * entries stay, and display receipts are not trimmed.
+   */
+  private readonly keepAll: boolean;
+
   constructor(
     private readonly paths: ManagedLifecyclePaths,
     private readonly service: LifecycleServiceAdapter,
     private readonly database: LifecycleDatabaseAdapter,
     private readonly authority?: LifecycleMutationAuthority,
+    options: { keepAll?: boolean } = {},
   ) {
+    this.keepAll = options.keepAll === true;
     for (const [label, candidate] of Object.entries({
       lifecycleRoot: paths.lifecycleRoot,
       artifactSourceRoot: paths.artifactSourceRoot,
@@ -825,6 +834,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       writeJsonDurable(path.join(this.completedRoot, `${receipt.operationId}.json`), receipt, this.completedRoot);
     }
     writeJsonDurable(path.join(this.receiptsRoot, `${receipt.operationId}-${receipt.operation}.json`), receipt, this.receiptsRoot);
+    if (this.keepAll) return;
     const receipts = fs.readdirSync(this.receiptsRoot)
       .filter((entry) => entry.endsWith(".json"))
       .sort((left, right) => left.localeCompare(right));
@@ -1231,6 +1241,28 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
    * recovered. Nothing is deleted while retention is blocked.
    */
   async retainSnapshots(input: { operationId: string; keep: number; apply: boolean }): Promise<LifecycleRetentionRecord> {
+    if (this.keepAll && input.apply) {
+      // Removes and recovers nothing; the read-only preview only informs the receipt.
+      let wouldRemove: LifecycleRemovedItem[] | undefined;
+      try {
+        const preview = await this.retainSnapshots({ ...input, apply: false });
+        // A blocked preview removes nothing for a reason; "would remove nothing" would hide it.
+        if (preview.status === "preview") wouldRemove = preview.removed;
+      } catch {
+        wouldRemove = undefined;
+      }
+      return {
+        keepSnapshots: input.keep,
+        status: "skipped",
+        skippedReason: "skipped_by_operator",
+        removed: [],
+        removedBytes: 0,
+        recovered: [],
+        keptSnapshots: [],
+        keptVersions: [],
+        ...(wouldRemove ? { wouldRemove } : {}),
+      };
+    }
     const { input: retention, blockedReason } = this.retentionInput();
     const plan = planLifecycleRetention(retention, input.keep);
     const snapshotBytes = new Map(retention.snapshots.map((snapshot) => [snapshot.id, snapshot.bytes]));

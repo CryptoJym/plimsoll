@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-retention", 63);
+const completion = createProofCompletion("lifecycle-retention", 72);
 /**
  * eco-6hoxj.163.30: lifecycle update snapshots are bounded and cheap.
  *
@@ -17,6 +17,10 @@ const completion = createProofCompletion("lifecycle-retention", 63);
  * another process has open is refused before any change (r2), and so is a
  * full copy without room; a crash in the
  * middle of pruning resumes safely; `snapshots prune` dry runs change nothing.
+ * eco-6hoxj.163.47: `--retention keep-all` updates and rollbacks remove no
+ * snapshot, runtime, trash entry or display receipt, record what retention
+ * would have removed, and leave history a later prune still handles; any
+ * other use of the flag fails before any change.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -36,6 +40,7 @@ import {
   LifecycleInterruption,
   LifecycleManager,
   PURGE_CONFIRMATION,
+  parseCompletionReceipt,
   planLifecycleRetention,
   type LifecycleAdapter,
   type LifecycleJournal,
@@ -176,7 +181,7 @@ function createHome(name: string, ledgerMegabytes: number) {
       sourcePath,
     };
   };
-  const adapter = (database?: LifecycleDatabaseAdapter): LifecycleAdapter => {
+  const adapter = (database?: LifecycleDatabaseAdapter, keepAll = false): LifecycleAdapter => {
     process.env.PLIMSOLL_HOME = collector;
     return composeLifecycleAdapter({
       homeDir: home,
@@ -184,6 +189,7 @@ function createHome(name: string, ledgerMegabytes: number) {
       artifactSourceRoot: home,
       service: fixtureService,
       ...(database ? { database } : {}),
+      ...(keepAll ? { keepAll } : {}),
     });
   };
   return {
@@ -197,6 +203,7 @@ function createHome(name: string, ledgerMegabytes: number) {
     artifact,
     adapter,
     manager: (database?: LifecycleDatabaseAdapter) => new LifecycleManager(adapter(database)),
+    keepAllManager: () => new LifecycleManager(adapter(undefined, true)),
     snapshots: () => listDirectory(path.join(lifecycleRoot, "snapshots")),
     versions: () => listDirectory(path.join(lifecycleRoot, "versions")),
     trash: () => listDirectory(path.join(lifecycleRoot, "trash")),
@@ -323,6 +330,20 @@ function treeDigest(root: string) {
   };
   walk(root);
   return { digest: sha256(rows.join("\n")), entries: rows.length };
+}
+
+/** Relative path of every entry under root (never following a link). */
+function relativeEntries(root: string) {
+  const entries: string[] = [];
+  const walk = (directory: string) => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const absolute = path.join(directory, name);
+      entries.push(path.relative(root, absolute));
+      if (fs.lstatSync(absolute).isDirectory()) walk(absolute);
+    }
+  };
+  walk(root);
+  return entries;
 }
 
 function cliEnvironment(home: Home): NodeJS.ProcessEnv {
@@ -787,6 +808,137 @@ syncBuiltinESMExports();
       same(endToEnd.snapshots(), ["cli-2", "cli-3"]) &&
       same(endToEnd.versions(), ["9.0.0-proof", "9.0.1-proof", "9.0.2-proof"]) && !exists(path.join(stub, "calls.log")),
       { codes: cliUpdates.map((run) => run.code), receipt: lastCliUpdate.receipt, stderr: cliUpdates.map((run) => run.stderr.slice(-300)) });
+
+    // ---- Operator keep-all: the operation removes nothing -----------------
+    // Managed rollout windows pass --retention keep-all so an update never
+    // deletes a host's earlier snapshots; cleanup stays a separate prune.
+    const keeper = createHome("keep-all", 4);
+    const keepAllReceipts: LifecycleReceipt[] = [];
+    for (const [index, version] of ["4.0.0", "4.0.1", "4.0.2", "4.0.3"].entries()) {
+      appendRow(keeper, `keep-${index}`);
+      keepAllReceipts.push(await keeper.keepAllManager().update({ operationId: `k${index + 1}`, artifact: keeper.artifact(version) }));
+    }
+    const k5 = await keeper.keepAllManager().rollback({ operationId: "k5", artifact: keeper.artifact("4.0.2") });
+    keepAllReceipts.push(k5);
+    check("keep_all_updates_and_rollback_remove_no_snapshot_or_runtime",
+      same(keeper.snapshots(), ["k1", "k2", "k3", "k4", "k5"]) && same(keeper.versions(), ["4.0.0", "4.0.1", "4.0.2", "4.0.3"]) &&
+      keepAllReceipts.every((receipt) => receipt.status === "completed" && receipt.retention?.status === "skipped" &&
+        receipt.retention.skippedReason === "skipped_by_operator" && receipt.retention.removed.length === 0 &&
+        receipt.retention.removedBytes === 0 && receipt.retention.recovered.length === 0),
+      { snapshots: keeper.snapshots(), versions: keeper.versions(), retention: keepAllReceipts.map((receipt) => receipt.retention) });
+    const wouldRemove = (receipt: LifecycleReceipt) =>
+      (receipt.retention?.wouldRemove ?? []).map((item) => `${item.kind}:${item.name}`);
+    const keepAllPreview = await keeper.manager().pruneSnapshots({ operationId: "keep-all-preview" });
+    check("keep_all_receipt_records_exactly_what_retention_would_have_removed",
+      keepAllPreview.receipt === null && keepAllPreview.retention.status === "preview" &&
+      same(wouldRemove(k5), ["snapshot:k1", "snapshot:k2", "snapshot:k3", "runtime_version:4.0.0", "runtime_version:4.0.1"]) &&
+      same(wouldRemove(k5), keepAllPreview.retention.removed.map((item) => `${item.kind}:${item.name}`)) &&
+      k5.retention!.wouldRemove!.every((item) => Number.isSafeInteger(item.bytes) && item.bytes > 0),
+      { k5: k5.retention, preview: keepAllPreview.retention });
+    const k5Marker = JSON.parse(fs.readFileSync(path.join(keeper.lifecycleRoot, "completed-operations", "k5.json"), "utf8")) as
+      Record<string, unknown> & { retention: Record<string, unknown> };
+    const keepAllListing = await keeper.manager().listSnapshots();
+    check("keep_all_receipts_stay_known_ordered_operations_for_later_retention",
+      parseCompletionReceipt(k5Marker, "k5")?.status === "completed" &&
+      JSON.stringify(k5Marker.retention) === JSON.stringify(k5.retention) && keepAllListing.blockedReason === null &&
+      keepAllListing.snapshots.length === 5 && keepAllListing.snapshots.every((row) => row.operationState === "completed"),
+      keepAllListing);
+    const withRetention = (retention: Record<string, unknown>) => ({ ...k5Marker, retention });
+    check("only_an_operator_keep_all_record_may_carry_would_remove_and_it_recovers_nothing",
+      parseCompletionReceipt(withRetention({ ...k5Marker.retention, skippedReason: "retention_failed" }), "k5") === null &&
+      parseCompletionReceipt(withRetention({ ...k5Marker.retention, recovered: [{ kind: "snapshot", name: "k0", bytes: 1 }] }), "k5") === null &&
+      parseCompletionReceipt(withRetention({ ...k5Marker.retention, wouldRemove: [{ kind: "snapshot", name: "../k0", bytes: 1 }] }), "k5") === null &&
+      parseCompletionReceipt(withRetention(Object.fromEntries(Object.entries(k5Marker.retention)
+        .filter(([key]) => key !== "wouldRemove"))), "k5") !== null);
+
+    // A full display-receipt directory and an interrupted earlier removal stay as they are.
+    const keepReceipts = path.join(keeper.lifecycleRoot, "receipts");
+    const seededReceipts = Array.from({ length: 32 }, (_unused, index) => `0-seed-${String(index).padStart(2, "0")}-update.json`);
+    for (const name of seededReceipts) fs.writeFileSync(path.join(keepReceipts, name), "{}\n", { mode: 0o600 });
+    const pendingTrash = `snapshot+k0-interrupted+${"a".repeat(12)}`;
+    fs.mkdirSync(path.join(keeper.lifecycleRoot, "trash", pendingTrash), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(keeper.lifecycleRoot, "trash", pendingTrash, "database"), "interrupted removal\n", { mode: 0o600 });
+    const entriesBeforeK6 = relativeEntries(keeper.lifecycleRoot);
+    const receiptsBeforeK6 = listDirectory(keepReceipts).length;
+    const contentDigests = () => new Map([
+      ...keeper.snapshots().map((id) => [`snapshot:${id}`, treeDigest(path.join(keeper.lifecycleRoot, "snapshots", id)).digest] as const),
+      ...keeper.versions().map((version) => [`runtime:${version}`, treeDigest(path.join(keeper.lifecycleRoot, "versions", version)).digest] as const),
+    ]);
+    const digestsBeforeK6 = contentDigests();
+    const k6 = await keeper.keepAllManager().update({ operationId: "k6", artifact: keeper.artifact("4.0.4") });
+    const entriesAfterK6 = new Set(relativeEntries(keeper.lifecycleRoot));
+    const digestsAfterK6 = contentDigests();
+    check("keep_all_update_keeps_every_entry_the_trash_and_a_full_display_receipt_directory",
+      k6.retention?.skippedReason === "skipped_by_operator" && k6.retention.recovered.length === 0 &&
+      receiptsBeforeK6 === 37 && listDirectory(keepReceipts).length === 38 &&
+      entriesBeforeK6.every((entry) => entriesAfterK6.has(entry)) && keeper.trash().includes(pendingTrash) &&
+      [...digestsBeforeK6].every(([key, digest]) => digestsAfterK6.get(key) === digest),
+      { receipts: listDirectory(keepReceipts).length, missing: entriesBeforeK6.filter((entry) => !entriesAfterK6.has(entry)),
+        changed: [...digestsBeforeK6].filter(([key, digest]) => digestsAfterK6.get(key) !== digest).map(([key]) => key) });
+
+    // A keep-all update that fails readiness rolls back without trimming receipts or finishing the trash.
+    const failing = createHome("keep-all-fail", 2);
+    await failing.keepAllManager().update({ operationId: "f1", artifact: failing.artifact("6.0.0") });
+    await failing.keepAllManager().update({ operationId: "f2", artifact: failing.artifact("6.0.1") });
+    const failReceipts = path.join(failing.lifecycleRoot, "receipts");
+    for (const name of seededReceipts) fs.writeFileSync(path.join(failReceipts, name), "{}\n", { mode: 0o600 });
+    fs.mkdirSync(path.join(failing.lifecycleRoot, "trash", pendingTrash), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(failing.lifecycleRoot, "trash", pendingTrash, "database"), "interrupted removal\n", { mode: 0o600 });
+    const entriesBeforeF3 = relativeEntries(failing.lifecycleRoot);
+    failing.service.failHealth = true;
+    const failedF3 = await rejection(() => failing.keepAllManager().update({ operationId: "f3", artifact: failing.artifact("6.0.2") }));
+    failing.service.failHealth = false;
+    const f3 = failing.receipt("f3");
+    const entriesAfterF3 = new Set(relativeEntries(failing.lifecycleRoot));
+    check("keep_all_update_that_fails_readiness_rolls_back_without_trimming_receipts_or_touching_the_trash",
+      failedF3 !== null && f3.status === "rolled_back" && f3.retention === undefined &&
+      entriesBeforeF3.every((entry) => entriesAfterF3.has(entry)) && listDirectory(failReceipts).length === 32 + 3 &&
+      failing.trash().includes(pendingTrash) && same(failing.snapshots(), ["f1", "f2", "f3"]),
+      { error: failedF3?.message, status: f3.status, receipts: listDirectory(failReceipts).length,
+        missing: entriesBeforeF3.filter((entry) => !entriesAfterF3.has(entry)) });
+    // The owner's later cleanup: prune removes what the receipt said and finishes the interrupted removal.
+    const laterPrune = await keeper.manager().pruneSnapshots({ operationId: "keep-all-later-prune", apply: true });
+    check("later_prune_removes_what_keep_all_recorded_and_finishes_the_interrupted_removal",
+      laterPrune.retention.status === "applied" && wouldRemove(k6).length > 0 &&
+      same(laterPrune.retention.removed.map((item) => `${item.kind}:${item.name}`), wouldRemove(k6)) &&
+      same(laterPrune.retention.recovered.map((item) => `${item.kind}:${item.name}`), ["snapshot:k0-interrupted"]) &&
+      same(keeper.snapshots(), ["k5", "k6"]) && keeper.trash().length === 0,
+      { prune: laterPrune.retention, k6: k6.retention, snapshots: keeper.snapshots() });
+
+    // The real CLI: keep-all removes nothing; any other use of the flag changes nothing.
+    const flagHome = createHome("keep-all-cli", 2);
+    fs.writeFileSync(collectorConfigPath(flagHome.home), "{}\n", { mode: 0o600 });
+    const keepAllRuns = ["9.1.0-proof", "9.1.1-proof", "9.1.2-proof"].map((version, index) =>
+      cli(flagHome, [...updateArgs(`cli-keep-${index + 1}`, version), "--retention", "keep-all"], [], stub));
+    const lastKeepAll = JSON.parse(keepAllRuns.at(-1)!.stdout || "{}") as { receipt?: LifecycleReceipt };
+    const cliRollback = cli(flagHome, ["lifecycle", "rollback", "--operation-id", "cli-keep-rb", "--artifact", CLI_ENTRY,
+      "--artifact-version", "9.1.1-proof", "--retention", "keep-all"], [], stub);
+    const rolledBackTo = JSON.parse(cliRollback.stdout || "{}") as { receipt?: LifecycleReceipt };
+    check("real_cli_update_and_rollback_with_retention_keep_all_remove_nothing",
+      keepAllRuns.every((run) => run.code === 0) && lastKeepAll.receipt?.retention?.skippedReason === "skipped_by_operator" &&
+      same(wouldRemove(lastKeepAll.receipt), ["snapshot:cli-keep-1"]) &&
+      cliRollback.code === 0 && rolledBackTo.receipt?.operation === "rollback" && rolledBackTo.receipt.status === "completed" &&
+      rolledBackTo.receipt.retention?.skippedReason === "skipped_by_operator" &&
+      same(flagHome.snapshots(), ["cli-keep-1", "cli-keep-2", "cli-keep-3", "cli-keep-rb"]) &&
+      same(flagHome.versions(), ["9.1.0-proof", "9.1.1-proof", "9.1.2-proof"]) && !exists(path.join(stub, "calls.log")),
+      { codes: keepAllRuns.map((run) => run.code), receipt: lastKeepAll.receipt, rollback: rolledBackTo.receipt ?? cliRollback.stderr.slice(-300),
+        stderr: keepAllRuns.map((run) => run.stderr.slice(-300)) });
+    const flagTree = treeDigest(flagHome.home);
+    const misuses = [
+      [...updateArgs("cli-bad-1", "9.2.0-proof"), "--retention"],
+      [...updateArgs("cli-bad-2", "9.2.0-proof"), "--retention", "keep-2"],
+      [...updateArgs("cli-bad-3", "9.2.0-proof"), "--retention=keep-all"],
+      [...updateArgs("cli-bad-4", "9.2.0-proof"), "--retention", "keep-all", "--retention", "keep-all"],
+      ["lifecycle", "snapshots", "prune", "--apply", "--retention", "keep-all"],
+      [...updateArgs("cli-bad-5", "9.2.0-proof"), "--keep-all"],
+      [...updateArgs("cli-bad-6", "9.2.0-proof"), "--retension", "keep-all"],
+      [...updateArgs("cli-bad-7", "9.2.0-proof"), "--Retention", "keep-all"],
+      ["lifecycle", "rollback", "--operation-id", "cli-bad-8", "--artifact", CLI_ENTRY, "--artifact-version", "9.1.0-proof", "keep-all"],
+    ].map((args) => cli(flagHome, args, [], stub));
+    check("misused_or_misspelled_retention_flags_fail_before_any_change",
+      misuses.every((run) => run.code !== 0 && run.stderr.includes("--retention")) &&
+      treeDigest(flagHome.home).digest === flagTree.digest && !exists(path.join(stub, "calls.log")),
+      misuses.map((run) => ({ code: run.code, stderr: run.stderr.slice(-200) })));
 
     // ---- Hostile layout: retention never follows a symlink ----------------
     const hostile = createHome("hostile", 1);

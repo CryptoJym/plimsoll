@@ -99,6 +99,8 @@ export type ComposeLifecycleAdapterOptions = {
   authorityLeaseMs?: number;
   service?: LifecycleServiceAdapter;
   database?: LifecycleDatabaseAdapter;
+  /** `--retention keep-all`: the operation removes no snapshot, runtime, trash entry or receipt. */
+  keepAll?: boolean;
 };
 
 function sha256File(file: string): `sha256:${string}` {
@@ -1251,5 +1253,5 @@ export function composeLifecycleAdapter(options: ComposeLifecycleAdapterOptions 
     options.authorityRoot ?? defaultLifecycleAuthorityRoot(options.homeDir),
     ...(options.authorityLeaseMs !== undefined ? [{ defaultLeaseMs: options.authorityLeaseMs }] : []),
   );
-  return new FilesystemLifecycleAdapter(paths, service, database, authority);
+  return new FilesystemLifecycleAdapter(paths, service, database, authority, { keepAll: options.keepAll === true });
 }
