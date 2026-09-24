@@ -208,6 +208,23 @@ function openLedger(file: string) {
   });
 }
 
+/**
+ * eco-6hoxj.163.21: a ledger whose capture-time context index is complete
+ * attributes through it (session-context-index-proof). The checks that pin
+ * the 0.7.36 session scan, which still serves every window of an older ledger
+ * until its backfill completes, mark their fixture's index as not yet covered.
+ * On builds without the index this is a no-op.
+ */
+function useSessionScan(buffer: LocalEventBuffer) {
+  const installed = buffer.database
+    .prepare(`select 1 from sqlite_master where type = 'table' and name = 'session_repo_context_control'`)
+    .get();
+  if (installed) {
+    buffer.database.prepare(`update session_repo_context_control set backfill_complete = 0 where singleton = 1`).run();
+  }
+  return buffer;
+}
+
 function tokenEvent(
   id: string,
   sessionId: string | undefined,
@@ -411,7 +428,7 @@ function buildScenario(file: string, seed: number) {
 }
 
 async function largeSessionBudget(dir: string) {
-  const busy = openLedger(path.join(dir, "busy.sqlite"));
+  const busy = useSessionScan(openLedger(path.join(dir, "busy.sqlite")));
   let started = performance.now();
   insertFiller(busy.database, Array.from({ length: BUSY_EVENTS }, (_, index) => ({
     id: `busy-${index}`,
@@ -702,7 +719,7 @@ async function bounds(dir: string) {
 
   await check("default_scan_bound_is_exact_at_4096_index_entries", () => {
     expect(Batch, "SessionAttributionBatch is not available in this build");
-    const buffer = openLedger(path.join(dir, "edge.sqlite"));
+    const buffer = useSessionScan(openLedger(path.join(dir, "edge.sqlite")));
     const event = tokenEvent(uuid(0x30_0000), "edge", iso(T0));
     appendAll(buffer, [event]);
     // Window [T0-6h, T0+6h] holds the token row, three REPO_A contexts and
@@ -731,7 +748,7 @@ async function bounds(dir: string) {
 
   await check("batch_read_budget_fails_later_lookups_closed", () => {
     expect(Batch, "SessionAttributionBatch is not available in this build");
-    const buffer = openLedger(path.join(dir, "budget.sqlite"));
+    const buffer = useSessionScan(openLedger(path.join(dir, "budget.sqlite")));
     const first = tokenEvent(uuid(0x31_0000), "budget-1", iso(T0));
     const second = tokenEvent(uuid(0x31_0001), "budget-2", iso(T0));
     appendAll(buffer, [first, second]);
@@ -824,7 +841,7 @@ async function sealTimeRules(dir: string) {
 async function queryPlans(dir: string) {
   await check("lookup_statements_use_idx_events_session_and_count_from_the_covering_index", () => {
     const Batch = batchApi();
-    const buffer = openLedger(path.join(dir, "plan.sqlite"));
+    const buffer = useSessionScan(openLedger(path.join(dir, "plan.sqlite")));
     const event = tokenEvent(uuid(0x50_0000), "plan", iso(T0));
     appendAll(buffer, [event]);
     const lookups = instrumentSessionLookups(buffer.database);

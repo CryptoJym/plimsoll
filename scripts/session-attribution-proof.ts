@@ -87,22 +87,40 @@ function main() {
     .prepare("update buffered_events set repo_hash = ? where id = ?")
     .run(REPO_A, toolResult.id);
   // Plan the statements the lookup actually prepares, not a copy of them.
-  const prepare = ledger.database.prepare;
-  const lookupSql: string[] = [];
-  ledger.database.prepare = ((source: string) => {
-    lookupSql.push(source);
-    return prepare.call(ledger.database, source);
-  }) as typeof prepare;
-  const otelAttribution = new SessionAttributionBatch(ledger.database, [{ event: otelAssistant }])
-    .attribute(otelAssistant);
-  ledger.database.prepare = prepare;
-  const queryPlans = lookupSql.map((source) => ledger.database
-    .prepare(`explain query plan ${source}`)
-    .all("session-fixture", "2026-09-23T06:00:00.000Z", "2026-09-23T18:00:00.000Z", 257) as Array<{ detail: string }>);
-  assert.equal(queryPlans.length, 2);
-  assert.ok(queryPlans.every((plan) => plan.some((row) => row.detail.includes("idx_events_session"))));
-  assert.equal(otelAttribution.event.projectKey, REPO_A);
-  assert.equal(otelAttribution.event.metadata.projectBasis, "session_inherited");
+  // A ledger whose capture-time context index is complete reads it
+  // (eco-6hoxj.163.21); `contextIndex: false` selects the 0.7.36 session scan,
+  // which serves an older ledger until its backfill completes.
+  const plannedLookup = (options: { contextIndex?: boolean }) => {
+    const prepare = ledger.database.prepare;
+    const lookupSql: string[] = [];
+    ledger.database.prepare = ((source: string) => {
+      lookupSql.push(source);
+      return prepare.call(ledger.database, source);
+    }) as typeof prepare;
+    const attributed = new SessionAttributionBatch(ledger.database, [{ event: otelAssistant }], options)
+      .attribute(otelAssistant);
+    ledger.database.prepare = prepare;
+    const queryPlans = lookupSql.map((source) => (source.includes("where session_id = ?")
+      ? ledger.database
+        .prepare(`explain query plan ${source}`)
+        .all("session-fixture", "2026-09-23T06:00:00.000Z", "2026-09-23T18:00:00.000Z", 257)
+      : ledger.database.prepare(`explain query plan ${source}`).all()) as Array<{ detail: string }>);
+    return { attributed, queryPlans };
+  };
+  const scanned = plannedLookup({ contextIndex: false });
+  assert.equal(scanned.queryPlans.length, 2);
+  assert.ok(scanned.queryPlans.every((plan) => plan.some((row) => row.detail.includes("idx_events_session"))));
+  const indexed = plannedLookup({});
+  // The coverage-marker read and one primary-key range over the index.
+  assert.equal(indexed.queryPlans.length, 2);
+  assert.ok(indexed.queryPlans.some((plan) => plan.some((row) =>
+    row.detail.includes("SEARCH session_repo_contexts USING PRIMARY KEY"))));
+  assert.ok(indexed.queryPlans.every((plan) => plan.every((row) => !/^SCAN /.test(row.detail))));
+  for (const { attributed } of [scanned, indexed]) {
+    assert.equal(attributed.event.projectKey, REPO_A);
+    assert.equal(attributed.event.metadata.projectBasis, "session_inherited");
+  }
+  const otelAttribution = indexed.attributed;
   assert.equal(sealOutboundEnvelope({ event: otelAttribution.event, suppressedFields: [] }).ok, true);
   const lease = ledger.delivery.lease({
     maxRows: 10,
