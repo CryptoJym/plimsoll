@@ -570,9 +570,9 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           errors.push(`${where}: local-only review expired on ${entry.expires} (owner ${entry.owner}); renew the reviewed declaration or wire the proof into CI`);
           continue;
         }
-        if (expires - today > MAX_QUARANTINE_DAYS * DAY_MS) {
-          const latest = new Date(today + MAX_QUARANTINE_DAYS * DAY_MS).toISOString().slice(0, 10);
-          errors.push(`${where}: expires ${entry.expires}, more than ${MAX_QUARANTINE_DAYS} days away (latest allowed today: ${latest}); renew it in review instead`);
+        if (expires - reviewedOn > MAX_QUARANTINE_DAYS * DAY_MS) {
+          const latest = new Date(reviewedOn + MAX_QUARANTINE_DAYS * DAY_MS).toISOString().slice(0, 10);
+          errors.push(`${where}: expires ${entry.expires}, more than ${MAX_QUARANTINE_DAYS} days after reviewedOn (latest allowed: ${latest}); renew it in review instead`);
           continue;
         }
         // A local-only proof needs an input CI does not have. The gate checks

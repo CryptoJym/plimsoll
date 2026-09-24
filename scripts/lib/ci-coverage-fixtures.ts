@@ -630,6 +630,21 @@ export const FIXTURES: Fixture[] = [
     replayableOnTextualGate: false,
   },
   {
+    name: "local_only_stale_review_fresh_expiry",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a recent expiry cannot extend a review from 2025",
+    build: (input) => ({
+      input: withExceptions(input, (exceptions) => {
+        const entry = exceptions.localOnly?.["scripts/oversized-continuation-rollback-proof.ts"];
+        if (!entry) throw new Error("rollback local-only entry missing");
+        entry.reviewedOn = "2025-01-01";
+        entry.expires = daysFromToday(input, 26);
+      }),
+      error: /more than 30 days after reviewedOn/,
+    }),
+  },
+  {
     name: "stale_exception_entry",
     origin: "gate",
     expectGateGreen: false,
