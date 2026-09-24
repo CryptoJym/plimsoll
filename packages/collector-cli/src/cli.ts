@@ -2537,7 +2537,9 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
-    // Its WAL checkpoints (and their fsync) run on a worker thread instead.
+    // A worker thread copies its WAL back and keeps it bounded; the
+    // connection's own automatic checkpoint stays only as a backstop
+    // (wal-checkpoint-worker.ts).
     const walCheckpoint = new WalCheckpointWorker(buffer.database);
     // Outcome facts intentionally live outside the capture ledger. Opening the
     // local read model here does not schedule collection; the only writer is
@@ -2679,6 +2681,7 @@ async function main() {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
       syncStatus: () => syncBackoff.status(syncInFlight),
+      walCheckpointStatus: () => walCheckpoint.status(),
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the

@@ -12,8 +12,8 @@
  * whose observed_at order is shuffled against insertion order, so walking the
  * session index is a cold point lookup per row, then serves Codex OTLP exports
  * for that session through the collector's own HTTP server and measures the
- * longest event-loop stall. It also holds an upload batch to the same budget
- * and checks the off-thread WAL checkpointer.
+ * longest event-loop stall. It also holds an upload batch to the same budget.
+ * The off-thread WAL checkpointer has its own proof, proof:wal-checkpoint-bound.
  *
  *   pnpm proof:studio0-main-thread-turns
  *   STUDIO0_TURNS_SESSION_ROWS=300000 pnpm proof:studio0-main-thread-turns
@@ -272,35 +272,6 @@ async function main() {
       assert.equal(uploaded, EXPORTS * RECORDS_PER_EXPORT, "every captured event uploaded exactly once");
       assert.ok(loop.maxBlockedMs <= TURN_BUDGET_MS, `event loop held for ${loop.maxBlockedMs} ms during upload`);
       return measurements.upload;
-    });
-
-    await check("wal_checkpoints_run_off_the_event_loop_and_fall_back_on_worker_loss", async () => {
-      const module = await import("../packages/collector-cli/src/wal-checkpoint-worker").catch(() => null);
-      assert.ok(module, "no off-thread WAL checkpointer: the daemon connection checkpoints (and fsyncs) inside intake commits");
-      const walCheckpoint = new module.WalCheckpointWorker(buffer.database, 50);
-      assert.equal(walCheckpoint.start(), true);
-      assert.equal(buffer.database.pragma("wal_autocheckpoint", { simple: true }), 0);
-      const response = await fetch(`http://127.0.0.1:${port}/v1/logs`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-plimsoll-source": "codex" },
-        body: JSON.stringify(codexExport()),
-      });
-      assert.equal(response.status, 202);
-      const deadline = Date.now() + 10_000;
-      while (walCheckpoint.counters.framesCheckpointed === 0 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      assert.ok(walCheckpoint.counters.framesCheckpointed > 0, "the worker checkpointed no frames");
-      const counters = { ...walCheckpoint.counters };
-      // Losing the worker thread restores SQLite's own automatic checkpoint.
-      const worker = (walCheckpoint as unknown as { worker: { terminate(): Promise<number> } | null }).worker;
-      assert.ok(worker, "worker thread running");
-      await worker.terminate();
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.equal(buffer.database.pragma("wal_autocheckpoint", { simple: true }), 1_000);
-      assert.equal(walCheckpoint.counters.failures, 1);
-      await walCheckpoint.stop();
-      return counters;
     });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
