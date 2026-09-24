@@ -11,6 +11,12 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  PROOF_WORKFLOW,
+  proofCiCoverage,
+  readProofCiCoverageInput,
+  type ProofCiCoverage,
+} from "./lib/proof-ci-coverage";
+import {
   PROOF_CHECKS,
   collectPrivacySpecModel,
   docIsStale,
@@ -35,6 +41,25 @@ function mutatedModel(mutate: (model: PrivacySpecModel) => void): PrivacySpecMod
   const model = collectPrivacySpecModel();
   mutate(model);
   return model;
+}
+
+/**
+ * eco-6hoxj.163.23: a cited check is evidence only while CI runs it. Returns
+ * each cited check that is defined in a proof file proof.yml does not run.
+ */
+function citedChecksNotRunInCi(found: Map<string, string[]>, coverage: ProofCiCoverage): string[] {
+  const runInCi = new Set(
+    coverage.scripts.filter((entry) => entry.invocations.length > 0).map((entry) => entry.entry),
+  );
+  const missing: string[] = [];
+  for (const ref of Object.values(PROOF_CHECKS)) {
+    for (const name of ref.checks) {
+      const files = found.get(name) ?? [];
+      const notRun = files.filter((file) => !runInCi.has(file));
+      if (files.length === 0 || notRun.length > 0) missing.push(`${name} (${notRun.join(", ") || "no proof file"})`);
+    }
+  }
+  return missing;
 }
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -124,6 +149,40 @@ check(
           JSON.stringify(found.get(name)),
         );
       }
+    }
+  },
+);
+
+check(
+  "every_cited_proof_check_runs_in_ci",
+  false,
+  () => {
+    const missing = citedChecksNotRunInCi(verifyProofChecks(), proofCiCoverage(readProofCiCoverageInput(repoRoot)));
+    assert.deepEqual(missing, [], `cited check(s) whose proof ${PROOF_WORKFLOW} does not run: ${missing.join("; ")}`);
+  },
+);
+
+check(
+  "adversarial_cited_proof_dropped_from_ci_rejected",
+  true,
+  () => {
+    const found = verifyProofChecks();
+    const input = readProofCiCoverageInput(repoRoot);
+    const coverage = proofCiCoverage(input);
+    for (const [name, files] of found) {
+      // Delete every proof.yml line that runs a proof defining this check.
+      const commands = new Set(
+        coverage.scripts
+          .filter((entry) => entry.entry !== null && files.includes(entry.entry))
+          .flatMap((entry) => entry.invocations.map((invocation) => invocation.command)),
+      );
+      assert.ok(commands.size > 0, `${name}: no CI line to drop`);
+      const workflow = input.workflow
+        .split("\n")
+        .filter((line) => !commands.has(line.trim().replace(/^run:\s+/, "")))
+        .join("\n");
+      const missing = citedChecksNotRunInCi(found, proofCiCoverage({ ...input, workflow }));
+      assert.ok(missing.some((entry) => entry.startsWith(`${name} (`)), `${name} not rejected: ${JSON.stringify(missing)}`);
     }
   },
 );
