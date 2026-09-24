@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -25,14 +26,19 @@ import { defaultLifecycleAuthorityRoot, LifecycleMutationAuthority } from "./lif
 import {
   FilesystemLifecycleAdapter,
   type LifecycleDatabaseAdapter,
+  type LifecycleDatabaseSnapshot,
   type LifecycleServiceAdapter,
   type ManagedLifecyclePaths,
 } from "./lifecycle-filesystem";
 import {
   LIFECYCLE_SCHEMA_VERSION,
+  LifecycleSnapshotRefusal,
+  snapshotHeadroomBytes,
   validateRuntimeArtifact,
   type LifecycleAdapter,
+  type LifecycleCloneFallback,
   type LifecycleReadiness,
+  type LifecycleSnapshotPlan,
   type LifecycleSupportSnapshot,
   type RuntimeArtifact,
 } from "./lifecycle";
@@ -46,8 +52,9 @@ import { PLIMSOLL_VERSION } from "./version";
  * - FilesystemLifecycleAdapter over the canonical collector home,
  * - a LaunchAgent-manifest service adapter that rewrites the owned plist and
  *   NEVER invokes launchctl (load/unload stay explicit operator commands),
- * - a SQLite online-backup database adapter (a live WAL database is never
- *   copied byte-wise; only quiesced backup snapshots are restorable),
+ * - a SQLite ledger snapshot adapter: an APFS clone of the ledger while an
+ *   exclusive lock proves it quiesced, otherwise the online backup (a live
+ *   WAL database is never copied byte-wise),
  * - the shared cross-process mutation authority fencing every mutating step.
  *
  * Artifact resolution pins the packaged bundle plus its vendored native
@@ -641,6 +648,217 @@ export class LaunchAgentManifestLifecycleService implements LifecycleServiceAdap
   }
 }
 
+const CLONE_HELPER = "/usr/bin/osascript";
+const CLONE_TIMEOUT_MS = 5 * 60_000;
+/** clonefile(2) from libSystem; flag 1 is CLONE_NOFOLLOW. Prints 0 or -1. */
+const CLONEFILE_SCRIPT =
+  'ObjC.bindFunction("clonefile", ["int", ["char *", "char *", "unsigned int"]]); ' +
+  "function run(argv) { return String($.clonefile(argv[0], argv[1], 1)); }";
+
+/** Returns true only when `destination` is now an APFS clone of `source`. */
+export type FileCloner = (source: string, destination: string) => boolean;
+
+/**
+ * clonefile(2): clone or fail, never a byte copy. Node cannot express this on
+ * macOS: libuv 1.51 answers COPYFILE_FICLONE_FORCE with ENOSYS and turns
+ * COPYFILE_FICLONE into a full copy, and `cp -c` and `ditto --clone` also
+ * fall back to full copies silently. JavaScript for Automation binds the
+ * system call without a native addon. The call runs in a child process, so
+ * this process never opens (and closes) a descriptor on the source, which
+ * would release the SQLite POSIX locks that keep a quiesced ledger quiet.
+ */
+export const cloneFileOrFail: FileCloner = (source, destination) => {
+  if (process.platform !== "darwin") return false;
+  const result = spawnSync(CLONE_HELPER, ["-l", "JavaScript", "-e", CLONEFILE_SCRIPT, source, destination], {
+    encoding: "utf8",
+    env: { PATH: "/usr/bin:/bin" },
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: CLONE_TIMEOUT_MS,
+    maxBuffer: 4096,
+  });
+  return result.status === 0 && result.stdout.trim() === "0";
+};
+
+/** Size by lstat only; never opens a descriptor. Absent is 0. */
+function regularFileBytes(file: string) {
+  try {
+    const stat = fs.lstatSync(file);
+    return stat.isFile() ? stat.size : 0;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+}
+
+function isCloneResult(source: string, destination: string) {
+  try {
+    const stat = fs.lstatSync(destination);
+    return stat.isFile() && stat.size === fs.lstatSync(source).size;
+  } catch {
+    return false;
+  }
+}
+
+function removeSqliteFiles(database: string) {
+  fs.rmSync(`${database}-wal`, { force: true });
+  fs.rmSync(`${database}-shm`, { force: true });
+  fs.rmSync(database, { force: true });
+}
+
+function volumeFreeBytes(directory: string) {
+  const stat = fs.statfsSync(directory);
+  return stat.bavail * stat.bsize;
+}
+
+/**
+ * Proves the ledger is quiesced and keeps it so until the connection closes.
+ * In EXCLUSIVE locking mode the first write transaction takes an EXCLUSIVE
+ * lock on the database file and keeps it after COMMIT. Every open WAL
+ * connection holds a shared lock for its whole life, so SQLite refuses that
+ * lock (SQLITE_BUSY, no waiting) while any other connection in any process
+ * has the ledger open. Holding it, a TRUNCATE checkpoint moves every committed
+ * frame into the database file and empties the WAL: the database file alone
+ * is then the complete ledger, and nothing can change it until close.
+ */
+function quiesceLedger(source: string):
+  | { connection: InstanceType<typeof Database> }
+  | { fallback: LifecycleCloneFallback } {
+  let connection: InstanceType<typeof Database>;
+  try {
+    connection = new Database(source, { fileMustExist: true, timeout: 0 });
+  } catch {
+    return { fallback: "quiescence_unproven" };
+  }
+  try {
+    connection.pragma("locking_mode = EXCLUSIVE");
+    connection.exec("BEGIN EXCLUSIVE");
+    connection.exec("COMMIT");
+    if (connection.pragma("journal_mode", { simple: true }) !== "wal") {
+      connection.close();
+      return { fallback: "ledger_not_wal" };
+    }
+    const [checkpoint] = connection.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
+    if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== 0 || regularFileBytes(`${source}-wal`) !== 0) {
+      connection.close();
+      return { fallback: "wal_not_empty" };
+    }
+    return { connection };
+  } catch (error) {
+    connection.close();
+    const code = (error as { code?: unknown }).code;
+    return {
+      fallback: typeof code === "string" && /^SQLITE_(BUSY|LOCKED)/.test(code) ? "ledger_in_use" : "quiescence_unproven",
+    };
+  }
+}
+
+/**
+ * Production ledger snapshots. When no other connection has the ledger open
+ * (the managed update stops the collector first), the snapshot is an APFS
+ * clone taken while an exclusive lock holds the ledger still: it costs no
+ * space when taken and restores the same bytes. Otherwise (collector still
+ * running, another volume, no clone support) it is the SQLite online backup,
+ * a full copy, and only when the volume keeps max(2 GiB, 5%) of headroom
+ * after it; if not, the update is refused before anything changes.
+ */
+export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
+  private readonly clone: FileCloner;
+  private readonly freeBytes: (directory: string) => number;
+  private readonly backup = new SqliteOnlineBackupAdapter();
+
+  constructor(options: { clone?: FileCloner; freeBytes?: (directory: string) => number } = {}) {
+    this.clone = options.clone ?? cloneFileOrFail;
+    this.freeBytes = options.freeBytes ?? volumeFreeBytes;
+  }
+
+  async snapshot(input: { source: string; destination: string }): Promise<LifecycleDatabaseSnapshot> {
+    if (!fs.existsSync(input.source)) {
+      return { present: false, method: null, quiesced: false, cloneFallback: null };
+    }
+    removeSqliteFiles(input.destination);
+    const quiesced = quiesceLedger(input.source);
+    let cloneFallback: LifecycleCloneFallback;
+    if ("connection" in quiesced) {
+      try {
+        if (this.clone(input.source, input.destination) && isCloneResult(input.source, input.destination)) {
+          fs.chmodSync(input.destination, 0o600);
+          return { present: true, method: "clone", quiesced: true, cloneFallback: null };
+        }
+      } finally {
+        quiesced.connection.close();
+      }
+      fs.rmSync(input.destination, { force: true });
+      cloneFallback = "clone_unsupported";
+    } else {
+      cloneFallback = quiesced.fallback;
+    }
+    const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
+    const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
+    const freeBytes = this.freeBytes(path.dirname(input.destination));
+    if (freeBytes < ledgerBytes + headroomBytes) {
+      throw new LifecycleSnapshotRefusal({
+        reason: "insufficient_free_space",
+        method: "online_backup",
+        cloneFallback,
+        ledgerBytes,
+        headroomBytes,
+        requiredFreeBytes: ledgerBytes + headroomBytes,
+        freeBytes,
+      });
+    }
+    await this.backup.snapshot(input);
+    return { present: true, method: "online_backup", quiesced: "connection" in quiesced, cloneFallback };
+  }
+
+  /** Same bytes as a copy; a clone when the volume allows it, so a rollback needs no free space. */
+  async restore(input: { source: string; destination: string }): Promise<void> {
+    const stat = fs.lstatSync(input.source);
+    if (!stat.isFile()) throw new Error("database restore source must be a regular file");
+    removeSqliteFiles(input.destination);
+    if (!(this.clone(input.source, input.destination) && isCloneResult(input.source, input.destination))) {
+      fs.rmSync(input.destination, { force: true });
+      fs.copyFileSync(input.source, input.destination);
+    }
+    fs.chmodSync(input.destination, 0o600);
+  }
+
+  /**
+   * Predicts the snapshot of an update run after the collector stops: a clone
+   * when the ledger can be cloned onto the lifecycle volume (probed with a
+   * throwaway clone), otherwise a full copy that needs the ledger plus headroom.
+   */
+  async plan(input: { source: string; probe: string }): Promise<LifecycleSnapshotPlan> {
+    const freeBytes = this.freeBytes(path.dirname(input.probe));
+    if (!fs.existsSync(input.source)) {
+      return {
+        method: "none", cloneCapable: false, ledgerBytes: 0, headroomBytes: 0,
+        requiredFreeBytes: 0, requiredFreeBytesIfInUse: 0, freeBytes, ok: true, reason: null,
+      };
+    }
+    let cloneCapable = false;
+    try {
+      cloneCapable = this.clone(input.source, input.probe);
+    } finally {
+      fs.rmSync(input.probe, { force: true });
+    }
+    const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
+    const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
+    const requiredFreeBytes = cloneCapable ? 0 : ledgerBytes + headroomBytes;
+    const ok = freeBytes >= requiredFreeBytes;
+    return {
+      method: cloneCapable ? "clone" : "online_backup",
+      cloneCapable,
+      ledgerBytes,
+      headroomBytes,
+      requiredFreeBytes,
+      requiredFreeBytesIfInUse: ledgerBytes + headroomBytes,
+      freeBytes,
+      ok,
+      reason: ok ? null : "insufficient_free_space",
+    };
+  }
+}
+
 /** Quiesced SQLite snapshots via the online backup API; never a raw WAL copy. */
 export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
   snapshot(input: { source: string; destination: string }): Promise<boolean> {
@@ -723,7 +941,7 @@ export function composeLifecycleAdapter(options: ComposeLifecycleAdapterOptions 
     ...(options.homeDir !== undefined ? { homeDir: options.homeDir } : {}),
     lifecycleRoot: paths.lifecycleRoot,
   });
-  const database = options.database ?? new SqliteOnlineBackupAdapter();
+  const database = options.database ?? new SqliteLedgerSnapshotAdapter();
   const authority = new LifecycleMutationAuthority(
     options.authorityRoot ?? defaultLifecycleAuthorityRoot(options.homeDir),
     ...(options.authorityLeaseMs !== undefined ? [{ defaultLeaseMs: options.authorityLeaseMs }] : []),

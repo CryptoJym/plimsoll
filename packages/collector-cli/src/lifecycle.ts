@@ -80,12 +80,155 @@ export type LifecycleReadiness = {
   reason: "ready" | "runtime_mismatch" | "service_unready" | "config_incompatible" | "database_incompatible";
 };
 
+/**
+ * Completed update/rollback snapshots kept after every healthy completion.
+ * The newest one restores the version that ran before the current one; the
+ * second is a restore point for a problem found only after a further update,
+ * or after a same-version re-pin whose snapshot restores the current version
+ * itself. Each copy can cost a full ledger, so the count stays small.
+ */
+export const LIFECYCLE_RETAINED_SNAPSHOTS = 2;
+export const LIFECYCLE_MAX_RETAINED_SNAPSHOTS = 64;
+
+/** Free space a full ledger copy must leave behind: max(2 GiB, 5% of the ledger). */
+export function snapshotHeadroomBytes(ledgerBytes: number) {
+  return Math.max(2 * 1024 ** 3, Math.ceil(ledgerBytes * 0.05));
+}
+
+export type LifecycleSnapshotMethod = "clone" | "online_backup";
+
+/** Why a snapshot was not an APFS clone of the quiesced ledger. */
+export type LifecycleCloneFallback =
+  | "ledger_in_use"
+  | "ledger_not_wal"
+  | "wal_not_empty"
+  | "quiescence_unproven"
+  | "clone_unsupported";
+
+export type LifecycleSnapshotRecord = {
+  /** Null when no ledger existed or the database adapter did not report it. */
+  method: LifecycleSnapshotMethod | null;
+  /** An exclusive SQLite lock proved no other connection and an empty WAL. */
+  quiesced: boolean;
+  cloneFallback: LifecycleCloneFallback | null;
+  databaseBytes: number;
+};
+
+export type LifecycleRefusal = {
+  reason: "insufficient_free_space";
+  method: "online_backup";
+  cloneFallback: LifecycleCloneFallback | null;
+  ledgerBytes: number;
+  headroomBytes: number;
+  requiredFreeBytes: number;
+  freeBytes: number;
+};
+
+/** Update --preflight: the snapshot the next update will take once the collector is stopped. */
+export type LifecycleSnapshotPlan = {
+  method: LifecycleSnapshotMethod | "none";
+  cloneCapable: boolean;
+  ledgerBytes: number;
+  headroomBytes: number;
+  requiredFreeBytes: number;
+  /** What a full copy needs if the ledger is still in use at snapshot time. */
+  requiredFreeBytesIfInUse: number;
+  freeBytes: number;
+  ok: boolean;
+  reason: "insufficient_free_space" | null;
+};
+
+export type LifecycleRemovedItem = {
+  kind: "snapshot" | "runtime_version";
+  name: string;
+  bytes: number;
+};
+
+export type LifecycleRetentionRecord = {
+  keepSnapshots: number;
+  status: "applied" | "preview" | "skipped";
+  skippedReason: "lifecycle_state_unreadable" | "journal_unreadable" | "retention_failed" | null;
+  removed: LifecycleRemovedItem[];
+  removedBytes: number;
+  /** Removals an interrupted earlier retention left in the trash, finished now. */
+  recovered: LifecycleRemovedItem[];
+  keptSnapshots: string[];
+  keptVersions: string[];
+};
+
+export type LifecycleSnapshotState = "completed" | "rolled_back" | "in_progress" | "rollback_required" | "unknown";
+export type LifecycleSnapshotRetentionReason =
+  | "newest_completed"
+  | "restores_previous_version"
+  | "unfinished_operation"
+  | "operation_unknown"
+  | "older_completed"
+  | "rolled_back_operation"
+  | "incomplete_snapshot";
+export type LifecycleVersionRetentionReason =
+  | "current"
+  | "service_manifest"
+  | "unfinished_operation"
+  | "restore_target"
+  | "restore_target_unknown"
+  | "unreferenced";
+
+export type LifecycleRetentionSnapshot = {
+  id: string;
+  bytes: number;
+  createdAtMs: number | null;
+  metadataValid: boolean;
+  /** Version the snapshot restores (the one installed before its operation). */
+  restoresVersion: string | null;
+  method: LifecycleSnapshotMethod | null;
+  /** Terminal receipt of the operation that took it; null when absent or unreadable. */
+  operation: { kind: string; status: string; completedAtMs: number } | null;
+};
+
+export type LifecycleRetentionInput = {
+  installedVersion: string | null;
+  pinnedVersions: readonly { version: string; reason: "current" | "service_manifest" }[];
+  journal: Pick<LifecycleJournal, "operationId" | "snapshotId" | "fromVersion" | "toVersion" | "phase"> | null;
+  snapshots: readonly LifecycleRetentionSnapshot[];
+  versions: readonly { version: string; bytes: number }[];
+};
+
+export type LifecycleRetentionPlan = {
+  snapshots: Array<{ id: string; keep: boolean; reason: LifecycleSnapshotRetentionReason; state: LifecycleSnapshotState }>;
+  versions: Array<{ version: string; keep: boolean; reason: LifecycleVersionRetentionReason }>;
+};
+
+export type LifecycleSnapshotInventory = {
+  keepSnapshots: number;
+  installedVersion: string | null;
+  /** Set when retention would refuse to remove anything. */
+  blockedReason: "lifecycle_state_unreadable" | "journal_unreadable" | null;
+  snapshots: Array<{
+    id: string;
+    createdAt: string | null;
+    bytes: number;
+    method: LifecycleSnapshotMethod | "unrecorded";
+    restoresVersion: string | null;
+    operationState: LifecycleSnapshotState;
+    retention: "keep" | "prune";
+    reason: LifecycleSnapshotRetentionReason;
+  }>;
+  versions: Array<{
+    version: string;
+    bytes: number;
+    retention: "keep" | "prune";
+    reason: LifecycleVersionRetentionReason;
+  }>;
+  pendingRemoval: LifecycleRemovedItem[];
+  bytes: { snapshots: number; versions: number; prunable: number; pendingRemoval: number };
+};
+
 export type LifecycleReceipt = {
   schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
   toolVersion: string;
   operationId: string;
-  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle";
-  status: "completed" | "rolled_back" | "rollback_required" | "preview" | "purged" | "generated";
+  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle" | "snapshots_prune";
+  status: "completed" | "rolled_back" | "rollback_required" | "preview" | "purged" | "generated" | "refused";
   fromVersion: string | null;
   toVersion: string | null;
   restoredVersion: string | null;
@@ -94,6 +237,12 @@ export type LifecycleReceipt = {
   retainedTargets: readonly LifecycleRetainedTarget[];
   purgeOnlyTargets: readonly LifecyclePurgeOnlyTarget[];
   preserved: readonly ("ledger" | "history" | "credentials" | "workspace_membership")[];
+  /** Update/rollback: how the operation's rollback snapshot was taken. */
+  snapshot?: LifecycleSnapshotRecord;
+  /** Completed update/rollback and snapshots_prune: what retention removed (names and bytes only). */
+  retention?: LifecycleRetentionRecord;
+  /** Refused update/rollback: why nothing was changed. */
+  refusal?: LifecycleRefusal;
 };
 
 export type LifecycleSupportSnapshot = {
@@ -143,10 +292,121 @@ export type LifecycleAdapter = {
   uninstallOwned(input: { apply: boolean }): Promise<readonly string[]>;
   purgeOwnedData(input: { apply: boolean; confirmation: string | null }): Promise<readonly string[]>;
   supportSnapshot(): Promise<LifecycleSupportSnapshot>;
+  /** Durable record of how a snapshot was taken, read back from its metadata. */
+  snapshotRecord?(snapshotId: string): Promise<LifecycleSnapshotRecord | null>;
+  /** Read-only: the snapshot the next update will take and the free space it needs. */
+  planSnapshot?(): Promise<LifecycleSnapshotPlan>;
+  /** Read-only: every snapshot and runtime version with its retention decision. */
+  inspectSnapshots?(input: { keep: number }): Promise<LifecycleSnapshotInventory>;
+  /**
+   * Previews (apply false, read-only) or applies retention. Anything the
+   * journal, an unknown operation, the installed state, the current pointer or
+   * the service manifest references is never removed. Apply revalidates the
+   * operation's fence before each removal.
+   */
+  retainSnapshots?(input: { operationId: string; keep: number; apply: boolean }): Promise<LifecycleRetentionRecord>;
 };
 
 export class LifecycleInterruption extends Error {
   readonly code = "LIFECYCLE_INTERRUPTED";
+}
+
+/** Thrown before any copy when a full ledger copy would not fit; nothing was changed. */
+export class LifecycleSnapshotRefusal extends Error {
+  readonly code = "LIFECYCLE_SNAPSHOT_REFUSED";
+
+  constructor(readonly refusal: LifecycleRefusal) {
+    super(
+      `lifecycle update refused before any change: the ledger could not be cloned ` +
+      `(${refusal.cloneFallback ?? "no clone"}) and a full copy needs ${refusal.requiredFreeBytes} bytes free ` +
+      `(ledger ${refusal.ledgerBytes} + headroom ${refusal.headroomBytes}) but ${refusal.freeBytes} are free; ` +
+      "free space (plimsoll lifecycle snapshots prune --apply) or stop the collector so the ledger can be cloned, " +
+      "then retry the same operation ID",
+    );
+  }
+}
+
+function assertRetainedSnapshotCount(keep: number) {
+  if (!Number.isSafeInteger(keep) || keep < 1 || keep > LIFECYCLE_MAX_RETAINED_SNAPSHOTS) {
+    throw new Error(`--keep must be an integer from 1 to ${LIFECYCLE_MAX_RETAINED_SNAPSHOTS}`);
+  }
+}
+
+/**
+ * Pure retention policy. Keeps the `keep` newest completed update/rollback
+ * snapshots plus the newest one that restores a version other than the
+ * installed one, and everything an unfinished or unknown operation owns.
+ * Snapshots of finished operations beyond that (older completed ones, failed
+ * updates whose automatic rollback already restored them, incomplete copies)
+ * are removable. Runtime versions are kept when installed, pinned by the
+ * current pointer or service manifest, owned by the journal, or restored by a
+ * kept snapshot.
+ */
+export function planLifecycleRetention(input: LifecycleRetentionInput, keep: number): LifecycleRetentionPlan {
+  assertRetainedSnapshotCount(keep);
+  type Decision = { keep: boolean; reason: LifecycleSnapshotRetentionReason; state: LifecycleSnapshotState };
+  const decisions = new Map<string, Decision>();
+  const completed: Array<LifecycleRetentionSnapshot & { operation: { completedAtMs: number } }> = [];
+  const journal = input.journal;
+  for (const snapshot of input.snapshots) {
+    if (journal && (snapshot.id === journal.snapshotId || snapshot.id === journal.operationId)) {
+      decisions.set(snapshot.id, {
+        keep: true,
+        reason: "unfinished_operation",
+        state: journal.phase === "rollback_required" || journal.phase === "rollback_complete"
+          ? "rollback_required"
+          : "in_progress",
+      });
+      continue;
+    }
+    const operation = snapshot.operation;
+    const finished = operation !== null &&
+      (operation.kind === "update" || operation.kind === "rollback") &&
+      (operation.status === "completed" || operation.status === "rolled_back");
+    if (!finished) {
+      decisions.set(snapshot.id, { keep: true, reason: "operation_unknown", state: "unknown" });
+    } else if (!snapshot.metadataValid) {
+      decisions.set(snapshot.id, { keep: false, reason: "incomplete_snapshot", state: operation.status as LifecycleSnapshotState });
+    } else if (operation.status === "rolled_back") {
+      decisions.set(snapshot.id, { keep: false, reason: "rolled_back_operation", state: "rolled_back" });
+    } else {
+      completed.push(snapshot as LifecycleRetentionSnapshot & { operation: { completedAtMs: number } });
+    }
+  }
+  completed.sort((left, right) =>
+    right.operation.completedAtMs - left.operation.completedAtMs ||
+    (right.createdAtMs ?? 0) - (left.createdAtMs ?? 0) ||
+    right.id.localeCompare(left.id));
+  completed.forEach((snapshot, index) => decisions.set(snapshot.id, {
+    keep: index < keep,
+    reason: index < keep ? "newest_completed" : "older_completed",
+    state: "completed",
+  }));
+  const rollbackPoint = completed.find((snapshot) => snapshot.restoresVersion !== input.installedVersion);
+  if (rollbackPoint && !decisions.get(rollbackPoint.id)!.keep) {
+    decisions.set(rollbackPoint.id, { keep: true, reason: "restores_previous_version", state: "completed" });
+  }
+
+  const snapshots = input.snapshots.map((snapshot) => ({ id: snapshot.id, ...decisions.get(snapshot.id)! }));
+  const kept = input.snapshots.filter((snapshot) => decisions.get(snapshot.id)!.keep);
+  const versionReasons = new Map<string, LifecycleVersionRetentionReason>();
+  const protect = (version: string | null | undefined, reason: LifecycleVersionRetentionReason) => {
+    if (version && !versionReasons.has(version)) versionReasons.set(version, reason);
+  };
+  protect(input.installedVersion, "current");
+  for (const pinned of input.pinnedVersions) protect(pinned.version, pinned.reason);
+  protect(journal?.toVersion, "unfinished_operation");
+  protect(journal?.fromVersion, "unfinished_operation");
+  for (const snapshot of kept) protect(snapshot.restoresVersion, "restore_target");
+  // A kept snapshot whose metadata cannot name its runtime could need any of
+  // them. The journal already names both runtimes of an unfinished operation.
+  const unknownTarget = kept.some((snapshot) =>
+    !snapshot.metadataValid && decisions.get(snapshot.id)!.reason !== "unfinished_operation");
+  const versions = input.versions.map(({ version }) => {
+    const reason = versionReasons.get(version) ?? (unknownTarget ? "restore_target_unknown" : "unreferenced");
+    return { version, keep: reason !== "unreferenced", reason };
+  });
+  return { snapshots, versions };
 }
 
 function assertBoundedIdentifier(value: string, label: string) {
@@ -305,7 +565,12 @@ export class LifecycleManager {
     }
   }
 
-  private rollbackReceipt(journal: LifecycleJournal, status: "rolled_back" | "rollback_required"): LifecycleReceipt {
+  private async snapshotRecord(snapshotId: string) {
+    const record = await this.adapter.snapshotRecord?.(snapshotId);
+    return record ? { snapshot: record } : {};
+  }
+
+  private async rollbackReceipt(journal: LifecycleJournal, status: "rolled_back" | "rollback_required"): Promise<LifecycleReceipt> {
     return {
       schemaVersion: LIFECYCLE_SCHEMA_VERSION,
       toolVersion: PLIMSOLL_VERSION,
@@ -320,6 +585,7 @@ export class LifecycleManager {
       retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
       purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
       preserved: ["ledger", "history", "credentials", "workspace_membership"],
+      ...await this.snapshotRecord(journal.snapshotId),
     };
   }
 
@@ -329,7 +595,7 @@ export class LifecycleManager {
       try {
         await this.adapter.restore(journal.snapshotId);
       } catch {
-        const blocked = this.rollbackReceipt(journal, "rollback_required");
+        const blocked = await this.rollbackReceipt(journal, "rollback_required");
         await this.adapter.persistReceipt(blocked);
         throw new Error("rollback required: restore failed; retry the same operationId");
       }
@@ -339,10 +605,76 @@ export class LifecycleManager {
     if (journal.phase !== "rollback_complete") {
       throw new Error("rollback recovery state is invalid");
     }
-    const receipt = this.rollbackReceipt(journal, "rolled_back");
+    const receipt = await this.rollbackReceipt(journal, "rolled_back");
     await this.adapter.persistReceipt(receipt);
     await this.adapter.clearJournal(journal.operationId);
     return receipt;
+  }
+
+  /**
+   * A refused snapshot happens before anything else: the journal is still
+   * "prepared", nothing was staged or switched and the service was untouched.
+   * Clearing that journal returns to the pre-operation state; the receipt
+   * records why and the operation ID stays usable for a retry.
+   */
+  private async refuseBeforeChange(journal: LifecycleJournal, refusal: LifecycleRefusal) {
+    await this.fence(journal.operationId);
+    await this.adapter.persistReceipt({
+      schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+      toolVersion: PLIMSOLL_VERSION,
+      operationId: journal.operationId,
+      operation: journal.kind,
+      status: "refused",
+      fromVersion: journal.fromVersion,
+      toVersion: journal.toVersion,
+      restoredVersion: null,
+      health: null,
+      ownedTargets: [],
+      retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+      purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
+      preserved: ["ledger", "history", "credentials", "workspace_membership"],
+      refusal,
+    });
+    await this.adapter.clearJournal(journal.operationId);
+  }
+
+  /**
+   * Runs after the update's receipt is durable and its journal cleared, so a
+   * retention problem can never undo or fail a completed update. A lost fence
+   * means a successor owns the lifecycle root: nothing more is touched. Other
+   * failures are recorded; the next completion or `snapshots prune` retries.
+   */
+  private async retainAfterCompletion(receipt: LifecycleReceipt): Promise<LifecycleReceipt> {
+    if (!this.adapter.retainSnapshots) return receipt;
+    let retention: LifecycleRetentionRecord;
+    try {
+      await this.fence(receipt.operationId);
+      retention = await this.adapter.retainSnapshots({
+        operationId: receipt.operationId,
+        keep: LIFECYCLE_RETAINED_SNAPSHOTS,
+        apply: true,
+      });
+    } catch (error) {
+      if (error instanceof LifecycleInterruption) return receipt;
+      retention = {
+        keepSnapshots: LIFECYCLE_RETAINED_SNAPSHOTS,
+        status: "skipped",
+        skippedReason: "retention_failed",
+        removed: [],
+        removedBytes: 0,
+        recovered: [],
+        keptSnapshots: [],
+        keptVersions: [],
+      };
+    }
+    const retained = { ...receipt, retention };
+    try {
+      await this.fence(receipt.operationId);
+      await this.adapter.persistReceipt(retained);
+    } catch {
+      // The committed receipt without the retention addendum stays durable.
+    }
+    return retained;
   }
 
   async update(input: {
@@ -422,12 +754,17 @@ export class LifecycleManager {
         retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
         purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
         preserved: ["ledger", "history", "credentials", "workspace_membership"],
+        ...await this.snapshotRecord(journal.snapshotId),
       };
       await this.adapter.persistReceipt(receipt);
       await this.adapter.clearJournal(operationId);
-      return receipt;
+      return await this.retainAfterCompletion(receipt);
     } catch (error) {
       if (error instanceof LifecycleInterruption) throw error;
+      if (error instanceof LifecycleSnapshotRefusal && journal?.phase === "prepared") {
+        await this.refuseBeforeChange(journal, error.refusal);
+        throw error;
+      }
       if (journal?.phase === "rollback_required" || journal?.phase === "rollback_complete" || journal?.phase === "verified") {
         throw error;
       }
@@ -444,6 +781,68 @@ export class LifecycleManager {
 
   rollback(input: { operationId: string; artifact: RuntimeArtifact }) {
     return this.update({ ...input, kind: "rollback" });
+  }
+
+  /** Read-only; takes no lock. Run before stopping the service for an update. */
+  async preflightUpdate(): Promise<LifecycleSnapshotPlan> {
+    if (!this.adapter.planSnapshot) throw new Error("this lifecycle adapter cannot plan snapshots");
+    return this.adapter.planSnapshot();
+  }
+
+  /** Read-only; takes no lock and writes nothing. */
+  async listSnapshots(input: { keep?: number } = {}): Promise<LifecycleSnapshotInventory> {
+    const keep = input.keep ?? LIFECYCLE_RETAINED_SNAPSHOTS;
+    assertRetainedSnapshotCount(keep);
+    if (!this.adapter.inspectSnapshots) throw new Error("this lifecycle adapter cannot list snapshots");
+    return this.adapter.inspectSnapshots({ keep });
+  }
+
+  /**
+   * Dry run by default: no lock, no receipt, no change. Apply holds the
+   * mutation lease and removes only what retention would, with the same
+   * protections, even while another operation's journal awaits recovery.
+   */
+  async pruneSnapshots(input: { operationId: string; keep?: number; apply?: boolean }): Promise<{
+    receipt: LifecycleReceipt | null;
+    retention: LifecycleRetentionRecord;
+  }> {
+    assertBoundedIdentifier(input.operationId, "operationId");
+    const keep = input.keep ?? LIFECYCLE_RETAINED_SNAPSHOTS;
+    assertRetainedSnapshotCount(keep);
+    const retainSnapshots = this.adapter.retainSnapshots?.bind(this.adapter);
+    if (!retainSnapshots) throw new Error("this lifecycle adapter cannot prune snapshots");
+    if (input.apply !== true) {
+      return { receipt: null, retention: await retainSnapshots({ operationId: input.operationId, keep, apply: false }) };
+    }
+    if (!(await this.adapter.acquireLock(input.operationId))) {
+      throw new Error("another lifecycle operation owns the lock");
+    }
+    try {
+      await this.assertFreshOperation(input.operationId);
+      await this.fence(input.operationId);
+      const retention = await retainSnapshots({ operationId: input.operationId, keep, apply: true });
+      const receipt: LifecycleReceipt = {
+        schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+        toolVersion: PLIMSOLL_VERSION,
+        operationId: input.operationId,
+        operation: "snapshots_prune",
+        status: retention.status === "applied" ? "completed" : "refused",
+        fromVersion: retention.skippedReason === "lifecycle_state_unreadable" ? null : await this.adapter.installedVersion(),
+        toVersion: null,
+        restoredVersion: null,
+        health: null,
+        ownedTargets: ["lifecycle_snapshots", "runtime_versions"],
+        retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+        purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
+        preserved: ["ledger", "history", "credentials", "workspace_membership"],
+        retention,
+      };
+      await this.fence(input.operationId);
+      await this.adapter.persistReceipt(receipt);
+      return { receipt, retention };
+    } finally {
+      await this.adapter.releaseLock(input.operationId);
+    }
   }
 
   async uninstall(input: { operationId: string; apply?: boolean }): Promise<LifecycleReceipt> {

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -7,10 +7,19 @@ import {
   LifecycleInterruption,
   PURGE_CONFIRMATION,
   immutableRuntimeRelativePath,
+  planLifecycleRetention,
   type LifecycleAdapter,
+  type LifecycleCloneFallback,
   type LifecycleJournal,
   type LifecycleReadiness,
   type LifecycleReceipt,
+  type LifecycleRemovedItem,
+  type LifecycleRetentionInput,
+  type LifecycleRetentionRecord,
+  type LifecycleSnapshotInventory,
+  type LifecycleSnapshotMethod,
+  type LifecycleSnapshotPlan,
+  type LifecycleSnapshotRecord,
   type LifecycleSupportSnapshot,
   type RuntimeArtifact,
 } from "./lifecycle";
@@ -20,6 +29,14 @@ const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const EXECUTABLE_MODE = 0o700;
 const MAX_RECEIPTS = 32;
+const MAX_MARKER_BYTES = 64 * 1024;
+const MAX_MANIFEST_BYTES = 256 * 1024;
+const MAX_TREE_ENTRIES = 200_000;
+/** Trash entries are `<kind>+<name>+<nonce>`; `+` never occurs in an identifier. */
+const TRASH_SEPARATOR = "+";
+const CLONE_FALLBACKS: readonly LifecycleCloneFallback[] = [
+  "ledger_in_use", "ledger_not_wal", "wal_not_empty", "quiescence_unproven", "clone_unsupported",
+];
 
 export type ManagedLifecyclePaths = {
   lifecycleRoot: string;
@@ -40,11 +57,21 @@ export type LifecycleServiceAdapter = {
   supportSnapshot(): Promise<LifecycleSupportSnapshot>;
 };
 
+export type LifecycleDatabaseSnapshot = {
+  present: boolean;
+  method: LifecycleSnapshotMethod | null;
+  quiesced: boolean;
+  cloneFallback: LifecycleCloneFallback | null;
+};
+
 /** SQLite implementations must use the online backup API or an equivalent
- * quiesced snapshot. Copying a live WAL database is not a compatible backup. */
+ * quiesced snapshot. Copying a live WAL database is not a compatible backup.
+ * A bare boolean result (present or absent) records no snapshot method. */
 export type LifecycleDatabaseAdapter = {
-  snapshot(input: { source: string; destination: string }): Promise<boolean>;
+  snapshot(input: { source: string; destination: string }): Promise<boolean | LifecycleDatabaseSnapshot>;
   restore(input: { source: string; destination: string }): Promise<void>;
+  /** Update --preflight. May clone the source to `probe` to test the volume; always removes it. */
+  plan?(input: { source: string; probe: string }): Promise<LifecycleSnapshotPlan>;
 };
 
 type SnapshotMetadata = {
@@ -52,6 +79,13 @@ type SnapshotMetadata = {
   currentVersion: string | null;
   currentExecutable: string | null;
   present: Record<"config" | "database" | "service", boolean>;
+  createdAt?: string;
+  database?: {
+    method: LifecycleSnapshotMethod | null;
+    quiesced: boolean;
+    cloneFallback: LifecycleCloneFallback | null;
+    bytes: number;
+  };
 };
 
 function isBoundedIdentifier(value: unknown): value is string {
@@ -163,12 +197,70 @@ function sha256(file: string) {
   return `sha256:${createHash("sha256").update(fs.readFileSync(file)).digest("hex")}`;
 }
 
+/** Apparent bytes of the regular files under target; never follows a symlink. */
+function treeBytes(target: string) {
+  let total = 0;
+  let visited = 0;
+  const walk = (entry: string, depth: number) => {
+    const stat = lstatIfPresent(entry);
+    if (!stat || stat.isSymbolicLink()) return;
+    if (stat.isFile()) {
+      total += stat.size;
+      return;
+    }
+    if (!stat.isDirectory() || depth > 32) return;
+    for (const name of fs.readdirSync(entry)) {
+      visited += 1;
+      if (visited > MAX_TREE_ENTRIES) return;
+      walk(path.join(entry, name), depth + 1);
+    }
+  };
+  walk(target, 0);
+  return total;
+}
+
+/** Makes completed renames in a directory durable before anything depends on them. */
+function fsyncDirectory(directory: string) {
+  const descriptor = fs.openSync(directory, "r");
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function snapshotRecordFrom(metadata: SnapshotMetadata, databaseBytes: number): LifecycleSnapshotRecord {
+  const database = metadata.present.database ? metadata.database : undefined;
+  return {
+    method: database?.method === "clone" || database?.method === "online_backup" ? database.method : null,
+    quiesced: database?.quiesced === true,
+    cloneFallback: CLONE_FALLBACKS.find((reason) => reason === database?.cloneFallback) ?? null,
+    databaseBytes,
+  };
+}
+
+/** Runtime version names a service manifest references under versionsRoot. */
+function versionsNamedIn(manifest: string, versionsRoots: readonly string[]) {
+  const text = manifest.replace(/&(amp|lt|gt|quot|apos);/g, (_entity, name: string) =>
+    ({ amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'" })[name]!);
+  const found = new Set<string>();
+  for (const root of versionsRoots) {
+    const prefix = `${root}${path.sep}`;
+    for (let index = text.indexOf(prefix); index >= 0; index = text.indexOf(prefix, index + prefix.length)) {
+      const name = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/.exec(text.slice(index + prefix.length))?.[0];
+      if (isBoundedIdentifier(name)) found.add(name);
+    }
+  }
+  return [...found];
+}
+
 export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private readonly root: string;
   private readonly versionsRoot: string;
   private readonly snapshotsRoot: string;
   private readonly receiptsRoot: string;
   private readonly completedRoot: string;
+  private readonly trashRoot: string;
   private readonly statePath: string;
   private readonly journalPath: string;
   private readonly lockPath: string;
@@ -203,6 +295,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     this.snapshotsRoot = path.join(this.root, "snapshots");
     this.receiptsRoot = path.join(this.root, "receipts");
     this.completedRoot = path.join(this.root, "completed-operations");
+    this.trashRoot = path.join(this.root, "trash");
     this.statePath = path.join(this.root, "state.json");
     this.journalPath = path.join(this.root, "journal.json");
     this.lockPath = path.join(this.root, "operation.lock");
@@ -365,22 +458,40 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       if (databaseSource && !databaseSource.isFile()) {
         throw new Error("managed database source must be a regular file");
       }
-      present.database = await this.database.snapshot({
+      const outcome = await this.database.snapshot({
         source: this.paths.database,
         destination: path.join(snapshot, "database"),
       });
+      const database = typeof outcome === "boolean"
+        ? { present: outcome, method: null, quiesced: false, cloneFallback: null }
+        : outcome;
+      present.database = database.present;
       assertNoSymlink(snapshot, this.snapshotsRoot);
+      let databaseBytes = 0;
       if (present.database) {
         const databaseSnapshot = path.join(snapshot, "database");
         assertNoSymlink(databaseSnapshot, snapshot);
-        if (!fs.lstatSync(databaseSnapshot).isFile()) throw new Error("database snapshot must be a regular file");
+        const stat = fs.lstatSync(databaseSnapshot);
+        if (!stat.isFile()) throw new Error("database snapshot must be a regular file");
         fs.chmodSync(databaseSnapshot, FILE_MODE);
+        databaseBytes = stat.size;
       }
       const metadata: SnapshotMetadata = {
         schemaVersion: 1,
         currentVersion: state?.version ?? null,
         currentExecutable: state?.executablePath ?? null,
         present,
+        createdAt: new Date().toISOString(),
+        ...(present.database
+          ? {
+              database: {
+                method: database.method,
+                quiesced: database.quiesced,
+                cloneFallback: database.cloneFallback,
+                bytes: databaseBytes,
+              },
+            }
+          : {}),
       };
       writeJson(path.join(snapshot, "snapshot.json"), metadata, snapshot);
       return operationId;
@@ -561,11 +672,12 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     // roots are ensured here.
     ensureDirectory(this.receiptsRoot, this.root);
     ensureDirectory(this.completedRoot, this.root);
-    if (receipt.status !== "rollback_required") {
+    if (receipt.status !== "rollback_required" && receipt.status !== "refused") {
       // The durable, unbounded marker is the operation-ID authority. Commit
       // it before the bounded display receipt so a stop between the two can
       // never make a completed destructive operation reusable. A verified or
       // rollback-complete journal can still reopen and finish receipt writing.
+      // A refusal changed nothing, so its operation ID stays usable.
       writeJson(path.join(this.completedRoot, `${receipt.operationId}.json`), receipt, this.completedRoot);
     }
     writeJson(path.join(this.receiptsRoot, `${receipt.operationId}-${receipt.operation}.json`), receipt, this.receiptsRoot);
@@ -608,10 +720,270 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     }
     assertNoSymlink(this.snapshotsRoot, this.root);
     fs.rmSync(this.snapshotsRoot, { recursive: true, force: true });
+    // Snapshots awaiting removal still hold config and ledger copies.
+    assertNoSymlink(this.trashRoot, this.root);
+    fs.rmSync(this.trashRoot, { recursive: true, force: true });
     return targets;
   }
 
   supportSnapshot() {
     return this.service.supportSnapshot();
+  }
+
+  private readSnapshotMetadata(snapshot: string): SnapshotMetadata | null {
+    try {
+      const metadataPath = path.join(snapshot, "snapshot.json");
+      assertNoSymlink(metadataPath, this.root);
+      const metadata = readJson<unknown>(metadataPath);
+      return isSnapshotMetadata(metadata) ? metadata : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async snapshotRecord(snapshotId: string): Promise<LifecycleSnapshotRecord | null> {
+    if (!isBoundedIdentifier(snapshotId)) return null;
+    const snapshot = path.join(this.snapshotsRoot, snapshotId);
+    const metadata = this.readSnapshotMetadata(snapshot);
+    if (!metadata) return null;
+    const database = metadata.present.database ? lstatIfPresent(path.join(snapshot, "database")) : null;
+    return snapshotRecordFrom(metadata, database?.isFile() ? database.size : 0);
+  }
+
+  async planSnapshot(): Promise<LifecycleSnapshotPlan> {
+    if (!this.database.plan) throw new Error("the database adapter cannot plan snapshots");
+    // The clone probe lives in the trash so any leftover is removed by the
+    // next retention or prune.
+    assertNoSymlink(this.root, this.paths.ownershipRoot);
+    ensureDirectory(this.root, this.paths.ownershipRoot);
+    ensureDirectory(this.trashRoot, this.root);
+    assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
+    return this.database.plan({
+      source: this.paths.database,
+      probe: path.join(this.trashRoot, ["probe", randomBytes(6).toString("hex")].join(TRASH_SEPARATOR)),
+    });
+  }
+
+  /** Terminal receipt of an operation, or null when absent or unreadable. */
+  private operationMarker(operationId: string) {
+    try {
+      const marker = path.join(this.completedRoot, `${operationId}.json`);
+      assertNoSymlink(marker, this.root);
+      const stat = fs.lstatSync(marker);
+      if (!stat.isFile() || stat.size > MAX_MARKER_BYTES) return null;
+      const row = JSON.parse(fs.readFileSync(marker, "utf8")) as { operation?: unknown; status?: unknown };
+      if (typeof row?.operation !== "string" || typeof row.status !== "string") return null;
+      return { kind: row.operation, status: row.status, completedAtMs: stat.mtimeMs };
+    } catch {
+      return null;
+    }
+  }
+
+  private versionOf(target: string) {
+    const relative = path.relative(this.versionsRoot, path.resolve(this.root, target));
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+    const version = relative.split(path.sep)[0];
+    return isBoundedIdentifier(version) ? version : null;
+  }
+
+  /** Versions the current pointer and the service manifest point at. */
+  private pinnedVersions() {
+    const pinned: Array<{ version: string; reason: "current" | "service_manifest" }> = [];
+    if (lstatIfPresent(this.currentPath)?.isSymbolicLink()) {
+      const version = this.versionOf(fs.readlinkSync(this.currentPath));
+      if (version) pinned.push({ version, reason: "current" });
+    }
+    const manifest = lstatIfPresent(this.paths.serviceManifest);
+    if (manifest?.isFile() && manifest.size <= MAX_MANIFEST_BYTES) {
+      const roots = new Set([this.versionsRoot]);
+      try {
+        roots.add(fs.realpathSync(this.versionsRoot));
+      } catch {
+        // No versions directory: nothing further to resolve.
+      }
+      for (const version of versionsNamedIn(fs.readFileSync(this.paths.serviceManifest, "utf8"), [...roots])) {
+        pinned.push({ version, reason: "service_manifest" });
+      }
+    }
+    return pinned;
+  }
+
+  private childDirectories(parent: string) {
+    if (!lstatIfPresent(parent)) return [];
+    assertNoSymlink(parent, this.root);
+    if (!fs.lstatSync(parent).isDirectory()) throw new Error("managed lifecycle directory is malformed");
+    return fs.readdirSync(parent).sort().filter((name) => {
+      if (!isBoundedIdentifier(name)) return false;
+      const stat = lstatIfPresent(path.join(parent, name));
+      return Boolean(stat?.isDirectory() && !stat.isSymbolicLink());
+    });
+  }
+
+  /** Read-only view of everything retention decides over. */
+  private retentionInput() {
+    let blockedReason: LifecycleSnapshotInventory["blockedReason"] = null;
+    const empty: LifecycleRetentionInput = { installedVersion: null, pinnedVersions: [], journal: null, snapshots: [], versions: [] };
+    if (!lstatIfPresent(this.root)) return { input: empty, blockedReason, createdAt: new Map<string, string | null>() };
+    assertNoSymlink(this.root, this.paths.ownershipRoot);
+    let installedVersion: string | null = null;
+    try {
+      installedVersion = this.state()?.version ?? null;
+    } catch {
+      blockedReason = "lifecycle_state_unreadable";
+    }
+    let journal: LifecycleJournal | null = null;
+    try {
+      assertNoSymlink(this.journalPath, this.root);
+      const value = readJson<unknown>(this.journalPath);
+      if (value !== null && !isLifecycleJournal(value)) throw new Error("malformed journal");
+      journal = value;
+    } catch {
+      blockedReason ??= "journal_unreadable";
+    }
+    const createdAt = new Map<string, string | null>();
+    const snapshots = this.childDirectories(this.snapshotsRoot).map((id) => {
+      const directory = path.join(this.snapshotsRoot, id);
+      const metadata = this.readSnapshotMetadata(directory);
+      const createdAtMs = metadata?.createdAt !== undefined && Number.isFinite(Date.parse(metadata.createdAt))
+        ? Date.parse(metadata.createdAt)
+        : (lstatIfPresent(path.join(directory, "snapshot.json")) ?? fs.lstatSync(directory)).mtimeMs;
+      createdAt.set(id, new Date(createdAtMs).toISOString());
+      return {
+        id,
+        bytes: treeBytes(directory),
+        createdAtMs,
+        metadataValid: metadata !== null,
+        restoresVersion: metadata?.currentVersion ?? null,
+        method: metadata ? snapshotRecordFrom(metadata, 0).method : null,
+        operation: this.operationMarker(id),
+      };
+    });
+    const versions = this.childDirectories(this.versionsRoot).map((version) => ({
+      version,
+      bytes: treeBytes(path.join(this.versionsRoot, version)),
+    }));
+    return {
+      input: { installedVersion, pinnedVersions: this.pinnedVersions(), journal, snapshots, versions },
+      blockedReason,
+      createdAt,
+    };
+  }
+
+  /** Entries an earlier removal renamed into the trash but had not deleted yet. */
+  private trashEntries() {
+    const trash = lstatIfPresent(this.trashRoot);
+    if (!trash) return [];
+    assertNoSymlink(this.trashRoot, this.root);
+    if (!trash.isDirectory()) throw new Error("lifecycle trash must be a directory");
+    const entries: Array<{ fileName: string; item: LifecycleRemovedItem | null }> = [];
+    for (const fileName of fs.readdirSync(this.trashRoot).sort()) {
+      const [kind, name] = fileName.split(TRASH_SEPARATOR);
+      if (kind === "probe") {
+        entries.push({ fileName, item: null });
+      } else if ((kind === "snapshot" || kind === "runtime_version") && isBoundedIdentifier(name)) {
+        entries.push({ fileName, item: { kind, name, bytes: treeBytes(path.join(this.trashRoot, fileName)) } });
+      }
+    }
+    return entries;
+  }
+
+  private async drainTrash(operationId: string) {
+    const drained: LifecycleRemovedItem[] = [];
+    for (const entry of this.trashEntries()) {
+      await this.assertFence(operationId);
+      fs.rmSync(path.join(this.trashRoot, entry.fileName), { recursive: true, force: true });
+      if (entry.item) drained.push(entry.item);
+    }
+    return drained;
+  }
+
+  async inspectSnapshots(input: { keep: number }): Promise<LifecycleSnapshotInventory> {
+    const { input: retention, blockedReason, createdAt } = this.retentionInput();
+    const plan = planLifecycleRetention(retention, input.keep);
+    const byId = new Map(retention.snapshots.map((snapshot) => [snapshot.id, snapshot]));
+    const snapshots = plan.snapshots.map((decision) => {
+      const snapshot = byId.get(decision.id)!;
+      return {
+        id: decision.id,
+        createdAt: createdAt.get(decision.id) ?? null,
+        bytes: snapshot.bytes,
+        method: snapshot.method ?? "unrecorded" as const,
+        restoresVersion: snapshot.restoresVersion,
+        operationState: decision.state,
+        retention: decision.keep ? "keep" as const : "prune" as const,
+        reason: decision.reason,
+      };
+    }).sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? "") || right.id.localeCompare(left.id));
+    const versionBytes = new Map(retention.versions.map((version) => [version.version, version.bytes]));
+    const versions = plan.versions.map((decision) => ({
+      version: decision.version,
+      bytes: versionBytes.get(decision.version) ?? 0,
+      retention: decision.keep ? "keep" as const : "prune" as const,
+      reason: decision.reason,
+    })).sort((left, right) => right.version.localeCompare(left.version, undefined, { numeric: true }));
+    const pendingRemoval = this.trashEntries().flatMap((entry) => entry.item ? [entry.item] : []);
+    const sum = (rows: readonly { bytes: number }[]) => rows.reduce((total, row) => total + row.bytes, 0);
+    return {
+      keepSnapshots: input.keep,
+      installedVersion: retention.installedVersion,
+      blockedReason,
+      snapshots,
+      versions,
+      pendingRemoval,
+      bytes: {
+        snapshots: sum(snapshots),
+        versions: sum(versions),
+        prunable: blockedReason ? 0 : sum([...snapshots, ...versions].filter((row) => row.retention === "prune")),
+        pendingRemoval: sum(pendingRemoval),
+      },
+    };
+  }
+
+  /**
+   * Crash-safe removal: each removed snapshot or runtime is first renamed into
+   * the lifecycle trash (atomic on one volume; the directories are fsynced),
+   * then deleted. A process that stops between the two leaves only trash,
+   * which the next retention or prune deletes and records as recovered.
+   */
+  async retainSnapshots(input: { operationId: string; keep: number; apply: boolean }): Promise<LifecycleRetentionRecord> {
+    const recovered = input.apply ? await this.drainTrash(input.operationId) : [];
+    const { input: retention, blockedReason } = this.retentionInput();
+    const plan = planLifecycleRetention(retention, input.keep);
+    const snapshotBytes = new Map(retention.snapshots.map((snapshot) => [snapshot.id, snapshot.bytes]));
+    const versionBytes = new Map(retention.versions.map((version) => [version.version, version.bytes]));
+    const removed: LifecycleRemovedItem[] = [
+      ...plan.snapshots.filter((row) => !row.keep)
+        .map((row) => ({ kind: "snapshot" as const, name: row.id, bytes: snapshotBytes.get(row.id) ?? 0 })),
+      ...plan.versions.filter((row) => !row.keep)
+        .map((row) => ({ kind: "runtime_version" as const, name: row.version, bytes: versionBytes.get(row.version) ?? 0 })),
+    ];
+    const record = (status: LifecycleRetentionRecord["status"], items: LifecycleRemovedItem[]): LifecycleRetentionRecord => ({
+      keepSnapshots: input.keep,
+      status,
+      skippedReason: status === "skipped" ? blockedReason : null,
+      removed: items,
+      removedBytes: items.reduce((total, item) => total + item.bytes, 0),
+      recovered,
+      keptSnapshots: status === "skipped" ? [] : plan.snapshots.filter((row) => row.keep).map((row) => row.id),
+      keptVersions: status === "skipped" ? [] : plan.versions.filter((row) => row.keep).map((row) => row.version),
+    });
+    if (blockedReason) return record("skipped", []);
+    if (!input.apply) return record("preview", removed);
+    for (const item of removed) {
+      await this.assertFence(input.operationId);
+      const source = path.join(item.kind === "snapshot" ? this.snapshotsRoot : this.versionsRoot, item.name);
+      assertNoSymlink(source, this.root);
+      if (!fs.lstatSync(source).isDirectory()) throw new Error("retention target must be a directory");
+      ensureDirectory(this.trashRoot, this.root);
+      const target = path.join(this.trashRoot, [item.kind, item.name, randomBytes(6).toString("hex")].join(TRASH_SEPARATOR));
+      fs.renameSync(source, target);
+    }
+    if (removed.length > 0) {
+      fsyncDirectory(this.trashRoot);
+      if (removed.some((item) => item.kind === "snapshot")) fsyncDirectory(this.snapshotsRoot);
+      if (removed.some((item) => item.kind === "runtime_version")) fsyncDirectory(this.versionsRoot);
+    }
+    await this.drainTrash(input.operationId);
+    return record("applied", removed);
   }
 }
