@@ -48,12 +48,20 @@ import {
   runClaudeStatusLineProxy,
   runCodexAppServerCapacityProbe,
 } from "../packages/collector-cli/src/provider-capacity-adapters";
+import { FIXTURE_ROOT_ENV } from "../packages/collector-config/src/fixture-root";
 import { scanCapacityDoctrine } from "./capacity-dependency-reachability";
 
 const root = process.cwd();
 const fixtureDir = path.join(root, "scripts/fixtures/capacity-adapters");
 const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-capacity-adapters-"));
 const fakeServer = path.join(fixtureDir, "fake-app-server.mjs");
+// Every scenario passes its own scratch homeDir. An ambient PLIMSOLL_HOME (the
+// CI layout exports one) would override it, so all scenarios would share one
+// adapter state directory and a provider-error backoff would block later probes.
+delete process.env.PLIMSOLL_HOME;
+// Issue 0071: a proof's managed-config apply must land inside a declared
+// fixture root. Every settings file this proof configures is under scratchRoot.
+process.env[FIXTURE_ROOT_ENV] = scratchRoot;
 
 type Check = { name: string; detail?: Record<string, unknown> };
 const checks: Check[] = [];
