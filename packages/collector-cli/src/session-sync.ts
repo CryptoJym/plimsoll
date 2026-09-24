@@ -9,6 +9,7 @@ import type { CollectorConfig } from "./config";
 import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
+import { BOUNDED_SQL_READ_PREDICATE, BoundedSqlReadError, boundedSqlRows } from "./bounded-sql-read";
 import { TransportError } from "./http-transport";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
@@ -560,11 +561,11 @@ export function listLedgerSessionIds(
   options: { until: string; since?: string | null; extraIds?: string[]; excludedIds?: string[] },
 ): string[] {
   const query = ledgerSessionIdsQuery(ledger, options);
-  query.sql += ` order by e.session_id asc limit ${SESSION_ID_PAGE_SIZE + 1}`;
-  const rows = ledger.prepare(query.sql).all(query.params) as Array<{ sessionId: string }>;
-  if (rows.length > SESSION_ID_PAGE_SIZE) {
-    throw new Error("session_id_scan_requires_off_thread_paging");
-  }
+  query.sql += ` and ${BOUNDED_SQL_READ_PREDICATE} order by e.session_id asc limit @limit`;
+  query.params.limit = SESSION_ID_PAGE_SIZE + 1;
+  const rows = boundedSqlRows<{ sessionId: string }>(
+    ledger, query.sql, query.params, SESSION_ID_PAGE_SIZE,
+  );
   const excluded = new Set(options.excludedIds ?? []);
   return mergeSessionIds(rows.map(row => row.sessionId), options.extraIds ?? [])
     .filter((id) => !excluded.has(id));
@@ -609,7 +610,18 @@ export function planDaemonSessionSync(input: {
   const fromBatches = sessionIdsFromBatches(input.uploadedBatches);
   const blocked = mergeSessionIds(input.state.blockedSessionIds ?? []);
   const blockedSet = new Set(blocked);
-  const summaryPending = listSessionSummaryPendingIds(input.db, until);
+  const fullWalk = (pending: string[]): DaemonSessionSyncPlan => ({
+    skip: false, sessionIds: undefined, until, reason: "full_catchup",
+    state: { ...input.state, caughtUp: false, pendingSessionIds: pending, blockedSessionIds: blocked },
+  });
+  let summaryPending: string[];
+  try {
+    summaryPending = listSessionSummaryPendingIds(input.db, until, MAX_PENDING_SESSION_IDS);
+  } catch (error) {
+    if (!(error instanceof BoundedSqlReadError)) throw error;
+    return fullWalk(mergeSessionIds(input.state.pendingSessionIds, fromBatches)
+      .filter((id) => !blockedSet.has(id)));
+  }
   const pending = mergeSessionIds(input.state.pendingSessionIds, fromBatches, summaryPending)
     .filter((id) => !blockedSet.has(id));
   if (!input.state.caughtUp) {
@@ -624,14 +636,20 @@ export function planDaemonSessionSync(input: {
       state: { ...input.state, pendingSessionIds: pending, blockedSessionIds: blocked },
     };
   }
-  const sessionIds = input.ledgerSessionIds === undefined
-    ? listLedgerSessionIds(input.db, {
+  let sessionIds: string[];
+  try {
+    sessionIds = input.ledgerSessionIds === undefined
+      ? listLedgerSessionIds(input.db, {
         until,
         since: input.state.lastSuccessfulUntil,
         extraIds: pending,
         excludedIds: blocked,
       })
-    : mergeSessionIds(input.ledgerSessionIds, pending).filter((id) => !blockedSet.has(id));
+      : mergeSessionIds(input.ledgerSessionIds, pending).filter((id) => !blockedSet.has(id));
+  } catch (error) {
+    if (!(error instanceof BoundedSqlReadError)) throw error;
+    return fullWalk(pending);
+  }
   if (sessionIds.length === 0) {
     return {
       skip: true,

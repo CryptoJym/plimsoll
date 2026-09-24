@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 
+import { BOUNDED_SQL_READ_PREDICATE, boundedSqlRows } from "./bounded-sql-read";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 
 /** A read query that can be executed by the session-summary read worker. */
@@ -775,21 +776,26 @@ function fallbackReason(
 }
 
 /** Session ids whose durable summaries need another bounded pass. */
-export function listSessionSummaryPendingIds(db: Database.Database, until: string): string[] {
+export function listSessionSummaryPendingIds(db: Database.Database, until: string, maxIds = 8_000): string[] {
   if (!tableExists(db, "session_sync_summary_state") || !tableExists(db, "session_sync_summary_dirty")) return [];
-  const rows = db.prepare(
+  const limit = Math.max(1, Math.min(Math.trunc(maxIds), 8_000));
+  const rows = boundedSqlRows<{ sessionId: string }>(db,
     `select session_id as sessionId from session_sync_summary_dirty
+       where ${BOUNDED_SQL_READ_PREDICATE}
      union
-     select session_id as sessionId from session_sync_summary_state where complete = 0
+     select session_id as sessionId from session_sync_summary_state
+       where complete = 0 and ${BOUNDED_SQL_READ_PREDICATE}
      union
      select r.session_id as sessionId from session_sync_summary_revision r
        left join session_sync_summary_state s on s.session_id = r.session_id
-       where s.session_id is null or r.mutation_revision != s.mutation_revision
+       where (s.session_id is null or r.mutation_revision != s.mutation_revision)
+         and ${BOUNDED_SQL_READ_PREDICATE}
      union
      select r.session_id as sessionId from session_sync_summary_rows r
        join buffered_events e on e.rowid = r.raw_rowid
-       where e.created_at <= ?`,
-  ).all(until) as Array<{ sessionId: string }>;
+       where e.created_at <= @until and ${BOUNDED_SQL_READ_PREDICATE}
+     limit @limit`,
+    { until, limit: limit + 1 }, limit);
   return rows.map((row) => row.sessionId);
 }
 

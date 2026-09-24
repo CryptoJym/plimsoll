@@ -11,6 +11,7 @@ import {
   buildSessionSyncRow,
   collectSessionSnapshots,
   emptyDaemonSessionSyncState,
+  listLedgerSessionIds,
   listLedgerSessionIdsOffThread,
   planDaemonSessionSync,
   readLedgerOffThread,
@@ -18,6 +19,7 @@ import {
 } from "../packages/collector-cli/src/session-sync";
 import {
   ensureSessionSummarySchema,
+  listSessionSummaryPendingIds,
   sessionSummaryCounters,
   updateSessionSummary,
 } from "../packages/collector-cli/src/session-summary";
@@ -150,6 +152,7 @@ async function reviewRegressions() {
     "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
     "interleaved_initial_insert", "trigger_upgrade", "privacy_handoff_erasure",
     "backdated_queue_planner", "stale_send_fast_retry",
+    "pending_id_bounds", "sync_id_deadline",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -501,6 +504,58 @@ async function reviewRegressions() {
         const branch = cliSource.indexOf("if (sessionResult.ok", pending);
         assert.ok(pending >= 0 && branch > pending);
         assert.match(cliSource.slice(pending, branch), /summaryCatchUp = summaryPending\.length > 0/);
+      } else if (name === "pending_id_bounds") {
+        const insert = buffer.database.prepare(
+          "insert into session_sync_summary_dirty (session_id, reason, updated_at) values (?, 'fixture', ?)",
+        );
+        buffer.database.transaction(() => {
+          for (let index = 0; index < 8_050; index += 1) {
+            insert.run(`eeeeeeee-eeee-4eee-8eee-${String(index).padStart(12, "0")}`, until);
+          }
+        })();
+        let bounded = false;
+        try {
+          bounded = listSessionSummaryPendingIds(buffer.database, until, 8_000).length <= 8_000;
+        } catch (error) {
+          bounded = error instanceof Error && error.message.includes("bounded_sql_read");
+        }
+        assert.equal(bounded, true);
+        const plan = planDaemonSessionSync({
+          db: buffer.database,
+          state: { ...emptyDaemonSessionSyncState(), caughtUp: true, lastSuccessfulUntil: until },
+          uploadedBatches: [], until, ledgerSessionIds: [],
+        });
+        assert.equal(plan.reason, "full_catchup");
+      } else if (name === "sync_id_deadline") {
+        for (let index = 0; index < 180; index += 1) {
+          insertRaw(buffer, {
+            id: uuid(50_000 + index),
+            sessionId: `ffffffff-ffff-4fff-8fff-${String(index).padStart(12, "0")}`,
+            observedAt: "2026-09-20T02:00:00.000Z",
+            createdAt: "2026-09-20T02:00:00.000Z",
+            inputTokens: 1, outputTokens: 1,
+          });
+        }
+        buffer.database.function("slow_session_id_probe", () => {
+          const end = performance.now() + 2;
+          while (performance.now() < end) { /* simulate a costly SQLite row */ }
+          return 1;
+        });
+        const db = buffer.database;
+        const originalPrepare = db.prepare.bind(db);
+        (db as typeof db & { prepare: typeof db.prepare }).prepare = ((sql: string) =>
+          originalPrepare(sql.includes("select distinct e.session_id as sessionId")
+            ? sql.replace(" order by e.session_id asc", " and slow_session_id_probe() order by e.session_id asc")
+            : sql)) as typeof db.prepare;
+        let deadlineRaised = false;
+        try {
+          listLedgerSessionIds(db, { until });
+        } catch (error) {
+          deadlineRaised = error instanceof Error && error.message.includes("bounded_sql_read_deadline");
+        } finally {
+          (db as typeof db & { prepare: typeof db.prepare }).prepare = originalPrepare;
+        }
+        assert.equal(deadlineRaised, true);
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
     } finally {
