@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
-export type MaintenanceSource = "codex" | "claude_code";
+/** Grok git contexts (usage files and hooks) resolve in the worker too (bead eco-6hoxj.163.20). */
+export type MaintenanceSource = "codex" | "claude_code" | "grok";
 export type MaintenanceProgressStage =
   | "source_scan"
   | "discovery_directory"

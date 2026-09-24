@@ -190,7 +190,9 @@ export function resolveRepoContextBatch(
       deferred.push(...requests.slice(index));
       break;
     }
-    if (repoContext.source !== "codex" && repoContext.source !== "claude_code") {
+    // Codex, Claude and Grok contexts all carry a working directory their
+    // capture observed (Grok's from its session directory name or hooks).
+    if (repoContext.source !== "codex" && repoContext.source !== "claude_code" && repoContext.source !== "grok") {
       emit(unknownResult(repoContext));
       continue;
     }

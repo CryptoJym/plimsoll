@@ -91,7 +91,7 @@ export type MaintenanceProgressReceipt = {
   nonce: string;
   sequence: number;
   stage: MaintenanceProgressStage;
-  source: "codex" | "claude_code";
+  source: "codex" | "claude_code" | "grok";
   candidateHash: string | null;
 };
 
@@ -182,7 +182,7 @@ const PROGRESS_STAGES = new Set<MaintenanceProgressStage>([
 function parseProgress(value: unknown): MaintenanceProgress | null {
   const row = record(value);
   if (!row || !exactKeys(row, ["source", "stage", "candidateHash"]) ||
-    (row.source !== "codex" && row.source !== "claude_code") ||
+    (row.source !== "codex" && row.source !== "claude_code" && row.source !== "grok") ||
     typeof row.stage !== "string" || !PROGRESS_STAGES.has(row.stage as MaintenanceProgressStage) ||
     (row.candidateHash !== null &&
       (typeof row.candidateHash !== "string" || !/^sha256:[a-f0-9]{64}$/i.test(row.candidateHash))) ||

@@ -56,7 +56,7 @@ export type MaintenanceBoundaryStatus = {
   state: MaintenanceBoundaryState;
   accepting: boolean;
   stage: "idle" | "spawning" | "automatic_capture" | "terminating" | "closed";
-  source: "codex" | "claude_code" | "unknown";
+  source: "codex" | "claude_code" | "grok" | "unknown";
   deadlineMs: number;
   generation: number;
   inFlight: boolean;
@@ -86,7 +86,7 @@ export type MaintenanceBoundaryStatus = {
     escalatedDelayMs: number;
   };
   quarantine: {
-    source: "codex" | "claude_code" | null;
+    source: "codex" | "claude_code" | "grok" | null;
     stage: MaintenanceProgress["stage"] | null;
     candidateHash: string | null;
     until: string | null;
