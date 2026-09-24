@@ -384,6 +384,25 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm docs:privacy --check
 
+      # Independent of the TypeScript typecheck. The cache holds the SDK module
+      # cache that dominates a cold build (~32 s of ~38 s on an M-series Mac).
+      # That cache records its absolute path and fails, not rebuilds, when
+      # restored elsewhere, so the key carries the workspace path.
+      - name: Restore the menubar Swift build cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache@v4
+        with:
+          path: packages/mac-menubar/.build
+          key: mac-menubar-${{ runner.os }}-${{ runner.arch }}-xcode-16.2-${{ github.workspace }}-${{ hashFiles('packages/mac-menubar/Package.swift', 'packages/mac-menubar/Sources/**', 'packages/mac-menubar/Tests/**') }}
+          restore-keys: mac-menubar-${{ runner.os }}-${{ runner.arch }}-xcode-16.2-${{ github.workspace }}-
+
+      - name: Build and test the macOS menubar app (#12)
+        if: ${{ !cancelled() }}
+        env:
+          # The tests use Swift Testing (Xcode 16+); macos-14 defaults to Xcode 15.4.
+          DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+        run: pnpm proof:mac-menubar
+
       - name: Upload evidence artifact
         if: always()
         uses: actions/upload-artifact@v4

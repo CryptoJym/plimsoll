@@ -131,6 +131,7 @@
     "proof:dashboard-security": "tsx scripts/dashboard-security-proof.ts",
     "proof:dashboard-cdp": "tsx scripts/dashboard-security-cdp-proof.ts",
     "proof:dashboard-dom-wait": "tsx scripts/dashboard-dom-wait-proof.ts",
+    "proof:mac-menubar": "sh packages/mac-menubar/scripts/check.sh",
     "proof:outcome-timeline": "tsx scripts/outcome-timeline-proof.ts --receipt evidence/outcome-timeline-proof.json",
     "proof:performance-layer": "tsx scripts/performance-layer-proof.ts",
     "proof:lane-receipts": "tsx scripts/lane-receipt-proof.ts",
