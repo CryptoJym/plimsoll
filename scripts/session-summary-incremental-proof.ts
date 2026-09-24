@@ -91,31 +91,42 @@ function expectedSessions(buffer: LocalEventBuffer, sessionIds: string[]) {
 }
 
 async function runIncremental(buffer: LocalEventBuffer, sessionIds: string[]) {
-  let wire = "";
-  const fetchImpl = (async (_input, init) => {
-    wire = String(init?.body ?? "");
-    return new Response(JSON.stringify({
-      ...acceptedFixtureDelivery(wire, installKey),
-      inserted: JSON.parse(wire).sessions.length,
-      updated: 0,
-      skippedStale: 0,
-    }), { status: 200, headers: { "content-type": "application/json" } });
-  }) as typeof fetch;
-  const result = await runSessionSync(config, {
-    ledgerDb: buffer.database,
-    incremental: true,
-    sessionIds,
-    until,
-    fetchImpl,
-    sleep: async () => undefined,
-    delayMs: 0,
-    maxAttemptsPerBatch: 1,
-    summaryMaxRows: 100_000,
-    summaryMaxMs: 5_000,
-    log: () => undefined,
-  });
-  const sent = wire ? JSON.parse(wire).sessions : [];
-  return { result, sent };
+  let fullRecomputes = 0;
+  let rowsRead = 0;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    let wire = "";
+    const fetchImpl = (async (_input, init) => {
+      wire = String(init?.body ?? "");
+      return new Response(JSON.stringify({
+        ...acceptedFixtureDelivery(wire, installKey),
+        inserted: JSON.parse(wire).sessions.length,
+        updated: 0,
+        skippedStale: 0,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const result = await runSessionSync(config, {
+      ledgerDb: buffer.database,
+      incremental: true,
+      sessionIds,
+      until,
+      fetchImpl,
+      sleep: async () => undefined,
+      delayMs: 0,
+      maxAttemptsPerBatch: 1,
+      summaryMaxRows: 100_000,
+      summaryMaxMs: 5_000,
+      log: () => undefined,
+    });
+    fullRecomputes += result.summaryStats.fullRecomputes;
+    rowsRead += result.summaryStats.rowsRead;
+    if (result.summaryComplete) {
+      return {
+        result: { ...result, summaryStats: { ...result.summaryStats, fullRecomputes, rowsRead } },
+        sent: wire ? JSON.parse(wire).sessions : [],
+      };
+    }
+  }
+  throw new Error("session_summary_did_not_complete_within_20_bounded_slices");
 }
 
 function compareExact(buffer: LocalEventBuffer, sessionIds: string[], sent: unknown[]) {
