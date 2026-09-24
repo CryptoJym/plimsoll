@@ -670,9 +670,21 @@ function summaryRowsQuery(
   appendRows = false,
 ): SessionReadQuery {
   const eligible = terminalPrivacyEligibilitySql(db, "e");
-  const cursor = appendRows
-    ? "r.session_id = @sessionId and r.raw_rowid > @highWater"
-    : "e.session_id = @sessionId and e.rowid <= @scanBoundary and (e.observed_at, e.rowid) > (@cursorObservedAt, @cursorRowid)";
+  // SQLite cannot seek by rowid within a timestamp group for the tuple
+  // predicate (observed_at, rowid) > (?, ?). Split the equal-timestamp and
+  // later-timestamp ranges so a long session with many equal observations
+  // still resumes in index order within the read deadline.
+  const historicalRows = `(select e0.rowid as raw_rowid, e0.observed_at as sort_observed_at
+      from buffered_events e0 indexed by idx_events_session
+      where e0.session_id = @sessionId and e0.observed_at = @cursorObservedAt
+        and e0.rowid > @cursorRowid and e0.rowid <= @scanBoundary
+      union all
+      select e0.rowid as raw_rowid, e0.observed_at as sort_observed_at
+      from buffered_events e0 indexed by idx_events_session
+      where e0.session_id = @sessionId and e0.observed_at > @cursorObservedAt
+        and e0.rowid <= @scanBoundary
+      order by sort_observed_at, raw_rowid limit @limit) scan
+      join buffered_events e on e.rowid = scan.raw_rowid`;
   return {
     sql: `select e.rowid as rowid, e.id, e.session_id as sessionId, e.source,
        e.observed_at as observedAt, e.created_at as createdAt,
@@ -684,9 +696,9 @@ function summaryRowsQuery(
        case when ${eligible} then 1 else 0 end as eligible
      from ${appendRows
        ? "session_sync_summary_rows r join buffered_events e on e.rowid = r.raw_rowid"
-       : "buffered_events e indexed by idx_events_session"}
-     where ${cursor}
-     order by ${appendRows ? "e.rowid" : "e.observed_at, e.rowid"} asc limit @limit`,
+       : historicalRows}
+     ${appendRows ? "where r.session_id = @sessionId and r.raw_rowid > @highWater" : ""}
+     order by ${appendRows ? "e.rowid" : "scan.sort_observed_at, scan.raw_rowid"} asc limit @limit`,
     params: { sessionId, highWater, cursorObservedAt: cursorObservedAt ?? "", cursorRowid, scanBoundary, limit },
     ...(maxMs === undefined ? {} : { maxMs }),
   };

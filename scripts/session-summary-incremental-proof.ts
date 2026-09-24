@@ -152,7 +152,7 @@ async function reviewRegressions() {
     "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
     "interleaved_initial_insert", "trigger_upgrade", "privacy_handoff_erasure",
     "backdated_queue_planner", "stale_send_fast_retry",
-    "pending_id_bounds", "sync_id_deadline",
+    "pending_id_bounds", "sync_id_deadline", "same_time_seek",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -174,7 +174,7 @@ async function reviewRegressions() {
         let injected = false;
         const read = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
           const rows = await directRead<T>(queries);
-          if (!injected && queries.some((query) => query.sql.includes("order by e.observed_at, e.rowid asc"))) {
+          if (!injected && queries.some((query) => /order by (?:e\.observed_at, e\.rowid|scan\.sort_observed_at, scan\.raw_rowid) asc/.test(query.sql))) {
             injected = true;
             add(2);
           }
@@ -305,7 +305,7 @@ async function reviewRegressions() {
         let changed = false;
         const read = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
           const rows = await directRead<T>(queries);
-          if (!changed && queries.some((query) => query.sql.includes("order by e.observed_at, e.rowid asc"))) {
+          if (!changed && queries.some((query) => /order by (?:e\.observed_at, e\.rowid|scan\.sort_observed_at, scan\.raw_rowid) asc/.test(query.sql))) {
             changed = true;
             buffer.database.prepare(`insert into upload_receipts
               (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
@@ -556,6 +556,40 @@ async function reviewRegressions() {
           (db as typeof db & { prepare: typeof db.prepare }).prepare = originalPrepare;
         }
         assert.equal(deadlineRaised, true);
+      } else if (name === "same_time_seek") {
+        for (let index = 1; index <= 3; index += 1) {
+          insertRaw(buffer, {
+            id: uuid(60_000 + index), sessionId,
+            observedAt: "2026-09-20T04:00:00.000Z",
+            createdAt: "2026-09-20T04:00:00.000Z",
+            inputTokens: 1, outputTokens: 1,
+          });
+        }
+        const first = await updateSessionSummary(buffer.database, sessionId, until, {
+          read: directRead, maxRows: 1,
+        });
+        assert.equal(first.complete, false);
+        const plans: string[] = [];
+        const plannedRead = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
+          for (const query of queries) {
+            if (query.sql.includes("@cursorObservedAt")) {
+              const explain = buffer.database.prepare(`explain query plan ${query.sql}`)
+                .all(query.params) as Array<{ detail: string }>;
+              plans.push(...explain.map((row) => row.detail));
+            }
+          }
+          return directRead<T>(queries);
+        };
+        const second = await updateSessionSummary(buffer.database, sessionId, until, {
+          read: plannedRead, maxRows: 1,
+        });
+        assert.ok(second.highWater > first.highWater);
+        assert.ok(plans.some((detail) => /observed_at=\? AND rowid>\?/.test(detail)),
+          `same-timestamp continuation did not seek by rowid: ${plans.join("; ")}`);
+        const complete = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        assert.deepEqual(complete.snapshot, collectSessionSnapshots(buffer.database, {
+          until, sessionIds: [sessionId],
+        })[0]);
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
     } finally {
