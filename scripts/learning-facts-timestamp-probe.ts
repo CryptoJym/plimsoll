@@ -5,12 +5,23 @@
 // `direct-new` exercises current admission; downgrade/reupgrade exercise the
 // same admitted spellings after the new stored-key schema is present.
 import assert from "node:assert/strict";
+import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 
 const [mode, ledgerPath] = process.argv.slice(2);
 assert.ok(["seed-old", "upgrade-new", "direct-new", "downgrade-old", "reupgrade-new"].includes(mode));
-assert.ok(ledgerPath?.startsWith("/tmp/"));
+assert.ok(ledgerPath, "ledger path required");
+const isolatedTempDir = path.resolve(process.env.TMPDIR || os.tmpdir());
+const resolvedLedgerPath = path.resolve(ledgerPath);
+const relativeLedgerPath = path.relative(isolatedTempDir, resolvedLedgerPath);
+assert.ok(
+  relativeLedgerPath &&
+    relativeLedgerPath !== ".." &&
+    !relativeLedgerPath.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relativeLedgerPath),
+  `ledger path must be inside isolated temp folder ${isolatedTempDir}`,
+);
 const requireFromRepo = createRequire(path.join(process.cwd(), "package.json"));
 const Database = requireFromRepo("better-sqlite3");
 const facts = requireFromRepo(path.join(process.cwd(), "packages/collector-cli/src/learning-facts.ts"));

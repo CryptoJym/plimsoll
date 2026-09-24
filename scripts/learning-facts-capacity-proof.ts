@@ -1276,12 +1276,29 @@ function exerciseNestedEpisodeRollback() {
 
 function exerciseTimestampProperty(root: string) {
   const probe = path.join(repoRoot, "scripts/learning-facts-timestamp-probe.ts");
+  const tsx = path.join(repoRoot, "node_modules/tsx/dist/cli.mjs");
   const result = spawnSync(process.execPath,
-    [path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"), probe,
-      "direct-new", path.join(root, "timestamp-property.sqlite")],
+    [tsx, probe, "direct-new", path.join(root, "timestamp-property.sqlite")],
+    { cwd: repoRoot, encoding: "utf8", timeout: 30_000 });
+  const isolatedTempDir = path.resolve(process.env.TMPDIR || os.tmpdir());
+  const outsideLedger = path.join(
+    path.dirname(isolatedTempDir),
+    `plimsoll-timestamp-outside-${process.pid}.sqlite`,
+  );
+  const outside = spawnSync(process.execPath,
+    [tsx, probe, "direct-new", outsideLedger],
     { cwd: repoRoot, encoding: "utf8", timeout: 30_000 });
   check("seeded_admitted_timestamp_grammar_matches_date_parse_and_instant_order",
-    result.status === 0, { status: result.status, stdout: result.stdout, stderr: result.stderr });
+    result.status === 0 && outside.status !== 0, {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      isolatedTempDir,
+      outsideLedger,
+      outsideStatus: outside.status,
+      outsideStdout: outside.stdout,
+      outsideStderr: outside.stderr,
+    });
 }
 
 function exerciseInvalidLegacyTimestamp() {
