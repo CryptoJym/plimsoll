@@ -145,6 +145,7 @@ async function reviewRegressions() {
     "first_read_insert", "fallback_checkpoint", "missing_dirty_marker", "privacy_before_send",
     "unrelated_revision", "retry_erasure", "hard_bounds", "session_id_paging",
     "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
+    "interleaved_initial_insert",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -240,20 +241,25 @@ async function reviewRegressions() {
         assert.ok(second.highWater > first.highWater, JSON.stringify({ first, second }));
       } else if (name === "retry_erasure") {
         add(1);
+        await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
         let calls = 0;
-        const result = await runSessionSync(config, {
-          ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
-          delayMs: 0, maxAttemptsPerBatch: 2,
-          fetchImpl: (async () => {
-            calls += 1;
-            return new Response("{}", { status: 503 });
-          }) as typeof fetch,
-          sleep: async () => {
-            buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(451));
-          },
-          log: () => undefined,
-        });
+        let result: Awaited<ReturnType<typeof runSessionSync>> | undefined;
+        for (let attempt = 0; attempt < 20 && calls === 0; attempt += 1) {
+          result = await runSessionSync(config, {
+            ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+            delayMs: 0, maxAttemptsPerBatch: 2,
+            fetchImpl: (async () => {
+              calls += 1;
+              return new Response("{}", { status: 503 });
+            }) as typeof fetch,
+            sleep: async () => {
+              buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(451));
+            },
+            log: () => undefined,
+          });
+        }
         assert.equal(calls, 1);
+        assert.ok(result);
         assert.equal(result.sentSessions, 0);
         assert.equal(result.summaryComplete, false);
         assert.ok(result.pendingSummarySessionIds.includes(sessionId));
@@ -342,6 +348,21 @@ async function reviewRegressions() {
         assert.equal(second.fullRecompute, true);
         assert.deepEqual(second.snapshot, collectSessionSnapshots(buffer.database, {
           until: later, sessionIds: [sessionId],
+        })[0]);
+      } else if (name === "interleaved_initial_insert") {
+        add(5);
+        add(10);
+        const first = await updateSessionSummary(buffer.database, sessionId, until, {
+          read: directRead, maxRows: 1,
+        });
+        assert.equal(first.complete, false);
+        add(1);
+        add(20);
+        await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        const final = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        assert.equal(final.complete, true);
+        assert.deepEqual(final.snapshot, collectSessionSnapshots(buffer.database, {
+          until, sessionIds: [sessionId],
         })[0]);
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));

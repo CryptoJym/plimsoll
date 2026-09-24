@@ -28,12 +28,14 @@ export type SessionSnapshot = {
   accountHash: string | null;
 };
 
-export const SESSION_SUMMARY_SCHEMA_VERSION = 2 as const;
+export const SESSION_SUMMARY_SCHEMA_VERSION = 3 as const;
 export const SESSION_SUMMARY_DEFAULT_MAX_ROWS = 5_000;
 export const SESSION_SUMMARY_DEFAULT_MAX_MS = 250;
 
 type SummaryAccumulator = {
   sessionId: string;
+  /** Rows through this rowid belong to the frozen historical scan. */
+  scanBoundary: number;
   /** Historical scan cursor follows idx_events_session (session, observation, rowid). */
   cursorObservedAt: string | null;
   cursorRowid: number;
@@ -149,7 +151,16 @@ function columnNames(db: Database.Database, table: string): Set<string> {
  */
 export function ensureSessionSummarySchema(db: Database.Database): void {
   const revisionTableMissing = !tableExists(db, "session_sync_summary_revision");
-  db.exec(`
+  const rawInsertTrigger = db.prepare(
+    "select sql from sqlite_master where type='trigger' and name='trg_session_summary_raw_insert'",
+  ).get() as { sql: string } | undefined;
+  // SQLite's CREATE TRIGGER IF NOT EXISTS keeps the old trigger body. Replace
+  // it atomically when upgrading a v1/v2 ledger to the frozen scan boundary.
+  db.transaction(() => {
+    if (rawInsertTrigger && !rawInsertTrigger.sql.includes("scanBoundary")) {
+      db.exec("drop trigger trg_session_summary_raw_insert");
+    }
+    db.exec(`
     create table if not exists session_sync_summary_control (
       singleton integer primary key check (singleton = 1),
       mutation_revision integer not null default 0,
@@ -219,7 +230,11 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       insert into session_sync_summary_dirty (session_id, reason, updated_at)
         select new.session_id, 'raw_insert_before_high_water', strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where exists (select 1 from session_sync_summary_state
-          where session_id = new.session_id and high_water >= new.rowid)
+          where session_id = new.session_id and
+            (high_water >= new.rowid or
+             (complete = 0 and mode != 'incremental' and
+              (case when json_valid(accumulator_json)
+                then json_extract(accumulator_json, '$.scanBoundary') end) >= new.rowid)))
         on conflict(session_id) do update set
           reason = excluded.reason, updated_at = excluded.updated_at;
     end;
@@ -260,7 +275,8 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           reason = excluded.reason, updated_at = excluded.updated_at;
       delete from session_sync_summary_rows where raw_rowid = old.rowid;
     end;
-  `);
+    `);
+  }).immediate();
 
   // The previous schema stored the global revision in each state. Preserve
   // that baseline once, then let dirty-marker triggers advance only the
@@ -443,6 +459,7 @@ export function sessionSummaryCounters(db: Database.Database): SessionSummaryCou
 function emptyAccumulator(sessionId: string): SummaryAccumulator {
   return {
     sessionId,
+    scanBoundary: 0,
     cursorObservedAt: null,
     cursorRowid: 0,
     cursorId: null,
@@ -550,6 +567,8 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
     const parsed = JSON.parse(value) as Partial<SummaryAccumulator>;
     const candidate = { ...emptyAccumulator(sessionId), ...parsed } as SummaryAccumulator;
     if (candidate.sessionId !== sessionId) return null;
+    if (typeof parsed.scanBoundary !== "number" ||
+        !Number.isSafeInteger(parsed.scanBoundary) || parsed.scanBoundary < 0) return null;
     if (typeof candidate.cursorObservedAt !== "string" && candidate.cursorObservedAt !== null) return null;
     if (!Number.isSafeInteger(candidate.cursorRowid) || candidate.cursorRowid < 0) return null;
     if (typeof candidate.cursorId !== "string" && candidate.cursorId !== null) return null;
@@ -644,6 +663,7 @@ function summaryRowsQuery(
   highWater: number,
   cursorObservedAt: string | null,
   cursorRowid: number,
+  scanBoundary: number,
   limit: number,
   maxMs?: number,
   appendRows = false,
@@ -651,7 +671,7 @@ function summaryRowsQuery(
   const eligible = terminalPrivacyEligibilitySql(db, "e");
   const cursor = appendRows
     ? "r.session_id = @sessionId and r.raw_rowid > @highWater"
-    : "e.session_id = @sessionId and (e.observed_at, e.rowid) > (@cursorObservedAt, @cursorRowid)";
+    : "e.session_id = @sessionId and e.rowid <= @scanBoundary and (e.observed_at, e.rowid) > (@cursorObservedAt, @cursorRowid)";
   return {
     sql: `select e.rowid as rowid, e.id, e.session_id as sessionId, e.source,
        e.observed_at as observedAt, e.created_at as createdAt,
@@ -666,7 +686,7 @@ function summaryRowsQuery(
        : "buffered_events e indexed by idx_events_session"}
      where ${cursor}
      order by ${appendRows ? "e.rowid" : "e.observed_at, e.rowid"} asc limit @limit`,
-    params: { sessionId, highWater, cursorObservedAt: cursorObservedAt ?? "", cursorRowid, limit },
+    params: { sessionId, highWater, cursorObservedAt: cursorObservedAt ?? "", cursorRowid, scanBoundary, limit },
     ...(maxMs === undefined ? {} : { maxMs }),
   };
 }
@@ -851,55 +871,42 @@ export async function updateSessionSummary(
       : stored ? "incremental" : "initial";
 
   let state: SummaryState;
-  if (needsFallback) {
-    const revision = currentRevision;
-    db.transaction(() => {
-      db.prepare(
-        `update session_sync_summary_control
-         set fallback_recomputes = fallback_recomputes + 1,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         where singleton = 1`,
-      ).run();
-      writeState(db, {
+  if (needsFallback || !stored) {
+    // Freeze the old rowid range while installing the trigger-visible state.
+    // Rows inserted afterward enter the append queue, even if their observed
+    // time sorts behind the historical cursor.
+    state = db.transaction(() => {
+      if (needsFallback) {
+        db.prepare(
+          `update session_sync_summary_control
+           set fallback_recomputes = fallback_recomputes + 1,
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           where singleton = 1`,
+        ).run();
+      }
+      const boundary = db.prepare(
+        "select rowid from buffered_events order by rowid desc limit 1",
+      ).get() as { rowid: number } | undefined;
+      const accumulator = emptyAccumulator(sessionId);
+      accumulator.scanBoundary = boundary?.rowid ?? 0;
+      const fresh: SummaryState = {
         sessionId,
         schemaVersion: SESSION_SUMMARY_SCHEMA_VERSION,
         highWater: 0,
         checkpointId: null,
         coveredUntil: until,
         complete: false,
-        mutationRevision: revision,
-        mode: "fallback",
-        accumulator: emptyAccumulator(sessionId),
-      });
-    })();
-    state = {
-      sessionId,
-      schemaVersion: SESSION_SUMMARY_SCHEMA_VERSION,
-      highWater: 0,
-      checkpointId: null,
-      coveredUntil: until,
-      complete: false,
-      mutationRevision: revision,
-      mode: "fallback",
-      accumulator: emptyAccumulator(sessionId),
-    };
-  } else if (stored && parsed) {
+        mutationRevision: sessionRevision(db, sessionId),
+        mode: needsFallback ? "fallback" : "initial",
+        accumulator,
+      };
+      writeState(db, fresh);
+      return fresh;
+    }).immediate();
+  } else if (parsed) {
     state = stateFromStored(stored, parsed);
   } else {
-    state = {
-      sessionId,
-      schemaVersion: SESSION_SUMMARY_SCHEMA_VERSION,
-      highWater: 0,
-      checkpointId: null,
-      coveredUntil: until,
-      complete: false,
-        mutationRevision: currentRevision,
-      mode: "initial",
-      accumulator: emptyAccumulator(sessionId),
-    };
-    // Install the row before the first off-thread read. The insert trigger
-    // then captures a row appended after that read but before its commit.
-    db.transaction(() => writeState(db, state)).immediate();
+    throw new Error("session_summary_accumulator_missing");
   }
 
   if (mode === "cached" && !needsFallback) {
@@ -971,6 +978,7 @@ export async function updateSessionSummary(
           state.highWater,
           state.accumulator.cursorObservedAt,
           state.accumulator.cursorRowid,
+          state.accumulator.scanBoundary,
           limit,
           Math.max(1, maxMs - (performance.now() - started)),
           state.mode === "incremental",
@@ -1032,7 +1040,7 @@ export async function updateSessionSummary(
     const noQueuedRows = !queuedRowsAfter(db, sessionId, state.highWater, until);
     const finalComplete = complete && revisionStable && noQueuedRows;
     state.complete = finalComplete;
-    state.mode = finalComplete ? "incremental" : needsFallback ? "fallback" : state.mode;
+    state.mode = complete ? "incremental" : needsFallback ? "fallback" : state.mode;
     writeState(db, state);
     if (finalComplete) {
       db.prepare(`delete from session_sync_summary_dirty where session_id = ?`).run(sessionId);
