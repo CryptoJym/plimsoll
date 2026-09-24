@@ -132,12 +132,7 @@ struct PlimsollMenubarCoreTests {
     }
 
     @Test func statusLargerThanThePipeBufferIsReadWithoutDeadlock() throws {
-        // The collector's status JSON grows with the host; this one is ~1 MB.
-        let collector = try FakeCollector("""
-            printf '{"port":48271,"stats":{"count":3,"tokenAttributedEvents":3},"padding":"'
-            head -c 1000000 /dev/zero | tr '\\0' 'x'
-            printf '"}'
-            """)
+        let collector = try FakeCollector(megabyteStatusScript)
         defer { collector.remove() }
 
         let result = try ProcessCollectorExecutor.run(collector.invocation, timeout: 20)
@@ -145,6 +140,29 @@ struct PlimsollMenubarCoreTests {
         #expect(result.exitCode == 0)
         #expect(result.standardOutput.utf8.count > 1_000_000)
         #expect(try CollectorStatus(json: Data(result.standardOutput.utf8)).eventCount == 3)
+    }
+
+    /// Swift Testing runs every test on the Swift concurrency pool: one thread
+    /// per core, three on a GitHub macOS runner. When all of them are blocked,
+    /// Dispatch starts no thread for DispatchQueue.global() work, so a status
+    /// read must not need one. Twice as many blocking reads as cores fill it.
+    @Test func statusReadsFinishWhileEveryPoolThreadIsBlocked() async throws {
+        let collector = try FakeCollector(megabyteStatusScript)
+        defer { collector.remove() }
+        let callers = 2 * ProcessInfo.processInfo.activeProcessorCount
+
+        let sizes = try await withThrowingTaskGroup(of: Int.self) { group in
+            for _ in 0..<callers {
+                group.addTask {
+                    // Blocks this pool thread for the whole read, as a synchronous caller does.
+                    try ProcessCollectorExecutor.run(collector.invocation, timeout: 20).standardOutput.utf8.count
+                }
+            }
+            return try await group.reduce(into: [Int]()) { $0.append($1) }
+        }
+
+        #expect(sizes.count == callers)
+        #expect(sizes.allSatisfy { $0 > 1_000_000 })
     }
 
     @Test func hungCollectorTimesOutAndIsStopped() throws {
@@ -334,6 +352,14 @@ struct PlimsollMenubarCoreTests {
         #expect(json.contains("\"requestsAdditionalPermissions\":false"))
     }
 }
+
+/// Status JSON of about 1 MB. The real document grows with the host, and
+/// anything over the 64 KB pipe buffer blocks a collector nobody is reading.
+private let megabyteStatusScript = """
+    printf '{"port":48271,"stats":{"count":3,"tokenAttributedEvents":3},"padding":"'
+    head -c 1000000 /dev/zero | tr '\\0' 'x'
+    printf '"}'
+    """
 
 /// A throwaway executable standing in for `plimsoll`; it is run as
 /// `<path> status`, exactly as the menubar runs the real collector.

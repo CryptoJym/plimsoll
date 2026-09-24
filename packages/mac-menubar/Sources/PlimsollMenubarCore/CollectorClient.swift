@@ -160,23 +160,49 @@ public enum ProcessCollectorExecutor {
             throw CollectorClientError.processLaunchFailed(error.localizedDescription)
         }
 
-        // Read both pipes while the collector runs. Waiting for it to exit
-        // first deadlocks once the status JSON outgrows the pipe buffer: the
-        // collector blocks writing and never exits.
-        let stdout = PipeReader(output.fileHandleForReading)
-        let stderr = PipeReader(error.fileHandleForReading)
-        let deadline = DispatchTime.now() + timeout
-        guard exited.wait(timeout: deadline) == .success,
-              let standardOutput = stdout.wait(until: deadline),
-              let standardError = stderr.wait(until: deadline) else {
+        // Read both pipes on this thread while the collector runs. Waiting for
+        // it to exit first deadlocks once the status JSON outgrows the pipe
+        // buffer. Handing the reads to DispatchQueue.global() stalls whenever
+        // every Swift concurrency pool thread is blocked: Dispatch then starts
+        // no thread for global-queue work, so the reads never begin.
+        let deadline = Date().addingTimeInterval(timeout)
+        let descriptors = [output.fileHandleForReading.fileDescriptor, error.fileHandleForReading.fileDescriptor]
+        guard let streams = readToEnd(descriptors, until: deadline),
+              exited.wait(timeout: .now() + max(0, deadline.timeIntervalSinceNow)) == .success else {
             stop(process)
             throw CollectorClientError.timedOut(seconds: Int(timeout.rounded(.up)))
         }
         return CollectorExecutionResult(
-            standardOutput: String(decoding: standardOutput, as: UTF8.self),
-            standardError: String(decoding: standardError, as: UTF8.self),
+            standardOutput: String(decoding: streams[0], as: UTF8.self),
+            standardError: String(decoding: streams[1], as: UTF8.self),
             exitCode: process.terminationStatus
         )
+    }
+
+    /// Reads each descriptor to end-of-file with poll(2), or returns nil if the
+    /// deadline passes first.
+    private static func readToEnd(_ descriptors: [Int32], until deadline: Date) -> [Data]? {
+        var streams = descriptors.map { _ in Data() }
+        var watched = descriptors.map { pollfd(fd: $0, events: Int16(POLLIN), revents: 0) }
+        var buffer = [UInt8](repeating: 0, count: 65_536)
+        while watched.contains(where: { $0.fd >= 0 }) {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return nil }
+            let ready = poll(&watched, nfds_t(watched.count), Int32((min(remaining, 60) * 1000).rounded(.up)))
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            for index in watched.indices where watched[index].fd >= 0 && watched[index].revents != 0 {
+                let count = read(watched[index].fd, &buffer, buffer.count)
+                if count > 0 {
+                    streams[index].append(contentsOf: buffer[..<count])
+                } else if count == 0 || errno != EINTR {
+                    watched[index].fd = -1 // end of file, or a read error: stop watching it
+                }
+            }
+        }
+        return streams
     }
 
     private static func stop(_ process: Process) {
@@ -189,25 +215,5 @@ public enum ProcessCollectorExecutor {
         if process.isRunning {
             kill(process.processIdentifier, SIGKILL)
         }
-    }
-}
-
-/// Reads one pipe to end-of-file on a background queue.
-private final class PipeReader: @unchecked Sendable {
-    private let done = DispatchSemaphore(value: 0)
-    // Written once before `done` is signalled; read only after waiting on it.
-    private var data = Data()
-
-    init(_ handle: FileHandle) {
-        DispatchQueue.global(qos: .utility).async {
-            // readToEnd() reports a read error as a Swift error; the older
-            // readDataToEndOfFile() raises an exception Swift cannot catch.
-            self.data = ((try? handle.readToEnd()) ?? nil) ?? Data()
-            self.done.signal()
-        }
-    }
-
-    func wait(until deadline: DispatchTime) -> Data? {
-        done.wait(timeout: deadline) == .success ? data : nil
     }
 }
