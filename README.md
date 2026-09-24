@@ -225,6 +225,39 @@ Residual behaviour worth knowing:
 - An `http`/`curl` hook whose post never reaches a listening collector is still
   lost: there is no Plimsoll process on that path to spool it.
 
+OTLP exports get the same protection from their own spool, `otlp-spool/` in the
+Plimsoll home. An authenticated OTLP request that was read whole, parsed and
+bounded, and then could not be committed in time — the ledger stayed busy past
+the 750 ms retry budget (`storage_busy_retry`) or the 1.5 s request deadline ran
+out (`request_deadline_exceeded`, including a request whose body arrived while
+the collector's event loop was blocked) — is answered
+`202 {"status":"otlp_spooled"}` after its uncommitted part is flushed to a
+private file (0600 in a 0700 directory, `F_FULLFSYNC` on macOS). What is written
+is not the request body: it is the normalized, already-suppressed rows the
+ledger itself would store, so no prompt, response or tool content and no value
+the ledger drops can be in it; the raw working directory the ledger never stores
+is not written either, and events that carried one replay without repository
+linkage (`repoContextDropped`). A drain every 2 s replays the oldest files through
+the same 16-row commit the live route uses, at most 250 ms per pass, and stops at
+the first busy ledger. Each row is committed exactly once: ids are fixed when the
+request arrives, and a cursor committed in the same transaction as each chunk
+makes a crash mid-replay resume where it stopped. A file is deleted only after
+its last chunk committed and the ledger's WAL was flushed.
+
+The spool is bounded at 5,000 files, 256 MiB and seven days. When it cannot hold
+a request (full, or the disk refuses), the answer is `503` with `Retry-After: 1`
+for both causes — a deadline refusal is no longer the non-retryable `408` in that
+case. A body that never finished arriving is still `408`. Files older than seven
+days are deleted unreplayed and counted. `/status` reports it all under
+`otlpSpool`: `pendingFiles`, `pendingBytes`, `oldestPendingAgeSeconds`,
+`spooled`, `replayed` (with `deduplicated` and `collisions`), `droppedByCap`
+(`fileCap`, `byteCap`, `ageCap`), `writeFailed`, `rejectedOnReplay` and
+`deferredPasses`. The first spool in each minute prints `otlp_spooled_at_intake`
+to `collector.err.log`, followed by one `otlp_spooled_at_intake_summary` line;
+drain progress prints `otlp_spool_drain` at most once a minute. Set
+`PLIMSOLL_OTLP_SPOOL=off` in the collector's environment to restore the previous
+503/408 answers.
+
 ### What the capture-health label means
 
 `captureHealth` in `plimsoll status --json`, the collector's `/status`, and

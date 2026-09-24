@@ -75,20 +75,27 @@ export function validateDeliveryAcknowledgement(
   if (ids.length !== expected.itemIds.length || new Set(ids).size !== ids.length ||
       ids.some(id => typeof id !== "string" || !expected.itemIds.includes(id))) fail();
   const acceptedCount = acceptedIds.length;
+  const submittedCount = expected.itemIds.length;
   const counter = (name: string, max: number, exact = false) => {
     const value = response[name];
     if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || (exact ? value !== max : value > max))) fail();
   };
-  for (const name of ["accepted", "inserted", "matched", "updated", "skippedStale"]) {
+  for (const name of ["accepted", "inserted", "matched", "updated"]) {
     counter(name, acceptedCount, name === "accepted" || name === "matched");
   }
+  // The cloud session route reports skippedStale for every submitted row that
+  // was not inserted or updated. A row rejected by the tenant/device guard is
+  // therefore included in this counter even though it is absent from
+  // acceptedIds. Keep the identity partition authoritative while validating
+  // this aggregate against the complete submitted batch.
+  counter("skippedStale", submittedCount);
   const acceptedTypeCount = (type: string) =>
     acceptedIds.filter(id => typeof id === "string" && expected.itemTypes[id] === type).length;
   counter("acceptedArtifacts", acceptedTypeCount("artifact"), true);
   counter("acceptedOutcomes", acceptedTypeCount("outcome"), true);
   for (const name of ["detachedActorRefs", "detachedSessionRefs"]) counter(name, acceptedCount);
   if (typeof response.inserted === "number" && typeof response.updated === "number" && response.inserted + response.updated > acceptedCount) fail();
-  if (typeof response.inserted === "number" && typeof response.updated === "number" && typeof response.skippedStale === "number" && response.inserted + response.updated + response.skippedStale !== acceptedCount) fail();
+  if (typeof response.inserted === "number" && typeof response.updated === "number" && typeof response.skippedStale === "number" && response.inserted + response.updated + response.skippedStale !== submittedCount) fail();
   return {
     acceptedIds: acceptedIds as string[],
     rejectedIds: rejectedIds as string[],

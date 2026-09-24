@@ -388,6 +388,7 @@ const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["planType", "classification"],
   ["stitched", "classification"],
   ["usageSource", "classification"],
+  ["projectBasis", "classification"],
   ["cliVersion", "version"],
   ["serviceVersion", "version"],
   ["spanId", "trace"],

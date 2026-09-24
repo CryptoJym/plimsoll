@@ -2,6 +2,7 @@ import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallati
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
 import os from "node:os";
+import { performance } from "node:perf_hooks";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
@@ -18,6 +19,7 @@ import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
+import type { LedgerOpenTimingSink } from "./open-timing";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
 import { promoteRuntimeLearningFacts } from "./runtime-facts";
 import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFinancePublicationDirty,
@@ -228,8 +230,22 @@ export class LocalEventBuffer {
        * workers may use a short bounded wait. The better-sqlite3 default is
        * five seconds, which is never appropriate on the listener event loop. */
       databaseBusyTimeoutMs?: number;
+      /** Optional diagnostic sink used by the copied-ledger rehearsal tool. */
+      onOpenStep?: LedgerOpenTimingSink;
     } = {},
   ) {
+    const openStarted = performance.now();
+    let stepStarted = openStarted;
+    const markOpenStep = (step: string) => {
+      if (!options.onOpenStep) return;
+      const finished = performance.now();
+      options.onOpenStep({
+        step,
+        durationMs: finished - stepStarted,
+        elapsedMs: finished - openStarted,
+      });
+      stepStarted = finished;
+    };
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
     this.db = new Database(path, { timeout });
@@ -238,6 +254,7 @@ export class LocalEventBuffer {
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
       .get();
+    markOpenStep("ledger.sqlite_open");
     this.db.exec(`
       create table if not exists buffered_events (
         id text primary key,
@@ -441,6 +458,7 @@ export class LocalEventBuffer {
         )
       ) without rowid;
     `);
+    markOpenStep("ledger.core_schema");
     const retentionControlColumns = new Set(
       (this.db.pragma("table_info(raw_retention_control)") as Array<{ name: string }>)
         .map((column) => column.name),
@@ -502,6 +520,7 @@ export class LocalEventBuffer {
     // Establish the ledger-local winner before the parent begins serving or
     // can spawn a second connection. First admission therefore only reads it.
     this.repoContextHmacKey();
+    markOpenStep("ledger.column_migrations");
     this.db.exec(`
       create index if not exists idx_events_privacy_disposition
         on buffered_events (privacy_disposition, data_mode, created_at, id);
@@ -534,11 +553,14 @@ export class LocalEventBuffer {
         select raise(abort, 'privacy_disposition_is_terminal');
       end;
     `);
+    markOpenStep("ledger.privacy_schema");
     this.delivery = new DeliveryOutbox(this.db, {
       ...(options.delivery ?? {}),
       deviceId: options.deviceId,
     });
+    markOpenStep("ledger.delivery_schema");
     if (options.workspaceId) this.useWorkspace(options.workspaceId);
+    markOpenStep("ledger.workspace_binding");
     this.db.exec(`
       create index if not exists idx_events_upload on buffered_events (uploaded_at, created_at);
       create index if not exists idx_events_workspace_upload
@@ -714,12 +736,24 @@ export class LocalEventBuffer {
           and sealed_envelope_json is null and attempt_count = 0;
       end;
     `);
+    markOpenStep("ledger.raw_indexes_and_triggers");
     ensureCodexReconciliationSchema(this.db);
+    markOpenStep("ledger.codex_reconciliation_schema");
     this.learningFacts = new LearningFactStore(
       this.db,
       options.learningFacts?.limits,
     );
-    this.projection = new DashboardProjectionStore(this.db, { newLedger });
+    markOpenStep("ledger.learning_schema");
+    this.projection = new DashboardProjectionStore(this.db, {
+      newLedger,
+      onOpenStep: options.onOpenStep
+        ? (step) => options.onOpenStep!({
+            ...step,
+            elapsedMs: performance.now() - openStarted,
+          })
+        : undefined,
+    });
+    markOpenStep("ledger.projection_schema");
   }
 
   /**

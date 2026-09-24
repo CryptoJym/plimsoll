@@ -12,10 +12,12 @@ import {
   collectorLogPath,
 } from "./config";
 import { deterministicEventId } from "./normalizer";
+import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
   aiWorkAttributionRepairBatchSchema,
+  aiInteractionEventSchema,
   aiWorkIngestBatchSchema,
   type AiInteractionEvent,
   type AiWorkAttributionRepairRow,
@@ -101,6 +103,24 @@ export type NormalizedHistoryEvent =
   | { ok: true; envelope: HistoryEnvelope; bytes: number; idDerived: boolean }
   | { ok: false; reason: HistorySkipReason; detail: string };
 
+type HistoryRowInput = {
+  payloadJson: string;
+  suppressedFieldsJson: string;
+  dataMode?: string;
+  repoHash?: string | null;
+  branchHash?: string | null;
+};
+
+export type PreparedHistoryEvent =
+  | {
+      ok: true;
+      candidate: Record<string, unknown>;
+      /** The schema-valid event project attribution applies to, if any. */
+      event: AiInteractionEvent | null;
+      idDerived: boolean;
+    }
+  | { ok: false; reason: HistorySkipReason; detail: string };
+
 /**
  * Row → wire envelope. The payload is local captured truth; the wire copy is
  * reduced by the shared outbound sealer after two schema repairs:
@@ -112,13 +132,15 @@ export type NormalizedHistoryEvent =
  * contract is skipped with a reason. Unknown/local/raw metadata values are
  * omitted and bounded safe field names remain in suppression receipts.
  */
-export function normalizeHistoryEvent(row: {
-  payloadJson: string;
-  suppressedFieldsJson: string;
-  dataMode?: string;
-  repoHash?: string | null;
-  branchHash?: string | null;
-}): NormalizedHistoryEvent {
+export function normalizeHistoryEvent(
+  row: HistoryRowInput & { attribution?: SessionAttributionBatch },
+): NormalizedHistoryEvent {
+  const prepared = prepareHistoryEvent(row);
+  return prepared.ok ? sealHistoryEvent(prepared, row) : prepared;
+}
+
+/** The parse and repair half of normalizeHistoryEvent, before attribution. */
+export function prepareHistoryEvent(row: HistoryRowInput): PreparedHistoryEvent {
   if (row.dataMode === "evidence") {
     return {
       ok: false,
@@ -170,13 +192,44 @@ export function normalizeHistoryEvent(row: {
   // attachRepoLinkage). Never overwrites a payload-supplied projectKey.
   if (row.repoHash && !candidate.projectKey) {
     candidate.projectKey = row.repoHash;
-    if (row.branchHash) {
-      const metadata =
-        candidate.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata)
-          ? (candidate.metadata as Record<string, unknown>)
-          : {};
-      candidate.metadata = { ...metadata, branchHash: row.branchHash };
-    }
+    const metadata =
+      candidate.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata)
+        ? (candidate.metadata as Record<string, unknown>)
+        : {};
+    candidate.metadata = {
+      ...metadata,
+      ...(row.branchHash ? { branchHash: row.branchHash } : {}),
+      projectBasis: "repo_context",
+    };
+  }
+
+  const parsedCandidate = aiInteractionEventSchema.safeParse(candidate);
+  return {
+    ok: true,
+    candidate,
+    event: parsedCandidate.success ? parsedCandidate.data : null,
+    idDerived,
+  };
+}
+
+/**
+ * The attribution and sealing half of normalizeHistoryEvent.  History upload
+ * is also an upload boundary: runWorkspaceHistoryUpload passes the bounded
+ * session batch planned for its ledger page (one lookup per session, not per
+ * row).  Without a batch only the row's own repo linkage applies.
+ */
+export function sealHistoryEvent(
+  prepared: Extract<PreparedHistoryEvent, { ok: true }>,
+  row: HistoryRowInput & { attribution?: SessionAttributionBatch },
+): NormalizedHistoryEvent {
+  const { candidate, idDerived } = prepared;
+  if (prepared.event) {
+    const linkage = { repoHash: row.repoHash, branchHash: row.branchHash };
+    const attributed = row.attribution
+      ? row.attribution.attribute(prepared.event, linkage)
+      : applyProjectAttribution(prepared.event, linkage);
+    for (const key of Object.keys(candidate)) delete candidate[key];
+    Object.assign(candidate, attributed.event);
   }
 
   let suppressedFields: string[] = [];
@@ -545,12 +598,18 @@ export async function postHistoryBatch(input: {
   sleep: (ms: number) => Promise<void>;
   maxAttempts: number;
   timeoutMs?: number;
+  /** Session snapshots can receive an explicit accepted/rejected partition.
+   * History/outcome callers keep the strict all-accepted behavior. */
+  allowPartial?: boolean;
   log: (line: string) => void;
 }): Promise<{
   accepted: number;
+  acceptedItemIds: string[];
+  rejectedItemIds: string[];
   inserted: number | null;
   matched: number | null;
   updated: number | null;
+  skippedStale: number | null;
   attempts: number;
 }> {
   let lastError = "network_error";
@@ -569,14 +628,23 @@ export async function postHistoryBatch(input: {
       if (!acknowledgement) {
         throw new FatalUploadError("Workspace delivery deferred: invalid_acknowledgement. Resume state retained.");
       }
-      if (acknowledgement.rejectedIds.length > 0) {
+      if (acknowledgement.rejectedIds.length > 0 && !input.allowPartial) {
         throw new FatalUploadError("Workspace delivery deferred: remote_rejected. Resume state retained.");
       }
       const body = response.body as Record<string, unknown>;
       const counter = (key: string) => typeof body[key] === "number" ? body[key] as number : null;
       // The identity list, not an optional legacy count, authorizes progress.
       const accepted = acknowledgement.acceptedIds.length;
-      return { accepted, inserted: counter("inserted"), matched: counter("matched"), updated: counter("updated"), attempts: attempt };
+      return {
+        accepted,
+        acceptedItemIds: acknowledgement.acceptedIds,
+        rejectedItemIds: acknowledgement.rejectedIds,
+        inserted: counter("inserted"),
+        matched: counter("matched"),
+        updated: counter("updated"),
+        skippedStale: counter("skippedStale"),
+        attempts: attempt,
+      };
     }
     if (response && response.status !== 408 && response.status !== 429 && response.status < 500) {
       throw new FatalUploadError(`Workspace delivery deferred: remote_${response.status}. Resume state retained.`);
@@ -861,9 +929,19 @@ export async function runWorkspaceHistoryUpload(
     }
     const lastPage = rows.length < pageSize;
 
-    for (const row of rows) {
+    // Parse the page once, plan its token rows' bounded session lookups as
+    // one batch, then attribute and seal each row.
+    const prepared = rows.map((row) => row.privacyEligible === 0 ? null : prepareHistoryEvent(row));
+    const attribution = new SessionAttributionBatch(
+      ledger,
+      prepared.flatMap((item, index) =>
+        item?.ok && item.event ? [{ event: item.event, repoHash: rows[index]!.repoHash }] : []),
+    );
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
       scannedRows += 1;
-      if (row.privacyEligible === 0) {
+      const preparedRow = prepared[index];
+      if (!preparedRow) {
         skipQueue.push({
           rowid: row.rowid,
           reason:
@@ -874,7 +952,9 @@ export async function runWorkspaceHistoryUpload(
         });
         continue;
       }
-      const normalized = normalizeHistoryEvent(row);
+      const normalized = preparedRow.ok
+        ? sealHistoryEvent(preparedRow, { ...row, attribution })
+        : preparedRow;
       if (!normalized.ok) {
         skipQueue.push({ rowid: row.rowid, reason: normalized.reason });
         continue;

@@ -222,6 +222,20 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-daemon
 
+      - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-worker-parity
+
+      - name: Prove bounded legacy outbox writer turns and retryable busy refusals (eco-6hoxj.163.11)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:studio0-writer-contention
+
+      - name: Prove session-inherited project attribution and its upload-path bound (eco-6hoxj.163.9)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:session-attribution
+          pnpm proof:session-attribution-bounded
+
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
@@ -237,6 +251,9 @@ jobs:
       - name: Prove hook events survive collector 503/refused/reset via idempotent spool replay (eco-6hoxj.61 / .65)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:hook-spool
+      - name: Prove refused OTLP exports are spooled and replayed exactly once (eco-6hoxj.163.17)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:otlp-intake-spool
       - name: Prove producer-to-ledger parity instrumentation (eco-6hoxj.29)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:producer-parity
@@ -250,9 +267,20 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:maintenance-boundary
 
+      - name: Prove maintenance stage integration
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:maintenance-stage-integration
+
       - name: Prove shipped dashboard projection truth
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard
+
+      - name: Prove projection convergence and bounded token-time migration
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:projection-convergence
+          pnpm proof:projection-active-convergence
+          pnpm proof:last-token-event-backfill
 
       - name: Prove Jev receipt projection and authenticated access
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

@@ -50,6 +50,7 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
+import type { LedgerOpenTimingSink } from "./open-timing";
 import {
   collectorHomeIdentityHash,
   defaultCollectorHome,
@@ -143,6 +144,7 @@ import {
   type CaptureRoot,
 } from "./capture-root-inventory";
 import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
+import { OtlpIntakeSpool } from "./otlp-spool";
 import {
   HOOK_SPOOL_COLLECTOR_TOO_OLD,
   HOOK_SPOOL_COLLECTOR_UNREACHABLE,
@@ -249,6 +251,7 @@ import {
   commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState,
   planDaemonSessionSync,
+  listLedgerSessionIdsOffThread,
   runSessionSync,
   saveDaemonSessionSyncState,
   sessionIdsFromBatches,
@@ -495,13 +498,17 @@ function openBuffer(
   config: CollectorConfig,
   deliveryOverride = false,
   databaseBusyTimeoutMs = 5_000,
+  diagnostics: {
+    databasePath?: string;
+    onOpenStep?: LedgerOpenTimingSink;
+  } = {},
 ) {
   ensureCollectorHome();
   const identity = loadOrCreateDeviceIdentity(undefined, {
     seed: { deviceId: config.deviceId, keyId: config.keyId },
   });
   recordDeviceSeen();
-  return new LocalEventBuffer(collectorBufferPath(), {
+  return new LocalEventBuffer(diagnostics.databasePath ?? collectorBufferPath(), {
     workspaceId: config.tenantId,
     deviceId: identity.deviceId,
     delivery: {
@@ -509,6 +516,7 @@ function openBuffer(
       limits: config.delivery,
     },
     databaseBusyTimeoutMs,
+    onOpenStep: diagnostics.onOpenStep,
   });
 }
 
@@ -2020,6 +2028,81 @@ async function main() {
     return;
   }
 
+  if (command === "__rehearse_ledger_open") {
+    if (process.env.PLIMSOLL_REHEARSAL !== "copied-ledger-v1") {
+      throw new Error("copied-ledger rehearsal must be launched through scripts/rehearse-ledger-open.ts");
+    }
+    const requestedLedger = optionValue("--ledger");
+    if (!requestedLedger || !path.isAbsolute(requestedLedger)) {
+      throw new Error("copied-ledger rehearsal requires an absolute --ledger path");
+    }
+    const ledgerPath = fs.realpathSync(requestedLedger);
+    const ledgerStat = fs.lstatSync(ledgerPath);
+    if (!ledgerStat.isFile() || ledgerStat.isSymbolicLink()) {
+      throw new Error("copied-ledger rehearsal requires a regular, non-symlink ledger file");
+    }
+    const rehearsalHome = ensureCollectorHome();
+    if (rehearsalHome !== resolveCollectorHome().home) {
+      throw new Error("copied-ledger rehearsal home resolution drifted");
+    }
+    // A copied ledger retains its workspace/device binding, while a deliberately
+    // empty sandbox HOME has no identity yet. Seed that non-secret identity from
+    // the copy so openBuffer takes the same bound-ledger path as the daemon.
+    // This read-only probe is outside the measured open and never touches the
+    // source host's config or identity files.
+    const bindingDatabase = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    let rehearsalBinding: { workspaceId: string; deviceId: string | null } | undefined;
+    try {
+      const hasBindingTable = bindingDatabase.prepare(
+        `select 1 from sqlite_master where type='table' and name='collector_workspace_binding'`,
+      ).get();
+      if (hasBindingTable) {
+        const bindingColumns = new Set(
+          (bindingDatabase.pragma("table_info(collector_workspace_binding)") as Array<{ name: string }>)
+            .map((column) => column.name),
+        );
+        rehearsalBinding = bindingDatabase.prepare(
+          `select current_workspace_id as workspaceId,
+             ${bindingColumns.has("current_device_id") ? "current_device_id" : "null"} as deviceId
+           from collector_workspace_binding where singleton=1`,
+        ).get() as typeof rehearsalBinding;
+      }
+    } finally {
+      bindingDatabase.close();
+    }
+    const rehearsalConfig = collectorConfigSchema.parse({
+      ...(rehearsalBinding?.workspaceId ? { tenantId: rehearsalBinding.workspaceId } : {}),
+      ...(rehearsalBinding?.deviceId ? { deviceId: rehearsalBinding.deviceId } : {}),
+    });
+    const timings: Array<Parameters<LedgerOpenTimingSink>[0]> = [];
+    const started = performance.now();
+    let buffer: LocalEventBuffer | null = null;
+    try {
+      buffer = openBuffer(rehearsalConfig, false, 0, {
+        databasePath: ledgerPath,
+        onOpenStep: (step) => {
+          timings.push(step);
+          process.stdout.write(`${JSON.stringify({
+            status: "open_step",
+            step: step.step,
+            durationMs: Number(step.durationMs.toFixed(3)),
+            elapsedMs: Number(step.elapsedMs.toFixed(3)),
+          })}\n`);
+        },
+      });
+    } finally {
+      buffer?.close();
+    }
+    process.stdout.write(`${JSON.stringify({
+      status: "open_complete",
+      collector: "packaged",
+      ledgerBytes: ledgerStat.size,
+      stepCount: timings.length,
+      durationMs: Number((performance.now() - started).toFixed(3)),
+    })}\n`);
+    return;
+  }
+
   if (command === "__maintenance_worker") {
     const spawnNonce = process.argv[3] ?? "";
     const environmentNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
@@ -2549,9 +2632,14 @@ async function main() {
     // Bead eco-6hoxj.61. Created before the listener so /status can read its
     // cached snapshot, armed with the other cadences below.
     let hookSpoolDrain: HookSpoolDrain | undefined;
+    // Bead eco-6hoxj.163.17: an OTLP export the ledger cannot take in time is
+    // written here (normalized, bounded) instead of being refused, and the
+    // drain armed below replays it. PLIMSOLL_OTLP_SPOOL=off disables both.
+    const otlpSpool = new OtlpIntakeSpool({ home: collectorHome() });
     const syncBackoff = new SyncBackoff(config.syncIntervalSeconds * 1_000);
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
+      otlpSpool,
       syncStatus: () => syncBackoff.status(syncInFlight),
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
@@ -2650,12 +2738,20 @@ async function main() {
         const touchedSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
+        const sessionUntil = new Date().toISOString();
         try {
           const sessionPlan = planDaemonSessionSync({
             db: buffer.database,
             state: { ...sessionSyncState, pendingSessionIds },
             uploadedBatches,
-            until: new Date().toISOString(),
+            until: sessionUntil,
+            ledgerSessionIds: sessionSyncState.caughtUp
+              ? await listLedgerSessionIdsOffThread(buffer.database, {
+                  until: sessionUntil,
+                  since: sessionSyncState.lastSuccessfulUntil,
+                  excludedIds: sessionSyncState.blockedSessionIds,
+                })
+              : undefined,
           });
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
@@ -2663,13 +2759,18 @@ async function main() {
           if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
               ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
+              excludedSessionIds: sessionPlan.state.blockedSessionIds,
               until: sessionPlan.until,
               ledgerDb: buffer.database,
               log: () => undefined,
             });
             if (sessionResult.ok) {
-              sessionSyncState = commitDaemonSessionSyncSuccess(sessionSyncState, sessionPlan.until);
-              pendingSessionIds = [];
+              sessionSyncState = commitDaemonSessionSyncSuccess(
+                sessionSyncState,
+                sessionPlan.until,
+                sessionResult.rejectedSessionIds,
+              );
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
             } else {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
@@ -2680,14 +2781,11 @@ async function main() {
                 JSON.stringify({
                   status: "session_sync",
                   sessions: sessionResult.sentSessions,
+                  accepted: sessionResult.acceptedSessions,
+                  rejected: sessionResult.rejectedSessionIds.length,
                   inserted: sessionResult.insertedSessions,
                   updated: sessionResult.updatedSessions,
-                  skippedStale:
-                    sessionResult.insertedSessions === null || sessionResult.updatedSessions === null
-                      ? null
-                      : sessionResult.acceptedSessions -
-                        sessionResult.insertedSessions -
-                        sessionResult.updatedSessions,
+                  skippedStale: sessionResult.skippedStaleSessions,
                 }),
               );
             } else if (!sessionResult.ok) {
@@ -2970,6 +3068,10 @@ async function main() {
     // holds no timer at all in that case.
     hookSpoolDrain = createHookSpoolDrain(config, buffer, { home: collectorHome() });
     hookSpoolDrain.start();
+    // OTLP intake-spool drain: every 2 s, at most 250 ms of 16-row writer
+    // turns through the live route's own `appendMany`, stopping at the first
+    // busy ledger. Holds no timer when the spool is disabled.
+    otlpSpool.startDrain(buffer);
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
@@ -2979,6 +3081,7 @@ async function main() {
       for (const timer of timers) clearInterval(timer);
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
+      otlpSpool.stopDrain();
       scheduler?.stopAccepting();
       enrichmentScheduler?.stopAccepting();
       ownership.release();
@@ -3026,6 +3129,7 @@ async function main() {
       for (const timer of timers) clearInterval(timer);
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
+      otlpSpool.stopDrain();
       scheduler?.stopAccepting();
       enrichmentScheduler?.stopAccepting();
       ownership.release();

@@ -21,7 +21,7 @@ import {
   remoteLinkageHash,
   validatedMetadataAttribute,
 } from "../../shared/src/index";
-import { appendForwardedHook } from "./forwarder";
+import { appendForwardedHook, appendNormalizedHook, normalizeForwardedHook } from "./forwarder";
 import {
   PRODUCER_EVENT_ID_HEADER,
   appendProducerObservation,
@@ -29,6 +29,14 @@ import {
   readProducerEventIdHeader,
 } from "./producer-parity";
 import { explodeOtlpPayload } from "./otlp";
+import {
+  otlpBatchRemainder,
+  otlpChunk,
+  otlpChunkCount,
+  type OtlpIntakeBatch,
+  type OtlpIntakeSpool,
+  type OtlpSpoolCause,
+} from "./otlp-spool";
 import { saveCollectorConfig } from "./config";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
@@ -688,6 +696,12 @@ export function createCollectorServer(
     hookSpoolHome?: string;
     /** Proof-injectable directory bounds. Production uses HOOK_SPOOL_LIMITS. */
     hookSpoolLimits?: Partial<HookSpoolBounds>;
+    /**
+     * Bead eco-6hoxj.163.17: the OTLP intake spool the daemon arms. Absent (or
+     * disabled by PLIMSOLL_OTLP_SPOOL=off), an OTLP request the ledger cannot
+     * take is refused exactly as before: 503 busy, 408 deadline.
+     */
+    otlpSpool?: OtlpIntakeSpool;
   } = {},
 ) {
   assertCollectorPrivacyMode(config, "collector server");
@@ -944,6 +958,107 @@ export function createCollectorServer(
       }));
     }
     return { ok: true, path: written.path, source };
+  };
+
+  // ---------------------------------------------------------------------
+  // OTLP intake spool (bead eco-6hoxj.163.17). Only a request that was
+  // authenticated, read whole, parsed, bounded and normalized reaches it, and
+  // only for the two outcomes that mean "the ledger could not take it in
+  // time": 503 `storage_busy_retry` and 408 `request_deadline_exceeded`.
+  // ---------------------------------------------------------------------
+  const otlpSpool = options.otlpSpool;
+  const otlpSpoolWindows = new Map<
+    RejectionClientClass,
+    { firstAtMs: number; count: number; suppressed: number }
+  >();
+  const closeOtlpSpoolWindows = (nowMs: number, all: boolean) => {
+    const lines: Array<Record<string, unknown>> = [];
+    for (const [clientClass, window] of otlpSpoolWindows) {
+      if (!all && nowMs - window.firstAtMs < REJECTION_SUMMARY_INTERVAL_MS) continue;
+      otlpSpoolWindows.delete(clientClass);
+      lines.push({
+        status: "otlp_spooled_at_intake_summary",
+        clientClass,
+        count: window.count,
+        suppressed: window.suppressed,
+        intervalMs: REJECTION_SUMMARY_INTERVAL_MS,
+      });
+    }
+    return lines;
+  };
+  const observeOtlpSpool = (
+    source: LocalProducerSource,
+    clientClass: RejectionClientClass,
+    cause: OtlpSpoolCause,
+  ) => {
+    const nowMs = spoolSummaryNowMs();
+    for (const line of closeOtlpSpoolWindows(nowMs, false)) console.warn(JSON.stringify(line));
+    const window = otlpSpoolWindows.get(clientClass);
+    if (!window) {
+      otlpSpoolWindows.set(clientClass, { firstAtMs: nowMs, count: 1, suppressed: 0 });
+      console.warn(JSON.stringify({ status: "otlp_spooled_at_intake", source, clientClass, cause }));
+      return;
+    }
+    window.count += 1;
+    window.suppressed += 1;
+  };
+  /**
+   * Keep the uncommitted part of a refused OTLP request, or say how to refuse
+   * it. `spooled` means the batch is durable and the caller answers 202;
+   * otherwise `error` is what the caller throws.
+   *
+   * A spool that cannot hold the batch answers 503 with Retry-After for BOTH
+   * causes: 408 is not a status an OTLP exporter retries, so a deadline
+   * refusal that stayed 408 would be a certain loss where a 503 is not.
+   */
+  const spoolOtlpAtIntake = async (
+    error: unknown,
+    context: {
+      request: http.IncomingMessage;
+      source: LocalProducerSource;
+      transportPath: string | undefined;
+      receivedAtMs: number;
+      batch: OtlpIntakeBatch;
+      committedChunks: number;
+      setDiagnostic: (diagnostic: Record<string, unknown>) => void;
+    },
+  ): Promise<{ spooled: true } | { spooled: false; error: unknown }> => {
+    const failure = asHttpBoundaryRejection(error);
+    const cause: OtlpSpoolCause | null =
+      failure.reason === "storage_busy_retry" && failure.status === 503
+        ? "storage_busy_retry"
+        : failure.reason === "request_deadline_exceeded" && failure.status === 408
+          ? "request_deadline_exceeded"
+          : null;
+    if (!cause || !otlpSpool) return { spooled: false, error };
+    // `write` reports its own failures; a throw is treated as one, so a
+    // retryable refusal can never turn into a 400 an exporter drops.
+    const outcome = await otlpSpool.write({
+      source: context.source,
+      transportPath: context.transportPath,
+      receivedAtMs: context.receivedAtMs,
+      cause,
+      committedChunks: context.committedChunks,
+      batch: context.batch,
+    }).catch(() => ({ ok: false as const, attempted: true, refused: "spool_write_failed" as const, bound: undefined }));
+    if (outcome.ok) {
+      observeOtlpSpool(context.source, classifyRejectionClient(context.request), cause);
+      return { spooled: true };
+    }
+    context.setDiagnostic({
+      spoolAttempted: outcome.attempted,
+      spoolRefused: true,
+      spoolRefusedReason: outcome.refused,
+      ...(outcome.bound ? { spoolBound: outcome.bound } : {}),
+    });
+    // The kill switch restores the previous answers exactly, 408 included.
+    if (outcome.refused === "spool_disabled") return { spooled: false, error };
+    return {
+      spooled: false,
+      error: cause === "request_deadline_exceeded"
+        ? new HttpBoundaryRejection("request_deadline_exceeded", 503)
+        : error,
+    };
   };
 
   const invalidateStatus = (body: Record<string, unknown>, reason: string) => {
@@ -1307,6 +1422,8 @@ export function createCollectorServer(
             );
           }
           body.hookSpool = options.hookSpoolStatus?.() ?? null;
+          // In-memory index and counters only; no filesystem or ledger read.
+          body.otlpSpool = otlpSpool?.status() ?? null;
           body.sync = options.syncStatus?.() ?? null;
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
             "x-plimsoll-projection-generation": String(cached.generation),
@@ -1665,50 +1782,99 @@ export function createCollectorServer(
         assertProducer(request, source);
         const body = decodeBoundedRequestBody(
           request,
-          await readBoundedRequestBody(request, budget),
+          await readBoundedRequestBody(request, budget, {
+            completeAfterDeadline: otlpSpool?.enabled === true,
+          }),
         );
         const parsedEnvelope = parseBoundedJson(body.text);
         assertBoundedOtlpCardinality(parsedEnvelope, body.decodedBytes);
         if (hasLiveUsageClaim(parsedEnvelope)) throw new HttpBoundaryRejection("source_not_allowed", 403);
 
+        const transportPath = canonicalOtlpTransportPath(request.url);
         const repoLabels: Array<{ hash: string; label: string }> = [];
         const exploded = explodeOtlpPayload(parsedEnvelope, {
           policy: config.policy,
           source,
-          transportPath: canonicalOtlpTransportPath(request.url),
+          transportPath,
           onRepoLabel: (hash, label) => repoLabels.push({ hash, label }),
         });
+        // From here the request is authenticated, whole, bounded and
+        // normalized: a busy ledger or a spent deadline is no longer a reason
+        // to lose it when the intake spool is armed.
+        const spoolContext = (batch: OtlpIntakeBatch, committedChunks: number) => ({
+          request,
+          source,
+          transportPath,
+          receivedAtMs,
+          batch,
+          committedChunks,
+          setDiagnostic: (diagnostic: Record<string, unknown>) => {
+            intakeSpoolDiagnostic = diagnostic;
+          },
+        });
+        const answerSpooled = (spooledEvents: number, spooledMetricSamples: number) => {
+          response.writeHead(202, { "content-type": "application/json" });
+          response.end(JSON.stringify({
+            status: "otlp_spooled",
+            source,
+            events: spooledEvents,
+            metricSamples: spooledMetricSamples,
+            recordCount: exploded.recordCount,
+            datapointCount: exploded.datapointCount,
+            parseFailures: exploded.parseFailures,
+            droppedEvents: exploded.droppedEventCount,
+          }));
+        };
 
         if (
           exploded.events.length > 0 ||
           exploded.metricSamples.length > 0 ||
           exploded.droppedEventCount > 0
         ) {
-          budget.checkpoint();
-          for (const { hash, label } of repoLabels) {
-            await retryStorageBusy(budget, () => buffer.recordRepoLabel(hash, label));
-          }
+          const batch: OtlpIntakeBatch = {
+            events: exploded.events,
+            metricSamples: exploded.metricSamples,
+            admissionDrops: exploded.admissionDrops,
+          };
           // Admission is durable in small transactions. Yield between chunks
           // so availability reads and other producers receive a turn. A retry
           // after any partial commit retains the existing deterministic IDs.
           const integrity = { deduplicatedCount: 0, collisionQuarantinedCount: 0 };
-          const projectionDeadlineMs = performance.now() + 25;
-          const chunks = Math.max(Math.ceil(exploded.events.length / 16),
-            Math.ceil(exploded.metricSamples.length / 16), 1);
-          for (let chunk = 0; chunk < chunks; chunk += 1) {
-            if (chunk > 0) await new Promise<void>(resolve => setImmediate(resolve));
+          let committedChunks = 0;
+          try {
             budget.checkpoint();
-            const result = await retryStorageBusy(
-              budget,
-              () => buffer.appendMany(
-                exploded.events.slice(chunk * 16, (chunk + 1) * 16),
-                exploded.metricSamples.slice(chunk * 16, (chunk + 1) * 16),
-                chunk === 0 ? exploded.admissionDrops : [],
-                { projectionDeadlineMs },
-              ),
-            );
-            integrity.deduplicatedCount += result.deduplicatedCount;
-            integrity.collisionQuarantinedCount += result.collisionQuarantinedCount;
+            // Only `resolveGit` callers produce labels; network admission
+            // never sets it, so nothing here needs a spooled copy.
+            for (const { hash, label } of repoLabels) {
+              await retryStorageBusy(budget, () => buffer.recordRepoLabel(hash, label));
+            }
+            const projectionDeadlineMs = performance.now() + 25;
+            const chunks = otlpChunkCount(batch);
+            for (let chunk = 0; chunk < chunks; chunk += 1) {
+              if (chunk > 0) await new Promise<void>(resolve => setImmediate(resolve));
+              budget.checkpoint();
+              const part = otlpChunk(batch, chunk);
+              const result = await retryStorageBusy(
+                budget,
+                () => buffer.appendMany(
+                  part.events,
+                  part.metricSamples,
+                  part.admissionDrops,
+                  { projectionDeadlineMs },
+                ),
+              );
+              committedChunks = chunk + 1;
+              integrity.deduplicatedCount += result.deduplicatedCount;
+              integrity.collisionQuarantinedCount += result.collisionQuarantinedCount;
+            }
+          } catch (error) {
+            // A chunk that threw rolled back whole, so exactly the chunks from
+            // `committedChunks` on are uncommitted; those are what is kept.
+            const remainder = otlpBatchRemainder(batch, committedChunks);
+            const spooled = await spoolOtlpAtIntake(error, spoolContext(remainder, committedChunks));
+            if (!spooled.spooled) throw spooled.error;
+            answerSpooled(remainder.events.length, remainder.metricSamples.length);
+            return;
           }
           rejectionDiagnostics.recordAccepted(source);
           response.writeHead(202, { "content-type": "application/json" });
@@ -1746,15 +1912,22 @@ export function createCollectorServer(
           body_parse_error: "unrecognized_otlp_envelope_shape",
           content_encoding: body.contentEncoding,
         };
-        budget.checkpoint();
-        const normalized = await retryStorageBusy(budget, () =>
-          appendForwardedHook(fallbackPayload, {
-            config,
-            buffer,
-            source,
-            transportPath: canonicalOtlpTransportPath(request.url),
-          })
-        );
+        // Normalized once, so every retry and a spooled copy carry one id.
+        const fallback = normalizeForwardedHook(fallbackPayload, { config, source, transportPath });
+        let normalized: ReturnType<typeof appendNormalizedHook>;
+        try {
+          budget.checkpoint();
+          normalized = await retryStorageBusy(budget, () => appendNormalizedHook(buffer, fallback));
+        } catch (error) {
+          const spooled = await spoolOtlpAtIntake(error, spoolContext({
+            events: [{ event: fallback.event, suppressedFields: fallback.suppressedFields }],
+            metricSamples: [],
+            admissionDrops: [],
+          }, 0));
+          if (!spooled.spooled) throw spooled.error;
+          answerSpooled(1, 0);
+          return;
+        }
         rejectionDiagnostics.recordAccepted(source);
         if (normalized.futureTimestampClampedEvents) {
           console.log(JSON.stringify({
@@ -1829,10 +2002,18 @@ export function createCollectorServer(
           failure.reason === "producer_token_invalid")
           ? classifyRejectionRoute(request.url)
           : undefined;
+      // An OTLP deadline refusal the intake spool could not hold names the
+      // route and the spool's reason too; summaries keep their shape, since
+      // only the busy class is route-classified there.
+      const deadlineSpoolDiagnostic =
+        busyRoute === undefined && failure.reason === "request_deadline_exceeded" && intakeSpoolDiagnostic
+          ? { route: classifyRejectionRoute(request.url), ...intakeSpoolDiagnostic }
+          : undefined;
       const diagnosticRejection = {
         ...rejection,
         clientClass,
         ...(busyRouteDiagnostic ?? {}),
+        ...(deadlineSpoolDiagnostic ?? {}),
         ...(identifiedRoute ? { route: identifiedRoute } : {}),
         ...(recordDiagnostic ?? {}),
       };
@@ -1855,6 +2036,14 @@ export function createCollectorServer(
         response.writeHead(failure.status, {
           connection: "close",
           "content-type": "application/json",
+          // OTLP/HTTP treats 503 as retryable; tell exporters when to retry a
+          // transient writer lock rather than forcing an immediate hot loop.
+          // A deadline refusal the OTLP intake spool could not hold is a 503
+          // for the same reason (bead eco-6hoxj.163.17).
+          ...(failure.status === 503 &&
+            (failure.reason === "storage_busy_retry" || failure.reason === "request_deadline_exceeded")
+            ? { "retry-after": "1" }
+            : {}),
         });
         response.end(JSON.stringify(rejection));
       } else {
@@ -1880,6 +2069,9 @@ export function createCollectorServer(
     // rejection summary, so it is printed here rather than returned.
     flush: () => {
       for (const line of closeSpoolWindows(spoolSummaryNowMs(), true)) {
+        console.warn(JSON.stringify(line));
+      }
+      for (const line of closeOtlpSpoolWindows(spoolSummaryNowMs(), true)) {
         console.warn(JSON.stringify(line));
       }
       return rejectionDiagnostics.flush();

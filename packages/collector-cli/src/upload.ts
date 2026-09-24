@@ -19,6 +19,10 @@ import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
 import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
+import {
+  applyProjectAttribution,
+  SessionAttributionBatch,
+} from "./session-attribution";
 
 /**
  * Project attribution parity (issue 0036): the ledger's per-event repo
@@ -30,14 +34,7 @@ export function attachRepoLinkage(
   repoHash: string | null | undefined,
   branchHash?: string | null,
 ): AiInteractionEvent {
-  if (!repoHash || payload.projectKey) return payload;
-  return {
-    ...payload,
-    projectKey: repoHash,
-    ...(branchHash
-      ? { metadata: { ...payload.metadata, branchHash } }
-      : {}),
-  };
+  return applyProjectAttribution(payload, { repoHash, branchHash }).event;
 }
 
 /** Legacy/stateless snapshot builder retained for `upload --no-mark`. */
@@ -54,9 +51,17 @@ export function buildIngestBatch(
 
   const rows: BufferedEventRow[] = [];
   const events = [];
+  const attribution = new SessionAttributionBatch(
+    buffer.database,
+    candidateRows.map((row) => ({ event: row.payload, repoHash: row.repoHash })),
+  );
   for (const row of candidateRows) {
+    const attributed = attribution.attribute(row.payload, {
+      repoHash: row.repoHash,
+      branchHash: row.branchHash,
+    });
     const sealed = sealOutboundEnvelope({
-      event: attachRepoLinkage(row.payload, row.repoHash, row.branchHash),
+      event: attributed.event,
       suppressedFields: row.suppressedFields,
     });
     if (!sealed.ok) continue;
@@ -377,7 +382,16 @@ export async function uploadBufferedEvents(
 
   await storage(() => buffer.delivery.configure({ enabled: true, limits: config.delivery }));
   const nowFn = options.now ?? (() => new Date());
-  await storage(() => buffer.delivery.migrateLegacy({ now: nowFn() }));
+  // One daemon upload cycle may run 20 batches while the HTTP listener is
+  // serving OTLP. Keep each legacy migration writer turn well below the
+  // listener's 750 ms busy retry budget; the cursor resumes next batch.
+  await storage(() => buffer.delivery.migrateLegacy({
+    now: nowFn(),
+    maxRows: Math.min(config.delivery.migrationBatchRows, 256),
+    maxBytes: Math.min(config.delivery.migrationBatchBytes,
+      Math.max(config.delivery.maxItemBytes, 1_048_576)),
+    maxWriterMs: 100,
+  }));
   const appVersion = options.appVersion ?? PLIMSOLL_VERSION;
   const contractHash = uploadContractHash(config, url, appVersion);
   const outputLimit = Math.max(

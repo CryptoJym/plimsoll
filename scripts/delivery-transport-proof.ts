@@ -73,6 +73,17 @@ async function main() {
     const partition=validateDeliveryAcknowledgement({ok:true,accepted:1,inserted:1,ack:acknowledgement},expected);
     assert.deepEqual(partition,{acceptedIds:expected.itemIds.slice(0,1),rejectedIds:expected.itemIds.slice(1)});
   });
+  await check('partial_acknowledgement_counts_rejected_rows_as_skipped_stale',()=>{
+    // eco-6hoxj.163.15: the cloud session route reports skippedStale over every
+    // submitted row (Studio3: 316 inserted + 0 updated + 1 skipped = 317 sent,
+    // one rejected), so the counter sum is checked against the submitted batch.
+    const acknowledgement=deliveryAcknowledgement(expected,expected.itemIds.slice(0,1));
+    const partition=validateDeliveryAcknowledgement({ok:true,accepted:1,inserted:1,updated:0,skippedStale:1,ack:acknowledgement},expected);
+    assert.deepEqual(partition,{acceptedIds:expected.itemIds.slice(0,1),rejectedIds:expected.itemIds.slice(1)});
+    for(const [inserted,updated,skippedStale] of [[1,0,0],[1,0,2],[1,1,1],[2,0,0]]){
+      assert.throws(()=>validateDeliveryAcknowledgement({ok:true,accepted:1,inserted,updated,skippedStale,ack:acknowledgement},expected));
+    }
+  });
   await check('post_delivery_returns_partial_partition',async()=>{
     const acknowledgement=deliveryAcknowledgement(expected,expected.itemIds.slice(0,1));
     const result=await postDelivery({...options,fetchImpl:fake({ok:true,accepted:1,inserted:1,ack:acknowledgement})});

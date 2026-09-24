@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
@@ -19,7 +20,8 @@ import {
   type FinanceCoverageSource,
   type FinanceSourceCoverageRow,
 } from "./history-coverage";
-import { projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
+import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
+import type { LedgerOpenTimingSink } from "./open-timing";
 
 /** The version of the derived projection schema this binary writes and reads.
  *
@@ -666,15 +668,31 @@ export class DashboardProjectionStore {
 
   constructor(
     private readonly db: Database.Database,
-    options: { newLedger?: boolean; now?: Date } = {},
+    options: { newLedger?: boolean; now?: Date; onOpenStep?: LedgerOpenTimingSink } = {},
   ) {
+    const openStarted = performance.now();
+    let stepStarted = openStarted;
+    const markOpenStep = (step: string) => {
+      if (!options.onOpenStep) return;
+      const finished = performance.now();
+      options.onOpenStep({
+        step,
+        durationMs: finished - stepStarted,
+        elapsedMs: finished - openStarted,
+      });
+      stepStarted = finished;
+    };
     const now = options.now ?? new Date(Date.now());
     ensureFinanceProvenanceSchema(this.db);
-    this.createSchema(now, Boolean(options.newLedger));
-    if (options.newLedger) this.publishSnapshots(now);
+    markOpenStep("projection.finance_schema");
+    this.createSchema(now, Boolean(options.newLedger), markOpenStep);
+    if (options.newLedger) {
+      this.publishSnapshots(now);
+      markOpenStep("projection.initial_snapshots");
+    }
   }
 
-  private createSchema(now: Date, newLedger: boolean) {
+  private createSchema(now: Date, newLedger: boolean, markOpenStep: (step: string) => void) {
     const storedSchemaVersion = this.readStoredSchemaVersion();
     this.db.exec(`
       create table if not exists dashboard_projection_control (
@@ -1060,7 +1078,9 @@ export class DashboardProjectionStore {
         scan_json text
       );
     `);
+    markOpenStep("projection.core_schema_and_indexes");
     this.ensureProjectionSchemaColumns();
+    markOpenStep("projection.column_migrations");
     this.db.exec(`
       create index if not exists idx_dashboard_facts_finance_scope
         on dashboard_event_facts (workspace_id, installation_epoch_id, observed_at_ms, projection_id);
@@ -1071,6 +1091,7 @@ export class DashboardProjectionStore {
         where workspace_id is null or raw_generation is null
           or length(raw_generation)=0 or observed_at_ms is null;
     `);
+    markOpenStep("projection.finance_indexes");
     this.db.prepare(`insert or ignore into dashboard_lifetime_totals (singleton) values (1)`).run();
 
     this.db.prepare(
@@ -1105,6 +1126,7 @@ export class DashboardProjectionStore {
         this.db.prepare(`insert or ignore into dashboard_post_highwater_window (days) values (?)`).run(days);
       }
     }
+    markOpenStep("projection.control_rows");
 
     const deletedPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "old");
     const hasRetentionReceipts = Boolean(this.db.prepare(
@@ -1364,8 +1386,14 @@ export class DashboardProjectionStore {
           end`);
       }
     }
-    if (this.projectionOpenRefused()) this.stampOpenRefusal();
-    else this.ensureCompactSummaryMigration(now);
+    markOpenStep("projection.triggers");
+    if (this.projectionOpenRefused()) {
+      this.stampOpenRefusal();
+      markOpenStep("projection.open_refusal");
+    } else {
+      this.ensureCompactSummaryMigration(now);
+      markOpenStep("projection.compact_summary_migration");
+    }
   }
 
   private projectionOpenRefused() {
@@ -1501,17 +1529,48 @@ export class DashboardProjectionStore {
     // so each session carries its own last token-event time. Rows written before
     // the column exists keep whatever the facts still hold; a session whose facts
     // have aged out stays null and falls back to its any-kind end, as before.
-    for (const table of ["dashboard_session_repair_source", "dashboard_session_source_window"]) {
+    const sessionTablesMissingTokenTime = [
+      "dashboard_session_repair_source",
+      "dashboard_session_source_window",
+    ].filter((table) => {
       const columns = new Set(
         (this.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((row) => row.name),
       );
-      if (columns.has("last_token_event_at")) continue;
-      this.db.exec(`alter table ${table} add column last_token_event_at text`);
-      this.db.exec(`update ${table} set last_token_event_at=(
-        select max(f.observed_at) from dashboard_event_facts f
-        where f.session_hash=${table}.session_hash and f.source=${table}.source
-          and f.input_tokens is not null) where token_events>0`);
-    }
+      return !columns.has("last_token_event_at");
+    });
+    if (sessionTablesMissingTokenTime.length === 0) return;
+
+    this.db.transaction(() => {
+      for (const table of sessionTablesMissingTokenTime) {
+        this.db.exec(`alter table ${table} add column last_token_event_at text`);
+      }
+      this.db.exec(`create temp table dashboard_token_event_max (
+        session_hash text not null,
+        source text not null,
+        last_token_event_at text not null,
+        primary key (session_hash,source)
+      ) without rowid`);
+      try {
+        // Read the partial token index once. Target rows then seek this small
+        // session/source aggregate instead of rescanning one source's facts.
+        this.db.exec(`insert into dashboard_token_event_max
+          (session_hash,source,last_token_event_at)
+          select session_hash,source,max(observed_at)
+          from dashboard_event_facts indexed by idx_dashboard_facts_source_token
+          where input_tokens is not null and session_hash is not null
+          group by session_hash,source`);
+        for (const table of sessionTablesMissingTokenTime) {
+          this.db.exec(`update ${table} set last_token_event_at=(
+            select dashboard_token_event_max.last_token_event_at
+            from dashboard_token_event_max
+            where dashboard_token_event_max.session_hash=${table}.session_hash
+              and dashboard_token_event_max.source=${table}.source
+          ) where token_events>0`);
+        }
+      } finally {
+        this.db.exec(`drop table temp.dashboard_token_event_max`);
+      }
+    }).immediate();
   }
 
   private ensureCompactSummaryMigration(now:Date){
@@ -1934,7 +1993,8 @@ export class DashboardProjectionStore {
     ).all() as Array<{days:number;cutoffAt:string;targetCutoffAt:string|null;expiryCursorAt:string|null;expiryCursorId:string|null}>;
     for(const window of windows)if(this.factIncludedInWindow(previous,window)){
       this.applyFlatDelta(window.days,previous,-1);
-      if(previous.sessionHash)this.markSessionDirty(window.days,previous.sessionHash,"fact_delete",now,true);
+      if(previous.sessionHash)this.markSessionDirty(window.days,previous.sessionHash,"fact_delete",now,
+        this.factMutationRequiresRestart(window.days,previous.sessionHash,previous.rawRowid));
     }
     const reference=this.control();
     const table=reference.backfillHighWater!==null?(previous.rawRowid>reference.backfillHighWater
@@ -1959,15 +2019,25 @@ export class DashboardProjectionStore {
        from dashboard_window_control`,
     ).all() as Array<{ days: number; cutoffAt: string; targetCutoffAt:string|null;expiryCursorAt:string|null;expiryCursorId:string|null }>;
     for (const window of windows) {
+      const changedSessions = new Set<string>();
       const previousIncluded = previous && this.factIncludedInWindow(previous, window);
       if (previousIncluded && previous) {
         this.applyFlatDelta(window.days, previous, -1);
-        if (previous.sessionHash) this.markSessionDirty(window.days, previous.sessionHash, "fact_update", now);
+        if (previous.sessionHash) changedSessions.add(previous.sessionHash);
       }
       const admissionCutoff = window.targetCutoffAt ?? window.cutoffAt;
       if (next.observedAt >= admissionCutoff) {
         this.applyFlatDelta(window.days, next, 1);
-        if (next.sessionHash) this.markSessionDirty(window.days, next.sessionHash, "fact_update", now,Boolean(previous));
+        if (next.sessionHash) changedSessions.add(next.sessionHash);
+      }
+      for (const sessionHash of changedSessions) {
+        this.markSessionDirty(
+          window.days,
+          sessionHash,
+          "fact_update",
+          now,
+          this.factMutationRequiresRestart(window.days, sessionHash, next.rawRowid),
+        );
       }
     }
     const reference = this.control();
@@ -2211,10 +2281,21 @@ export class DashboardProjectionStore {
       `insert into dashboard_dirty_sessions
        (days,session_hash,reason,queued_at,revision,restart_revision)
        values (?,?,?,?,1,?) on conflict(days,session_hash) do update set
-        reason=excluded.reason,queued_at=excluded.queued_at,
+        reason=excluded.reason,
         revision=dashboard_dirty_sessions.revision+1,
         restart_revision=dashboard_dirty_sessions.restart_revision+excluded.restart_revision`,
     ).run(days, sessionHash, reason, now.toISOString(),restart?1:0);
+  }
+
+  /** A fact mutation only invalidates scratch state after the repair cursor has
+   * counted that row. Later rows are read in their current form, so retaining
+   * the cursor is both exact and the key to convergence on a live session. */
+  private factMutationRequiresRestart(days:number,sessionHash:string,rawRowid:number){
+    const job=this.db.prepare(
+      `select cursor_raw_rowid as cursorRawRowid from dashboard_session_repair_jobs
+       where days=? and session_hash=?`,
+    ).get(days,sessionHash) as {cursorRawRowid:number}|undefined;
+    return Boolean(job&&rawRowid<=job.cursorRawRowid);
   }
 
   private aliases() {
@@ -2341,12 +2422,64 @@ export class DashboardProjectionStore {
     return {rowsVisited:facts.length,finalized:exhausted};
   }
 
-  private finalizeSessionRepair(days:number,sessionHash:string){
-    const job=this.db.prepare(`select * from dashboard_session_repair_jobs where days=? and session_hash=?`).get(days,sessionHash) as Record<string,unknown>;
+  private deletePublishedSession(days:number,sessionHash:string){
     for(const table of ["dashboard_session_source_window","dashboard_session_root_window",
       "dashboard_repo_session_window","dashboard_repo_branch_window","dashboard_account_session_window"]){
       this.db.prepare(`delete from ${table} where days=? and session_hash=?`).run(days,sessionHash);
     }
+  }
+
+  /** Copy a fully materialized session between windows only after the caller
+   * proves both windows include every fact in the session. */
+  private copyPublishedSession(fromDays:number,toDays:number,sessionHash:string){
+    this.clearSessionRepair(toDays,sessionHash);
+    this.deletePublishedSession(toDays,sessionHash);
+    this.db.prepare(
+      `insert into dashboard_session_root_window
+       (days,session_hash,started_at,ended_at,events,token_events,dominant_repo_hash,repo_count,
+        branch_hash,dominant_account_hash,source,machine_hashes_json,input_tokens,output_tokens,
+        cache_read_tokens,cache_creation_tokens,cost_nanos)
+       select ?,session_hash,started_at,ended_at,events,token_events,dominant_repo_hash,repo_count,
+        branch_hash,dominant_account_hash,source,machine_hashes_json,input_tokens,output_tokens,
+        cache_read_tokens,cache_creation_tokens,cost_nanos
+       from dashboard_session_root_window where days=? and session_hash=?`,
+    ).run(toDays,fromDays,sessionHash);
+    this.db.prepare(
+      `insert into dashboard_session_source_window
+       (days,session_hash,source,started_at,ended_at,events,token_events,input_tokens,
+        output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos,last_token_event_at)
+       select ?,session_hash,source,started_at,ended_at,events,token_events,input_tokens,
+        output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos,last_token_event_at
+       from dashboard_session_source_window where days=? and session_hash=?`,
+    ).run(toDays,fromDays,sessionHash);
+    this.db.prepare(
+      `insert into dashboard_repo_session_window
+       (days,repo_key,repo_hash,session_hash,input_tokens,output_tokens,cost_nanos)
+       select ?,repo_key,repo_hash,session_hash,input_tokens,output_tokens,cost_nanos
+       from dashboard_repo_session_window where days=? and session_hash=?`,
+    ).run(toDays,fromDays,sessionHash);
+    this.db.prepare(
+      `insert into dashboard_repo_branch_window
+       (days,repo_key,repo_hash,branch_hash,session_hash,events)
+       select ?,repo_key,repo_hash,branch_hash,session_hash,events
+       from dashboard_repo_branch_window where days=? and session_hash=?`,
+    ).run(toDays,fromDays,sessionHash);
+    this.db.prepare(
+      `insert into dashboard_account_session_window
+       (days,account_key,account_hash,session_hash,dominant_repo_hash,source,machine_hashes_json,
+        cost_nanos,input_tokens,output_tokens)
+       select ?,account_key,account_hash,session_hash,dominant_repo_hash,source,machine_hashes_json,
+        cost_nanos,input_tokens,output_tokens
+       from dashboard_account_session_window where days=? and session_hash=?`,
+    ).run(toDays,fromDays,sessionHash);
+    this.db.prepare(
+      `delete from dashboard_dirty_sessions where days=? and session_hash=?`,
+    ).run(toDays,sessionHash);
+  }
+
+  private finalizeSessionRepair(days:number,sessionHash:string){
+    const job=this.db.prepare(`select * from dashboard_session_repair_jobs where days=? and session_hash=?`).get(days,sessionHash) as Record<string,unknown>;
+    this.deletePublishedSession(days,sessionHash);
     if(Number(job.events)>0){
       const dominantRepo=(this.db.prepare(
         `select r.repo_hash as repoHash from dashboard_session_repair_repo r
@@ -2417,6 +2550,19 @@ export class DashboardProjectionStore {
           cost_nanos,input_tokens,output_tokens) values (?,?,?,?,?,?,?,?,?,?)`,
       ).run(days,dominantAccount??UNLINKED_ACCOUNT,dominantAccount,sessionHash,dominantRepo,job.source,
         JSON.stringify(machines),job.cost_nanos,job.input_tokens,job.output_tokens);
+    }
+    const oldest=(this.db.prepare(
+      `select min(observed_at) as oldest from dashboard_event_facts where session_hash=?`,
+    ).get(sessionHash) as {oldest:string|null}).oldest;
+    if(oldest&&oldest>=String(job.cutoff_at)){
+      const compatible=this.db.prepare(
+        `select d.days,coalesce(w.target_cutoff_at,w.cutoff_at) as cutoffAt
+         from dashboard_dirty_sessions d join dashboard_window_control w on w.days=d.days
+         where d.session_hash=? and d.days<>? order by d.days`,
+      ).all(sessionHash,days) as Array<{days:number;cutoffAt:string}>;
+      for(const target of compatible){
+        if(oldest>=target.cutoffAt)this.copyPublishedSession(days,target.days,sessionHash);
+      }
     }
     this.clearSessionRepair(days,sessionHash);
     this.db.prepare(`delete from dashboard_dirty_sessions where days=? and session_hash=?`).run(days,sessionHash);
@@ -2966,7 +3112,26 @@ export class DashboardProjectionStore {
       if (complete && backlog.repairs === 0 && backlog.compactMutations===0 && backlog.compactGcDays===0 && backlog.dirtySessions === 0 &&
         backlog.accountInvalidations === 0 && backlog.expiryWindows === 0 &&
         settled.degradedReason !== "projection_clock_rollback") {
-        if (settled.dirty || !settled.ready) this.publishSnapshots(now);
+        if (settled.dirty || !settled.ready) {
+          const published=this.publishSnapshots(now);
+          // A busy session can keep the early expiry pass parked while its
+          // exact aggregate finishes. Once that checkpoint publishes, begin
+          // the current cutoff in the same transaction. With no expiring facts
+          // this merely advances the verified window; otherwise the just-
+          // published generation remains the coherent stale snapshot while
+          // the new target drains on following passes. Only use the otherwise
+          // idle expiry allowance here, preserving the per-pass row bound.
+          if(published&&expiryFacts===0){
+            expiryFacts+=this.advanceExpiry(now);
+            const postPublishBacklog=this.backlog();
+            if(Object.values(postPublishBacklog).some((value)=>value>0)||this.control().dirty){
+              this.db.prepare(
+                `update dashboard_projection_control set ready=1,parity_ready=0,
+                  degraded_reason='projection_repair_backlog' where singleton=1`,
+              ).run();
+            }
+          }
+        }
         else {
           // A completed no-change pass verifies the current window without
           // rebuilding aggregates. Quiet capture must still renew validity.
@@ -3103,6 +3268,13 @@ export class DashboardProjectionStore {
         continue;
       }
       if (delta === 0) continue;
+      // A new target would change the input of every unfinished session job
+      // for this window. Finish those jobs and publish the current cutoff
+      // first; an already-active target still drains normally below. This
+      // bounds cutoff lag without repeatedly discarding multi-pass progress.
+      if (!row.targetCutoffAt && this.db.prepare(
+        `select 1 from dashboard_dirty_sessions where days=? limit 1`,
+      ).get(days)) continue;
       const activeTarget = row.targetCutoffAt ?? target;
       const cursorAt = row.cursorAt ?? row.cutoffAt;
       const cursorId = row.cursorId ?? "";
@@ -3231,6 +3403,28 @@ export class DashboardProjectionStore {
       dirtySessions:control.dirtySessionBacklog,
       accountInvalidations:control.accountInvalidationBacklog,
       expiryWindows: (this.db.prepare(`select count(*) as n from dashboard_window_control where target_cutoff_at is not null`).get() as {n:number}).n,
+    };
+  }
+
+  private snapshotLag(control:ProjectionControl,backlog:ReturnType<DashboardProjectionStore["backlog"]>,nowMs=Date.now()){
+    const pending=this.db.prepare(
+      `select min(queued_at) as oldestPendingAt,coalesce(sum(revision),0) as pendingRevisions
+       from dashboard_dirty_sessions`,
+    ).get() as {oldestPendingAt:string|null;pendingRevisions:number};
+    const activeSessionRepairs=(this.db.prepare(
+      `select count(*) as n from dashboard_session_repair_jobs`,
+    ).get() as {n:number}).n;
+    const behind=Boolean(control.dirty||!control.ready||!control.parityReady||
+      Object.values(backlog).some((value)=>value>0));
+    return {
+      state:control.lastSuccessAt===null?"unavailable" as const:behind?"behind" as const:"current" as const,
+      lastPublishedAt:control.lastSuccessAt,
+      ageMs:evidenceAge(control.lastSuccessAt,nowMs),
+      oldestPendingAt:pending.oldestPendingAt,
+      oldestPendingAgeMs:evidenceAge(pending.oldestPendingAt,nowMs),
+      pendingRevisions:Number(pending.pendingRevisions),
+      dirtySessions:backlog.dirtySessions,
+      activeSessionRepairs,
     };
   }
 
@@ -3785,7 +3979,7 @@ export class DashboardProjectionStore {
         metricHighWater:c.metricBackfillHighWater,metricCursor:c.metricBackfillCursor,
         metricComplete:Boolean(c.metricBackfillComplete),metricSampleCount:c.metricBackfillComplete?c.metricSampleCount:null,
         progressMode:"bounded_rowid_watermark_no_exact_remaining",sliceRows:BACKFILL_ROWS},
-      backlog,counters:this.workCounters(),retention:{rawTtlActivation:"bounded_active",
+      backlog,snapshotLag:this.snapshotLag(c,backlog),counters:this.workCounters(),retention:{rawTtlActivation:"bounded_active",
         projectionParityReady:Boolean(c.parityReady)}};
   }
 

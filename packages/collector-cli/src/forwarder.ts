@@ -8,17 +8,26 @@ import {
 import { sealOutboundEvent } from "./outbound-envelope";
 import { attachRepoContextSidecar, extractRepoContextCwd } from "./repo-context";
 
+type ForwardedHookOptions = {
+  config: CollectorConfig;
+  source: ToolSource;
+  transportPath?: string;
+  now?: () => number;
+  producerEventId?: string;
+};
+
 export function appendForwardedHook(
   payload: unknown,
-  options: {
-    config: CollectorConfig;
-    buffer: LocalEventBuffer;
-    source: ToolSource;
-    transportPath?: string;
-    now?: () => number;
-    producerEventId?: string;
-  },
+  options: ForwardedHookOptions & { buffer: LocalEventBuffer },
 ) {
+  return appendNormalizedHook(options.buffer, normalizeForwardedHook(payload, options));
+}
+
+/**
+ * The normalized event and receipts `appendForwardedHook` appends, without the
+ * append: the OTLP fallback normalizes once so a spooled copy keeps its id.
+ */
+export function normalizeForwardedHook(payload: unknown, options: ForwardedHookOptions) {
   assertCollectorPrivacyMode(options.config, "hook capture");
   // Hook admission must not touch caller-selected filesystem paths. Repository
   // linkage is intentionally UNKNOWN here; bounded maintenance may enrich it
@@ -45,8 +54,14 @@ export function appendForwardedHook(
 
   const cwd = extractRepoContextCwd(payload);
   if (cwd) attachRepoContextSidecar(canonical.event, canonical.event.id, cwd);
+  return canonical;
+}
 
-  const appended = options.buffer.append(
+export function appendNormalizedHook(
+  buffer: LocalEventBuffer,
+  canonical: ReturnType<typeof normalizeForwardedHook>,
+) {
+  const appended = buffer.append(
     canonical.event,
     canonical.suppressedFields,
     { integrityReceipt: true },
