@@ -95,6 +95,15 @@ function workflowText(input: CoverageInput) {
   return input.workflows.find((candidate) => candidate.path === path)!.text;
 }
 
+/** Resolve a fixture's target from this checkout's workflow, including pnpm run and run-proof forms. */
+function proofLine(input: CoverageInput, unit: string) {
+  const workflow = fixtureWorkflow(input);
+  const line = proofCiCoverage(input).units.find((candidate) => candidate.unit === unit)?.covered
+    .find((invocation) => invocation.workflow === workflow)?.command;
+  if (!line) throw new Error(`fixture target ${unit} is not covered in ${workflow}`);
+  return line;
+}
+
 function withWorkflowText(input: CoverageInput, text: string, path = fixtureWorkflow(input)): CoverageInput {
   const current = fixtureWorkflow(input);
   return {
@@ -792,7 +801,7 @@ export const FIXTURES: Fixture[] = [
     describe: "an optional proof knob alone cannot justify a local-only declaration without review metadata",
     build: (input) => {
       let edited = editWorkflow(input, (document) => {
-        const found = findStep(document, "pnpm proof:otlp-intake-spool");
+        const found = findStep(document, proofLine(input, "scripts/otlp-intake-spool-proof.ts"));
         const steps = found.job.get("steps", true);
         if (!isSeq(steps)) throw new Error("fixture workflow has no steps");
         steps.items.splice(found.index, 1);
@@ -981,7 +990,7 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: `the OTLP proof line sets its own OTLP_SPOOL_PROOF_ONLY=${value} setting`,
     build: (input) => ({
-      input: editRun(input, "pnpm proof:otlp-intake-spool", (line) => [`OTLP_SPOOL_PROOF_ONLY=${value} ${line}`]),
+      input: editRun(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), (line) => [`OTLP_SPOOL_PROOF_ONLY=${value} ${line}`]),
       error: /proof-owned CI settings/,
     }),
   })),
@@ -991,7 +1000,7 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: `the ${level} env sets OTLP_SPOOL_PROOF_ONLY=none for the counted OTLP proof`,
     build: (input) => {
-      const line = "pnpm proof:otlp-intake-spool";
+      const line = proofLine(input, "scripts/otlp-intake-spool-proof.ts");
       const env = { OTLP_SPOOL_PROOF_ONLY: "none" };
       const edited = level === "step" ? setStepKey(input, line, "env", env)
         : level === "job" ? setJobKey(input, line, "env", env)
@@ -1005,7 +1014,7 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: "a proof step cannot rewrite pnpm's script shell before running the proof",
     build: (input) => ({
-      input: editRun(input, "pnpm proof:usage-dedupe", (line) => ["pnpm config set script-shell /usr/bin/true", line]),
+      input: editRun(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), (line) => ["pnpm config set script-shell /usr/bin/true", line]),
       error: /pnpm config\/set command/,
     }),
   },
@@ -1015,7 +1024,7 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: "a step before proofs cannot write a user npmrc/pnpm rc file",
     build: (input) => ({
-      input: insertStepBefore(input, "pnpm proof:usage-dedupe", { name: "Configure package manager", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/.npmrc"' }),
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure package manager", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/.npmrc"' }),
       error: /writes an npm\/pnpm rc file/,
     }),
   },
@@ -1025,7 +1034,7 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: "a proof step cannot rewrite npm config before running the proof",
     build: (input) => ({
-      input: editRun(input, "pnpm proof:usage-dedupe", (line) => ["npm config set script-shell /usr/bin/true", line]),
+      input: editRun(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), (line) => ["npm config set script-shell /usr/bin/true", line]),
       error: /npm config command/,
     }),
   },
@@ -1035,7 +1044,7 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: "a proof step cannot write a pnpm rc file",
     build: (input) => ({
-      input: insertStepBefore(input, "pnpm proof:usage-dedupe", { name: "Configure pnpm rc", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/pnpm/rc"' }),
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure pnpm rc", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/pnpm/rc"' }),
       error: /writes an npm\/pnpm rc file/,
     }),
   },
