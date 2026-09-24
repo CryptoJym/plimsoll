@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -384,6 +385,18 @@ function stateDirectory(homeDir: string) {
   return path.join(homeDir, "Library", "Application Support", "Plimsoll");
 }
 
+/** A loopback port nothing listens on: bound, then released. */
+function reserveLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as net.AddressInfo;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
 async function runCli(args: string[], homeDir: string) {
   const child = spawn(
     process.execPath,
@@ -664,6 +677,15 @@ async function firstJoinAndRejoinScenario(shape: SeedShape) {
     // Scenario 5a — status receipt reports future-only enrollment without
     // reading or printing payloads.
     //
+    // `status` and `doctor` ask the daemon at config.port, and the join kept
+    // the default port. Point them at a released loopback port so a run on a
+    // host with a live collector never reaches it; they find no daemon, as on
+    // a CI runner.
+    const statusConfigPath = collectorConfigPath(firstHome);
+    fs.writeFileSync(statusConfigPath, `${JSON.stringify({
+      ...JSON.parse(fs.readFileSync(statusConfigPath, "utf8")),
+      port: await reserveLoopbackPort(),
+    }, null, 2)}\n`, { mode: 0o600 });
     const status = await runCli(["status"], firstHome);
     if (process.env.PLIMSOLL_PROOF_DEBUG) {
       console.error("DEBUG ledgerPath:", ledgerPath, "exists:", fs.existsSync(ledgerPath));
