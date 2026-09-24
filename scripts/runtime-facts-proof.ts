@@ -605,7 +605,7 @@ async function main() {
     const finalDrops = runtimeFactDropCounters(buffer.database);
     check(
       "drop_accounting_stays_one_row_per_reason",
-      finalDrops.length <= 8 &&
+      finalDrops.length <= 9 &&
         finalDrops.every((row) => Number.isSafeInteger(row.droppedCount) && row.droppedCount >= 1),
       { reasons: finalDrops.map((row) => row.reason) },
     );

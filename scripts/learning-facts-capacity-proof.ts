@@ -126,6 +126,7 @@ function actualCounts(db: Database.Database) {
 function exerciseHotPathBound() {
   let fullCounts = 0;
   let orderedSelections = 0;
+  let candidateSelections = 0;
   let rowDeletes = 0;
   const statusSql: string[] = [];
   let tracingStatus = false;
@@ -133,6 +134,7 @@ function exerciseHotPathBound() {
     verbose: (sql) => {
       if (/count\s*\(\s*\*\s*\)/i.test(String(sql))) fullCounts += 1;
       if (/^select operation_id as id\s+from tool_attempt_facts\s+order by/i.test(String(sql))) orderedSelections += 1;
+      if (/^select operation_id as id, started_at as retentionTimestamp\s+from tool_attempt_facts\s+order by/i.test(String(sql))) candidateSelections += 1;
       if (/^delete from tool_attempt_facts where operation_id = /i.test(String(sql))) rowDeletes += 1;
       if (tracingStatus) statusSql.push(String(sql));
     },
@@ -179,9 +181,9 @@ function exerciseHotPathBound() {
       { before, after, inserted, burstSize, peakRows, oldestSeed, newestBurst, burstMs: Number(burstMs.toFixed(2)) },
     );
     check(
-      "normal_write_cost_is_bounded_by_one_indexed_eviction",
-      orderedSelections === burstSize && rowDeletes === burstSize,
-      { burstSize, orderedSelections, rowDeletes, burstMs: Number(burstMs.toFixed(2)), averageMs: Number((burstMs / burstSize).toFixed(4)) },
+      "normal_write_cost_is_bounded_by_one_indexed_candidate_and_eviction",
+      candidateSelections === burstSize && orderedSelections === burstSize && rowDeletes === burstSize,
+      { burstSize, candidateSelections, orderedSelections, rowDeletes, burstMs: Number(burstMs.toFixed(2)), averageMs: Number((burstMs / burstSize).toFixed(4)) },
     );
     check("status_reads_only_the_four_row_state", statusSql.length === 1 &&
       /from learning_fact_table_state/i.test(statusSql[0]) && !/count\(/i.test(statusSql[0]), { statusSql });
@@ -705,9 +707,13 @@ function exerciseEvictionRollbackAndIndexes() {
 
     const plans = [
       `select operation_id from tool_attempt_facts order by started_at,operation_id limit 1`,
+      `select operation_id as id, started_at as retentionTimestamp from tool_attempt_facts order by started_at,operation_id limit 1`,
       `select episode_id from work_episode_facts order by started_at,episode_id limit 1`,
+      `select episode_id as id, started_at as retentionTimestamp from work_episode_facts order by started_at,episode_id limit 1`,
       `select exposure_id from technique_exposure_facts order by exposed_at,exposure_id limit 1`,
+      `select exposure_id as id, exposed_at as retentionTimestamp from technique_exposure_facts order by exposed_at,exposure_id limit 1`,
       `select technique_key from technique_identity_registry order by first_seen_at,technique_key limit 1`,
+      `select technique_key as id, first_seen_at as retentionTimestamp from technique_identity_registry order by first_seen_at,technique_key limit 1`,
       `delete from tool_attempt_facts where episode_id = 'fixture'`,
       `delete from technique_exposure_facts where episode_id = 'fixture'`,
       `select episode_id from work_episode_facts where parent_episode_id = 'fixture'`,
@@ -766,6 +772,147 @@ function exerciseLateRuntimeResult() {
       runtimeFactDropCounters(buffer.database).some(row => row.reason === "unpaired_result" && row.droppedCount === 1), {});
     assertCounts(buffer.database, "late_runtime_result_counts_exact");
   } finally { buffer.close(); }
+}
+
+function checkIdentityTie<T>(
+  table: TableName,
+  candidates: T[],
+  identity: (candidate: T) => string,
+  write: (candidate: T) => { inserted: boolean; dropped?: boolean; dropReason?: string },
+  retainedIds: () => string[],
+  evictedCount: () => number,
+) {
+  const sorted = [...candidates].sort((a, b) => identity(a) < identity(b) ? -1 : 1);
+  check(`${table}_equal_timestamp_candidates_are_distinct`,
+    new Set(sorted.map(identity)).size === 4, { ids: sorted.map(identity) });
+  write(sorted[1]); write(sorted[2]);
+  const rejected = write(sorted[0]);
+  check(`${table}_equal_timestamp_lower_identity_is_counted_drop`,
+    rejected.inserted === false && rejected.dropped === true &&
+      rejected.dropReason === "outside_retention_window" &&
+      JSON.stringify(retainedIds().sort()) === JSON.stringify([identity(sorted[1]), identity(sorted[2])]) &&
+      evictedCount() === 0,
+    { rejected, retained: retainedIds(), evictedCount: evictedCount() });
+  const admitted = write(sorted[3]);
+  check(`${table}_equal_timestamp_higher_identity_evicts_lowest`,
+    admitted.inserted === true &&
+      JSON.stringify(retainedIds().sort()) === JSON.stringify([identity(sorted[2]), identity(sorted[3])]) &&
+      evictedCount() === 1,
+    { admitted, retained: retainedIds(), evictedCount: evictedCount() });
+}
+
+function exerciseOutOfOrderRetention() {
+  const dropReason = "outside_retention_window";
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { attempts: 2 });
+      store.recordToolSignal(attempt(10, "delayed"));
+      store.recordToolSignal(attempt(20, "delayed"));
+      const rejected = store.recordToolSignal(attempt(0, "delayed"));
+      check("delayed_attempt_drops_without_eviction_or_write",
+        rejected.dropped === true && rejected.fact === null && rejected.dropReason === dropReason &&
+          JSON.stringify(store.attempts().map(row => row.startedAt)) === JSON.stringify([timestamp(10), timestamp(20)]) &&
+          store.status().tables.tool_attempt_facts.evictedCount === 0 &&
+          runtimeFactDropCounters(db).some(row => row.reason === dropReason && row.droppedCount === 1),
+        { rejected, status: store.status() });
+      assertCounts(db, "delayed_attempt_counts_exact");
+    } finally { db.close(); }
+  }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { episodes: 2 });
+      const episode = (n: number) => buildWorkEpisodeFact({source:"codex", sessionId:`delayed-${n}`,
+        sourceEpisodeKey:`episode-${n}`, workClass:"review", complexityBand:"medium", startedAt:timestamp(n)});
+      store.recordWorkEpisode(episode(10)); store.recordWorkEpisode(episode(20));
+      const rejected = store.recordWorkEpisode(episode(0));
+      check("delayed_episode_drops_without_graph_eviction",
+        rejected.dropped === true && rejected.fact === null && rejected.dropReason === dropReason &&
+          JSON.stringify(store.episodes().map(row => row.startedAt)) === JSON.stringify([timestamp(10), timestamp(20)]) &&
+          store.status().tables.work_episode_facts.evictedCount === 0 &&
+          runtimeFactDropCounters(db).some(row => row.reason === dropReason && row.droppedCount === 1),
+        { rejected, status: store.status() });
+      assertCounts(db, "delayed_episode_counts_exact");
+    } finally { db.close(); }
+  }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { exposures: 2 });
+      const episode = buildWorkEpisodeFact({source:"codex", sessionId:"delayed-exposure",
+        sourceEpisodeKey:"episode", workClass:"review", complexityBand:"medium", startedAt:timestamp(0)});
+      store.recordWorkEpisode(episode);
+      const exposure = (n: number) => buildTechniqueExposureFact({episodeId:episode.episodeId,
+        techniqueId:"delayed-technique", techniqueVersion:"1", assignmentId:`assignment-${n}`,
+        workClass:"review", complexityBand:"medium", exposedAt:timestamp(n), mode:"treatment"});
+      store.recordTechniqueExposure(exposure(10)); store.recordTechniqueExposure(exposure(20));
+      const rejected = store.recordTechniqueExposure(exposure(0));
+      check("delayed_exposure_drops_without_eviction_or_identity_write",
+        rejected.dropped === true && rejected.fact === null && rejected.dropReason === dropReason &&
+          JSON.stringify(store.exposures().map(row => row.exposedAt)) === JSON.stringify([timestamp(10), timestamp(20)]) &&
+          store.status().tables.technique_exposure_facts.evictedCount === 0 &&
+          store.status().tables.technique_identity_registry.rowCount === 1 &&
+          runtimeFactDropCounters(db).some(row => row.reason === dropReason && row.droppedCount === 1),
+        { rejected, status: store.status() });
+      assertCounts(db, "delayed_exposure_counts_exact");
+    } finally { db.close(); }
+  }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { attempts: 2, episodes: 2, exposures: 2 });
+      const tieAt = timestamp(50);
+      checkIdentityTie("tool_attempt_facts", [0,1,2,3].map(n => ({...attempt(n,"tie"), startedAt:tieAt})),
+        row => row.operationId, row => store.recordToolSignal(row),
+        () => store.attempts().map(row => row.operationId),
+        () => store.status().tables.tool_attempt_facts.evictedCount);
+      const episodes = [0,1,2,3].map(n => buildWorkEpisodeFact({source:"codex", sessionId:`tie-${n}`,
+        sourceEpisodeKey:`episode-${n}`, workClass:"review", complexityBand:"medium", startedAt:tieAt}));
+      checkIdentityTie("work_episode_facts", episodes, row => row.episodeId,
+        row => store.recordWorkEpisode(row), () => store.episodes().map(row => row.episodeId),
+        () => store.status().tables.work_episode_facts.evictedCount);
+      const root = buildWorkEpisodeFact({source:"codex", sessionId:"tie-exposure", sourceEpisodeKey:"root",
+        workClass:"review", complexityBand:"medium", startedAt:timestamp(0)});
+      // Make room for the root without changing the two retained tie episodes.
+      const exposureDb = new Database(":memory:");
+      try {
+        const exposureStore = new LearningFactStore(exposureDb, { exposures: 2 });
+        exposureStore.recordWorkEpisode(root);
+        const exposures = [0,1,2,3].map(n => buildTechniqueExposureFact({episodeId:root.episodeId,
+          techniqueId:"tie-technique", techniqueVersion:"1", assignmentId:`tie-assignment-${n}`,
+          workClass:"review", complexityBand:"medium", exposedAt:tieAt, mode:"treatment"}));
+        checkIdentityTie("technique_exposure_facts", exposures, row => row.exposureId,
+          row => exposureStore.recordTechniqueExposure(row), () => exposureStore.exposures().map(row => row.exposureId),
+          () => exposureStore.status().tables.technique_exposure_facts.evictedCount);
+        assertCounts(exposureDb, "equal_timestamp_exposure_counts_exact");
+      } finally { exposureDb.close(); }
+      assertCounts(db, "equal_timestamp_attempt_episode_counts_exact");
+    } finally { db.close(); }
+  }
+  {
+    const buffer = new LocalEventBuffer(":memory:", {
+      delivery: {enabled:false}, learningFacts:{limits:{episodes:2, attempts:10}},
+    });
+    try {
+      const event = (n:number, result=false) => aiInteractionEventSchema.parse({
+        id:deterministicLearningFactId(["delayed-runtime-replay",String(n),String(result)]),
+        source:"codex", sessionId:`replay-${n}`, dataMode:"metadata",
+        eventType:result ? "tool_result" : "tool_use", observedAt:timestamp(result ? 30 : n),
+        actionClass:"shell", metadata:{call_id:`operation-${n}`},
+      });
+      for (const n of [10,20,0]) check(`runtime_capture_accepts_event_${n}`, buffer.append(event(n)), {});
+      buffer.append(event(0,true));
+      check("delayed_runtime_replay_keeps_newer_whole_episode_graphs",
+        JSON.stringify(buffer.learningFacts.episodes().map(row => row.sessionId)) === JSON.stringify(["replay-10","replay-20"]) &&
+          JSON.stringify(buffer.learningFacts.attempts().map(row => row.sessionId)) === JSON.stringify(["replay-10","replay-20"]) &&
+          buffer.learningFacts.status().tables.work_episode_facts.evictedCount === 0 &&
+          runtimeFactDropCounters(buffer.database).some(row => row.reason === dropReason && row.droppedCount === 1) &&
+          runtimeFactDropCounters(buffer.database).some(row => row.reason === "unpaired_result" && row.droppedCount === 1),
+        { status: buffer.learningFacts.status(), drops: runtimeFactDropCounters(buffer.database) });
+      assertCounts(buffer.database, "delayed_runtime_replay_counts_exact");
+    } finally { buffer.close(); }
+  }
 }
 
 function exerciseNestedEpisodeRollback() {
@@ -838,6 +985,7 @@ async function main() {
     },
     fairness: exerciseFairness,
     referential: () => { exerciseReferentialRetention(); exerciseLateRuntimeResult(); exerciseNestedEpisodeRollback(); },
+    "out-of-order": exerciseOutOfOrderRetention,
     migration: exerciseInterruptedUpgradeDowngrade,
     "migration-recount": exerciseMissingTriggers,
     production: exerciseProductionStage,

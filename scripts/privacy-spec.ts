@@ -584,7 +584,7 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`### Promoted learning facts`);
   lines.push(``);
   lines.push(`The collector may promote only the bounded, normalized learning facts listed below from typed tool and assignment signals. They remain local to \`work-ledger.sqlite\`; no learning-fact table is part of an upload envelope or outbound query (\`${SOURCE_LEARNING_FACTS}\`).`);
-  lines.push(`Each cap is a hard row bound. When a table is full, the write transaction removes the oldest indexed row(s) needed for the new fact; maintenance selects at most 256 oldest roots per table per pass, plus their dependent facts. Evicting an episode removes its descendants, attempts, and exposures together; evicting an attempt also removes its retry descendants. A late reference to an evicted episode is dropped and counted, never written as an orphan and never raised into capture.`);
+  lines.push(`Each cap is a hard row bound. At a full table, the incoming fact competes with the oldest retained fact by timestamp, then identity. If it ranks lower, the collector drops that table's fact without a write or eviction and increments the local \`outside_retention_window\` counter; otherwise the write transaction evicts the oldest indexed row(s). Maintenance selects at most 256 oldest roots per table per pass, plus their dependent facts. Evicting an episode removes its descendants, attempts, and exposures together; evicting an attempt also removes its retry descendants. A late reference to an evicted episode is dropped and counted, never written as an orphan and never raised into capture.`);
   lines.push(``);
   lines.push(`| Table | What it retains | Hard cap | Retention and erasure |`);
   lines.push(`|---|---|---:|---|`);

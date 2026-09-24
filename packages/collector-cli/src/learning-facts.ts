@@ -84,7 +84,7 @@ export type LearningFactMaintenanceResult = {
 
 export type LearningFactWriteResult<T> = {
   inserted: boolean;
-  /** Null only when the write was intentionally dropped as stale. */
+  /** Null only when the write was intentionally dropped. */
   fact: T | null;
   dropped?: boolean;
   dropReason?: RuntimeFactDropReason;
@@ -695,12 +695,13 @@ export class LearningFactStore {
   private capacityPressure(
     table: LearningFactTableName,
     id: string,
-  ) {
+    retentionTimestamp: string,
+  ): boolean {
     const definition = LEARNING_FACT_TABLES.find((entry) => entry.name === table)!;
     const existing = this.db
       .prepare(`select 1 from ${definition.name} where ${definition.idColumn} = ?`)
       .get(id);
-    if (existing) return;
+    if (existing) return true;
     const state = this.db
       .prepare(
         `select row_count as rowCount
@@ -709,15 +710,33 @@ export class LearningFactStore {
       .get(definition.name) as { rowCount: number } | undefined;
     if (!state) throw new Error(`LearningFactStateMissing:${definition.name}`);
     const limit = this.limits[definition.limit];
-    if (state.rowCount >= limit) {
-      // The indexed retention query removes exactly the rows needed to make
-      // room, including a complete episode graph when the episode table is
-      // under pressure. No full-table count or refusal occurs on this path.
-      this.evictOldest(definition, state.rowCount - limit + 1);
+    if (state.rowCount > limit) {
+      // A legacy/raw writer can leave overflow. Repair only those rows before
+      // comparing the new candidate, so even a rejected write leaves a bound.
+      this.evictOldest(definition, state.rowCount - limit);
+      state.rowCount = (this.db.prepare(
+        `select row_count as rowCount from learning_fact_table_state where table_name = ?`,
+      ).get(definition.name) as { rowCount: number }).rowCount;
     }
+    if (state.rowCount < limit) return true;
+    const oldest = this.db.prepare(
+      `select ${definition.idColumn} as id, ${definition.retentionColumn} as retentionTimestamp
+         from ${definition.name}
+        order by ${definition.retentionColumn}, ${definition.idColumn}
+        limit 1`,
+    ).get() as { id: string; retentionTimestamp: string } | undefined;
+    if (!oldest) throw new Error(`LearningFactStateMismatch:${definition.name}`);
+    // These persisted identifiers and ISO timestamp strings use SQLite BINARY
+    // ordering. A full table keeps the greater (timestamp, identity) tuple.
+    if (retentionTimestamp < oldest.retentionTimestamp ||
+        (retentionTimestamp === oldest.retentionTimestamp && id < oldest.id)) {
+      return false;
+    }
+    this.evictOldest(definition, 1);
+    return true;
   }
 
-  private staleReference<T>(reason: RuntimeFactDropReason = "stale_reference"): LearningFactWriteResult<T> {
+  private dropFact<T>(reason: RuntimeFactDropReason = "stale_reference"): LearningFactWriteResult<T> {
     recordRuntimeFactDrop(this.db, reason);
     return { inserted: false, fact: null, dropped: true, dropReason: reason };
   }
@@ -756,7 +775,7 @@ export class LearningFactStore {
               startedAt: string;
               endedAt: string | null;
             } | undefined;
-          if (!episode) return this.staleReference<ToolAttemptFact>();
+          if (!episode) return this.dropFact<ToolAttemptFact>();
           if (episode.source !== start.source || episode.sessionId !== start.sessionId) {
             throw new Error("ToolAttemptEpisodeIdentityConflict");
           }
@@ -785,11 +804,13 @@ export class LearningFactStore {
             throw new Error("ToolAttemptRetryTargetConflict");
           }
         }
-        this.capacityPressure("tool_attempt_facts", start.operationId);
+        if (!this.capacityPressure("tool_attempt_facts", start.operationId, start.startedAt)) {
+          return this.dropFact<ToolAttemptFact>("outside_retention_window");
+        }
         if (start.retryOf && !this.db.prepare(
           `select 1 from tool_attempt_facts where operation_id = ?`,
         ).get(start.retryOf)) {
-          return this.staleReference<ToolAttemptFact>("retry_target_missing");
+          return this.dropFact<ToolAttemptFact>("retry_target_missing");
         }
         const now = new Date().toISOString();
         this.db.prepare(
@@ -816,7 +837,7 @@ export class LearningFactStore {
       const existing = this.db
         .prepare(`${ATTEMPT_SELECT} where operation_id = ?`)
         .get(result.operationId) as AttemptRow | undefined;
-      if (!existing) return this.staleReference<ToolAttemptFact>("unpaired_result");
+      if (!existing) return this.dropFact<ToolAttemptFact>("unpaired_result");
       const current = attemptFromRow(existing);
       if (current.source !== result.source || current.sessionId !== result.sessionId) {
         throw new Error("ToolAttemptResultIdentityConflict");
@@ -836,7 +857,7 @@ export class LearningFactStore {
             `select ended_at as endedAt from work_episode_facts where episode_id = ?`,
           )
           .get(current.episodeId) as { endedAt: string | null } | undefined;
-        if (!episode) return this.staleReference<ToolAttemptFact>();
+        if (!episode) return this.dropFact<ToolAttemptFact>();
         if (
           episode.endedAt !== null &&
           Date.parse(result.endedAt) > Date.parse(episode.endedAt)
@@ -884,7 +905,7 @@ export class LearningFactStore {
             sessionId: string;
             startedAt: string;
           } | undefined;
-        if (!parent) return this.staleReference<WorkEpisodeFact>();
+        if (!parent) return this.dropFact<WorkEpisodeFact>();
         if (parent.source !== fact.source || parent.sessionId !== fact.sessionId) {
           throw new Error("WorkEpisodeParentIdentityConflict");
         }
@@ -916,14 +937,16 @@ export class LearningFactStore {
         }
         return { inserted: false, fact: existing };
       }
-      this.capacityPressure("work_episode_facts", fact.episodeId);
+      if (!this.capacityPressure("work_episode_facts", fact.episodeId, fact.startedAt)) {
+        return this.dropFact<WorkEpisodeFact>("outside_retention_window");
+      }
       if (fact.parentEpisodeId) {
         const parentStillExists = this.db
           .prepare(`select 1 from work_episode_facts where episode_id = ?`)
           .get(fact.parentEpisodeId);
         // The parent may itself have been the oldest graph root. Do not write
         // a child that would be orphaned by the same bounded eviction.
-        if (!parentStillExists) return this.staleReference<WorkEpisodeFact>();
+        if (!parentStillExists) return this.dropFact<WorkEpisodeFact>();
       }
       this.db.prepare(
         `insert into work_episode_facts
@@ -973,7 +996,7 @@ export class LearningFactStore {
           startedAt: string;
           endedAt: string | null;
         } | undefined;
-      if (!episode) return this.staleReference<TechniqueExposureFact>();
+      if (!episode) return this.dropFact<TechniqueExposureFact>();
       if (
         episode.workClass !== fact.workClass ||
         episode.complexityBand !== fact.complexityBand
@@ -1008,25 +1031,30 @@ export class LearningFactStore {
         }
         return { inserted: false, fact: stored };
       }
-      this.capacityPressure("technique_exposure_facts", fact.exposureId);
+      if (!this.capacityPressure("technique_exposure_facts", fact.exposureId, fact.exposedAt)) {
+        return this.dropFact<TechniqueExposureFact>("outside_retention_window");
+      }
       const techniqueKey = deterministicLearningFactId([
         fact.techniqueId,
         fact.techniqueVersion ?? "",
         fact.contentDigest ?? "",
       ]);
-      this.capacityPressure("technique_identity_registry", techniqueKey);
       const now = new Date().toISOString();
-      this.db.prepare(
+      if (this.capacityPressure("technique_identity_registry", techniqueKey, now)) {
+        this.db.prepare(
         `insert or ignore into technique_identity_registry
           (technique_key, technique_id, technique_version, content_digest, first_seen_at)
          values (@techniqueKey, @techniqueId, @techniqueVersion, @contentDigest, @now)`,
-      ).run({
-        techniqueKey,
-        techniqueId: fact.techniqueId,
-        techniqueVersion: fact.techniqueVersion ?? null,
-        contentDigest: fact.contentDigest ?? null,
-        now,
-      });
+        ).run({
+          techniqueKey,
+          techniqueId: fact.techniqueId,
+          techniqueVersion: fact.techniqueVersion ?? null,
+          contentDigest: fact.contentDigest ?? null,
+          now,
+        });
+      } else {
+        recordRuntimeFactDrop(this.db, "outside_retention_window");
+      }
       this.db.prepare(
         `insert into technique_exposure_facts
           (exposure_id, episode_id, technique_id, technique_version, content_digest,

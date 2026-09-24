@@ -8,6 +8,7 @@ export type RuntimeFactDropReason =
   | "unpaired_result"
   | "retry_target_missing"
   | "capacity_exceeded"
+  | "outside_retention_window"
   | "stale_reference";
 
 type DropRow = { reason: RuntimeFactDropReason; droppedCount: number; lastDroppedAt: string };
