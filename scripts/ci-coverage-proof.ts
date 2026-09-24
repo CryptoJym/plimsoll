@@ -7,8 +7,8 @@
  * workflow step that provably runs on every successful push and pull request
  * to main, or be a declared sub-proof of a suite CI runs
  * (scripts/proof-suites.json), or carry a reviewed entry in
- * scripts/proof-local-only.json (local-only with the input CI lacks, or
- * quarantined for at most 30 days). The gate must also be the first proof
+ * scripts/proof-local-only.json (local-only with the input CI lacks and a
+ * recent reviewedOn/expiry pair, or quarantined for at most 30 days). The gate must also be the first proof
  * step in its job. Then every adversarial fixture in
  * scripts/lib/ci-coverage-fixtures.ts, including each case from both reviews
  * of PR #397, must reach the verdict a correct gate reaches.
@@ -42,7 +42,8 @@
  * gate itself into a no-op. Locally: pnpm proof:ci-coverage [--audit-only]
  * [--root DIR] [--today YYYY-MM-DD]
  *   --root audits another checkout (self-tests are skipped); --today checks
- *   quarantine expiry against another date.
+ *   quarantine expiry against another date. These options are local-only: the
+ *   CI invocation must use this file with no arguments.
  */
 import path from "node:path";
 

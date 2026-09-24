@@ -27,6 +27,8 @@ export type WorkflowStep = {
   uses: string | null;
   /** Names the step's `env:` sets; null when it is not a literal mapping. */
   env: string[] | null;
+  /** Literal step environment values, when the mapping is readable. */
+  envValues: Record<string, unknown> | null;
   /** Null when every successful push/PR run executes this step's shell script with errexit. */
   notCovering: string | null;
 };
@@ -38,8 +40,10 @@ export type WorkflowModel = {
   steps: WorkflowStep[];
   /** Names the workflow-level `env:` sets; null when it is not a literal mapping. */
   env: string[] | null;
+  /** Literal workflow environment values, when the mapping is readable. */
+  envValues: Record<string, unknown> | null;
   /** Per job: the names its `env:` sets (null when not a literal mapping), and whether it runs in a container. */
-  jobs: Record<string, { env: string[] | null; container: boolean }>;
+  jobs: Record<string, { env: string[] | null; envValues: Record<string, unknown> | null; container: boolean }>;
 };
 
 // ---------------------------------------------------------------------------
@@ -464,6 +468,7 @@ function unknownKeys(path: string, workflow: Json): string[] {
 }
 
 const envNames = (env: unknown): string[] | null => (env === undefined ? [] : isRecord(env) ? Object.keys(env) : null);
+const envValues = (env: unknown): Record<string, unknown> | null => (env === undefined ? {} : isRecord(env) ? env : null);
 
 function lineOf(document: Document, lineCounter: LineCounter, path: Array<string | number>) {
   const node = document.getIn(path, true) as { range?: [number, number, number] } | undefined;
@@ -474,15 +479,15 @@ export function modelWorkflow(path: string, text: string): WorkflowModel {
   const lineCounter = new LineCounter();
   const document = parseDocument(text, { lineCounter, prettyErrors: true, uniqueKeys: true });
   const errors = [...document.errors, ...document.warnings].map((problem) => `${path}: ${problem.message.split("\n")[0]}`);
-  if (errors.length > 0) return { path, errors, triggerProblems: [], steps: [], env: [], jobs: {} };
+  if (errors.length > 0) return { path, errors, triggerProblems: [], steps: [], env: [], envValues: {}, jobs: {} };
   let workflow: unknown;
   try {
     workflow = document.toJS({ maxAliasCount: 100 });
   } catch (error) {
-    return { path, errors: [`${path}: ${error instanceof Error ? error.message : String(error)}`], triggerProblems: [], steps: [], env: [], jobs: {} };
+    return { path, errors: [`${path}: ${error instanceof Error ? error.message : String(error)}`], triggerProblems: [], steps: [], env: [], envValues: {}, jobs: {} };
   }
   if (!isRecord(workflow) || !isRecord(workflow.jobs)) {
-    return { path, errors: [`${path}: not a workflow with a jobs mapping`], triggerProblems: [], steps: [], env: [], jobs: {} };
+    return { path, errors: [`${path}: not a workflow with a jobs mapping`], triggerProblems: [], steps: [], env: [], envValues: {}, jobs: {} };
   }
   const structure = [
     ...mergeKeys(workflow, "").map((at) => `${path}: YAML merge key \`<<\` at ${at}; GitHub does not merge keys and the gate does not guess`),
@@ -590,11 +595,11 @@ export function modelWorkflow(path: string, text: string): WorkflowModel {
         }
       }
       const uses = typeof record.uses === "string" ? record.uses : null;
-      steps.push({ workflow: path, job: jobId, stepIndex: index, name, line, run, uses, env: envNames(record.env), notCovering });
+      steps.push({ workflow: path, job: jobId, stepIndex: index, name, line, run, uses, env: envNames(record.env), envValues: envValues(record.env), notCovering });
     });
   }
   const jobInfo = Object.fromEntries(
-    Object.entries(jobs).map(([id, job]) => [id, { env: isRecord(job) ? envNames(job.env) : null, container: isRecord(job) && job.container !== undefined }]),
+    Object.entries(jobs).map(([id, job]) => [id, { env: isRecord(job) ? envNames(job.env) : null, envValues: isRecord(job) ? envValues(job.env) : null, container: isRecord(job) && job.container !== undefined }]),
   );
-  return { path, errors: structure, triggerProblems: triggers, steps, env: envNames(workflow.env), jobs: jobInfo };
+  return { path, errors: structure, triggerProblems: triggers, steps, env: envNames(workflow.env), envValues: envValues(workflow.env), jobs: jobInfo };
 }

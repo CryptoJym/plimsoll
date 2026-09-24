@@ -10,7 +10,7 @@
  * A package script (pnpm runs it with `sh -c`) is canonical when it is
  * exactly one of:
  *   tsx <file> [args]
- *   node [--expose-gc] --import tsx <file> [args]
+ *   node [--expose-gc] [--max-old-space-size=N] --import tsx <file> [args]
  *   node ./node_modules/tsx/dist/cli.mjs <file> [args]
  *   pnpm <script>                                     (a pure alias)
  * where <file> is a repository .ts/.js file under scripts/ or packages/ and
@@ -25,8 +25,9 @@
  *   [NAME=value ...] pnpm|node <args> [> file | >> file]
  *   export NAME=value
  * Args are plain words; values may also be "$VAR" or "$(mktemp -d <template>)".
- * The one GitHub expression allowed is the head commit SHA,
- * "${{ github.event.pull_request.head.sha || github.sha }}", as an argument:
+ * The inert GitHub expressions allowed as arguments are the head commit SHA,
+ * `github.sha`, `runner.temp` and `github.workspace` (including the combined
+ * head-SHA expression):
  * GitHub pastes every `${{ }}` into the script before bash reads it, and that
  * one always expands to 40 hex digits. Blank lines and whole-line comments
  * are skipped; anything else (other expressions, operators, heredocs, other
@@ -36,6 +37,13 @@
 
 export const LITERAL_WORD = /^[A-Za-z0-9_./:@%+,=-]+$/;
 export const RUN_PROOF_WRAPPER = "scripts/run-proof.ts";
+/** Expressions that GitHub resolves without changing which proof runs. */
+export const INERT_EXPRESSIONS = {
+  "${{ github.event.pull_request.head.sha || github.sha }}": "<head-sha>",
+  "${{ github.sha }}": "<github-sha>",
+  "${{ runner.temp }}": "<runner-temp>",
+  "${{ github.workspace }}": "<github-workspace>",
+} as const;
 const TSX_CLI = "node_modules/tsx/dist/cli.mjs";
 const REPO_FILE = /^(?:scripts|packages)\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[cm]?[jt]s$/;
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -65,10 +73,10 @@ export function runnerInvocation(words: string[]): RunnerInvocation | Problem {
         if (rest[fileAt] === "--import" && rest[fileAt + 1] === "tsx" && !loadsTsx) {
           loadsTsx = true;
           fileAt += 2;
-        } else if (rest[fileAt] === "--expose-gc") {
+        } else if (rest[fileAt] === "--expose-gc" || /^--max-old-space-size=[1-9][0-9]*$/.test(rest[fileAt] ?? "")) {
           fileAt += 1;
         } else {
-          return { problem: `node flag \`${rest[fileAt]}\` is not allowed (only --import tsx and --expose-gc)` };
+          return { problem: `node flag \`${rest[fileAt]}\` is not allowed (only --import tsx, --expose-gc and --max-old-space-size=N)` };
         }
       }
       if (!loadsTsx) return { problem: "node must load tsx (`--import tsx`) or run ./node_modules/tsx/dist/cli.mjs" };
@@ -100,9 +108,11 @@ export function packageScriptForm(text: string): ScriptForm | Problem {
   }
   if (ASSIGNMENT.test(words[0]!)) return { problem: `\`${words[0]}\` sets the environment before the command` };
   if (words[0] === "pnpm") {
-    return words.length === 2 && !words[1]!.startsWith("-")
-      ? { alias: words[1]! }
-      : { problem: "pnpm is allowed only as a pure alias, `pnpm <script>`" };
+    const alias = words[1] === "run" ? words[2] : words[1];
+    const pureAlias = typeof alias === "string" && !alias.startsWith("-");
+    return (((words.length === 2 && words[1] !== "run") || (words.length === 3 && words[1] === "run")) && pureAlias)
+      ? { alias: alias! }
+      : { problem: "pnpm is allowed only as a pure alias, `pnpm <script>` or `pnpm run <script>`" };
   }
   return runnerInvocation(words);
 }
@@ -122,12 +132,12 @@ export type WorkflowLine =
   | { kind: "export"; name: string }
   | { kind: "command"; assignments: string[]; words: string[] };
 
-type Segment = "literal" | "sha" | "var" | "mktemp";
+type Segment = "literal" | "sha" | "inert" | "var" | "mktemp";
 type LineWord = { text: string; segments: Set<Segment> } | { redirect: ">" | ">>" };
 
 function outsideForm(rest: string): Problem {
   if (rest.startsWith("${{") || rest.startsWith('"${{')) {
-    return { problem: "GitHub pastes `${{ … }}` into the script before bash reads it; only the head-SHA expression is allowed" };
+    return { problem: "GitHub pastes `${{ … }}` into the script before bash reads it; only the documented inert expressions are allowed" };
   }
   if (/^\d*<</.test(rest)) return { problem: "heredocs are not allowed" };
   if (rest.startsWith("#")) return { problem: "trailing comments are not allowed" };
@@ -162,10 +172,6 @@ function scanLine(line: string): LineWord[] | Problem {
         taken = literal[0];
         text += taken;
         segments.add("literal");
-      } else if (rest.startsWith(`"${INERT_EXPRESSION}"`)) {
-        taken = `"${INERT_EXPRESSION}"`;
-        text += "<head-sha>";
-        segments.add("sha");
       } else if (variable) {
         taken = variable[0];
         text += `$${variable[1] ?? variable[2]}`;
@@ -175,7 +181,17 @@ function scanLine(line: string): LineWord[] | Problem {
         text += "<mktemp>";
         segments.add("mktemp");
       } else {
-        return outsideForm(rest);
+        const expression = Object.entries(INERT_EXPRESSIONS).find(([candidate]) =>
+          rest.startsWith(`"${candidate}"`) || rest.startsWith(candidate),
+        );
+        if (expression) {
+          const [candidate, replacement] = expression;
+          taken = rest.startsWith(`"${candidate}"`) ? `"${candidate}"` : candidate;
+          text += replacement;
+          segments.add(candidate === INERT_EXPRESSION ? "sha" : "inert");
+        } else {
+          return outsideForm(rest);
+        }
       }
       i += taken.length;
     }
@@ -217,7 +233,7 @@ export function workflowLineForm(line: string): WorkflowLine | Problem {
   if (!command || !only(command, ["literal"]) || (command.text !== "pnpm" && command.text !== "node")) {
     return { problem: `\`${command?.text ?? ""}\` is not an allowed command (pnpm or node)` };
   }
-  const bad = args.find((arg) => !only(arg, ["literal", "sha"]));
-  if (bad) return { problem: `argument \`${bad.text}\` must be a plain word or the head-SHA expression` };
+  const bad = args.find((arg) => !only(arg, ["literal", "sha", "inert"]));
+  if (bad) return { problem: `argument \`${bad.text}\` must be a plain word or an inert GitHub expression` };
   return { kind: "command", assignments, words: [command.text, ...args.map((arg) => arg.text)] };
 }
