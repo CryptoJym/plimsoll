@@ -65,6 +65,7 @@ const CASES = {
     "crash_after_unlink_leaves_a_durable_removal_record",
     "next_prune_records_the_removal_the_crash_left_unrecorded",
     "failed_receipt_write_after_retention_is_recovered_by_the_next_prune",
+    "unrecognized_trash_entries_are_left_alone_and_never_block_retention",
   ],
   preflight: [
     "preflight_is_read_only_and_creates_nothing",
@@ -853,6 +854,25 @@ async function b5RemovalsAreDurablyRecorded() {
         next.retention.recovered.some((item) => item.kind === "snapshot" && item.name === "w1") &&
         receiptsNaming(fixture, "w1").length > 0 && listDirectory(path.join(fixture.lifecycleRoot, "removals")).length === 0,
       { w3: w3.retention, next: next.retention, naming: receiptsNaming(fixture, "w1") });
+  });
+  // Entries the lifecycle never names this way are not its to delete, and must
+  // not make a removal record unreadable.
+  await runCase([CASES.b5[3]], async (record) => {
+    const fixture = createHome("b5-foreign-trash");
+    for (const [id, version] of [["f1", "6.0.0"], ["f2", "6.0.1"]] as const) {
+      await fixture.manager().update({ operationId: id, artifact: fixture.artifact(version) });
+    }
+    const trash = path.join(fixture.lifecycleRoot, "trash");
+    fs.mkdirSync(path.join(trash, "snapshot+odd+zz"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(trash, "notes.txt"), "not lifecycle trash\n", { mode: 0o600 });
+    const first = await fixture.manager().pruneSnapshots({ operationId: "b5-foreign-1", keep: 1, apply: true });
+    const second = await fixture.manager().pruneSnapshots({ operationId: "b5-foreign-2", keep: 1, apply: true });
+    record(CASES.b5[3],
+      first.retention.status === "applied" && second.retention.status === "applied" &&
+        same(first.retention.removed.map((item) => `${item.kind}:${item.name}`), ["snapshot:f1"]) &&
+        same(listDirectory(trash), ["notes.txt", "snapshot+odd+zz"]) &&
+        listDirectory(path.join(fixture.lifecycleRoot, "removals")).length === 0,
+      { first: first.retention, second: second.retention, trash: listDirectory(trash) });
   });
 }
 

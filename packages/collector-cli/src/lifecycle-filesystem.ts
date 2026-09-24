@@ -1097,11 +1097,13 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     if (!trash) return [];
     assertNoSymlink(this.trashRoot, this.root);
     if (!trash.isDirectory()) throw new Error("lifecycle trash must be a directory");
+    // Only names this adapter gives trash entries; anything else is left alone.
     const entries: Array<{ fileName: string; item: LifecycleRemovedItem }> = [];
     for (const fileName of fs.readdirSync(this.trashRoot).sort()) {
-      const [kind, name] = fileName.split(TRASH_SEPARATOR);
-      if ((kind === "snapshot" || kind === "runtime_version") && isBoundedIdentifier(name)) {
-        entries.push({ fileName, item: { kind, name, bytes: treeBytes(path.join(this.trashRoot, fileName)) } });
+      const match = TRASH_NAME.exec(fileName);
+      if (match && isBoundedIdentifier(match[2])) {
+        const kind = match[1] as LifecycleRemovedItem["kind"];
+        entries.push({ fileName, item: { kind, name: match[2]!, bytes: treeBytes(path.join(this.trashRoot, fileName)) } });
       }
     }
     return entries;
