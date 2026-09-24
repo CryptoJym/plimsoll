@@ -82,9 +82,12 @@ Bounds:
   session is reached within two rounds.
 - These hold when a new worker replaces the old one every pass, as long as
   one pass can read past a group's covered entries within its wall and its
-  65,536 reads. Reading past a covered entry took about 1 µs on Studio1 at a
-  load average of 50–80, so about 40,000 fit in a 50 ms pass. A persistent
-  worker keeps its directory streams open across passes and has no such
-  limit.
+  65,536 reads. On Studio1 at a load average near 70, a new worker with the
+  production limits read past 10,000 covered entries in 21–50 ms, but not
+  past 40,000 in one 50 ms pass. In a group that large, a worker replaced
+  every pass stops advancing once the covered entries ahead of the next
+  uncovered one take more than a pass to read. The production maintenance
+  child is persistent (`maintenance-boundary.ts`), and a persistent worker
+  keeps its directory streams open across passes, so it has no such limit.
 - The durable walk state holds only name hashes and numbers; it names no
   path.
