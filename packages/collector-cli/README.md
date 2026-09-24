@@ -153,6 +153,10 @@ merely resolve to this machine. Every use prints a warning to stderr and a
 command-line flag, not a setting, so it never carries over to other commands
 or processes.
 
+The collector's own loopback HTTP requests and its generated Codex and Grok
+curl hooks bypass inherited proxies, keeping their local credentials and bodies
+on this machine. Hosted workspace requests still use configured proxies.
+
 ## What leaves your machine
 
 Nothing, unless you configure an upload target. Identifying values are
