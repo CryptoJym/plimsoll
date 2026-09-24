@@ -124,6 +124,7 @@ const HISTORICAL_FILES_PER_SOURCE = 1_200;
 const RECENT_BASELINE_CODEX_FILES = 200;
 const BASELINE_FIXTURE_CODEX_GENERATIONS = RECENT_BASELINE_CODEX_FILES + 1;
 const BASELINE_FIXTURE_CLAUDE_GENERATIONS = HISTORICAL_FILES_PER_SOURCE + 1;
+const MAX_FIXTURE_METADATA_FAILURES = 16;
 // Both sources require two stable sweeps. Alternating source priority means a
 // cadence may spend its budget on only one source, so the safe deterministic
 // ceiling is the sum of both chunk counts plus mutation/replay quiet sweeps.
@@ -705,6 +706,23 @@ function syntheticUuid(prefix: "codex" | "claude", index: number) {
   return `${head}-0000-7000-8000-${String(index).padStart(12, "0")}`;
 }
 
+function fixtureDirectoryTopology(root: string, recursive: boolean) {
+  let entries = 0;
+  let calls = 0;
+  const walk = (directory: string) => {
+    const listed = fs.readdirSync(directory, { withFileTypes: true });
+    calls += 1;
+    entries += listed.length;
+    if (recursive) {
+      for (const entry of listed) {
+        if (entry.isDirectory()) walk(path.join(directory, entry.name));
+      }
+    }
+  };
+  walk(root);
+  return { entries, calls };
+}
+
 function writeFirstBootFixtures(sandbox: ResourceSandbox) {
   const now = new Date();
   const observedAt = now.toISOString();
@@ -828,6 +846,9 @@ function writeFirstBootFixtures(sandbox: ResourceSandbox) {
     );
   }
 
+  const codexStableTopology = fixtureDirectoryTopology(path.dirname(recentRollout), false);
+  const claudeStableTopology = fixtureDirectoryTopology(sandbox.claudeProjects, true);
+
   return {
     observedAt,
     recentRollout,
@@ -846,6 +867,16 @@ function writeFirstBootFixtures(sandbox: ResourceSandbox) {
     baselineCodexGenerations: BASELINE_FIXTURE_CODEX_GENERATIONS,
     baselineClaudeGenerations: BASELINE_FIXTURE_CLAUDE_GENERATIONS,
     nestedNoncandidateEntries: 300,
+    expectedStableDirectoryEntries:
+      codexStableTopology.entries + claudeStableTopology.entries,
+    expectedStableEnumerationCalls: codexStableTopology.calls + claudeStableTopology.calls,
+    // Startup and baseline each walk the same fixed topology. Derive their
+    // exact contract from the files just written so a fixture edit cannot
+    // leave a stale hand-counted setup limit in the proof.
+    expectedSetupFilesystemEntriesScanned:
+      (codexStableTopology.entries + claudeStableTopology.entries) * 2,
+    expectedSetupFilesystemEnumerationCalls:
+      (codexStableTopology.calls + claudeStableTopology.calls) * 2,
   };
 }
 
@@ -869,22 +900,106 @@ type DirectoryEnumerationRecord = {
   failedCalls: number;
   readFailures: number;
   deduplicatedEntries: number;
+  metadataCalls: number;
+  metadataFailures: number;
   unregistered: boolean;
   restorationVerified: boolean;
 };
 
 const directoryEnumerationObservers = new Map<string, DirectoryEnumerationRecord>();
 const directoryObserverDuplicateProbes = new WeakMap<fs.Dir, (entry: fs.Dirent) => void>();
-let directoryEnumerationOriginal: typeof fs.readdirSync | undefined;
-let directoryEnumerationWrapper: typeof fs.readdirSync | undefined;
-let directoryOpenOriginal: typeof fs.opendirSync | undefined;
-let directoryOpenWrapper: typeof fs.opendirSync | undefined;
+type DirectoryObserverSlot = {
+  owner: Record<string, unknown>;
+  name: string;
+  original: unknown;
+  wrapper: unknown;
+};
+let directoryObserverSlots: DirectoryObserverSlot[] | undefined;
+
+type DirectoryFsApis = {
+  readdir: (...args: any[]) => any;
+  readdirSync: (...args: any[]) => any;
+  opendir: (...args: any[]) => any;
+  opendirSync: (...args: any[]) => any;
+  glob?: (...args: any[]) => any;
+  globSync?: (...args: any[]) => any;
+  promises: {
+    readdir: (...args: any[]) => any;
+    opendir: (...args: any[]) => any;
+    glob?: (...args: any[]) => any;
+  };
+  statSync: (...args: any[]) => any;
+  lstatSync: (...args: any[]) => any;
+  realpathSync: (...args: any[]) => any;
+};
+
+const directoryFs = fs as unknown as DirectoryFsApis;
+
+const OBSERVED_CAPTURE_DIRECTORY_APIS = new Set([
+  "fs.readdir",
+  "fs.readdirSync",
+  "fs.promises.readdir",
+  "fs.opendir",
+  "fs.opendirSync",
+  "fs.promises.opendir",
+  "fs.glob",
+  "fs.globSync",
+  "fs.promises.glob",
+]);
+
+const CAPTURE_DIRECTORY_API_PATTERN = /\bfs\.(?:(promises)\.)?(readdir|opendir|glob)(Sync)?\b/g;
+
+function captureSourceFiles(directory: string): string[] {
+  const files: string[] = [];
+  const pending = [directory];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const candidate = path.join(current, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      else if (entry.isFile() && /\.(?:ts|tsx|js|mjs|cjs)$/.test(entry.name)) files.push(candidate);
+    }
+  }
+  return files.sort();
+}
+
+/**
+ * Capture owns one allowlisted directory API surface. A new direct fs call
+ * must be added to the observer before it can enter the collector; otherwise
+ * this source check fails closed instead of silently reporting zero work.
+ */
+export function assertCaptureDirectoryApisObserved() {
+  const sourceRoot = path.join(repoRoot, "packages", "collector-cli", "src");
+  const violations: string[] = [];
+  for (const file of captureSourceFiles(sourceRoot)) {
+    const source = fs.readFileSync(file, "utf8");
+    for (const match of source.matchAll(CAPTURE_DIRECTORY_API_PATTERN)) {
+      const api = `fs.${match[1] ? "promises." : ""}${match[2]}${match[3] ? "Sync" : ""}`;
+      if (!OBSERVED_CAPTURE_DIRECTORY_APIS.has(api)) {
+        violations.push(`${path.relative(repoRoot, file)}:${source.slice(0, match.index ?? 0).split("\n").length}:${api}`);
+      }
+    }
+  }
+  assert.deepEqual(violations, [], "capture directory APIs must be covered by the resource observer");
+}
 
 function readdirPath(value: Parameters<typeof fs.readdirSync>[0]) {
   if (typeof value === "string") return value;
   if (Buffer.isBuffer(value)) return value.toString();
   if (value instanceof URL && value.protocol === "file:") return fileURLToPath(value);
   return null;
+}
+
+function directoryScope(value: unknown, options?: { cwd?: unknown }) {
+  if (typeof value !== "string" && !Buffer.isBuffer(value) && !(value instanceof URL)) return null;
+  const raw = readdirPath(value as Parameters<typeof fs.readdirSync>[0]);
+  if (!raw) return null;
+  const cwd = typeof options?.cwd === "string" ? options.cwd : process.cwd();
+  const resolved = path.resolve(cwd, raw);
+  const magic = resolved.search(/[\\*?\[\]{}()!]/);
+  if (magic === -1) return resolved;
+  const prefix = resolved.slice(0, magic);
+  return path.resolve(prefix.endsWith(path.sep) ? prefix : path.dirname(prefix));
 }
 
 function recordDirectoryEnumeration(directory: string | null, calls: number, entries: number) {
@@ -906,6 +1021,16 @@ function recordDirectoryEnumerationFailure(
     if (!observer.unregistered && within(observer.root, directory)) {
       if (kind === "open") observer.failedCalls += 1;
       else observer.readFailures += 1;
+    }
+  }
+}
+
+function recordDirectoryMetadata(directory: string | null, failed = false) {
+  if (!directory) return;
+  for (const observer of directoryEnumerationObservers.values()) {
+    if (!observer.unregistered && within(observer.root, directory)) {
+      observer.metadataCalls += 1;
+      if (failed) observer.metadataFailures += 1;
     }
   }
 }
@@ -1013,44 +1138,199 @@ function instrumentDirectoryHandle(handle: fs.Dir, directory: string | null) {
 }
 
 function installDirectoryEnumerationWrapper() {
-  if (directoryEnumerationWrapper) {
-    if (
-      fs.readdirSync !== directoryEnumerationWrapper ||
-      fs.opendirSync !== directoryOpenWrapper
-    ) {
+  if (directoryObserverSlots) {
+    if (directoryObserverSlots.some((slot) => slot.owner[slot.name] !== slot.wrapper)) {
       throw new Error("DirectoryObserverIntegrityLost");
     }
     return;
   }
-  directoryEnumerationOriginal = fs.readdirSync;
-  const original = directoryEnumerationOriginal;
-  directoryEnumerationWrapper = ((...args: Parameters<typeof fs.readdirSync>) => {
-    const directory = readdirPath(args[0]);
+  const slots: DirectoryObserverSlot[] = [];
+  const replace = (owner: Record<string, unknown>, name: string, make: (original: any) => any) => {
+    const original = owner[name];
+    if (typeof original !== "function") return;
+    const wrapper = make(original);
+    owner[name] = wrapper;
+    slots.push({ owner, name, original, wrapper });
+  };
+
+  replace(directoryFs, "readdirSync", (original) => (...args: any[]) => {
+    const directory = directoryScope(args[0]);
     try {
       const result = original(...args);
-      recordDirectoryEnumeration(directory, 1, result.length);
+      recordDirectoryEnumeration(directory, 1, Array.isArray(result) ? result.length : 0);
       return result;
     } catch (error) {
       recordDirectoryEnumerationFailure(directory, "open");
       throw error;
     }
-  }) as typeof fs.readdirSync;
-  fs.readdirSync = directoryEnumerationWrapper;
-
-  directoryOpenOriginal = fs.opendirSync;
-  const openOriginal = directoryOpenOriginal;
-  directoryOpenWrapper = ((...args: Parameters<typeof fs.opendirSync>) => {
-    const directory = readdirPath(args[0]);
+  });
+  replace(directoryFs, "readdir", (original) => (...args: any[]) => {
+    const directory = directoryScope(args[0], args[1]);
+    const callback = typeof args.at(-1) === "function" ? args.at(-1) : undefined;
+    if (!callback) {
+      try {
+        const result = original(...args);
+        return Promise.resolve(result).then(
+          (entries) => {
+            recordDirectoryEnumeration(directory, 1, Array.isArray(entries) ? entries.length : 0);
+            return entries;
+          },
+          (error) => {
+            recordDirectoryEnumerationFailure(directory, "open");
+            throw error;
+          },
+        );
+      } catch (error) {
+        recordDirectoryEnumerationFailure(directory, "open");
+        throw error;
+      }
+    }
     try {
-      const handle = openOriginal(...args);
+      const callbackIndex = args.length - 1;
+      const wrapped = (...callbackArgs: any[]) => {
+        const error = callbackArgs[0];
+        if (error) recordDirectoryEnumerationFailure(directory, "open");
+        else recordDirectoryEnumeration(directory, 1, Array.isArray(callbackArgs[1]) ? callbackArgs[1].length : 0);
+        callback(...callbackArgs);
+      };
+      const callArgs = [...args];
+      callArgs[callbackIndex] = wrapped;
+      return original(...callArgs);
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
+  });
+  replace(directoryFs.promises, "readdir", (original) => async (...args: any[]) => {
+    const directory = directoryScope(args[0], args[1]);
+    try {
+      const result = await original(...args);
+      recordDirectoryEnumeration(directory, 1, Array.isArray(result) ? result.length : 0);
+      return result;
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
+  });
+
+  const wrapOpen = (original: any, directory: string | null, args: any[]) => {
+    try {
+      const handle = original(...args);
       recordDirectoryEnumeration(directory, 1, 0);
       return instrumentDirectoryHandle(handle, directory);
     } catch (error) {
       recordDirectoryEnumerationFailure(directory, "open");
       throw error;
     }
-  }) as typeof fs.opendirSync;
-  fs.opendirSync = directoryOpenWrapper;
+  };
+  replace(directoryFs, "opendirSync", (original) => (...args: any[]) =>
+    wrapOpen(original, directoryScope(args[0], args[1]), args));
+  replace(directoryFs, "opendir", (original) => (...args: any[]) => {
+    const directory = directoryScope(args[0], args[1]);
+    const callback = typeof args.at(-1) === "function" ? args.at(-1) : undefined;
+    if (!callback) {
+      try {
+        const handle = original(...args);
+        recordDirectoryEnumeration(directory, 1, 0);
+        return instrumentDirectoryHandle(handle, directory);
+      } catch (error) {
+        recordDirectoryEnumerationFailure(directory, "open");
+        throw error;
+      }
+    }
+    try {
+      const callArgs = [...args];
+      callArgs[callArgs.length - 1] = (error: unknown, handle: fs.Dir | undefined) => {
+        if (error || !handle) recordDirectoryEnumerationFailure(directory, "open");
+        else {
+          recordDirectoryEnumeration(directory, 1, 0);
+          handle = instrumentDirectoryHandle(handle, directory);
+        }
+        callback(error, handle);
+      };
+      return original(...callArgs);
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
+  });
+  replace(directoryFs.promises, "opendir", (original) => async (...args: any[]) => {
+    const directory = directoryScope(args[0], args[1]);
+    try {
+      const handle = await original(...args);
+      recordDirectoryEnumeration(directory, 1, 0);
+      return instrumentDirectoryHandle(handle, directory);
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
+  });
+
+  const wrapGlobResult = (directory: string | null, result: unknown) => {
+    recordDirectoryEnumeration(directory, 1, Array.isArray(result) ? result.length : 0);
+    return result;
+  };
+  replace(directoryFs, "globSync", (original) => (...args: any[]) => {
+    const directory = directoryScope(args[0], args[1]);
+    try { return wrapGlobResult(directory, original(...args)); }
+    catch (error) { recordDirectoryEnumerationFailure(directory, "open"); throw error; }
+  });
+  replace(directoryFs, "glob", (original) => (...args: any[]) => {
+    const directory = directoryScope(args[0], args[1]);
+    const callback = typeof args.at(-1) === "function" ? args.at(-1) : undefined;
+    if (!callback) {
+      try { return original(...args); }
+      catch (error) { recordDirectoryEnumerationFailure(directory, "open"); throw error; }
+    }
+    try {
+      const callArgs = [...args];
+      callArgs[callArgs.length - 1] = (error: unknown, matches: unknown) => {
+        if (error) recordDirectoryEnumerationFailure(directory, "open");
+        else recordDirectoryEnumeration(directory, 1, Array.isArray(matches) ? matches.length : 0);
+        callback(error, matches);
+      };
+      return original(...callArgs);
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
+  });
+  replace(directoryFs.promises, "glob", (original) => (...args: any[]) => {
+    const directory = directoryScope(args[0], args[1]);
+    try {
+      const iterator = original(...args) as AsyncIterable<unknown>;
+      const originalIterator = iterator[Symbol.asyncIterator]();
+      recordDirectoryEnumeration(directory, 1, 0);
+      const wrapped: AsyncIterableIterator<unknown> = {
+        async next(...nextArgs: [] | [undefined]) {
+          try {
+            const result = await originalIterator.next(...nextArgs);
+            if (!result.done) recordDirectoryEnumeration(directory, 0, 1);
+            return result;
+        } catch (error) {
+          recordDirectoryEnumerationFailure(directory, "read");
+          throw error;
+        }
+        },
+        [Symbol.asyncIterator]() { return this; },
+      };
+      if (originalIterator.return) wrapped.return = originalIterator.return.bind(originalIterator);
+      if (originalIterator.throw) wrapped.throw = originalIterator.throw.bind(originalIterator);
+      return wrapped;
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
+  });
+
+  for (const name of ["statSync", "lstatSync", "realpathSync"]) {
+    replace(directoryFs, name, (original) => (...args: any[]) => {
+      const directory = directoryScope(args[0]);
+      try { const result = original(...args); recordDirectoryMetadata(directory); return result; }
+      catch (error) { recordDirectoryMetadata(directory, true); throw error; }
+    });
+  }
+  directoryObserverSlots = slots;
 }
 
 function observeDirectoryEnumeration(root: string) {
@@ -1066,6 +1346,8 @@ function observeDirectoryEnumeration(root: string) {
     failedCalls: 0,
     readFailures: 0,
     deduplicatedEntries: 0,
+    metadataCalls: 0,
+    metadataFailures: 0,
     unregistered: false,
     restorationVerified: false,
   };
@@ -1077,6 +1359,8 @@ function observeDirectoryEnumeration(root: string) {
       failedCalls: record.failedCalls,
       deduplicatedEntries: record.deduplicatedEntries,
       readFailures: record.readFailures,
+      metadataCalls: record.metadataCalls,
+      metadataFailures: record.metadataFailures,
     }),
     unregister: () => {
       if (record.unregistered) return;
@@ -1088,30 +1372,18 @@ function observeDirectoryEnumeration(root: string) {
       directoryEnumerationObservers.delete(resolvedRoot);
       record.unregistered = true;
       if (directoryEnumerationObservers.size === 0) {
-        const original = directoryEnumerationOriginal;
-        const wrapper = directoryEnumerationWrapper;
-        if (original && wrapper && fs.readdirSync === wrapper) {
-          fs.readdirSync = original;
+        const slots = directoryObserverSlots ?? [];
+        for (const slot of slots) {
+          if (slot.owner[slot.name] === slot.wrapper) slot.owner[slot.name] = slot.original;
         }
-        const openOriginal = directoryOpenOriginal;
-        const openWrapper = directoryOpenWrapper;
-        if (openOriginal && openWrapper && fs.opendirSync === openWrapper) {
-          fs.opendirSync = openOriginal;
-        }
-        record.restorationVerified = Boolean(
-          original &&
-          fs.readdirSync === original &&
-          openOriginal &&
-          fs.opendirSync === openOriginal,
+        record.restorationVerified = slots.length > 0 && slots.every(
+          (slot) => slot.owner[slot.name] === slot.original,
         );
-        directoryEnumerationOriginal = undefined;
-        directoryEnumerationWrapper = undefined;
-        directoryOpenOriginal = undefined;
-        directoryOpenWrapper = undefined;
+        directoryObserverSlots = undefined;
       } else {
-        record.restorationVerified =
-          fs.readdirSync === directoryEnumerationWrapper &&
-          fs.opendirSync === directoryOpenWrapper;
+        record.restorationVerified = (directoryObserverSlots ?? []).every(
+          (slot) => slot.owner[slot.name] === slot.wrapper,
+        );
       }
     },
     status: () => ({
@@ -1120,6 +1392,8 @@ function observeDirectoryEnumeration(root: string) {
       failedCalls: record.failedCalls,
       deduplicatedEntries: record.deduplicatedEntries,
       readFailures: record.readFailures,
+      metadataCalls: record.metadataCalls,
+      metadataFailures: record.metadataFailures,
       restored: record.unregistered && record.restorationVerified,
     }),
   };
@@ -1134,6 +1408,8 @@ type DirectoryObserverExercise = {
   failedCalls: number;
   readFailures: number;
   deduplicatedEntries: number;
+  metadataCalls: number;
+  metadataFailures: number;
   restored: boolean;
 };
 
@@ -1157,6 +1433,34 @@ async function readDirectoryWithCallback(handle: fs.Dir) {
     readNext();
   });
   return entries;
+}
+
+async function readDirectoryCallback(root: string) {
+  return new Promise<number>((resolve, reject) => {
+    directoryFs.readdir(root, { withFileTypes: true }, (error: unknown, entries: unknown[]) => {
+      if (error) { reject(error); return; }
+      resolve(Array.isArray(entries) ? entries.length : 0);
+    });
+  });
+}
+
+async function openDirectoryCallback(root: string) {
+  return new Promise<void>((resolve, reject) => {
+    directoryFs.opendir(root, (error: unknown, handle: fs.Dir | undefined) => {
+      if (error || !handle) { reject(error ?? new Error("DirectoryHandleMissing")); return; }
+      closeDirectoryHandle(handle);
+      resolve();
+    });
+  });
+}
+
+async function readGlobCallback(pattern: string) {
+  return new Promise<number>((resolve, reject) => {
+    directoryFs.glob!(pattern, (error: unknown, entries: unknown[]) => {
+      if (error) { reject(error); return; }
+      resolve(Array.isArray(entries) ? entries.length : 0);
+    });
+  });
 }
 
 function closeDirectoryHandle(handle: fs.Dir) {
@@ -1183,6 +1487,11 @@ async function exerciseDirectoryObserver(root: string, fileCount: number) {
     await new Promise<void>((resolve) => setImmediate(resolve));
     const listed = fs.readdirSync(probeRoot, { withFileTypes: true });
     assert.equal(listed.length, fileCount + 1);
+    fs.statSync(probeRoot);
+    fs.lstatSync(probeRoot);
+    fs.realpathSync(probeRoot);
+    assert.equal(await readDirectoryCallback(probeRoot), listed.length);
+    assert.equal((await directoryFs.promises.readdir(probeRoot, { withFileTypes: true })).length, listed.length);
 
     const syncHandle = fs.opendirSync(probeRoot);
     let firstSyncEntry: fs.Dirent | null = null;
@@ -1212,6 +1521,20 @@ async function exerciseDirectoryObserver(root: string, fileCount: number) {
     }
     closeDirectoryHandle(promiseHandle);
 
+    await openDirectoryCallback(probeRoot);
+    const promiseOpenHandle = await directoryFs.promises.opendir(probeRoot);
+    for await (const _entry of promiseOpenHandle) {
+      // Promise-form opendir handles expose the same async iterator API.
+    }
+    closeDirectoryHandle(promiseOpenHandle);
+
+    const globPattern = path.join(probeRoot, "*");
+    assert.equal(directoryFs.globSync!(globPattern).length, listed.length);
+    assert.equal(await readGlobCallback(globPattern), listed.length);
+    let promiseGlobEntries = 0;
+    for await (const _entry of directoryFs.promises.glob!(globPattern)) promiseGlobEntries += 1;
+    assert.equal(promiseGlobEntries, listed.length);
+
     for (const missing of ["missing-readdir", "missing-opendir"]) {
       const missingPath = path.join(probeRoot, missing);
       try {
@@ -1222,8 +1545,11 @@ async function exerciseDirectoryObserver(root: string, fileCount: number) {
       }
     }
 
-    const expectedEntries = listed.length * 5;
-    const expectedCalls = 5;
+    // Node 22's glob implementations perform one additional opendir walk for
+    // each async glob form. Those internal calls are real directory work and
+    // stay in the exact fixture contract.
+    const expectedEntries = listed.length * 14;
+    const expectedCalls = 15;
     const beforeUnregister = observer.status();
     observer.unregister();
     const afterUnregister = observer.status();
@@ -1232,6 +1558,8 @@ async function exerciseDirectoryObserver(root: string, fileCount: number) {
     assert.equal(beforeUnregister.failedCalls, 2);
     assert.equal(beforeUnregister.readFailures, 0);
     assert.equal(beforeUnregister.deduplicatedEntries, 2);
+    assert.equal(beforeUnregister.metadataCalls, 4);
+    assert.equal(beforeUnregister.metadataFailures, 0);
     assert.equal(afterUnregister.restored, true);
     return {
       root: probeRoot,
@@ -1242,6 +1570,8 @@ async function exerciseDirectoryObserver(root: string, fileCount: number) {
       failedCalls: afterUnregister.failedCalls,
       readFailures: afterUnregister.readFailures,
       deduplicatedEntries: afterUnregister.deduplicatedEntries,
+      metadataCalls: afterUnregister.metadataCalls,
+      metadataFailures: afterUnregister.metadataFailures,
       restored: afterUnregister.restored,
     } satisfies DirectoryObserverExercise;
   } finally {
@@ -1253,8 +1583,20 @@ async function exerciseDirectoryObserver(root: string, fileCount: number) {
 export async function runDirectoryObserverConcurrencyContract(
   roots: readonly [string, string],
 ) {
-  const originalReaddirSync = fs.readdirSync;
-  const originalOpendirSync = fs.opendirSync;
+  const originalDirectoryApis = [
+    [directoryFs, "readdir"],
+    [directoryFs, "readdirSync"],
+    [directoryFs, "opendir"],
+    [directoryFs, "opendirSync"],
+    [directoryFs, "glob"],
+    [directoryFs, "globSync"],
+    [directoryFs.promises, "readdir"],
+    [directoryFs.promises, "opendir"],
+    [directoryFs.promises, "glob"],
+    [directoryFs, "statSync"],
+    [directoryFs, "lstatSync"],
+    [directoryFs, "realpathSync"],
+  ].map(([owner, name]) => [owner, name, owner[name as keyof typeof owner]] as const);
   const exercises = await Promise.all([
     exerciseDirectoryObserver(roots[0], 2),
     exerciseDirectoryObserver(roots[1], 4),
@@ -1266,6 +1608,8 @@ export async function runDirectoryObserverConcurrencyContract(
       exercise.failedCalls === 2 &&
       exercise.readFailures === 0 &&
       exercise.deduplicatedEntries === 2 &&
+      exercise.metadataCalls === 4 &&
+      exercise.metadataFailures === 0 &&
       exercise.restored,
   );
   const isolationProved = isolationAssertions.every(Boolean);
@@ -1290,6 +1634,9 @@ export async function runDirectoryObserverConcurrencyContract(
   assert.equal(failureStatus.calls, 0);
   assert.equal(failureStatus.restored, true);
 
+  const exactGlobalIdentityRestored = originalDirectoryApis.every(
+    ([owner, name, original]) => owner[name as keyof typeof owner] === original,
+  );
   return {
     exercises,
     isolationAssertions,
@@ -1298,8 +1645,7 @@ export async function runDirectoryObserverConcurrencyContract(
     injectedFailure: injectedFailure ? "fail" : "pass",
     injectedFailureEntriesScanned: failureStatus.entries,
     injectedFailureObserverRestored: failureStatus.restored,
-    exactGlobalIdentityRestored:
-      fs.readdirSync === originalReaddirSync && fs.opendirSync === originalOpendirSync,
+    exactGlobalIdentityRestored,
   };
 }
 
@@ -1412,10 +1758,14 @@ export async function runNoChangeConstantWorkContract(
 ): Promise<ScenarioReceipt> {
   const started = performance.now();
   const counters = emptyWorkCounters();
+  let directoryApiCoverageChecked = false;
   let buffer: LocalEventBuffer | undefined;
   let maintenance: CollectorMaintenance | undefined;
   let directoryObserver: ReturnType<typeof observeDirectoryEnumeration> | undefined;
+  let stableEmptyRoot: string | undefined;
   try {
+    assertCaptureDirectoryApisObserved();
+    directoryApiCoverageChecked = true;
     const fixture = writeFirstBootFixtures(sandbox);
     await new Promise<void>((resolve) => setTimeout(resolve, 2));
     buffer = new LocalEventBuffer(sandbox.ledger);
@@ -1496,7 +1846,7 @@ export async function runNoChangeConstantWorkContract(
     // unchanged run starts a fresh recent discovery sweep. The ledger and
     // baseline state remain the same; only the two bounded sweep cursors are
     // reset below to make the measured metadata work explicit.
-    maintenance.close();
+    maintenance?.close();
     maintenance = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(sandbox.ledger);
@@ -1510,16 +1860,59 @@ export async function runNoChangeConstantWorkContract(
         .prepare("delete from maintenance_state where key = ?")
         .run(`capture_sweep_resume:${source}`);
     }
-    maintenance = makeMaintenance();
     const stableBefore = eventMutationCounts(buffer);
     const stableDirectoryBefore = activeDirectoryObserver.snapshot();
-    const stableRun = await maintenance.runRecent();
+    const stableRuns: CollectorMaintenanceRunResult[] = [];
+    stableEmptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-resource-proof-empty-"));
+    const runStableSource = async (source: "codex" | "claude_code") => {
+      const stableMaintenance = source === "codex"
+        ? new CollectorMaintenance(
+            buffer!,
+            new RolloutTailer(buffer!, sandbox.codexSessions, () => []),
+            new TranscriptTailer(buffer!, stableEmptyRoot!),
+          )
+        : new CollectorMaintenance(
+            buffer!,
+            new RolloutTailer(buffer!, stableEmptyRoot!, () => []),
+            new TranscriptTailer(buffer!, sandbox.claudeProjects),
+          );
+      maintenance = stableMaintenance;
+      let finalRun: CollectorMaintenanceRunResult | undefined;
+      try {
+        for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
+          finalRun = await stableMaintenance.runRecent();
+          stableRuns.push(finalRun);
+          const sweep = source === "codex"
+            ? finalRun.rollout.activity.scan
+            : finalRun.transcript.activity.scan;
+          if (sweep?.sweepComplete === true && sweep.converging === false) break;
+        }
+      } finally {
+        stableMaintenance.close();
+      }
+      if (!finalRun) throw new Error("StableMaintenanceResultMissing");
+      return finalRun;
+    };
+    const stableRolloutRun = await runStableSource("codex");
+    const stableTranscriptRun = await runStableSource("claude_code");
     const stableMutations = eventMutationDelta(stableBefore, eventMutationCounts(buffer));
     const stableDirectoryAfter = activeDirectoryObserver.snapshot();
     const unchangedFilesystemEntriesScanned =
       stableDirectoryAfter.entries - stableDirectoryBefore.entries;
     const unchangedFilesystemEnumerationCalls =
       stableDirectoryAfter.calls - stableDirectoryBefore.calls;
+    const stableRolloutSweep = stableRolloutRun.rollout.activity.scan;
+    const stableTranscriptSweep = stableTranscriptRun.transcript.activity.scan;
+    const stableSweepCompleted =
+      stableRolloutSweep?.sweepComplete === true &&
+      stableRolloutSweep.converging === false &&
+      stableTranscriptSweep?.sweepComplete === true &&
+      stableTranscriptSweep.converging === false &&
+      unchangedFilesystemEntriesScanned === fixture.expectedStableDirectoryEntries &&
+      unchangedFilesystemEnumerationCalls === fixture.expectedStableEnumerationCalls;
+    const stableRunsUnchanged = stableRuns.every(unchangedMaintenanceResult);
+    fs.rmSync(stableEmptyRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    stableEmptyRoot = undefined;
     const observedDirectoryBeforeUnregister = activeDirectoryObserver.status();
     activeDirectoryObserver.unregister();
     const directoryObservation = activeDirectoryObserver.status();
@@ -1582,7 +1975,7 @@ export async function runNoChangeConstantWorkContract(
       0,
     );
     const unchangedCoalescedCycle =
-      unchangedMaintenanceResult(stableRun) &&
+      stableRunsUnchanged &&
       stableMutations.inserted === 0 &&
       stableMutations.updated === 0 &&
       stableMutations.deleted === 0;
@@ -1613,9 +2006,13 @@ export async function runNoChangeConstantWorkContract(
     const filesystemEnumerationObserved =
       unchangedFilesystemEnumerationCalls > 0 && unchangedFilesystemEntriesScanned > 0;
     const unchangedFilesystemEntriesBounded =
-      unchangedFilesystemEntriesScanned <= 512;
+      unchangedFilesystemEntriesScanned === fixture.expectedStableDirectoryEntries;
     const unchangedFilesystemEnumerationCallsBounded =
-      unchangedFilesystemEnumerationCalls <= 8;
+      unchangedFilesystemEnumerationCalls === fixture.expectedStableEnumerationCalls;
+    const filesystemMetadataObserved =
+      activeDirectoryObserver.snapshot().metadataCalls > 0;
+    const filesystemMetadataFailuresBounded =
+      activeDirectoryObserver.snapshot().metadataFailures <= MAX_FIXTURE_METADATA_FAILURES;
     const recentDidNotPromote =
       initialCoverage.status === "incomplete" &&
       initialCoverage.reason === EXPLICIT_FULL_BACKFILL_NOT_COMPLETED &&
@@ -1623,7 +2020,6 @@ export async function runNoChangeConstantWorkContract(
 
     // Reopen the real ledger and construct new tailers/scheduler. With no file
     // changes the restart must perform no content reads or durable writes.
-    maintenance.close();
     maintenance = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(sandbox.ledger);
@@ -2278,14 +2674,19 @@ export async function runNoChangeConstantWorkContract(
       fixture.oldFiles >= 2_000 &&
       fixture.baselineCodexGenerations >= 200 &&
       fixture.baselineClaudeGenerations >= 1_200 &&
+      fixture.expectedStableDirectoryEntries > 0 &&
+      fixture.expectedStableEnumerationCalls > 0 &&
       firstBootRecentOnly &&
       pendingMetadataWithinCap &&
       baselineProgressFair &&
       baselineCadenceBounded &&
       oldContentReadsAtBoot === 0 &&
       unchangedCoalescedCycle &&
+      stableSweepCompleted &&
       coalescingProved &&
       counterProvenanceProved &&
+      setupFilesystemEntriesScanned === fixture.expectedSetupFilesystemEntriesScanned &&
+      setupFilesystemEnumerationCalls === fixture.expectedSetupFilesystemEnumerationCalls &&
       recentDidNotPromote &&
       restartZeroWork &&
       preinstallGrowthStayedExcluded &&
@@ -2300,6 +2701,8 @@ export async function runNoChangeConstantWorkContract(
       counters.rawEventRewrites === 0 &&
       counters.overlappingJobs === 0 &&
       filesystemEnumerationObserved &&
+      filesystemMetadataObserved &&
+      filesystemMetadataFailuresBounded &&
       unchangedFilesystemEntriesBounded &&
       unchangedFilesystemEnumerationCallsBounded;
 
@@ -2317,6 +2720,10 @@ export async function runNoChangeConstantWorkContract(
         baselineCodexGenerations: fixture.baselineCodexGenerations,
         baselineClaudeGenerations: fixture.baselineClaudeGenerations,
         nestedNoncandidateEntries: fixture.nestedNoncandidateEntries,
+        expectedStableDirectoryEntries: fixture.expectedStableDirectoryEntries,
+        expectedStableEnumerationCalls: fixture.expectedStableEnumerationCalls,
+        expectedSetupFilesystemEntriesScanned: fixture.expectedSetupFilesystemEntriesScanned,
+        expectedSetupFilesystemEnumerationCalls: fixture.expectedSetupFilesystemEnumerationCalls,
         baselineCadences: bootRuns.length,
         baselineCadenceLimit: MAX_DISCOVERY_CADENCES + initialDrain.length,
         startupReadinessUpperBoundSeconds,
@@ -2341,6 +2748,11 @@ export async function runNoChangeConstantWorkContract(
         claudeMetadataEnumerationCaveat:
           "baseline stats every discovered Claude generation but opens no old content",
         unchangedCoalescedCycle,
+        stableRuns: stableRuns.length,
+        stableRunsUnchanged,
+        stableSweepCompleted,
+        stableRolloutSweepComplete: stableRolloutSweep?.sweepComplete ?? false,
+        stableTranscriptSweepComplete: stableTranscriptSweep?.sweepComplete ?? false,
         restartZeroWork,
         preinstallGrowthStayedExcluded,
         appendedExactlyOnce,
@@ -2405,12 +2817,22 @@ export async function runNoChangeConstantWorkContract(
         filesystemObserverRestored: directoryObservation.restored,
         counterProvenanceProved,
         filesystemEnumerationObserved,
+        filesystemMetadataObserved,
+        filesystemMetadataFailuresBounded,
+        filesystemMetadataFailureBound: MAX_FIXTURE_METADATA_FAILURES,
+        directoryApiCoverageChecked,
         filesystemCounterSource:
-          "successful returned directory entries from fs.readdirSync and fs.opendirSync Dir reads; failed opens/reads are reported separately",
+          "successful returned directory entries from all observed fs readdir/opendir/glob forms; failed calls and metadata operations are reported separately",
+        filesystemMetadataOperations: directoryObservation.metadataCalls,
+        filesystemMetadataFailures: directoryObservation.metadataFailures,
         maintenanceRunCounterSource: "scheduler runCount",
       },
     };
   } catch (error) {
+    if (stableEmptyRoot) {
+      fs.rmSync(stableEmptyRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+      stableEmptyRoot = undefined;
+    }
     directoryObserver?.unregister();
     const directoryObservation = directoryObserver?.status();
     if (directoryObservation) {
@@ -2427,11 +2849,14 @@ export async function runNoChangeConstantWorkContract(
       counters,
       measurements: {
         deterministicIdleCounters: false,
+        directoryApiCoverageChecked,
         filesystemObserverRestored: directoryObservation?.restored ?? false,
         counterProvenanceProved: directoryObservation?.restored ?? false,
         filesystemEnumerationCalls: directoryObservation?.calls ?? 0,
         filesystemEnumerationFailedCalls: directoryObservation?.failedCalls ?? 0,
         filesystemEnumerationReadFailures: directoryObservation?.readFailures ?? 0,
+        filesystemMetadataOperations: directoryObservation?.metadataCalls ?? 0,
+        filesystemMetadataFailures: directoryObservation?.metadataFailures ?? 0,
       },
     };
   } finally {
