@@ -1174,6 +1174,30 @@ export const FIXTURES: Fixture[] = [
       error: /PLIMSOLL_QUALIFICATION_ARTIFACT.*environment allow-list/,
     }),
   },
+  {
+    name: "computed_export_name",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an export with a computed variable name is not reviewable",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), (line) => [
+        "name=OTLP_SPOOL_PROOF_ONLY", 'export "$name=none"', line,
+      ]),
+      error: /exports a nonliteral or multiple environment variables/,
+    }),
+  },
+  {
+    name: "github_env_group_multiple_commands",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a grouped GITHUB_ENV write may contain only one reviewed assignment per line",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), {
+        name: "Set two values", run: '{\n  echo "HOME=$TMPDIR"; echo "OTLP_SPOOL_PROOF_ONLY=none"\n} >> "$GITHUB_ENV"',
+      }),
+      error: /writes a nonliteral value to \$GITHUB_ENV/,
+    }),
+  },
   // ---- Review 2: YAML the gate cannot read the way GitHub does -----------
   {
     name: "review2_merge_key_disabled_step",

@@ -283,12 +283,12 @@ function githubEnvironmentWriteProblem(runText: string): string | null {
   const group = /\{\s*\n([\s\S]*?)\}\s*>>\s*"?\$GITHUB_ENV"?/g;
   let remaining = runText.replace(group, (_whole, body: string) => {
     const assignments = body.split("\n").map((line) => line.trim()).filter(Boolean);
-    if (assignments.some((line) => !/^echo\s+["']?[A-Z][A-Z0-9_]*=/.test(line))) return "INVALID_GITHUB_ENV_WRITE";
+    if (assignments.some((line) => !/^echo\s+"[A-Z][A-Z0-9_]*=[^";&|]*"$/.test(line))) return "INVALID_GITHUB_ENV_WRITE";
     return assignments.join("\n");
   });
   if (remaining.includes("INVALID_GITHUB_ENV_WRITE")) return "writes a nonliteral value to $GITHUB_ENV";
   for (const line of remaining.split("\n").filter((candidate) => candidate.includes("GITHUB_ENV"))) {
-    if (!/^\s*echo\s+["']?([A-Z][A-Z0-9_]*)=/.test(line) || !/>>\s*"?\$GITHUB_ENV"?\s*$/.test(line)) {
+    if (!/^\s*echo\s+"[A-Z][A-Z0-9_]*=[^";&|]*"\s*>>\s*"\$GITHUB_ENV"\s*$/.test(line)) {
       return "writes a nonliteral value to $GITHUB_ENV";
     }
   }
@@ -393,6 +393,14 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         if (activeRun.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
         const githubEnvironmentProblem = githubEnvironmentWriteProblem(activeRun);
         if (githubEnvironmentProblem) errors.push(`${where} ${githubEnvironmentProblem}`);
+        for (const line of activeRun.split("\n").filter((candidate) => /(?:^|[;&|])\s*export\b/.test(candidate))) {
+          const literal = /^\s*export\s+([A-Z][A-Z0-9_]*)=(.+)$/.exec(line);
+          if (!literal || /[;&|]/.test(line) || /\b[A-Z][A-Z0-9_]*=/.test(literal[2]!)) {
+            errors.push(`${where} exports a nonliteral or multiple environment variables`);
+          } else if (!allowedWorkflowEnvironment(literal[1]!, literal[2]!.replace(/^['"]|['"]$/g, ""))) {
+            errors.push(`${where} exports ${literal[1]} outside the environment allow-list`);
+          }
+        }
         for (const match of activeRun.matchAll(/\b(?:export\s+)?([A-Z][A-Z0-9_]*)=([^\s"']*)/g)) {
           if (!allowedWorkflowEnvironment(match[1]!, match[2])) errors.push(`${where} sets ${match[1]} outside the environment allow-list`);
         }
