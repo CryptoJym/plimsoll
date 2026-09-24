@@ -414,8 +414,10 @@ export class RolloutTailer {
    * has committed each file's current size. The capture frontier moves from
    * this, never from a pass: automatic passes open only today's and
    * yesterday's day folders. It lists sessions/YYYY/MM/DD as a full scan does,
-   * and is incomplete when a configured root is not ready, as a scan is. Twin
-   * of TranscriptTailer.coverageWalk.
+   * and is incomplete when a configured root is not ready, as a scan is. A
+   * full scan never descends through a symlinked folder or reads a symlinked
+   * rollout, so the walk reports each one as a link, never covered, without
+   * following it (review r4, S1). Twin of TranscriptTailer.coverageWalk.
    */
   coverageWalk(maxEntries = CAPTURE_COVERAGE_MAX_ENTRIES): CaptureCoverageWalk {
     if (this.inventoryConfigured && inspectCaptureRoots(this.captureRoots).some((root) => root.state !== "ready")) {
@@ -425,20 +427,29 @@ export class RolloutTailer {
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.sessionsDir],
       maxEntries,
-      list: (directory, depth) => depth < 3
-        ? {
-            directories: this.io.readDirents(directory).filter((entry) => entry.isDirectory())
-              .map((entry) => path.join(directory, entry.name)),
-            files: [],
+      list: (directory, depth) => {
+        if (depth < 3) {
+          const listing = { directories: [] as string[], files: [], links: [] as string[] };
+          for (const entry of this.io.readDirents(directory)) {
+            if (entry.isDirectory()) listing.directories.push(path.join(directory, entry.name));
+            else if (entry.isSymbolicLink()) listing.links.push(path.join(directory, entry.name));
           }
-        : {
-            directories: [],
-            files: this.io.readNames(directory).filter((name) => name.startsWith("rollout-") && name.endsWith(".jsonl"))
-              .map((name) => path.join(directory, name)),
-          },
+          return listing;
+        }
+        // A symlinked rollout is listed here and checked as a link.
+        return {
+          directories: [],
+          files: this.io.readNames(directory).filter((name) => name.startsWith("rollout-") && name.endsWith(".jsonl"))
+            .map((name) => path.join(directory, name)),
+        };
+      },
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
         return stat ? verdict(this.cursorKey(file), stat) : null;
+      },
+      checkLink: (link) => {
+        const stat = lstatIfPresent((target) => this.io.lstat(target), link);
+        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat) : null;
       },
     });
   }

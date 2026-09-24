@@ -30,6 +30,13 @@ import { jsonlScanStateKey } from "./jsonl-byte-tailer";
  * - A file the tailer keeps up with is uncovered only since the walk before:
  *   when the tailer has read everything the file held at that walk, what is
  *   unread now came after it (review r3, S5).
+ * - A symlink where a tailer would read a file or descend into a directory is
+ *   never covered (review r4, S1). The tailers do not follow links, and
+ *   neither does this check: nothing behind one is read, listed or stat'ed.
+ *   Following links is a privacy and security decision the tailers have not
+ *   taken. The link is uncovered from its creation (not before the epoch
+ *   start, nor after the walk that first saw it) to the last walk that saw
+ *   it, and stays a gap after it is removed.
  * The frontier is the earliest hold (or the check's start) less the write lag,
  * and it never moves backwards.
  *
@@ -87,21 +94,41 @@ export type CaptureCoverageFile = {
   progress: number;
   /** The tailer has read everything the file holds now. */
   fullyRead: boolean;
+  /**
+   * A symlink the tailer does not follow: never read, so never covered. Its
+   * `key` is never a file's, and `mtimeMs` is the time the walk saw it (the
+   * link's own times say nothing about what lies behind it).
+   */
+  link?: true;
 };
 /** `complete` is false when a walk hit its entry budget, a directory error or an unready root. */
 export type CaptureCoverageSnapshot = { complete: boolean; files: CaptureCoverageFile[] };
 
-/** What one directory holds for a walk: directories to descend into and files to check. */
-export type CaptureCoverageListing = { directories: string[]; files: string[] };
+/**
+ * What one directory holds for a walk: directories to descend into, files to
+ * check, and symlinks where the tailer would descend if they were directories.
+ */
+export type CaptureCoverageListing = { directories: string[]; files: string[]; links?: string[] };
 
 export type CaptureCoverageWalkSpec = {
   roots: readonly string[];
   /** List one directory; depth 0 is a root. Throws when it cannot be listed. */
   list(directory: string, depth: number): CaptureCoverageListing;
-  /** Stat one file and read the tailer's state; null when it is gone or not a regular file. Throws otherwise. */
+  /**
+   * Stat one file (lstat, never through a link) and read the tailer's state; a
+   * symlinked file is a `link` verdict. Null when it is gone or not a regular
+   * file or link. Throws otherwise.
+   */
   check(file: string): CaptureCoverageFile | null;
+  /** The `link` verdict for a listed symlink (lstat only); null once it is gone or no longer a link. */
+  checkLink(link: string): CaptureCoverageFile | null;
   maxEntries?: number;
 };
+
+/** The verdict for a symlink the tailer does not follow, seen by a walk now. */
+export function linkCoverageFile(key: string, birthtimeMs: number): CaptureCoverageFile {
+  return { key, mtimeMs: Date.now(), birthtimeMs, extent: -1, progress: -1, fullyRead: false, link: true };
+}
 
 const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | null)?.code;
 
@@ -114,7 +141,7 @@ const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | null)?.c
  */
 export class CaptureCoverageWalk {
   private readonly directories: Array<{ directory: string; depth: number }>;
-  private readonly files: string[] = [];
+  private readonly files: Array<{ path: string; link: boolean }> = [];
   private entries = 0;
   done = false;
   complete = true;
@@ -127,7 +154,12 @@ export class CaptureCoverageWalk {
 
   /** A complete walk of a source with nothing to read. */
   static empty() {
-    return new CaptureCoverageWalk({ roots: [], list: () => ({ directories: [], files: [] }), check: () => null });
+    return new CaptureCoverageWalk({
+      roots: [],
+      list: () => ({ directories: [], files: [] }),
+      check: () => null,
+      checkLink: () => null,
+    });
   }
 
   step(deadline: number, onBatch: (files: CaptureCoverageFile[]) => void, now: () => number = () => performance.now()) {
@@ -140,7 +172,7 @@ export class CaptureCoverageWalk {
       const file = this.files.pop();
       if (file !== undefined) {
         try {
-          const checked = this.spec!.check(file);
+          const checked = file.link ? this.spec!.checkLink(file.path) : this.spec!.check(file.path);
           if (checked) batch.push(checked);
         } catch {
           this.fail();
@@ -161,7 +193,8 @@ export class CaptureCoverageWalk {
         if (!(next.depth === 0 && errorCode(error) === "ENOENT")) this.fail();
         continue;
       }
-      this.entries += listing.directories.length + listing.files.length;
+      const links = listing.links ?? [];
+      this.entries += listing.directories.length + listing.files.length + links.length;
       if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) {
         this.fail();
         continue;
@@ -169,7 +202,10 @@ export class CaptureCoverageWalk {
       for (let index = listing.directories.length - 1; index >= 0; index -= 1) {
         this.directories.push({ directory: listing.directories[index]!, depth: next.depth + 1 });
       }
-      for (let index = listing.files.length - 1; index >= 0; index -= 1) this.files.push(listing.files[index]!);
+      for (let index = links.length - 1; index >= 0; index -= 1) this.files.push({ path: links[index]!, link: true });
+      for (let index = listing.files.length - 1; index >= 0; index -= 1) {
+        this.files.push({ path: listing.files[index]!, link: false });
+      }
     }
     flush();
   }
@@ -185,7 +221,8 @@ export class CaptureCoverageWalk {
 /**
  * The verdict for one tailed JSONL file (rollout or transcript) from its
  * lstat and the tailer's own cursor row. The tailers pass their cursor key, so
- * the key cannot drift from theirs.
+ * the key cannot drift from theirs. A symlink is a `link` verdict under a key
+ * of its own (a path holds no NUL, so none collides with a file's).
  */
 export function jsonlCoverageCheck(database: Database.Database) {
   const cursor = database.prepare(
@@ -194,6 +231,9 @@ export function jsonlCoverageCheck(database: Database.Database) {
      from rollout_scan_state where file = ?`,
   );
   return (cursorKey: string, stat: fs.Stats): CaptureCoverageFile | null => {
+    // The tailers never read a symlinked JSONL file or descend through a
+    // symlinked directory (review r4, S1).
+    if (stat.isSymbolicLink()) return linkCoverageFile(jsonlScanStateKey(`${cursorKey}\0symlink`), stat.birthtimeMs);
     if (!stat.isFile()) return null;
     const key = jsonlScanStateKey(cursorKey);
     const row = cursor.get(key) as
@@ -368,6 +408,16 @@ export function applyCaptureCoverage(
       const row = read.get(...scope, file.key) as
         | { since: string; lastWriteAt: string; seenExtent: number; seenAt: string }
         | undefined;
+      if (file.link) {
+        // Nothing behind a link is read: uncovered from its creation, within
+        // the epoch and no later than this first sight, to this walk. No
+        // other rule applies, and none removes the row.
+        const linkBorn = Number.isFinite(file.birthtimeMs) && file.birthtimeMs > 0 ? file.birthtimeMs : check.epochStartMs;
+        const since = row ? row.since : isoMs(Math.min(check.startedMs, Math.max(check.epochStartMs, linkBorn)));
+        const seenMs = Math.max(file.mtimeMs, row ? Date.parse(row.lastWriteAt) : 0);
+        upsert.run(...scope, file.key, since, isoMs(seenMs), -1, check.startedAt);
+        continue;
+      }
       if (file.fullyRead || file.mtimeMs < check.epochStartMs) {
         if (row) remove.run(...scope, file.key);
         continue;

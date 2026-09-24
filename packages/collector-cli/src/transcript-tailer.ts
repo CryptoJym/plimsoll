@@ -355,8 +355,12 @@ export class TranscriptTailer {
    * cursor has committed each file's current size. The capture frontier moves
    * from this, never from a pass: automatic passes skip files not written in
    * the last 48 hours. It lists every *.jsonl as a full scan does, and is
-   * incomplete when a configured root is not ready, as a scan is. Twin of
-   * RolloutTailer.coverageWalk.
+   * incomplete when a configured root is not ready, as a scan is. A full scan
+   * never descends through a symlinked directory or reads a symlinked
+   * transcript, so the walk reports each one as a link, never covered, without
+   * following it (review r4, S1). One exception: a project's `memory`
+   * directory is Claude Code's store of Markdown notes, never transcripts, so
+   * a symlinked one is not reported. Twin of RolloutTailer.coverageWalk.
    */
   coverageWalk(maxEntries = CAPTURE_COVERAGE_MAX_ENTRIES): CaptureCoverageWalk {
     if (this.inventoryConfigured && inspectCaptureRoots(this.captureRoots).some((root) => root.state !== "ready")) {
@@ -366,19 +370,26 @@ export class TranscriptTailer {
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.projectsDir],
       maxEntries,
-      list: (directory) => {
+      list: (directory, depth) => {
         const directories: string[] = [];
         const files: string[] = [];
+        const links: string[] = [];
         for (const entry of this.io.readDirents(directory)) {
           const full = path.join(directory, entry.name);
           if (entry.isDirectory()) directories.push(full);
+          // A symlinked transcript is listed here and checked as a link.
           else if (entry.name.endsWith(".jsonl")) files.push(full);
+          else if (entry.isSymbolicLink() && !(depth === 1 && entry.name === "memory")) links.push(full);
         }
-        return { directories, files };
+        return { directories, files, links };
       },
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
         return stat ? verdict(this.cursorKey(file), stat) : null;
+      },
+      checkLink: (link) => {
+        const stat = lstatIfPresent((target) => this.io.lstat(target), link);
+        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat) : null;
       },
     });
   }

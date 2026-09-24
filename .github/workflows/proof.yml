@@ -88,6 +88,7 @@ jobs:
           pnpm proof:capture-claim
           pnpm proof:capture-claim-review
           pnpm proof:capture-claim-review-r4
+          pnpm proof:capture-claim-review-r5
           pnpm proof:repo-labels-response
 
       - name: Prove source installer and read-only doctor
