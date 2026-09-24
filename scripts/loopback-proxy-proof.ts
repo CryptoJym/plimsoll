@@ -18,7 +18,9 @@ const installKey = "fixture-loopback-install-key";
 const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 
 async function client(mode: string, url: string, home: string) {
-  if (mode === "join") {
+  if (mode === "native-proxy-probe") {
+    await fetch(url).catch(() => undefined);
+  } else if (mode === "join") {
     const { performJoin } = await import("../packages/collector-cli/src/join");
     const result = await performJoin({ target: "pljt_fixture-token", baseUrl: url, homeDir: home,
       temporaryRoot: path.join(home, "temporary") });
@@ -55,7 +57,9 @@ async function close(server: http.Server) {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-async function runChild(args: string[], home: string, proxyUrl: string) {
+type ProxyMechanism = "native NODE_USE_ENV_PROXY" | "undici EnvHttpProxyAgent";
+
+async function runChild(args: string[], home: string, proxyUrl: string, mechanism?: ProxyMechanism) {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home,
     PLIMSOLL_HOME: path.join(home, ".plimsoll"), CODEX_HOME: path.join(home, ".codex"),
     CLAUDE_CONFIG_DIR: path.join(home, ".claude"), TMPDIR: path.join(home, "tmp"),
@@ -66,7 +70,10 @@ async function runChild(args: string[], home: string, proxyUrl: string) {
   fs.mkdirSync(env.CODEX_HOME!, { recursive: true, mode: 0o700 });
   fs.mkdirSync(env.CLAUDE_CONFIG_DIR!, { recursive: true, mode: 0o700 });
   fs.mkdirSync(env.TMPDIR!, { recursive: true, mode: 0o700 });
-  const child = spawn(process.execPath, ["--import", path.join(repo, "node_modules/tsx/dist/loader.mjs"), ...args],
+  const imports = mechanism === "undici EnvHttpProxyAgent"
+    ? ["--import", path.join(repo, "scripts/fixtures/undici-env-proxy-agent.mjs")]
+    : [];
+  const child = spawn(process.execPath, [...imports, "--import", path.join(repo, "node_modules/tsx/dist/loader.mjs"), ...args],
     { cwd: repo, env, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "", stderr = "";
   child.stdout.setEncoding("utf8");
@@ -144,15 +151,16 @@ async function proof() {
     socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
   });
   const results: Array<Record<string, unknown>> = [];
+  let proxyMechanism: ProxyMechanism = "native NODE_USE_ENV_PROXY";
   let caseIndex = 0;
   const check = async (name: string, action: () => Promise<{ pass: boolean; detail: Record<string, unknown> }>) => {
     try {
       const result = await action();
       completion.check(name, result.pass);
-      results.push({ name, ...result });
+      results.push({ name, proxyMechanism, ...result });
     } catch (error) {
       completion.check(name, false);
-      results.push({ name, pass: false, error: String(error) });
+      results.push({ name, proxyMechanism, pass: false, error: String(error) });
     }
   };
   try {
@@ -163,11 +171,23 @@ async function proof() {
     const ipv6UploadUrl = `${ipv6Url}/api/work-intelligence/ingest`;
     const localhostUploadUrl = `http://localhost:${new URL(ipv6Url).port}/api/work-intelligence/ingest`;
     const counts = () => ({ direct: direct.length, forwarded: forwarded.length, connects: connects.length });
+    // Detect the actual Node capability with local servers. Older CI Nodes
+    // ignore NODE_USE_ENV_PROXY, so their children install undici's proxy
+    // dispatcher explicitly. No external DNS or hosted service is involved.
+    const probeHome = homeFor("native-proxy-probe");
+    const probeBefore = counts();
+    const probe = await runChild([import.meta.filename, "--client", "native-proxy-probe",
+      `${sinkUrl}/native-proxy-probe`, probeHome], probeHome, proxyUrl);
+    const probeAfter = counts();
+    if (probe.code !== 0) throw new Error(`native proxy capability probe failed: ${probe.stderr}`);
+    const nativeEnvProxySupported = probeAfter.forwarded > probeBefore.forwarded ||
+      probeAfter.connects > probeBefore.connects;
+    proxyMechanism = nativeEnvProxySupported ? "native NODE_USE_ENV_PROXY" : "undici EnvHttpProxyAgent";
     const run = async (args: string[], joinedUrl?: string) => {
       const home = homeFor(`case-${++caseIndex}`);
       seedUpload(home, joinedUrl);
       const before = counts();
-      const child = await runChild(["packages/collector-cli/src/cli.ts", ...args], home, proxyUrl);
+      const child = await runChild(["packages/collector-cli/src/cli.ts", ...args], home, proxyUrl, proxyMechanism);
       const after = counts();
       const forwardedRequests = after.forwarded - before.forwarded;
       const connectRequests = after.connects - before.connects;
@@ -198,7 +218,7 @@ async function proof() {
       await check(name, async () => {
         const home = homeFor(`case-${++caseIndex}`);
         const before = counts();
-        const child = await runChild([import.meta.filename, "--client", mode!, url!, home], home, proxyUrl);
+        const child = await runChild([import.meta.filename, "--client", mode!, url!, home], home, proxyUrl, proxyMechanism);
         const after = counts();
         const detail = { code: child.code, direct: after.direct - before.direct,
           forwardedRequests: after.forwarded - before.forwarded,
@@ -223,7 +243,8 @@ async function proof() {
           detail: { ...detail, input: url } };
       });
     }
-    console.log(JSON.stringify({ schema: "plimsoll.loopback-proxy-proof/v1", node: process.version, results }, null, 2));
+    console.log(JSON.stringify({ schema: "plimsoll.loopback-proxy-proof/v1", node: process.version,
+      nativeEnvProxySupported, proxyMechanism, results }, null, 2));
     completion.complete();
   } finally {
     await close(sink);
