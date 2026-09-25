@@ -186,10 +186,6 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   const rawInsertTrigger = db.prepare(
     "select sql from sqlite_master where type='trigger' and name='trg_session_summary_raw_insert'",
   ).get() as { sql: string } | undefined;
-  const rawUpdateTrigger = db.prepare(
-    "select sql from sqlite_master where type='trigger' and name='trg_session_summary_raw_update'",
-  ).get() as { sql: string } | undefined;
-  const scannedAwareUpgrade = Boolean(rawUpdateTrigger && !rawUpdateTrigger.sql.includes("summary_scanned_aware_v1"));
   const leaseTriggers = db.prepare(`select name, sql from sqlite_master where type='trigger'
     and name in ('trg_session_sync_upload_lease_insert',
       'trg_session_sync_upload_lease_dirty_insert',
@@ -225,8 +221,9 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   const newReceiptAffects = `exists (select 1 from buffered_events e
     join session_sync_summary_state s on s.session_id = e.session_id
     where e.id = new.delivery_id and ${newReceiptChange})`;
-  // SQLite's CREATE TRIGGER IF NOT EXISTS keeps the old trigger body. Replace
-  // it atomically when upgrading a v1/v2 ledger to the frozen scan boundary.
+  // Keep the 0.7.41 trigger names free. Its installer uses IF NOT EXISTS and
+  // must restore its own revision marks on downgrade. Remove those old-name
+  // triggers on re-upgrade; the scanned-aware triggers have distinct names.
   db.transaction(() => {
     // Existing 0.7.40 ledgers have this trigger. An append is outside the
     // leased snapshot; only edits and erasures of existing rows need a fence.
@@ -239,16 +236,13 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     if (rawInsertTrigger && !rawInsertTrigger.sql.includes("scanBoundary")) {
       db.exec("drop trigger trg_session_summary_raw_insert");
     }
-    if (scannedAwareUpgrade) {
-      db.exec(`drop trigger if exists trg_session_summary_raw_update;
-        drop trigger if exists trg_session_summary_raw_delete;
-        drop trigger if exists trg_session_summary_outbox_insert;
-        drop trigger if exists trg_session_summary_outbox_update;
-        drop trigger if exists trg_session_summary_outbox_delete;
-        drop trigger if exists trg_session_summary_receipt_insert;
-        drop trigger if exists trg_session_summary_receipt_update;
-        drop trigger if exists trg_session_summary_receipt_delete;`);
-    }
+    const legacySummaryTriggers = db.prepare(`select name from sqlite_master where type='trigger'
+      and name in ('trg_session_summary_raw_update', 'trg_session_summary_raw_delete',
+        'trg_session_summary_outbox_insert', 'trg_session_summary_outbox_update',
+        'trg_session_summary_outbox_delete', 'trg_session_summary_receipt_insert',
+        'trg_session_summary_receipt_update', 'trg_session_summary_receipt_delete')`)
+      .all() as Array<{ name: string }>;
+    for (const trigger of legacySummaryTriggers) db.exec(`drop trigger ${trigger.name}`);
     db.exec(`
     create table if not exists session_sync_summary_control (
       singleton integer primary key check (singleton = 1),
@@ -392,7 +386,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           reason = excluded.reason, updated_at = excluded.updated_at;
     end;
 
-    create trigger if not exists trg_session_summary_raw_update
+    create trigger if not exists trg_session_summary_raw_update_v42
     after update of id, source, data_mode, observed_at, created_at,
       session_id, input_tokens, output_tokens, cache_read_tokens,
       cache_creation_tokens, cost_usd, repo_hash, branch_hash, account_hash,
@@ -435,7 +429,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           reason = excluded.reason, updated_at = excluded.updated_at;
     end;
 
-    create trigger if not exists trg_session_summary_raw_delete
+    create trigger if not exists trg_session_summary_raw_delete_v42
     after delete on buffered_events
     begin
       update session_sync_summary_control
@@ -461,23 +455,13 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   if (revisionTableMissing) {
     db.exec(`insert or ignore into session_sync_summary_revision (session_id, mutation_revision)
       select session_id, mutation_revision from session_sync_summary_state`);
-    // Round 1 only invalidated privacy changes behind a committed HWM. A
-    // privacy change during the first read must invalidate that read too.
-    db.exec(`
-      drop trigger if exists trg_session_summary_outbox_insert;
-      drop trigger if exists trg_session_summary_outbox_update;
-      drop trigger if exists trg_session_summary_outbox_delete;
-      drop trigger if exists trg_session_summary_receipt_insert;
-      drop trigger if exists trg_session_summary_receipt_update;
-      drop trigger if exists trg_session_summary_receipt_delete;
-    `);
   }
 
   // These tables are created by DeliveryOutbox, but a small proof ledger or a
   // pre-delivery install may not have them. Raw edits/deletes remain covered.
   if (tableExists(db, "upload_outbox")) {
     db.exec(`
-      create trigger if not exists trg_session_summary_outbox_insert
+      create trigger if not exists trg_session_summary_outbox_insert_v42
       after insert on upload_outbox
       when new.raw_rowid is not null and exists (
         select 1 from buffered_events e
@@ -499,7 +483,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
-      create trigger if not exists trg_session_summary_outbox_update
+      create trigger if not exists trg_session_summary_outbox_update_v42
       after update of raw_rowid, raw_id, raw_created_at, raw_generation on upload_outbox
       when ${oldOutboxAffects} or ${newOutboxAffects}
       begin
@@ -528,7 +512,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
-      create trigger if not exists trg_session_summary_outbox_delete
+      create trigger if not exists trg_session_summary_outbox_delete_v42
       after delete on upload_outbox
       when old.raw_rowid is not null and exists (
         select 1 from buffered_events e
@@ -557,7 +541,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     const receiptColumns = columnNames(db, "upload_receipts");
     if (receiptColumns.has("reason") && receiptColumns.has("delivery_id")) {
       db.exec(`
-        create trigger if not exists trg_session_summary_receipt_insert
+        create trigger if not exists trg_session_summary_receipt_insert_v42
         after insert on upload_receipts
         when new.reason in ('local_evidence_quarantined','local_privacy_violation')
           and exists (
@@ -580,7 +564,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
             on conflict(session_id) do update set
               reason = excluded.reason, updated_at = excluded.updated_at;
         end;
-        create trigger if not exists trg_session_summary_receipt_update
+        create trigger if not exists trg_session_summary_receipt_update_v42
         after update of delivery_id, reason on upload_receipts
         when ${oldReceiptAffects} or ${newReceiptAffects}
         begin
@@ -609,7 +593,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
             on conflict(session_id) do update set
               reason = excluded.reason, updated_at = excluded.updated_at;
         end;
-        create trigger if not exists trg_session_summary_receipt_delete
+        create trigger if not exists trg_session_summary_receipt_delete_v42
         after delete on upload_receipts
         when old.reason in ('local_evidence_quarantined','local_privacy_violation')
           and exists (

@@ -8,6 +8,10 @@
   and terminal receipt changes still do. A worker slice is retried if an edit
   lands while it is being read, and scanned edits or erasures still rebuild
   only their affected session (`.163.87`).
+- The scanned-aware summary triggers now use distinct names so a 0.7.41
+  downgrade installs its own revision-marking triggers before sync. A CI
+  rehearsal rejects a terminal privacy receipt raced with the old worker;
+  0.7.39 still reads the full ledger on rollback (`.163.87` round 2).
 
 ## 0.7.5 — 2026-09-08
 

@@ -287,6 +287,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-live-churn
 
+      - name: Prove 0.7.41 and 0.7.39 downgrade privacy safety (eco-6hoxj.163.87)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-downgrade
+
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
