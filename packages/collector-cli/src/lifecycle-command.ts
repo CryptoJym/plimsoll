@@ -192,7 +192,7 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
     const unsequenced = unknown.filter((row) => row.reason === "receipt_without_sequence").length;
     lines.push(`${unknown.length} snapshot(s) are kept because their operation cannot be read or ordered` +
       (unsequenced > 0
-        ? ` (${unsequenced} recorded without a completion sequence by a lifecycle command older than 0.7.40 that could not read this host's order record)`
+        ? ` (${unsequenced} recorded without a completion sequence by a lifecycle command older than 0.7.41 that could not read this host's order record)`
         : "") +
       ". `plimsoll lifecycle snapshots reconcile` shows them and how to decide them with --keep-snapshots.");
   }

@@ -303,7 +303,7 @@ export type LifecycleRetentionInput = {
   /**
    * Snapshot IDs whose receipt is complete except for its completion
    * sequence: a lifecycle command that could not read the order record wrote
-   * it (0.7.38 on a sealed host, or with the record lost). Kept as unknown
+   * it (a pre-0.7.41 command on a sealed host, or with the record lost). Kept as unknown
    * until `snapshots reconcile` decides them.
    */
   receiptsWithoutSequence?: readonly string[];

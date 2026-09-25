@@ -596,10 +596,10 @@ and `load-launch-agent` touch the service), never run from a source checkout
 via `self`, and print one JSON receipt each. Once a host has run 0.7.38 or
 later, use 0.7.38 or later for updates and prunes: an update or rollback by
 an older CLI stops snapshot retention until `lifecycle snapshots reconcile`
-(0.7.40 and later) repairs it. To return to an older runtime, run that
+(0.7.41 and later) repairs it. To return to an older runtime, run that
 release's own `lifecycle rollback --artifact self` (a CLI installs only a
 bundle from its own install tree). Once a host has been sealed with
-`lifecycle snapshots reconcile --keep-snapshots`, use 0.7.40 or later for
+`lifecycle snapshots reconcile --keep-snapshots`, use 0.7.41 or later for
 updates, prunes and reconciles; an older release run there removes nothing,
 and the next reconcile decides its snapshot. Release signing, npm publication,
 and live-fleet rollout remain gated under

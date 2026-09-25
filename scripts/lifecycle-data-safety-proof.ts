@@ -2216,7 +2216,7 @@ async function r4ReceiptsWithoutSequence() {
     const resealed = await fixture.manager().reconcileSnapshots({ operationId: "ws-seal-2", keep: ["x4"], apply: true });
     const pruned = await fixture.manager().pruneSnapshots({ operationId: "ws-prune", keep: 2, apply: true });
     record(CASES.r4OldReceipts[0],
-      x4?.retention === "keep" && x4.reason === "receipt_without_sequence" && /older than 0\.7\.40/.test(text) &&
+      x4?.retention === "keep" && x4.reason === "receipt_without_sequence" && /older than 0\.7\.41/.test(text) &&
         /snapshots reconcile/.test(text) && same(dry.reconcile.findings.receiptsWithoutSequence, ["x4"]) &&
         dry.reconcile.neededRepair === "needs_keep" && resealed.reconcile.repair === "sealed" && resealed.reconcile.forced === false &&
         same(pruned.retention.removed.filter((item) => item.kind === "snapshot").map((item) => item.name), ["x1", "x2", "x3"]) &&
@@ -2304,7 +2304,7 @@ async function r5UsableWaysBack() {
         listed.decisions.d2 === "keep:restores_previous_version" && exists(runtimeExecutable(fixture, "23.1.1")),
       { pruned: pruned.retention.removed, listed, remains: fixture.snapshots() });
   });
-  // A snapshot taken before 0.7.40 recorded no runtime digest: it counts while
+  // A snapshot taken before 0.7.41 recorded no runtime digest: it counts while
   // its runtime is there, and not once it is gone.
   await runCase([CASES.r5WayBack[4]], async (record) => {
     const fixture = createHome("r5-legacy-snapshot");

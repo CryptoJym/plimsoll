@@ -97,8 +97,8 @@ target OS/architecture/Node ABI; a version string is insufficient.
    `lifecycle rollback --artifact self` (a CLI installs only a bundle from its
    own install tree). An update or rollback by a CLI older than 0.7.38 on a
    host that has run 0.7.38 stops snapshot retention until `lifecycle
-   snapshots reconcile` (0.7.40 and later) repairs it. On a host sealed by
-   `reconcile --keep-snapshots`, releases before 0.7.40 remove nothing and the
+   snapshots reconcile` (0.7.41 and later) repairs it. On a host sealed by
+   `reconcile --keep-snapshots`, releases before 0.7.41 remove nothing and the
    next reconcile decides their snapshots. A failed restore keeps the journal for recovery;
    preserve it and the snapshots. Uninstall and purge are separate actions,
    never a substitute for rollback.

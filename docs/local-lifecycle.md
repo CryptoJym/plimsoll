@@ -47,7 +47,7 @@ later. Releases up to 0.7.37 write receipts without a completion sequence:
 an update or rollback run by one of them (for example `npx -y
 @plimsoll/cli@0.7.37 lifecycle update`) leaves a receipt whose place in the
 order cannot be proved, and retention stops until `snapshots reconcile`
-(0.7.40 and later) repairs it.
+(0.7.41 and later) repairs it.
 
 To return to an older runtime explicitly, run that release's own
 `lifecycle rollback --operation-id <id> --artifact self`. A CLI installs
@@ -56,10 +56,10 @@ older release's bundle (it refuses with "artifact source must be a child of
 the ownership root" and changes nothing).
 
 Once a host has been sealed (`snapshots reconcile --keep-snapshots`), run
-updates, prunes and reconciles with 0.7.40 or later. 0.7.38 and 0.7.39 read a
+updates, prunes and reconciles with 0.7.41 or later. 0.7.38 and 0.7.39 read a
 sealed order record as invalid: they remove nothing, which is safe, but an
 update or rollback they run writes a receipt without a completion sequence.
-0.7.40 keeps that snapshot as `receipt_without_sequence`, and `snapshots
+0.7.41 keeps that snapshot as `receipt_without_sequence`, and `snapshots
 list` says to run `snapshots reconcile`, whose keep-set then decides it. An
 older release's own rollback is therefore safe on a sealed host and costs
 one reconcile afterwards. 0.7.38 likewise keeps, as unknown, the snapshots of
@@ -375,7 +375,7 @@ sequence is beyond the record, or a receipt without a sequence appeared
 after sequencing began) and `removal_record_unreadable`. Snapshots kept as
 `operation_unknown` or `receipt_without_sequence` (their receipt cannot be
 read or ordered) also stay until an operator decides them. The repair is
-`snapshots reconcile` (0.7.40 and later):
+`snapshots reconcile` (0.7.41 and later):
 
 ```sh
 plimsoll lifecycle snapshots reconcile                    # dry run: findings and the repair it would make
@@ -418,7 +418,7 @@ restores no version and does not count. A way back must also be able to
 restore: its own config, service and database copies are present (the
 database copy at its recorded size), and the runtime it restores is still a
 regular file under `versions/` that matches the digest the snapshot recorded.
-Snapshots record that digest from 0.7.40 on; older ones recorded none, so for
+Snapshots record that digest from 0.7.41 on; older ones recorded none, so for
 them only the runtime's presence is checked. The dry run lists
 `unusableWaysBack`, each with its reason, and a keep-set of only such
 snapshots is refused with that reason. That rule holds even with `--force`,

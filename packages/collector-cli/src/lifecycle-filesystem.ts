@@ -121,9 +121,9 @@ type SnapshotMetadata = {
   currentVersion: string | null;
   currentExecutable: string | null;
   /**
-   * Digest of `currentExecutable` when the snapshot was taken (from 0.7.40):
+   * Digest of `currentExecutable` when the snapshot was taken (from 0.7.41):
    * what a restore brings back. Older snapshots have none; releases up to
-   * 0.7.39 ignore it.
+   * 0.7.40 ignore it.
    */
   currentExecutableSha256?: string | null;
   present: Record<"config" | "database" | "service", boolean>;
@@ -1130,7 +1130,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         else if (!isOtherOperationReceipt(value, id)) {
           invalid.push(id);
           // Complete but for its sequence: a command that could not read the
-          // order record wrote it (0.7.38 on a sealed host, or with the record lost).
+          // order record wrote it (a pre-0.7.41 command on a sealed host, or with the record lost).
           if (parseCompletionReceipt(value, id, { sequenceOptional: true })) withoutSequence.push(id);
         }
       } catch {
@@ -1334,7 +1334,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
    * Why a snapshot could not actually be restored, or null when it can: its
    * own files are present (the database copy at its recorded size), and the
    * runtime it restores is still a regular file under versions/ that matches
-   * the digest the snapshot recorded (snapshots taken before 0.7.40 recorded
+   * the digest the snapshot recorded (snapshots taken before 0.7.41 recorded
    * none, so only its presence is checked). Read only; each runtime is hashed
    * once per call.
    */
