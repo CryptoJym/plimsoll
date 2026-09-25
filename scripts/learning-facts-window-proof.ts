@@ -71,14 +71,16 @@ async function w2() {
   const file = path.join(root, "w2.sqlite");
   const store = buffer(file, { attempts: 10 });
   try {
+    // /status uses the process clock, so this fixture must use that clock too.
+    const until = Date.now();
     for (let index = 0; index < 10; index += 1) attempt(store.learningFacts, `w2-${index}`,
-      UNTIL - 2 * DAY + index * HOUR);
-    const late = attempt(store.learningFacts, "w2-late", UNTIL - 3 * DAY);
+      until - 2 * DAY + index * HOUR);
+    const late = attempt(store.learningFacts, "w2-late", until - 3 * DAY);
     assert.equal(late.dropReason, "outside_retention_window");
-    const receipt = materialize(file, "w2");
+    const receipt = materialize(file, "w2", until);
     const body = await status(store, "w2");
-    const expected = iso(UNTIL - 3 * DAY + 1);
-    assert.equal(receipt.window.requestedStartInclusive, iso(UNTIL - 7 * DAY));
+    const expected = iso(until - 3 * DAY + 1);
+    assert.equal(receipt.window.requestedStartInclusive, iso(until - 7 * DAY));
     assert.equal(receipt.window.effectiveStartInclusive, expected);
     assert.equal(receipt.window.reason, "retention");
     assert.equal(body.learningFacts.analysisWindow.effectiveStartInclusive, expected);
