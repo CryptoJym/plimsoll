@@ -45,13 +45,18 @@ does not transfer its sessions to a tailer.
 - System-e2e path fields are normalized for the CI layout, and the coverage gate
   runs the newly covered proofs with host-only scopes recorded (`.163.59`,
   `.163.45`).
-- Session sync no longer holds the ledger's write lock during an upload. Each
-  send takes a short per-session lease; intake and maintenance writes to the
-  sessions in flight retry through the storage-busy path, and an erasure waits
-  for the send so it is never overtaken. Multi-batch catch-ups converge, and
-  under steady intake the daemon still runs session sync once the event
-  backlog fits in one cycle, or after at most 60 s of a larger backlog
-  (`.163.75`).
+- Session summary uploads use short database write transactions and
+  per-session send leases, leaving unrelated ledger writes free during the
+  network request. A live lease defers conflicting mutations, and an erasure
+  waits for the send so it is never overtaken. Intake for a session that is
+  being uploaded waits for that send; past the 750 ms busy budget (a slow cloud
+  round trip) its events are spooled and delivered later, never lost.
+  Automatic maintenance retries a lease-deferred attempt after a bounded 1-5
+  second backoff without counting it as a failure or opening the worker
+  circuit; repricing keeps its pending row until a retry succeeds. Multi-batch
+  catch-ups converge, and under steady intake the daemon still runs session
+  sync once the event backlog fits in one cycle, or after at most 60 s of a
+  larger backlog (`.163.75`).
 - The session context index keeps its checksum exact past 2^53, so very large
   ledgers no longer rebuild the index on every open (`.163.75`).
 - When a learning-fact table is full, a fact that would be refused anyway
