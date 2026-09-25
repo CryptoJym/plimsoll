@@ -48,7 +48,7 @@ install the pair names, never against the uploading install:
 | Stamp | Delivered raw row (ingest) | Undelivered member (part) |
 |---|---|---|
 | `(install, V)` **issued at its first sighting**: `V = 0`, or the audit row for `V` existed when the cloud first saw `(install, V)` in any request echo, delivered row or summary member | `actor_id = actor_of(install, V)`; basis `raw_ingest` (identical to `binding_at_capture` by construction) | `actor_id = actor_of(install, V)`, basis `binding_at_capture` |
-| `(install, V)` **not issued at its first sighting** (`V > binding_version` then), recorded once as the durable fact `stamp_not_issued(install, V)` in the same transaction; or a pair naming an install the tenant does not have | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify; **stays null after the cloud issues `V`**, at ingest, on replay and in every summary revision | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
+| `(install, V)` **not issued at its first sighting** (`V > binding_version` then), recorded once as the durable fact `stamp_not_issued(uploader, install, V)` in the same transaction, keyed by the **uploading install** as well (round 9); or a pair naming an install the tenant does not have (judged closed, **nothing recorded**) | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify; **stays null after the cloud issues `V`**, at ingest, on replay and in every summary revision | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
 | `null` (a collector older than B2a, or a B2a collector before the first versioned response of its **current** install, C4) | today's ingest binding (the uploading install's actor at ingest); basis `ingest_current` | `single_binding` (the install has no audit row and a non-null actor) else `unallocated_no_stamp` |
 
 **The guarantee (what `fixtures/b4_offline_rebind.py` and the tests prove).**
@@ -93,14 +93,21 @@ and both judge null; neither batch is refused. Of the 12 interleavings of a faul
 0 flip under this rule and the rebind waits in 4 (`b4_offline_rebind.py` R5; round 8 flipped in 1); the same schedules were
 reproduced in a real PostgreSQL cluster in round 9 (`checks/r5-postgres-reproduction.log`: without the lock T3 exported C and T1
 then recorded the fact; with `FOR SHARE` `pg_blocking_pids` shows the rebind waiting). The durable proof is pending in the cloud:
-`actor-binding-stamp-postgres.contract.test.ts` (B6).
+`actor-binding-stamp-postgres.contract.test.ts` (B6). **Scope (round 9, review r2 R7).** `actor_for_stamp` for a row or member
+uploaded by install U reads the facts with `uploader_install_id = U`; a fact another install recorded by naming `(install, V)` never
+enters `install`'s own view, so one install's faulty or hostile traffic cannot poison another install's next version (the
+poisoning of guarantee 3 is confined to the uploader's own pairs). A pair naming an install of another tenant fails closed and
+records nothing (the cloud test asserts the absence of the fact, not only the null). **Cap (round 9, low).** A request may create at
+most 8 new facts; a request that would create more is refused whole (400, `stamp_not_issued_flood`), judges nothing and records
+nothing, so an authenticated collector cannot write one fact per distinct version per batch. Every new fact a request creates is
+listed on its receipt.
 
 **What the echo is for.** `actorBindingVersionHeard` on every request, **upload deliveries included**, is the collector's
 `max(persisted version of the current install, highest stamp carried for the current install)`. It is a diagnostic and a sighting,
 never ownership: `stamp_ahead_of_echo` (a request carries a stamp above its own echo), `echo_ahead_of_binding` (an echo above the
 install's `binding_version`; it records the not-issued fact), `stamp_sequence_regressed` (a segment's versions are not
 non-decreasing in rowid order) and `stamp_from_earlier_install` (a pair naming an install other than the uploader: expected after a
-re-join, counted) are recorded on the request receipt and the segment, shown in `/status`, the S4 certify and the impact report,
+re-join, counted; a not-issued one records a fact for the uploader, never for the named install, round 9) are recorded on the request receipt and the segment, shown in `/status`, the S4 certify and the impact report,
 and change no actor. `heard_at` on the audit row is the instant of the **first request that echoes** the version, a disclosure
 fact for the export's `changed_at → heard_at` window; a response that supplies a version sets nothing, and the registration
 response is not an echo. `heard_at` exists only for an **issued** version, because it lives on the audit row: the instant of an
@@ -296,9 +303,12 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   stamp's pair names; `sightStamp(binding, stamp)` → the binding with `notIssued` extended when the stamp is above `currentVersion`
   (pure; persisting the fact is B6's); `firstEchoHeardAt(requests)` over every request kind; `stampDiagnostics({ stamps, echoed,
   currentVersion })` → `{ stampAheadOfEcho, echoAheadOfBinding, ownershipChanged }`. (B6, C1, C4)
-- `src/lib/ingest.ts`: `eventRowsForStorage(batch, tenantId, authorizedActorId, { uploadingInstallId, bindings })` binds the pair
-  `metadata.actorBindingVersion` + `metadata.actorBindingInstall` through `actorForStamp` against `bindings[actorBindingInstall]`
-  (a pair naming an install outside `bindings` fails closed); sets `metadata.actorStampInvalid`. (B6, C1)
+- `src/lib/ingest.ts`: `eventRowsForStorage(batch, tenantId, authorizedActorId, { uploadingInstallId, bindings, sightings })` binds
+  the pair `metadata.actorBindingVersion` + `metadata.actorBindingInstall` through `actorForStamp` against
+  `bindings[actorBindingInstall]`, the uploader's view of that install (its facts only); a pair naming an install outside `bindings`
+  fails closed and records nothing; sets `metadata.actorStampInvalid`; appends every new not-issued fact
+  `{ uploaderInstallId, deviceInstallId, version, source }` to `sightings`, which the route persists in the ingest transaction
+  (round 9). (B6, C1)
 - `src/lib/actor-binding-stamp-store.ts` (round 9): `sightPairInTransaction(tx, { tenantId, uploaderInstallId, deviceInstallId,
   version, source, at })` reads `device_installs.binding_version` `FOR SHARE`, judges, inserts the fact `ON CONFLICT DO NOTHING` when
   the version is above it and re-reads → `{ issued, actorId, recorded, bindingVersionThen }`; `issueBindingVersionInTransaction(tx,
@@ -314,8 +324,9 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 - `src/lib/capture-watermark/contract.ts`: `captureCoverageForPeriod` with `until: null` open gaps and `resolvedAt`. (B6, C5)
 - `src/lib/economics/token-volume.ts`: `tokenVolumeState`, `normalisedTokens`, `pricingGate`. (B15)
 - `prisma/schema.prisma`: `DeviceInstall.bindingVersion`, `DeviceInstall.activityLaneClosedAt`, `DeviceInstallActorBindingAudit.bindingVersion`
-  and `.heardAt`, models `AiSummaryActorPart`, `CaptureGap` and `DeviceInstallStampNotIssued` (`deviceInstallId`, `version`,
-  `firstSeenAt`, `bindingVersionThen`, `source`, unique per install and version). (B6, C1)
+  and `.heardAt`, models `AiSummaryActorPart`, `CaptureGap` and `DeviceInstallStampNotIssued` (`tenantId`, `uploaderInstallId`,
+  `deviceInstallId`, `version`, `firstSeenAt`, `bindingVersionThen`, `source`, unique per `(uploaderInstallId, deviceInstallId,
+  version)`, a relation to `DeviceInstall` without cascade; round 9). (B6, C1)
 
 **Surfaces the collector tests bind (plimsoll, `tests/contracts/lean/`).**
 - `packages/collector-cli/src/lean/schema.ts`: `ensureLeanSchema(db)` (ARCHITECTURE.md §3 DDL v3 plus C3) on the ledger connection

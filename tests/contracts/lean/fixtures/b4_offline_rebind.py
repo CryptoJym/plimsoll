@@ -43,6 +43,8 @@ Round 9 rule (B0 round 3, review-r2 blockers 1-2 and should-fixes 1, 4; CONTRACT
   (e) A sighting that may record a fact reads `device_installs.binding_version` with the install row locked FOR SHARE (the
       rebind's UPDATE takes the row lock and waits), then inserts the fact ON CONFLICT DO NOTHING and re-reads it, so a rebind
       can never commit between the read and the fact (review-r2 R5: 1 of 12 READ COMMITTED interleavings flipped a pair).
+  (f) The fact is keyed by the UPLOADER as well: (uploader_install, install, V); an install's own view is never poisoned by
+      another install's traffic naming it (review-r2 R7); a pair naming an install of another tenant records nothing.
   (g) `heard_at` exists only for an issued version (it lives on the audit row); a never-issued echo's instant is the fact's
       `first_seen_at`.
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
@@ -337,4 +339,22 @@ print("    R5 (sighting vs rebind): " + json.dumps({"orderings": len(schedules),
 c.expect(len(schedules) == 12 and not flips, "R5: in all 12 interleavings of a faulty sighting with the rebind that issues its version, every judgment of (X, 2) agrees (round 8 flipped in 1 of 12: T3 exported C, then T1 recorded the fact)", json.dumps([[list(o), a] for o, a in flips]))
 c.expect(serialized == 4, "R5: the FOR SHARE read makes the rebind wait in exactly the 4 orderings where it would otherwise commit between the sighting's read and its fact", f"serialized={serialized}")
 
+# ---- 9. should-fix 1 (review r2): the fact is keyed by the uploader, so one install's traffic cannot poison another's version --------
+class Cloud:
+    def __init__(self, audit): self.audit, self.facts = {k: dict(v) for k, v in audit.items()}, {}
+    def bv(self, install, at): return max(v for v, (_, t) in self.audit[install].items() if t <= at)
+    def sight(self, install, v, at, uploader, tenant_installs=("P", "Q")):
+        if install not in tenant_installs: return (None, "stamp_invalid:unknown_install")   # another tenant's install: judged closed, NO fact
+        key = (uploader, install, v) if R9 else (install, v)
+        if key in self.facts: return (None, "stamp_invalid:stamp_not_issued")
+        if v <= self.bv(install, at): return (self.audit[install][v][0], "binding_at_capture")
+        self.facts[key] = {"first_seen_at": at, "binding_version_then": self.bv(install, at)}
+        return (None, "stamp_invalid:stamp_not_issued")
+cloud = Cloud({"P": {0: ("A", 0)}, "Q": {0: ("A2", 0), 1: ("B2", 200)}})
+p_row = cloud.sight("Q", 1, 100, uploader="P")                               # P's collector names (Q, 1) while Q is at v0
+q_rows = [cloud.sight("Q", 1, t, uploader="Q") for t in (260, 400)]        # Q's honest rows after Q's rebind to B2 (v1)
+foreign = cloud.sight("F", 1, 300, uploader="P")                             # a pair naming an install the tenant does not have
+print("    R7 (fact scope): " + json.dumps({"P_row": p_row, "Q_rows": q_rows, "foreign": foreign, "facts": {"|".join(map(str, k)): v for k, v in cloud.facts.items()}}))
+c.expect(p_row[0] is None and all(r == ("B2", "binding_at_capture") for r in q_rows), "R7: another install's traffic naming (Q, 1) before Q issues 1 records a fact for THAT uploader only; Q's own rows stamped (Q, 1) after the rebind are B2's (round 8 keyed the fact by the named install and poisoned Q)", f"P={p_row} Q={q_rows}")
+c.expect(foreign == (None, "stamp_invalid:unknown_install") and not any(k[-2] == "F" for k in cloud.facts), "R7: a pair naming an install of another tenant fails closed and records no fact", json.dumps({"|".join(map(str, k)): v for k, v in cloud.facts.items()}))
 c.finish()
