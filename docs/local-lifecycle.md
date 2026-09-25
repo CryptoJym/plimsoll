@@ -68,12 +68,14 @@ update or rollback they run writes a receipt without a completion sequence.
 0.7.41 keeps that snapshot as `receipt_without_sequence`, and `snapshots
 list` says to run `snapshots reconcile`, whose keep-set then decides it. An
 older release's own rollback is therefore safe on a sealed host and costs
-one reconcile afterwards. Releases 0.7.38 through 0.7.40 also treat 0.7.41
-receipts containing `restore.integrity` or `retention.restored`, and
-`snapshots_reconcile` receipts, as unknown; they retain affected snapshots.
-For example, a 0.7.41 update that automatically rolls back to 0.7.40 leaves a
-receipt 0.7.40 cannot order. This fails safely by retaining snapshots, at the
-cost of disk space until 0.7.41 reconciles the records.
+one reconcile afterwards. Releases 0.7.38 through 0.7.40 accept a
+`snapshots_prune` receipt even when its retention record has `restored`.
+They treat update or rollback receipts carrying `restore.integrity` or
+`retention.restored` as unknown, and also do not recognize
+`snapshots_reconcile` receipts. For example, a 0.7.41 update that
+automatically rolls back to 0.7.40 leaves a rolled-back snapshot that
+0.7.40 keeps as `operation_unknown`. An ordinary 0.7.41 prune --apply or
+completed update with normal retention removes that snapshot.
 
 An update or rollback:
 
