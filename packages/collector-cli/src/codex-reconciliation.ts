@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 
 import { estimateCostUsd } from "../../shared/src/index";
+import { pairCodexUsageEvent, runCodexUsagePairingBackfill } from "./codex-usage-pairing";
 
 const WINDOW_SECONDS = 10 * 60;
 const CONTROL_ROW = 1;
@@ -663,6 +664,7 @@ export function runCodexReconciliationMaintenance(
             });
             rowsChanged += apply.run({ id: row.id, sessionId, model, costUsd, costKind, payloadJson })
               .changes;
+            if (sessionChanged) pairCodexUsageEvent(database, row.id);
             if (sessionChanged) stitched += 1;
             if (costChanged) priced += 1;
           }
@@ -878,6 +880,11 @@ export function runCodexReconciliationMaintenance(
       }
 
       const rowsVisited = legacyRowsVisited + contextRowsVisited + candidateRowsVisited;
+      // Preserve the established 50 ms reconciliation cadence. Pairing's
+      // historical scan has its own small real-time budget and never consumes
+      // the injected clock used to size the #397 reconciliation gate.
+      const pairingDeadline = performance.now() + 5;
+      runCodexUsagePairingBackfill(database, 128, () => performance.now() >= pairingDeadline);
       const sliceDurationMs = clock() - sliceStarted;
       const timeBudgetExhausted = clock() >= deadline;
       database
