@@ -2952,6 +2952,8 @@ async function main() {
               console.log(JSON.stringify({
                 status: "session_sync_partial",
                 pendingSummaries: summaryPending.length,
+                pendingSummaryReasons: sessionResult.pendingSummaryReasons,
+                fullRecomputes: sessionResult.summaryStats.fullRecomputes,
                 rowsRead: sessionResult.summaryStats.rowsRead,
                 summaryDurationMs: sessionResult.summaryStats.durationMs,
               }));

@@ -1008,6 +1008,8 @@ export type SessionSyncResult = {
   /** False when one or more summaries were persisted but not yet complete. */
   summaryComplete: boolean;
   pendingSummarySessionIds: string[];
+  /** Counts of why summaries remain pending in this pass. */
+  pendingSummaryReasons: Record<string, number>;
   summaryStats: {
     rowsRead: number;
     rowsApplied: number;
@@ -1089,6 +1091,7 @@ export async function runSessionSync(
   }>();
   let ledgerSessions = 0;
   const pendingSummarySessionIds: string[] = [];
+  const pendingSummaryReasons: Record<string, number> = {};
   const summaryStats = {
     rowsRead: 0,
     rowsApplied: 0,
@@ -1134,6 +1137,8 @@ export async function runSessionSync(
         if (!update.complete) {
           summaryComplete = false;
           pendingSummarySessionIds.push(sessionId);
+          const pendingReason = update.fallbackReason ?? `${update.mode}_in_progress`;
+          pendingSummaryReasons[pendingReason] = (pendingSummaryReasons[pendingReason] ?? 0) + 1;
         } else if (update.snapshot) {
           snapshots.push(update.snapshot);
           snapshotVersions.set(ensureUuidSessionId(sessionId).id, {
@@ -1215,7 +1220,11 @@ export async function runSessionSync(
   const markStale = (sessionId: string) => {
     summaryComplete = false;
     const rawSessionId = snapshotVersions.get(sessionId)?.rawSessionId ?? sessionId;
-    if (!pendingSummarySessionIds.includes(rawSessionId)) pendingSummarySessionIds.push(rawSessionId);
+    if (!pendingSummarySessionIds.includes(rawSessionId)) {
+      pendingSummarySessionIds.push(rawSessionId);
+      pendingSummaryReasons.snapshot_changed_before_send =
+        (pendingSummaryReasons.snapshot_changed_before_send ?? 0) + 1;
+    }
   };
 
   const inFlight = new Set<Promise<void>>();
@@ -1412,6 +1421,7 @@ export async function runSessionSync(
     auditTable: renderSessionAudit(audit),
     summaryComplete,
     pendingSummarySessionIds,
+    pendingSummaryReasons,
     summaryStats,
   };
 
@@ -1435,6 +1445,7 @@ export async function runSessionSync(
       incremental: Boolean(options.incremental),
       summaryComplete,
       pendingSummarySessions: pendingSummarySessionIds.length,
+      pendingSummaryReasons,
       summaryRowsRead: summaryStats.rowsRead,
       summaryRowsApplied: summaryStats.rowsApplied,
       summaryFullRecomputes: summaryStats.fullRecomputes,

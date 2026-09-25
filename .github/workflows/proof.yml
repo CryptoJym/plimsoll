@@ -279,6 +279,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-incremental
 
+      - name: Prove session summaries resume across moving daemon horizons (eco-6hoxj.163.86)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-cycle-resume
+
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
