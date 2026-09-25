@@ -26,7 +26,7 @@ RELEASES = {
     "0.7.39": ("4d6920097c0eab03fe3b63ac329761a1f3948e25cc558d27dcac17aa300299b9", "6829d9c0c6ea84471837e27ab083e8bd9c2d6911a31567e5b6b741e236cb1354"),
     "0.7.40": ("9d84b45d9884474eb9fe98cdd5910c0fc86ef826b071e7e42fcbb7d65d7a9c88", "f065623520e69d1adc2809e4a908e81468ff1fa857a985def2258483633218b2"),
 }
-SCENES = ("pending_restore", "both_in_trash", "interrupted_prune", "interrupted_update")
+SCENES = ("pending_restore", "both_in_trash", "interrupted_prune", "interrupted_update", "interrupted_prune_same_id")
 
 
 def require(condition, message):
@@ -164,7 +164,7 @@ def scenario(fixture, name):
         result, _ = fixture.update("a4", "1.0.4", fault)
         require(result.returncode == -9, f"update retention fault did not fire: {result.returncode} {result.stderr[-400:]}")
     else:
-        if name == "interrupted_prune":
+        if name in ("interrupted_prune", "interrupted_prune_same_id"):
             fault = (r"/snapshots/a2$", r"/trash/snapshot\+a2\+[0-9a-f]+$", "kill-before")
         else:
             fault = (r"/versions/1\.0\.1$", r"/trash/runtime_version\+1\.0\.1\+[0-9a-f]+$", "kill-after")
@@ -206,8 +206,10 @@ def main():
                     fixture = Fixture(Path(fixture_root))
                     scenario(fixture, name)
                     before = fixture.census()
+                    operation = (read_json(next((fixture.life / "removals").glob("*.json")))["operationId"]
+                                 if name == "interrupted_prune_same_id" else f"older-{version.replace('.', '')}-{name}")
                     result, output = fixture.call(cli, ["snapshots", "prune", "--keep", "1", "--operation-id",
-                                                        f"older-{version.replace('.', '')}-{name}", "--apply"])
+                                                        operation, "--apply"])
                     after = fixture.census()
                     retention = output.get("retention") or (output.get("receipt") or {}).get("retention") or {}
                     ok = (result.returncode == 0 and retention.get("status") == "skipped" and
@@ -221,7 +223,7 @@ def main():
         summary = {"proof": "lifecycle-cross-version", "checks": checks, "passed": sum(c["passed"] for c in checks),
                    "total": len(checks), "liveStateTouched": False}
         print(json.dumps(summary), flush=True)
-        require(summary["passed"] == summary["total"] == 12, "released CLI matrix failed")
+        require(summary["passed"] == summary["total"] == 15, "released CLI matrix failed")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,6 @@ if (result.stderr) process.stderr.write(result.stderr);
 const summary = (() => {
   try { return JSON.parse(result.stdout?.trim().split("\n").at(-1) ?? ""); } catch { return null; }
 })();
-completion.check("all_twelve_pinned_release_states_preserve_every_protected_byte",
-  result.status === 0 && summary?.passed === 12 && summary?.total === 12 && summary?.liveStateTouched === false);
+completion.check("all_fifteen_pinned_release_states_preserve_every_protected_byte",
+  result.status === 0 && summary?.passed === 15 && summary?.total === 15 && summary?.liveStateTouched === false);
 completion.complete();
