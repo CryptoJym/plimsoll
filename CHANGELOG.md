@@ -48,10 +48,15 @@ does not transfer its sessions to a tailer.
   snapshots reconcile` (a dry run unless `--apply`) shows why retention is
   blocked and repairs it.
 - An update refuses to start while any other process has the ledger, its WAL
-  or its shared-memory file open (`ledger_in_use`). Stop every ledger user,
-  including SQLite clients and other `plimsoll` commands, during an update
-  window (`.163.30`). A rollback checks the restored ledger with
+  or its shared-memory file open, or when it cannot prove that none does
+  (`ledger_in_use`, `quiescence_unproven`). A refused update changes nothing;
+  start it again once the ledger is free. Stop every ledger user, including
+  SQLite clients and other `plimsoll` commands, during an update window
+  (`.163.30`). A rollback checks the restored ledger with
   `PRAGMA integrity_check` and records `restore.integrity` in its receipt.
+- `--retention keep-all` still removes no snapshot, runtime version, receipt
+  or trash entry; an update can delete a leftover
+  `work-ledger.sqlite.restore-*` file from an earlier crashed restore.
 
 ## 0.7.40 — 2026-09-24
 
