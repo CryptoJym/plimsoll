@@ -37,7 +37,6 @@ const previousTenant = "00000000-0000-4000-8000-000000000702";
 const deviceInstallId = "00000000-0000-4000-8000-000000000703";
 const oldDeviceInstallId = deviceInstallId;
 const installKey = "session-sync-upgrade-proof-install";
-const until = "2026-09-24T23:59:59.000Z";
 const expectedSourceCounts = { claude_code: 209, codex: 108 };
 const conflictSessionId = "00000000-0000-4000-8000-000000000799";
 
@@ -52,6 +51,7 @@ type Receipt = {
     sourceCounts: Record<string, number>;
     conflictSessionId: string;
     legacySessionResumeState: "none";
+    coveredUntil: string;
   };
   wire: {
     sentSessions: number;
@@ -198,6 +198,12 @@ async function main() {
     pathToFileURL(path.join(cloudRoot, "src/lib/delivery-ack-response.ts")).href,
   ) as unknown as CloudAckResponseModule;
   const db = new Database(ledgerPath);
+  // The v0.7.4 fixture stamps created_at from its own clock. Cover its exact
+  // persisted rows so this upgrade proof remains valid on later CI dates.
+  const cutoff = db.prepare(`select max(created_at) as coveredUntil
+    from buffered_events where session_id is not null`).get() as { coveredUntil: string | null };
+  assert.ok(cutoff.coveredUntil, "legacy fixture has no session rows");
+  const until = cutoff.coveredUntil;
   const config = collectorConfigSchema.parse({
     uploadUrl: "http://127.0.0.1:1/ingest",
     tenantId: currentTenant,
@@ -250,7 +256,7 @@ async function main() {
     schema: "plimsoll.collector-session-sync-upgrade-proof/v1",
     expected,
     passed,
-    fixture: { ledgerPath, ...fixture, conflictSessionId },
+    fixture: { ledgerPath, ...fixture, conflictSessionId, coveredUntil: until },
     wire: {
       sentSessions: result.sentSessions,
       acceptedSessions: result.acceptedSessions,

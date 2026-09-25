@@ -158,9 +158,21 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   const rawInsertTrigger = db.prepare(
     "select sql from sqlite_master where type='trigger' and name='trg_session_summary_raw_insert'",
   ).get() as { sql: string } | undefined;
+  const leaseTriggers = db.prepare(`select name, sql from sqlite_master where type='trigger'
+    and name in ('trg_session_sync_upload_lease_insert',
+      'trg_session_sync_upload_lease_dirty_insert',
+      'trg_session_sync_upload_lease_dirty_update')`).all() as Array<{ name: string; sql: string }>;
   // SQLite's CREATE TRIGGER IF NOT EXISTS keeps the old trigger body. Replace
   // it atomically when upgrading a v1/v2 ledger to the frozen scan boundary.
   db.transaction(() => {
+    // Existing 0.7.40 ledgers have this trigger. An append is outside the
+    // leased snapshot; only edits and erasures of existing rows need a fence.
+    for (const trigger of leaseTriggers) {
+      if (trigger.name === "trg_session_sync_upload_lease_insert" ||
+          !trigger.sql.includes("raw_insert_before_high_water")) {
+        db.exec(`drop trigger ${trigger.name}`);
+      }
+    }
     if (rawInsertTrigger && !rawInsertTrigger.sql.includes("scanBoundary")) {
       db.exec("drop trigger trg_session_summary_raw_insert");
     }
@@ -195,9 +207,9 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       mutation_revision integer not null check (mutation_revision >= 0)
     );
     -- A session-sync upload owns a short, per-session lease rather than the
-    -- database-wide write reservation. Raw mutations defer while the lease is
-    -- live, so an in-flight body cannot be overtaken by an erasure or another
-    -- source change. The transport clears these rows after the response (or
+    -- database-wide write reservation. Appends remain in the summary queue;
+    -- edits and erasures defer so an in-flight body cannot be overtaken by
+    -- an erasure. The transport clears these rows after the response (or
     -- they become eligible for reuse after their bounded expiry).
     create table if not exists session_sync_upload_leases (
       session_id text primary key,
@@ -208,16 +220,6 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     );
     create index if not exists idx_session_sync_upload_leases_expiry
       on session_sync_upload_leases (lease_expires_at);
-    create trigger if not exists trg_session_sync_upload_lease_insert
-    before insert on buffered_events
-    when new.session_id is not null and exists (
-      select 1 from session_sync_upload_leases
-       where session_id = new.session_id
-         and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    )
-    begin
-      select raise(abort, 'session_sync_upload_lease');
-    end;
     create trigger if not exists trg_session_sync_upload_lease_update
     before update of id, source, event_type, data_mode, observed_at, created_at,
       session_id, input_tokens, output_tokens, cache_read_tokens,
@@ -242,11 +244,12 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       select raise(abort, 'session_sync_upload_lease');
     end;
     -- Privacy receipt/outbox changes also dirty the summary. Abort their
-    -- original statement so callers retain the work for retry; a no-op would
-    -- let a caller mistake a deferred erasure for a completed one.
+    -- original statement so callers retain the work for retry. A backdated
+    -- append may dirty a frozen scan; its marker is allowed through so the
+    -- post-send freshness check resends a complete snapshot on the next pass.
     create trigger if not exists trg_session_sync_upload_lease_dirty_insert
     before insert on session_sync_summary_dirty
-    when exists (select 1 from session_sync_upload_leases
+    when new.reason != 'raw_insert_before_high_water' and exists (select 1 from session_sync_upload_leases
       where session_id = new.session_id
         and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     begin
@@ -254,7 +257,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     end;
     create trigger if not exists trg_session_sync_upload_lease_dirty_update
     before update on session_sync_summary_dirty
-    when exists (select 1 from session_sync_upload_leases
+    when new.reason != 'raw_insert_before_high_water' and exists (select 1 from session_sync_upload_leases
       where session_id = new.session_id
         and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     begin

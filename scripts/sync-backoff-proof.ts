@@ -216,7 +216,7 @@ async function main() {
   });
   await check("session_followups_are_carried_during_server_cooldown",()=>{
     const source=fs.readFileSync(path.resolve("packages/collector-cli/src/cli.ts"),"utf8");
-    const guard="if (serverRetryAfterMs > 0) { carrySessions(); return; }";
+    const guard="if (serverRetryAfterMs > 0) { await carrySessions(); return; }";
     assert.ok(source.includes(guard));
     assert.ok(source.indexOf(guard)<source.indexOf("const touchedSessionIds ="));
   });

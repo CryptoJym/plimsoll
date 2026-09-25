@@ -18,6 +18,7 @@ import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import { ensureSessionContextIndexSchema } from "./session-context-index";
+import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -560,6 +561,16 @@ export class LocalEventBuffer {
       deviceId: options.deviceId,
     });
     markOpenStep("ledger.delivery_schema");
+    // A 0.7.40 ledger can still hold an unexpired upload lease. Remove its
+    // insert fence before the daemon accepts the first intake request.
+    // Other ledgers keep the lazy session-summary schema initialization.
+    const oldLeaseInsertTrigger = this.db.prepare(
+      "select 1 from sqlite_master where type='trigger' and name='trg_session_sync_upload_lease_insert'",
+    ).get();
+    if (oldLeaseInsertTrigger) {
+      ensureSessionSummarySchema(this.db);
+      markOpenStep("ledger.session_summary_schema");
+    }
     if (options.workspaceId) this.useWorkspace(options.workspaceId);
     markOpenStep("ledger.workspace_binding");
     this.db.exec(`

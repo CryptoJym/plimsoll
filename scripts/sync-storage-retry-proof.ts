@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
@@ -19,6 +20,12 @@ import {
 } from "../packages/collector-cli/src/sqlite-contention";
 import { DeliveryUploadError, uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { SyncBackoff } from "../packages/collector-cli/src/sync-backoff";
+import {
+  emptyDaemonSessionSyncState,
+  loadDaemonSessionSyncState,
+  saveDaemonSessionSyncState,
+  saveDaemonSessionSyncStateWithRetry,
+} from "../packages/collector-cli/src/session-sync";
 import { PLIMSOLL_VERSION } from "../packages/collector-cli/src/version";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
@@ -414,6 +421,39 @@ async function main() {
         detail: { holdMs, elapsedMs: Number(elapsedMs.toFixed(3)), ...storageRetry.receipt() },
       });
     } finally {
+      buffer.close();
+    }
+  });
+
+  await check("daemon_session_carry_survives_a_busy_writer", async () => {
+    const buffer = target();
+    const writer = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+    const initial = emptyDaemonSessionSyncState();
+    const next = {
+      ...initial,
+      caughtUp: true,
+      lastSuccessfulUntil: "2026-09-25T00:00:00.000Z",
+      pendingSessionIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa41"],
+    };
+    let release: ReturnType<typeof setTimeout> | undefined;
+    try {
+      saveDaemonSessionSyncState(buffer.database, initial);
+      writer.exec("begin immediate");
+      assert.throws(() => saveDaemonSessionSyncState(buffer.database, next), isSqliteContentionError);
+      release = setTimeout(() => writer.exec("commit"), holdMs);
+      const retry = new SyncStorageRetryController({ budgetMs: 1_000 });
+      await saveDaemonSessionSyncStateWithRetry(buffer.database, next, retry);
+      assert.ok(retry.receipt().retries > 0);
+      assert.deepEqual(loadDaemonSessionSyncState(buffer.database), next);
+      const source = fs.readFileSync(
+        new URL("../packages/collector-cli/src/cli.ts", import.meta.url), "utf8",
+      );
+      assert.match(source, /await saveDaemonSessionSyncStateWithRetry\(/);
+      assert.match(source, /if \(!await persistSessionCarry\(\)\) return/);
+    } finally {
+      if (release) clearTimeout(release);
+      if (writer.inTransaction) writer.exec("rollback");
+      writer.close();
       buffer.close();
     }
   });
