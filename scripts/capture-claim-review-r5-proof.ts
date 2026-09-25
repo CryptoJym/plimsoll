@@ -253,28 +253,35 @@ function coverageTurnBudget() {
   const links = Array.from({ length: RELEASE_MAX_WORK_PER_TURN * 2 + 17 },
     (_, index) => `link-${index}`);
   let checked = 0;
+  let next = 0;
   const walk = new CaptureCoverageWalk({
     roots: ["root"],
-    list: () => ({ directories: [], files: [], links }),
+    open: () => ({
+      read: () => next < links.length ? { path: links[next++]!, kind: "link" as const } : null,
+      unchanged: () => true,
+      close: () => undefined,
+    }),
     check: () => null,
     checkLink: () => {
       checked += 1;
       return null;
     },
   });
-  walk.step(1_000, () => undefined, () => 0);
-  walk.step(1_000, () => undefined, () => 0);
+  const firstWork = walk.step(1_000, () => undefined, () => 0);
+  const secondWork = walk.step(1_000, () => undefined, () => 0);
   const afterBudgetTurn = checked;
   let virtualNow = 0;
-  walk.step(8, () => undefined, () => virtualNow++);
+  const deadlineWork = walk.step(8, () => undefined, () => virtualNow++);
   const afterDeadlineTurn = checked - afterBudgetTurn;
   check("R4_S1_coverage_walk_enforces_the_deterministic_turn_work_budget_and_deadline",
     CAPTURE_COVERAGE_MAX_WORK_PER_TURN === RELEASE_MAX_WORK_PER_TURN &&
-      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN &&
-      afterDeadlineTurn === 8 &&
+      firstWork === RELEASE_MAX_WORK_PER_TURN && secondWork === RELEASE_MAX_WORK_PER_TURN &&
+      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN - 1 &&
+      deadlineWork === 8 && afterDeadlineTurn === 4 &&
       !walk.done,
     { maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, releaseMaxWorkPerTurn: RELEASE_MAX_WORK_PER_TURN,
-      afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+      firstWork, secondWork, deadlineWork, afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+  walk.close();
 }
 
 async function manyLinks() {

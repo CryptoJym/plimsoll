@@ -46,7 +46,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -427,22 +427,17 @@ export class RolloutTailer {
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.sessionsDir],
       maxEntries,
-      list: (directory, depth) => {
+      open: (directory, depth) => openCaptureCoverageDirectory(directory, (entry) => {
+        const full = path.join(directory, entry.name);
         if (depth < 3) {
-          const listing = { directories: [] as string[], files: [], links: [] as string[] };
-          for (const entry of this.io.readDirents(directory)) {
-            if (entry.isDirectory()) listing.directories.push(path.join(directory, entry.name));
-            else if (entry.isSymbolicLink()) listing.links.push(path.join(directory, entry.name));
-          }
-          return listing;
+          if (entry.isDirectory()) return { path: full, kind: "directory" };
+          if (entry.isSymbolicLink()) return { path: full, kind: "link" };
+        } else if (entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
+          // The check below classifies symlinked rollouts as uncovered links.
+          return { path: full, kind: "file" };
         }
-        // A symlinked rollout is listed here and checked as a link.
-        return {
-          directories: [],
-          files: this.io.readNames(directory).filter((name) => name.startsWith("rollout-") && name.endsWith(".jsonl"))
-            .map((name) => path.join(directory, name)),
-        };
-      },
+        return null;
+      }),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
         return stat ? verdict(this.cursorKey(file), stat) : null;

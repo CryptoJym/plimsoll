@@ -1,4 +1,4 @@
-import type fs from "node:fs";
+import fs from "node:fs";
 
 import type Database from "better-sqlite3";
 
@@ -106,16 +106,84 @@ export type CaptureCoverageFile = {
 /** `complete` is false when a walk hit its entry budget, a directory error or an unready root. */
 export type CaptureCoverageSnapshot = { complete: boolean; files: CaptureCoverageFile[] };
 
+export type CaptureCoverageEntry = { path: string; kind: "directory" | "file" | "link" };
+
+/** One directory cursor; `undefined` is an ignored entry and `null` is EOF. */
+export type CaptureCoverageDirectory = {
+  read(): CaptureCoverageEntry | undefined | null;
+  unchanged(): boolean;
+  close(): void;
+};
+
 /**
- * What one directory holds for a walk: directories to descend into, files to
- * check, and symlinks where the tailer would descend if they were directories.
+ * Open without materializing a listing. Node may prefetch at most one 32-entry
+ * batch; each returned entry is charged before the walk reads the next one.
+ * Directory identity and change times are checked across turns and at EOF.
  */
-export type CaptureCoverageListing = { directories: string[]; files: string[]; links?: string[] };
+export function openCaptureCoverageDirectory(
+  directory: string,
+  classify: (entry: fs.Dirent) => CaptureCoverageEntry | null,
+): CaptureCoverageDirectory {
+  const identity = () => fs.lstatSync(directory, { bigint: true });
+  const before = identity();
+  if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("capture_coverage_not_directory");
+  const handle = fs.opendirSync(directory, { bufferSize: 32 });
+  let closed = false;
+  const close = () => {
+    if (!closed) {
+      closed = true;
+      handle.closeSync();
+    }
+  };
+  const unchanged = () => {
+    try {
+      const after = identity();
+      return after.isDirectory() && after.dev === before.dev && after.ino === before.ino &&
+        after.mtimeNs === before.mtimeNs && after.ctimeNs === before.ctimeNs;
+    } catch {
+      return false;
+    }
+  };
+  if (!unchanged()) {
+    close();
+    throw new Error("capture_coverage_directory_changed");
+  }
+  return {
+    read: () => {
+      const entry = handle.readSync();
+      return entry ? classify(entry) ?? undefined : null;
+    },
+    unchanged,
+    close,
+  };
+}
+
+/** A one-entry cursor for a root that is itself a symlink. */
+export function linkCaptureCoverageDirectory(link: string): CaptureCoverageDirectory {
+  const before = fs.lstatSync(link, { bigint: true });
+  if (!before.isSymbolicLink()) throw new Error("capture_coverage_link_changed");
+  let read = false;
+  return {
+    read: () => {
+      if (read) return null;
+      read = true;
+      return { path: link, kind: "link" };
+    },
+    unchanged: () => {
+      try {
+        const after = fs.lstatSync(link, { bigint: true });
+        return after.isSymbolicLink() && after.dev === before.dev && after.ino === before.ino &&
+          after.mtimeNs === before.mtimeNs && after.ctimeNs === before.ctimeNs;
+      } catch { return false; }
+    },
+    close: () => undefined,
+  };
+}
 
 export type CaptureCoverageWalkSpec = {
   roots: readonly string[];
-  /** List one directory; depth 0 is a root. Throws when it cannot be listed. */
-  list(directory: string, depth: number): CaptureCoverageListing;
+  /** Open one directory incrementally; depth 0 is a root. Throws on errors. */
+  open(directory: string, depth: number): CaptureCoverageDirectory;
   /**
    * Stat one file (lstat, never through a link) and read the tailer's state; a
    * symlinked file is a `link` verdict. Null when it is gone or not a regular
@@ -144,6 +212,7 @@ const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | null)?.c
 export class CaptureCoverageWalk {
   private readonly directories: Array<{ directory: string; depth: number }>;
   private readonly files: Array<{ path: string; link: boolean }> = [];
+  private active: CaptureCoverageDirectory | null = null;
   private entries = 0;
   done = false;
   complete = true;
@@ -158,7 +227,7 @@ export class CaptureCoverageWalk {
   static empty() {
     return new CaptureCoverageWalk({
       roots: [],
-      list: () => ({ directories: [], files: [] }),
+      open: () => { throw new Error("empty_walk_has_no_directory"); },
       check: () => null,
       checkLink: () => null,
     });
@@ -172,11 +241,13 @@ export class CaptureCoverageWalk {
   ) {
     let batch: CaptureCoverageFile[] = [];
     let work = 0;
+    const limit = Math.max(0, Math.min(CAPTURE_COVERAGE_MAX_WORK_PER_TURN, Math.floor(maxWork)));
     const flush = () => {
       if (batch.length > 0) onBatch(batch);
       batch = [];
     };
-    while (!this.done && work < maxWork && now() < deadline) {
+    if (this.active && !this.active.unchanged()) this.fail();
+    while (!this.done && work < limit && now() < deadline) {
       const file = this.files.pop();
       if (file !== undefined) {
         work += 1;
@@ -189,40 +260,49 @@ export class CaptureCoverageWalk {
         if (batch.length >= CAPTURE_COVERAGE_BATCH) flush();
         continue;
       }
-      const next = this.directories.pop();
-      if (!next) {
-        this.done = true;
-        break;
+      if (this.active) {
+        work += 1;
+        try {
+          const entry = this.active.read();
+          if (entry === null) {
+            if (!this.active.unchanged()) this.fail();
+            else { this.active.close(); this.active = null; }
+          } else {
+            this.entries += 1;
+            if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) this.fail();
+            else if (entry?.kind === "directory") {
+              this.directories.push({ directory: entry.path, depth: this.activeDepth + 1 });
+            } else if (entry) this.files.push({ path: entry.path, link: entry.kind === "link" });
+          }
+        } catch { this.fail(); }
+        continue;
       }
-      let listing: CaptureCoverageListing;
+      const next = this.directories.pop();
+      if (!next) { this.done = true; break; }
+      work += 1;
       try {
-        listing = this.spec!.list(next.directory, next.depth);
+        this.active = this.spec!.open(next.directory, next.depth);
+        this.activeDepth = next.depth;
       } catch (error) {
         // A missing root holds no files, as it does for the tailers' scans.
         if (!(next.depth === 0 && errorCode(error) === "ENOENT")) this.fail();
-        continue;
-      }
-      const links = listing.links ?? [];
-      work += 1 + listing.directories.length + listing.files.length + links.length;
-      this.entries += listing.directories.length + listing.files.length + links.length;
-      if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) {
-        this.fail();
-        continue;
-      }
-      for (let index = listing.directories.length - 1; index >= 0; index -= 1) {
-        this.directories.push({ directory: listing.directories[index]!, depth: next.depth + 1 });
-      }
-      for (let index = links.length - 1; index >= 0; index -= 1) this.files.push({ path: links[index]!, link: true });
-      for (let index = listing.files.length - 1; index >= 0; index -= 1) {
-        this.files.push({ path: listing.files[index]!, link: false });
       }
     }
+    if (this.active && !this.active.unchanged()) this.fail();
     flush();
+    return work;
   }
+
+  private activeDepth = 0;
+
+  /** Close a suspended directory when maintenance stops or discards a walk. */
+  close() { if (!this.done) this.fail(); }
 
   private fail() {
     this.complete = false;
     this.done = true;
+    try { this.active?.close(); } catch { /* already failing closed */ }
+    this.active = null;
     this.directories.length = 0;
     this.files.length = 0;
   }

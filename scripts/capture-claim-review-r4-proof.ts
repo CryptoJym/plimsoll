@@ -42,6 +42,7 @@ import { recordSpoolLoss } from "../packages/collector-cli/src/spool-losses";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
+import { incrementalCoverageChecks } from "./lib/capture-coverage-incremental";
 
 // maintenance.ts checkCaptureCoverage steps one coverage walk per source in a
 // turn: codex, claude_code and grok.
@@ -52,7 +53,7 @@ const COVERAGE_SOURCES = 3;
  * this proof until the new ceiling is reviewed and written here. */
 const RELEASE_MAX_WORK_PER_TURN = 4_096;
 
-const completion = createProofCompletion("capture-claim-review-r4", 6);
+const completion = createProofCompletion("capture-claim-review-r4", 11);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
 const check = (name: string, passed: boolean, detail: Record<string, unknown>) => {
   completion.check(name, passed);
@@ -265,28 +266,35 @@ function coverageTurnBudget() {
   const files = Array.from({ length: RELEASE_MAX_WORK_PER_TURN * 2 + 17 },
     (_, index) => `file-${index}`);
   let checked = 0;
+  let next = 0;
   const walk = new CaptureCoverageWalk({
     roots: ["root"],
-    list: () => ({ directories: [], files }),
+    open: () => ({
+      read: () => next < files.length ? { path: files[next++]!, kind: "file" as const } : null,
+      unchanged: () => true,
+      close: () => undefined,
+    }),
     check: () => {
       checked += 1;
       return null;
     },
     checkLink: () => null,
   });
-  walk.step(1_000, () => undefined, () => 0);
-  walk.step(1_000, () => undefined, () => 0);
+  const firstWork = walk.step(1_000, () => undefined, () => 0);
+  const secondWork = walk.step(1_000, () => undefined, () => 0);
   const afterBudgetTurn = checked;
   let virtualNow = 0;
-  walk.step(8, () => undefined, () => virtualNow++);
+  const deadlineWork = walk.step(8, () => undefined, () => virtualNow++);
   const afterDeadlineTurn = checked - afterBudgetTurn;
   check("R3_N4_coverage_walk_enforces_the_deterministic_turn_work_budget_and_deadline",
     CAPTURE_COVERAGE_MAX_WORK_PER_TURN === RELEASE_MAX_WORK_PER_TURN &&
-      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN &&
-      afterDeadlineTurn === 8 &&
+      firstWork === RELEASE_MAX_WORK_PER_TURN && secondWork === RELEASE_MAX_WORK_PER_TURN &&
+      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN - 1 &&
+      deadlineWork === 8 && afterDeadlineTurn === 4 &&
       !walk.done,
     { maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, releaseMaxWorkPerTurn: RELEASE_MAX_WORK_PER_TURN,
-      afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+      firstWork, secondWork, deadlineWork, afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+  walk.close();
 }
 
 async function r3n4() {
@@ -411,7 +419,7 @@ async function grokCoverage() {
 }
 
 async function main() {
-  for (const step of [r3s2, r3s4, r3s5, coverageTurnBudget, r3n4, grokCoverage]) {
+  for (const step of [r3s2, r3s4, r3s5, coverageTurnBudget, () => incrementalCoverageChecks(check), r3n4, grokCoverage]) {
     try {
       await step();
     } catch (error) {

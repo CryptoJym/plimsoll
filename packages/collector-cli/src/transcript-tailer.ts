@@ -47,7 +47,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -370,19 +370,16 @@ export class TranscriptTailer {
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.projectsDir],
       maxEntries,
-      list: (directory, depth) => {
-        const directories: string[] = [];
-        const files: string[] = [];
-        const links: string[] = [];
-        for (const entry of this.io.readDirents(directory)) {
-          const full = path.join(directory, entry.name);
-          if (entry.isDirectory()) directories.push(full);
-          // A symlinked transcript is listed here and checked as a link.
-          else if (entry.name.endsWith(".jsonl")) files.push(full);
-          else if (entry.isSymbolicLink() && !(depth === 1 && entry.name === "memory")) links.push(full);
+      open: (directory, depth) => openCaptureCoverageDirectory(directory, (entry) => {
+        const full = path.join(directory, entry.name);
+        if (entry.isDirectory()) return { path: full, kind: "directory" };
+        // The check below classifies symlinked transcripts as uncovered links.
+        if (entry.name.endsWith(".jsonl")) return { path: full, kind: "file" };
+        if (entry.isSymbolicLink() && !(depth === 1 && entry.name === "memory")) {
+          return { path: full, kind: "link" };
         }
-        return { directories, files, links };
-      },
+        return null;
+      }),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
         return stat ? verdict(this.cursorKey(file), stat) : null;
