@@ -159,6 +159,9 @@ const CASES = {
     "new_update_retention_record_is_fenced_before_its_first_move",
     "inherited_pending_record_is_fenced_before_a_refused_retry",
   ],
+  r13Marker: [
+    "inherited_pending_record_is_fenced_at_its_first_restore_move",
+  ],
   r12Preview: ["unusable_restore_preview_and_list_refuse_before_apply"],
   r12Inventory: ["unrestorable_snapshot_list_warns_against_old_keep_one"],
 } as const;
@@ -1668,6 +1671,55 @@ async function r12RemovalMarkers() {
         treeDigest(source) === before && listDirectory(path.join(fixture.lifecycleRoot, "trash")).length === 0 &&
         fixture.receipt("r12-inherited-retry", "snapshots_prune") === null,
       { error: refused?.message, record: after, snapshotUnchanged: treeDigest(source) === before });
+  });
+
+  await runCase([CASES.r13Marker[0]], async (record) => {
+    const fixture = createHome("r13-inherited-first-restore");
+    await updatesWithoutRetention(fixture, [["m1", "37.2.0"], ["m2", "37.2.1"], ["m3", "37.2.2"]]);
+    const trashRoot = path.join(fixture.lifecycleRoot, "trash");
+    const removalRoot = path.join(fixture.lifecycleRoot, "removals");
+    fs.mkdirSync(trashRoot, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(removalRoot, { recursive: true, mode: 0o700 });
+    const items = [
+      { kind: "snapshot", name: "m2", bytes: 0, trashName: "snapshot+m2+0123456789ab", origin: "planned" },
+      { kind: "runtime_version", name: "37.2.0", bytes: 0, trashName: "runtime_version+37.2.0+0123456789ab", origin: "planned" },
+    ] as const;
+    fs.renameSync(path.join(fixture.lifecycleRoot, "snapshots", "m2"), path.join(trashRoot, items[0].trashName));
+    fs.renameSync(path.join(fixture.lifecycleRoot, "versions", "37.2.0"), path.join(trashRoot, items[1].trashName));
+    fs.rmSync(path.join(fixture.lifecycleRoot, "versions", "37.2.1"), { recursive: true, force: true });
+    const removalRecord = path.join(removalRoot, "r13-inherited.json");
+    const inherited = { schemaVersion: 1, operationId: "r13-inherited", items };
+    fs.writeFileSync(removalRecord, `${JSON.stringify(inherited)}\n`, { mode: 0o600 });
+
+    const mutableFs = fs as typeof fs & { renameSync: (...args: Parameters<typeof fs.renameSync>) => void };
+    const originalRename = mutableFs.renameSync;
+    let atFirstMove: Record<string, unknown> | null = null;
+    let firstMoveComplete = false;
+    let snapshotStillInTrash = false;
+    mutableFs.renameSync = (...args) => {
+      const result = originalRename.apply(fs, args);
+      if (atFirstMove === null && String(args[0]).startsWith(`${trashRoot}${path.sep}`)) {
+        firstMoveComplete = !exists(String(args[0])) && exists(String(args[1]));
+        snapshotStillInTrash = exists(path.join(trashRoot, items[0].trashName));
+        atFirstMove = JSON.parse(fs.readFileSync(removalRecord, "utf8")) as Record<string, unknown>;
+      }
+      return result;
+    };
+    let failed: Awaited<ReturnType<typeof rejection>> = null;
+    try {
+      failed = await rejection(() => fixture.manager().pruneSnapshots({
+        operationId: "r13-inherited-retry", keep: 1, apply: true,
+      }));
+    } finally {
+      mutableFs.renameSync = originalRename;
+    }
+    const receipt = fixture.receipt("r13-inherited-retry", "snapshots_prune");
+    record(CASES.r13Marker[0],
+      oldReaderAccepts(inherited) && failed === null && firstMoveComplete && snapshotStillInTrash &&
+        marked(atFirstMove) && !exists(removalRecord) &&
+        same(receipt?.retention?.restored?.map((item) => `${item.kind}:${item.name}`) ?? [],
+          ["snapshot:m2", "runtime_version:37.2.0"]),
+      { error: failed?.message, atFirstMove, firstMoveComplete, snapshotStillInTrash, receipt });
   });
 }
 
