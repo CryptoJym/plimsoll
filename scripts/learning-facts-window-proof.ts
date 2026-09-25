@@ -333,6 +333,33 @@ function x5b() {
     effectiveStart: receipt.window.effectiveStartInclusive };
 }
 
+function x6c() {
+  const file = path.join(root, "x6c.sqlite");
+  const now = Date.now();
+  const store = buffer(file, {});
+  const episode = buildWorkEpisodeFact({ source: "codex", sessionId: "r2-session",
+    sourceEpisodeKey: "x6c", workClass: "other", complexityBand: "unknown",
+    startedAt: iso(now - 2 * DAY) });
+  store.learningFacts.recordWorkEpisode(episode);
+  const lostAt = now - HOUR;
+  attempt(store.learningFacts, "x6c-valid", lostAt, undefined, episode.episodeId);
+  store.database.prepare(`update work_episode_facts set source = 'not-a-source',
+    retention_verified = null where episode_id = ?`).run(episode.episodeId);
+  store.close();
+  const reopened = buffer(file, {});
+  try {
+    const left = (reopened.database.prepare(`select count(*) as n from tool_attempt_facts`
+    ).get() as { n: number }).n;
+    assert.equal(left, 0);
+    const window = reopened.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(lostAt),
+      "an invalid raw episode deleted a valid attempt inside the claimed window");
+    assert.equal(window.reason, "retention");
+    return { case: "X6c", lostAt: iso(lostAt), effectiveStart: window.effectiveStartInclusive };
+  } finally { reopened.close(); }
+}
+
 async function main() {
   try {
     const results: unknown[] = [];
@@ -346,6 +373,7 @@ async function main() {
     if (selected === "all" || selected === "x6b") results.push(x6b());
     if (selected === "all" || selected === "x5a") results.push(x5a());
     if (selected === "all" || selected === "x5b") results.push(x5b());
+    if (selected === "all" || selected === "x6c") results.push(x6c());
     if (results.length === 0) throw new Error(`unknown case: ${selected}`);
     console.log(JSON.stringify({ proof: "learning-facts-window", passed: true, cases: results }));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

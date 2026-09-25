@@ -929,11 +929,23 @@ export class LearningFactStore {
     const removeEpisodes = this.db.prepare(`delete from work_episode_facts where episode_id = ?`);
     // Remove dependent facts and child episodes in the same transaction.
     for (const episodeId of [...episodeIds].reverse()) {
-      if (countEviction) {
-        for (const definition of LEARNING_FACT_TABLES.slice(0, 3)) {
+      for (const definition of LEARNING_FACT_TABLES.slice(0, 3)) {
+        if (countEviction) {
           const last = this.db.prepare(`select max(retention_ms) as ms from ${definition.name}
             where episode_id = ?`).get(episodeId) as { ms: number | null };
           this.advanceLossCutoff(definition, last.ms === null ? null : last.ms + 1);
+        } else {
+          // Invalid raw roots may have provisional or missing retention keys.
+          // Preserve the timestamps of valid dependents before deleting them.
+          const rows = this.db.prepare(`select ${definition.retentionColumn} as timestamp,
+            retention_ms as ms from ${definition.name} where episode_id = ?`
+          ).all(episodeId) as Array<{ timestamp: string; ms: number | null }>;
+          let newestDeleted: number | null = null;
+          for (const row of rows) {
+            const at = retentionInstant(row.timestamp) ?? row.ms ?? Date.now();
+            newestDeleted = Math.max(newestDeleted ?? at, at);
+          }
+          this.advanceLossCutoff(definition, newestDeleted === null ? null : newestDeleted + 1);
         }
       }
       counts.tool_attempt_facts += removeAttempts.run(episodeId).changes;
@@ -984,19 +996,21 @@ export class LearningFactStore {
     const remove = this.db.prepare(
       `delete from ${definition.name} where ${definition.idColumn} = ?`,
     );
-    const readRetention = countEviction ? this.db.prepare(
-      `select retention_ms as ms from ${definition.name} where ${definition.idColumn} = ?`,
-    ) : null;
+    const readRetention = this.db.prepare(countEviction
+      ? `select retention_ms as ms from ${definition.name} where ${definition.idColumn} = ?`
+      : `select retention_ms as ms, ${definition.retentionColumn} as timestamp
+        from ${definition.name} where ${definition.idColumn} = ?`);
     let lastDeletedMs: number | null = null;
     for (const row of ids) {
-      const victim = readRetention?.get(row.id) as { ms: number | null } | undefined;
-      if (typeof victim?.ms === "number") {
-        lastDeletedMs = Math.max(lastDeletedMs ?? victim.ms, victim.ms);
+      const victim = readRetention.get(row.id) as { ms: number | null; timestamp?: string } | undefined;
+      if (victim) {
+        const at = countEviction ? victim.ms :
+          retentionInstant(victim.timestamp!) ?? victim.ms ?? Date.now();
+        if (at !== null) lastDeletedMs = Math.max(lastDeletedMs ?? at, at);
       }
       counts[definition.name] += remove.run(row.id).changes;
     }
-    if (countEviction) this.advanceLossCutoff(definition,
-      lastDeletedMs === null ? null : lastDeletedMs + 1);
+    this.advanceLossCutoff(definition, lastDeletedMs === null ? null : lastDeletedMs + 1);
     if (countEviction) this.addEvictionCounts(counts);
     else for (const table of LEARNING_FACT_TABLES) this.markMaintenance(table);
     return counts;
