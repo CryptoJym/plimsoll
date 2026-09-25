@@ -105,6 +105,9 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- New events for a session are recorded promptly while its summary uploads.
+  The upload keeps the snapshot it started with, and a later pass sends any
+  newly eligible events. Erasures still wait for the active send.
 - OTLP exports the ledger cannot commit in time are kept, not lost
   (`eco-6hoxj.163.17`). An authenticated, validated request that meets a busy
   ledger or runs out of its 1.5 s deadline — including one whose body arrived

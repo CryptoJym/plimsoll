@@ -3,8 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { performance } from "node:perf_hooks";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { markRawPrivacyDisposition } from "../packages/collector-cli/src/privacy-disposition";
 import { isSqliteContentionError, SyncStorageBusyError } from "../packages/collector-cli/src/sqlite-contention";
@@ -318,6 +320,202 @@ async function runFenceErasureCase(kind: "delete" | "privacy" | "receipt") {
   }
 }
 
+async function runLeaseSafeIntakeCase() {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p41-lease-intake-"));
+  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const external = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+  const sessionId = uuid(45_000);
+  const originalId = uuid(45_001);
+  insertRaw(buffer, {
+    id: originalId, sessionId,
+    observedAt: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z",
+    inputTokens: 1, outputTokens: 1,
+  });
+  let firstBody = "";
+  let spooled = 0;
+  let erasure = "not_attempted";
+  const intakeMs: number[] = [];
+  try {
+    const first = await runSessionSync(config, {
+      ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+      delayMs: 0, maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        firstBody = String(init?.body ?? "");
+        if (process.env.PROBE_MUTATION === "restore_intake_abort") {
+          external.exec(`create trigger trg_session_sync_upload_lease_insert
+            before insert on buffered_events
+            when new.session_id is not null and exists (
+              select 1 from session_sync_upload_leases where session_id = new.session_id
+                and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            begin select raise(abort, 'session_sync_upload_lease'); end`);
+        }
+        for (let index = 0; index < 3; index += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          const started = performance.now();
+          try {
+            assert.equal(buffer.append(aiInteractionEventSchema.parse({
+              id: uuid(45_002 + index), sessionId, source: "codex",
+              eventType: "assistant_response", observedAt: new Date().toISOString(),
+              inputTokens: 2, outputTokens: 2,
+            })), true);
+          } catch (error) {
+            assert.equal(asHttpBoundaryRejection(error).reason, "storage_busy_retry");
+            spooled += 1;
+          }
+          intakeMs.push(performance.now() - started);
+          if (index === 0) {
+            try {
+              external.prepare("delete from buffered_events where id = ?").run(originalId);
+              erasure = "overtook_send";
+            } catch (error) {
+              erasure = error instanceof Error ? error.message : String(error);
+            }
+          }
+        }
+        return new Response(JSON.stringify(acceptedFixtureDelivery(firstBody, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+      log: () => undefined,
+    });
+    console.log(JSON.stringify({ leaseIntakeProbe: { spooled, intakeMs, erasure,
+      firstBodyEvents: JSON.parse(firstBody).sessions[0].totals.events,
+      firstOk: first.ok, pending: first.pendingSummarySessionIds } }));
+    assert.equal(spooled, 0, "intake must not spool during a session-summary lease");
+    assert.ok(intakeMs.every((ms) => ms < 200), JSON.stringify(intakeMs));
+    assert.equal(erasure, "session_sync_upload_lease");
+    assert.equal(JSON.parse(firstBody).sessions[0].totals.events, 1);
+    assert.equal(first.ok, false, JSON.stringify(first));
+    assert.ok(first.pendingSummarySessionIds.includes(sessionId), JSON.stringify(first));
+    assert.equal(external.prepare("delete from buffered_events where id = ?").run(originalId).changes, 1);
+    const second = await runIncremental(buffer, [sessionId]);
+    assert.equal(second.result.ok, true, JSON.stringify(second.result));
+    assert.equal(second.sent[0]?.totals.events, 3);
+    compareExact(buffer, [sessionId], second.sent);
+    return { spooled, maxIntakeMs: Math.max(...intakeMs), erasure,
+      firstBodyEvents: 1, nextBodyEvents: second.sent[0]?.totals.events };
+  } finally {
+    external.close();
+    buffer.close();
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+async function runLeaseUpgradeCase() {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p41-lease-upgrade-"));
+  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const sessionId = uuid(46_000);
+  try {
+    ensureSessionSummarySchema(buffer.database);
+    // Recreate the 0.7.40 fences on a private fixture to prove the additive
+    // schema upgrade removes the intake abort and replaces the dirty guards.
+    buffer.database.exec(`
+      drop trigger trg_session_sync_upload_lease_dirty_insert;
+      drop trigger trg_session_sync_upload_lease_dirty_update;
+      create trigger trg_session_sync_upload_lease_insert before insert on buffered_events
+      when new.session_id is not null and exists (select 1 from session_sync_upload_leases
+        where session_id = new.session_id and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      begin select raise(abort, 'session_sync_upload_lease'); end;
+      create trigger trg_session_sync_upload_lease_dirty_insert before insert on session_sync_summary_dirty
+      when exists (select 1 from session_sync_upload_leases
+        where session_id = new.session_id and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      begin select raise(abort, 'session_sync_upload_lease'); end;
+      create trigger trg_session_sync_upload_lease_dirty_update before update on session_sync_summary_dirty
+      when exists (select 1 from session_sync_upload_leases
+        where session_id = new.session_id and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      begin select raise(abort, 'session_sync_upload_lease'); end;
+    `);
+    ensureSessionSummarySchema(buffer.database);
+    assert.equal(buffer.database.prepare("select 1 from sqlite_master where name = 'trg_session_sync_upload_lease_insert'").get(), undefined);
+    for (const name of ["trg_session_sync_upload_lease_dirty_insert", "trg_session_sync_upload_lease_dirty_update"]) {
+      const trigger = buffer.database.prepare("select sql from sqlite_master where name = ?").get(name) as { sql: string };
+      assert.ok(trigger.sql.includes("raw_insert_before_high_water"), name);
+    }
+    for (const [rowid, eventId] of [[100, uuid(46_001)], [200, uuid(46_002)]] as const) {
+      insertRaw(buffer, { rowid, id: eventId, sessionId,
+        observedAt: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z",
+        inputTokens: 1, outputTokens: 1 });
+    }
+    let firstBody = "";
+    const first = await runSessionSync(config, {
+      ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+      delayMs: 0, maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        firstBody = String(init?.body ?? "");
+        insertRaw(buffer, { rowid: 150, id: uuid(46_003), sessionId,
+          observedAt: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z",
+          inputTokens: 1, outputTokens: 1 });
+        return new Response(JSON.stringify(acceptedFixtureDelivery(firstBody, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+      log: () => undefined,
+    });
+    assert.equal(JSON.parse(firstBody).sessions[0].totals.events, 2);
+    assert.equal(first.ok, false, JSON.stringify(first));
+    assert.ok(first.pendingSummarySessionIds.includes(sessionId), JSON.stringify(first));
+    const next = await runIncremental(buffer, [sessionId]);
+    assert.equal(next.result.ok, true, JSON.stringify(next.result));
+    assert.equal(next.sent[0]?.totals.events, 3);
+    compareExact(buffer, [sessionId], next.sent);
+    return { firstBodyEvents: 2, nextBodyEvents: 3, migrated: true };
+  } finally {
+    buffer.close();
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+async function runLeaseFutureAppendCase() {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p41-lease-future-"));
+  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const sessionId = uuid(47_000);
+  const firstUntil = new Date(Date.now() - 1_000).toISOString();
+  insertRaw(buffer, { id: uuid(47_001), sessionId,
+    observedAt: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z",
+    inputTokens: 1, outputTokens: 1 });
+  let firstBody = "";
+  let nextBody = "";
+  try {
+    const first = await runSessionSync(config, {
+      ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until: firstUntil,
+      delayMs: 0, maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        firstBody = String(init?.body ?? "");
+        assert.equal(buffer.append(aiInteractionEventSchema.parse({
+          id: uuid(47_002), sessionId, source: "codex",
+          eventType: "assistant_response", observedAt: new Date().toISOString(),
+          inputTokens: 2, outputTokens: 2,
+        })), true);
+        return new Response(JSON.stringify(acceptedFixtureDelivery(firstBody, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch, log: () => undefined,
+    });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.summaryComplete, true);
+    assert.equal(JSON.parse(firstBody).sessions[0].totals.events, 1);
+    const nextUntil = new Date(Date.now() + 1_000).toISOString();
+    const nextIds = listLedgerSessionIds(buffer.database, { since: firstUntil, until: nextUntil });
+    assert.ok(nextIds.includes(sessionId), JSON.stringify(nextIds));
+    const next = await runSessionSync(config, {
+      ledgerDb: buffer.database, incremental: true, sessionIds: nextIds, until: nextUntil,
+      delayMs: 0, maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        nextBody = String(init?.body ?? "");
+        return new Response(JSON.stringify(acceptedFixtureDelivery(nextBody, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch, log: () => undefined,
+    });
+    assert.equal(next.ok, true, JSON.stringify(next));
+    assert.equal(JSON.parse(nextBody).sessions[0].totals.events, 2);
+    return { firstBodyEvents: 1, nextBodyEvents: 2, nextPassFoundSession: true };
+  } finally {
+    buffer.close();
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
 async function runStaleBeforePostCase() {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p41-fence-stale-"));
   const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
@@ -471,7 +669,7 @@ async function reviewRegressions() {
     "interleaved_initial_insert", "trigger_upgrade", "privacy_handoff_erasure",
     "backdated_queue_planner", "stale_send_fast_retry",
     "pending_id_bounds", "sync_id_deadline", "same_time_seek",
-    "fence_multibatch", "fence_erasure", "fence_stale_before_post", "fence_contention",
+    "fence_multibatch", "fence_erasure", "lease_safe_intake", "lease_upgrade", "lease_future_append", "fence_stale_before_post", "fence_contention",
     "summary_busy_state", "summary_busy_stable", "summary_busy_daemon", "summary_busy_budget",
   ];
   for (const name of cases) {
@@ -1016,6 +1214,21 @@ async function reviewRegressions() {
         for (const kind of ["delete", "privacy", "receipt"] as const) {
           result.push(await runFenceErasureCase(kind));
         }
+        console.log(JSON.stringify({ reviewCase: name, result: "PASS", detail: result }));
+        continue;
+      } else if (name === "lease_safe_intake") {
+        buffer.close();
+        const result = await runLeaseSafeIntakeCase();
+        console.log(JSON.stringify({ reviewCase: name, result: "PASS", detail: result }));
+        continue;
+      } else if (name === "lease_upgrade") {
+        buffer.close();
+        const result = await runLeaseUpgradeCase();
+        console.log(JSON.stringify({ reviewCase: name, result: "PASS", detail: result }));
+        continue;
+      } else if (name === "lease_future_append") {
+        buffer.close();
+        const result = await runLeaseFutureAppendCase();
         console.log(JSON.stringify({ reviewCase: name, result: "PASS", detail: result }));
         continue;
       } else if (name === "fence_stale_before_post") {
