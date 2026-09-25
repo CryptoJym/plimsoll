@@ -1746,6 +1746,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
           (lstatIfPresent(path.join(this.trashRoot, item.trashName)) || lstatIfPresent(this.removalSource(item))));
       if (!hasUsableWayBack && pendingWayBack) {
         const restored: LifecycleRemovedItem[] = [];
+        const restoredMoves: RemovalItem[] = [];
         let complete = true;
         for (const pending of earlier) {
           for (const item of [...pending.items].reverse()) {
@@ -1760,6 +1761,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
               try {
                 fs.renameSync(trash, source);
                 restored.push({ kind: item.kind, name: item.name, bytes: item.bytes });
+                restoredMoves.push(item);
               } catch {
                 complete = false;
               }
@@ -1778,6 +1780,28 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
           snapshot.metadataValid && snapshot.restoresVersion !== null &&
           snapshot.restoresVersion !== refreshed.input.installedVersion && snapshot.restorable !== false);
         if (refreshed.blockedReason || !usableRestoredWayBack) {
+          // The restored files did not form a usable rollback point. Return
+          // this attempt's moves to their recorded trash names. If a rename
+          // fails, the record still fences the next prune from deleting the
+          // partly restored way back.
+          for (const item of [...restoredMoves].reverse()) {
+            try {
+              await this.assertFence(input.operationId);
+              assertNoSymlink(this.trashRoot, this.root);
+              const source = this.removalSource(item);
+              const trash = path.join(this.trashRoot, item.trashName);
+              if (lstatIfPresent(source) && !lstatIfPresent(trash)) fs.renameSync(source, trash);
+            } catch {
+              // The durable removal record remains for another retry.
+            }
+          }
+          try {
+            if (lstatIfPresent(this.trashRoot)) fsyncDirectory(this.trashRoot);
+            if (restoredMoves.some((item) => item.kind === "snapshot") && lstatIfPresent(this.snapshotsRoot)) fsyncDirectory(this.snapshotsRoot);
+            if (restoredMoves.some((item) => item.kind === "runtime_version") && lstatIfPresent(this.versionsRoot)) fsyncDirectory(this.versionsRoot);
+          } catch {
+            // A later prune still sees the record and must restore or refuse.
+          }
           throw new RetentionPlanChanged("needed_restore_unusable");
         }
         for (const pending of earlier) {

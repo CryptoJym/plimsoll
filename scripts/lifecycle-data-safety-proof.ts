@@ -151,6 +151,7 @@ const CASES = {
   r10PruneSafety: [
     "partial_crash_restore_retry_keeps_the_last_usable_way_back",
     "incomplete_undo_retry_keeps_the_last_usable_way_back",
+    "unusable_restored_way_back_refuses_and_keeps_its_record_and_trash",
   ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
@@ -1530,6 +1531,23 @@ async function r8PruneSafety() {
         !exists(removalRecord) && listDirectory(trashRoot).length === 0,
       { first: first?.message, refused, second: second?.message, receipt,
         snapshots: fixture.snapshots(), versions: fixture.versions(), trash: listDirectory(trashRoot), recordKept: exists(removalRecord) });
+  });
+
+  await runCase([CASES.r10PruneSafety[2]], async (record) => {
+    const { fixture, trashRoot, removalRecord, items } = await crashedPrune("r10-unusable-restored");
+    const executable = path.join(trashRoot, items[1].trashName, `darwin-${ARCHITECTURE}`, "bin", "plimsoll.mjs");
+    fs.appendFileSync(executable, "// digest changed after the snapshot\n");
+    const refused = await rejection(() => fixture.manager().pruneSnapshots({
+      operationId: "r10-unusable-restored-prune", keep: 1, apply: true,
+    }));
+    record(CASES.r10PruneSafety[2],
+      refused !== null && /needed_restore_unusable/.test(refused.message) &&
+        !refused.message.includes(fixture.home) &&
+        exists(removalRecord) && items.every((item) => exists(path.join(trashRoot, item.trashName))) &&
+        !fixture.snapshots().includes("a2") && !fixture.versions().includes("34.1.0") &&
+        fixture.receipt("r10-unusable-restored-prune", "snapshots_prune") === null,
+      { error: refused?.message, recordKept: exists(removalRecord),
+        snapshots: fixture.snapshots(), versions: fixture.versions(), trash: listDirectory(trashRoot) });
   });
 }
 
