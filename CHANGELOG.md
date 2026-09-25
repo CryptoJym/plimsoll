@@ -95,10 +95,14 @@ does not transfer its sessions to a tailer.
 ### Changed
 
 - Capture coverage reads large directories a few entries at a time and keeps
-  each source within 4,096 work units per turn. A directory that changes
-  during a walk stops that check without moving its coverage frontier. Codex,
+  each source within 4,096 work units per turn. It finishes listing a folder
+  before checking its files, so files added after listing are picked up by the
+  next check. A folder changed while still being listed makes the check
+  incomplete; a deleted or renamed folder also fails closed. Ignored names
+  use work but do not count toward the 200,000 relevant-entry ceiling. Codex,
   Claude Code, and Grok each get a share of every turn, with the first source
-  rotating between turns.
+  rotating and unused time returning to active sources. Legacy symlinked
+  Codex or Claude roots now make coverage incomplete, like configured roots.
 - When the OTLP intake spool cannot hold a refused request (full, or the disk
   refuses), a deadline refusal is answered `503` with `Retry-After: 1` instead
   of `408`, which OTLP exporters do not retry. A body that never finished
