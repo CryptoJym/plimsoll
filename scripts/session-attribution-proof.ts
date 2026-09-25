@@ -118,8 +118,16 @@ function main() {
   const scanned = plannedLookup({ contextIndex: false });
   assert.equal(scanned.queryPlans.length, 2);
   assert.ok(scanned.queryPlans.every((plan) => plan.some((row) => row.detail.includes("idx_events_session"))));
+  // The first indexed lookup on a connection validates the whole index once
+  // (a full recompute of its checksum, cached per connection in
+  // invariantAgrees), so measure it separately from the steady state.
+  const firstIndexed = plannedLookup({});
+  assert.equal(firstIndexed.queryPlans.length, 3);
+  assert.equal(firstIndexed.queryPlans.filter((plan) =>
+    plan.some((row) => /^SCAN session_repo_contexts/.test(row.detail))).length, 1);
   const indexed = plannedLookup({});
-  // The coverage-marker read and one primary-key range over the index.
+  // Afterwards each lookup is the coverage-marker read and one primary-key
+  // range over the index.
   assert.equal(indexed.queryPlans.length, 2);
   assert.ok(indexed.queryPlans.some((plan) => plan.some((row) =>
     /SEARCH (?:session_repo_contexts|c) USING PRIMARY KEY/.test(row.detail))));
@@ -206,7 +214,7 @@ function main() {
   const stable = applyProjectAttribution(single.event, { sessionContexts: [context(2, "2026-09-23T11:59:00.000Z", REPO_A)] });
   assert.deepEqual(stable.event, single.event);
   ledger.close();
-  console.log(JSON.stringify({ status: "PASS", checks: 14, fixture: "otel-assistant_response-tool_result-session" }));
+  console.log(JSON.stringify({ status: "PASS", checks: 16, fixture: "otel-assistant_response-tool_result-session" }));
 }
 
 main();
