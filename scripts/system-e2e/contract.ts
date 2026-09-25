@@ -16,6 +16,18 @@ export const SYSTEM_E2E_BUDGETS = {
   blockOperations: 500_000,
   capturedOutputBytes: 24 * 1024 * 1024,
 } as const;
+/**
+ * Ceilings on the idle scenario's directory enumeration. They stop the fixture
+ * from silently growing; the exact topology checks in the resource proof are
+ * the regression guards. Shared by the proof and the receipt verifier.
+ */
+export const SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS = {
+  entriesScanned: 8_192,
+  setupEntriesScanned: 7_680,
+  unchangedEntriesScanned: 2_048,
+  enumerationCalls: 32,
+  unchangedEnumerationCalls: 8,
+} as const;
 
 export type SupportingKind =
   | "json_result"

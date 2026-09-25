@@ -16,6 +16,7 @@ import {
 } from "../../packages/collector-cli/src/learning-facts";
 import {
   SYSTEM_E2E_BUDGETS,
+  SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS,
   SYSTEM_E2E_SCHEMA,
   digest,
   exactKeys,
@@ -245,13 +246,54 @@ function verifyMeasurements(
   assert.equal(margins.capturedOutputBytes, SYSTEM_E2E_BUDGETS.capturedOutputBytes - outputBytes, "output budget margin mismatch");
 
   const idle = object(measurements.idle, "idle measurements");
-  exactKeys(idle, ["rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs"], "idle measurements");
+  exactKeys(idle, [
+    "rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs",
+    "filesystemEntriesScanned", "filesystemEnumerationCalls",
+    "startupFilesystemEntriesScanned", "startupFilesystemEnumerationCalls",
+    "baselineFilesystemEntriesScanned", "baselineFilesystemEnumerationCalls",
+    "setupFilesystemEntriesScanned", "setupFilesystemEnumerationCalls",
+    "unchangedFilesystemEntriesScanned", "unchangedFilesystemEnumerationCalls",
+    "filesystemEnumerationFailedCalls", "filesystemEnumerationReadFailures",
+    "stableSweepCursorReset",
+  ], "idle measurements");
   assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 2);
   assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
   assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_610);
   assert.equal(integer(idle.filesOpened, "history files opened"), 2_614);
   assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
   assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
+  // Directory enumeration: the same invariants system-e2e-proof.ts checks before it writes the receipt.
+  const idleEntries = integer(idle.filesystemEntriesScanned, "idle filesystem entries scanned");
+  const idleCalls = integer(idle.filesystemEnumerationCalls, "idle filesystem enumeration calls");
+  const setupEntries = integer(idle.setupFilesystemEntriesScanned, "idle setup entries scanned");
+  const setupCalls = integer(idle.setupFilesystemEnumerationCalls, "idle setup enumeration calls");
+  const unchangedEntries = integer(idle.unchangedFilesystemEntriesScanned, "idle unchanged entries scanned");
+  const unchangedCalls = integer(idle.unchangedFilesystemEnumerationCalls, "idle unchanged enumeration calls");
+  assert.equal(
+    setupEntries,
+    integer(idle.startupFilesystemEntriesScanned, "idle startup entries scanned") +
+      integer(idle.baselineFilesystemEntriesScanned, "idle baseline entries scanned"),
+    "idle setup entries are not startup plus baseline",
+  );
+  assert.equal(
+    setupCalls,
+    integer(idle.startupFilesystemEnumerationCalls, "idle startup enumeration calls") +
+      integer(idle.baselineFilesystemEnumerationCalls, "idle baseline enumeration calls"),
+    "idle setup enumeration calls are not startup plus baseline",
+  );
+  assert.equal(setupEntries + unchangedEntries, idleEntries, "idle entries scanned are not setup plus unchanged");
+  assert.equal(setupCalls + unchangedCalls, idleCalls, "idle enumeration calls are not setup plus unchanged");
+  assert.ok(setupEntries > 0 && unchangedEntries > 0 && unchangedCalls > 0, "idle directory enumeration was not observed");
+  assert.ok(idleEntries >= idleCalls, "idle enumeration calls exceed entries scanned");
+  const ceilings = SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS;
+  assert.ok(idleEntries <= ceilings.entriesScanned, "idle entries scanned exceed the fixture ceiling");
+  assert.ok(setupEntries <= ceilings.setupEntriesScanned, "idle setup entries exceed the fixture ceiling");
+  assert.ok(unchangedEntries <= ceilings.unchangedEntriesScanned, "idle unchanged entries exceed the fixture ceiling");
+  assert.ok(idleCalls <= ceilings.enumerationCalls, "idle enumeration calls exceed the fixture ceiling");
+  assert.ok(unchangedCalls <= ceilings.unchangedEnumerationCalls, "idle unchanged enumeration calls exceed the fixture ceiling");
+  assert.ok(integer(idle.filesystemEnumerationFailedCalls, "idle failed enumeration calls") <= idleCalls, "idle failed enumeration calls exceed calls");
+  integer(idle.filesystemEnumerationReadFailures, "idle enumeration read failures");
+  assert.equal(idle.stableSweepCursorReset, true, "idle stable sweep cursor was not reset");
   const firstBootScenario = resourceScenarios
     .map((entry, index) => object(entry, `resource scenario ${index}`))
     .find((scenario) => scenario.id === "no_change_constant_work");

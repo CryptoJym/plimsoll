@@ -48,6 +48,7 @@ import {
 import {
   SYSTEM_E2E_SCHEMA,
   SYSTEM_E2E_BUDGETS,
+  SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS,
   digest,
   loadSupportContract,
   loadRootGuardContract,
@@ -1219,11 +1220,11 @@ async function main() {
   // The stable phase walks each stable fixture entry exactly once. These
   // ceilings only stop the fixture from silently growing; the exact topology
   // and enumeration-call assertions above remain the regression guards.
-  assert.ok(filesystemEntriesScanned <= 8_192);
-  assert.ok(setupFilesystemEntriesScanned <= 7_680);
-  assert.ok(unchangedFilesystemEntriesScanned <= 2_048);
-  assert.ok(filesystemEnumerationCalls <= 32);
-  assert.ok(unchangedFilesystemEnumerationCalls <= 8);
+  assert.ok(filesystemEntriesScanned <= SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS.entriesScanned);
+  assert.ok(setupFilesystemEntriesScanned <= SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS.setupEntriesScanned);
+  assert.ok(unchangedFilesystemEntriesScanned <= SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS.unchangedEntriesScanned);
+  assert.ok(filesystemEnumerationCalls <= SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS.enumerationCalls);
+  assert.ok(unchangedFilesystemEnumerationCalls <= SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS.unchangedEnumerationCalls);
   assert.equal(idle?.measurements.stableSweepCursorReset, true);
   assert.equal(idle?.measurements.stableSweepCompleted, true);
   assert.equal(idle?.measurements.stableRolloutSweepComplete, true);
