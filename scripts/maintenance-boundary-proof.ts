@@ -120,9 +120,19 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_00
 }
 
 async function rejectsWith(promise: Promise<unknown>, message: string) {
-  await assert.rejects(promise, (error: unknown) => (
-    error instanceof Error && error.message === message
-  ));
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await assert.rejects(Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("boundary_rejection_wait_expired")), 10_000);
+      }),
+    ]), (error: unknown) => (
+      error instanceof Error && error.message === message
+    ));
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function outcome(rawEventWrites = 1): MaintenanceRunOutcome {
