@@ -265,7 +265,7 @@ import {
   listLedgerSessionIdsOffThread,
   readLedgerOffThread,
   runSessionSync,
-  saveDaemonSessionSyncState,
+  saveDaemonSessionSyncStateWithRetry,
   sessionIdsFromBatches,
   shouldDeferDaemonSessionSync,
 } from "./session-sync";
@@ -530,6 +530,16 @@ Config tools:
       proved, and the runtimes those restore. Every removal is recorded
       durably before it happens. Every completed update also applies this
       with the default count.
+  lifecycle snapshots reconcile [--keep-snapshots ID[,ID...]] [--apply] [--force] [--operation-id ID]
+      When retention is blocked or a snapshot's operation cannot be read
+      (list says why): shows what blocks it (default, changes nothing), or
+      repairs it. The completion order is rebuilt only from the receipts' own
+      sequences, and only when they agree with the version chain; otherwise
+      name the snapshots to keep with --keep-snapshots and every other
+      existing snapshot becomes removable. The keep-set must include a
+      snapshot that restores an earlier version; sealing when nothing needs
+      it, or releasing the newest way back, needs --force. Unreadable removal
+      records are moved aside, not deleted. Deletes no snapshot itself.
 `);
 }
 
@@ -2786,19 +2796,29 @@ async function main() {
       syncInFlight = true;
       const storageRetry = new SyncStorageRetryController();
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
-      const persistSessionCarry = () => {
+      const persistSessionCarry = async () => {
         sessionSyncState = { ...sessionSyncState, pendingSessionIds };
         try {
-          saveDaemonSessionSyncState(buffer.database, sessionSyncState);
-        } catch {
+          await saveDaemonSessionSyncStateWithRetry(
+            buffer.database, sessionSyncState,
+            new SyncStorageRetryController(),
+          );
+          return true;
+        } catch (error) {
           sessionSyncState = { ...sessionSyncState, caughtUp: false };
+          summaryCatchUp = true;
+          console.warn(JSON.stringify({
+            warning: "session_sync_state_write_failed",
+            message: error instanceof Error ? error.message : String(error),
+          }));
+          return false;
         }
       };
-      const carrySessions = () => {
+      const carrySessions = async () => {
         pendingSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
-        persistSessionCarry();
+        await persistSessionCarry();
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
@@ -2839,7 +2859,7 @@ async function main() {
         syncBackoff.success(uploaded, serverRetryAfterMs);
         // Session snapshots share the ingest endpoint. Carry their identities
         // rather than issue another request inside a server-directed cooldown.
-        if (serverRetryAfterMs > 0) { carrySessions(); return; }
+        if (serverRetryAfterMs > 0) { await carrySessions(); return; }
         // While more than a cycle of events is due, events drain first. A
         // session snapshot re-reads every row of each touched session (1.88M
         // for Studio0's busiest), seconds to minutes that would hold the next
@@ -2851,7 +2871,7 @@ async function main() {
           remainingDelivery,
           maxBatchesPerCycle: config.delivery.maxBatchesPerCycle,
           elapsedSinceLastSessionPassMs: performance.now() - lastSessionPassAt,
-        })) { carrySessions(); return; }
+        })) { await carrySessions(); return; }
 
         // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
         // plus durable pending, and a ledger catch-up until the first full
@@ -2878,7 +2898,7 @@ async function main() {
           });
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
-          persistSessionCarry();
+          if (!await persistSessionCarry()) return;
           if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
               ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
@@ -2913,7 +2933,7 @@ async function main() {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             }
-            persistSessionCarry();
+            if (!await persistSessionCarry()) return;
             if (sessionResult.ok && sessionResult.summaryComplete && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
@@ -2932,6 +2952,8 @@ async function main() {
               console.log(JSON.stringify({
                 status: "session_sync_partial",
                 pendingSummaries: summaryPending.length,
+                pendingSummaryReasons: sessionResult.pendingSummaryReasons,
+                fullRecomputes: sessionResult.summaryStats.fullRecomputes,
                 rowsRead: sessionResult.summaryStats.rowsRead,
                 summaryDurationMs: sessionResult.summaryStats.durationMs,
               }));
@@ -2951,12 +2973,12 @@ async function main() {
           );
           sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, touchedSessionIds);
           pendingSessionIds = sessionSyncState.pendingSessionIds;
-          persistSessionCarry();
+          await persistSessionCarry();
         } finally {
           lastSessionPassAt = performance.now();
         }
       } catch (error) {
-        carrySessions();
+        await carrySessions();
         const scheduling = syncBackoff.failure(error, uploaded, Date.now(), maintenanceBoundary.status().state === "circuit_open");
         if (error instanceof SyncStorageBusyError) {
           console.warn(
@@ -3580,7 +3602,7 @@ async function main() {
           sessionAttribution: sessionContextIndexStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
-          learningFacts: buffer.learningFacts.status(),
+          learningFacts: buffer.learningFacts.statusWithWindow(),
           // Hook events the collector could not accept live, and what the
           // drain has recovered since (bead eco-6hoxj.61).
           hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonState.hookSpool),

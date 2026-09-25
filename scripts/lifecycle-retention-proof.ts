@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-retention", 73);
+const completion = createProofCompletion("lifecycle-retention", 74);
 /**
  * eco-6hoxj.163.30: lifecycle update snapshots are bounded and cheap.
  *
@@ -71,7 +71,7 @@ const NODE_MAJOR = Number(process.versions.node.split(".", 1)[0]);
 const ARCHITECTURE = process.arch === "x64" ? "x64" as const : "arm64" as const;
 const LEDGER_SENTINEL = `ledger-content-sentinel-${randomBytes(6).toString("hex")}`;
 const CONFIG_SENTINEL = `config-secret-sentinel-${randomBytes(6).toString("hex")}`;
-const FIXTURE_PARENT = "/private/var/tmp";
+const FIXTURE_PARENT = process.env.TMPDIR || "/private/var/tmp";
 fs.mkdirSync(FIXTURE_PARENT, { recursive: true });
 const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(FIXTURE_PARENT, "plimsoll-retention-")));
 
@@ -84,6 +84,55 @@ const exists = (file: string) => fs.existsSync(file);
 const listDirectory = (directory: string) => exists(directory) ? fs.readdirSync(directory).sort() : [];
 const same = (left: readonly string[], right: readonly string[]) =>
   JSON.stringify([...left].sort()) === JSON.stringify([...right].sort());
+
+/**
+ * Ask the filesystem for the physical device offsets backing two files.  A
+ * clone and its source point at the same extents; a helper that silently
+ * byte-copies the file does not.  This is deliberately a small, value-blind
+ * probe so the proof does not infer COW from the helper's method label or
+ * st_blocks (APFS charges shared extents to both files in that field).
+ */
+const physicalCloneOffsets = (source: string, destination: string) => {
+  const script = [
+    "import fcntl,json,os,struct,sys",
+    "F_LOG2PHYS_EXT=65",
+    "def offsets(path):",
+    "    fd=os.open(path,os.O_RDONLY)",
+    "    try:",
+    "        size=os.fstat(fd).st_size",
+    "        block=4096",
+    "        if size < block: raise ValueError('ledger too small to prove shared extents')",
+    "        samples=(0,size//4,size//2,3*size//4,size-block)",
+    "        result=[]",
+    "        for sample in samples:",
+    "            offset=(sample//block)*block",
+    "            raw=fcntl.fcntl(fd,F_LOG2PHYS_EXT,struct.pack('=Iqq',0,block,offset))",
+    "            physical=struct.unpack('=Iqq',raw)[2]",
+    "            if physical < 0: raise ValueError('unmapped physical extent')",
+    "            result.append(physical)",
+    "        return result",
+    "    finally: os.close(fd)",
+    "source=offsets(sys.argv[1]); destination=offsets(sys.argv[2])",
+    "print(json.dumps({'source':source,'destination':destination,'shared':source==destination}))",
+  ].join("\n");
+  const probe = spawnSync("python3", ["-c", script, source, destination], {
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (probe.status !== 0 || probe.error) return null;
+  try {
+    const parsed = JSON.parse(probe.stdout) as {
+      source: number[];
+      destination: number[];
+      shared: boolean;
+    };
+    return parsed.source.length === 5 && parsed.destination.length === 5 &&
+      parsed.source.every((offset) => Number.isSafeInteger(offset) && offset >= 0) &&
+      parsed.destination.every((offset) => Number.isSafeInteger(offset) && offset >= 0) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
 
 async function rejection(action: () => Promise<unknown>) {
   try {
@@ -445,10 +494,19 @@ async function main() {
       u4Inspection.digest === digestsBefore.get("u4") && u4Inspection.digest !== digestsBefore.get("u5"));
 
     const lockSamples: string[] = [];
+    const physicalSamples: Array<{
+      source: number[];
+      destination: number[];
+      shared: boolean;
+    }> = [];
     const cloneWithProbe = (source: string, destination: string) => {
       lockSamples.push(probeFromOtherProcess(source));
       const cloned = cloneFileOrFail(source, destination);
       lockSamples.push(probeFromOtherProcess(source));
+      if (cloned !== false) {
+        const physical = physicalCloneOffsets(source, destination);
+        if (physical) physicalSamples.push(physical);
+      }
       return cloned;
     };
     const probedSamples: Array<{ method: string | null; consumed: number }> = [];
@@ -463,6 +521,9 @@ async function main() {
     check("measured_clone_snapshot_consumes_under_a_quarter_of_the_ledger",
       probedSamples.length === 1 && probedSamples[0]!.method === "clone" && probedSamples[0]!.consumed < ledgerBytes * 0.25,
       { probedSamples, ledgerBytes });
+    check("clone_snapshot_shares_physical_extents_with_its_source",
+      u6.snapshot?.method === "clone" && physicalSamples.length === 1 && physicalSamples[0]!.shared === true,
+      { physicalSamples });
     check("crash_left_wal_is_checkpointed_into_the_clone_and_emptied",
       killedWith === "SIGKILL" && walBeforeU6 > 0 && inspectSnapshotDatabase(primary, "u6").digest === beforeU6 &&
       walBytes(primary.ledger) === 0, { killedWith, walBeforeU6, walAfter: walBytes(primary.ledger) });

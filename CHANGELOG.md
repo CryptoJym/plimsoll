@@ -24,6 +24,40 @@ entire downgrade: older binaries ignore continuation and retirement state. Keep
 the ledger, source files and session authority intact. Disabling the live observer
 does not transfer its sessions to a tailer.
 
+## 0.7.41 — 2026-09-25
+
+- An unfinished session-summary rebuild now resumes across daemon cycles as
+  the sync horizon moves (`.163.86`). In 0.7.40, a long session that received
+  a raw update restarted its rebuild on every cycle, and session sync on that
+  Mac stopped advancing; no events were lost. Rows appended during a rebuild
+  are applied after the frozen historical scan, and a raw edit or erasure of
+  the session still restarts its rebuild. Partial sync logs name why summaries
+  remain pending and how many rebuilds began.
+- New events for a session are recorded promptly while its summary uploads
+  (`.163.80`). The upload keeps the snapshot it started with, and a later pass
+  sends any newly eligible events. Erasures still wait for the active send.
+- A busy ledger no longer silently skips the daemon's session-sync carry
+  write; it retries that durable write for a bounded time and reports
+  exhaustion (`.163.80`).
+- Learning results and status show the effective start when local retention
+  or the fact cap shortens the requested window (`.163.73`).
+- Snapshot retention is safe to interrupt (`.163.30`). A removal is recorded
+  before any file moves, and the next 0.7.41 or later prune or completed
+  update finishes it or restores what it moved. Releases 0.7.38 to 0.7.40
+  cannot read these records, so they skip retention. `plimsoll lifecycle
+  snapshots reconcile` (a dry run unless `--apply`) shows why retention is
+  blocked and repairs it.
+- An update refuses to start while any other process has the ledger, its WAL
+  or its shared-memory file open, or when it cannot prove that none does
+  (`ledger_in_use`, `quiescence_unproven`). A refused update changes nothing;
+  start it again once the ledger is free. Stop every ledger user, including
+  SQLite clients and other `plimsoll` commands, during an update window
+  (`.163.30`). A rollback checks the restored ledger with
+  `PRAGMA integrity_check` and records `restore.integrity` in its receipt.
+- `--retention keep-all` still removes no snapshot, runtime version, receipt
+  or trash entry; an update can delete a leftover
+  `work-ledger.sqlite.restore-*` file from an earlier crashed restore.
+
 ## 0.7.40 — 2026-09-24
 
 - Busy-session indexing records session context at capture time and validates

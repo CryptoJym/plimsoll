@@ -23,6 +23,7 @@ plimsoll lifecycle support-bundle --operation-id ID
 plimsoll lifecycle update --preflight
 plimsoll lifecycle snapshots list  [--keep N] [--json]
 plimsoll lifecycle snapshots prune [--keep N] [--apply] [--operation-id ID]
+plimsoll lifecycle snapshots reconcile [--keep-snapshots ID[,ID...]] [--apply] [--force] [--operation-id ID]
 ```
 
 `--artifact self` pins the currently running packaged bundle (a source
@@ -34,7 +35,56 @@ absolute built bundles and require `--artifact-version`.
 
 Every operation prints one JSON receipt plus a boundary statement. Update and
 rollback never invoke `launchctl`: they publish the desired manifest and the
-operator restarts explicitly with `plimsoll load-launch-agent`.
+operator restarts explicitly with `plimsoll load-launch-agent`. An update
+window is therefore three steps: stop the collector
+(`plimsoll unload-launch-agent`), run `lifecycle update`, then start the new
+runtime (`plimsoll load-launch-agent`). An update run while the collector is
+live is refused before any change (`ledger_in_use`, see "The ledger must be
+quiet"); retry the same operation ID after the stop.
+
+Once a host has run 0.7.38 or later, run updates and prunes with 0.7.38 or
+later. Releases up to 0.7.37 write receipts without a completion sequence:
+an update or rollback run by one of them (for example `npx -y
+@plimsoll/cli@0.7.37 lifecycle update`) leaves a receipt whose place in the
+order cannot be proved, and retention stops until `snapshots reconcile`
+(0.7.41 and later) repairs it.
+
+After any interrupted 0.7.41 prune or update retention, use 0.7.41 or
+later for prunes and updates. Every removal record written by 0.7.41 is
+unreadable to 0.7.38–0.7.40: their prunes remove nothing, and their updates
+and rollbacks skip all retention until a 0.7.41+ prune or completed update
+finishes the record. On a host with only an older CLI available, install or
+run 0.7.41 or later and use `lifecycle snapshots prune --apply` to finish or
+restore the recorded removal. This also applies after a `needed_restore_*`
+prune refusal; a completed 0.7.41+ update can create a new way back first.
+
+The older releases do not check whether a kept snapshot can actually
+restore. After `retention.restored`, or whenever `snapshots list` flags a
+snapshot that cannot restore, use 0.7.41 or later for prune, especially with
+`--keep 1`. A 0.7.38–0.7.40 `prune --keep 1 --apply` can delete the only
+usable way back while keeping the newest unusable snapshot.
+
+To return to an older runtime explicitly, run that release's own
+`lifecycle rollback --operation-id <id> --artifact self`. A CLI installs
+only a bundle from its own install tree, so a newer CLI cannot install an
+older release's bundle (it refuses with "artifact source must be a child of
+the ownership root" and changes nothing).
+
+Once a host has been sealed (`snapshots reconcile --keep-snapshots`), run
+updates, prunes and reconciles with 0.7.41 or later. Releases 0.7.38 through
+0.7.40 read a sealed order record as invalid: they remove nothing, but an
+update or rollback they run writes a receipt without a completion sequence.
+0.7.41 keeps that snapshot as `receipt_without_sequence`, and `snapshots
+list` says to run `snapshots reconcile`, whose keep-set then decides it. An
+older release's own rollback is therefore safe on a sealed host and costs
+one reconcile afterwards. Releases 0.7.38 through 0.7.40 accept a
+`snapshots_prune` receipt even when its retention record has `restored`.
+They treat update or rollback receipts carrying `restore.integrity` or
+`retention.restored` as unknown, and also do not recognize
+`snapshots_reconcile` receipts. For example, a 0.7.41 update that
+automatically rolls back to 0.7.40 leaves a rolled-back snapshot that
+0.7.40 keeps as `operation_unknown`. An ordinary 0.7.41 prune --apply or
+completed update with normal retention removes that snapshot.
 
 An update or rollback:
 
@@ -101,9 +151,12 @@ update at all (Studio0 held 21 copies: 693,521,793,024 bytes, 645.9 GiB).
 **The ledger must be quiet.** `lifecycle update` never stops the collector;
 the managed update window stops it before running the command. The update
 then opens the ledger in SQLite's exclusive locking mode, which SQLite
-refuses while any other connection in any process has the ledger open. If
-another process has it open (the collector, another `plimsoll` command, any
-SQLite client), or the ledger cannot be locked at all, the update is refused
+refuses while any other connection in any process has the ledger open. A
+connection that was opened but has not run a statement yet holds no lock, so
+the update also asks `lsof` whether any other process has the ledger, its
+`-wal` or its `-shm` open. If another process has it open (the collector,
+another `plimsoll` command, any SQLite client, even one that has not used it
+yet), or either check cannot be completed, the update is refused
 before anything changes: no journal remains, nothing is staged or switched,
 the service is not touched, the receipt says `status: "refused"` with
 `refusal.reason: "ledger_in_use"` (or `"quiescence_unproven"`), and the same
@@ -121,26 +174,53 @@ or cannot be cloned (another volume, a file system without clones), the
 snapshot is the SQLite online backup, a full copy, recorded as
 `method: "online_backup"` with the reason in `cloneFallback`.
 
+The checkpoint runs with SQLite's `checkpoint_fullfsync` on, so on macOS the
+ledger file reaches stable storage (`F_FULLFSYNC`) before its WAL is
+emptied; a plain `fsync` there reaches only the drive's cache, where a power
+loss can lose the ledger's pages after the WAL is already gone. Every file
+and directory `fsync` the lifecycle issues itself is already `F_FULLFSYNC`
+on macOS (Node's libuv makes it so). Before it measures free space, an update
+also removes a `<ledger>.restore-<nonce>` that a crashed byte-copy restore
+left behind (it can be as large as the ledger).
+
 **How a rollback restores it.** A restore never deletes the live ledger
 first. It builds the restored ledger beside it (`<ledger>.restore-<nonce>`):
 an APFS clone of the snapshot, or, only when the volume has room for a byte
 copy while the live ledger still exists, a copy (a clone snapshot shares its
 blocks with the live ledger, so removing the live name would free little).
-The copy is fsynced and must pass `PRAGMA integrity_check`. Then, holding an
+The copy is fsynced and must pass `PRAGMA integrity_check`. If the ledger
+was already damaged before the update, every snapshot carries that damage:
+the copy may then fail the check only with complaints the live ledger also
+has (both are checked), so the rollback is no worse than keeping the live
+ledger. The receipt then records `restore.integrity: "preexisting_damage"`;
+repair the ledger afterwards (for index damage, `REINDEX`). A copy with any
+complaint the live ledger does not have is refused. Then, holding an
 exclusive lock on the restored copy and on the live ledger (refused if any
-other connection has the live ledger open), a TRUNCATE checkpoint empties
-the live WAL, one atomic rename swaps the files, the replaced file's header
-is zeroed once no name reaches it (a process that opened it an instant
-earlier gets "not a database" instead of writing into an unlinked file),
-and its `-wal`, `-shm` and `-journal` names are removed before either lock
-is released. The ledger is restored before the config, runtime pointer and
+other connection has the live ledger locked, or if `lsof` shows any other
+process with the ledger, `-wal` or `-shm` open), a TRUNCATE checkpoint
+(also with `checkpoint_fullfsync`) empties the live WAL, the operation's lease is checked one last time, one
+atomic rename swaps the files, and the replaced file's `-wal`, `-shm` and
+`-journal` names are removed before either lock is released. The only
+process that can still hold the replaced file is one that opened it in the
+fraction of a second between the `lsof` check and the rename. As a last
+defense the replaced file's header is zeroed once no name reaches it: such
+a process gets "not a database" if it first uses the ledger before anything
+reopens the restored one. If it first uses it only after the restarted
+collector has written (so the restored ledger has a WAL), SQLite pairs it
+with that `-wal`/`-shm` by name and it can read and write stale pages. That
+residual needs a process that opens the ledger during the swap itself and
+then waits; the update window must stop every ledger user, and no Plimsoll
+command behaves that way. The ledger is restored before the config, runtime pointer and
 service; if it refuses (`ledger_in_use`, `insufficient_free_space`,
 `integrity_check_failed`), nothing else changes, the journal stays
 `rollback_required` and the receipt records `restoreRefusal`; retry the
 same operation ID after fixing the cause. A completed rollback records how
 the ledger was restored in `restore` (`clone` or `copy`, and why).
-`integrity_check` reads the whole restored ledger, so a rollback of a very
-large ledger takes minutes.
+`integrity_check` reads the whole restored ledger (about 265 MiB/s measured,
+so over 4 minutes for a 69 GB ledger). It runs in a helper process while the
+operation renews its lease, and a byte copy renews it the same way; if the lease is still lost (a stalled process
+superseded by another operation), the rollback stops before the swap with
+`LIFECYCLE_INTERRUPTED` and the same operation ID finishes it later.
 
 Node cannot clone on macOS itself (libuv answers `COPYFILE_FICLONE_FORCE`
 with ENOSYS and turns `COPYFILE_FICLONE` into a byte copy), and `cp -c` and
@@ -184,7 +264,9 @@ healthy runtime, retention keeps:
   a problem found only after a further update, or after a same-version
   re-pin whose snapshot restores the current runtime itself;
 - the newest completed snapshot that restores a runtime other than the
-  installed one, even when it is older than those two;
+  installed one, even when it is older than those two; if that one cannot
+  actually restore (see "Repairing blocked retention"), also the newest one
+  that can;
 - every snapshot an unfinished operation references (the journal, including
   a rollback that still needs recovery) and every snapshot whose operation
   is unknown;
@@ -227,7 +309,8 @@ sequencing that has since gone. A completed snapshot is removed only when 2
 sequence beyond the order record, a missing or damaged order record, or a
 pre-sequencing receipt that appeared after sequencing began (an older
 collector ran an update later) make the order unproven: retention removes
-nothing (`completion_order_unproven`) until it is repaired.
+nothing (`completion_order_unproven`) until `snapshots reconcile` repairs it
+(see "Repairing blocked retention").
 
 Everything else is removed: older completed snapshots, snapshots of failed
 updates whose automatic rollback already restored them (`rolled_back`), and
@@ -249,21 +332,57 @@ process stops at any point, or the receipt cannot be written, the next prune
 or completed update finishes the recorded removals and reports them under
 `retention.recovered` in its own receipt; items that never moved are decided
 again.
+If a recorded removal would leave no usable way back, prune attempts to
+restore its items and reports successful moves under `retention.restored`.
+A snapshot can already be back under `snapshots/` while its runtime is still
+in `trash/`. The removal record stays until the snapshot and runtime are
+both back and form a usable way back. Prune restores the remaining item or
+refuses; it does not finish deleting that record's trash.
+
+`needed_restore_incomplete` means a recorded item is missing, blocked, or
+present in both places, or no item can be moved back while no usable way
+back exists. Remove a filesystem block and retry with 0.7.41 or later.
+If the files themselves are damaged, repair the affected recorded item under
+`lifecycle/trash/`: `snapshot+<id>+<hex>/` or
+`runtime_version+<version>+<hex>/`. For a never-moved record, inspect its
+copy under `lifecycle/snapshots/` or `lifecycle/versions/` instead. Even a
+record written before any item moved can refuse on every prune when its
+snapshot is unusable; nothing needs to be in `trash/` for this refusal. A
+completed update can create a usable way back and then finish that record.
+
+`needed_restore_unusable` means the moved-back files did not form a valid
+rollback point. The attempted moves are returned to their recorded trash
+names; if that return is blocked, the record still protects the next retry.
+Repair the affected snapshot or runtime under its recorded `lifecycle/trash/`
+name (or its source under `lifecycle/snapshots/` or `lifecycle/versions/` if
+never moved), or complete an update before retrying prune. Both
+refusals leave the pending record and do not write a prune receipt.
 
 **Operator commands.**
 
 ```sh
 plimsoll lifecycle snapshots list            # id, created, size, method, operation state, keep/prune and why
 plimsoll lifecycle snapshots list --json
-plimsoll lifecycle snapshots prune           # dry run: exactly what would go, changes nothing
+plimsoll lifecycle snapshots prune           # dry run: planned removals or pending restore, changes nothing
 plimsoll lifecycle snapshots prune --apply   # holds the lifecycle lease; same protections as retention
 plimsoll lifecycle snapshots prune --keep 1 --apply
 ```
 
 `--keep N` (1 to 64, default 2) changes only how many newest completed
 snapshots are kept; every other protection stays. Prune may run while the
-collector is running and while an interrupted operation awaits recovery (it
-never touches the ledger or what that operation references). Its output is
+collector is running and while an interrupted operation is in
+`rollback_required`, because freeing space may be needed for its restore. It
+never touches the ledger or what that operation references. A
+`rollback_complete` journal blocks prune until the rollback receipt is durable.
+When a recorded way back needs restoring, the dry run reports `pendingRestore`
+and no planned removals. `snapshots list` marks the affected decisions
+`pending_restore`. Apply attempts the named restore and refuses if the files
+are incomplete or unusable. The dry run predicts known validation failures;
+a rename or filesystem access can still fail during apply.
+If the journal is malformed or unreadable, the dry run reports
+`journal_unreadable`; `prune --apply` exits nonzero without a receipt or any
+removal. Preserve the journal for repair and retry after its state is known.
+Its output is
 value-blind: operation IDs, runtime names, dates, sizes, methods and
 decisions.
 
@@ -296,7 +415,80 @@ On a host whose history predates sequencing, the dry run shows which
 snapshots the version chain orders. A snapshot marked
 `completion_order_unproven` stays; if the chain cannot place the two newest,
 nothing is pruned until two sequenced updates have completed (or one has,
-with `--keep 1`).
+with `--keep 1`), or until the operator names what to keep with
+`snapshots reconcile --keep-snapshots`.
+
+**Repairing blocked retention.** `snapshots list` names the reason in
+`blockedReason`. Two reasons need an operator: `completion_order_unproven`
+(the order record is lost or damaged, two completions share a sequence, a
+sequence is beyond the record, or a receipt without a sequence appeared
+after sequencing began) and `removal_record_unreadable`. Snapshots kept as
+`operation_unknown` or `receipt_without_sequence` (their receipt cannot be
+read or ordered) also stay until an operator decides them. The repair is
+`snapshots reconcile` (0.7.41 and later):
+
+```sh
+plimsoll lifecycle snapshots reconcile                    # dry run: findings and the repair it would make
+plimsoll lifecycle snapshots reconcile --apply            # only when the order can be rebuilt from provable facts
+plimsoll lifecycle snapshots reconcile --keep-snapshots ID[,ID...] --apply
+```
+
+The dry run changes nothing. It reports each finding and one `repair`:
+
+- `none`: the order is proven and retention can decide every snapshot.
+  Apply only moves unreadable removal records aside and removes what a
+  crash left.
+- `rebuilt`: the order record is missing or damaged, but every receipt is
+  readable and carries a sequence, no two share one, every snapshot has a
+  receipt, and the sequences follow the version chain: in sequence order
+  each operation starts from the version the one before it left installed
+  (its target, or its starting version when it rolled back), and the last
+  one left the version installed now. The receipts' own sequences are then
+  the whole order, and apply rewrites the record from them. A sequence that
+  contradicts the chain (a damaged receipt claiming to be newest) makes it
+  `needs_keep` instead.
+- `needs_keep`: anything else: the order cannot be proved, or retention
+  keeps a snapshot it cannot order or whose receipt it cannot read
+  (`findings.undecidedSnapshots`). Apply without `--keep-snapshots` refuses
+  and changes nothing.
+
+The dry run also reports `neededRepair` (the repair without a keep-set) and
+`newestWayBack`: the newest snapshot, by its recorded time, that restores a
+version other than the installed one.
+
+`--keep-snapshots` seals the order with the operator's decision. The named
+snapshots are kept; every other snapshot present now is released
+(`released_by_reconcile`) and goes at the next prune or completed update;
+every receipt present now counts as older than every completion after the
+seal. The named snapshots stay (`kept_by_reconcile`) until `--keep N` newer
+completions exist; then retention treats them like any older snapshot. When
+any snapshot can restore an earlier version, the keep-set must name at least
+one of them, so a way back always remains; the first install's snapshot
+restores no version and does not count. A way back must also be able to
+restore: its own config, service and database copies are present (the
+database copy at its recorded size), and the runtime it restores is still a
+regular file under `versions/` that matches the digest the snapshot recorded.
+Snapshots record that digest from 0.7.41 on; older ones recorded none, so for
+them only the runtime's presence is checked. The dry run lists
+`unusableWaysBack`, each with its reason, and a keep-set of only such
+snapshots is refused with that reason. That rule holds even with `--force`,
+and the check only reads: it restores and writes nothing.
+Two more cases need `--force`, and the dry run shows both: sealing when
+nothing needs a keep-set (`neededRepair` is `none` or `rebuilt`), and a
+keep-set that releases `newestWayBack` (`newestWayBackReleased`). A forced
+seal records `forced: true` in its receipt. Choose from `snapshots list`
+(dates, versions, sizes).
+
+Apply holds the lifecycle lease and refuses while an interrupted operation
+awaits recovery. It moves each unreadable removal record, byte for byte, to
+`lifecycle/removals-unreadable/` (kept there; only `purge` removes it; the
+receipt names each with its size and SHA-256), removes temporaries a crash
+left (`removals/*.json.tmp`, `completion-order.json.tmp`), writes the new
+order record durably, and writes a `snapshots_reconcile` receipt with the
+findings, the repair, the keep-set and the released snapshots. It removes no
+snapshot or runtime itself: run `snapshots prune` (dry run first) afterwards.
+A prune apply or completed update also removes those temporaries whenever
+retention is not blocked.
 
 ## Uninstall, purge, leave, and revoke
 

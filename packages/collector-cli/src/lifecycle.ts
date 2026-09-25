@@ -71,6 +71,8 @@ export type LifecycleJournal = {
   toVersion: string;
   phase: LifecyclePhase;
   snapshotId: string;
+  /** Set with rollback_complete: how the ledger was restored, for a receipt written on retry. */
+  restore?: LifecycleRestoreRecord;
 };
 
 export type LifecycleReadiness = {
@@ -125,6 +127,11 @@ export type LifecycleRestoreRecord = {
   method: "clone" | "copy" | "none";
   cloneFallback: "clone_unsupported" | null;
   databaseBytes: number;
+  /**
+   * "preexisting_damage": the restored copy fails PRAGMA integrity_check, but
+   * only with complaints the live ledger it replaced already had.
+   */
+  integrity?: "ok" | "preexisting_damage";
 };
 
 /** Why a rollback left the live ledger untouched instead of restoring it. */
@@ -173,6 +180,13 @@ export type LifecycleRemovedItem = {
   bytes: number;
 };
 
+/** A recorded way back that prune must restore, or refuse to touch. */
+export type LifecyclePendingRestore = {
+  items: LifecycleRemovedItem[];
+  wouldRestore: LifecycleRemovedItem[];
+  refusal: "needed_restore_incomplete" | "needed_restore_unusable" | null;
+};
+
 export type LifecycleRetentionRecord = {
   keepSnapshots: number;
   status: "applied" | "preview" | "skipped";
@@ -183,11 +197,17 @@ export type LifecycleRetentionRecord = {
     | "removal_record_unreadable"
     | "retention_failed"
     | "skipped_by_operator"
+    | "needed_restore_incomplete"
+    | "needed_restore_unusable"
     | null;
   removed: LifecycleRemovedItem[];
   removedBytes: number;
   /** Removals an interrupted earlier retention left in the trash, finished now. */
   recovered: LifecycleRemovedItem[];
+  /** Recorded trash entries restored to their original locations to preserve a usable way back. */
+  restored?: LifecycleRemovedItem[];
+  /** Read-only prune preview: pending recorded items and the attempted restore. */
+  pendingRestore?: LifecyclePendingRestore;
   keptSnapshots: string[];
   keptVersions: string[];
   /**
@@ -198,22 +218,68 @@ export type LifecycleRetentionRecord = {
   wouldRemove?: LifecycleRemovedItem[];
 };
 
+/**
+ * What `snapshots reconcile` found and did: names, counts and bytes only.
+ * "rebuilt": the order record was restored from the receipts' own
+ * sequences; "sealed": the operator named the snapshots to keep; "none":
+ * nothing needed repair; "needs_keep": only the operator's keep-set can
+ * decide (the order cannot be proved, or a snapshot's receipt cannot be read
+ * or ordered). `neededRepair` is what reconcile would do without a keep-set.
+ */
+export type LifecycleReconcileRecord = {
+  status: "preview" | "applied";
+  blockedBefore: "lifecycle_state_unreadable" | "journal_unreadable" | "completion_order_unproven" | "removal_record_unreadable" | null;
+  findings: {
+    orderRecord: "valid" | "absent" | "invalid";
+    duplicateSequences: string[];
+    sequencesBeyondRecord: string[];
+    unsequencedAfterSequencing: string[];
+    unreadableReceipts: string[];
+    /** Complete receipts without a completion sequence: written by a command that could not read the order record. */
+    receiptsWithoutSequence: string[];
+    snapshotsWithoutReceipt: string[];
+    /** Snapshots retention keeps only because it cannot order them or read their receipt. */
+    undecidedSnapshots: string[];
+    unreadableRemovalRecords: string[];
+    staleTemporaries: number;
+  };
+  repair: "none" | "rebuilt" | "sealed" | "needs_keep";
+  neededRepair: "none" | "rebuilt" | "needs_keep";
+  /** A seal applied with --force although nothing needed one or it releases the newest way back. */
+  forced: boolean;
+  keep: string[];
+  released: string[];
+  /** The newest snapshot (by its recorded time) that can restore a version other than the installed one. */
+  newestWayBack: string | null;
+  newestWayBackReleased: boolean;
+  /** Snapshots that would restore an earlier version but cannot, and why: they never count as a way back. */
+  unusableWaysBack: Array<{ id: string; restoresVersion: string; reason: string }>;
+  /** Unreadable removal records moved to lifecycle/removals-unreadable/, kept byte for byte. */
+  quarantined: Array<{ name: string; bytes: number; sha256: string }>;
+  lastSequence: number | null;
+};
+
 export type LifecycleSnapshotState = "completed" | "rolled_back" | "in_progress" | "rollback_required" | "unknown";
 export type LifecycleSnapshotRetentionReason =
   | "newest_completed"
   | "restores_previous_version"
   | "unfinished_operation"
   | "operation_unknown"
+  | "receipt_without_sequence"
   | "completion_order_unproven"
+  | "kept_by_reconcile"
+  | "released_by_reconcile"
   | "older_completed"
   | "rolled_back_operation"
-  | "incomplete_snapshot";
+  | "incomplete_snapshot"
+  | "pending_restore";
 export type LifecycleVersionRetentionReason =
   | "current"
   | "service_manifest"
   | "unfinished_operation"
   | "restore_target"
   | "restore_target_unknown"
+  | "pending_restore"
   | "unreferenced";
 
 export type LifecycleRetentionSnapshot = {
@@ -223,6 +289,12 @@ export type LifecycleRetentionSnapshot = {
   /** Version the snapshot restores (the one installed before its operation). */
   restoresVersion: string | null;
   method: LifecycleSnapshotMethod | null;
+  /**
+   * False when the snapshot could not actually be restored: its own files or
+   * the runtime it restores are gone, or that runtime no longer matches the
+   * digest the snapshot recorded. Absent means not checked (treated as usable).
+   */
+  restorable?: boolean;
 };
 
 /** A completed update/rollback with its durable completion order. */
@@ -241,6 +313,13 @@ export type LifecycleRetentionInput = {
    * an unknown operation.
    */
   operations: readonly LifecycleOrderedOperation[];
+  /**
+   * Snapshot IDs whose receipt is complete except for its completion
+   * sequence: a lifecycle command that could not read the order record wrote
+   * it (a pre-0.7.41 command on a sealed host, or with the record lost). Kept as unknown
+   * until `snapshots reconcile` decides them.
+   */
+  receiptsWithoutSequence?: readonly string[];
   order: {
     /** False when the durable order itself is missing, duplicated or contradictory: nothing is pruned. */
     proven: boolean;
@@ -250,9 +329,22 @@ export type LifecycleRetentionInput = {
      * without one, and none recorded at sequencing that has since vanished.
      */
     legacyChain: boolean;
+    /**
+     * Written by `snapshots reconcile --keep-snapshots`: every snapshot that
+     * existed then (`covered`) other than the operator's keep-set is released;
+     * the keep-set counts as older than every completion sequenced after
+     * `sequence`, and the pre-seal receipts are no longer ordered.
+     */
+    seal?: LifecycleOrderSeal | null;
   };
   snapshots: readonly LifecycleRetentionSnapshot[];
   versions: readonly { version: string; bytes: number }[];
+};
+
+export type LifecycleOrderSeal = {
+  sequence: number;
+  keep: readonly string[];
+  covered: readonly string[];
 };
 
 export type LifecycleRetentionPlan = {
@@ -276,6 +368,8 @@ export type LifecycleSnapshotInventory = {
     bytes: number;
     method: LifecycleSnapshotMethod | "unrecorded";
     restoresVersion: string | null;
+    /** Read-only reason this snapshot cannot restore, if any. */
+    cannotRestoreReason: string | null;
     operationState: LifecycleSnapshotState;
     retention: "keep" | "prune";
     reason: LifecycleSnapshotRetentionReason;
@@ -287,6 +381,7 @@ export type LifecycleSnapshotInventory = {
     reason: LifecycleVersionRetentionReason;
   }>;
   pendingRemoval: LifecycleRemovedItem[];
+  pendingRestore: LifecyclePendingRestore | null;
   bytes: { snapshots: number; versions: number; prunable: number; pendingRemoval: number };
 };
 
@@ -294,7 +389,7 @@ export type LifecycleReceipt = {
   schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
   toolVersion: string;
   operationId: string;
-  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle" | "snapshots_prune";
+  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle" | "snapshots_prune" | "snapshots_reconcile";
   status: "completed" | "rolled_back" | "rollback_required" | "preview" | "purged" | "generated" | "refused";
   fromVersion: string | null;
   toVersion: string | null;
@@ -320,6 +415,8 @@ export type LifecycleReceipt = {
   restore?: LifecycleRestoreRecord;
   /** Rollback still required: why the restore left the live ledger untouched. */
   restoreRefusal?: LifecycleRestoreRefusalRecord;
+  /** snapshots_reconcile: what was found and repaired. */
+  reconcile?: LifecycleReconcileRecord;
 };
 
 export type LifecycleSupportSnapshot = {
@@ -365,7 +462,7 @@ export type LifecycleAdapter = {
   switchTo(artifact: RuntimeArtifact): Promise<void>;
   readiness(expectedVersion: string, input: { signal: AbortSignal; deadlineMs: number }): Promise<LifecycleReadiness>;
   /** Adapters that know how the ledger was restored return it for the receipt. */
-  restore(snapshotId: string): Promise<void | LifecycleRestoreRecord>;
+  restore(snapshotId: string, operationId?: string): Promise<void | LifecycleRestoreRecord>;
   persistReceipt(receipt: LifecycleReceipt): Promise<void>;
   uninstallOwned(input: { apply: boolean }): Promise<readonly string[]>;
   purgeOwnedData(input: { apply: boolean; confirmation: string | null }): Promise<readonly string[]>;
@@ -395,6 +492,13 @@ export type LifecycleAdapter = {
    * removal records that receipt accounts for, once it names every item.
    */
   commitRetention?(operationId: string): Promise<void>;
+  /**
+   * Diagnoses (apply false, read-only) or repairs what blocks retention: a
+   * lost or contradictory completion order, unreadable removal records and
+   * stale temporaries. The order is rebuilt only from provable facts;
+   * otherwise `keep` (the operator's keep-set) seals it. Deletes nothing.
+   */
+  reconcileRetention?(input: { operationId: string; keep: readonly string[] | null; apply: boolean; force?: boolean }): Promise<LifecycleReconcileRecord>;
 };
 
 export class LifecycleInterruption extends Error {
@@ -433,7 +537,8 @@ export class LifecycleSnapshotRefusal extends Error {
 }
 
 const RESTORE_REFUSAL_MESSAGES: Record<Exclude<LifecycleRestoreRefusalRecord["reason"], "insufficient_free_space">, string> = {
-  integrity_check_failed: "the restored copy failed PRAGMA integrity_check",
+  integrity_check_failed: "the restored copy failed PRAGMA integrity_check with damage the live ledger does not " +
+    "already have",
   ledger_in_use: "another process has the live ledger open and could keep writing to the replaced file " +
     "(ledger_in_use); stop the collector service and every plimsoll command",
   quiescence_unproven: "the live ledger could not be locked exclusively (quiescence_unproven)",
@@ -471,11 +576,14 @@ function assertRetainedSnapshotCount(keep: number) {
  * every operation on it.
  */
 function provenCompletionOrder(input: LifecycleRetentionInput) {
+  const seal = input.order.seal ?? null;
   const completed = input.operations.filter((operation) => operation.status === "completed");
-  const sequenced = completed.filter((operation) => operation.sequence !== null)
+  // After a reconcile seal only completions sequenced after it are ordered;
+  // the operator's keep-set stands for everything before it.
+  const sequenced = completed.filter((operation) => operation.sequence !== null && (!seal || operation.sequence > seal.sequence))
     .sort((left, right) => right.sequence! - left.sequence!);
   const ordered: LifecycleOrderedOperation[] = [...sequenced];
-  if (input.order.legacyChain) {
+  if (input.order.legacyChain && !seal) {
     const legacy = completed.filter((operation) => operation.sequence === null);
     let anchor = sequenced.length > 0
       ? sequenced[sequenced.length - 1]!.fromVersion
@@ -507,7 +615,11 @@ export function planLifecycleRetention(input: LifecycleRetentionInput, keep: num
   const decisions = new Map<string, Decision>();
   const journal = input.journal;
   const operations = new Map(input.operations.map((operation) => [operation.id, operation]));
+  const seal = input.order.seal ?? null;
+  const covered = new Set(seal?.covered ?? []);
+  const sealedKeep = new Set(seal?.keep ?? []);
   const completed: LifecycleRetentionSnapshot[] = [];
+  const keptBySeal: LifecycleRetentionSnapshot[] = [];
   for (const snapshot of input.snapshots) {
     if (journal && (snapshot.id === journal.snapshotId || snapshot.id === journal.operationId)) {
       decisions.set(snapshot.id, {
@@ -520,8 +632,20 @@ export function planLifecycleRetention(input: LifecycleRetentionInput, keep: num
       continue;
     }
     const operation = operations.get(snapshot.id);
+    // A later operation that reuses the ID of a covered snapshot without a
+    // receipt completes after the seal: the seal does not decide it.
+    if (seal && covered.has(snapshot.id) && (operation?.sequence ?? 0) <= seal.sequence && input.order.proven) {
+      // The operator named what to keep when the order could not be proved.
+      if (sealedKeep.has(snapshot.id)) keptBySeal.push(snapshot);
+      else decisions.set(snapshot.id, { keep: false, reason: "released_by_reconcile", state: operation?.status ?? "unknown" });
+      continue;
+    }
     if (!operation) {
-      decisions.set(snapshot.id, { keep: true, reason: "operation_unknown", state: "unknown" });
+      decisions.set(snapshot.id, {
+        keep: true,
+        reason: input.receiptsWithoutSequence?.includes(snapshot.id) ? "receipt_without_sequence" : "operation_unknown",
+        state: "unknown",
+      });
     } else if (!input.order.proven) {
       decisions.set(snapshot.id, { keep: true, reason: "completion_order_unproven", state: operation.status });
     } else if (operation.status === "rolled_back") {
@@ -530,7 +654,7 @@ export function planLifecycleRetention(input: LifecycleRetentionInput, keep: num
       completed.push(snapshot);
     }
   }
-  if (completed.length > 0) {
+  if (completed.length > 0 || keptBySeal.length > 0) {
     const byId = new Map(completed.map((snapshot) => [snapshot.id, snapshot]));
     const ordered = provenCompletionOrder(input).flatMap((operation) => byId.get(operation.id) ?? []);
     ordered.forEach((snapshot, index) => decisions.set(snapshot.id, {
@@ -550,20 +674,37 @@ export function planLifecycleRetention(input: LifecycleRetentionInput, keep: num
         ? { keep: false, reason: snapshot.metadataValid ? "older_completed" : "incomplete_snapshot", state: "completed" }
         : { keep: true, reason: "completion_order_unproven", state: "completed" });
     }
+    // The operator's keep-set is older than every completion sequenced after
+    // the seal: it goes once `keep` of those are kept.
+    for (const snapshot of keptBySeal) {
+      const state = operations.get(snapshot.id)?.status ?? "unknown";
+      decisions.set(snapshot.id, olderThanKept
+        ? { keep: false, reason: snapshot.metadataValid ? "older_completed" : "incomplete_snapshot", state }
+        : { keep: true, reason: "kept_by_reconcile", state });
+    }
     const restoresOther = (snapshot: LifecycleRetentionSnapshot) =>
       snapshot.metadataValid && snapshot.restoresVersion !== input.installedVersion;
+    const keepAsWayBack = (snapshot: LifecycleRetentionSnapshot) => {
+      if (!decisions.get(snapshot.id)!.keep) {
+        decisions.set(snapshot.id, {
+          keep: true,
+          reason: "restores_previous_version",
+          state: operations.get(snapshot.id)?.status ?? "unknown",
+        });
+      }
+    };
     const rollbackPoint = ordered.find(restoresOther);
-    if (rollbackPoint) {
-      if (!decisions.get(rollbackPoint.id)!.keep) {
-        decisions.set(rollbackPoint.id, { keep: true, reason: "restores_previous_version", state: "completed" });
-      }
-    } else {
-      // The newest way back is somewhere among the unordered: keep them all.
-      for (const snapshot of unordered.filter(restoresOther)) {
-        if (!decisions.get(snapshot.id)!.keep) {
-          decisions.set(snapshot.id, { keep: true, reason: "restores_previous_version", state: "completed" });
-        }
-      }
+    if (rollbackPoint) keepAsWayBack(rollbackPoint);
+    // The newest way back is somewhere among the unordered: keep them all.
+    else for (const snapshot of [...unordered, ...keptBySeal].filter(restoresOther)) keepAsWayBack(snapshot);
+    // A way back that cannot actually restore does not count. When none that
+    // can is kept, also keep the newest one that can (every such one when the
+    // order cannot tell which is newest).
+    const usable = (snapshot: LifecycleRetentionSnapshot) => restoresOther(snapshot) && snapshot.restorable !== false;
+    if (!input.snapshots.some((snapshot) => usable(snapshot) && decisions.get(snapshot.id)?.keep)) {
+      const newestUsable = ordered.find(usable);
+      if (newestUsable) keepAsWayBack(newestUsable);
+      else for (const snapshot of [...unordered, ...keptBySeal].filter(usable)) keepAsWayBack(snapshot);
     }
   }
 
@@ -767,10 +908,11 @@ function validSnapshotRecord(value: unknown) {
   return record.method !== "clone" || (record.quiesced && record.cloneFallback === null);
 }
 
-function validRestoreRecord(value: unknown) {
+export function validRestoreRecord(value: unknown) {
   const record = ownPlainRecord(value);
-  if (!record || !exactKeys(record, ["method", "cloneFallback", "databaseBytes"])) return false;
+  if (!record || !exactKeys(record, ["method", "cloneFallback", "databaseBytes"], ["integrity"])) return false;
   if (!nonnegativeInteger(record.databaseBytes)) return false;
+  if ("integrity" in record && record.integrity !== "ok" && record.integrity !== "preexisting_damage") return false;
   if (record.method === "clone" || record.method === "none") return record.cloneFallback === null;
   return record.method === "copy" && (record.cloneFallback === "clone_unsupported" || record.cloneFallback === null);
 }
@@ -779,15 +921,16 @@ function validRetentionRecord(value: unknown) {
   const record = ownPlainRecord(value);
   if (!record || !exactKeys(record, [
     "keepSnapshots", "status", "skippedReason", "removed", "removedBytes", "recovered", "keptSnapshots", "keptVersions",
-  ], ["wouldRemove"])) return false;
+  ], ["wouldRemove", "restored"])) return false;
   if (!nonnegativeInteger(record.keepSnapshots) || record.keepSnapshots < 1 ||
       record.keepSnapshots > LIFECYCLE_MAX_RETAINED_SNAPSHOTS) return false;
   if (!boundedList(record.removed, isRemovedItem) || !boundedList(record.recovered, isRemovedItem)) return false;
+  if ("restored" in record && (!boundedList(record.restored, isRemovedItem) || record.status !== "applied")) return false;
   if (!boundedList(record.keptSnapshots, isIdentifier) || !boundedList(record.keptVersions, isIdentifier)) return false;
   if (record.removedBytes !== record.removed.reduce((total, item) => total + item.bytes, 0)) return false;
   // An operator keep-all removed and recovered nothing; only it may carry the preview.
   if (record.skippedReason === "skipped_by_operator") {
-    if (record.recovered.length > 0) return false;
+    if (record.recovered.length > 0 || ("restored" in record && Array.isArray(record.restored) && record.restored.length > 0)) return false;
     if ("wouldRemove" in record && !boundedList(record.wouldRemove, isRemovedItem)) return false;
   } else if ("wouldRemove" in record) {
     return false;
@@ -812,7 +955,11 @@ function validCompletedHealth(value: unknown, toVersion: string) {
  * proves a completed or rolled-back update/rollback; anything else returns
  * null, which retention treats as an unknown operation it never prunes.
  */
-export function parseCompletionReceipt(value: unknown, operationId: string): LifecycleCompletedOperation | null {
+export function parseCompletionReceipt(
+  value: unknown,
+  operationId: string,
+  options: { sequenceOptional?: boolean } = {},
+): LifecycleCompletedOperation | null {
   const record = ownPlainRecord(value);
   if (!record || !exactKeys(record, RECEIPT_KEYS, ["snapshot", "retention", "restore", "completionSequence"])) return null;
   const { operation, status, fromVersion, toVersion } = record;
@@ -828,7 +975,7 @@ export function parseCompletionReceipt(value: unknown, operationId: string): Lif
   // sequencing began, so each must carry its durable completion sequence.
   const sequence = record.completionSequence;
   if (sequence !== undefined && !(nonnegativeInteger(sequence) && sequence > 0)) return null;
-  if (sequence === undefined && ("snapshot" in record || "retention" in record || "restore" in record)) return null;
+  if (sequence === undefined && !options.sequenceOptional && ("snapshot" in record || "retention" in record || "restore" in record)) return null;
   if (status === "completed") {
     if (record.restoredVersion !== null || !validCompletedHealth(record.health, toVersion)) return null;
     if (!sameList(record.ownedTargets, COMPLETED_OWNED_TARGETS) || "restore" in record) return null;
@@ -940,12 +1087,14 @@ export class LifecycleManager {
   }
 
   private async finishRequiredRollback(journal: LifecycleJournal, operationId: string) {
-    let restored: LifecycleRestoreRecord | undefined;
     if (journal.phase === "rollback_required") {
       await this.fence(operationId);
+      let restored: LifecycleRestoreRecord | undefined;
       try {
-        restored = await this.adapter.restore(journal.snapshotId) ?? undefined;
+        restored = await this.adapter.restore(journal.snapshotId, operationId) ?? undefined;
       } catch (error) {
+        // A lost fence means a successor owns the lifecycle root: record nothing.
+        if (error instanceof LifecycleInterruption) throw error;
         const refusal = error instanceof LifecycleRestoreRefusal ? error.refusal : undefined;
         const blocked = await this.rollbackReceipt(journal, "rollback_required", refusal ? { restoreRefusal: refusal } : {});
         await this.adapter.persistReceipt(blocked);
@@ -954,12 +1103,13 @@ export class LifecycleManager {
           : "rollback required: restore failed; retry the same operationId");
       }
       journal.phase = "rollback_complete";
+      if (restored) journal.restore = restored;
       await this.adapter.writeJournal(journal);
     }
     if (journal.phase !== "rollback_complete") {
       throw new Error("rollback recovery state is invalid");
     }
-    const receipt = await this.rollbackReceipt(journal, "rolled_back", restored ? { restore: restored } : {});
+    const receipt = await this.rollbackReceipt(journal, "rolled_back", journal.restore ? { restore: journal.restore } : {});
     await this.adapter.persistReceipt(receipt);
     await this.adapter.clearJournal(journal.operationId);
     return receipt;
@@ -1157,7 +1307,8 @@ export class LifecycleManager {
   /**
    * Dry run by default: no lock, no receipt, no change. Apply holds the
    * mutation lease and removes only what retention would, with the same
-   * protections, even while another operation's journal awaits recovery.
+   * protections. A rollback-required journal may prune to free restore space;
+   * a completed rollback still blocks until its receipt is durable.
    */
   async pruneSnapshots(input: { operationId: string; keep?: number; apply?: boolean }): Promise<{
     receipt: LifecycleReceipt | null;
@@ -1175,6 +1326,13 @@ export class LifecycleManager {
       throw new Error("another lifecycle operation owns the lock");
     }
     try {
+      // A rollback-required journal may need prune to free the space needed by
+      // its restore. Once the restore is complete, its receipt must be durable
+      // before another prune mutates retention.
+      const journal = await this.adapter.readJournal();
+      if (journal?.phase === "rollback_complete") {
+        throw new Error("lifecycle recovery is required before prune");
+      }
       await this.assertFreshOperation(input.operationId);
       await this.fence(input.operationId);
       const retention = await retainSnapshots({ operationId: input.operationId, keep, apply: true });
@@ -1198,6 +1356,62 @@ export class LifecycleManager {
       await this.adapter.persistReceipt(receipt);
       if (retention.status === "applied") await this.adapter.commitRetention?.(input.operationId);
       return { receipt, retention };
+    } finally {
+      await this.adapter.releaseLock(input.operationId);
+    }
+  }
+
+  /**
+   * Dry run by default (read-only, no receipt). Apply holds the mutation lease,
+   * refuses while an interrupted operation awaits recovery, repairs what it
+   * can prove (or seals the order with the operator's keep-set) and records
+   * everything in a snapshots_reconcile receipt. It deletes no snapshot: the
+   * next prune or completed update does, with the usual removal records.
+   */
+  async reconcileSnapshots(input: { operationId: string; keep?: readonly string[]; apply?: boolean; force?: boolean }): Promise<{
+    receipt: LifecycleReceipt | null;
+    reconcile: LifecycleReconcileRecord;
+  }> {
+    assertBoundedIdentifier(input.operationId, "operationId");
+    const keep = input.keep ?? null;
+    if (keep) {
+      if (keep.length === 0 || keep.length > LIFECYCLE_MAX_RETAINED_SNAPSHOTS || new Set(keep).size !== keep.length) {
+        throw new Error(`--keep-snapshots must name 1 to ${LIFECYCLE_MAX_RETAINED_SNAPSHOTS} distinct snapshot IDs`);
+      }
+      for (const id of keep) assertBoundedIdentifier(id, "snapshot ID");
+    }
+    const reconcile = this.adapter.reconcileRetention?.bind(this.adapter);
+    if (!reconcile) throw new Error("this lifecycle adapter cannot reconcile snapshots");
+    if (input.apply !== true) {
+      return { receipt: null, reconcile: await reconcile({ operationId: input.operationId, keep, apply: false, force: input.force === true }) };
+    }
+    if (!(await this.adapter.acquireLock(input.operationId))) {
+      throw new Error("another lifecycle operation owns the lock");
+    }
+    try {
+      if (await this.adapter.readJournal()) throw new Error("lifecycle recovery is required before reconcile");
+      await this.assertFreshOperation(input.operationId);
+      await this.fence(input.operationId);
+      const record = await reconcile({ operationId: input.operationId, keep, apply: true, force: input.force === true });
+      const receipt: LifecycleReceipt = {
+        schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+        toolVersion: PLIMSOLL_VERSION,
+        operationId: input.operationId,
+        operation: "snapshots_reconcile",
+        status: "completed",
+        fromVersion: await this.adapter.installedVersion().catch(() => null),
+        toVersion: null,
+        restoredVersion: null,
+        health: null,
+        ownedTargets: ["lifecycle_snapshots"],
+        retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+        purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
+        preserved: ["ledger", "history", "credentials", "workspace_membership"],
+        reconcile: record,
+      };
+      await this.fence(input.operationId);
+      await this.adapter.persistReceipt(receipt);
+      return { receipt, reconcile: record };
     } finally {
       await this.adapter.releaseLock(input.operationId);
     }

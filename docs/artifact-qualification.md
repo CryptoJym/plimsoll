@@ -75,13 +75,17 @@ target OS/architecture/Node ABI; a version string is insufficient.
    recovery path. Confirm the backup is readable and binds to this installation
    before activation. Keep credentials in their existing private store, out of
    logs, ordinary support receipts and public artifacts.
-3. Invoke the packaged lifecycle update with a unique recorded operation ID
-   and the selected exact artifact. The current lifecycle command stages files,
-   snapshots and updates the manifest; loading/unloading the live service is a
-   separate owner action. Inspect the operation receipt and readiness before
-   that action, then attest the live PID, runtime digest, home identity and a
-   real admitted provider token. Do not substitute the source `install.sh`
-   sequence for the lifecycle transaction.
+3. Stop the collector (`unload-launch-agent`), then invoke the packaged
+   lifecycle update with a unique recorded operation ID and the selected exact
+   artifact, then start the new runtime (`load-launch-agent`). The update
+   refuses before any change while any process has the ledger open
+   (`ledger_in_use`); it snapshots, stages files and updates the manifest, and
+   never loads or unloads the service itself. Inspect the operation receipt
+   and readiness before loading, then attest the live PID, runtime digest,
+   home identity and a real admitted provider token. If the update is refused,
+   nothing changed: fix the cause and retry the same operation ID, or reload
+   the prior service. Do not substitute the source `install.sh` sequence for
+   the lifecycle transaction.
 4. If interrupted, preserve the journal and operation ID. The mutation lease
    remains authoritative until release or its recorded expiry (currently ten
    minutes by default). Retry the same operation/artifact after expiry; do not
@@ -89,8 +93,13 @@ target OS/architecture/Node ABI; a version string is insufficient.
    operation correctly fails closed.
 5. If readiness fails, inspect the persisted rollback receipt and verify the
    prior manifest/version, config bytes, ledger and identity before restarting
-   the prior service. Explicit rollback uses the retained exact prior artifact
-   and its recorded version. A failed restore keeps the journal for recovery;
+   the prior service. Explicit rollback runs the prior release's own CLI with
+   `lifecycle rollback --artifact self` (a CLI installs only a bundle from its
+   own install tree). An update or rollback by a CLI older than 0.7.38 on a
+   host that has run 0.7.38 stops snapshot retention until `lifecycle
+   snapshots reconcile` (0.7.41 and later) repairs it. On a host sealed by
+   `reconcile --keep-snapshots`, releases before 0.7.41 remove nothing and the
+   next reconcile decides their snapshots. A failed restore keeps the journal for recovery;
    preserve it and the snapshots. Uninstall and purge are separate actions,
    never a substitute for rollback.
 6. After the pilot passes restart, first real token, offline capture/remote
