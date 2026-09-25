@@ -195,7 +195,9 @@ segment proxy is therefore unmeasured and the fixture falls back to the 1.2 × s
    start a hold. **The census obligation (round 8):** the census is taken **after the catch-up** (S1b (b)), **at most one day before
    the S1b decision**, and **re-taken before S3** (its counts are the conversion's denominator); it gives no gate value otherwise.
    The `VACUUM INTO` copy is made only when free space on the volume is at least the ledger's bytes plus the reserve (the copy is a
-   full live-page copy), and it is deleted after the count. The 1.25 factor covers the **row widths** until S2 has measured them on
+   full live-page copy), and it is deleted after the count. **The re-census before S3 runs during the hold (round 9, review r2):**
+   its copy is made only when `free − ledger ≥ reserve + rebuild_headroom + G_owed`, so the copy itself can never put the runway
+   under a rung (`censusPreflight` reason `copy_would_trip_rung`; a copy that fits `ledger + reserve` alone may not). The 1.25 factor covers the **row widths** until S2 has measured them on
    a copy; it no longer covers the mix, which is measured.
 2. **One G.** `G_gate = 1.25 × G_host` (or the copy's measured peak) is subtracted in the runway numerator **and** sizes the
    multiplier: `g_gate = G_gate / raw_bytes_at_census`, `hold_growth_per_day = p95_7d(gross growth) × (1 + g_gate × raw_share)`.
@@ -225,12 +227,15 @@ segment proxy is therefore unmeasured and the fixture falls back to the 1.2 × s
    copy, that it followed the catch-up), `G_gate`, its basis, the measured conversion size and abort peak where a copy exists, and
    the runway series.
 
-**Tests.** Collector `tests/contracts/lean/runway.contract.ts` (B1, B10a; 5 cases): the reviewer's 333-session counterexample (the
-gate's G bounds the host's real need; the segment proxy raises G; an unmeasured host has no gate value), at the gate's 63-day
+**Tests.** Collector `tests/contracts/lean/runway.contract.ts` (B1, B10a, B2a; 6 cases): the reviewer's 333-session counterexample
+(the gate's G bounds the host's real need; the segment proxy raises G; an unmeasured host has no gate value), at the gate's 63-day
 threshold the host really has ≥ 63 days with the multiplier on `G_gate`, G owed against an independent simulation (dual-write pages
 ignored, the two terms, never overstating in the six reviewer scenarios, the 5-day and 2-day rungs never late, 0 at completion),
-the round-6 `s1b_runway_geometry.py` assertion, and `censusPreflight` (after the catch-up, at most a day old, room for the copy).
-Fixture: `fixtures/s1b_runway_host_bound.py` (19 checks: r6 9/19, r7 9/19, r8 19/19).
+the round-6 `s1b_runway_geometry.py` assertion, `censusPreflight` (after the catch-up, at most a day old, room for the copy, and
+during the hold room for the ladder's terms too), and `withMeasuredWrite` (round 9: `C_conv` equals the page delta around the
+converter's own transaction and excludes another writer's pages between two of them). Fixture: `fixtures/s1b_runway_host_bound.py`
+(25 checks: r6 10/25, r7 10/25, **r8 22/25**, r9 25/25; the round-9 checks: a measured `C_conv` exact at width factors 1.25 and
+0.8 where rows × estimates is not, the live writer's pages outside it, `U` in the census's basis, and the during-hold copy gate).
 
 ## C3. `conversion_rejects` DDL (b0Carries 3a; B2a collector)
 
@@ -372,8 +377,10 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `null` for an unmeasured census); `holdRunway({ freeBytes, reserveBytes, rebuildHeadroomBytes, gGateBytes, rawBytesAtCensus,
   converterWrittenBytes, rawUnfoldedBytesSinceCensus, conversionComplete, leanTableBytesNow?, grossGrowthP95PerDay, rawBytes,
   ledgerBytes })` → `{ runwayDays, gOwedBytes, holdGrowthPerDay, rung ∈ none | converter_paused | release_acked_only | abort }`;
-  `censusPreflight({ censusAtMs, catchUpCompleteAtMs, decisionAtMs, freeBytes, ledgerBytes, reserveBytes })` → `{ ok, reasons ⊆
-  {census_before_catchup, census_stale, no_space_for_vacuum_into} }`. (B1, B10a; C2)
+  `censusPreflight({ censusAtMs, catchUpCompleteAtMs, decisionAtMs, freeBytes, ledgerBytes, reserveBytes, duringHold?,
+  rebuildHeadroomBytes?, gOwedBytes? })` → `{ ok, reasons ⊆ {census_before_catchup, census_stale, no_space_for_vacuum_into,
+  copy_would_trip_rung} }` (round 9: `copy_would_trip_rung` when `duringHold` and `freeBytes − ledgerBytes < reserveBytes +
+  rebuildHeadroomBytes + gOwedBytes`). (B1, B10a; C2)
 - `packages/collector-cli/src/lean/converter.ts`: `withMeasuredWrite(db, write)` runs `write` in one transaction and returns
   `{ writtenBytes }` = `Δ(page_count − freelist_count) × page_size` across it, the converter's `C_conv` increment, committed with the
   chunk into its checkpoint (round 9; C2).

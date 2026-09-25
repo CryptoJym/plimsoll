@@ -31,6 +31,9 @@ Round 9 (B0 round 3, review-r2 should-fixes 5-6; CONTRACTS.md r9 C2): the FORMUL
            writer at a time, so those pages are the converter's alone); never rows x estimated widths (round 8 said "its own
            counter" without a basis) and never a lean-table page count (round 7). U is in the census's raw-bytes basis:
            unfolded post-census raw rows x (raw_bytes_at_census / raw_rows_at_census).
+  The re-census before S3 runs DURING the hold: its VACUUM INTO copy is made only when free - ledger >= reserve + rebuild
+           headroom + G_owed (the copy must leave the ladder's terms intact and cannot trip a rung), on top of the first census's
+           free >= ledger + reserve.
 Modes: --rule r6 (round 6), r7 (round-1 C2 as written), r8 (round-2 C2 as written), r9 (this rule). Red under r6, r7 and r8,
 green under r9.
 """
@@ -178,6 +181,8 @@ def census_preflight(census_day, catchup_complete_day, decision_day, free_bytes,
     if census_day < catchup_complete_day: reasons.append("census_before_catchup")
     if decision_day - census_day > 1: reasons.append("census_stale")
     if free_bytes < ledger_bytes + reserve_bytes: reasons.append("no_space_for_vacuum_into")
+    if R9 and during_hold and free_bytes - ledger_bytes < reserve_bytes + rebuild_headroom + g_owed:
+        reasons.append("copy_would_trip_rung")                                    # round 9: the re-census copy must leave the ladder's terms intact
     return {"ok": not reasons, "reasons": reasons}
 L = h4["ledger"]
 stale = census_preflight(census_day=0, catchup_complete_day=3, decision_day=7, free_bytes=40 * GiB, ledger_bytes=L, reserve_bytes=reserve)
@@ -235,4 +240,14 @@ U_rows = 12_345
 c.expect(abs(rule_owed(G_gate(h4), h4["raw_bytes"], G_gate(h4), 0, U_rows * raw_bytes_per_row, False) - (G_gate(h4) / h4["raw"]) * U_rows) < 1e-6,
          "U is the unfolded post-census raw rows x the census's bytes per raw row, so g_gate x U equals G_gate per raw row x rows (the census's basis, not payload bytes)", f"g_gate x U = {rule_owed(G_gate(h4), h4['raw_bytes'], G_gate(h4), 0, U_rows * raw_bytes_per_row, False) / MB:.2f} MB")
 
+# ---- 10. should-fix 6 (review r2): the re-census copy during the hold must not trip a rung ---------------------------------------
+sc = simulate(h4, 40 * MB, 14, 2, 0.6)
+rebuild_hd, g_owed_now = sc["rebuild"], sc["owed"]
+room_for_copy_only = L + reserve + rebuild_hd / 2                      # passes round 8's free >= ledger + reserve; the copy would eat into the rebuild headroom
+mid_hold = census_preflight(census_day=20, catchup_complete_day=3, decision_day=20, free_bytes=room_for_copy_only, ledger_bytes=L, reserve_bytes=reserve, during_hold=True, rebuild_headroom=rebuild_hd, g_owed=g_owed_now)
+runway_after_copy = (room_for_copy_only - L - reserve - rebuild_hd - g_owed_now) / sc["growth"]
+print(f"    re-census during the hold with free = ledger + reserve + rebuild/2: runway after the copy would be {runway_after_copy:.2f} d; preflight {mid_hold}")
+c.expect(not mid_hold["ok"] and "copy_would_trip_rung" in mid_hold["reasons"], "the re-census copy before S3 is refused when free - ledger < reserve + rebuild headroom + G_owed (the copy itself would put the runway under a rung: here negative), even though ledger + reserve is free", str(mid_hold))
+enough = census_preflight(census_day=20, catchup_complete_day=3, decision_day=20, free_bytes=L + reserve + rebuild_hd + g_owed_now + 30 * sc["growth"], ledger_bytes=L, reserve_bytes=reserve, during_hold=True, rebuild_headroom=rebuild_hd, g_owed=g_owed_now)
+c.expect(enough["ok"], "a re-census copy that leaves reserve + rebuild headroom + G_owed and 30 days of growth free is accepted", str(enough))
 c.finish()

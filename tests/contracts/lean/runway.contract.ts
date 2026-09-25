@@ -4,8 +4,8 @@
  * the reviewer's 333-session counterexample, the Studio4 census, the dual-write and post-census scenarios, the census gate and the
  * segment proxy) and s1b_runway_geometry.py. The "true runway" in test 3 is a byte-level simulation independent of holdRunway
  * (note, review r2: it reuses rule 2's growth figure as the daily loss, so it tests the owed bytes, not the growth rate). Round 3
- * of B0 (review-r2 should-fix 5): C_conv is MEASURED as the converter's own page allocation (test 6, B2a's
- * lean/converter.ts `withMeasuredWrite`).
+ * of B0 (review-r2 should-fixes 5-6): C_conv is MEASURED as the converter's own page allocation (test 6, B2a's
+ * lean/converter.ts `withMeasuredWrite`), and the re-census copy during the hold is gated on the runway (test 5).
  * Pending until B1 lands packages/collector-cli/src/lean/runway.ts (tests 1-5) and B2a lean/converter.ts (test 6).
  */
 import assert from "node:assert/strict";
@@ -34,7 +34,7 @@ async function surface() {
   return {
     estimateHostG: fn(mod, "estimateHostG") as (census: Census) => { gateBytes: number; hostBytes: number; basis: string } | null,
     holdRunway: fn(mod, "holdRunway") as (input: RunwayInput) => Runway,
-    censusPreflight: fn(mod, "censusPreflight") as (input: Record<string, number>) => { ok: boolean; reasons: string[] },
+    censusPreflight: fn(mod, "censusPreflight") as (input: Record<string, number | boolean>) => { ok: boolean; reasons: string[] },
   };
 }
 
@@ -115,9 +115,14 @@ test("B10a: a Studio1-shaped host with 50 GiB free and 0.30 GiB/day gross growth
   assert.ok(rule.runwayDays < 63, `runway ${rule.runwayDays.toFixed(1)} d < max(30, 1.5 x 42)`);
 });
 
-test("B1 C2 (round 2): the census gives a gate value only when taken after the catch-up, at most a day before the decision, and the VACUUM INTO copy is refused without ledger + reserve free", pending("B1"), async () => {
+test("B1 C2 (round 2-3): the census gives a gate value only when taken after the catch-up, at most a day before the decision, the VACUUM INTO copy is refused without ledger + reserve free, and during the hold the re-census copy is refused unless free - ledger >= reserve + rebuild headroom + G_owed", pending("B1"), async () => {
   const { censusPreflight } = await surface();
   const day = 86_400_000, L = STUDIO4.ledgerBytes, reserve = 25 * GiB;
+  // round 3 (review-r2 should-fix 6): the re-census before S3 runs DURING the hold; its copy must leave the ladder's terms intact
+  const rebuild = 1.2 * L, gOwed = 250 * MB;
+  const midHold = censusPreflight({ censusAtMs: 20 * day, catchUpCompleteAtMs: 3 * day, decisionAtMs: 20 * day, freeBytes: L + reserve + rebuild / 2, ledgerBytes: L, reserveBytes: reserve, duringHold: true, rebuildHeadroomBytes: rebuild, gOwedBytes: gOwed });
+  assert.deepEqual(midHold, { ok: false, reasons: ["copy_would_trip_rung"] }, "ledger + reserve is free, but the copy would eat the rebuild headroom and put the runway under a rung");
+  assert.deepEqual(censusPreflight({ censusAtMs: 20 * day, catchUpCompleteAtMs: 3 * day, decisionAtMs: 20 * day, freeBytes: L + reserve + rebuild + gOwed + 30 * 100 * MB, ledgerBytes: L, reserveBytes: reserve, duringHold: true, rebuildHeadroomBytes: rebuild, gOwedBytes: gOwed }), { ok: true, reasons: [] });
   const stale = censusPreflight({ censusAtMs: 0, catchUpCompleteAtMs: 3 * day, decisionAtMs: 7 * day, freeBytes: 40 * GiB, ledgerBytes: L, reserveBytes: reserve });
   assert.equal(stale.ok, false);
   assert.deepEqual([...stale.reasons].sort(), ["census_before_catchup", "census_stale"]);
