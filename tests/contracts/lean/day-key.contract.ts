@@ -6,11 +6,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { DASHBOARD_SCHEMA_VERSION } from "../../../packages/collector-cli/src/dashboard-projection";
 import { fn, loadSurface, pending } from "./_pending";
 
-test("B5: DASHBOARD_SCHEMA_VERSION is 3 (UTC-day-aligned windows)", pending("B5"), () => {
-  assert.equal(DASHBOARD_SCHEMA_VERSION, 3);
+test("B5: DASHBOARD_SCHEMA_VERSION is 3 (UTC-day-aligned windows)", pending("B5"), async () => {
+  const projection = await loadSurface("../../../packages/collector-cli/src/dashboard-projection.ts"); // today's module, loaded at run time so a rename stays pending
+  assert.equal(projection.DASHBOARD_SCHEMA_VERSION, 3);
 });
 
 test("B5: every schema-accepted timestamp has a UTC day; only a string Date.parse rejects has none", pending("B5"), async () => {

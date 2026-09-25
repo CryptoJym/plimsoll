@@ -2,7 +2,7 @@
   "name": "@plimsoll/monorepo",
   "version": "0.1.0",
   "private": true,
-  "description": "Plimsoll \u2014 the load line for your AI spend. Local-first telemetry for Claude Code & Codex that joins token usage to shipped outcomes.",
+  "description": "Plimsoll — the load line for your AI spend. Local-first telemetry for Claude Code & Codex that joins token usage to shipped outcomes.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

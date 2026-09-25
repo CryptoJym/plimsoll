@@ -9,11 +9,23 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 
-import { collectorConfigSchema } from "../../../packages/collector-cli/src/config";
-import { sealOutboundEnvelope } from "../../../packages/collector-cli/src/outbound-envelope";
-import { buildIngestBatch } from "../../../packages/collector-cli/src/upload";
-import { aiWorkIngestBatchSchema, metadataKeyDisposition } from "../../../packages/shared/src/index";
-import { event, openTempBuffer, pending } from "./_pending";
+import { event, fn, loadSurface, openTempBuffer, pending } from "./_pending";
+
+// Today's product modules are loaded at run time too (review-r1 low): a rename stays a pending failure, never a red CI step.
+type Parse<T> = { parse(v: unknown): T; safeParse(v: unknown): { success: boolean } };
+async function wire() {
+  const [config, upload, shared, envelope] = await Promise.all([
+    loadSurface("../../../packages/collector-cli/src/config.ts"), loadSurface("../../../packages/collector-cli/src/upload.ts"),
+    loadSurface("../../../packages/shared/src/index.ts"), loadSurface("../../../packages/collector-cli/src/outbound-envelope.ts"),
+  ]);
+  return {
+    collectorConfigSchema: config.collectorConfigSchema as Parse<unknown>,
+    buildIngestBatch: fn(upload, "buildIngestBatch") as (config: unknown, buffer: unknown) => { batch?: { events: Array<{ event: { id: string; metadata: unknown } }> } },
+    aiWorkIngestBatchSchema: shared.aiWorkIngestBatchSchema as Parse<unknown>,
+    metadataKeyDisposition: fn(shared, "metadataKeyDisposition") as (key: string) => { valueKind?: string } | undefined,
+    sealOutboundEnvelope: fn(envelope, "sealOutboundEnvelope") as (input: unknown) => { ok: boolean; envelope: { event: { metadata: unknown } } },
+  };
+}
 
 type Binding = { actorBindingVersion?: number | null; actorBindingInstall?: string | null } | null;
 type Stamped = { recordActorBindingVersion(version: number, installId: string): void; workspaceBinding(): Binding };
@@ -50,7 +62,8 @@ test("B2a C1: after a response supplies a version the collector persists the (in
   } finally { close(); }
 });
 
-test("B2a C1: every upload batch echoes actorBindingVersionHeard (>= every stamp it carries for the current install) and carries the pair on the wire; the shared schema accepts it", pending("B2a"), () => {
+test("B2a C1: every upload batch echoes actorBindingVersionHeard (>= every stamp it carries for the current install) and carries the pair on the wire; the shared schema accepts it", pending("B2a"), async () => {
+  const { collectorConfigSchema, buildIngestBatch, aiWorkIngestBatchSchema } = await wire();
   const { buffer, close } = openTempBuffer({ workspaceId: "lean-contract", deviceId: "lean-device", lean: { write: true } });
   try {
     (buffer as unknown as Stamped).recordActorBindingVersion(2, INSTALL_X);
@@ -59,14 +72,15 @@ test("B2a C1: every upload batch echoes actorBindingVersionHeard (>= every stamp
     const { batch } = buildIngestBatch(config, buffer);
     assert.ok(batch, "a batch was built");
     assert.equal((batch as unknown as { actorBindingVersionHeard?: number | null }).actorBindingVersionHeard, 2);
-    const metadata = batch.events[0].event.metadata as { actorBindingVersion?: number; actorBindingInstall?: string };
+    const metadata = batch!.events[0].event.metadata as { actorBindingVersion?: number; actorBindingInstall?: string };
     assert.equal(metadata.actorBindingVersion, 2, "the version travels on the wire");
     assert.equal(metadata.actorBindingInstall, INSTALL_X, "the install the version was issued to travels with it");
     assert.equal(aiWorkIngestBatchSchema.safeParse({ ...batch, actorBindingVersionHeard: 2 }).success, true);
   } finally { close(); }
 });
 
-test("B2a C1: metadata.actorBindingVersion and metadata.actorBindingInstall are allowlisted identifier keys that survive the outbound seal", pending("B2a"), () => {
+test("B2a C1: metadata.actorBindingVersion and metadata.actorBindingInstall are allowlisted identifier keys that survive the outbound seal", pending("B2a"), async () => {
+  const { metadataKeyDisposition, sealOutboundEnvelope } = await wire();
   for (const key of ["actorBindingVersion", "actorBindingInstall"]) {
     assert.ok(metadataKeyDisposition(key), `${key}: disposition exists`);
     assert.equal(metadataKeyDisposition(key)?.valueKind, metadataKeyDisposition("workItemId")?.valueKind, key);
@@ -98,7 +112,8 @@ test("B2a C4 (round 2): the persisted pair is scoped to the install: a re-join (
   } finally { close(); }
 });
 
-test("B2a C1 (round 2): a response from a different install replaces the pair (no cross-install comparison), and rows stamped before a re-join keep their old pair on the wire while the batch echoes the current install's version", pending("B2a"), () => {
+test("B2a C1 (round 2): a response from a different install replaces the pair (no cross-install comparison), and rows stamped before a re-join keep their old pair on the wire while the batch echoes the current install's version", pending("B2a"), async () => {
+  const { collectorConfigSchema, buildIngestBatch } = await wire();
   const { buffer, close } = openTempBuffer({ workspaceId: "lean-contract", deviceId: "lean-device", lean: { write: true } });
   try {
     const stamped = buffer as unknown as Stamped;
@@ -115,7 +130,7 @@ test("B2a C1 (round 2): a response from a different install replaces the pair (n
     const { batch } = buildIngestBatch(config, buffer);
     assert.ok(batch, "a batch was built");
     assert.equal((batch as unknown as { actorBindingVersionHeard?: number | null }).actorBindingVersionHeard, 0, "the echo is the CURRENT install's version; an earlier install's stamps do not raise it");
-    const byId = new Map(batch.events.map((row) => [row.event.id, row.event.metadata as { actorBindingVersion?: number; actorBindingInstall?: string }]));
+    const byId = new Map(batch!.events.map((row) => [row.event.id, row.event.metadata as { actorBindingVersion?: number; actorBindingInstall?: string }]));
     assert.deepEqual([byId.get(preJoin.id)?.actorBindingVersion, byId.get(preJoin.id)?.actorBindingInstall], [2, INSTALL_X], "the old pair travels unchanged");
     assert.deepEqual([byId.get(postJoin.id)?.actorBindingVersion, byId.get(postJoin.id)?.actorBindingInstall], [0, INSTALL_Z]);
   } finally { close(); }
