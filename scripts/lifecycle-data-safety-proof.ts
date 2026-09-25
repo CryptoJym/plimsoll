@@ -161,6 +161,7 @@ const CASES = {
   ],
   r13Marker: [
     "inherited_pending_record_is_fenced_at_its_first_restore_move",
+    "unknown_minimum_reader_marker_blocks_retention",
   ],
   r12Preview: ["unusable_restore_preview_and_list_refuse_before_apply"],
   r12Inventory: ["unrestorable_snapshot_list_warns_against_old_keep_one"],
@@ -1720,6 +1721,29 @@ async function r12RemovalMarkers() {
         same(receipt?.retention?.restored?.map((item) => `${item.kind}:${item.name}`) ?? [],
           ["snapshot:m2", "runtime_version:37.2.0"]),
       { error: failed?.message, atFirstMove, firstMoveComplete, snapshotStillInTrash, receipt });
+  });
+
+  await runCase([CASES.r13Marker[1]], async (record) => {
+    const fixture = createHome("r13-unknown-reader-marker");
+    await updatesWithoutRetention(fixture, [["u1", "38.1.0"], ["u2", "38.1.1"], ["u3", "38.1.2"]]);
+    const removals = path.join(fixture.lifecycleRoot, "removals");
+    fs.mkdirSync(removals, { recursive: true, mode: 0o700 });
+    const removalRecord = path.join(removals, "r13-unknown-reader.json");
+    fs.writeFileSync(removalRecord, `${JSON.stringify({
+      schemaVersion: 1, operationId: "r13-unknown-reader", items: [], requiresCliVersion: "0.7.42",
+    })}\n`, { mode: 0o600 });
+    const snapshots = path.join(fixture.lifecycleRoot, "snapshots");
+    const versions = path.join(fixture.lifecycleRoot, "versions");
+    const before = [treeDigest(snapshots), treeDigest(versions), fs.readFileSync(removalRecord, "utf8")];
+    const blocked = await fixture.manager().pruneSnapshots({
+      operationId: "r13-unknown-reader-prune", keep: 1, apply: true,
+    });
+    record(CASES.r13Marker[1],
+      blocked.retention.status === "skipped" && blocked.retention.skippedReason === "removal_record_unreadable" &&
+        blocked.retention.removed.length === 0 && same(fixture.snapshots(), ["u1", "u2", "u3"]) &&
+        treeDigest(snapshots) === before[0] && treeDigest(versions) === before[1] &&
+        fs.readFileSync(removalRecord, "utf8") === before[2],
+      { retention: blocked.retention, snapshots: fixture.snapshots() });
   });
 }
 
