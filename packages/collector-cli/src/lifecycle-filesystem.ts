@@ -285,7 +285,13 @@ function isOtherOperationReceipt(value: unknown, operationId: string) {
  * accounted for.
  */
 type RemovalItem = LifecycleRemovedItem & { trashName: string; origin: "planned" | "orphan" };
-type RemovalRecord = { schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION; operationId: string; items: RemovalItem[] };
+type RemovalRecord = {
+  schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
+  operationId: string;
+  items: RemovalItem[];
+  /** Older CLIs must not finish this record without the way-back safety rule. */
+  requiresCliVersion?: "0.7.41";
+};
 
 class RetentionPlanChanged extends Error {
   constructor(reason = "retention plan changed") {
@@ -302,7 +308,10 @@ const TRASH_NAME = /^(snapshot|runtime_version)\+([A-Za-z0-9][A-Za-z0-9._-]{0,95
 function parseRemovalRecord(value: unknown, operationId: string): RemovalRecord | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  if (Object.keys(row).sort().join(",") !== "items,operationId,schemaVersion" || row.schemaVersion !== 1 ||
+  const keys = Object.keys(row).sort().join(",");
+  if ((keys !== "items,operationId,schemaVersion" &&
+       keys !== "items,operationId,requiresCliVersion,schemaVersion") ||
+      ("requiresCliVersion" in row && row.requiresCliVersion !== "0.7.41") || row.schemaVersion !== 1 ||
       row.operationId !== operationId || !Array.isArray(row.items) || row.items.length > MAX_COMPLETION_MARKERS) return null;
   const items: RemovalItem[] = [];
   for (const entry of row.items as unknown[]) {
@@ -318,7 +327,8 @@ function parseRemovalRecord(value: unknown, operationId: string): RemovalRecord 
       origin: item.origin,
     });
   }
-  return { schemaVersion: 1, operationId, items };
+  return { schemaVersion: 1, operationId, items,
+    ...(row.requiresCliVersion === "0.7.41" ? { requiresCliVersion: "0.7.41" as const } : {}) };
 }
 
 /** Whether a durable receipt's retention record names every one of `items`. */
@@ -1745,6 +1755,15 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         .find((item) => item.kind === "snapshot" &&
           (lstatIfPresent(path.join(this.trashRoot, item.trashName)) || lstatIfPresent(this.removalSource(item))));
       if (!hasUsableWayBack && pendingWayBack) {
+        // Records written before this guard may also reach this state. Mark
+        // them durably before any restore attempt so a 0.7.38-0.7.40 retry
+        // refuses the unfamiliar record instead of deleting the last way back.
+        for (const pending of earlier) {
+          if (pending.requiresCliVersion === "0.7.41") continue;
+          await this.assertFence(input.operationId);
+          writeJsonDurable(path.join(this.removalsRoot, `${pending.operationId}.json`),
+            { ...pending, requiresCliVersion: "0.7.41" } satisfies RemovalRecord, this.root);
+        }
         const restored: LifecycleRemovedItem[] = [];
         const restoredMoves: RemovalItem[] = [];
         let complete = true;
@@ -1837,7 +1856,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       if (items.length > 0) {
         await this.assertFence(input.operationId);
         writeJsonDurable(removalRecordPath,
-          { schemaVersion: 1, operationId: input.operationId, items } satisfies RemovalRecord, this.root);
+          { schemaVersion: 1, operationId: input.operationId, items, requiresCliVersion: "0.7.41" } satisfies RemovalRecord, this.root);
         committed.push(input.operationId);
       }
       const report = (item: RemovalItem): LifecycleRemovedItem => ({ kind: item.kind, name: item.name, bytes: item.bytes });

@@ -601,8 +601,11 @@ release's own `lifecycle rollback --artifact self` (a CLI installs only a
 bundle from its own install tree). Once a host has been sealed with
 `lifecycle snapshots reconcile --keep-snapshots`, use 0.7.41 or later for
 updates, prunes and reconciles; an older release run there removes nothing,
-and the next reconcile decides its snapshot. Release signing, npm publication,
-and live-fleet rollout remain gated under
+and the next reconcile decides its snapshot. After any `needed_restore_*`
+prune refusal, use only 0.7.41 or later for prunes and updates. Older CLIs
+cannot read the protected removal record and leave it in place; 0.7.41 or
+later can restore the way back or complete an update. Release signing, npm
+publication, and live-fleet rollout remain gated under
 [#103](https://github.com/CryptoJym/plimsoll/issues/103).
 
 **Contributors / running from source** (adds pnpm + git):
