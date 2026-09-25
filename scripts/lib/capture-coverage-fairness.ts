@@ -81,4 +81,43 @@ console.log(JSON.stringify({ turns, wallMs: { max: sorted.at(-1), p95: sorted[Ma
 maintenance.close();
 buffer.close();
 fs.rmSync(root, { recursive: true, force: true });
+
+const singleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "coverage-single-source-"));
+const singleBuffer = new LocalEventBuffer(path.join(singleRoot, "ledger.sqlite"), {
+  workspaceId: "00000000-0000-4000-8000-0000000000c1",
+  delivery: { enabled: true, limits: { maxOldestAgeDays: 3650 } },
+});
+let steps = 0;
+let work = 0;
+const onlyWalk = new CaptureCoverageWalk({
+  roots: ["codex"],
+  open: () => {
+    let next = 0;
+    return {
+      read: () => {
+        const until = performance.now() + 0.04;
+        while (performance.now() < until) { /* slow active directory */ }
+        return next < 20_000 ? { path: `file-${next++}`, kind: "file" as const } : null;
+      },
+      unchanged: () => true,
+      close: () => undefined,
+    };
+  },
+  check: () => null,
+  checkLink: () => null,
+});
+const originalStep = onlyWalk.step.bind(onlyWalk);
+onlyWalk.step = (...args) => { steps += 1; const used = originalStep(...args); work += used; return used; };
+const single = new CollectorMaintenance(singleBuffer,
+  { coverageWalk: () => onlyWalk, close: () => undefined } as unknown as RolloutTailer,
+  { coverageWalk: () => CaptureCoverageWalk.empty(), close: () => undefined } as unknown as TranscriptTailer,
+  undefined,
+  { coverageWalk: () => CaptureCoverageWalk.empty(), close: () => undefined } as unknown as GrokUsageTailer,
+  { captureCoverageTurnMs: 250, captureCoverageIntervalMs: 0 });
+(single as unknown as { checkCaptureCoverage(): void }).checkCaptureCoverage();
+check("unused_source_shares_are_returned_without_spending_cap_twice",
+  steps >= 2 && work <= 4_096, { steps, work, done: onlyWalk.done });
+single.close();
+singleBuffer.close();
+fs.rmSync(singleRoot, { recursive: true, force: true });
 }

@@ -16,6 +16,7 @@ import {
   applyCaptureCoverage,
   beginCaptureCoverage,
   CAPTURE_COVERAGE_INTERVAL_MS,
+  CAPTURE_COVERAGE_MAX_WORK_PER_TURN,
   CAPTURE_COVERAGE_TURN_MS,
   CaptureCoverageWalk,
   finishCaptureCoverage,
@@ -835,15 +836,29 @@ export class CollectorMaintenance {
         }
       }
       const walks = this.coverageWalks;
-      const shareMs = Math.max(1, (this.options.captureCoverageTurnMs ?? CAPTURE_COVERAGE_TURN_MS) -
-        CAPTURE_COVERAGE_TURN_MARGIN_MS) / Math.max(1, walks.length);
+      const turnMs = Math.max(1, (this.options.captureCoverageTurnMs ?? CAPTURE_COVERAGE_TURN_MS) -
+        CAPTURE_COVERAGE_TURN_MARGIN_MS);
+      const turnDeadline = performance.now() + turnMs;
+      const shareMs = turnMs / Math.max(1, walks.length);
       const first = this.coverageSourceTurn++ % Math.max(1, walks.length);
+      const remaining = walks.map(() => CAPTURE_COVERAGE_MAX_WORK_PER_TURN);
+      const advance = (index: number, deadline: number) => {
+        const { check, walk } = walks[index]!;
+        if (walk.done || remaining[index]! <= 0) return;
+        const used = walk.step(deadline, (files) => applyCaptureCoverage(database, check, files),
+          undefined, remaining[index]);
+        remaining[index]! -= used;
+        if (walk.done && walk.complete) finishCaptureCoverage(database, check);
+      };
       for (let offset = 0; offset < walks.length; offset += 1) {
         if (this.signal?.aborted) break;
-        const { check, walk } = walks[(first + offset) % walks.length]!;
-        if (walk.done) continue;
-        walk.step(performance.now() + shareMs, (files) => applyCaptureCoverage(database, check, files));
-        if (walk.done && walk.complete) finishCaptureCoverage(database, check);
+        advance((first + offset) % walks.length, performance.now() + shareMs);
+      }
+      // Every source gets its first share before an active source reuses idle
+      // time. The common deadline prevents the bonus from extending the turn.
+      for (let offset = 0; offset < walks.length && !this.signal?.aborted; offset += 1) {
+        if (performance.now() >= turnDeadline) break;
+        advance((first + offset) % walks.length, turnDeadline);
       }
       if (this.signal?.aborted) {
         walks.forEach(({ walk }) => walk.close());
