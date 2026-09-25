@@ -66,6 +66,12 @@ does not transfer its sessions to a tailer.
 
 ## Unreleased
 
+- A long session summary rebuild now resumes across daemon cycles even as the
+  sync horizon moves. Appended rows are applied after the frozen historical
+  scan, and a raw edit or erasure still restarts that session's rebuild.
+  Partial sync logs show why summaries remain pending and how many rebuilds
+  began, so a session changing faster than it can be scanned is visible.
+
 Learning results and status now show the effective start when local retention shortens the requested window.
 
 ### Added

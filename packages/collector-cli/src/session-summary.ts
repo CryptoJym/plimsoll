@@ -42,8 +42,10 @@ type SummaryAccumulator = {
   cursorObservedAt: string | null;
   cursorRowid: number;
   cursorId: string | null;
-  /** A preexisting future-created row requires one fallback when the horizon advances. */
+  /** A preexisting future-created row needs a fallback when it becomes eligible. */
   futureRows: boolean;
+  /** Earliest skipped future row; older ledgers have only futureRows. */
+  futureCreatedAt: string | null;
   sourceMax: string | null;
   startedAt: string | null;
   endedAt: string | null;
@@ -537,6 +539,7 @@ function emptyAccumulator(sessionId: string): SummaryAccumulator {
     cursorRowid: 0,
     cursorId: null,
     futureRows: false,
+    futureCreatedAt: null,
     sourceMax: null,
     startedAt: null,
     endedAt: null,
@@ -646,6 +649,7 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
     if (!Number.isSafeInteger(candidate.cursorRowid) || candidate.cursorRowid < 0) return null;
     if (typeof candidate.cursorId !== "string" && candidate.cursorId !== null) return null;
     if (typeof candidate.futureRows !== "boolean") return null;
+    if (typeof candidate.futureCreatedAt !== "string" && candidate.futureCreatedAt !== null) return null;
     if (!Number.isSafeInteger(candidate.events) || candidate.events < 0) return null;
     for (const key of [
       "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens",
@@ -852,7 +856,10 @@ function fallbackReason(
   if (!Number.isSafeInteger(stored.highWater) || stored.highWater < 0) return "high_water_invalid";
   if (Number.isNaN(Date.parse(stored.coveredUntil))) return "covered_until_invalid";
   if (Date.parse(stored.coveredUntil) > Date.parse(until)) return "until_rollback";
-  if (parsed.futureRows && Date.parse(stored.coveredUntil) < Date.parse(until)) return "future_horizon";
+  // A skipped future row only invalidates the scanned prefix when it actually
+  // enters the new horizon. Old 0.7.40 states lack the date and rebuild once.
+  if (parsed.futureRows && Date.parse(stored.coveredUntil) < Date.parse(until) &&
+      (parsed.futureCreatedAt === null || parsed.futureCreatedAt <= until)) return "future_horizon";
   if (currentRevision !== stored.mutationRevision) return "ledger_mutation";
   if (!checkpointOk) return "checkpoint_mismatch";
   if (dirty) return "dirty_marker";
@@ -956,7 +963,7 @@ export async function updateSessionSummary(
   const resumableFallback = stored?.mode === "fallback" &&
     !stored.complete && stored.mutationRevision === currentRevision &&
     parsed !== null && checkpointOk && (reason === null || reason === "dirty_marker") &&
-    Date.parse(stored.coveredUntil) === Date.parse(until);
+    Date.parse(stored.coveredUntil) <= Date.parse(until);
   const needsFallback = reason !== null && !resumableFallback;
   const fullRecompute = needsFallback;
   let mode: SessionSummaryUpdateResult["mode"] = needsFallback
@@ -1102,7 +1109,12 @@ export async function updateSessionSummary(
         state.highWater = row.rowid;
         state.checkpointId = row.id;
       }
-      if (row.createdAt > until) state.accumulator.futureRows = true;
+      if (row.createdAt > until) {
+        state.accumulator.futureRows = true;
+        if (state.accumulator.futureCreatedAt === null || row.createdAt < state.accumulator.futureCreatedAt) {
+          state.accumulator.futureCreatedAt = row.createdAt;
+        }
+      }
       else if (row.eligible) {
         fold(state.accumulator, row);
         rowsApplied += 1;
@@ -1130,20 +1142,26 @@ export async function updateSessionSummary(
   // Revision, queued-row check, and state write share one write transaction.
   // A concurrent append can land before it (and is observed) or afterward
   // (and remains in the queue for the upload fence).
-  const stable = await writeRetry.run(() => db.transaction(() => {
+  const stability = await writeRetry.run(() => db.transaction(() => {
     const revisionStable = sessionRevision(db, sessionId) === state.mutationRevision;
     const noQueuedRows = !queuedRowsAfter(db, sessionId, state.highWater, until);
     const finalComplete = complete && revisionStable && noQueuedRows;
     state.complete = finalComplete;
     state.mode = complete ? "incremental" : needsFallback ? "fallback" : state.mode;
     writeState(db, state);
-    if (finalComplete) {
+    // The historical dirty cause is discharged once that scan is stable.
+    // A post-boundary append remains in the durable queue and resumes in
+    // incremental mode next cycle, even if its observed time sorts earlier.
+    if (complete && revisionStable) {
       db.prepare(`delete from session_sync_summary_dirty where session_id = ?`).run(sessionId);
+    }
+    if (finalComplete) {
       db.prepare(`delete from session_sync_summary_rows where session_id = ? and raw_rowid <= ?`)
         .run(sessionId, state.highWater);
     }
-    return revisionStable && noQueuedRows;
+    return { revisionStable, noQueuedRows };
   }).immediate());
+  const stable = stability.revisionStable && stability.noQueuedRows;
 
   const finalMode: SessionSummaryUpdateResult["mode"] = fullRecompute
     ? "fallback"
@@ -1157,7 +1175,10 @@ export async function updateSessionSummary(
     highWater: state.highWater,
     mode: finalMode,
     fullRecompute,
-    fallbackReason: fullRecompute ? reason : null,
+    fallbackReason: fullRecompute ? reason
+      : !stability.revisionStable ? "ledger_mutation_during_slice"
+      : !complete && state.mode === "fallback" ? "fallback_in_progress"
+      : !stability.noQueuedRows ? "append_queue" : null,
     mutationRevision: state.mutationRevision,
   };
 }
