@@ -179,11 +179,17 @@ create table if not exists conversion_rejects (     -- one row per stored raw ro
 create index if not exists idx_cr_open on conversion_rejects (resolved_at_ms) where resolved_at_ms is null;
 ```
 
-Retention: **never deleted by age or by budget pressure** (it is in the never-delete set of ARCHITECTURE.md §2.3); a resolved
-row keeps its record with `resolved_at_ms`; the table is compacted only by B14 with the same proof as `capture_root_observations`.
-`/status` lists `conversionRejects = {open, resolved, byReason}` and the S3 certify (f) lists every open row by id. Its raw row is
-in the never-delete set while the reject is open. Test: collector `tests/contracts/lean/schema.contract.ts` (DDL) and
-`converter.contract.ts` (a NaN string becomes one counted gap and one reject; nothing vanishes; `b5_non_iso_day_facts.py`).
+Retention: **never deleted by age or by budget pressure**: the table and any raw row with an open reject are listed in the
+never-delete set of ARCHITECTURE.md §2.3 (round 8); a resolved row keeps its record with `resolved_at_ms`; the table is compacted
+only by B14 with the same proof as `capture_root_observations`. The prune and the ladder's release (`releaseUnderLadder`) refuse a raw
+row with an open reject; a resolved reject releases its raw row under the ordinary rules. **`raw_rowid` is a live pointer only:** the
+raw-delete trigger of ARCHITECTURE.md §2.2 ("Every raw delete, by any path, tombstones") also sets `conversion_rejects.raw_rowid =
+null` for `old.id` in the same statement, so a rowid SQLite reuses after the delete can never alias the reject (its identity is
+`(event_id, raw_generation)`, as for `target_ref`, B3). `/status` lists `conversionRejects = {open, resolved, byReason}` and the S3
+certify (f) lists every open row by id. Tests: collector `tests/contracts/lean/schema.contract.ts` (DDL), `converter.contract.ts`
+(a NaN string becomes one counted gap and one reject; nothing vanishes; `b5_non_iso_day_facts.py`) and
+`conversion-rejects.contract.ts` (round 8: B2a, the trigger nulls the pointer and a reused rowid does not alias; B10b, an open
+reject is never released by the prune or the ladder, the reject row survives both, a resolved reject releases its raw row).
 
 ## C4. Null stamps before the first response, and the install scope of the pair (b0Carries 3b; review-r1 blocker 1; B2a collector, B6 cloud)
 
@@ -270,7 +276,8 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 - `packages/collector-cli/src/lean/day-key.ts`: `utcDayOf`, `censusClass`, `dashboardWindowSince`; `DASHBOARD_SCHEMA_VERSION = 3`. (B5)
 - `packages/collector-cli/src/lean/converter.ts`: `convertLedgerHistory(buffer, options)`. (B2a; C3)
 - `packages/collector-cli/src/lean/capture-gaps.ts`: `declareUnresolvedFileGap`, `resolveCaptureGap`, `coverageCompleteForPeriod`. (B22; C5)
-- `packages/collector-cli/src/lean/retention.ts`: `applyUploadReceipts`, `releaseUnderLadder`, `retireSegment`. (B2a, B10b)
+- `packages/collector-cli/src/lean/retention.ts`: `applyUploadReceipts`, `releaseUnderLadder` (refuses a raw row with an open
+  `conversion_rejects` row), `retireSegment`; the raw-delete trigger on `buffered_events` nulls `conversion_rejects.raw_rowid`. (B2a, B10b; C3)
 - `packages/collector-cli/src/lean/rebuild.ts`: `abortRebuildBound`. (B13)
 
 A bead may rename a surface only by updating its test in the same change; the contract is the behaviour, the name is the handle.
