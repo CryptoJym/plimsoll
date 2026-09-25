@@ -4,7 +4,9 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { captureRootDigest, type CaptureRoot } from "./capture-root-inventory";
 import { ABSOLUTE_MAX_READ_BYTES, jsonlScanStateKey, type JsonlScanCursor, type JsonlTailRead, type JsonlTailReadLimits, type JsonlTailerIo } from "./jsonl-byte-tailer";
-import { classifySkippedRecord, type CaptureSkippedRecord } from "./capture-record-loss";
+import { classifySkippedRecordWithProof, newSkippedDiscriminatorProbe, observeSkippedDiscriminators,
+  proveSkippedNonUsage, type CaptureSkippedRecord, type SkippedDiscriminatorProbe,
+  type SkippedPrefixClassification } from "./capture-record-loss";
 import { start, feed, checkpoint, restore, project, LIMITS } from "./oversized-extractor.mjs";
 import { fingerprint, extend, equal, resumePolicy, sameSnapshot, type Fingerprint, type Snapshot } from "./oversized-continuity.mjs";
 
@@ -22,8 +24,10 @@ type Provider = "codex" | "claude";
 type Binding = { provider: Provider; cursorKey: string; fileKey: string; root: string; profile: string; epoch: string; enrollment: string; baseline: string; inventory: string };
 type Envelope = { sha256?: string; version: 1; rollbackVersion: "0.7.4"; binding: Binding; priorCursor: string; ancestors: string; snapshot: Snapshot;
  parser: string; prefix: Fingerprint; verification: { snapshot: Snapshot; prefix: Fingerprint } | null;
- reason: string | null; skip?: { reason: string; offset: number; ended: boolean; classified: boolean;
-   kind: CaptureSkippedRecord["kind"]; usagePossible: boolean; fingerprint?: string } };
+ reason: string | null; discriminatorProbe?: SkippedDiscriminatorProbe;
+ skip?: { reason: string; offset: number; ended: boolean; classified: boolean;
+   kind: CaptureSkippedRecord["kind"]; usagePossible: boolean; fingerprint?: string;
+   nonUsageProof?: SkippedPrefixClassification["nonUsageProof"] } };
 export type ContinuationProposal = {
  action: "checkpoint" | "complete" | "park"; reason: string | null; requiredMinimumBytes: number | null;
  scanBytesAdvanced: number; prefixBytesRead: number;
@@ -73,7 +77,7 @@ function decode(raw: string): Envelope {
  if (Buffer.byteLength(raw) > MAX_ENVELOPE_BYTES) throw new Error("envelope_limit");
  const e = JSON.parse(raw);
  if (!validSeal(e)) throw new Error("corrupt_envelope");
- if (!exact(e, ["sha256", "version", "rollbackVersion", "binding", "priorCursor", "ancestors", "snapshot", "parser", "prefix", "verification", "reason", ...(e.skip === undefined ? [] : ["skip"])]) || e.version !== 1 || e.rollbackVersion !== "0.7.4" ||
+ if (!exact(e, ["sha256", "version", "rollbackVersion", "binding", "priorCursor", "ancestors", "snapshot", "parser", "prefix", "verification", "reason", ...(e.discriminatorProbe === undefined ? [] : ["discriminatorProbe"]), ...(e.skip === undefined ? [] : ["skip"])]) || e.version !== 1 || e.rollbackVersion !== "0.7.4" ||
    !exact(e.binding, ["provider", "cursorKey", "fileKey", "root", "profile", "epoch", "enrollment", "baseline", "inventory"]) ||
    !["codex", "claude"].includes(e.binding.provider) || !Object.entries(e.binding).every(([k, v]) => k === "provider" || typeof v === "string" && /^[a-f0-9]{64}$/.test(v)) ||
    typeof e.priorCursor !== "string" || !/^[a-f0-9]{64}$/.test(e.priorCursor) || !validSnapshot(e.snapshot) || typeof e.ancestors !== "string" || !/^[a-f0-9]{64}$/.test(e.ancestors) ||
@@ -83,11 +87,21 @@ function decode(raw: string): Envelope {
  if (p.provider !== e.binding.provider || e.prefix.start !== p.recordStart ||
    (e.skip ? e.prefix.end !== e.skip.offset || p.scanOffset > e.skip.offset : e.prefix.end !== p.scanOffset) ||
    e.prefix.end > e.snapshot.size) throw new Error("parser_fingerprint_mismatch");
+ if (e.discriminatorProbe !== undefined && (!exact(e.discriminatorProbe,
+   ["scanned","typeCount","payloadCount","typeMatch","payloadMatch","escaped"]) ||
+   !safe(e.discriminatorProbe.scanned) || e.discriminatorProbe.scanned !== e.prefix.end - e.prefix.start ||
+   !safe(e.discriminatorProbe.typeCount) || e.discriminatorProbe.typeCount > 3 ||
+   !safe(e.discriminatorProbe.payloadCount) || e.discriminatorProbe.payloadCount > 2 ||
+   !safe(e.discriminatorProbe.typeMatch) || e.discriminatorProbe.typeMatch > 5 ||
+   !safe(e.discriminatorProbe.payloadMatch) || e.discriminatorProbe.payloadMatch > 8 ||
+   typeof e.discriminatorProbe.escaped !== "boolean")) throw new Error("invalid_discriminator_probe");
  if (e.skip !== undefined && (!exact(e.skip,["reason","offset","ended","classified","kind","usagePossible",
-   ...(e.skip.fingerprint === undefined ? [] : ["fingerprint"])]) ||
+   ...(e.skip.fingerprint === undefined ? [] : ["fingerprint"]),
+   ...(e.skip.nonUsageProof === undefined ? [] : ["nonUsageProof"])]) ||
    !REFUSALS.has(e.skip.reason) || !safe(e.skip.offset) || typeof e.skip.ended !== "boolean" ||
    typeof e.skip.classified !== "boolean" || typeof e.skip.usagePossible !== "boolean" ||
    (e.skip.fingerprint !== undefined && (typeof e.skip.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(e.skip.fingerprint))) ||
+   (e.skip.nonUsageProof !== undefined && !["top_type","payload_type"].includes(e.skip.nonUsageProof)) ||
    !["codex_token_count","codex_non_usage","claude_assistant","claude_non_usage","unknown"].includes(e.skip.kind))) throw new Error("invalid_skip_state");
  if (e.verification !== null) {
    if (!exact(e.verification, ["snapshot", "prefix"]) || !validSnapshot(e.verification.snapshot)) throw new Error("invalid_verification");
@@ -326,7 +340,8 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      const offset = cursor?.committedOffset ?? options.initialOffset ?? 0;
      initialOffset = offset;
      envelope = { version:1, rollbackVersion:"0.7.4", binding:b, priorCursor, ancestors:admittedAncestors!, snapshot:current,
-       parser:checkpoint(start(options.provider, offset)), prefix:fingerprint(offset), verification:null, reason:null };
+       parser:checkpoint(start(options.provider, offset)), prefix:fingerprint(offset), verification:null, reason:null,
+       discriminatorProbe:newSkippedDiscriminatorProbe() };
      return result("checkpoint");
    }
    current = securePath();
@@ -365,7 +380,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
        // fingerprint and may have trusted a nested type. Reclassify it before
        // recording a loss. A cut enrollment fragment is always uncertain.
        if (skip.reason !== "enrollment_boundary_fragment")
-         Object.assign(skip, classifySkippedRecord(options.provider, prefix));
+         Object.assign(skip, classifySkippedRecordWithProof(options.provider, prefix));
        skip.fingerprint = sha(prefix);
        skip.classified = true;
      }
@@ -384,6 +399,8 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
        }, {maxBytes: LIMITS.sliceBytes, deadline: options.deadline});
        if (next.status === "changed") return refuse("prefix_changed");
        if (next.status !== "complete") return result("checkpoint");
+       if (envelope.discriminatorProbe)
+         observeSkippedDiscriminators(envelope.discriminatorProbe,bytes.subarray(0,target-at));
        envelope.prefix = next.fingerprint;
        skip.offset = target;
        skip.ended = newline >= 0;
@@ -391,6 +408,9 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      if (!skip.ended) return skip.offset === current.size ? refuse("incomplete_record") : result("checkpoint");
      const skippedBytes = skip.offset - parser.recordStart;
      if (skippedBytes <= ABSOLUTE_MAX_READ_BYTES && skip.reason !== "enrollment_boundary_fragment") return refuse(skip.reason);
+     if (!skip.usagePossible && !proveSkippedNonUsage(skip.nonUsageProof,envelope.discriminatorProbe)) {
+       skip.kind = "unknown"; skip.usagePossible = true;
+     }
      const headBytes = Math.min(512, current.size), continuityBytes = Math.min(512, skip.offset);
      if (maxBytes - bytesRead < headBytes + continuityBytes) return result("checkpoint");
      const headHash = sha(readAt(0, headBytes));
@@ -422,6 +442,8 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      }, {maxBytes: LIMITS.sliceBytes, deadline:options.deadline});
      if (next.status === "changed") return refuse("prefix_changed");
      if (next.status !== "complete") return result("checkpoint"); // parser proposal discarded
+     if (envelope.discriminatorProbe)
+       observeSkippedDiscriminators(envelope.discriminatorProbe,bytes.subarray(0,parser.scanOffset-offset));
      envelope.parser = checkpoint(parser); envelope.prefix = next.fingerprint;
    }
    if (parser.status === "refused") {

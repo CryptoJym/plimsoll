@@ -111,10 +111,13 @@ does not transfer its sessions to a tailer.
   bytes are counted, and any possible usage loss remains a capture gap after
   the file reaches its end. Same-session rewrites with unchanged prior usage
   events replay through stable identities so tokens are not counted again.
-  Skipped-record kinds use JSON nesting, so a nested `type` cannot hide an
-  oversized usage record. An unknown prefix remains a possible usage loss;
-  an older saved skip is reclassified on resume, and receipts distinguish
-  same-size rewrites by a short prefix hash. Earlier
+  Skipped-record kinds use JSON nesting. The bounded reader also checks the
+  whole skipped record for duplicate or escaped discriminator keys before it
+  calls a skip known non-usage. An uncertain skip stays a possible usage loss
+  in the cloud claim, even after its file reaches EOF. An older saved skip is
+  reclassified on resume. Receipt identity includes a hash of the first 2 KiB:
+  same-offset, same-size rewrites sharing that prefix still share one receipt.
+  Earlier
   pre-enrollment bytes remain excluded. Once post-enrollment growth advances
   the shared cursor to EOF, those earlier bytes cannot be imported through
   that cursor; a separate historical cursor and identity policy is needed.
