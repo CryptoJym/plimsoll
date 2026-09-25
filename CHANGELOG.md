@@ -45,6 +45,16 @@ does not transfer its sessions to a tailer.
 - System-e2e path fields are normalized for the CI layout, and the coverage gate
   runs the newly covered proofs with host-only scopes recorded (`.163.59`,
   `.163.45`).
+- Session sync no longer holds the ledger's write lock during an upload. Each
+  send takes a short per-session lease; intake and maintenance writes to the
+  sessions in flight retry through the storage-busy path, and an erasure waits
+  for the send so it is never overtaken. Multi-batch catch-ups converge
+  (`.163.75`).
+- The session context index keeps its checksum exact past 2^53, so very large
+  ledgers no longer rebuild the index on every open (`.163.75`).
+- When a learning-fact table is full, a fact that would be refused anyway
+  (a retry with no target, an episode fact with no parent) is dropped before
+  anything is evicted (`.163.75`).
 
 ## Unreleased
 
