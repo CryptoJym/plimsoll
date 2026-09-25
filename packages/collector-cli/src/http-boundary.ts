@@ -34,6 +34,9 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   otlpNestedRecords: 4_096,
   otlpAttributesPerContainer: 128,
   otlpAttributesTotal: 16_384,
+  // This is the local HTTP product deadline described in README's hook and
+  // OTLP retry/spool behavior. It also leaves room inside the hook client's
+  // 2 s cap; a proof runner's scheduling delay cannot raise this value.
   requestDeadlineMs: 1_500,
   // A maintenance writer may briefly own WAL. Retry durable hook/OTLP appends
   // with timer yields for at most half the request deadline, leaving the
