@@ -307,6 +307,40 @@ function tailForFailure(text: string) {
   return text.slice(Math.max(0, text.length - 2_000));
 }
 
+/**
+ * A drifted supporting artifact keeps its content and, on the repeat run,
+ * names the leaves that differ from the first run's artifact (bounded), so a
+ * nondeterministic phase explains itself in CI instead of printing a digest.
+ */
+function artifactDriftDetail(name: string, artifact: unknown): string {
+  const evidence = path.join(repoRoot, "evidence");
+  const saved = path.join(evidence, `system-e2e-artifact-drift-${name}.json`);
+  fs.mkdirSync(evidence, { recursive: true });
+  fs.writeFileSync(saved, `${JSON.stringify(artifact, null, 2)}\n`, { mode: 0o600 });
+  const compareArg = process.argv.indexOf("--compare-deterministic-receipt");
+  const previousPath = compareArg >= 0 ? path.resolve(process.argv[compareArg + 1] ?? "") : "";
+  if (!previousPath || !fs.existsSync(previousPath)) return `; saved=${path.relative(repoRoot, saved)}`;
+  const previous = JSON.parse(fs.readFileSync(previousPath, "utf8")) as {
+    flow?: { phaseChain?: Array<{ name?: unknown; artifact?: unknown }> };
+  };
+  const before = previous.flow?.phaseChain?.find((phase) => phase.name === name)?.artifact;
+  const leaves = (value: unknown, prefix: string, out: Map<string, string>) => {
+    if (value && typeof value === "object") {
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) leaves(child, `${prefix}/${key}`, out);
+    } else {
+      out.set(prefix, JSON.stringify(value) ?? "undefined");
+    }
+    return out;
+  };
+  const a = leaves(before, "", new Map());
+  const b = leaves(artifact, "", new Map());
+  const changed = [...new Set([...a.keys(), ...b.keys()])]
+    .filter((key) => a.get(key) !== b.get(key))
+    .slice(0, 12)
+    .map((key) => `${key}: ${(a.get(key) ?? "<absent>").slice(0, 60)} -> ${(b.get(key) ?? "<absent>").slice(0, 60)}`);
+  return `; saved=${path.relative(repoRoot, saved)}; differs from the first run at ${changed.length ? changed.join("; ") : "no leaf (ordering only)"}`;
+}
+
 function runSupportingProof(options: {
   name: string;
   kind: SupportingKind;
@@ -387,11 +421,9 @@ function runSupportingProof(options: {
   const phaseContract = supportContract.phases.find((phase) => phase.name === options.name);
   assert.ok(phaseContract, `${options.name} has no committed support contract`);
   assert.equal(phaseContract.kind, options.kind, `${options.name} support kind drifted`);
-  assert.equal(
-    artifactDigest,
-    phaseContract.expectedArtifactDigest,
-    `${options.name} actual artifact digest drifted; actual=${artifactDigest}`,
-  );
+  if (artifactDigest !== phaseContract.expectedArtifactDigest) {
+    assert.fail(`${options.name} actual artifact digest drifted; actual=${artifactDigest}${artifactDriftDetail(options.name, artifact)}`);
+  }
   const semanticDigest = digest({
     name: options.name,
     status: "pass",
