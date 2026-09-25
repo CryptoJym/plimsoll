@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Active Codex sessions keep their summary rebuild cursor when reconciliation
+  edits a row the summary has not read yet. Ordinary delivery acknowledgements
+  no longer dirty a session through an outbox delete; privacy-changing lineage
+  and terminal receipt changes still do. A worker slice is retried if an edit
+  lands while it is being read, and scanned edits or erasures still rebuild
+  only their affected session (`.163.87`).
+
 ## 0.7.5 — 2026-09-08
 
 - Stable and finitely growing oversized Codex and Claude JSONL records can
