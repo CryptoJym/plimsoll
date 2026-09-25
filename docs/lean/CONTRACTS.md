@@ -102,6 +102,17 @@ most 8 new facts; a request that would create more is refused whole (400, `stamp
 nothing, so an authenticated collector cannot write one fact per distinct version per batch. Every new fact a request creates is
 listed on its receipt.
 
+**Retention and erasure (round 9, review r2 should-fix 2).** The answer for every pair is read from the audit rows and from every
+install a pair can name, the **old** install after a re-join included. They are therefore kept **until tenant erasure**: audit rows,
+superseded installs and the `stamp_not_issued` facts are outside every retention job and every future device-removal path (a path
+that deleted an install would turn its pairs from an actor into null); the fact's foreign key to `device_installs` (no cascade)
+refuses such a delete by construction. At `plimsoll-cloud@4954995` only tenant erasure deletes installs or audit rows
+(`src/lib/work-intelligence/subject-rights.ts:500,506`). Tenant erasure deletes `device_install_stamp_not_issued` (tenant-scoped)
+**before** `device_installs`, in the same transaction, and the residue check counts it (ARCHITECTURE.md §7); the `tenant_id`
+column exists for exactly that. Tests: cloud `schema-additions.contract.test.ts` (the model with `tenant_id`, `uploader_install_id`,
+the install relation without cascade; the erasure list and residue check), `actor-binding-stamp-postgres.contract.test.ts` (the
+refused install delete; erasure with zero residue).
+
 **What the echo is for.** `actorBindingVersionHeard` on every request, **upload deliveries included**, is the collector's
 `max(persisted version of the current install, highest stamp carried for the current install)`. It is a diagnostic and a sighting,
 never ownership: `stamp_ahead_of_echo` (a request carries a stamp above its own echo), `echo_ahead_of_binding` (an echo above the
@@ -323,6 +334,8 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `src/lib/activity-summary/actor-parts.ts`: `actorPartsForSegment({ members, install })`. (B6)
 - `src/lib/capture-watermark/contract.ts`: `captureCoverageForPeriod` with `until: null` open gaps and `resolvedAt`. (B6, C5)
 - `src/lib/economics/token-volume.ts`: `tokenVolumeState`, `normalisedTokens`, `pricingGate`. (B15)
+- `src/lib/work-intelligence/subject-rights.ts`: the tenant-scoped delete list names `DeviceInstallStampNotIssued` before
+  `DeviceInstall`, and `countTenantResidue` counts it (round 9). (B6, C1)
 - `prisma/schema.prisma`: `DeviceInstall.bindingVersion`, `DeviceInstall.activityLaneClosedAt`, `DeviceInstallActorBindingAudit.bindingVersion`
   and `.heardAt`, models `AiSummaryActorPart`, `CaptureGap` and `DeviceInstallStampNotIssued` (`tenantId`, `uploaderInstallId`,
   `deviceInstallId`, `version`, `firstSeenAt`, `bindingVersionThen`, `source`, unique per `(uploaderInstallId, deviceInstallId,
