@@ -3083,7 +3083,7 @@ export async function runDashboardProjectionBudgetContract(
       after.snapshotBuilds === buildsBefore &&
       sqliteWritesDuringRefresh === 0 &&
       durations.length > 0 &&
-      Number.isFinite(warmP95);
+      warmP95 <= 500;
     return {
       id: "dashboard_projection_budget",
       required: true,

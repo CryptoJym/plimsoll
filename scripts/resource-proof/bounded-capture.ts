@@ -567,7 +567,9 @@ export async function runBoundedCaptureContract(
   );
   const warmP95Ms = percentile(latencies, 0.95);
   const rssGrowthBytes = peakRss - rssBefore;
-  const responsiveAndBounded = latencies.length > 0 && Number.isFinite(warmP95Ms) && Number.isFinite(rssGrowthBytes);
+  // Resource ceilings with wide CI margins (09-25: p95 18.8 ms, RSS growth 40 MB);
+  // only the wall-clock turn gates were flaky, so these stay release gates.
+  const responsiveAndBounded = latencies.length > 0 && warmP95Ms <= 500 && rssGrowthBytes < 768 * 1024 * 1024;
 
   // Malformed, partial, oversized and CRLF boundary generations remain
   // metadata-only failures while a valid boundary record captures once.
