@@ -1,56 +1,100 @@
-# Lean Plimsoll contract register (round 7 = B0, eco-6hoxj.164.4)
+# Lean Plimsoll contract register (round 8 = B0 round 2, eco-6hoxj.164.4)
 
 **As of:** 2026-09-25 MDT · **Owner:** B0 (contract owner; documents and failing tests only). This file is normative for the
-five items the round-6 review left to B0: the two blockers and the four `b0Carries` items (`input/review-r6/VERDICT.json`). Where
-it and a round-6 document disagree, this file wins and the round-6 document carries a "round 7" note pointing here. Every rule
-below has (a) a runnable fixture in `fixtures/` (red under `--rule r6`, green under `--rule r7`; `checks/fixtures-summary.json`)
-and (b) a **pending test** in the repository that owns the rule (§C6), which fails today and names the bead that turns it green.
-Nothing here is implemented; nothing here is frozen until the lead signs the freeze list (`FREEZE.md`).
+items the round-6 review left to B0 (two blockers, four `b0Carries`; `input/review-r6/VERDICT.json`) and for the repairs the
+round-1 review of B0 required (`input/review-r1/VERDICT.json`: C1/C4 judged at judgment time, C2 rule 3 overstating the runway,
+the test helper; and its should-fixes). Where it and another document disagree, this file wins and the other carries a "round 7"
+or "round 8" note pointing here. Every rule below has (a) a runnable fixture in `fixtures/` (the two round-8 fixtures are red
+under `--rule r6` and `--rule r7` and green under `--rule r8`; `checks/fixtures-summary.json`) and (b) a **pending test** in the
+repository that owns the rule (§C6), which fails today and names the bead that turns it green. Nothing here is implemented;
+nothing here is frozen until the lead signs the freeze list (`FREEZE.md`).
 
-## C1. One actor-ownership predicate (blocker 1; B6 cloud, B2a collector)
+## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1; B6 cloud, B2a collector)
 
-**The defect.** Round 6 wrote two validators. A delivered stamp had to satisfy `V exists, V ≤ actorBindingVersionHeard ≤ current`;
-an undelivered stamp only `V exists, V ≤ current` plus a rowid-monotonic list check. For a version the cloud has issued but the
-collector has not yet echoed (version 1 supplied by the 300 response, first echoed by the 650 request) a row stamped 1 was null on
-the delivered path and actor B on the undelivered path (`input/review-r6/checks/reviewer-new-counterexamples.log`).
+**The defect (review r6).** Round 6 wrote two validators. A delivered stamp had to satisfy `V exists, V ≤ actorBindingVersionHeard
+≤ current`; an undelivered stamp only `V exists, V ≤ current`. For a version the cloud had issued but the collector had not yet
+echoed, a row stamped 1 was null on the delivered path and B on the undelivered path.
 
-**The rule.** `actor_for_stamp(install, stamp)` is the only ownership function, and both paths call it:
+**The defect (review r1).** Round 7 replaced them with one predicate, valid iff `0 ≤ V ≤ binding_version` **at judgment**. That
+still depends on time: a delivered row is judged once at ingest, an undelivered member when its summary arrives, so a stamp for a
+version the cloud issues *later* was null on one path and a real actor on the other (stamp 2 delivered at 400: null; the same row
+judged in its summary at 1000: C; a dead delivery replayed at 700: C). An honest collector reached such a stamp on **re-join**:
+the cloud creates a new `DeviceInstall` per join (`plimsoll-cloud@4954995 src/lib/auth/join-token-store.ts:95-104`), B6 starts it
+at `binding_version` 0, and the round-7 B2a kept the highest version ever persisted in the surviving ledger (`plimsoll@03445d3a
+packages/collector-cli/src/join.ts:205-232,603-625` keeps the ledger and its binding row across a join) and never lowered it, so
+rows captured under the new install's first actor D were null when delivered and F's when exported
+(`input/review-r1/checks/review_c1_orderings.log` R1, R2).
+
+**The rule.** A stamp is the **pair** `(install, V)`: the `DeviceInstall` id of the response that supplied `V` and the version. The
+collector persists the pair, stamps it on the identity row (`summary_members.actor_binding_version`, `.actor_binding_install`) and
+sends it on the wire (`metadata.actorBindingVersion`, `metadata.actorBindingInstall`); the summary item's per-segment parts are
+keyed by the pair. `actor_for_stamp(stamp)` is the only ownership function and both paths call it; it judges `V` against the
+install the pair names, never against the uploading install:
 
 | Stamp | Delivered raw row (ingest) | Undelivered member (part) |
 |---|---|---|
-| `V` such that `0 ≤ V ≤ install.binding_version` at judgment (`V = 0` is the registration binding, `V ≥ 1` the audit row that created version `V`) | `actor_id = actor_of(install, V)`; basis `raw_ingest` (identical to `binding_at_capture` by construction) | `actor_id = actor_of(install, V)`, basis `binding_at_capture` |
-| `V` the cloud never issued for that install (`V > binding_version`, or no audit row for `V ≥ 1`) | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
-| `null` (a collector older than B2a, or a B2a collector before its first response, C4) | today's ingest binding (the install's actor at ingest); basis `ingest_current` | `single_binding` (the install has no audit row and a non-null actor) else `unallocated_no_stamp` |
+| `(install, V)` **issued at its first sighting**: `V = 0`, or the audit row for `V` existed when the cloud first saw `(install, V)` in any request echo, delivered row or summary member | `actor_id = actor_of(install, V)`; basis `raw_ingest` (identical to `binding_at_capture` by construction) | `actor_id = actor_of(install, V)`, basis `binding_at_capture` |
+| `(install, V)` **not issued at its first sighting** (`V > binding_version` then), recorded once as the durable fact `stamp_not_issued(install, V)` in the same transaction; or a pair naming an install the tenant does not have | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify; **stays null after the cloud issues `V`**, at ingest, on replay and in every summary revision | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
+| `null` (a collector older than B2a, or a B2a collector before the first versioned response of its **current** install, C4) | today's ingest binding (the uploading install's actor at ingest); basis `ingest_current` | `single_binding` (the install has no audit row and a non-null actor) else `unallocated_no_stamp` |
 
-The stamped rows are therefore owned by the same actor whether or not they were delivered, for every ordering of capture,
-rebind, contact and delivery, and a dead delivery replayed after a later rebind resolves as its first attempt would have. The
-**null-stamp row remains the one disclosed exception**, now stated as confined to `stamp = null` on a rebound install, whichever
-collector version wrote it (C4).
+**The guarantee (what `fixtures/b4_offline_rebind.py` and the tests prove).**
+1. **Fixed at the first sighting.** For every install and every `V`, the answer for `(install, V)` is decided the first time the
+   cloud sees the pair and is never revisited: `actor_for_stamp` reads only the audit table and the `stamp_not_issued` facts, an
+   audit row created after the fact does not revive it, and no fact can be created once the audit row exists. Every judgment is a
+   sighting, so every judgment of a row stamped `(install, V)` (ingest, a dead delivery's replay, any summary revision, either
+   path) returns the same actor or the same null. The fixture probes every sighted pair at every instant from its first sighting
+   to the end of the timeline and finds one answer each (round 7 flipped for `(W, 2)` and `(Zf, 2)`).
+2. **Honest collectors are exact.** A collector that stamps only versions it persisted from its current install's responses, and
+   clears the pair at a join, re-join or workspace transition (C4), never produces a not-issued pair: every stamped row is owned
+   by `actor_of(install, V)` on both paths for every ordering of capture, rebind, contact, delivery and re-join, including a row
+   still in the outbox at a re-join (it keeps the old install's pair and is judged against the old install, whoever delivers it).
+   The echo, `heard_at`, the delivery instant and the summary instant are not inputs.
+3. **A not-issued pair fails closed, permanently and visibly.** Rows carrying it are unallocated on both paths (never anyone's),
+   and so are rows the same install later stamps legitimately with that version: `(install, V)` is poisoned, listed on the
+   certify (`stamp_not_issued` with the first sighting, the binding version then and the affected row count) and on the impact
+   report as unallocated with candidates; the repair is an admin rebind, which issues a fresh version. The cloud cannot tell a
+   faulty stamp from a stamp issued later except by the order of sightings, which is why the fact is recorded durably at the first one.
+4. **The null-stamp row remains the one disclosed exception**, confined to `stamp = null` on a rebound install, whichever collector
+   version wrote it (C4).
 
-**What the echo is for.** `actorBindingVersionHeard` (every request) and the rowid order of the versions in a segment are
-**diagnostics, never ownership**: `stamp_ahead_of_echo` (a request carries a stamp above its own echo) and
-`stamp_sequence_regressed` (a segment's versions are not non-decreasing in rowid order) are recorded on the request receipt and
-the segment, shown in `/status`, the S4 certify report and the impact report, and change no actor. `heard_at` on the audit row is
-the instant of the **first request that echoes** the version: a disclosure fact for the export's `changed_at → heard_at` window.
-A collector's echo is `max(persisted version, highest stamp in the request)`, so an honest collector never trips the diagnostic.
+**Sightings and the durable fact.** `device_install_stamp_not_issued (tenant_id, device_install_id, version, first_seen_at,
+binding_version_then, source ∈ {echo, row, member})`, unique per `(device_install_id, version)`, written in the transaction of the
+request receipt, the ingest or the summary judgment that first saw the pair above the install's `binding_version`; never deleted
+except with the install by a tenant erasure. A refused batch (schema violation, 400) judges nothing and records nothing.
 
-**The corrected timeline** (fixture `b4_offline_rebind.py`): registration supplies version 0; contact 50 echoes 0; contact 300
-echoes 0 and its response first supplies 1; contact 650 first echoes 1 (`heard_at(1) = 650`) and its response supplies 2, which
-has no `heard_at` until the next contact. A row captured at 350 is stamped 1 (the collector persisted 1 at 300) and belongs to B
-on both paths whether delivered at 400 (before the echo) or at 700. Cases covered: A-H in the fixture: before the rebind,
-across it, the reviewer's offline capture (stamp 0 after the rebind), the issued-but-unheard stamp, a delivery after a second
-rebind, an undelivered row, a never-issued stamp (5), and a pre-first-response null stamp on a never-rebound install; plus the
-replay and the rebound-install null-stamp exception.
+**What the echo is for.** `actorBindingVersionHeard` on every request, **upload deliveries included**, is the collector's
+`max(persisted version of the current install, highest stamp carried for the current install)`. It is a diagnostic and a sighting,
+never ownership: `stamp_ahead_of_echo` (a request carries a stamp above its own echo), `echo_ahead_of_binding` (an echo above the
+install's `binding_version`; it records the not-issued fact), `stamp_sequence_regressed` (a segment's versions are not
+non-decreasing in rowid order) and `stamp_from_earlier_install` (a pair naming an install other than the uploader: expected after a
+re-join, counted) are recorded on the request receipt and the segment, shown in `/status`, the S4 certify and the impact report,
+and change no actor. `heard_at` on the audit row is the instant of the **first request that echoes** the version, a disclosure
+fact for the export's `changed_at → heard_at` window; a response that supplies a version sets nothing, and the registration
+response is not an echo.
 
-**Judgment state.** Validity is decided against the install's audit table at the time the event or the item is judged; a
-version that does not exist then is invalid on both paths. Parts are computed per received revision and frozen at the seal; a
-raw row's actor is bound once at ingest. A stamp that the cloud never issued is a collector or cloud defect (`stamp_not_issued`
-on the certify), not an expected state.
+**The corrected timeline** (`fixtures/b4_offline_rebind.py`, round 8; should-fixes 1-2 of review r1). Install X: registration
+supplies 0; requests at 50 (heartbeat, echo 0: `heard_at(0) = 50`), 150 (delivery), 300 (heartbeat, echo 0; its response first
+supplies 1), 400 (the delivery that carries the row stamped 1: echo 1, `heard_at(1) = 400`, not 650), 650 (heartbeat, echo 1;
+response supplies 2), 700 (delivery, echo 2: `heard_at(2) = 700`), 710 (a delivery carrying a never-issued stamp 5: echo 5,
+`echo_ahead_of_binding`, `stamp_not_issued(X, 5)`). The fixture's `--rule r6` mode is round 6 **as written** (two validators, first-echo
+`heard_at`), so case D splits null/B under it; `--rule r7` is round 7 as written with the round-1 fixture's modelling (deliveries are
+non-echoing instants, `heard_at(0)` = the registration), so cases I and J split under it; `--rule r8` is this rule. Cases: A-H
+(round 7), I (a stamp from a version issued later, on install W), J0 (a pre-re-join outbox row), J1/J3 (an honest re-join), J1' (a
+join whose response carries no version), Jf (a faulty collector carrying a stale version into the new install), K (an A→B→A
+reversal), the over-time probe and the timeline facts: 36 checks, r6 12/36, r7 20/36, r8 36/36.
 
-**Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6): the predicate table above, the eight
-orderings, the reviewer's counterexample, the replay, `firstEchoHeardAt`, the diagnostics, `eventRowsForStorage` binding by
-stamp, and `acknowledgedResponse` carrying `actorBindingVersion`. Collector `tests/contracts/lean/actor-stamp.contract.ts`
-(B2a): the stamp on the identity row and on the wire, the echo on every batch, null before the first response.
+**Judgment state.** Validity is decided at the first sighting of `(install, V)` and recorded; a version that did not exist then is
+invalid on both paths for ever. Parts are computed per received revision and frozen at the seal; a raw row's actor is bound once at
+ingest; because the fact precedes both, neither can differ from the other.
+
+**Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 10 cases): the reviewer's issued-but-unheard row,
+the honest orderings and the A→B→A reversal, the never-issued stamp, the first-sighting rule with the replay and the repair, the
+re-join (honest, pre-re-join outbox row, faulty, null after the join), C4, `firstEchoHeardAt` with deliveries as requests and the
+diagnostics, `eventRowsForStorage` binding by the pair (unknown install fails closed), `acknowledgedResponse`, the per-actor parts;
+`schema-additions.contract.test.ts` (the `stamp_not_issued` fact). Collector `tests/contracts/lean/actor-stamp.contract.ts` (B2a,
+6 cases): null before the first response, the pair on the identity row and never lowered within one install, the echo and the pair
+on the wire, both keys allowlisted through the seal, the scope cleared by a re-join and a transition with the new install's 0
+accepted, and a pre-re-join row keeping its pair while the batch echoes the current install's version.
 
 ## C2. S1b runway: G per host, one G, G remaining (blocker 2 and should-fix 5; B1 and B10a collector)
 
@@ -115,17 +159,23 @@ row keeps its record with `resolved_at_ms`; the table is compacted only by B14 w
 in the never-delete set while the reject is open. Test: collector `tests/contracts/lean/schema.contract.ts` (DDL) and
 `converter.contract.ts` (a NaN string becomes one counted gap and one reject; nothing vanishes; `b5_non_iso_day_facts.py`).
 
-## C4. Null stamps before the first response (b0Carries 3b; B2a collector, B6 cloud)
+## C4. Null stamps before the first response, and the install scope of the pair (b0Carries 3b; review-r1 blocker 1; B2a collector, B6 cloud)
 
-A B2a collector stamps every raw row with the highest `actorBindingVersion` it has **persisted**. It persists a version from any
-authenticated response (the registration or enrollment response included, where the route exists; B6 verifies each route).
-Until the first such response it writes **null**, exactly like a pre-B2a collector: a fresh install's rows before its first
-contact, and an upgraded install's rows before its first post-upgrade response, carry `actor_binding_version = null`. The cloud
-treats every null stamp by the C1 exception, so the exception is stated as "stamp = null on a rebound install", not as
-"older collectors". The collector's `/status` shows `actorBinding = {version, heardAt, stampedRows, nullStampedRows}` so the size
-of the exception is visible per host, and B2a's acceptance counts the null-stamped rows admitted before the first response on
-the Studio5 copy. Test: collector `actor-stamp.contract.ts` (null until the first response; stamped after); cloud
-`actor-binding-stamp.contract.test.ts` (case H, the rebound-install exception).
+A B2a collector stamps every raw row with the pair `(install, version)` it has **persisted**: the `DeviceInstall` id and the
+`actorBindingVersion` of the latest authenticated response (the registration or enrollment response included, where the route
+exists; B6 verifies each route). The pair is **scoped to the install it names**: a response from a different install replaces it
+(no cross-install comparison); a lower version from the same install never lowers it; a join, re-join or workspace transition
+(`buffer.ts` `useWorkspace` with a new installation epoch, `transitionWorkspace`) clears it to null. Until the first versioned
+response of the **current** install the collector writes **null**, exactly like a pre-B2a collector: a fresh install's rows before
+its first contact, an upgraded install's rows before its first post-upgrade response, and a re-joined ledger's rows between the
+join and the new install's first versioned response carry `actor_binding_version = null`; the join response supplies the new
+install's version 0 where the route carries it, so that window is normally empty. Rows already in the outbox at a re-join keep the
+pair they were stamped with and are judged against that install (C1). The cloud treats every null stamp by the C1 exception, so
+the exception is stated as "stamp = null on a rebound install", not as "older collectors". The collector's `/status` shows
+`actorBinding = {install, version, heardAt, stampedRows, nullStampedRows, earlierInstallRows}` so the size of the exception and of
+the re-join tail is visible per host, and B2a's acceptance counts the null-stamped rows admitted before the first response on the
+Studio5 copy. Test: collector `actor-stamp.contract.ts` (null until the first response; stamped after; cleared by a re-join and a
+transition; the pre-re-join row keeps its pair); cloud `actor-binding-stamp.contract.test.ts` (C4 case, the re-join cases).
 
 ## C5. `b22_false_complete.py` with repository-relative paths (b0Carries 4; B22 collector, B6 cloud)
 
@@ -149,10 +199,14 @@ globs and, in the collector, outside `tsconfig` `include`, so they never break `
 and linted, so a missing surface is loaded at run time through `loadSurface()` and fails as a test, not as a type error.
 
 **Surfaces the cloud tests bind (plimsoll-cloud, `tests/contracts/lean/`).**
-- `src/lib/actor-binding-stamp.ts`: `actorForStamp({ stamp, path, binding })` → `{ actorId, basis, stampInvalid? }`;
-  `firstEchoHeardAt(contacts)`; `stampDiagnostics({ stamp, echoed, currentVersion })`. (B6, C1, C4)
-- `src/lib/ingest.ts`: `eventRowsForStorage(batch, tenantId, authorizedActorId, { binding })` binds `metadata.actorBindingVersion`
-  through `actorForStamp`; sets `metadata.actorStampInvalid`. (B6, C1)
+- `src/lib/actor-binding-stamp.ts`: `actorForStamp({ stamp, path, binding })` → `{ actorId, basis, stampInvalid? }` where `binding =
+  { installId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued: number[] }` is the state of the install the
+  stamp's pair names; `sightStamp(binding, stamp)` → the binding with `notIssued` extended when the stamp is above `currentVersion`
+  (pure; persisting the fact is B6's); `firstEchoHeardAt(requests)` over every request kind; `stampDiagnostics({ stamps, echoed,
+  currentVersion })` → `{ stampAheadOfEcho, echoAheadOfBinding, ownershipChanged }`. (B6, C1, C4)
+- `src/lib/ingest.ts`: `eventRowsForStorage(batch, tenantId, authorizedActorId, { uploadingInstallId, bindings })` binds the pair
+  `metadata.actorBindingVersion` + `metadata.actorBindingInstall` through `actorForStamp` against `bindings[actorBindingInstall]`
+  (a pair naming an install outside `bindings` fails closed); sets `metadata.actorStampInvalid`. (B6, C1)
 - `src/lib/delivery-ack-response.ts`: `acknowledgedResponse` emits `actorBindingVersion` for a registered install
   (`CollectorUploadAuthorization` gains `actorBindingVersion: number`). (B6)
 - `src/lib/activity-summary/contract.ts`: `ACTIVITY_SUMMARY_PAYLOAD_KIND`, `isActivitySummaryPayload`, `activitySummaryBatchSchema`,
@@ -161,7 +215,8 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 - `src/lib/capture-watermark/contract.ts`: `captureCoverageForPeriod` with `until: null` open gaps and `resolvedAt`. (B6, C5)
 - `src/lib/economics/token-volume.ts`: `tokenVolumeState`, `normalisedTokens`, `pricingGate`. (B15)
 - `prisma/schema.prisma`: `DeviceInstall.bindingVersion`, `DeviceInstall.activityLaneClosedAt`, `DeviceInstallActorBindingAudit.bindingVersion`
-  and `.heardAt`, models `AiSummaryActorPart` and `CaptureGap`. (B6)
+  and `.heardAt`, models `AiSummaryActorPart`, `CaptureGap` and `DeviceInstallStampNotIssued` (`deviceInstallId`, `version`,
+  `firstSeenAt`, `bindingVersionThen`, `source`, unique per install and version). (B6, C1)
 
 **Surfaces the collector tests bind (plimsoll, `tests/contracts/lean/`).**
 - `packages/collector-cli/src/lean/schema.ts`: `ensureLeanSchema(db)` (ARCHITECTURE.md §3 DDL v3 plus C3) on the ledger connection
@@ -171,11 +226,15 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `raw_retention_control.hold_reason`; `collector_workspace_binding.actor_binding_version`; `raw_retention_receipts` accepting the four
   reasons. (B2a, B10a, B10b)
 - `packages/collector-cli/src/buffer.ts`: `prune` deletes nothing while `hold_reason` is set; `retentionProgressStatus().hold`;
-  `recordActorBindingVersion(version)`; `workspaceBinding().actorBindingVersion`; `summary_members` written at `append` with the stamp
-  and two edges when `lean.write` is on (`new LocalEventBuffer(path, { lean: { write: true } })`). (B10a, B2a)
-- `packages/collector-cli/src/upload.ts`: `buildIngestBatch(...).batch.actorBindingVersionHeard`; `packages/shared/src/schemas.ts`:
-  `aiWorkIngestBatchSchema` accepts it; `analytical-metadata.ts`: `metadataKeyDisposition("actorBindingVersion")` is an identifier;
-  `outbound-envelope.ts`: `sealOutboundEnvelope` keeps it. (B2a)
+  `recordActorBindingVersion(version, installId)` (a different install replaces the pair; a lower version of the same install is
+  ignored); `workspaceBinding().actorBindingVersion` and `.actorBindingInstall`, both cleared by `useWorkspace` with a new
+  installation epoch and by `transitionWorkspace`; `summary_members` written at `append` with the pair
+  (`actor_binding_version`, `actor_binding_install`) and two edges when `lean.write` is on (`new LocalEventBuffer(path, { lean:
+  { write: true } })`). (B10a, B2a; C1, C4)
+- `packages/collector-cli/src/upload.ts`: `buildIngestBatch(...).batch.actorBindingVersionHeard` (the current install's version;
+  earlier installs' stamps do not raise it) and the pair on every event's metadata; `packages/shared/src/schemas.ts`:
+  `aiWorkIngestBatchSchema` accepts it; `analytical-metadata.ts`: `metadataKeyDisposition("actorBindingVersion")` and
+  `("actorBindingInstall")` are identifiers; `outbound-envelope.ts`: `sealOutboundEnvelope` keeps both. (B2a)
 - `packages/collector-cli/src/lean/runway.ts`: `LEAN_ROW_WIDTHS`, `estimateHostG(census)`, `holdRunway(input)`. (B1, B10a; C2)
 - `packages/collector-cli/src/lean/day-key.ts`: `utcDayOf`, `censusClass`, `dashboardWindowSince`; `DASHBOARD_SCHEMA_VERSION = 3`. (B5)
 - `packages/collector-cli/src/lean/converter.ts`: `convertLedgerHistory(buffer, options)`. (B2a; C3)
