@@ -164,7 +164,7 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
   ];
   if (inventory.snapshots.length > 0) {
     lines.push("", table([
-      ["ID", "CREATED (UTC)", "SIZE", "METHOD", "OPERATION", "RESTORES", "RETENTION"],
+      ["ID", "CREATED (UTC)", "SIZE", "METHOD", "OPERATION", "RESTORES", "RESTORE CHECK", "RETENTION"],
       ...inventory.snapshots.map((row) => [
         row.id,
         row.createdAt?.slice(0, 16).replace("T", " ") ?? "-",
@@ -172,6 +172,7 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
         row.method,
         row.operationState,
         row.restoresVersion ?? "-",
+        row.cannotRestoreReason ? `cannot restore (${row.cannotRestoreReason})` : "can restore",
         `${row.retention} (${row.reason})`,
       ]),
     ]));
@@ -192,6 +193,9 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
   } else if (inventory.pendingRemoval.length > 0) {
     lines.push("", `Interrupted removal pending: ${inventory.pendingRemoval.length} item(s), ${formatBytes(inventory.bytes.pendingRemoval)}; ` +
       "the next 0.7.41 or later prune --apply or completed update finishes it; 0.7.38–0.7.40 skip retention.");
+  }
+  if (inventory.snapshots.some((row) => row.cannotRestoreReason !== null)) {
+    lines.push("", "A snapshot that cannot restore is present. Do not run 0.7.38–0.7.40 snapshots prune --keep 1; use 0.7.41 or later.");
   }
   lines.push("");
   const unknown = inventory.snapshots.filter((row) => row.reason === "operation_unknown" || row.reason === "receipt_without_sequence");

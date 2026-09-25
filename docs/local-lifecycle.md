@@ -58,6 +58,12 @@ run 0.7.41 or later and use `lifecycle snapshots prune --apply` to finish or
 restore the recorded removal. This also applies after a `needed_restore_*`
 prune refusal; a completed 0.7.41+ update can create a new way back first.
 
+The older releases do not check whether a kept snapshot can actually
+restore. After `retention.restored`, or whenever `snapshots list` flags a
+snapshot that cannot restore, use 0.7.41 or later for prune, especially with
+`--keep 1`. A 0.7.38–0.7.40 `prune --keep 1 --apply` can delete the only
+usable way back while keeping the newest unusable snapshot.
+
 To return to an older runtime explicitly, run that release's own
 `lifecycle rollback --operation-id <id> --artifact self`. A CLI installs
 only a bundle from its own install tree, so a newer CLI cannot install an

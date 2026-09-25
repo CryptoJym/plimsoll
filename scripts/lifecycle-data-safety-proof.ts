@@ -160,6 +160,7 @@ const CASES = {
     "inherited_pending_record_is_fenced_before_a_refused_retry",
   ],
   r12Preview: ["unusable_restore_preview_and_list_refuse_before_apply"],
+  r12Inventory: ["unrestorable_snapshot_list_warns_against_old_keep_one"],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -2491,6 +2492,13 @@ async function r5UsableWaysBack() {
     fs.rmSync(runtimeDirectory(fixture, "23.1.2"), { recursive: true, force: true });
     const pruned = await fixture.manager().pruneSnapshots({ operationId: "nu-prune", keep: 1, apply: true });
     const listed = await listDecisions(fixture, 1);
+    const inventory = await fixture.manager().listSnapshots({ keep: 1 });
+    const inventoryText = formatSnapshotInventory(inventory);
+    record(CASES.r12Inventory[0],
+      inventory.snapshots.find((item) => item.id === "d3")?.cannotRestoreReason !== null &&
+        /cannot restore/.test(inventoryText) && /0\.7\.38–0\.7\.40/.test(inventoryText) &&
+        /--keep 1/.test(inventoryText),
+      { snapshot: inventory.snapshots.find((item) => item.id === "d3"), inventoryText });
     record(CASES.r5WayBack[3],
       pruned.retention.removed.filter((item) => item.kind === "snapshot").length === 0 && same(fixture.snapshots(), ["d2", "d3"]) &&
         listed.decisions.d2 === "keep:restores_previous_version" && exists(runtimeExecutable(fixture, "23.1.1")),

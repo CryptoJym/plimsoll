@@ -368,6 +368,8 @@ export type LifecycleSnapshotInventory = {
     bytes: number;
     method: LifecycleSnapshotMethod | "unrecorded";
     restoresVersion: string | null;
+    /** Read-only reason this snapshot cannot restore, if any. */
+    cannotRestoreReason: string | null;
     operationState: LifecycleSnapshotState;
     retention: "keep" | "prune";
     reason: LifecycleSnapshotRetentionReason;

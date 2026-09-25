@@ -1502,7 +1502,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   async inspectSnapshots(input: { keep: number }): Promise<LifecycleSnapshotInventory> {
-    const { input: retention, blockedReason, createdAt } = this.retentionInput();
+    const { input: retention, blockedReason, createdAt, unusable } = this.retentionInput();
     const plan = planLifecycleRetention(retention, input.keep);
     const pendingRestore = blockedReason ? null : this.pendingWayBackRestore(retention, this.removalRecords().records);
     const pendingSnapshots = new Set(pendingRestore?.items.filter((item) => item.kind === "snapshot").map((item) => item.name));
@@ -1515,6 +1515,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         bytes: snapshot.bytes,
         method: snapshot.method ?? "unrecorded" as const,
         restoresVersion: snapshot.restoresVersion,
+        cannotRestoreReason: !snapshot.metadataValid ? "snapshot metadata is unreadable"
+          : snapshot.restoresVersion === null ? "no earlier runtime was recorded"
+          : unusable.get(decision.id) ?? null,
         operationState: decision.state,
         retention: decision.keep || pendingRestore ? "keep" as const : "prune" as const,
         reason: pendingRestore && (!decision.keep || pendingSnapshots.has(decision.id)) ? "pending_restore" as const : decision.reason,

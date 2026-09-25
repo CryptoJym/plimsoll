@@ -607,7 +607,9 @@ Its removal record is unreadable to 0.7.38–0.7.40: their prunes remove
 nothing, and their updates and rollbacks skip all retention. Run a 0.7.41+
 `lifecycle snapshots prune --apply` to finish or restore the record,
 including after a `needed_restore_*` refusal; a completed 0.7.41+ update
-can create a new way back first. Release signing, npm
+can create a new way back first. When `snapshots list` flags a snapshot
+that cannot restore, or after `retention.restored`, use 0.7.41+ for prune:
+older CLIs with `--keep 1` can delete the only usable way back. Release signing, npm
 publication, and live-fleet rollout remain gated under
 [#103](https://github.com/CryptoJym/plimsoll/issues/103).
 
