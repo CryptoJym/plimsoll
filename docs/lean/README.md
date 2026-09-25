@@ -1,8 +1,8 @@
-# Lean Plimsoll contract documents (round 8 = B0 round 2, eco-6hoxj.164.4)
+# Lean Plimsoll contract documents (round 9 = B0 round 3, eco-6hoxj.164.4)
 
-The contract documents of the lean-Plimsoll program (round 8 = B0 round 2, after the round-1 review of B0), carried in this
+The contract documents of the lean-Plimsoll program (round 9 = B0 round 3, after the round-2 review of B0), carried in this
 repository so the pending contract tests under `tests/contracts/lean/` can cite and read them by repository-relative path.
 `CONTRACTS.md` is normative for the B0 items (C1-C8); `FREEZE.md` says what is ready for the lead's signature; `CHANGES.md` maps
 every review item to its section, fixture and test; `SUMMARY-FOR-JAMES.md` is the plain-language summary of this round;
 `DECISION-METRICS.md` the metric definitions the gates cite; the other files are the round-6 plan documents with the recorded
-round-7 and round-8 edits. The cloud repository's tests refer here.
+round-7, round-8 and round-9 edits. The cloud repository's tests refer here.

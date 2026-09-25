@@ -8,6 +8,12 @@
 
 **What changed in round 8 (B0 round 2).** S1b (d) subtracts `G_owed` (the converter's own bytes and the rows admitted since the census), requires the census after the catch-up, at most a day old and with room for its copy, and S3 re-takes it (`CONTRACTS.md` C2). S1's `<UR>` pin test now exists in both repositories (`CONTRACTS.md` C8). S4 judges a stamp by its `(install, version)` pair at its first sighting and keeps the `stamp_not_issued` fact (`CONTRACTS.md` C1).
 
+**What changed in round 9 (B0 round 3).** The collector accepts a binding version only from the install its ledger is joined with,
+recorded at join activation (`CONTRACTS.md` C4). S4's sighting reads the install row `FOR SHARE` and keys the fact by the uploader;
+facts, audit rows and installs are kept until tenant erasure, which deletes the facts first (`CONTRACTS.md` C1). S1b (d) and S3
+read `C_conv` from the converter's measured page allocation, and the re-census copy before S3 is made only when the runway leaves
+room for it (`CONTRACTS.md` C2).
+
 ## 1. Invariants that hold on every host at every step
 
 1. **No raw row is deleted by any job between the hold and S9, except under the disclosed hold-release ladder.** From S1b the prune is held (ARCHITECTURE.md §2.4); today's prune would otherwise delete a pending-upload row at age (`collector-cli/src/buffer.ts:3008-3013,3041-3052`). The ladder's rung at fewer than 5 days of runway deletes only rows whose delivery is acknowledged (`uploaded_at` set and an `acknowledged` receipt for the row's own id, `collector-cli/src/outbox.ts:662-671,701-709`), never a member of an open target, and writes a receipt and a tombstone; the S3 certify converts the affected sessions as `cloud_superset` (§3, §6). A rollback through S8 therefore replays or rebuilds from every raw row that is not in the cloud already; **after a rung-2 release** the old reader path is reconstructable only from the rows still present, and the difference is exactly the receipted release set (§8; `out/fixtures/sf1_ladder_rollback_parity.py`).
