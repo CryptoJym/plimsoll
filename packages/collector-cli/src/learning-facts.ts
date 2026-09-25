@@ -712,29 +712,6 @@ export class LearningFactStore {
         `);
       }
 
-      // 0.7.40 counted evictions but did not record the deleted timestamps.
-      // On the first 0.7.41 open (or after an older binary evicts again),
-      // discard claims about history before this open. The marker is durable;
-      // later 0.7.41 deletions advance it by their actual fact timestamps.
-      const openedAt = Date.now() + 1;
-      this.db.prepare(`update learning_fact_table_state
-        set loss_through_ms = max(coalesce(loss_through_ms, ?), ?),
-            loss_evicted_count = evicted_count
-        where evicted_count > loss_evicted_count`).run(openedAt, openedAt);
-      const dropCount = capacityDropCount(this.db);
-      const trackedDrops = (this.db.prepare(`select loss_drop_count as n
-        from learning_fact_table_state where table_name = 'tool_attempt_facts'`
-      ).get() as { n: number }).n;
-      if (dropCount !== trackedDrops) {
-        // An older binary can refuse a fact without changing evicted_count.
-        // Its counter changed without this marker, so use this open as the bound.
-        this.db.prepare(`update learning_fact_table_state
-          set loss_through_ms = max(coalesce(loss_through_ms, ?), ?)
-          where table_name != 'technique_identity_registry'`).run(openedAt, openedAt);
-        this.db.prepare(`update learning_fact_table_state set loss_drop_count = ?
-          where table_name = 'tool_attempt_facts'`).run(dropCount);
-      }
-
       if (requiresRecount) {
         for (const definition of LEARNING_FACT_TABLES) {
           const rowCount = (
@@ -758,6 +735,33 @@ export class LearningFactStore {
       // the subsequent trim share the IMMEDIATE transaction; no invalid row
       // can evict a valid one during startup.
       this.verifyRetentionKeys();
+
+      // 0.7.40 counted evictions and capacity drops without the lost fact's
+      // timestamp. Verify old rows first, then bound unexplained loss by both
+      // this open and the newest trustworthy retained timestamp. A clock set
+      // forward remains conservative; a clock set behind cannot claim facts
+      // newer than the retained ledger.
+      const openedAt = Date.now() + 1;
+      const dropCount = capacityDropCount(this.db);
+      const trackedDrops = (this.db.prepare(`select loss_drop_count as n
+        from learning_fact_table_state where table_name = 'tool_attempt_facts'`
+      ).get() as { n: number }).n;
+      for (const definition of LEARNING_FACT_TABLES) {
+        const state = this.db.prepare(`select evicted_count as evicted, loss_evicted_count as tracked
+          from learning_fact_table_state where table_name = ?`
+        ).get(definition.name) as { evicted: number; tracked: number };
+        const unexplainedEviction = state.evicted > state.tracked;
+        if (!unexplainedEviction && !(dropCount !== trackedDrops &&
+          definition.name !== "technique_identity_registry")) continue;
+        const newest = this.db.prepare(`select max(retention_ms) as ms from ${definition.name}`
+        ).get() as { ms: number | null };
+        this.advanceLossCutoff(definition,
+          Math.max(openedAt, newest.ms === null ? openedAt : newest.ms + 1));
+        if (unexplainedEviction) this.db.prepare(`update learning_fact_table_state
+          set loss_evicted_count = evicted_count where table_name = ?`).run(definition.name);
+      }
+      if (dropCount !== trackedDrops) this.db.prepare(`update learning_fact_table_state
+        set loss_drop_count = ? where table_name = 'tool_attempt_facts'`).run(dropCount);
 
       // A ledger written by an older version may already be over a configured
       // limit. Restore the hard bound before the first post-upgrade write.

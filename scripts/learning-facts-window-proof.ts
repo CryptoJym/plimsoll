@@ -282,6 +282,57 @@ function x6b() {
   } finally { store.close(); }
 }
 
+function legacyClockFixture(name: string, now: number) {
+  const file = path.join(root, `${name}.sqlite`);
+  const store = buffer(file, { attempts: 5 });
+  const rootId = deterministicLearningFactId(["r2", `${name}-root`]);
+  const retryId = deterministicLearningFactId(["r2", `${name}-retry`]);
+  attempt(store.learningFacts, `${name}-root`, now - 2 * DAY);
+  attempt(store.learningFacts, `${name}-other`, now - DAY);
+  const lostAt = now - HOUR;
+  attempt(store.learningFacts, `${name}-retry`, lostAt, rootId);
+  attempt(store.learningFacts, `${name}-newest`, now - 30 * 60_000);
+  store.close();
+  const raw = new Database(file);
+  try {
+    raw.prepare(`delete from tool_attempt_facts where operation_id in (?, ?)`).run(rootId, retryId);
+    raw.prepare(`update learning_fact_table_state set evicted_count = 2,
+      loss_evicted_count = 0, loss_through_ms = null
+      where table_name = 'tool_attempt_facts'`).run();
+  } finally { raw.close(); }
+  return { file, lostAt };
+}
+
+function x5a() {
+  const now = Date.now();
+  const { file } = legacyClockFixture("x5a", now);
+  const realNow = Date.now;
+  Date.now = () => now + 30 * DAY;
+  try { buffer(file, { attempts: 5 }).close(); }
+  finally { Date.now = realNow; }
+  const receipt = materialize(file, "x5a", now + HOUR);
+  assert.equal(receipt.status, "blocked_dependencies");
+  assert.equal(receipt.window.reason, "retention");
+  assert.equal(receipt.window.effectiveStartInclusive, iso(now + HOUR));
+  return { case: "X5a", status: receipt.status, reason: receipt.window.reason };
+}
+
+function x5b() {
+  const now = Date.now();
+  const { file, lostAt } = legacyClockFixture("x5b", now);
+  const realNow = Date.now;
+  Date.now = () => now - 3 * DAY;
+  try { buffer(file, { attempts: 5 }).close(); }
+  finally { Date.now = realNow; }
+  const receipt = materialize(file, "x5b", now + HOUR);
+  assert.equal(receipt.window.reason, "retention");
+  assert.ok(receipt.window.effectiveStartInclusive !== null &&
+    receipt.window.effectiveStartInclusive > iso(lostAt),
+    "a clock behind the deleted retry must not claim to cover that retry");
+  return { case: "X5b", lostAt: iso(lostAt),
+    effectiveStart: receipt.window.effectiveStartInclusive };
+}
+
 async function main() {
   try {
     const results: unknown[] = [];
@@ -293,6 +344,8 @@ async function main() {
     if (selected === "all" || selected === "w8") results.push(w8());
     if (selected === "all" || selected === "x6a") results.push(x6a());
     if (selected === "all" || selected === "x6b") results.push(x6b());
+    if (selected === "all" || selected === "x5a") results.push(x5a());
+    if (selected === "all" || selected === "x5b") results.push(x5b());
     if (results.length === 0) throw new Error(`unknown case: ${selected}`);
     console.log(JSON.stringify({ proof: "learning-facts-window", passed: true, cases: results }));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
