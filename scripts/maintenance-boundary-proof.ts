@@ -1170,6 +1170,7 @@ async function progressStageTimeoutProof() {
   const stageReceipts: Array<Record<string, unknown>> = [];
 
   for (const [index, stage] of stages.entries()) {
+    const clock = new ManualClock();
     const privateCandidate = `${PRIVATE_PATH_SENTINEL}/${stage}/candidate.jsonl`;
     const candidateHash = stageCases[stage] === "none"
       ? null
@@ -1196,10 +1197,21 @@ async function progressStageTimeoutProof() {
       deadlineMs: 5,
       termGraceMs: 5,
       killGraceMs: 5,
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
     });
 
     const stalled = harness.boundary.run();
     void stalled.catch(() => undefined);
+    // The progress receipt must reach the boundary before the job clock is
+    // advanced. If the boundary drops it, waitFor fails instead of allowing a
+    // real 5 ms timer to choose which stage this proof observes.
+    await waitFor(() => harness.children[0]?.sent.some((message) => (
+      (message as { type?: string; sequence?: number }).type === "ack" &&
+      (message as { sequence?: number }).sequence === 1
+    )) ?? false, `${stage}_progress_ack`, 30_000);
+    clock.advanceBy(5);
     await rejectsWith(stalled, "maintenance_deadline_exceeded");
     const status = harness.boundary.status();
     const child = harness.children[0]!;
