@@ -165,6 +165,12 @@ function retentionInstant(timestamp: string): number | null {
   return Number.isFinite(milliseconds) ? milliseconds : null;
 }
 
+// Loss boundaries are exclusive. Keep even an untrusted future loss visible
+// from this operation, without letting its timestamp block a future window.
+function lossCutoffLimit(): number {
+  return Math.max(Date.now(), new Date().getTime()) + 1;
+}
+
 function capacityDropCount(db: Database.Database): number {
   if (!db.prepare(`select 1 from sqlite_master where type='table'
     and name='runtime_fact_drops'`).get()) return 0;
@@ -741,7 +747,10 @@ export class LearningFactStore {
       // this open and the newest trustworthy retained timestamp. A clock set
       // forward remains conservative; a clock set behind cannot claim facts
       // newer than the retained ledger.
-      const openedAt = Date.now() + 1;
+      const openedAt = lossCutoffLimit();
+      // An earlier build may already have persisted an unbounded cutoff.
+      this.db.prepare(`update learning_fact_table_state set loss_through_ms = ?
+        where loss_through_ms > ?`).run(openedAt, openedAt);
       const dropCount = capacityDropCount(this.db);
       const trackedDrops = (this.db.prepare(`select loss_drop_count as n
         from learning_fact_table_state where table_name = 'tool_attempt_facts'`
@@ -885,9 +894,10 @@ export class LearningFactStore {
 
   private advanceLossCutoff(definition: LearningFactTableDefinition, throughMs: number | null) {
     if (throughMs === null) return;
+    const boundedThroughMs = Math.min(throughMs, lossCutoffLimit());
     this.db.prepare(`update learning_fact_table_state
       set loss_through_ms = max(coalesce(loss_through_ms, ?), ?)
-      where table_name = ?`).run(throughMs, throughMs, definition.name);
+      where table_name = ?`).run(boundedThroughMs, boundedThroughMs, definition.name);
   }
 
   private syncCapacityDropCount() {

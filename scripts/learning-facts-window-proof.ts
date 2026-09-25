@@ -92,16 +92,17 @@ async function w2() {
 
 function w2b() {
   const file = path.join(root, "w2b.sqlite");
+  const until = Date.now() + DAY;
   const store = buffer(file, { attempts: 10 });
   try {
     for (let index = 0; index < 10; index += 1) attempt(store.learningFacts, `w2b-${index}`,
-      UNTIL - 5 * DAY + index * 6 * HOUR);
-    attempt(store.learningFacts, "w2b-new1", UNTIL - 2 * HOUR);
-    attempt(store.learningFacts, "w2b-new2", UNTIL - HOUR);
-    const lateAt = UNTIL - 5 * DAY + 6 * HOUR + 30 * 60_000;
+      until - 5 * DAY + index * 6 * HOUR);
+    attempt(store.learningFacts, "w2b-new1", until - 2 * HOUR);
+    attempt(store.learningFacts, "w2b-new2", until - HOUR);
+    const lateAt = until - 5 * DAY + 6 * HOUR + 30 * 60_000;
     const late = attempt(store.learningFacts, "w2b-late", lateAt);
     assert.equal(late.dropReason, "outside_retention_window");
-    const receipt = materialize(file, "w2b");
+    const receipt = materialize(file, "w2b", until);
     assert.equal(receipt.window.effectiveStartInclusive, iso(lateAt + 1));
     assert.equal(receipt.window.reason, "retention");
     return { case: "W2b", effectiveStart: receipt.window.effectiveStartInclusive };
@@ -282,7 +283,7 @@ function x6b() {
   } finally { store.close(); }
 }
 
-function legacyClockFixture(name: string, now: number) {
+function legacyClockFixture(name: string, now: number, futureAt?: number) {
   const file = path.join(root, `${name}.sqlite`);
   const store = buffer(file, { attempts: 5 });
   const rootId = deterministicLearningFactId(["r2", `${name}-root`]);
@@ -292,6 +293,7 @@ function legacyClockFixture(name: string, now: number) {
   const lostAt = now - HOUR;
   attempt(store.learningFacts, `${name}-retry`, lostAt, rootId);
   attempt(store.learningFacts, `${name}-newest`, now - 30 * 60_000);
+  if (futureAt !== undefined) attempt(store.learningFacts, `${name}-future`, futureAt);
   store.close();
   const raw = new Database(file);
   try {
@@ -331,6 +333,95 @@ function x5b() {
     "a clock behind the deleted retry must not claim to cover that retry");
   return { case: "X5b", lostAt: iso(lostAt),
     effectiveStart: receipt.window.effectiveStartInclusive };
+}
+
+function x5f() {
+  const now = Date.now();
+  const { file, lostAt } = legacyClockFixture("x5f", now, now + 30 * DAY);
+  const reopened = buffer(file, { attempts: 5 });
+  try {
+    const window = reopened.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(lostAt) &&
+      window.effectiveStartInclusive <= iso(now + 60_000),
+      "a retained future fact must not keep an old loss cutoff in the future");
+    assert.equal(window.reason, "retention", "the old loss must still be disclosed");
+    return { case: "X5f", lostAt: iso(lostAt), effectiveStart: window.effectiveStartInclusive };
+  } finally { reopened.close(); }
+}
+
+function x5g() {
+  const now = Date.now();
+  const file = path.join(root, "x5g.sqlite");
+  const store = buffer(file, {});
+  attempt(store.learningFacts, "x5g-kept", now - DAY);
+  store.database.prepare(`update learning_fact_table_state set evicted_count = 1,
+    loss_evicted_count = 1, loss_through_ms = ? where table_name = 'tool_attempt_facts'`
+  ).run(now + 30 * DAY);
+  store.close();
+  const reopened = buffer(file, {});
+  try {
+    const window = reopened.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(now) &&
+      window.effectiveStartInclusive <= iso(now + 60_000),
+      "a previously stored future cutoff must be clamped on open");
+    assert.equal(window.reason, "retention");
+    return { case: "X5g", effectiveStart: window.effectiveStartInclusive };
+  } finally { reopened.close(); }
+}
+
+function x6cFutureAttempt() {
+  const file = path.join(root, "x6c-future-attempt.sqlite");
+  const now = Date.now();
+  const store = buffer(file, {});
+  attempt(store.learningFacts, "x6c-future-valid", now - 3 * DAY);
+  store.database.prepare(`insert into tool_attempt_facts
+    (operation_id, source, session_id, episode_id, tool_class, tool_name, started_at,
+      ended_at, duration_ms, result_status, error_category, retry_of, created_at,
+      updated_at, retention_ms, retention_verified)
+    values (?, 'not-a-source', 'r2-session', null, 'compute', 'shell', ?,
+      null, null, 'unknown', 'unknown', null, ?, ?, null, null)`
+  ).run(deterministicLearningFactId(["r2", "x6c-future-invalid"]),
+    iso(now + 30 * DAY), iso(now), iso(now));
+  store.close();
+  const reopened = buffer(file, {});
+  try {
+    const window = reopened.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(now) &&
+      window.effectiveStartInclusive <= iso(now + 60_000),
+      "an invalid future row must move coverage without blocking for 30 days");
+    assert.equal(window.reason, "retention");
+    return { case: "X6c-future-attempt", effectiveStart: window.effectiveStartInclusive };
+  } finally { reopened.close(); }
+}
+
+function x6cFutureGraph() {
+  const file = path.join(root, "x6c-future-graph.sqlite");
+  const now = Date.now();
+  const store = buffer(file, {});
+  const episode = buildWorkEpisodeFact({ source: "codex", sessionId: "r2-session",
+    sourceEpisodeKey: "x6c-future-graph", workClass: "other", complexityBand: "unknown",
+    startedAt: iso(now - 2 * DAY) });
+  store.learningFacts.recordWorkEpisode(episode);
+  const lostAt = now - HOUR;
+  attempt(store.learningFacts, "x6c-future-graph-valid", lostAt, undefined, episode.episodeId);
+  store.database.prepare(`update work_episode_facts set source = 'not-a-source',
+    started_at = ?, retention_verified = null where episode_id = ?`
+  ).run(iso(now + 30 * DAY), episode.episodeId);
+  store.close();
+  const reopened = buffer(file, {});
+  try {
+    const window = reopened.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(lostAt) &&
+      window.effectiveStartInclusive <= iso(now + 60_000),
+      "an invalid future graph must disclose its valid dependent without a future cutoff");
+    assert.equal(window.reason, "retention");
+    return { case: "X6c-future-graph", lostAt: iso(lostAt),
+      effectiveStart: window.effectiveStartInclusive };
+  } finally { reopened.close(); }
 }
 
 function x6c() {
@@ -373,7 +464,11 @@ async function main() {
     if (selected === "all" || selected === "x6b") results.push(x6b());
     if (selected === "all" || selected === "x5a") results.push(x5a());
     if (selected === "all" || selected === "x5b") results.push(x5b());
+    if (selected === "all" || selected === "x5f") results.push(x5f());
+    if (selected === "all" || selected === "x5g") results.push(x5g());
     if (selected === "all" || selected === "x6c") results.push(x6c());
+    if (selected === "all" || selected === "x6c-future-attempt") results.push(x6cFutureAttempt());
+    if (selected === "all" || selected === "x6c-future-graph") results.push(x6cFutureGraph());
     if (results.length === 0) throw new Error(`unknown case: ${selected}`);
     console.log(JSON.stringify({ proof: "learning-facts-window", passed: true, cases: results }));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
