@@ -291,14 +291,37 @@ function verifyMeasurements(
   assert.ok(unchangedEntries <= ceilings.unchangedEntriesScanned, "idle unchanged entries exceed the fixture ceiling");
   assert.ok(idleCalls <= ceilings.enumerationCalls, "idle enumeration calls exceed the fixture ceiling");
   assert.ok(unchangedCalls <= ceilings.unchangedEnumerationCalls, "idle unchanged enumeration calls exceed the fixture ceiling");
-  assert.ok(integer(idle.filesystemEnumerationFailedCalls, "idle failed enumeration calls") <= idleCalls, "idle failed enumeration calls exceed calls");
-  integer(idle.filesystemEnumerationReadFailures, "idle enumeration read failures");
+  const failedCalls = integer(idle.filesystemEnumerationFailedCalls, "idle failed enumeration calls");
+  const readFailures = integer(idle.filesystemEnumerationReadFailures, "idle enumeration read failures");
   assert.equal(idle.stableSweepCursorReset, true, "idle stable sweep cursor was not reset");
-  const firstBootScenario = resourceScenarios
+  // The projection must equal the pinned resource artifact it came from. That artifact normalizes only
+  // the startup/baseline split as volatile, so the split is checked by its sum above.
+  const idleScenario = resourceScenarios
     .map((entry, index) => object(entry, `resource scenario ${index}`))
     .find((scenario) => scenario.id === "no_change_constant_work");
-  assert.ok(firstBootScenario, "first-boot resource scenario missing");
-  const firstBoot = object(firstBootScenario.measurements, "first-boot measurements");
+  assert.ok(idleScenario, "idle resource scenario missing");
+  const idleArtifactCounters = object(idleScenario.counters, "idle resource counters");
+  const idleArtifact = object(idleScenario.measurements, "idle resource measurements");
+  const pinned = (value: unknown, label: string) => integer(value, `idle resource ${label}`);
+  for (const [label, projected, artifact] of [
+    ["entries scanned", idleEntries, pinned(idleArtifactCounters.filesystemEntriesScanned, "entries scanned")],
+    ["enumeration calls", idleCalls, pinned(idleArtifact.filesystemEnumerationCalls, "enumeration calls")],
+    ["setup entries", setupEntries, pinned(idleArtifact.setupFilesystemEntriesScanned, "setup entries")],
+    ["setup enumeration calls", setupCalls, pinned(idleArtifact.setupFilesystemEnumerationCalls, "setup enumeration calls")],
+    ["unchanged entries", unchangedEntries, pinned(idleArtifact.unchangedFilesystemEntriesScanned, "unchanged entries")],
+    ["unchanged enumeration calls", unchangedCalls, pinned(idleArtifact.unchangedFilesystemEnumerationCalls, "unchanged enumeration calls")],
+    ["failed enumeration calls", failedCalls, pinned(idleArtifact.filesystemEnumerationFailedCalls, "failed enumeration calls")],
+    ["enumeration read failures", readFailures, pinned(idleArtifact.filesystemEnumerationReadFailures, "enumeration read failures")],
+  ] as const) {
+    assert.equal(projected, artifact, `idle ${label} disagree with the resource artifact`);
+  }
+  assert.equal(idleArtifact.stableSweepCursorReset, true, "idle resource stable sweep cursor was not reset");
+  // The artifact's own exact fixture topology.
+  assert.equal(setupEntries, pinned(idleArtifact.expectedSetupFilesystemEntriesScanned, "expected setup entries"), "idle setup entries differ from the fixture topology");
+  assert.equal(setupCalls, pinned(idleArtifact.expectedSetupFilesystemEnumerationCalls, "expected setup calls"), "idle setup enumeration calls differ from the fixture topology");
+  assert.equal(unchangedEntries, pinned(idleArtifact.expectedStableDirectoryEntries, "expected stable entries"), "idle unchanged entries differ from the fixture topology");
+  assert.equal(unchangedCalls, pinned(idleArtifact.expectedStableEnumerationCalls, "expected stable calls"), "idle unchanged enumeration calls differ from the fixture topology");
+  const firstBoot = idleArtifact;
   assert.equal(firstBoot.firstBootRecentOnly, true);
   assert.equal(integer(firstBoot.oldContentReadsAtBoot, "old boot reads"), 0);
   assert.equal(firstBoot.restartZeroWork, true);

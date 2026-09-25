@@ -274,6 +274,29 @@
       "mutations": [{ "pointer": "/unknownTopField", "replacement": true }],
       "resign": false,
       "expectedError": "system E2E receipt has missing, extra, or unknown fields"
+    },
+    {
+      "id": "idle_filesystem_coherent_underreport",
+      "mutations": [
+        { "pointer": "/measurements/idle/startupFilesystemEntriesScanned", "replacement": 1 },
+        { "pointer": "/measurements/idle/startupFilesystemEnumerationCalls", "replacement": 1 },
+        { "pointer": "/measurements/idle/baselineFilesystemEntriesScanned", "replacement": 1 },
+        { "pointer": "/measurements/idle/baselineFilesystemEnumerationCalls", "replacement": 1 },
+        { "pointer": "/measurements/idle/setupFilesystemEntriesScanned", "replacement": 2 },
+        { "pointer": "/measurements/idle/setupFilesystemEnumerationCalls", "replacement": 2 },
+        { "pointer": "/measurements/idle/unchangedFilesystemEntriesScanned", "replacement": 1 },
+        { "pointer": "/measurements/idle/unchangedFilesystemEnumerationCalls", "replacement": 1 },
+        { "pointer": "/measurements/idle/filesystemEntriesScanned", "replacement": 3 },
+        { "pointer": "/measurements/idle/filesystemEnumerationCalls", "replacement": 3 }
+      ],
+      "resign": false,
+      "expectedError": "idle entries scanned disagree with the resource artifact"
+    },
+    {
+      "id": "idle_filesystem_failed_calls_projection",
+      "mutations": [{ "pointer": "/measurements/idle/filesystemEnumerationFailedCalls", "replacement": 1 }],
+      "resign": false,
+      "expectedError": "idle failed enumeration calls disagree with the resource artifact"
     }
   ]
 }
