@@ -40,6 +40,7 @@ step whose effect does not reach it. The suite reduction cases
 `suite_code_hardcodes_six_via_run_proof` and `suite_code_skips_cadence` are
 runtime backstop cases: their completion receipts fail when stages or cadence
 are reduced, even though the static inventory cannot infer those values.
+`resource_proof_help_arg` is accidental invocation drift, not deliberate shell indirection; it needs the resource proof's passed receipt.
 
 The final CI receipt owned by eco-6hoxj.163.32 is the runtime backstop. It must
 read `evidence/completion/ci-coverage-proof.json` from the checkout, require
