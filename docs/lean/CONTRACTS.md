@@ -96,44 +96,70 @@ diagnostics, `eventRowsForStorage` binding by the pair (unknown install fails cl
 on the wire, both keys allowlisted through the seal, the scope cleared by a re-join and a transition with the new install's 0
 accepted, and a pre-re-join row keeping its pair while the batch echoes the current install's version.
 
-## C2. S1b runway: G per host, one G, G remaining (blocker 2 and should-fix 5; B1 and B10a collector)
+## C2. S1b runway: G per host, one G, G owed (review-r6 blocker 2 and should-fix 5; review-r1 blocker 2 and should-fix 5; B1 and B10a collector)
 
-**The defect.** `G_host = usage_rows × 1,632 B + raw_rows × 309 B` embeds Studio1's session, day and segment density in the
+**The defect (review r6).** `G_host = usage_rows × 1,632 B + raw_rows × 309 B` embeds Studio1's session, day and segment density in the
 1,632 B. At 333 sessions per 1,000 usage rows the same row widths need 507 MB against a 457 MB gate, and a host exactly at
 the 63-day start threshold has 58.06 real days. The multiplier used the unfactored `G_host` while the numerator used `1.25 ×
 G_host`, and the continuous runway kept subtracting full G after conversion had already consumed part of it.
 
+**The defect (review r1).** Round 7's rule 3, `G_remaining = max(0, G_gate − new_table_bytes_now)`, subtracted **every** page of the
+lean tables. S2 dual-write precedes S3 conversion (MIGRATION.md §2), so the live writer's bytes were counted as conversion progress,
+and the one-time census omitted rows admitted after it, which still need converting. Both overstate the runway: on Studio4's census
+by 0.39-2.56 days in the reviewer's scenarios, and the rule showed 5.0 d where the truth was 2.45 d and the 2.0 d abort point where
+the truth was −0.55 d (`input/review-r1/checks/review_c2_runway.log`). The round-7 fixture could not see it: its "true runway" was
+the rule's own `G − C`.
+
 **Evidence that the mix is host-specific.** A read-only census on a `VACUUM INTO` copy of this host's (Studio4's) ledger
-(`checks/host_cardinality_census.py`, `checks/studio4-cardinality-census.json`, 2026-09-25 14:21 MDT, 2.4 s on the copy): 79,259
+(`fixtures/host_cardinality_census.py`, `checks/studio4-cardinality-census.json`, 2026-09-25 14:21 MDT, 2.4 s on the copy): 79,259
 usage rows, 352,885 raw rows (3.45 activity rows per usage row; Studio1 has 0.61), 5,141 sessions (64.9 per 1,000 usage rows;
 Studio1 47), 5,654 session-day rows, 455 rollup buckets, 34 day targets, raw table 833 MB, ledger 1,504 MB. Round 6 assumed
 174,820 usage rows and 281,249 raw rows for Studio4 by scaling Studio1's counts by ledger size: more than double the real
-usage count and a fifth of the real activity ratio. Scaling is not measuring.
+usage count and a fifth of the real activity ratio. Scaling is not measuring. (The census was not re-run in round 8; Studio4's
+segment proxy is therefore unmeasured and the fixture falls back to the 1.2 × sessions geometry for it.)
 
 **The rule.**
 
 1. **G from counted cardinalities.** `G_host = usage_rows × (F + T) + sessions × S + session_day_rows × SD + (model_day_rows +
-   activity_day_rows) × DR + rollup_buckets × RB + (1.2 × sessions + rollup_buckets + day_targets) × SEG + raw_rows × I`, with the
+   activity_day_rows) × DR + rollup_buckets × RB + (segments + rollup_buckets + day_targets) × SEG + raw_rows × I`, with the
    round-5 row widths (`F` 1,050, `T` 364, `S` 1,300, `SD` 390, `DR` 390, `RB` 400, `SEG` 830, `I` 309 bytes, estimates from
-   column widths) and **every cardinality counted on the host itself**: on a light host by B1's one-time read-only census on a
-   `VACUUM INTO` copy of the ledger (the query in `checks/host_cardinality_census.py`; 2.4 s on Studio4's copy; never a scan on
-   Studio0), on a busy host and on Studio0 by the converted copy's measured peak (unchanged). A host whose counts were scaled from
-   another host, or not counted, has **no gate value** and cannot start a hold. The 1.25 factor covers the **row widths** until
-   S2 has measured them on a copy; it no longer covers the mix, which is measured.
+   column widths) and **every cardinality counted on the host itself**: on a light host by B1's read-only census on a `VACUUM INTO`
+   copy of the ledger (the query in `fixtures/host_cardinality_census.py`; 2.4 s on Studio4's copy; never a scan on Studio0), on a
+   busy host and on Studio0 by the converted copy's measured peak (unchanged). `segments = max(1.2 × sessions, segment_proxy)`, where
+   `segment_proxy` is the census's count of sessions split at 7 days (Σ over sessions of `1 + ⌊span_days / 7⌋`); the terminal-pause
+   splits it does not count are declared covered by the 1.25 factor (the whole segment term is 2.3% of G on Studio4; a 2× error
+   in it is inside the 25%). A host whose counts were scaled from another host, or not counted, has **no gate value** and cannot
+   start a hold. **The census obligation (round 8):** the census is taken **after the catch-up** (S1b (b)), **at most one day before
+   the S1b decision**, and **re-taken before S3** (its counts are the conversion's denominator); it gives no gate value otherwise.
+   The `VACUUM INTO` copy is made only when free space on the volume is at least the ledger's bytes plus the reserve (the copy is a
+   full live-page copy), and it is deleted after the count. The 1.25 factor covers the **row widths** until S2 has measured them on
+   a copy; it no longer covers the mix, which is measured.
 2. **One G.** `G_gate = 1.25 × G_host` (or the copy's measured peak) is subtracted in the runway numerator **and** sizes the
-   multiplier: `g_host = G_gate / raw_bytes`, `hold_growth_per_day = p95_7d(gross growth) × (1 + g_host × raw_share)`.
-3. **G remaining.** While conversion runs, `G_remaining = max(0, G_gate − new_table_bytes_now)` where `new_table_bytes_now` is the
-   bytes the lean tables occupy (their pages, from the daily `dbstat` sample on light hosts or the converter's own page counter
-   elsewhere); `runway_days = (free_disk − reserve − G_remaining − rebuild_headroom) / hold_growth_per_day`. Bytes the converter
-   has already written are in `free_disk` and are never subtracted twice; after S3 completes `G_remaining = 0`. The abort
-   ladder's rungs read this runway. A `/status` field `runway.g = {gate, remaining, basis: census | copy_peak}` discloses both.
-4. **Preflight receipt.** The S1b receipt records the census (counts, when, on which copy), `G_gate`, its basis, the measured
-   conversion size and abort peak where a copy exists, and the runway series.
+   multiplier: `g_gate = G_gate / raw_bytes_at_census`, `hold_growth_per_day = p95_7d(gross growth) × (1 + g_gate × raw_share)`.
+3. **G owed (round 8).** While conversion runs,
+   `G_owed = max(0, G_gate − C_conv) + g_gate × U`,
+   where `C_conv` is the bytes the **converter itself has written** for census-era history (its own counter, carried in its
+   checkpoint; never a page count of the lean tables, which from S2 on also holds the live writer's rows) and `U` is the bytes of
+   the raw rows admitted **after the census** that no lean row covers yet (neither converted nor dual-written; rows admitted after
+   S2 are dual-written at admission and are growth, already in `free_disk` and in the multiplier, not conversion work). `G_owed = 0`
+   once every census-era and post-census row is folded. `runway_days = (free_disk − reserve − G_owed − rebuild_headroom) /
+   hold_growth_per_day`. The abort ladder's rungs read this runway. A `/status` field `runway.g = {gate, owed, converterWritten,
+   unfoldedRawBytes, leanTableBytes, basis: census | copy_peak}` discloses the terms; `leanTableBytes` is disclosure only.
+   **What this guarantees** (`fixtures/s1b_runway_host_bound.py`, round 8, whose truth is a byte-level simulation of the ledger that
+   never calls the rule): with true widths at or below 1.25 × the estimates the published runway never exceeds the true runway in
+   any of the reviewer's dual-write and post-census scenarios, no rung fires later than the truth, and the only conservatism is the
+   1.25 allowance itself (0.25 × the census-era G until completion plus 0.25 × the post-census owed bytes); with widths above 1.25 ×
+   the estimates the rule overstates, which is why the **numbers** stay open until S2 measures the widths (FREEZE.md).
+4. **Preflight receipt.** The S1b receipt records the census (counts, the segment proxy, when, on which copy, the free space at the
+   copy, that it followed the catch-up), `G_gate`, its basis, the measured conversion size and abort peak where a copy exists, and
+   the runway series.
 
-**Tests.** Collector `tests/contracts/lean/runway.contract.ts` (B1, B10a): the reviewer's 333-session counterexample (the gate's
-G bounds the host's real need; at the gate's 63-day threshold the host really has ≥ 63 days), the Studio4 census as a second
-host, an unmeasured host has no gate value, the multiplier uses `G_gate`, G remaining mid-conversion and the < 5-day rung, and the
-round-6 `s1b_runway_geometry.py` assertions. Fixture: `fixtures/s1b_runway_host_bound.py`.
+**Tests.** Collector `tests/contracts/lean/runway.contract.ts` (B1, B10a; 5 cases): the reviewer's 333-session counterexample (the
+gate's G bounds the host's real need; the segment proxy raises G; an unmeasured host has no gate value), at the gate's 63-day
+threshold the host really has ≥ 63 days with the multiplier on `G_gate`, G owed against an independent simulation (dual-write pages
+ignored, the two terms, never overstating in the six reviewer scenarios, the 5-day and 2-day rungs never late, 0 at completion),
+the round-6 `s1b_runway_geometry.py` assertion, and `censusPreflight` (after the catch-up, at most a day old, room for the copy).
+Fixture: `fixtures/s1b_runway_host_bound.py` (19 checks: r6 9/19, r7 9/19, r8 19/19).
 
 ## C3. `conversion_rejects` DDL (b0Carries 3a; B2a collector)
 
@@ -235,7 +261,12 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   earlier installs' stamps do not raise it) and the pair on every event's metadata; `packages/shared/src/schemas.ts`:
   `aiWorkIngestBatchSchema` accepts it; `analytical-metadata.ts`: `metadataKeyDisposition("actorBindingVersion")` and
   `("actorBindingInstall")` are identifiers; `outbound-envelope.ts`: `sealOutboundEnvelope` keeps both. (B2a)
-- `packages/collector-cli/src/lean/runway.ts`: `LEAN_ROW_WIDTHS`, `estimateHostG(census)`, `holdRunway(input)`. (B1, B10a; C2)
+- `packages/collector-cli/src/lean/runway.ts`: `LEAN_ROW_WIDTHS`; `estimateHostG(census)` (with the optional `segmentProxy`;
+  `null` for an unmeasured census); `holdRunway({ freeBytes, reserveBytes, rebuildHeadroomBytes, gGateBytes, rawBytesAtCensus,
+  converterWrittenBytes, rawUnfoldedBytesSinceCensus, conversionComplete, leanTableBytesNow?, grossGrowthP95PerDay, rawBytes,
+  ledgerBytes })` → `{ runwayDays, gOwedBytes, holdGrowthPerDay, rung ∈ none | converter_paused | release_acked_only | abort }`;
+  `censusPreflight({ censusAtMs, catchUpCompleteAtMs, decisionAtMs, freeBytes, ledgerBytes, reserveBytes })` → `{ ok, reasons ⊆
+  {census_before_catchup, census_stale, no_space_for_vacuum_into} }`. (B1, B10a; C2)
 - `packages/collector-cli/src/lean/day-key.ts`: `utcDayOf`, `censusClass`, `dashboardWindowSince`; `DASHBOARD_SCHEMA_VERSION = 3`. (B5)
 - `packages/collector-cli/src/lean/converter.ts`: `convertLedgerHistory(buffer, options)`. (B2a; C3)
 - `packages/collector-cli/src/lean/capture-gaps.ts`: `declareUnresolvedFileGap`, `resolveCaptureGap`, `coverageCompleteForPeriod`. (B22; C5)
