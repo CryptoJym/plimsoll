@@ -2,6 +2,7 @@
 // filesystem baseline, 20 roots, 248 excluded files, SQLite and maintenance.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -260,9 +261,16 @@ async function main() {
   const proofs = [];
   for (const source of ["codex", "claude_code"] as const) proofs.push(await prove(source));
   const catchupPassed = await runUncoveredCatchupCase();
-  const passed = proofs.every(p => p.passed) && catchupPassed;
+  const repo = path.resolve(import.meta.dirname, "..");
+  const claimRun = spawnSync(process.execPath, [path.join(repo, "node_modules/tsx/dist/cli.mjs"),
+    "scripts/lib/oversized-loss-claim-case.mts"], {cwd:repo,env:process.env,encoding:"utf8",timeout:180_000,maxBuffer:1024*1024});
+  assert.equal(claimRun.status,0,`oversized claim case: ${(claimRun.stderr || claimRun.stdout).slice(-1000)}`);
+  const lossClaim = JSON.parse(claimRun.stdout) as {passed:boolean;receipts:Array<{usagePossible:number}>;gaps:unknown[]};
+  const lossClaimPassed = lossClaim.passed === true && lossClaim.receipts.length === 3 &&
+    lossClaim.receipts.every(row => row.usagePossible === 1) && lossClaim.gaps.length > 0;
+  const passed = proofs.every(p => p.passed) && catchupPassed && lossClaimPassed;
   console.log(JSON.stringify({ schema: "plimsoll.automatic-revisit-proof.v1", syntheticOnly: true, proofs,
-    uncoveredCatchupPassed:catchupPassed, passed }, null, 2));
+    uncoveredCatchupPassed:catchupPassed, lossClaimPassed, passed }, null, 2));
   if (!passed) process.exitCode = 1;
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

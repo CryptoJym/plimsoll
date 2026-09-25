@@ -23,7 +23,7 @@ type Binding = { provider: Provider; cursorKey: string; fileKey: string; root: s
 type Envelope = { sha256?: string; version: 1; rollbackVersion: "0.7.4"; binding: Binding; priorCursor: string; ancestors: string; snapshot: Snapshot;
  parser: string; prefix: Fingerprint; verification: { snapshot: Snapshot; prefix: Fingerprint } | null;
  reason: string | null; skip?: { reason: string; offset: number; ended: boolean; classified: boolean;
-   kind: CaptureSkippedRecord["kind"]; usagePossible: boolean } };
+   kind: CaptureSkippedRecord["kind"]; usagePossible: boolean; fingerprint?: string } };
 export type ContinuationProposal = {
  action: "checkpoint" | "complete" | "park"; reason: string | null; requiredMinimumBytes: number | null;
  scanBytesAdvanced: number; prefixBytesRead: number;
@@ -83,9 +83,11 @@ function decode(raw: string): Envelope {
  if (p.provider !== e.binding.provider || e.prefix.start !== p.recordStart ||
    (e.skip ? e.prefix.end !== e.skip.offset || p.scanOffset > e.skip.offset : e.prefix.end !== p.scanOffset) ||
    e.prefix.end > e.snapshot.size) throw new Error("parser_fingerprint_mismatch");
- if (e.skip !== undefined && (!exact(e.skip,["reason","offset","ended","classified","kind","usagePossible"]) ||
+ if (e.skip !== undefined && (!exact(e.skip,["reason","offset","ended","classified","kind","usagePossible",
+   ...(e.skip.fingerprint === undefined ? [] : ["fingerprint"])]) ||
    !REFUSALS.has(e.skip.reason) || !safe(e.skip.offset) || typeof e.skip.ended !== "boolean" ||
    typeof e.skip.classified !== "boolean" || typeof e.skip.usagePossible !== "boolean" ||
+   (e.skip.fingerprint !== undefined && (typeof e.skip.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(e.skip.fingerprint))) ||
    !["codex_token_count","codex_non_usage","claude_assistant","claude_non_usage","unknown"].includes(e.skip.kind))) throw new Error("invalid_skip_state");
  if (e.verification !== null) {
    if (!exact(e.verification, ["snapshot", "prefix"]) || !validSnapshot(e.verification.snapshot)) throw new Error("invalid_verification");
@@ -355,10 +357,16 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
    const parser = restore(envelope.parser);
    if (envelope.skip) {
      const skip = envelope.skip;
-     if (!skip.classified) {
+     if (!skip.classified || !skip.fingerprint) {
        const length = Math.min(2048, current.size - parser.recordStart);
        if (maxBytes - bytesRead < length) return result("checkpoint");
-       Object.assign(skip, classifySkippedRecord(options.provider, readAt(parser.recordStart, length)));
+       const prefix = readAt(parser.recordStart, length);
+       // A sealed continuation from the previous classifier has no prefix
+       // fingerprint and may have trusted a nested type. Reclassify it before
+       // recording a loss. A cut enrollment fragment is always uncertain.
+       if (skip.reason !== "enrollment_boundary_fragment")
+         Object.assign(skip, classifySkippedRecord(options.provider, prefix));
+       skip.fingerprint = sha(prefix);
        skip.classified = true;
      }
      if (!skip.ended && skip.offset < current.size) {
@@ -391,7 +399,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      completed.headBytes = headBytes; completed.headHash = headHash;
      completed.continuityBytes = continuityBytes; completed.continuityHash = continuityHash;
      completed.skippedRecord = {offset: parser.recordStart, bytes: skippedBytes, reason: skip.reason,
-       kind: skip.kind, usagePossible: skip.usagePossible};
+       kind: skip.kind, usagePossible: skip.usagePossible, fingerprint: skip.fingerprint!};
      return completed;
    }
    // One admitted parser read, leaving enough allowance for its old partial
