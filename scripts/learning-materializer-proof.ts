@@ -287,18 +287,33 @@ function buildLedger(
       }
       if (options.injectRetrospectiveExposure && seed.index === 1 && side === "control") {
         // Hostile direct write bypassing the guarded store: the stored fact
-        // claims exposure AFTER the episode had already started.
+        // claims exposure AFTER the episode had already started. Every field is
+        // schema-valid, so the store's raw-row verification keeps it and only
+        // the materializer's timing check can exclude it.
+        const late = buildTechniqueExposureFact({
+          episodeId: episode.episodeId,
+          techniqueId: "late-injection",
+          techniqueVersion: "0.0.1",
+          assignmentId: `assignment-${seed.index}`,
+          workClass: "implementation",
+          complexityBand: "medium",
+          exposedAt: "2026-08-20T15:00:00.000Z",
+          mode: "control",
+        });
         db.prepare(
           `insert into technique_exposure_facts
              (exposure_id, episode_id, technique_id, technique_version, content_digest,
               assignment_id, work_class, complexity_band, exposed_at, mode, assertion, created_at)
-           values (?, ?, 'late-injection', '0.0.1', NULL, ?, 'implementation', 'medium',
-                   '2026-08-20T15:00:00.000Z', ?, 'exposure_only', '2026-08-20T15:00:00.000Z')`,
+           values (?, ?, ?, ?, NULL, ?, 'implementation', 'medium', ?, ?, 'exposure_only', ?)`,
         ).run(
-          sha256Text(`retrospective-${seed.index}-${side}`),
-          episode.episodeId,
-          `assignment-${seed.index}`,
-          "control",
+          late.exposureId,
+          late.episodeId,
+          late.techniqueId,
+          late.techniqueVersion,
+          late.assignmentId,
+          late.exposedAt,
+          late.mode,
+          late.exposedAt,
         );
       }
       if (options.unresolvedAttemptForPairIndex === seed.index && side === "control") {
