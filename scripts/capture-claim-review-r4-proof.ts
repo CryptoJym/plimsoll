@@ -43,6 +43,10 @@ import { TranscriptTailer } from "../packages/collector-cli/src/transcript-taile
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
 
+// maintenance.ts checkCaptureCoverage steps one coverage walk per source in a
+// turn: codex, claude_code and grok.
+const COVERAGE_SOURCES = 3;
+
 const completion = createProofCompletion("capture-claim-review-r4", 6);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
 const check = (name: string, passed: boolean, detail: Record<string, unknown>) => {
@@ -318,24 +322,38 @@ async function r3n4() {
   const grok = grokModule ? new grokModule.GrokUsageTailer(buffer, grokHome) : undefined;
   const checks = maintenanceFor(buffer, world.rollout, world.transcript, { captureCoverageIntervalMs: 0 }, grok);
   const turns: number[] = [];
+  const rowsPerTurn: number[] = [];
+  // The table appears with the first coverage check; before it, no rows.
+  const uncoveredRows = () =>
+    buffer.database.prepare(`select 1 from sqlite_master where type = 'table' and name = 'capture_uncovered_files'`).get()
+      ? (buffer.database.prepare(`select count(*) as n from capture_uncovered_files`).get() as { n: number }).n
+      : 0;
   let frontier: { capturedThrough: string | null } | null = null;
   for (let turn = 0; turn < 400; turn += 1) {
     const started = performance.now();
+    const before = uncoveredRows();
     coverageTurn(checks);
     turns.push(Number((performance.now() - started).toFixed(1)));
+    rowsPerTurn.push(uncoveredRows() - before);
     frontier = captureFrontier(buffer.database);
     if (frontier?.capturedThrough) break;
   }
-  const rows = (buffer.database.prepare(`select count(*) as n from capture_uncovered_files`).get() as { n: number }).n;
+  const rows = uncoveredRows();
   const unreadFiles = 2 * Math.floor(perSource / 2) + grokSessions;
   const maxTurnMs = Math.max(...turns);
-  const minimumResumableTurns = Math.ceil(unreadFiles / CAPTURE_COVERAGE_MAX_WORK_PER_TURN);
+  // One coverage turn steps each source's walk once (maintenance.ts
+  // checkCaptureCoverage), each capped at CAPTURE_COVERAGE_MAX_WORK_PER_TURN.
+  const perTurnWorkCap = COVERAGE_SOURCES * CAPTURE_COVERAGE_MAX_WORK_PER_TURN;
+  const minimumResumableTurns = Math.ceil(unreadFiles / perTurnWorkCap);
+  const maxRowsPerTurn = Math.max(...rowsPerTurn);
   checks.close();
   buffer.close();
   fs.rmSync(base, { recursive: true, force: true });
   check("R3_N4_large_tree_walk_uses_resumable_work_budgets_and_completes",
-    frontier?.capturedThrough != null && rows === unreadFiles && turns.length >= minimumResumableTurns,
+    frontier?.capturedThrough != null && rows === unreadFiles && turns.length >= minimumResumableTurns &&
+      maxRowsPerTurn <= perTurnWorkCap,
     { filesPerSource: perSource, grokSessions, buildSeconds, turns: turns.length, minimumResumableTurns,
+      maxRowsPerTurn, perTurnWorkCap,
       maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, maxTurnMs,
       totalMs: Number(turns.reduce((total, ms) => total + ms, 0).toFixed(1)), uncoveredRows: rows, unreadFiles,
       frontier: frontier?.capturedThrough ?? null });

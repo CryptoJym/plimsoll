@@ -33,6 +33,10 @@ import { TranscriptTailer } from "../packages/collector-cli/src/transcript-taile
 import { grokUsageDocument } from "./lib/grok-usage-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 
+// maintenance.ts checkCaptureCoverage steps one coverage walk per source in a
+// turn: codex, claude_code and grok.
+const COVERAGE_SOURCES = 3;
+
 const completion = createProofCompletion("capture-claim-review-r5", 7);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
 const check = (name: string, passed: boolean, detail: Record<string, unknown>) => {
@@ -289,22 +293,37 @@ async function manyLinks() {
   }
   const buildSeconds = Number(((performance.now() - built) / 1000).toFixed(1));
   const turns: number[] = [];
+  const rowsPerTurn: number[] = [];
+  // The table appears with the first coverage check; before it, no rows.
+  const uncoveredRows = () =>
+    scene.buffer.database.prepare(`select 1 from sqlite_master where type = 'table' and name = 'capture_uncovered_files'`).get()
+      ? (scene.buffer.database.prepare(`select count(*) as n from capture_uncovered_files`).get() as { n: number }).n
+      : 0;
   let frontier: { capturedThrough: string | null } | null = null;
   for (let turn = 0; turn < 400; turn += 1) {
     const started = performance.now();
+    const before = uncoveredRows();
     scene.turn();
     turns.push(Number((performance.now() - started).toFixed(1)));
+    rowsPerTurn.push(uncoveredRows() - before);
     frontier = captureFrontier(scene.buffer.database);
     if (frontier?.capturedThrough) break;
   }
-  const rows = (scene.buffer.database.prepare(`select count(*) as n from capture_uncovered_files`).get() as { n: number }).n;
+  const rows = uncoveredRows();
   const maxTurnMs = Math.max(...turns);
   const expectedRows = 3 * perSource;
-  const minimumResumableTurns = Math.ceil(expectedRows / CAPTURE_COVERAGE_MAX_WORK_PER_TURN);
+  // One coverage turn steps each source's walk once (maintenance.ts
+  // checkCaptureCoverage: codex, claude_code, grok), and each step stops at
+  // CAPTURE_COVERAGE_MAX_WORK_PER_TURN. So a turn records at most three
+  // budgets of rows on any host, and the walk needs at least that many turns.
+  const perTurnWorkCap = COVERAGE_SOURCES * CAPTURE_COVERAGE_MAX_WORK_PER_TURN;
+  const minimumResumableTurns = Math.ceil(expectedRows / perTurnWorkCap);
+  const maxRowsPerTurn = Math.max(...rowsPerTurn);
   scene.close();
   check("R4_S1_walk_records_60000_links_with_resumable_work_budgets",
-    frontier?.capturedThrough != null && rows === expectedRows && turns.length >= minimumResumableTurns,
-    { linksPerSource: perSource, buildSeconds, turns: turns.length, minimumResumableTurns,
+    frontier?.capturedThrough != null && rows === expectedRows && turns.length >= minimumResumableTurns &&
+      maxRowsPerTurn <= perTurnWorkCap,
+    { linksPerSource: perSource, buildSeconds, turns: turns.length, minimumResumableTurns, maxRowsPerTurn, perTurnWorkCap,
       maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, maxTurnMs,
       totalMs: Number(turns.reduce((total, ms) => total + ms, 0).toFixed(1)), uncoveredRows: rows,
       frontier: frontier?.capturedThrough ?? null });
