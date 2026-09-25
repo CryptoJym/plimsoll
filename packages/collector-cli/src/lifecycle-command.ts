@@ -191,7 +191,7 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
         : `the next prune --apply attempts to restore ${pending.wouldRestore.length} recorded item(s) and refuses if they are incomplete or unusable. Use 0.7.41 or later.`));
   } else if (inventory.pendingRemoval.length > 0) {
     lines.push("", `Interrupted removal pending: ${inventory.pendingRemoval.length} item(s), ${formatBytes(inventory.bytes.pendingRemoval)}; ` +
-      "the next prune --apply or completed update finishes it.");
+      "the next 0.7.41 or later prune --apply or completed update finishes it; 0.7.38–0.7.40 skip retention.");
   }
   lines.push("");
   const unknown = inventory.snapshots.filter((row) => row.reason === "operation_unknown" || row.reason === "receipt_without_sequence");

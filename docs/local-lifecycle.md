@@ -49,11 +49,14 @@ an update or rollback run by one of them (for example `npx -y
 order cannot be proved, and retention stops until `snapshots reconcile`
 (0.7.41 and later) repairs it.
 
-After a `needed_restore_*` prune refusal, use only 0.7.41 or later for
-prunes and updates. The pending removal record needs 0.7.41's way-back
-rule; 0.7.38–0.7.40 reject that record and remove nothing. A 0.7.41
-prune retries the restore, and a completed 0.7.41 update can create a
-new way back before finishing the pending removal.
+After any interrupted 0.7.41 prune or update retention, use 0.7.41 or
+later for prunes and updates. Every removal record written by 0.7.41 is
+unreadable to 0.7.38–0.7.40: their prunes remove nothing, and their updates
+and rollbacks skip all retention until a 0.7.41+ prune or completed update
+finishes the record. On a host with only an older CLI available, install or
+run 0.7.41 or later and use `lifecycle snapshots prune --apply` to finish or
+restore the recorded removal. This also applies after a `needed_restore_*`
+prune refusal; a completed 0.7.41+ update can create a new way back first.
 
 To return to an older runtime explicitly, run that release's own
 `lifecycle rollback --operation-id <id> --artifact self`. A CLI installs
