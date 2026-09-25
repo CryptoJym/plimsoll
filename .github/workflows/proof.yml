@@ -47,8 +47,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prove every proof script runs in CI or is reviewed local-only (eco-6hoxj.163.23)
-        # Run with node, not pnpm, so no pnpm setting can turn the gate itself into a no-op.
-        run: node ./node_modules/tsx/dist/cli.mjs ./scripts/ci-coverage-proof.ts
+        # Run through the isolated proof wrapper, not pnpm, so pnpm config cannot skip the gate.
+        run: node ./node_modules/tsx/dist/cli.mjs scripts/run-proof.ts scripts/ci-coverage-proof.ts
 
       - name: Typecheck
         id: typecheck
@@ -90,6 +90,9 @@ jobs:
           pnpm proof:finance-export
           pnpm proof:finance-projection
           pnpm proof:delivery
+          pnpm proof:loopback-proxy
+          pnpm proof:managed-curl-proxy
+          pnpm proof:direct-loopback-timeout
           pnpm proof:capture-claim
           pnpm proof:capture-claim-review
           pnpm proof:capture-claim-review-r4
@@ -209,6 +212,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-data-safety
 
+      - name: Prove no lifecycle command removes a receipt and staging never changes an existing runtime (eco-6hoxj.163.49/.50)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-preservation
+
       - name: Prove bounded nonblocking Git metadata maintenance
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:git-context
@@ -241,6 +248,13 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:grok-usage
 
+      - name: Prove busy-host capture progress, the admission ceiling and a lossless Grok walk (eco-6hoxj.163.42)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:busy-host-capture
+          pnpm proof:grok-worker-replacement
+          pnpm proof:grok-starvation -- --expect=green
+
       - name: Prove maintenance lock conflict rolls back for retry
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sqlite-lock
@@ -257,6 +271,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-daemon
 
+      - name: Prove incremental session summary exactness and race fences (eco-6hoxj.163.41)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-incremental
+
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
@@ -265,11 +283,24 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:studio0-writer-contention
 
-      - name: Prove session-inherited project attribution and its upload-path bound (eco-6hoxj.163.9)
+      - name: Prove collector main-thread turns stay under budget on a Studio0-shaped session (eco-6hoxj.163.24)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:studio0-main-thread-turns
+
+      - name: Prove the ledger WAL stays bounded without maintenance and its checkpoint worker is watched (eco-6hoxj.163.24)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:wal-checkpoint-bound
+
+      - name: Prove sliced upload leases survive clock steps and failures between slices (eco-6hoxj.163.24)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:upload-lease-slices
+
+      - name: Prove session-inherited project attribution, its upload-path bound and its capture-time context index (eco-6hoxj.163.9, eco-6hoxj.163.21)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
           pnpm proof:session-attribution
           pnpm proof:session-attribution-bounded
+          pnpm proof:session-context-index
 
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -364,6 +395,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:learning-facts
 
+      - name: Prove bounded learning-fact capacity, retention, and migration
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:learning-facts-capacity
+
       - name: Prove runtime capture promotes bounded learning facts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:runtime-facts
@@ -454,6 +489,10 @@ jobs:
       - name: Run strict isolated resource proof
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/index.ts --require-integrated --receipt evidence/resource-proof.json
+
+      - name: Prove resource observer concurrency isolation
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/concurrency-proof.ts
 
       - name: Prove finalized privacy failures fail closed
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

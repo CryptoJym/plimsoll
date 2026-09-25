@@ -16,6 +16,7 @@ import {
 } from "../../packages/collector-cli/src/learning-facts";
 import {
   SYSTEM_E2E_BUDGETS,
+  SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS,
   SYSTEM_E2E_SCHEMA,
   digest,
   exactKeys,
@@ -125,7 +126,7 @@ function verifyMeasurements(
     "measurements",
   );
   const wallMs = nonnegative(measurements.wallMs, "wall measurement");
-  assert.ok(wallMs <= SYSTEM_E2E_BUDGETS.wallMs, "wall budget exceeded");
+  assert.ok(wallMs > 0 && wallMs <= SYSTEM_E2E_BUDGETS.wallMs, "wall budget exceeded");
 
   const cpu = object(measurements.cpu, "cpu measurements");
   exactKeys(cpu, ["childMs", "controllerMs", "totalMs"], "cpu measurements");
@@ -245,18 +246,97 @@ function verifyMeasurements(
   assert.equal(margins.capturedOutputBytes, SYSTEM_E2E_BUDGETS.capturedOutputBytes - outputBytes, "output budget margin mismatch");
 
   const idle = object(measurements.idle, "idle measurements");
-  exactKeys(idle, ["rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs"], "idle measurements");
+  exactKeys(idle, [
+    "rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs",
+    "filesystemEntriesScanned", "filesystemEnumerationCalls",
+    "startupFilesystemEntriesScanned", "startupFilesystemEnumerationCalls",
+    "baselineFilesystemEntriesScanned", "baselineFilesystemEnumerationCalls",
+    "setupFilesystemEntriesScanned", "setupFilesystemEnumerationCalls",
+    "unchangedFilesystemEntriesScanned", "unchangedFilesystemEnumerationCalls",
+    "filesystemEnumerationFailedCalls", "filesystemEnumerationReadFailures",
+    "stableSweepCursorReset",
+  ], "idle measurements");
   assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 2);
   assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
   assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_610);
   assert.equal(integer(idle.filesOpened, "history files opened"), 2_614);
   assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
   assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
-  const firstBootScenario = resourceScenarios
+  // Directory enumeration: the same invariants system-e2e-proof.ts checks before it writes the receipt.
+  const idleEntries = integer(idle.filesystemEntriesScanned, "idle filesystem entries scanned");
+  const idleCalls = integer(idle.filesystemEnumerationCalls, "idle filesystem enumeration calls");
+  const setupEntries = integer(idle.setupFilesystemEntriesScanned, "idle setup entries scanned");
+  const setupCalls = integer(idle.setupFilesystemEnumerationCalls, "idle setup enumeration calls");
+  const unchangedEntries = integer(idle.unchangedFilesystemEntriesScanned, "idle unchanged entries scanned");
+  const unchangedCalls = integer(idle.unchangedFilesystemEnumerationCalls, "idle unchanged enumeration calls");
+  assert.equal(
+    setupEntries,
+    integer(idle.startupFilesystemEntriesScanned, "idle startup entries scanned") +
+      integer(idle.baselineFilesystemEntriesScanned, "idle baseline entries scanned"),
+    "idle setup entries are not startup plus baseline",
+  );
+  assert.equal(
+    setupCalls,
+    integer(idle.startupFilesystemEnumerationCalls, "idle startup enumeration calls") +
+      integer(idle.baselineFilesystemEnumerationCalls, "idle baseline enumeration calls"),
+    "idle setup enumeration calls are not startup plus baseline",
+  );
+  assert.equal(setupEntries + unchangedEntries, idleEntries, "idle entries scanned are not setup plus unchanged");
+  assert.equal(setupCalls + unchangedCalls, idleCalls, "idle enumeration calls are not setup plus unchanged");
+  assert.ok(setupEntries > 0 && unchangedEntries > 0 && unchangedCalls > 0, "idle directory enumeration was not observed");
+  assert.ok(idleEntries >= idleCalls, "idle enumeration calls exceed entries scanned");
+  const ceilings = SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS;
+  assert.ok(idleEntries <= ceilings.entriesScanned, "idle entries scanned exceed the fixture ceiling");
+  assert.ok(setupEntries <= ceilings.setupEntriesScanned, "idle setup entries exceed the fixture ceiling");
+  assert.ok(unchangedEntries <= ceilings.unchangedEntriesScanned, "idle unchanged entries exceed the fixture ceiling");
+  assert.ok(idleCalls <= ceilings.enumerationCalls, "idle enumeration calls exceed the fixture ceiling");
+  assert.ok(unchangedCalls <= ceilings.unchangedEnumerationCalls, "idle unchanged enumeration calls exceed the fixture ceiling");
+  const failedCalls = integer(idle.filesystemEnumerationFailedCalls, "idle failed enumeration calls");
+  const readFailures = integer(idle.filesystemEnumerationReadFailures, "idle enumeration read failures");
+  assert.equal(idle.stableSweepCursorReset, true, "idle stable sweep cursor was not reset");
+  // The projection must equal the pinned resource artifact it came from. That artifact normalizes only
+  // the startup/baseline split as volatile, so the split is checked by its sum above.
+  const idleScenario = resourceScenarios
     .map((entry, index) => object(entry, `resource scenario ${index}`))
     .find((scenario) => scenario.id === "no_change_constant_work");
-  assert.ok(firstBootScenario, "first-boot resource scenario missing");
-  const firstBoot = object(firstBootScenario.measurements, "first-boot measurements");
+  assert.ok(idleScenario, "idle resource scenario missing");
+  const idleArtifactCounters = object(idleScenario.counters, "idle resource counters");
+  const idleArtifact = object(idleScenario.measurements, "idle resource measurements");
+  const pinned = (value: unknown, label: string) => integer(value, `idle resource ${label}`);
+  for (const [label, projected, artifact] of [
+    ["entries scanned", idleEntries, pinned(idleArtifactCounters.filesystemEntriesScanned, "entries scanned")],
+    ["enumeration calls", idleCalls, pinned(idleArtifact.filesystemEnumerationCalls, "enumeration calls")],
+    ["setup entries", setupEntries, pinned(idleArtifact.setupFilesystemEntriesScanned, "setup entries")],
+    ["setup enumeration calls", setupCalls, pinned(idleArtifact.setupFilesystemEnumerationCalls, "setup enumeration calls")],
+    ["unchanged entries", unchangedEntries, pinned(idleArtifact.unchangedFilesystemEntriesScanned, "unchanged entries")],
+    ["unchanged enumeration calls", unchangedCalls, pinned(idleArtifact.unchangedFilesystemEnumerationCalls, "unchanged enumeration calls")],
+    ["failed enumeration calls", failedCalls, pinned(idleArtifact.filesystemEnumerationFailedCalls, "failed enumeration calls")],
+    ["enumeration read failures", readFailures, pinned(idleArtifact.filesystemEnumerationReadFailures, "enumeration read failures")],
+  ] as const) {
+    assert.equal(projected, artifact, `idle ${label} disagree with the resource artifact`);
+  }
+  assert.equal(idleArtifact.stableSweepCursorReset, true, "idle resource stable sweep cursor was not reset");
+  // The artifact's own exact fixture topology.
+  assert.equal(setupEntries, pinned(idleArtifact.expectedSetupFilesystemEntriesScanned, "expected setup entries"), "idle setup entries differ from the fixture topology");
+  assert.equal(setupCalls, pinned(idleArtifact.expectedSetupFilesystemEnumerationCalls, "expected setup calls"), "idle setup enumeration calls differ from the fixture topology");
+  assert.equal(unchangedEntries, pinned(idleArtifact.expectedStableDirectoryEntries, "expected stable entries"), "idle unchanged entries differ from the fixture topology");
+  assert.equal(unchangedCalls, pinned(idleArtifact.expectedStableEnumerationCalls, "expected stable calls"), "idle unchanged enumeration calls differ from the fixture topology");
+  // The history projection also comes from that scenario's counters.
+  for (const [label, projected, counter] of [
+    ["raw event writes", idle.rawEventWrites, "rawEventWrites"],
+    ["raw event rewrites", idle.rawEventRewrites, "rawEventRewrites"],
+    ["files opened", idle.filesOpened, "filesOpened"],
+    ["file bytes read", idle.fileBytesRead, "fileBytesRead"],
+    ["full history file reads", idle.fullHistoryFileReads, "fullHistoryFileReads"],
+    ["overlapping jobs", idle.overlappingJobs, "overlappingJobs"],
+  ] as const) {
+    assert.equal(
+      integer(projected, `idle ${label}`),
+      pinned(idleArtifactCounters[counter], label),
+      `idle ${label} disagree with the resource artifact`,
+    );
+  }
+  const firstBoot = idleArtifact;
   assert.equal(firstBoot.firstBootRecentOnly, true);
   assert.equal(integer(firstBoot.oldContentReadsAtBoot, "old boot reads"), 0);
   assert.equal(firstBoot.restartZeroWork, true);

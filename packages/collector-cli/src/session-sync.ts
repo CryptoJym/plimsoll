@@ -2,6 +2,7 @@ import { buildWorkspaceEconomics } from "../../shared/src/economics/service";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
 import type { Period,UsageFact } from "../../shared/src/economics/contracts";
 import { createRequire } from "node:module";
+import crypto from "node:crypto";
 import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 
@@ -9,15 +10,44 @@ import type { CollectorConfig } from "./config";
 import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
+import { BOUNDED_SQL_READ_PREDICATE, BoundedSqlReadError, boundedSqlRows } from "./bounded-sql-read";
+import { TransportError } from "./http-transport";
+import { SyncStorageRetryController } from "./sqlite-contention";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import { deliveryItemId } from "./delivery-ack";
 import { pinnedUploadUrl } from "./http-transport";
+import { MAX_EVENT_UPLOAD_BATCH_SIZE } from "./upload";
 import {
   aiWorkSessionSyncBatchSchema,
   type AiWorkIngestBatch,
   type AiWorkSessionSyncRow,
 } from "../../shared/src/index";
+import {
+  ensureSessionSummarySchema,
+  listSessionSummaryPendingIds,
+  sessionSummaryCurrent,
+  updateSessionSummary,
+  type SessionReadQuery,
+  type SessionSnapshot,
+  type SessionSummaryRead,
+} from "./session-summary";
+
+export type { SessionSnapshot } from "./session-summary";
+
+/** Even a sustained event backlog must give the session planner a turn. */
+export const SESSION_SYNC_MAX_DEFERRAL_MS = 60_000;
+
+export function shouldDeferDaemonSessionSync(input: {
+  batchCapReached: boolean;
+  remainingDelivery: number;
+  maxBatchesPerCycle: number;
+  elapsedSinceLastSessionPassMs: number;
+}): boolean {
+  return input.batchCapReached &&
+    input.remainingDelivery > input.maxBatchesPerCycle * MAX_EVENT_UPLOAD_BATCH_SIZE &&
+    input.elapsedSinceLastSessionPassMs < SESSION_SYNC_MAX_DEFERRAL_MS;
+}
 
 /**
  * Session sync (issue 0037 / cloud Phase D1): the ledger stitches sessions
@@ -30,7 +60,8 @@ import {
  *
  * Invariants (the upload-history house rules):
  * - Event rows are never marked. The daemon's live handle is borrowed for
- *   snapshot reads; it also stores one `maintenance_state` horizon row so a
+ *   snapshot reads; the incremental path also stores one durable per-session
+ *   accumulator/HWM and the existing `maintenance_state` horizon row so a
  *   restart can catch up without `upload-history --sessions`.
  * - Idempotency comes from deterministic session ids: the cloud upserts by
  *   id with a grow-only guard, so re-sending the same snapshots updates rows
@@ -69,25 +100,6 @@ export function ensureUuidSessionId(rawId: string): { id: string; derived: boole
   return { id: deterministicEventId(["session-sync", rawId]), derived: true };
 }
 
-export type SessionSnapshot = {
-  sessionId: string;
-  source: string;
-  startedAt: string;
-  endedAt: string;
-  events: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
-  pricedEvents: number;
-  costUsd: number;
-  repoHash: string | null;
-  branchHash: string | null;
-  accountHash: string | null;
-};
-
-type SessionReadQuery = { sql: string; params: Record<string, unknown> };
-
 // better-sqlite3 steps synchronously. On a long-lived session, GROUP BY can
 // spend minutes doing index-to-table lookups; keep that exact SQL and its
 // SQLite aggregation semantics, but step it on a read-only worker connection.
@@ -95,40 +107,142 @@ const sessionReadWorkerSource = `
   const { parentPort, workerData } = require('node:worker_threads');
   const Database = require(workerData.sqliteModule);
   const db = new Database(workerData.ledgerPath, { readonly: true, fileMustExist: true });
-  try {
-    const rows = [];
-    for (const query of workerData.queries) rows.push(...db.prepare(query.sql).all(query.params));
-    parentPort.postMessage(rows);
-  } finally {
-    db.close();
-  }
+  parentPort.on('message', (message) => {
+    let timer;
+    try {
+      const rows = [];
+      for (const query of message.queries) {
+        if (Number.isFinite(query.maxMs) && query.maxMs > 0) {
+          timer = setTimeout(() => db.interrupt(), query.maxMs);
+        }
+        rows.push(...db.prepare(query.sql).all(query.params));
+        if (timer) { clearTimeout(timer); timer = undefined; }
+      }
+      parentPort.postMessage({ id: message.id, rows });
+    } catch (error) {
+      if (timer) clearTimeout(timer);
+      parentPort.postMessage({
+        id: message.id,
+        error: error && error.code === 'SQLITE_INTERRUPT'
+          ? 'session_summary_read_interrupted'
+          : error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
 `;
 
-function readSessionsOffThread<T>(ledger: Database.Database, queries: SessionReadQuery[]): Promise<T[]> {
-  if (queries.length === 0) return Promise.resolve([]);
-  // SQLite memory databases cannot be reopened by a worker. Production
-  // ledgers are file-backed; retain the direct path for isolated callers.
+type SessionReadWorkerReply = { id: number; rows?: unknown[]; error?: string };
+
+/** Reuse one read-only worker across all bounded session-summary slices. */
+function createPersistentLedgerReader(ledger: Database.Database): {
+  read: SessionSummaryRead;
+  close: () => Promise<void>;
+} {
   if (ledger.name === ":memory:") {
-    return Promise.resolve(queries.flatMap(query => ledger.prepare(query.sql).all(query.params) as T[]));
+    return {
+      read: async <T>(queries: SessionReadQuery[]) =>
+        queries.flatMap(query => ledger.prepare(query.sql).all(query.params) as T[]),
+      close: async () => {},
+    };
   }
-  return new Promise<T[]>((resolve, reject) => {
-    const worker = new Worker(sessionReadWorkerSource, {
-      eval: true,
-      execArgv: [],
-      workerData: {
-        ledgerPath: ledger.name,
-        sqliteModule: createRequire(import.meta.url).resolve("better-sqlite3"),
-        queries,
-      },
+  const workerOptions = {
+    eval: true,
+    execArgv: [],
+    workerData: {
+      ledgerPath: ledger.name,
+      sqliteModule: createRequire(import.meta.url).resolve("better-sqlite3"),
+    },
+  };
+  let nextId = 1;
+  const pending = new Map<number, {
+    resolve: (rows: unknown[]) => void;
+    reject: (error: Error) => void;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
+  let worker: Worker;
+  let workerError: Error | null = null;
+  let closed = false;
+  let restartPromise: Promise<void> | null = null;
+  const failPending = (error: Error) => {
+    for (const waiter of pending.values()) {
+      if (waiter.timer) clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    pending.clear();
+  };
+  const spawnWorker = () => {
+    const instance = new Worker(sessionReadWorkerSource, workerOptions);
+    instance.on("message", (message: SessionReadWorkerReply) => {
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id);
+      if (waiter.timer) clearTimeout(waiter.timer);
+      if (message.error) waiter.reject(new Error(message.error));
+      else waiter.resolve(message.rows ?? []);
     });
-    let rows: T[] | undefined;
-    worker.once("message", (message: T[]) => { rows = message; });
-    worker.once("error", reject);
-    worker.once("exit", code => {
-      if (code === 0 && rows) resolve(rows);
-      else reject(new Error(`Session read worker exited ${code} without rows`));
+    instance.on("error", (error) => {
+      if (instance !== worker) return;
+      workerError = error;
+      failPending(error);
     });
-  });
+    return instance;
+  };
+  worker = spawnWorker();
+  const restartAfterTimeout = () => {
+    const doomed = worker;
+    failPending(new Error("session_summary_read_interrupted"));
+    restartPromise = doomed.terminate().then(() => {
+      if (!closed && worker === doomed) {
+        workerError = null;
+        worker = spawnWorker();
+      }
+    }).finally(() => {
+      restartPromise = null;
+    });
+  };
+  return {
+    read: async <T>(queries: SessionReadQuery[]) => {
+      if (restartPromise) await restartPromise;
+      if (closed) throw new Error("session_summary_reader_closed");
+      if (workerError) throw workerError;
+      const id = nextId++;
+      return new Promise<T[]>((resolve, reject) => {
+        const maxMs = queries
+          .map((query) => query.maxMs)
+          .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0)
+          .sort((a, b) => a - b)[0];
+        const waiter: {
+          resolve: (rows: unknown[]) => void;
+          reject: (error: Error) => void;
+          timer?: ReturnType<typeof setTimeout>;
+        } = {
+          resolve: resolve as (rows: unknown[]) => void,
+          reject,
+        };
+        if (maxMs !== undefined) {
+          waiter.timer = setTimeout(() => {
+            if (!pending.has(id)) return;
+            restartAfterTimeout();
+          }, maxMs);
+        }
+        pending.set(id, waiter);
+        worker.postMessage({ id, queries });
+      });
+    },
+    close: async () => {
+      closed = true;
+      if (restartPromise) await restartPromise;
+      failPending(new Error("session_summary_reader_closed"));
+      await worker.terminate();
+    },
+  };
+}
+
+/** Step read-only queries on a one-shot worker connection; rows of all queries, in order. */
+export function readLedgerOffThread<T>(ledger: Database.Database, queries: SessionReadQuery[]): Promise<T[]> {
+  if (queries.length === 0) return Promise.resolve([]);
+  const reader = createPersistentLedgerReader(ledger);
+  return reader.read<T>(queries).finally(() => reader.close());
 }
 
 /**
@@ -219,7 +333,7 @@ async function collectSessionSnapshotsOffThread(
   ledger: Database.Database,
   options: { until: string; sessionIds?: string[] },
 ): Promise<SessionSnapshot[]> {
-  return readSessionsOffThread<SessionSnapshot>(ledger, sessionSnapshotQueries(ledger, options));
+  return readLedgerOffThread<SessionSnapshot>(ledger, sessionSnapshotQueries(ledger, options));
 }
 
 export type SessionSkipReason = "source_invalid" | "schema_invalid" | "forbidden_content";
@@ -316,6 +430,7 @@ export function sessionIdsFromBatches(batches: Array<AiWorkIngestBatch | null>):
 export const DAEMON_SESSION_SYNC_STATE_KEY = "session_sync_daemon_v1";
 export const DAEMON_SESSION_SYNC_SCHEMA_VERSION = 1 as const;
 const MAX_PENDING_SESSION_IDS = 8_000;
+const SESSION_ID_PAGE_SIZE = 5_000;
 const MAX_SESSION_ID_CHARS = 128;
 
 export type DaemonSessionSyncState = {
@@ -463,7 +578,11 @@ export function listLedgerSessionIds(
   options: { until: string; since?: string | null; extraIds?: string[]; excludedIds?: string[] },
 ): string[] {
   const query = ledgerSessionIdsQuery(ledger, options);
-  const rows = ledger.prepare(query.sql).all(query.params) as Array<{ sessionId: string }>;
+  query.sql += ` and ${BOUNDED_SQL_READ_PREDICATE} order by e.session_id asc limit @limit`;
+  query.params.limit = SESSION_ID_PAGE_SIZE + 1;
+  const rows = boundedSqlRows<{ sessionId: string }>(
+    ledger, query.sql, query.params, SESSION_ID_PAGE_SIZE,
+  );
   const excluded = new Set(options.excludedIds ?? []);
   return mergeSessionIds(rows.map(row => row.sessionId), options.extraIds ?? [])
     .filter((id) => !excluded.has(id));
@@ -508,7 +627,19 @@ export function planDaemonSessionSync(input: {
   const fromBatches = sessionIdsFromBatches(input.uploadedBatches);
   const blocked = mergeSessionIds(input.state.blockedSessionIds ?? []);
   const blockedSet = new Set(blocked);
-  const pending = mergeSessionIds(input.state.pendingSessionIds, fromBatches)
+  const fullWalk = (pending: string[]): DaemonSessionSyncPlan => ({
+    skip: false, sessionIds: undefined, until, reason: "full_catchup",
+    state: { ...input.state, caughtUp: false, pendingSessionIds: pending, blockedSessionIds: blocked },
+  });
+  let summaryPending: string[];
+  try {
+    summaryPending = listSessionSummaryPendingIds(input.db, until, MAX_PENDING_SESSION_IDS);
+  } catch (error) {
+    if (!(error instanceof BoundedSqlReadError)) throw error;
+    return fullWalk(mergeSessionIds(input.state.pendingSessionIds, fromBatches)
+      .filter((id) => !blockedSet.has(id)));
+  }
+  const pending = mergeSessionIds(input.state.pendingSessionIds, fromBatches, summaryPending)
     .filter((id) => !blockedSet.has(id));
   if (!input.state.caughtUp) {
     return {
@@ -522,14 +653,20 @@ export function planDaemonSessionSync(input: {
       state: { ...input.state, pendingSessionIds: pending, blockedSessionIds: blocked },
     };
   }
-  const sessionIds = input.ledgerSessionIds === undefined
-    ? listLedgerSessionIds(input.db, {
+  let sessionIds: string[];
+  try {
+    sessionIds = input.ledgerSessionIds === undefined
+      ? listLedgerSessionIds(input.db, {
         until,
         since: input.state.lastSuccessfulUntil,
         extraIds: pending,
         excludedIds: blocked,
       })
-    : mergeSessionIds(input.ledgerSessionIds, pending).filter((id) => !blockedSet.has(id));
+      : mergeSessionIds(input.ledgerSessionIds, pending).filter((id) => !blockedSet.has(id));
+  } catch (error) {
+    if (!(error instanceof BoundedSqlReadError)) throw error;
+    return fullWalk(pending);
+  }
   if (sessionIds.length === 0) {
     return {
       skip: true,
@@ -560,17 +697,49 @@ export function planDaemonSessionSync(input: {
 /** Daemon planner's distinct-id scan, without blocking HTTP intake. */
 export async function listLedgerSessionIdsOffThread(
   ledger: Database.Database,
-  options: { until: string; since?: string | null; excludedIds?: string[] },
+  options: { until: string; since?: string | null; excludedIds?: string[]; maxIds?: number; allSessions?: boolean },
 ): Promise<string[]> {
-  const query = ledgerSessionIdsQuery(ledger, options);
   const excluded = new Set(options.excludedIds ?? []);
-  // The planner switches to a full walk above this count. No later id can
-  // change that decision, so never clone an unbounded distinct-id set back
-  // onto the request event loop. Read enough extra rows to preserve the
-  // overflow signal after excluded IDs are removed.
-  query.sql += ` limit ${MAX_PENDING_SESSION_IDS + 1 + excluded.size}`;
-  const rows = await readSessionsOffThread<{ sessionId: string }>(ledger, [query]);
-  return rows.map(row => row.sessionId).filter((id) => !excluded.has(id));
+  // The planner only needs an overflow signal; a full catch-up needs every
+  // session. Both paths read at most one bounded page on the worker at a time.
+  const maxIds = options.maxIds ?? MAX_PENDING_SESSION_IDS + 1;
+  const ids: string[] = [];
+  let cursor: string | null = null;
+  for (;;) {
+    // The first catch-up only needs candidate ids; each session's summary
+    // applies the privacy and horizon predicates. Seek to the next distinct
+    // session through the existing index instead of scanning 1.9M duplicate
+    // entries in the largest session merely to emit one id.
+    const query: SessionReadQuery = options.allSessions ? {
+      sql: `with recursive session_ids(session_id) as (
+        select min(session_id) from buffered_events indexed by idx_events_session
+          where ${cursor === null ? "session_id is not null" : "session_id > @cursor"}
+        union all
+        select (select min(session_id) from buffered_events indexed by idx_events_session
+          where session_id > session_ids.session_id)
+        from session_ids where session_id is not null
+      ) select session_id as sessionId from session_ids
+        where session_id is not null limit @pageSize`,
+      params: { cursor, pageSize: SESSION_ID_PAGE_SIZE },
+    } : ledgerSessionIdsQuery(ledger, options);
+    if (!options.allSessions) {
+      if (cursor !== null) {
+        query.sql += " and e.session_id > @cursor";
+        query.params.cursor = cursor;
+      }
+      query.sql += " order by e.session_id asc limit @pageSize";
+      query.params.pageSize = SESSION_ID_PAGE_SIZE;
+    }
+    query.maxMs = 250;
+    const rows = await readLedgerOffThread<{ sessionId: string }>(ledger, [query]);
+    for (const row of rows) {
+      if (!excluded.has(row.sessionId)) ids.push(row.sessionId);
+      if (ids.length >= maxIds) return ids;
+    }
+    if (rows.length < SESSION_ID_PAGE_SIZE) return ids;
+    cursor = rows[rows.length - 1]!.sessionId;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
 }
 
 export function commitDaemonSessionSyncSuccess(
@@ -787,8 +956,15 @@ export type SessionSyncOptions = {
   appVersion?: string;
   ledgerPath?: string;
   /** Borrow an already-open handle (the daemon's live buffer) instead of
-   * opening the ledger file read-only. Reads only; never closed here. */
+   * opening the ledger file read-only. Never closed here. */
   ledgerDb?: Database.Database;
+  /** Use the durable per-session summary index. Callers must provide a
+   * writable ledgerDb; read-only upload/dry-run paths retain the legacy full
+   * recompute behavior. */
+  incremental?: boolean;
+  /** Test/diagnostic bounds; production keeps the conservative defaults. */
+  summaryMaxRows?: number;
+  summaryMaxMs?: number;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
@@ -820,6 +996,17 @@ export type SessionSyncResult = {
   dryRun: boolean;
   audit: SessionAudit;
   auditTable: string;
+  /** False when one or more summaries were persisted but not yet complete. */
+  summaryComplete: boolean;
+  pendingSummarySessionIds: string[];
+  summaryStats: {
+    rowsRead: number;
+    rowsApplied: number;
+    incrementalSessions: number;
+    cachedSessions: number;
+    fullRecomputes: number;
+    durationMs: number;
+  };
 };
 
 function defaultSleep(ms: number): Promise<void> {
@@ -831,8 +1018,9 @@ function defaultSleep(ms: number): Promise<void> {
  * the daemon's touched set), normalizes snapshots to wire rows, ships
  * ≤500-session signed batches with bounded concurrency over the SAME
  * transport as upload-history, and prints a source × month reconciliation
- * audit. Read-only, stateless, idempotent — re-running over the same --until
- * sends identical snapshots the cloud upserts in place.
+ * audit. The legacy path remains read-only; the daemon path persists only
+ * summary state and is idempotent — re-running over the same --until sends
+ * identical snapshots the cloud upserts in place.
  */
 export async function runSessionSync(
   config: CollectorConfig,
@@ -886,14 +1074,79 @@ export async function runSessionSync(
   const appVersion = options.appVersion ?? "0.1.0";
 
   const audit = createSessionAudit();
-  let snapshots: SessionSnapshot[];
+  let snapshots: SessionSnapshot[] = [];
+  const snapshotVersions = new Map<string, {
+    rawSessionId: string; mutationRevision: number; highWater: number;
+  }>();
+  let ledgerSessions = 0;
+  const pendingSummarySessionIds: string[] = [];
+  const summaryStats = {
+    rowsRead: 0,
+    rowsApplied: 0,
+    incrementalSessions: 0,
+    cachedSessions: 0,
+    fullRecomputes: 0,
+    durationMs: 0,
+  };
+  let summaryComplete = true;
+  let summaryReader: ReturnType<typeof createPersistentLedgerReader> | null = null;
   try {
     const excluded = new Set(options.excludedSessionIds ?? []);
-    snapshots = (await collectSessionSnapshotsOffThread(ledger, {
-      until,
-      sessionIds: options.sessionIds,
-    })).filter((snapshot) => !excluded.has(snapshot.sessionId));
+    if (options.incremental) {
+      if (!options.ledgerDb) {
+        throw new Error("incremental_session_sync_requires_writable_ledger");
+      }
+      const summaryWriteRetry = new SyncStorageRetryController({ budgetMs: 1_000, sleep });
+      await summaryWriteRetry.run(() => ensureSessionSummarySchema(ledger));
+      summaryReader = createPersistentLedgerReader(ledger);
+      const ids = options.sessionIds !== undefined
+        ? options.sessionIds
+        : await listLedgerSessionIdsOffThread(ledger, {
+            until,
+            excludedIds: options.excludedSessionIds,
+            maxIds: Number.POSITIVE_INFINITY,
+            allSessions: true,
+          });
+      const sessionIds = [...new Set(ids)].filter((id) => !excluded.has(id));
+      ledgerSessions = sessionIds.length;
+      for (const sessionId of sessionIds) {
+        const update = await updateSessionSummary(ledger, sessionId, until, {
+          read: summaryReader.read,
+          maxRows: options.summaryMaxRows,
+          maxMs: options.summaryMaxMs,
+          writeRetry: summaryWriteRetry,
+        });
+        summaryStats.rowsRead += update.rowsRead;
+        summaryStats.rowsApplied += update.rowsApplied;
+        summaryStats.durationMs += update.durationMs;
+        if (update.fullRecompute) summaryStats.fullRecomputes += 1;
+        if (update.mode === "cached") summaryStats.cachedSessions += 1;
+        else if (update.complete) summaryStats.incrementalSessions += 1;
+        if (!update.complete) {
+          summaryComplete = false;
+          pendingSummarySessionIds.push(sessionId);
+        } else if (update.snapshot) {
+          snapshots.push(update.snapshot);
+          snapshotVersions.set(ensureUuidSessionId(sessionId).id, {
+            rawSessionId: sessionId,
+            mutationRevision: update.mutationRevision,
+            highWater: update.highWater,
+          });
+        }
+        // Session summaries are maintenance work. Give intake and upload
+        // callbacks an event-loop turn between sessions even when a slice was
+        // cached and required no SQLite row reads.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    } else {
+      snapshots = (await collectSessionSnapshotsOffThread(ledger, {
+        until,
+        sessionIds: options.sessionIds,
+      })).filter((snapshot) => !excluded.has(snapshot.sessionId));
+      ledgerSessions = snapshots.length;
+    }
   } finally {
+    if (summaryReader) await summaryReader.close();
     if (ownsLedger) ledger.close();
   }
 
@@ -901,8 +1154,9 @@ export async function runSessionSync(
     JSON.stringify({
       status: "session_sync_start",
       until,
-      ledgerSessions: snapshots.length,
+      ledgerSessions,
       scopedToTouched: Boolean(options.sessionIds),
+      incremental: Boolean(options.incremental),
       batchSize,
       concurrency,
       dryRun: Boolean(options.dryRun),
@@ -911,7 +1165,14 @@ export async function runSessionSync(
 
   const eligible: Array<{ row: AiWorkSessionSyncRow; bytes: number }> = [];
   let derivedIds = 0;
+  // A catch-up walk builds a row for every ledger session (22.8k on the
+  // Studio0 ledger, ~0.3-0.5 s); the daemon's intake shares this event loop.
+  let sliceStartedAt = performance.now();
   for (const snapshot of snapshots) {
+    if (performance.now() - sliceStartedAt >= 50) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      sliceStartedAt = performance.now();
+    }
     const normalized = buildSessionSyncRow(snapshot);
     if (!normalized.ok) {
       audit.skipped[normalized.reason] = (audit.skipped[normalized.reason] ?? 0) + 1;
@@ -933,9 +1194,32 @@ export async function runSessionSync(
   let skippedStaleSessions: number | null = null;
   let batches = 0;
   let abortReason: string | null = null;
+  let staleReason: string | null = null;
+
+  const snapshotFresh = (sessionId: string): boolean => {
+    if (!options.incremental) return true;
+    const version = snapshotVersions.get(sessionId);
+    return version !== undefined && sessionSummaryCurrent(
+      ledger, version.rawSessionId, until, version.mutationRevision, version.highWater,
+    );
+  };
+  const markStale = (sessionId: string) => {
+    summaryComplete = false;
+    const rawSessionId = snapshotVersions.get(sessionId)?.rawSessionId ?? sessionId;
+    if (!pendingSummarySessionIds.includes(rawSessionId)) pendingSummarySessionIds.push(rawSessionId);
+  };
 
   const inFlight = new Set<Promise<void>>();
   const dispatch = async (chunk: Array<{ row: AiWorkSessionSyncRow }>) => {
+    // Rows can change while other sessions are normalized. Drop any stale
+    // snapshot before the batch is built, then fence the serialized body at
+    // the transport boundary on every retry.
+    chunk = chunk.filter((item) => {
+      if (snapshotFresh(item.row.session.id)) return true;
+      markStale(item.row.session.id);
+      return false;
+    });
+    if (chunk.length === 0) return;
     // Batch-level reseal prevents a future alternate caller from bypassing
     // buildSessionSyncRow and placing raw identifiers into a signed request.
     const sealedRows = chunk.map((item) => sealOutboundSessionRow(item.row));
@@ -954,18 +1238,82 @@ export async function runSessionSync(
       }),
     );
     const task = (async () => {
+      let sourceChanged = false;
+      const stale = () => {
+        sourceChanged = true;
+        rows.forEach((row) => markStale(row.session.id));
+        return new TransportError("source_changed");
+      };
       try {
+        const requestTimeoutMs = Math.min(120_000, config.delivery.requestTimeoutSeconds * 1_000);
+        const fencedFetch: typeof fetch = options.incremental ? async (request, init) => {
+          const leaseToken = crypto.randomUUID();
+          const retry = new SyncStorageRetryController({ budgetMs: 1_000, sleep });
+          // These callbacks are synchronous: only freshness/lease bookkeeping
+          // holds a write reservation. Network I/O never runs in a transaction.
+          await retry.run(() => ledger.transaction(() => {
+            ledger.prepare(`delete from session_sync_upload_leases
+              where lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')`).run();
+            if (!rows.every((row) => snapshotFresh(row.session.id))) throw stale();
+            const occupied = ledger.prepare(
+              "select 1 from session_sync_upload_leases where session_id = ?",
+            );
+            if (rows.some((row) => occupied.get(snapshotVersions.get(row.session.id)!.rawSessionId))) {
+              // Another uploader owns this session. Reuse the bounded network
+              // retry policy without labelling an unchanged source stale.
+              throw new TransportError("network_error");
+            }
+            const insert = ledger.prepare(`insert into session_sync_upload_leases
+              (session_id, lease_token, lease_expires_at, mutation_revision, high_water)
+              values (?, ?, ?, ?, ?)`);
+            const expiresAt = new Date(Date.now() + requestTimeoutMs + 5_000).toISOString();
+            for (const row of rows) {
+              const version = snapshotVersions.get(row.session.id)!;
+              insert.run(version.rawSessionId, leaseToken, expiresAt, version.mutationRevision, version.highWater);
+            }
+          }).immediate());
+          let released = false;
+          const clear = () => ledger.prepare(
+            "delete from session_sync_upload_leases where lease_token = ?",
+          ).run(leaseToken);
+          try {
+            // The HTTP deadline may expire while a short transaction retries.
+            // An aborted attempt must never start a delayed POST.
+            if (init?.signal?.aborted) throw new TransportError("deadline_exceeded");
+            const response = await fetchImpl(request, init);
+            const fresh = await retry.run(() => ledger.transaction(() => {
+              const current = rows.every((row) => snapshotFresh(row.session.id));
+              clear();
+              return current;
+            }).immediate());
+            released = true;
+            if (!fresh) {
+              void response.body?.cancel().catch(() => undefined);
+              throw stale();
+            }
+            return response;
+          } finally {
+            // A crashed/timed-out process leaves only an expiring lease. A
+            // live attempt clears only its own token, including failed sends.
+            if (!released) await retry.run(() => ledger.transaction(clear).immediate());
+          }
+        } : fetchImpl;
         const result = await postHistoryBatch({
           url,
           body,
           installKey: config.installKey,
           ingestKey: config.ingestKey,
           signingSecret: config.uploadSigningSecret,
-          fetchImpl,
+          fetchImpl: fencedFetch,
           sleep,
           maxAttempts,
-          timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
+          timeoutMs: requestTimeoutMs,
           allowPartial: true,
+          beforeSend: () => {
+            const fresh = rows.every((row) => snapshotFresh(row.session.id));
+            if (!fresh) stale();
+            return fresh;
+          },
           log,
         });
         batches += 1;
@@ -999,6 +1347,13 @@ export async function runSessionSync(
           }),
         );
       } catch (error) {
+        // A source change invalidates this body and leaves the summary dirty;
+        // the next catch-up pass will rebuild and retry it. It is not a fatal
+        // transport failure and must not abort later batches in this run.
+        if (sourceChanged) {
+          staleReason = error instanceof Error ? error.message : String(error);
+          return;
+        }
         abortReason = abortReason ?? (error instanceof Error ? error.message : String(error));
       }
     })();
@@ -1023,6 +1378,7 @@ export async function runSessionSync(
   }
 
   await Promise.allSettled([...inFlight]);
+  abortReason ??= staleReason;
 
   const durationMs = Date.now() - startedAt;
   const skippedSessions = Object.values(audit.skipped).reduce((sum, count) => sum + count, 0);
@@ -1030,7 +1386,7 @@ export async function runSessionSync(
     ok: abortReason === null,
     reason: abortReason,
     until,
-    ledgerSessions: snapshots.length,
+    ledgerSessions,
     eligibleSessions: eligible.length,
     skippedSessions,
     sentSessions,
@@ -1045,6 +1401,9 @@ export async function runSessionSync(
     dryRun: Boolean(options.dryRun),
     audit,
     auditTable: renderSessionAudit(audit),
+    summaryComplete,
+    pendingSummarySessionIds,
+    summaryStats,
   };
 
   log(
@@ -1064,6 +1423,13 @@ export async function runSessionSync(
       batches,
       durationMs,
       dryRun: result.dryRun,
+      incremental: Boolean(options.incremental),
+      summaryComplete,
+      pendingSummarySessions: pendingSummarySessionIds.length,
+      summaryRowsRead: summaryStats.rowsRead,
+      summaryRowsApplied: summaryStats.rowsApplied,
+      summaryFullRecomputes: summaryStats.fullRecomputes,
+      summaryDurationMs: summaryStats.durationMs,
     }),
   );
   log("");

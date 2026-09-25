@@ -602,6 +602,8 @@ export async function postHistoryBatch(input: {
   /** Session snapshots can receive an explicit accepted/rejected partition.
    * History/outcome callers keep the strict all-accepted behavior. */
   allowPartial?: boolean;
+  /** Rechecked by the transport immediately before every retry's fetch. */
+  beforeSend?: () => boolean;
   log: (line: string) => void;
 }): Promise<{
   accepted: number;

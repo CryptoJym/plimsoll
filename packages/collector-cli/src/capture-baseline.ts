@@ -722,6 +722,12 @@ export function ensureCaptureBaselineSchema(database: Database.Database): void {
     );
     create index if not exists idx_capture_baseline_generation
       on ${GENERATION_TABLE} (source, run_id, generation_key);
+    -- Covers the status aggregate (CAPTURE_BASELINE_GENERATION_STATUS_SQL), which
+    -- runs before every capture leader and on the parent's status refresh: with
+    -- 200,000 generations per source it read every table row, about 0.6 s on
+    -- Studio1; from this index alone it takes about 36 ms (eco-6hoxj.163.42).
+    create index if not exists idx_capture_baseline_generation_status
+      on ${GENERATION_TABLE} (source, run_id, baseline_size, last_observed_size, growth_observed_at);
     create table if not exists ${PENDING_GENERATION_TABLE} (
       source text not null check (source in ('codex', 'claude_code')),
       run_id text not null,
@@ -761,6 +767,16 @@ function pendingGenerationCount(
   ).get(source, runId) as { count: number }).count;
 }
 
+/** One source's baseline totals; read from idx_capture_baseline_generation_status alone. */
+export const CAPTURE_BASELINE_GENERATION_STATUS_SQL = `select count(*) as excludedGenerations,
+     coalesce(sum(baseline_size), 0) as excludedBaselineBytes,
+     coalesce(sum(last_observed_size), 0) as currentExcludedBytes,
+     sum(case when growth_observed_at is not null then 1 else 0 end)
+       as generationsWithObservedGrowth,
+     max(growth_observed_at) as lastGrowthObservedAt
+   from ${GENERATION_TABLE}
+   where source = ? and run_id = ?`;
+
 function sourceStatus(
   database: Database.Database,
   source: HistoryCoverageSource,
@@ -769,16 +785,7 @@ function sourceStatus(
   const row = stateRow(database, source);
   const activeRunId = row?.status === "complete" ? row.runId : "__inactive__";
   const counts = database
-    .prepare(
-      `select count(*) as excludedGenerations,
-         coalesce(sum(baseline_size), 0) as excludedBaselineBytes,
-         coalesce(sum(last_observed_size), 0) as currentExcludedBytes,
-         sum(case when growth_observed_at is not null then 1 else 0 end)
-           as generationsWithObservedGrowth,
-         max(growth_observed_at) as lastGrowthObservedAt
-       from ${GENERATION_TABLE}
-       where source = ? and run_id = ?`,
-    )
+    .prepare(CAPTURE_BASELINE_GENERATION_STATUS_SQL)
     .get(source, activeRunId) as {
     excludedGenerations: number;
     excludedBaselineBytes: number;

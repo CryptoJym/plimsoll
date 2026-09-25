@@ -1354,6 +1354,46 @@ async function diagnosticFailureReceiptProof() {
   });
 }
 
+async function leaseDeferralReceiptProof() {
+  const harness = fakeBoundary((spawnNonce, index) => {
+    const child = new FakeChild(20_520 + index);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      queueMicrotask(() => child.emit("message", index === 0 ? {
+        schema: MAINTENANCE_PROTOCOL_SCHEMA,
+        type: "error",
+        generation: request.generation,
+        nonce: request.nonce,
+        sequence: 1,
+        reason: "maintenance_failed",
+        errorClass: "SQLITE_CONSTRAINT_TRIGGER",
+        message: "session_sync_upload_lease",
+        stage: "recent_maintenance",
+        elapsedMs: 5,
+        progressAcknowledged: false,
+      } : resultReceipt(request)));
+    };
+    ready(child, spawnNonce);
+    return child;
+  });
+  try {
+    await rejectsWith(harness.boundary.run(), "session_sync_upload_lease");
+    const deferred = harness.boundary.status();
+    assert.equal(deferred.lastOutcome, "deferred");
+    assert.equal(deferred.circuit.openUntil, null);
+    assert.equal(deferred.circuit.failureCount, 0);
+    assert.equal((await harness.boundary.run() as MaintenanceRunOutcome).rawEventWrites, 1);
+    pass("lease_deferral_does_not_open_maintenance_circuit_and_next_run_succeeds", {
+      firstOutcome: deferred.lastOutcome,
+      circuit: deferred.circuit,
+      spawns: harness.spawnCount(),
+    });
+  } finally {
+    await harness.boundary.shutdown();
+  }
+}
+
 async function realWorkerCrashProof() {
   const fixturePath = path.resolve("scripts/fixtures/maintenance-boundary-crash-child.mjs");
   const boundary = new MaintenanceProcessBoundary({
@@ -1890,6 +1930,11 @@ async function main() {
     console.log(JSON.stringify({ proof: "maintenance_boundary_failure_diagnostics", checks }));
     return;
   }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "lease_deferral") {
+    await leaseDeferralReceiptProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_lease_deferral", checks }));
+    return;
+  }
   await fifoAvailabilityProof();
   await blockedShutdownProof();
   await circuitAndRecoveryProof();
@@ -1904,6 +1949,7 @@ async function main() {
   staticParentFilesystemIsolationProof();
   await malformedOversizedFrameProof();
   await diagnosticFailureReceiptProof();
+  await leaseDeferralReceiptProof();
   await realWorkerCrashProof();
   await partialOkArbitrationProof();
   await staleFenceAndImmediateSecondJobProof();

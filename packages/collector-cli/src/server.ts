@@ -40,6 +40,7 @@ import {
 import { saveCollectorConfig } from "./config";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import { sessionContextIndexStatus } from "./session-context-index";
 import { historyCoverageStatus } from "./history-coverage";
 import { captureBaselineStatus } from "./capture-baseline";
 import {
@@ -683,6 +684,8 @@ export function createCollectorServer(
     hookSpoolStatus?: () => HookSpoolStatus | null;
     /** Process-local upload scheduler state; no DB or filesystem work. */
     syncStatus?: () => unknown;
+    /** In-memory WAL checkpoint worker state (eco-6hoxj.163.24); no DB or filesystem work. */
+    walCheckpointStatus?: () => unknown;
     /**
      * Environment the intake spool reads its kill switch and its home from.
      * Production is `process.env`, exactly as the drain's is.
@@ -1112,6 +1115,7 @@ export function createCollectorServer(
       privacy: collectorPrivacyReadiness(config),
       retentionDays: config.retentionDays,
       retention: refreshControl ? buffer.retentionProgressStatus(config.retentionDays) : cachedControl?.retention ?? null,
+      learningFacts: refreshControl ? buffer.learningFacts.status() : cachedControl?.learningFacts ?? null,
       enrollment: { futureOnlyEnrollment: true, inspection: "not_inspected", quarantinedHistoryRows: null },
       stats,
       otlpAdmission: {
@@ -1125,6 +1129,9 @@ export function createCollectorServer(
       ingestIntegrity: refreshControl ? buffer.eventCollisionSummary() : cachedControl?.ingestIntegrity ?? null,
       delivery,
       reconciliation: refreshControl ? codexReconciliationStatus(buffer.database) : cachedControl?.reconciliation ?? null,
+      // Capture-time session context index: size and backfill progress.
+      sessionAttribution: refreshControl ? sessionContextIndexStatus(buffer.database)
+        : cachedControl?.sessionAttribution ?? null,
       maintenance,
       captureHealth: status.health ?? null,
       historyCoverage,
@@ -1185,6 +1192,7 @@ export function createCollectorServer(
       privacyMode: "metadata_only",
       privacy: collectorPrivacyReadiness(config),
       retentionDays: config.retentionDays,
+      learningFacts: buffer.learningFacts.status(),
       retention: {
         inspection: "not_inspected",
         policy: { retentionDays: config.retentionDays, cutoffAt: null },
@@ -1205,6 +1213,7 @@ export function createCollectorServer(
       stats: null,
       delivery: buffer.delivery.status(),
       reconciliation: codexReconciliationStatus(buffer.database),
+      sessionAttribution: sessionContextIndexStatus(buffer.database),
       maintenance: options.maintenanceStatus?.() ?? null,
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
@@ -1355,6 +1364,7 @@ export function createCollectorServer(
             privacyMode: "metadata_only",
             privacy: collectorPrivacyReadiness(config),
             retentionDays: config.retentionDays,
+            learningFacts: null,
             retention: {
               inspection: "not_inspected",
               policy: { retentionDays: config.retentionDays, cutoffAt: null },
@@ -1375,6 +1385,7 @@ export function createCollectorServer(
             stats: null,
             delivery: null,
             reconciliation: null,
+            sessionAttribution: null,
             maintenance: options.maintenanceStatus?.() ?? null,
             historyCoverage: null,
             captureBaseline: null,
@@ -1451,6 +1462,7 @@ export function createCollectorServer(
           // In-memory index and counters only; no filesystem or ledger read.
           body.otlpSpool = otlpSpool?.status() ?? null;
           body.sync = options.syncStatus?.() ?? null;
+          body.walCheckpoint = options.walCheckpointStatus?.() ?? null;
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
             "x-plimsoll-projection-generation": String(cached.generation),
           });

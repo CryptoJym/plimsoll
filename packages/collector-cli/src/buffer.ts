@@ -17,6 +17,7 @@ import {
 import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
+import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -737,6 +738,9 @@ export class LocalEventBuffer {
       end;
     `);
     markOpenStep("ledger.raw_indexes_and_triggers");
+    // Empty on first upgrade; maintenance backfills older rows in bounded batches.
+    ensureSessionContextIndexSchema(this.db);
+    markOpenStep("ledger.session_context_index");
     ensureCodexReconciliationSchema(this.db);
     markOpenStep("ledger.codex_reconciliation_schema");
     this.learningFacts = new LearningFactStore(

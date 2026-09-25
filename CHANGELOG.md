@@ -24,6 +24,46 @@ entire downgrade: older binaries ignore continuation and retirement state. Keep
 the ledger, source files and session authority intact. Disabling the live observer
 does not transfer its sessions to a tailer.
 
+## 0.7.40 — 2026-09-24
+
+- Busy-session indexing records session context at capture time and validates
+  it once per reopen (`.163.21`).
+- On a busy host, uploads claim and acknowledge in 125-row slices and yield to
+  the event loop between batches; only ledger WAL checkpoints move to a worker
+  thread (`.163.24`).
+- Session sync keeps incremental session summaries in the ledger and catches up
+  on a bounded cadence from an indexed cursor instead of rescanning history
+  (`.163.41`).
+- Resource observation now covers the supported directory APIs and proves the
+  stable fixture sweep and ownership isolation (`.163.31`).
+- Learning-facts maintenance is bounded and capacity-tested, and busy-host Grok
+  capture keeps progress durable through worker replacement (`.163.38`,
+  `.163.42`).
+- Loopback transport is direct and bounded, while lifecycle updates stage runtime
+  files transactionally and preserve recovery evidence (`.163.48`, `.163.49`,
+  `.163.50`).
+- System-e2e path fields are normalized for the CI layout, and the coverage gate
+  runs the newly covered proofs with host-only scopes recorded (`.163.59`,
+  `.163.45`).
+- Session summary uploads use short database write transactions and
+  per-session send leases, leaving unrelated ledger writes free during the
+  network request. A live lease defers conflicting mutations, and an erasure
+  waits for the send so it is never overtaken. Intake for a session that is
+  being uploaded waits for that send; past the 750 ms busy budget (a slow cloud
+  round trip) its events are spooled and delivered later, never lost.
+  Automatic maintenance retries a lease-deferred attempt after a bounded 1-5
+  second backoff without counting it as a failure or opening the worker
+  circuit; repricing keeps its pending row until a retry succeeds. Multi-batch
+  catch-ups converge, and under steady intake the daemon still runs session
+  sync once the event backlog fits in one cycle, or, with a larger backlog, at
+  the end of the first upload cycle that finishes 60 s or more after the
+  previous session pass (`.163.75`).
+- The session context index keeps its checksum exact past 2^53, so very large
+  ledgers no longer rebuild the index on every open (`.163.75`).
+- When a learning-fact table is full, a fact that would be refused anyway
+  (a retry with no target, an episode fact with no parent) is dropped before
+  anything is evicted (`.163.75`).
+
 ## Unreleased
 
 ### Added

@@ -1026,7 +1026,7 @@ export class TranscriptTailer {
             const next = readJsonlContinuation(candidate.file, candidate.stat, cursor, limits, this.io, {
               database: this.buffer.database, provider: "claude", cursorKey: this.cursorKey(candidate.file), root: root ?? undefined,
               directory: root?.directory ?? this.projectsDir,
-              deadline: performance.now() + (automatic?.budget.remainingWallMs() ?? 200),
+              deadline: automatic ? automatic.budget.unitDeadline() : performance.now() + 200,
               eligible: () => {
                 if (options.signal?.aborted) return false;
                 if (this.inventoryConfigured && !root) return false;

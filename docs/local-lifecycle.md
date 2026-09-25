@@ -46,7 +46,10 @@ An update or rollback:
    another process has the ledger open or a full ledger copy would not fit;
 4. copies a digest-verified artifact to an immutable absolute
    `versions/VERSION/darwin-ARCH/bin/plimsoll.mjs` path, together with its
-   vendored companion files (each digest-verified);
+   vendored companion files (each digest-verified and renamed into place). A
+   version that already exists is never changed: a different executable or
+   companion for it fails before any of its files is touched, identical files
+   are kept as they are, and a failed stage removes only what it created;
 5. asks the injected service adapter to activate that exact executable and
    atomically moves the convenience `current` pointer;
 6. accepts success only when runtime version, service, config compatibility,
@@ -266,13 +269,14 @@ decisions.
 
 **Keeping everything during an update.** `--retention keep-all` on `lifecycle
 update` or `lifecycle rollback` makes the operation remove nothing that
-existed before it: no snapshot, runtime, trash entry or display receipt (the
-`receipts/` directory is otherwise trimmed to its newest 32). Its receipt
+existed before it: no snapshot, runtime or trash entry (no lifecycle command
+removes a display receipt; see "Support output"). Its receipt
 records `retention.status: "skipped"` with `skippedReason:
 "skipped_by_operator"` and `wouldRemove`, what retention would have removed at
 that moment (absent when that read-only preview was blocked or failed). Managed rollout
 windows use it so that an update never deletes a host's history; removing old
-snapshots stays a separate, explicit `snapshots prune --apply`. The flag takes
+snapshots stays a separate, explicit `snapshots prune --apply`. The flag needs
+0.7.39 or later; older versions ignore it and prune. It takes
 exactly `keep-all`; a missing or other value, a repeated or `=`-joined flag,
 or the flag on any other lifecycle command fails before any change. `update`
 and `rollback` also refuse any option they do not take, so a misspelled flag
@@ -334,8 +338,11 @@ prompts/responses/tool content, repository or account identifiers, cookies,
 tokens, signing material, install credentials, and workspace credentials have
 no output field.
 
-Lifecycle receipts are similarly symbolic and bounded to the newest 32 local
-records. `ownedTargets` reports what the operation previews or applies,
+Lifecycle receipts are similarly symbolic. Every operation keeps its display
+receipt in `lifecycle/receipts/` (`<operation-id>-<operation>.json`, a few KB
+each; a retry of the same operation replaces its own). No lifecycle command
+removes one, not even a prune: a refused or `rollback_required` receipt is the
+only record of its operation. `ownedTargets` reports what the operation previews or applies,
 `retainedTargets` reports what remains, and `purgeOnlyTargets` identifies data
 that only the separate purge operation may remove. They report state
 transitions and categories, never paths or secret values.
@@ -349,6 +356,7 @@ pnpm proof:lifecycle            # transaction primitives with injected adapters
 pnpm proof:lifecycle-operator   # real adapter composition + packaged CLI end to end
 pnpm proof:lifecycle-retention  # bounded retention, clone snapshots, disk refusal, prune
 pnpm proof:lifecycle-data-safety  # open writers, atomic restore, strict receipts, clock steps, removal records
+pnpm proof:lifecycle-preservation  # no command removes a receipt; staging never changes an existing runtime
 ```
 
 The primitive proof uses a fresh temporary ownership root and injected
@@ -388,8 +396,10 @@ nothing; and the real CLI update path clones. Keep-all updates and rollbacks,
 through the manager and the real CLI, leave every earlier entry, the trash
 and a full receipts directory in place, record exactly what a prune would
 remove, and a later prune removes exactly that; a misused or misspelled
-`--retention` changes nothing, and a keep-all update that fails readiness
-rolls back without trimming receipts or touching the trash.
+`--retention` changes nothing, a keep-all update that fails readiness
+rolls back without trimming receipts or touching the trash, and a keep-all
+update whose preview is blocked (an unreadable removal record) records no
+`wouldRemove` and leaves that record as it was.
 
 The data-safety proof covers the worst cases: a writer that stays attached
 through an update, or attaches after the snapshot, never ends up writing to
@@ -401,3 +411,15 @@ unprovable order removes nothing; a process lost right after an unlink, or a
 receipt that cannot be written, still ends in a durable receipt naming the
 removal; preflight writes nothing; and the clone helper works from a
 detached session with no terminal.
+
+The preservation proof starts from more than 32 receipts, including a
+refused one, and runs a support bundle, uninstall and purge previews (also
+through the real CLI), a keep-all update, an update, a rollback, an update
+that rolls back, a prune while a `rollback_required` rollback is pending, and
+uninstall and purge applies: every receipt that existed before each command
+is still there, unchanged. It then installs a version with vendored
+companions and tries a rebuilt executable and a rebuilt native module under
+the same version: each fails and rolls back with every file of the installed
+version unchanged (content, mode, mtime and inode), an identical bundle
+re-stages without rewriting anything, a companion that fails its digest
+leaves no file behind, and a temp file an interrupted copy left is replaced.

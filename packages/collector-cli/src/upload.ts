@@ -8,7 +8,7 @@ import {
   type CollectorConfig,
 } from "./config";
 import { captureSpoolState } from "./capture-spool-state";
-import type { DeliveryCaptureClaim, LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
+import type { DeliveryCaptureClaim, DeliveryLease, LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
 import {
   aiWorkIngestBatchSchema,
   type AiInteractionEvent,
@@ -25,6 +25,9 @@ import {
   applyProjectAttribution,
   SessionAttributionBatch,
 } from "./session-attribution";
+
+/** Maximum events one upload request can take, including daemon requests. */
+export const MAX_EVENT_UPLOAD_BATCH_SIZE = 500;
 
 /**
  * Project attribution parity (issue 0036): the ledger's per-event repo
@@ -47,7 +50,7 @@ export function buildIngestBatch(
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
   buffer.useWorkspace(config.tenantId, config.deviceId);
   const candidateRows = buffer.listUnuploaded({
-    maxRows: options.limit ?? 500,
+    maxRows: options.limit ?? MAX_EVENT_UPLOAD_BATCH_SIZE,
     maxBytes: options.maxBytes,
   });
 
@@ -276,7 +279,7 @@ async function uploadStateless(
   // mode. This mode intentionally mutates no retry or upload state.
   const { batch } = buildIngestBatch(config, buffer, {
     ...options,
-    limit: 500,
+    limit: MAX_EVENT_UPLOAD_BATCH_SIZE,
     maxBytes: 1_500_000,
   });
   if (!batch) {
@@ -299,7 +302,7 @@ async function uploadStateless(
     attemptCount: 0,
   }));
   const maxRequestBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
-  const outputLimit = Math.max(1, Math.min(Math.trunc(options.limit ?? 500), 500));
+  const outputLimit = Math.max(1, Math.min(Math.trunc(options.limit ?? MAX_EVENT_UPLOAD_BATCH_SIZE), MAX_EVENT_UPLOAD_BATCH_SIZE));
   const items: LeasedDeliveryItem[] = [];
   for (const item of candidateItems) {
     if (items.length >= outputLimit) break;
@@ -366,6 +369,91 @@ export type UploadOptions = {
 
 let captureClaimFailureLogged = false;
 
+/**
+ * Rows one lease transaction seals and claims (eco-6hoxj.163.24). A 500-row
+ * lease re-checks privacy, attributes sessions and seals every row in one
+ * synchronous turn, 200-270 ms on the Studio0 ledger; the daemon claims the
+ * same batch in slices under one lease id and yields between them.
+ */
+export const LEASE_SLICE_ROWS = 125;
+
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function leasedRequestBytes(items: LeasedDeliveryItem[]) {
+  // outbox.lease's own accounting: envelope bytes plus one separator each.
+  return items.reduce((sum, item, index) => sum + Buffer.byteLength(item.envelopeJson) + (index > 0 ? 1 : 0), 0);
+}
+
+async function leaseInSlices(
+  buffer: LocalEventBuffer,
+  storage: <T>(operation: () => T | Promise<T>) => T | Promise<T>,
+  // One instant for every slice, as the single lease had: each lease() first
+  // expires overdue leases, and a later clock (a sleep or a clock step between
+  // slices) would expire this batch's own rows and claim them a second time.
+  options: { maxRows: number; maxBytes?: number; maxItemBytes: number; now: Date; leaseId?: string },
+): Promise<DeliveryLease> {
+  const maxBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
+  let requested = Math.min(options.maxRows, LEASE_SLICE_ROWS);
+  const first = await storage(() => buffer.delivery.lease({
+    maxRows: requested,
+    maxBytes,
+    now: options.now,
+    leaseId: options.leaseId,
+  }));
+  const items = [...first.items];
+  let locallyDead = first.locallyDead;
+  let last = first;
+  // A short slice ran out of due rows or of request bytes; later slices only
+  // start while any admissible item still fits the request.
+  while (
+    first.blockedBy === "none" &&
+    last.items.length + last.locallyDead >= requested &&
+    items.length < options.maxRows &&
+    maxBytes - leasedRequestBytes(items) - 1 >= options.maxItemBytes
+  ) {
+    await yieldToEventLoop();
+    requested = Math.min(options.maxRows - items.length, LEASE_SLICE_ROWS);
+    const budget = maxBytes - leasedRequestBytes(items) - 1;
+    last = await storage(() => buffer.delivery.lease({
+      maxRows: requested,
+      maxBytes: budget,
+      now: options.now,
+      leaseId: first.leaseId,
+    }));
+    if (last.blockedBy !== "none") break;
+    items.push(...last.items);
+    locallyDead += last.locallyDead;
+  }
+  return { leaseId: first.leaseId, items, locallyDead, blockedBy: first.blockedBy };
+}
+
+/** Acknowledge in slices of the lease's size; each id settles independently. */
+async function acknowledgeInSlices(
+  buffer: LocalEventBuffer,
+  storage: <T>(operation: () => T | Promise<T>) => T | Promise<T>,
+  leaseId: string,
+  ids: string[],
+  at: Date,
+  validationWitness?: { contractHash: string; item: LeasedDeliveryItem },
+) {
+  const total = { acknowledged: 0, acknowledgedIds: [] as string[], markedUploaded: 0, locallyDead: 0 };
+  let start = 0;
+  do {
+    if (start > 0) await yieldToEventLoop();
+    const slice = ids.slice(start, start + LEASE_SLICE_ROWS);
+    const witness = validationWitness && slice.includes(validationWitness.item.deliveryId)
+      ? validationWitness
+      : undefined;
+    const part = await storage(() => buffer.delivery.acknowledge(leaseId, slice, at, witness));
+    total.acknowledged += part.acknowledged;
+    total.acknowledgedIds.push(...part.acknowledgedIds);
+    total.markedUploaded += part.markedUploaded;
+    total.locallyDead += part.locallyDead;
+    start += LEASE_SLICE_ROWS;
+  } while (start < ids.length);
+  return total;
+}
+
 export async function uploadBufferedEvents(
   config: CollectorConfig,
   buffer: LocalEventBuffer,
@@ -402,8 +490,8 @@ export async function uploadBufferedEvents(
   const outputLimit = Math.max(
     1,
     Math.min(
-      Number.isFinite(options.limit) ? Math.trunc(options.limit!) : 500,
-      500,
+      Number.isFinite(options.limit) ? Math.trunc(options.limit!) : MAX_EVENT_UPLOAD_BATCH_SIZE,
+      MAX_EVENT_UPLOAD_BATCH_SIZE,
     ),
   );
   const maxProbes = Math.max(
@@ -480,12 +568,15 @@ export async function uploadBufferedEvents(
     throw new DeliveryUploadError(witnessFailure, witnessResult.statusClass, witnessResult.retryAfterMs ?? 0, witnessResult.networkCode ?? null);
   }
 
-  const lease = await storage(() => buffer.delivery.lease({
+  const lease = await leaseInSlices(buffer, storage, {
     maxRows: buffer.delivery.validationLeaseRows(outputLimit),
     maxBytes: options.maxBytes,
+    maxItemBytes: config.delivery.maxItemBytes,
     now: nowFn(),
     leaseId: options.leaseId,
-  }));
+  });
+  // Revalidation and the request body are the next synchronous turn.
+  if (lease.items.length > 0) await yieldToEventLoop();
   const statusBefore = buffer.delivery.status(nowFn());
   if (lease.items.length === 0) {
     return {
@@ -741,14 +832,16 @@ export async function uploadBufferedEvents(
 
   options.afterRemote?.();
 
-  const acknowledged = await storage(() => buffer.delivery.acknowledge(
+  const acknowledged = await acknowledgeInSlices(
+    buffer,
+    storage,
     lease.leaseId,
     [...succeeded.keys()],
     nowFn(),
     succeeded.size > 0
       ? { contractHash, item: [...succeeded.values()][0] }
       : undefined,
-  ));
+  );
   locallyDead += acknowledged.locallyDead;
   const acknowledgedIds = new Set(acknowledged.acknowledgedIds);
   for (const id of succeeded.keys()) {

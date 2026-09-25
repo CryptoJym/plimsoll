@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-retention", 72);
+const completion = createProofCompletion("lifecycle-retention", 73);
 /**
  * eco-6hoxj.163.30: lifecycle update snapshots are bounded and cheap.
  *
@@ -26,7 +26,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
-import os from "node:os";
 import path from "node:path";
 
 import Database from "better-sqlite3";
@@ -72,7 +71,9 @@ const NODE_MAJOR = Number(process.versions.node.split(".", 1)[0]);
 const ARCHITECTURE = process.arch === "x64" ? "x64" as const : "arm64" as const;
 const LEDGER_SENTINEL = `ledger-content-sentinel-${randomBytes(6).toString("hex")}`;
 const CONFIG_SENTINEL = `config-secret-sentinel-${randomBytes(6).toString("hex")}`;
-const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-retention-")));
+const FIXTURE_PARENT = "/private/var/tmp";
+fs.mkdirSync(FIXTURE_PARENT, { recursive: true });
+const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(FIXTURE_PARENT, "plimsoll-retention-")));
 
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const freeBytes = (directory: string) => {
@@ -843,6 +844,7 @@ syncBuiltinESMExports();
       JSON.stringify(k5Marker.retention) === JSON.stringify(k5.retention) && keepAllListing.blockedReason === null &&
       keepAllListing.snapshots.length === 5 && keepAllListing.snapshots.every((row) => row.operationState === "completed"),
       keepAllListing);
+
     const withRetention = (retention: Record<string, unknown>) => ({ ...k5Marker, retention });
     check("only_an_operator_keep_all_record_may_carry_would_remove_and_it_recovers_nothing",
       parseCompletionReceipt(withRetention({ ...k5Marker.retention, skippedReason: "retention_failed" }), "k5") === null &&
@@ -939,6 +941,29 @@ syncBuiltinESMExports();
       misuses.every((run) => run.code !== 0 && run.stderr.includes("--retention")) &&
       treeDigest(flagHome.home).digest === flagTree.digest && !exists(path.join(stub, "calls.log")),
       misuses.map((run) => ({ code: run.code, stderr: run.stderr.slice(-200) })));
+
+    // eco-6hoxj.163.52: a keep-all update whose read-only preview is blocked
+    // records no wouldRemove ("would remove nothing" would hide why), and the
+    // record that blocked it stays as it was.
+    const blockedPreview = createHome("keep-all-blocked", 2);
+    for (const [index, version] of ["8.0.0", "8.0.1", "8.0.2"].entries()) {
+      await blockedPreview.keepAllManager().update({ operationId: `b${index + 1}`, artifact: blockedPreview.artifact(version) });
+    }
+    const unreadableRecord = path.join(blockedPreview.lifecycleRoot, "removals", "b0-unreadable.json");
+    fs.mkdirSync(path.dirname(unreadableRecord), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(unreadableRecord, "{ not a removal record\n", { mode: 0o600 });
+    const unreadableBytes = fs.readFileSync(unreadableRecord);
+    const b4 = await blockedPreview.keepAllManager().update({ operationId: "b4", artifact: blockedPreview.artifact("8.0.3") });
+    const b4Marker = JSON.parse(fs.readFileSync(path.join(blockedPreview.lifecycleRoot, "completed-operations", "b4.json"), "utf8")) as
+      LifecycleReceipt;
+    const blockedListing = await blockedPreview.manager().listSnapshots();
+    check("keep_all_update_with_a_blocked_preview_records_no_would_remove_and_keeps_the_record",
+      b4.status === "completed" && b4.retention?.skippedReason === "skipped_by_operator" && !("wouldRemove" in b4.retention) &&
+      b4Marker.retention !== undefined && !("wouldRemove" in b4Marker.retention) &&
+      blockedListing.blockedReason === "removal_record_unreadable" &&
+      exists(unreadableRecord) && fs.readFileSync(unreadableRecord).equals(unreadableBytes) &&
+      same(blockedPreview.snapshots(), ["b1", "b2", "b3", "b4"]),
+      { retention: b4.retention, blockedReason: blockedListing.blockedReason, recordKept: exists(unreadableRecord) });
 
     // ---- Hostile layout: retention never follows a symlink ----------------
     const hostile = createHome("hostile", 1);

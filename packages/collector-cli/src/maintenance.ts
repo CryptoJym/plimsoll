@@ -24,6 +24,8 @@ import {
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
+import { DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH } from "./learning-facts";
+import { isSessionSyncUploadLeaseError } from "./sqlite-contention";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
@@ -36,18 +38,96 @@ const CAPTURE_COVERAGE_CHECK_KEY = "capture_coverage_checked_at";
 const CAPTURE_COVERAGE_TURN_MARGIN_MS = 25;
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
-const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
+const REPAIR_STAGES = [
+  "projection",
+  "reconciliation",
+  "repricing",
+  "repo_context_suppression",
+  "learning_facts",
+] as const;
+const AUTOMATIC_CAPTURE_FAIRNESS_KEY = "automatic_capture_fairness_v1";
+type CaptureSource = "codex" | "claude_code" | "grok";
 type RepairStage = typeof REPAIR_STAGES[number];
 type RepairService = { next: number; cycles: number; stages: Record<RepairStage, {
   attempts: number; completed: number; failures: number; rowsVisited: number; lastSuccessAt: string | null;
 }> };
 
+/**
+ * Capture hand-off (eco-6hoxj.163.42). A cadence whose capture leader the
+ * clock never let start (repairs or the bookkeeping before capture spent
+ * the allowance) hands the next cadence to capture (`captureFirst`) and lets
+ * that cadence's leader start its first unit even if the clock is spent
+ * again (`leaderDenied`). `deniedCadences` counts such cadences. Path- and
+ * content-free.
+ */
+export type AutomaticCaptureFairness = {
+  version: 2;
+  captureFirst: boolean;
+  leaderDenied: boolean;
+  deniedCadences: number;
+};
+
+/** One cadence's capture turn, for receipts and proofs. */
+export type AutomaticCaptureTurn = {
+  captureFirst: boolean;
+  order: CaptureSource[];
+  leader: CaptureSource;
+  /** The leader had its turn, so the rotation moved on to the next source. */
+  leaderServed: boolean;
+  /** The previous cadence denied its leader, so this one's could start past a spent clock. */
+  leaderOverride: boolean;
+  /** Cadence clock spent before the leader's turn: repairs on repair-first cadences, and bookkeeping. */
+  preCaptureMs: number;
+  admitted: Partial<Record<CaptureSource, boolean>>;
+  progressed: Partial<Record<CaptureSource, boolean>>;
+};
+
 export function automaticRepairServiceStatus(database: Database.Database): RepairService {
-  const stored = maintenanceState(database, REPAIR_SERVICE_KEY);
-  if (stored) return JSON.parse(stored) as RepairService;
-  return { next: 0, cycles: 0, stages: Object.fromEntries(REPAIR_STAGES.map(stage => [stage, {
+  const emptyStages = () => Object.fromEntries(REPAIR_STAGES.map(stage => [stage, {
     attempts: 0, completed: 0, failures: 0, rowsVisited: 0, lastSuccessAt: null,
-  }])) as RepairService["stages"] };
+  }])) as RepairService["stages"];
+  const stored = maintenanceState(database, REPAIR_SERVICE_KEY);
+  if (stored) {
+    const parsed = JSON.parse(stored) as Partial<RepairService>;
+    const stages = emptyStages();
+    for (const stage of REPAIR_STAGES) {
+      const prior = parsed.stages?.[stage];
+      if (prior) stages[stage] = { ...stages[stage], ...prior };
+    }
+    const next = typeof parsed.next === "number" && Number.isSafeInteger(parsed.next) && parsed.next >= 0
+      ? parsed.next
+      : 0;
+    const cycles = typeof parsed.cycles === "number" && Number.isSafeInteger(parsed.cycles) && parsed.cycles >= 0
+      ? parsed.cycles
+      : 0;
+    return {
+      next,
+      cycles,
+      stages,
+    };
+  }
+  return { next: 0, cycles: 0, stages: emptyStages() };
+}
+
+export function automaticCaptureFairnessStatus(database: Database.Database): AutomaticCaptureFairness {
+  try {
+    const stored = JSON.parse(maintenanceState(database, AUTOMATIC_CAPTURE_FAIRNESS_KEY) ?? "null") as
+      { version?: unknown; captureFirst?: unknown; leaderDenied?: unknown; deniedCadences?: unknown } | null;
+    // Version 1 (round 2) also carried a debt ledger; only its hand-off remains.
+    if (stored?.version === 1 || stored?.version === 2) {
+      return {
+        version: 2,
+        captureFirst: stored.captureFirst === true,
+        leaderDenied: stored.leaderDenied === true,
+        deniedCadences: Number.isSafeInteger(stored.deniedCadences) && (stored.deniedCadences as number) >= 0
+          ? stored.deniedCadences as number
+          : 0,
+      };
+    }
+  } catch {
+    // An unreadable hand-off is none: the parity alternation still serves capture.
+  }
+  return { version: 2, captureFirst: false, leaderDenied: false, deniedCadences: 0 };
 }
 
 function ensureAutomaticCaptureRuntimeState(database: Database.Database) {
@@ -592,6 +672,8 @@ export type CollectorMaintenanceRunResult = {
   captureAdvanced?: boolean;
   postCaptureDeferred?: string[];
   repairService?: RepairService;
+  /** Capture order, admission, progress and debt of this cadence. */
+  captureTurn?: AutomaticCaptureTurn;
   stageTimings?: MaintenanceStageTimings;
 };
 
@@ -804,11 +886,41 @@ export class CollectorMaintenance {
     // overruns the allowance cannot exhaust every cadence before any tailer
     // reads. Repairs on a capture-first cadence use only what capture leaves.
     // Persist the choice before work; neither restarts nor busy sources may
-    // starve either consumer on the intervening turns.
+    // starve either consumer on the intervening turns. The alternation is
+    // not trusted alone: a cadence whose capture leader never started,
+    // because repairs or the bookkeeping before capture spent the allowance,
+    // hands the next cadence to capture whatever its parity, and that
+    // cadence's leader starts its first unit even if the clock is spent
+    // again. The hand-off is used up by that cadence.
     const repairService = automaticRepairServiceStatus(this.buffer.database);
     const firstRepair = repairService.next % REPAIR_STAGES.length;
     repairService.cycles += 1;
-    const captureFirst = repairService.cycles % 2 === 0;
+    const fairness = automaticCaptureFairnessStatus(this.buffer.database);
+    const captureFirst = repairService.cycles % 2 === 0 || fairness.captureFirst;
+    const leaderOverride = fairness.leaderDenied;
+    if (fairness.captureFirst || fairness.leaderDenied) {
+      setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY,
+        JSON.stringify({ ...fairness, captureFirst: false, leaderDenied: false } satisfies AutomaticCaptureFairness));
+    }
+    const sourceOrder = this.grokTailer
+      ? ["codex", "claude_code", "grok"] as const
+      : ["codex", "claude_code"] as const;
+    // Capture sources lead in a fixed rotation, and the lead passes on once
+    // its holder has had its turn: it started with the aggregate clock open,
+    // whether it then committed, failed or was killed. Only a leader the clock
+    // never let start keeps the lead. With the hand-off, the rotation moves in
+    // at least one of every two cadences, so each of S sources leads within
+    // 2S cadences (6 with Grok), and as the leader its first unit is admitted
+    // and allowed to finish. A source that keeps failing cannot hold the
+    // lead, so it cannot keep the others out (eco-6hoxj.163.42 round 3). The
+    // bound does not depend on the bookkeeping before capture fitting inside
+    // the allowance: a leader the clock denies starts on the next cadence
+    // whatever the clock (round 4).
+    const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
+    const storedIndex = (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex");
+    const firstIndex = storedIndex >= 0 ? storedIndex : 0;
+    const runOrder: CaptureSource[] = sourceOrder.map((_, offset) =>
+      sourceOrder[(firstIndex + offset) % sourceOrder.length]!);
     let repairTurnAdvanced = false;
     const saveRepairService = () => setMaintenanceState(this.buffer.database,
       REPAIR_SERVICE_KEY, JSON.stringify(repairService));
@@ -879,12 +991,21 @@ export class CollectorMaintenance {
             case "repo_context_suppression":
               rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
               break;
+            case "learning_facts":
+              rows = this.buffer.learningFacts.runMaintenance(
+                DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH,
+              ).evicted;
+              break;
           }
           counter.completed += 1;
           counter.rowsVisited += rows;
           counter.lastSuccessAt = new Date(Date.now()).toISOString();
         } catch (error) {
-          counter.failures += 1;
+          // A live session send lease refuses this transaction temporarily.
+          // The work remains queued, so this attempt is deferred, not failed.
+          if (isSessionSyncUploadLeaseError(error)) {
+            repairService.next = REPAIR_STAGES.indexOf(stage);
+          } else counter.failures += 1;
           throw error;
         } finally { saveRepairService(); }
       }
@@ -899,26 +1020,29 @@ export class CollectorMaintenance {
     const phase = baselineAtStart.sources.every((source) => source.status === "complete")
       ? "capture" as const
       : "baseline" as const;
-    // Advance before admitted capture, including a possible slow-source kill.
-    // An exhausted repair turn cannot spend the next source's turn. With a
-    // Grok usage tailer the turn rotates over three sources, so each one
-    // leads the shared allowance every third cadence.
-    const sourceOrder = this.grokTailer
-      ? ["codex", "claude_code", "grok"] as const
-      : ["codex", "claude_code"] as const;
-    const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
-    const firstIndex = Math.max(0, (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex"));
-    const runOrder = sourceOrder.map((_, offset) => sourceOrder[(firstIndex + offset) % sourceOrder.length]!);
-    if (budget.canContinue()) setMaintenanceState(
-      this.buffer.database,
-      AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
-      sourceOrder[(firstIndex + 1) % sourceOrder.length]!,
-    );
+    // Each source's turn is a scope of the one shared budget. Every aggregate
+    // ceiling, the wall clock included, stays hard for admission: a source
+    // whose turn comes after the allowance is spent is not admitted. The
+    // remaining wall is shared among the sources still to run, so one busy
+    // source cannot take a whole cadence; unused time flows to the next. An
+    // admitted turn is progress, not just admission: its first bounded unit
+    // is admitted on the aggregate clock even past its share, and allowed to
+    // finish (`CaptureWorkBudget.unitDeadline`) instead of being abandoned
+    // after its slow read was already paid for. Bytes, records and events
+    // are not divided: a byte share would starve any Grok usage file larger
+    // than one share. The pre-Grok two-source cadence (callers without a
+    // Grok tailer) keeps its budget unchanged.
+    const scopedCaptureBudget = (sourcesLeft: number, pastSpentWall = false) => this.grokTailer || pastSpentWall
+      ? budget.scoped(this.grokTailer
+        ? { maxWallMs: Math.floor(budget.remainingWallMs() / Math.max(1, sourcesLeft)) }
+        : {}, { progressUnit: true, pastSpentWall })
+      : budget;
+    const admitted: Partial<Record<CaptureSource, boolean>> = {};
     const startedAt = new Date().toISOString();
     let rollout: RolloutScanResult | undefined;
     let transcript: TranscriptScanResult | undefined;
     let grok: GrokUsageScanResult | undefined;
-    const runRollout = async () => {
+    const runRollout = async (sourceBudget: CaptureWorkBudget) => {
       this.current = { phase, source: "codex", startedAt, budget };
       const sourceAccepted = options.onProgress?.({
         source: "codex",
@@ -929,19 +1053,19 @@ export class CollectorMaintenance {
       return this.rolloutTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
-        automatic: { phase, budget },
+        automatic: { phase, budget: sourceBudget },
         signal: this.signal,
         quarantine: options.quarantine?.source === "codex" && options.quarantine.candidateHash
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "codex", ...progress }) ?? true,
-        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
-          (options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan"),
+        deferredBeforeIo: !(admitted.codex = sourceBudget.canContinue() && sourceAccepted &&
+          !(options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan")),
       }).finally(() => {
         codexCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
     };
-    const runTranscript = async () => {
+    const runTranscript = async (sourceBudget: CaptureWorkBudget) => {
       this.current = { phase, source: "claude_code", startedAt, budget };
       const sourceAccepted = options.onProgress?.({
         source: "claude_code",
@@ -952,19 +1076,19 @@ export class CollectorMaintenance {
       return this.transcriptTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
-        automatic: { phase, budget },
+        automatic: { phase, budget: sourceBudget },
         signal: this.signal,
         quarantine: options.quarantine?.source === "claude_code" && options.quarantine.candidateHash
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "claude_code", ...progress }) ?? true,
-        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
-          (options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan"),
+        deferredBeforeIo: !(admitted.claude_code = sourceBudget.canContinue() && sourceAccepted &&
+          !(options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan")),
       }).finally(() => {
         claudeCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
     };
-    const runGrok = async (tailer: GrokUsageTailer) => {
+    const runGrok = async (tailer: GrokUsageTailer, sourceBudget: CaptureWorkBudget) => {
       this.current = { phase, source: "grok", startedAt, budget };
       // Announce the source before any filesystem work, as the other two do,
       // so a stall inside the Grok scan is held against Grok's own stage and
@@ -975,18 +1099,29 @@ export class CollectorMaintenance {
         candidateHash: null,
       }) !== false;
       return tailer.scan({
-        budget,
+        budget: sourceBudget,
         now: new Date(startedAt),
         signal: this.signal,
-        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
-          (options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan"),
+        deferredBeforeIo: !(admitted.grok = sourceBudget.canContinue() && sourceAccepted &&
+          !(options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan")),
       });
     };
+    let leaderServed = false;
+    let preCaptureMs = 0;
     try {
-      for (const source of runOrder) {
-        if (source === "codex") rollout = await runRollout();
-        else if (source === "claude_code") transcript = await runTranscript();
-        else if (this.grokTailer) grok = await runGrok(this.grokTailer);
+      for (const [index, source] of runOrder.entries()) {
+        if (index === 0) preCaptureMs = Math.round(budget.elapsedWallMs());
+        const sourceBudget = scopedCaptureBudget(runOrder.length - index, index === 0 && leaderOverride);
+        if (index === 0 && sourceBudget.canContinue()) {
+          // Pass the lead on before the leader's scan can fail, overrun or be
+          // killed with its worker.
+          leaderServed = true;
+          setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
+            sourceOrder[(firstIndex + 1) % sourceOrder.length]!);
+        }
+        if (source === "codex") rollout = await runRollout(sourceBudget);
+        else if (source === "claude_code") transcript = await runTranscript(sourceBudget);
+        else if (this.grokTailer) grok = await runGrok(this.grokTailer, sourceBudget);
       }
       this.lastBudget = budget.status();
       if (this.signal?.aborted || rollout?.aborted || transcript?.aborted || grok?.aborted) {
@@ -1002,6 +1137,28 @@ export class CollectorMaintenance {
       this.current = null;
     }
     if (!rollout || !transcript) throw new Error("automatic_maintenance_result_missing");
+    // The clock never let the leader start: hand the next cadence to capture
+    // and let its leader start whatever the clock.
+    if (!leaderServed) {
+      const denied = automaticCaptureFairnessStatus(this.buffer.database);
+      setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY, JSON.stringify({
+        version: 2, captureFirst: true, leaderDenied: true, deniedCadences: denied.deniedCadences + 1,
+      } satisfies AutomaticCaptureFairness));
+    }
+    // A durable commit this cadence: records, a checkpoint, a Grok document
+    // or a Grok walk step. Receipt only; the rotation does not depend on it.
+    const jsonlProgressed = (result: RolloutScanResult | TranscriptScanResult) =>
+      result.slicesCommitted > 0 || (result.recordsCommitted ?? 0) > 0 ||
+      (result.continuationBytesAdvanced ?? 0) > 0;
+    const progressed: Partial<Record<CaptureSource, boolean>> = {
+      codex: jsonlProgressed(rollout),
+      claude_code: jsonlProgressed(transcript),
+      ...(grok ? { grok: grok.recordsCommitted > 0 || grok.filesParsed > 0 || grok.activity.discoveryEntries > 0 } : {}),
+    };
+    const captureTurn: AutomaticCaptureTurn = {
+      captureFirst, order: runOrder, leader: runOrder[0]!, leaderServed, leaderOverride, preCaptureMs,
+      admitted, progressed,
+    };
     if (rollout.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
     }
@@ -1054,6 +1211,7 @@ export class CollectorMaintenance {
         (grok?.recordsCommitted ?? 0) > 0,
       postCaptureDeferred,
       repairService,
+      captureTurn,
       stageTimings: {
         codexCaptureMs,
         claudeCaptureMs,
@@ -1184,6 +1342,7 @@ export class CoalescingMaintenanceScheduler<
   private async drain() {
     const results: T[] = [];
     let firstError: unknown;
+    let firstFailure: unknown;
     while (this.pending) {
       this.pending = false;
       this.runCount += 1;
@@ -1207,7 +1366,10 @@ export class CoalescingMaintenanceScheduler<
         this.enrichmentRowsVisited += completed.enrichment.rowsVisited;
         results.push(result);
       } catch (error) {
-        this.failedRuns += 1;
+        if (!isSessionSyncUploadLeaseError(error)) {
+          this.failedRuns += 1;
+          firstFailure ??= error;
+        }
         firstError ??= error;
       } finally {
         this.activeJobs -= 1;
@@ -1222,7 +1384,8 @@ export class CoalescingMaintenanceScheduler<
     const waiters = this.waiters;
     this.waiters = [];
     for (const waiter of waiters) {
-      if (firstError !== undefined) waiter.reject(firstError);
+      if (firstFailure !== undefined) waiter.reject(firstFailure);
+      else if (firstError !== undefined) waiter.reject(firstError);
       else waiter.resolve(results);
     }
   }
@@ -1240,12 +1403,14 @@ export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOu
 
 export const AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS = 5_000;
 export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
+const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS = 1_000;
+const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS = 5_000;
 const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
 
 export type AutomaticMaintenanceCadenceStatus = {
   accepting: boolean;
   inFlight: boolean;
-  retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal" | null;
+  retryClass: "boot" | "startup" | "repair" | "capture" | "storage_busy" | "circuit" | "normal" | null;
   nextRetryAt: string | null;
   startupIntervalMs: number;
   normalIntervalMs: number;
@@ -1276,10 +1441,11 @@ export class AutomaticMaintenanceCadence<
   private accepting = true;
   private inFlight = false;
   private timer: unknown | null = null;
-  private retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal" | null = null;
+  private retryClass: AutomaticMaintenanceCadenceStatus["retryClass"] = null;
   private nextRetryAt: string | null = null;
   private triggerCount = 0;
   private failedTriggers = 0;
+  private storageBusyDeferrals = 0;
   private captureFollowups = 0;
 
   constructor(
@@ -1364,12 +1530,17 @@ export class AutomaticMaintenanceCadence<
     return after.state === "in_progress" && advanced ? "startup" : "normal";
   }
 
-  private schedule(retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal") {
+  private schedule(retryClass: Exclude<AutomaticMaintenanceCadenceStatus["retryClass"], null>) {
     if (!this.accepting || this.timer) return;
     const now = this.timerApi().now();
     const notBefore = this.options.retryNotBefore?.() ?? null;
     const delay = notBefore !== null && notBefore > now ? notBefore - now
-      : retryClass === "normal" ? this.normalIntervalMs() : this.startupIntervalMs();
+      : retryClass === "normal" ? this.normalIntervalMs()
+        : retryClass === "storage_busy"
+          ? Math.min(AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS,
+            AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS *
+              2 ** Math.max(0, this.storageBusyDeferrals - 1))
+          : this.startupIntervalMs();
     if (notBefore !== null && notBefore > now) retryClass = "circuit";
     this.retryClass = retryClass;
     const timerApi = this.timerApi();
@@ -1391,6 +1562,7 @@ export class AutomaticMaintenanceCadence<
     this.inFlight = true;
     this.triggerCount += 1;
     let failed = false;
+    let storageBusy = false;
     let discoveryAdvanced = false;
     let baselineBefore: ReturnType<typeof captureBaselineStatus>["progress"] | null = null;
     let repairBefore: { pending: boolean; units: number } | null = null;
@@ -1399,6 +1571,7 @@ export class AutomaticMaintenanceCadence<
       baselineBefore = this.baselineStatus().progress;
       repairBefore = this.options.repairProgress?.() ?? null;
       const results = await requestAutomaticRecentMaintenance(this.scheduler);
+      this.storageBusyDeferrals = 0;
       // Preserve a short retry burst across discovery/frame deferrals. Only
       // committed records or new durable scan bytes renew it; prefix rereads,
       // refused/idle work and failed transactions cannot renew the burst.
@@ -1420,19 +1593,29 @@ export class AutomaticMaintenanceCadence<
           ),
       );
     } catch (error) {
-      failed = true;
-      this.captureFollowups = 0;
-      this.failedTriggers += 1;
-      this.options.onError?.(error);
+      if (isSessionSyncUploadLeaseError(error)) {
+        storageBusy = true;
+        // Cap the backoff at five seconds under consecutive session sends.
+        this.storageBusyDeferrals = Math.min(4, this.storageBusyDeferrals + 1);
+      } else {
+        failed = true;
+        this.storageBusyDeferrals = 0;
+        this.captureFollowups = 0;
+        this.failedTriggers += 1;
+        this.options.onError?.(error);
+      }
     } finally {
       this.inFlight = false;
       if (this.accepting) {
-        let retry: "normal" | "repair" | "startup" | "capture" = "normal";
+        let retry: "normal" | "repair" | "startup" | "capture" | "storage_busy" =
+          storageBusy ? "storage_busy" : "normal";
         try {
-          const baselineAfter = this.baselineStatus().progress;
-          if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
-            : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
-              : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
+          if (!storageBusy) {
+            const baselineAfter = this.baselineStatus().progress;
+            if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
+              : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
+                : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
+          }
         } catch (error) {
           this.captureFollowups = 0;
           this.failedTriggers += 1;

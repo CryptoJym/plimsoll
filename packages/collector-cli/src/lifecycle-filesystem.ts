@@ -32,7 +32,6 @@ import { isStatusSummaryTempFile } from "./status-summary";
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const EXECUTABLE_MODE = 0o700;
-const MAX_RECEIPTS = 32;
 const MAX_MARKER_BYTES = 64 * 1024;
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const MAX_TREE_ENTRIES = 200_000;
@@ -659,33 +658,61 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     );
     const target = path.join(this.root, immutableRuntimeRelativePath(artifact));
     const stagedCompanions: Array<{ destination: string }> = [];
+    const companionDestinations = (artifact.files ?? []).map((file, index) => {
+      const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
+      assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
+      assertNoSymlink(path.dirname(destination), this.root);
+      return { file, destination, index };
+    });
+
+    // The executable is the immutable target for this version. Check it before
+    // touching any companion so a conflicting repin cannot damage an existing
+    // runtime closure before the transaction rolls back.
+    assertNoSymlink(path.dirname(target), this.root);
+    const targetStat = lstatIfPresent(target);
+    if (targetStat && (!targetStat.isFile() || targetStat.isSymbolicLink() || sha256(target) !== artifact.sha256)) {
+      throw new Error("immutable runtime target already differs");
+    }
+
+    // Existing companions are immutable too. Validate every one before
+    // staging a missing companion, so a mismatch leaves the whole closure
+    // untouched.
+    for (const { file, destination, index } of companionDestinations) {
+      const stat = lstatIfPresent(destination);
+      if (!stat) continue;
+      if (!stat.isFile() || stat.isSymbolicLink() || sha256(destination) !== file.sha256) {
+        throw new Error(`immutable runtime companion ${file.relativePath} already differs`);
+      }
+    }
+
     try {
-      for (const [index, file] of (artifact.files ?? []).entries()) {
-        const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
-        assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
-        assertNoSymlink(path.dirname(destination), this.root);
-        ensureDirectory(path.dirname(destination), this.root);
-        if (fs.existsSync(destination)) {
-          fs.rmSync(destination, { force: true });
-        }
+      for (const { file, index, destination } of companionDestinations) {
+        if (lstatIfPresent(destination)) continue;
         // Companion sources live in the artifact staging area next to the
         // bundle; their absolute paths were validated when resolved.
-        assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${index} source`);
+        assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${file.relativePath} source`);
         assertNoSymlink(file.sourcePath, this.paths.artifactSourceRoot);
-        copyRegularFile(file.sourcePath, destination, FILE_MODE, this.root);
-        if (sha256(destination) !== file.sha256) throw new Error(`companion ${index} digest mismatch`);
+        ensureDirectory(path.dirname(destination), this.root);
+        // Verify beside the final destination, then publish with one rename.
+        // A failed copy or digest check therefore cannot leave a partial or
+        // unverified companion under its immutable name.
+        const staging = `${destination}+staging`;
+        fs.rmSync(staging, { force: true });
+        try {
+          copyRegularFile(file.sourcePath, staging, FILE_MODE, this.root);
+          if (sha256(staging) !== file.sha256) throw new Error(`companion ${index} digest mismatch`);
+          fs.renameSync(staging, destination);
+        } catch (error) {
+          fs.rmSync(staging, { force: true });
+          throw error;
+        }
         stagedCompanions.push({ destination });
       }
-      assertNoSymlink(path.dirname(target), this.root);
-      ensureDirectory(path.dirname(target), this.root);
-      if (fs.existsSync(target)) {
-        const stat = fs.lstatSync(target);
-        if (!stat.isFile() || stat.isSymbolicLink() || sha256(target) !== artifact.sha256) {
-          throw new Error("immutable runtime target already differs");
-        }
+      if (targetStat) {
         fs.chmodSync(target, EXECUTABLE_MODE);
         return;
       }
+      ensureDirectory(path.dirname(target), this.root);
       const staging = `${target}.staging`;
       fs.rmSync(staging, { force: true });
       try {
@@ -827,20 +854,15 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     ensureDirectory(this.completedRoot, this.root);
     if (receipt.status !== "rollback_required" && receipt.status !== "refused") {
       // The durable, unbounded marker is the operation-ID authority. Commit
-      // it before the bounded display receipt so a stop between the two can
-      // never make a completed destructive operation reusable. A verified or
+      // it before the display receipt so a stop between the two can never
+      // make a completed destructive operation reusable. A verified or
       // rollback-complete journal can still reopen and finish receipt writing.
       // A refusal changed nothing, so its operation ID stays usable.
       writeJsonDurable(path.join(this.completedRoot, `${receipt.operationId}.json`), receipt, this.completedRoot);
     }
+    // Display receipts are never trimmed: a refused or rollback_required
+    // receipt is the only record of its operation.
     writeJsonDurable(path.join(this.receiptsRoot, `${receipt.operationId}-${receipt.operation}.json`), receipt, this.receiptsRoot);
-    if (this.keepAll) return;
-    const receipts = fs.readdirSync(this.receiptsRoot)
-      .filter((entry) => entry.endsWith(".json"))
-      .sort((left, right) => left.localeCompare(right));
-    for (const stale of receipts.slice(0, Math.max(0, receipts.length - MAX_RECEIPTS))) {
-      fs.rmSync(path.join(this.receiptsRoot, stale), { force: true });
-    }
   }
 
   async uninstallOwned(input: { apply: boolean }) {

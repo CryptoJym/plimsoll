@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 7 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 10 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -15,6 +15,18 @@ export const SYSTEM_E2E_BUDGETS = {
   maxRssBytes: 1_500_000_000,
   blockOperations: 500_000,
   capturedOutputBytes: 24 * 1024 * 1024,
+} as const;
+/**
+ * Ceilings on the idle scenario's directory enumeration. They stop the fixture
+ * from silently growing; the exact topology checks in the resource proof are
+ * the regression guards. Shared by the proof and the receipt verifier.
+ */
+export const SYSTEM_E2E_IDLE_FILESYSTEM_CEILINGS = {
+  entriesScanned: 8_192,
+  setupEntriesScanned: 7_680,
+  unchangedEntriesScanned: 2_048,
+  enumerationCalls: 32,
+  unchangedEnumerationCalls: 8,
 } as const;
 
 export type SupportingKind =
@@ -204,9 +216,17 @@ function normalizeString(
   return value;
 }
 
-const VOLATILE_NUMBER_KEYS = /^(?:pid|port|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
+// Loopback listeners receive an ephemeral port from the host. The proof keeps
+// the listener/bind assertions, so only the allocated numbers are
+// environmental and safe to replace in the cross-run semantic artifact.
+const VOLATILE_NUMBER_KEYS = /^(?:pid|port|unreachablePort|standInDefaultPort|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
+// The resource receipt keeps all directory work in the semantic artifact. The
+// system-e2e gate checks the complete setup total and unchanged sweep before
+// hashing. Startup and baseline split counters depend on which bounded source
+// sweep the scheduler runs first, so normalize only that environmental split;
+// keep totals and unchanged counters in the semantic artifact.
 const RESOURCE_VOLATILE_NUMBER_PATH =
-  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata)))$/;
+  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata|startupFilesystemEntriesScanned|startupFilesystemEnumerationCalls|baselineFilesystemEntriesScanned|baselineFilesystemEnumerationCalls)))$/;
 
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
@@ -381,7 +401,7 @@ function assertResourceReceipt(receipt: unknown) {
     ["schema", "generatedAt", "overall", "gateReady", "requireIntegrated", "environment", "summary", "scenarios"],
     "resource receipt",
   );
-  assert.equal(receipt.schema, "plimsoll.resource-proof.v1");
+  assert.equal(receipt.schema, "plimsoll.resource-proof.v2");
   assert.equal(receipt.overall, "pass");
   assert.equal(receipt.gateReady, true);
   assert.equal(receipt.requireIntegrated, true);

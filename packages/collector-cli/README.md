@@ -45,7 +45,8 @@ remain gated under
 # the owned LaunchAgent manifest at it, verify durable readiness; any failure
 # restores the previous runtime, config, database, and manifest automatically.
 # A healthy update then keeps the two newest update snapshots and removes older
-# ones; --retention keep-all removes nothing (prune later, below).
+# ones; --retention keep-all (0.7.39 or later; older versions ignore it and
+# prune) removes nothing; prune later (below).
 npx @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self --retention keep-all
 
 # Afterwards, restart the daemon on the new immutable runtime explicitly:
@@ -151,6 +152,10 @@ merely resolve to this machine. Every use prints a warning to stderr and a
 `development_upload_url_used` line in the command's output. It is a
 command-line flag, not a setting, so it never carries over to other commands
 or processes.
+
+The collector's own loopback HTTP requests and its generated Codex and Grok
+curl hooks bypass inherited proxies, keeping their local credentials and bodies
+on this machine. Hosted workspace requests still use configured proxies.
 
 ## What leaves your machine
 

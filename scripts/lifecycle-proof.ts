@@ -5,7 +5,6 @@
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import {
@@ -59,7 +58,9 @@ function mode(file: string) {
 type Fixture = ReturnType<typeof fixture>;
 
 function fixture(name: string) {
-  const ownershipRoot = fs.mkdtempSync(path.join(os.tmpdir(), `plimsoll-lifecycle-${name}-`));
+  const fixtureParent = "/private/var/tmp";
+  fs.mkdirSync(fixtureParent, { recursive: true });
+  const ownershipRoot = fs.mkdtempSync(path.join(fixtureParent, `plimsoll-lifecycle-${name}-`));
   const paths: ManagedLifecyclePaths = {
     ownershipRoot,
     lifecycleRoot: path.join(ownershipRoot, "private", "lifecycle"),
@@ -433,6 +434,116 @@ async function main() {
     happy.cleanup();
   }
 
+  // A failed same-version repin must not remove a native companion before the
+  // immutable executable conflict is discovered. The lifecycle transaction
+  // rolls back, but the current runtime must remain a complete closure.
+  const companion = fixture("companion-immutability");
+  try {
+    const ancestorHasNodeModules = (() => {
+      let cursor = path.resolve(companion.ownershipRoot);
+      while (true) {
+        if (fs.existsSync(path.join(cursor, "node_modules"))) return true;
+        const parent = path.dirname(cursor);
+        if (parent === cursor) return false;
+        cursor = parent;
+      }
+    })();
+    check("companion_fixture_has_no_node_modules_ancestor", !ancestorHasNodeModules, companion.ownershipRoot);
+    const artifactWithCompanion = (executable: string, companionText: string): RuntimeArtifact => {
+      const sourcePath = path.join(companion.ownershipRoot, "artifacts", executable);
+      const companionSource = path.join(companion.ownershipRoot, "artifacts", `${executable}.node`);
+      write(sourcePath, `#!/bin/sh\n# ${executable}\n`, 0o700);
+      write(companionSource, `${companionText}\n`);
+      return {
+        version: "5.0.0",
+        platform: "darwin",
+        architecture: "arm64",
+        nodeMajor: 22,
+        sha256: digest(sourcePath),
+        sourcePath,
+        files: [{ relativePath: "native/companion.node", sha256: digest(companionSource), sourcePath: companionSource }],
+      };
+    };
+    const c1 = artifactWithCompanion("c1", "native-companion-c1");
+    const first = await new LifecycleManager(companion.adapter).update({ operationId: "c1", artifact: c1 });
+    const runtimeDirectory = path.join(companion.paths.lifecycleRoot, "versions", "5.0.0", "darwin-arm64");
+    const executablePath = path.join(runtimeDirectory, "bin", "plimsoll.mjs");
+    const companionPath = path.join(runtimeDirectory, "native", "companion.node");
+    const executableBefore = fs.readFileSync(executablePath);
+    const companionBefore = fs.readFileSync(companionPath);
+    const c2 = artifactWithCompanion("c2", "native-companion-c2");
+    const failedRepin = await rejection(() => new LifecycleManager(companion.adapter).update({ operationId: "c2", artifact: c2 }));
+    const rollbackReceipt = JSON.parse(fs.readFileSync(
+      path.join(companion.paths.lifecycleRoot, "receipts", "c2-update.json"), "utf8",
+    )) as { status: string; restoredVersion: string | null };
+    const current = fs.readlinkSync(path.join(companion.paths.lifecycleRoot, "current"));
+    check(
+      "same_version_repin_rollback_preserves_the_immutable_companion",
+      first.status === "completed" && failedRepin?.message === "immutable runtime target already differs" &&
+        rollbackReceipt.status === "rolled_back" && rollbackReceipt.restoredVersion === "5.0.0" &&
+        current.endsWith("versions/5.0.0/darwin-arm64") &&
+        Buffer.compare(fs.readFileSync(executablePath), executableBefore) === 0 &&
+        Buffer.compare(fs.readFileSync(companionPath), companionBefore) === 0,
+      { error: failedRepin?.message, receipt: rollbackReceipt, current, companion: fs.existsSync(companionPath) },
+    );
+  } finally {
+    companion.cleanup();
+  }
+
+  // New companions are published only after their staging copy passes its
+  // digest check. A later failure must remove every new path and preserve the
+  // existing executable and companion exactly as they were.
+  const companionStage = fixture("companion-staging");
+  try {
+    const stagedArtifact = companionStage.artifact("6.0.0");
+    const runtimeDirectory = path.join(companionStage.paths.lifecycleRoot, "versions", "6.0.0", "darwin-arm64");
+    const executablePath = path.join(runtimeDirectory, "bin", "plimsoll.mjs");
+    fs.mkdirSync(path.dirname(executablePath), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(stagedArtifact.sourcePath, executablePath);
+    fs.chmodSync(executablePath, 0o700);
+    const existingSource = path.join(companionStage.ownershipRoot, "artifacts", "preexisting.node");
+    const firstSource = path.join(companionStage.ownershipRoot, "artifacts", "first.node");
+    const secondSource = path.join(companionStage.ownershipRoot, "artifacts", "second.node");
+    write(existingSource, "pre-existing-native-companion\n");
+    write(firstSource, "first-new-native-companion\n");
+    write(secondSource, "second-new-native-companion\n");
+    const existingPath = path.join(runtimeDirectory, "native", "preexisting.node");
+    write(existingPath, fs.readFileSync(existingSource, "utf8"));
+    const executableBefore = fs.readFileSync(executablePath);
+    const existingBefore = fs.readFileSync(existingPath);
+    const artifactWithFailure: RuntimeArtifact = {
+      ...stagedArtifact,
+      files: [
+        { relativePath: "native/preexisting.node", sha256: digest(existingSource), sourcePath: existingSource },
+        { relativePath: "native/first.node", sha256: digest(firstSource), sourcePath: firstSource },
+        { relativePath: "native/second.node", sha256: ("sha256:" + "0".repeat(64)) as `sha256:${string}`, sourcePath: secondSource },
+      ],
+    };
+    const error = await rejection(() => companionStage.adapter.stage(artifactWithFailure));
+    const firstPath = path.join(runtimeDirectory, "native", "first.node");
+    const secondPath = path.join(runtimeDirectory, "native", "second.node");
+    const stagingPaths = [
+      `${existingPath}+staging`, `${firstPath}+staging`, `${secondPath}+staging`,
+    ];
+    check(
+      "failed_later_companion_leaves_no_unverified_new_files_or_staging_paths",
+      error?.message === "companion 2 digest mismatch" &&
+        !fs.existsSync(firstPath) && !fs.existsSync(secondPath) && stagingPaths.every((file) => !fs.existsSync(file)) &&
+        Buffer.compare(fs.readFileSync(executablePath), executableBefore) === 0 &&
+        Buffer.compare(fs.readFileSync(existingPath), existingBefore) === 0,
+      {
+        error: error?.message,
+        firstFinal: fs.existsSync(firstPath),
+        secondFinal: fs.existsSync(secondPath),
+        staging: stagingPaths.filter((file) => fs.existsSync(file)),
+        executableUnchanged: Buffer.compare(fs.readFileSync(executablePath), executableBefore) === 0,
+        existingCompanionUnchanged: Buffer.compare(fs.readFileSync(existingPath), existingBefore) === 0,
+      },
+    );
+  } finally {
+    companionStage.cleanup();
+  }
+
   const recovery = fixture("rollback-required");
   try {
     const manager = new LifecycleManager(recovery.adapter);
@@ -740,7 +851,10 @@ async function main() {
       { exactReceiptKeys, exactReceiptHealthKeys, serializedBytes: Buffer.byteLength(serialized), receiptBytes: Buffer.byteLength(persistedReceipt) },
     );
     for (let index = 0; index < 40; index += 1) await manager.supportBundle(`bounded-${String(index).padStart(2, "0")}`);
-    check("lifecycle_receipts_are_bounded_to_32", fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).filter((file) => file.endsWith(".json")).length === 32, fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).length);
+    // eco-6hoxj.163.49: no lifecycle command trims receipts; the install's and the first bundle's stay.
+    const supportReceipts = fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).filter((file) => file.endsWith(".json"));
+    check("lifecycle_receipts_are_never_trimmed", supportReceipts.length === 42 &&
+      supportReceipts.includes("support-install-update.json") && supportReceipts.includes("support-bundle-support_bundle.json"), supportReceipts.length);
     check("support_unknown_getters_are_never_invoked_across_repeated_bundles", support.supportGetterAccesses === 0, support.supportGetterAccesses);
     const sanitized = sanitizeSupportSnapshot({
       installedVersion: "0.6.0",

@@ -358,6 +358,14 @@ export type GrokUsageSweepCounters = {
   discoveryErrors: number;
   statErrors: number;
   readErrors: number;
+  /**
+   * Groups and sessions a per-pass cap left to a later pass of the same
+   * sweep, summed over its passes. Nothing is dropped.
+   */
+  groupsOverLimit: number;
+  sessionsOverLimit: number;
+  /** Usage files the recent lane queued ahead of the walk. */
+  recentFiles: number;
 };
 
 /** Durable receipt of the automatic Grok usage backfill; path- and content-free. */

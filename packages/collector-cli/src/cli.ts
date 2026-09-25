@@ -50,6 +50,7 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
+import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
   collectorHomeIdentityHash,
@@ -119,6 +120,7 @@ import {
   type MaintenanceAttemptOutcome,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import { sessionContextIndexStatus } from "./session-context-index";
 import {
   historyCoverageStatus,
   recordExplicitFullHistoryCoverage,
@@ -155,10 +157,13 @@ import {
 } from "./hook-spool";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
+import { WalCheckpointWorker } from "./wal-checkpoint-worker";
 import {
-  maintenanceStarvationReceipt,
+  MAINTENANCE_CENSUS_QUERIES,
+  maintenanceStarvationStatus,
   recordMaintenanceDeadlineBlame,
   recordMaintenanceDeadlineKill,
+  type MaintenanceStarvationCensus,
 } from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
 import {
@@ -258,9 +263,11 @@ import {
   loadDaemonSessionSyncState,
   planDaemonSessionSync,
   listLedgerSessionIdsOffThread,
+  readLedgerOffThread,
   runSessionSync,
   saveDaemonSessionSyncState,
   sessionIdsFromBatches,
+  shouldDeferDaemonSessionSync,
 } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
@@ -1132,6 +1139,8 @@ function launchAgentUnloadReceipt(
  * rather than down (review r2, F4).
  */
 const COLLECTOR_STATUS_TIMEOUT_DEFAULT_MS = 3_000;
+/** Pause before the next upload cycle when the last one stopped at its batch cap. */
+const SYNC_CATCH_UP_DELAY_MS = 5_000;
 
 function collectorStatusTimeoutMs() {
   const configured = Number(process.env.PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS ?? "");
@@ -1220,7 +1229,7 @@ async function readDaemonState(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+    const response = await fetchCollectorUrl(`http://127.0.0.1:${port}/status`, {
       signal: controller.signal,
       headers: managementToken ? { "x-plimsoll-token": managementToken } : {},
     });
@@ -1256,7 +1265,7 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
 
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+    const response = await fetchCollectorUrl(`http://127.0.0.1:${port}/status`, {
       signal: controller.signal,
       // Issue 0056 (#104): enforcing daemons gate status behind the
       // provisioned management credential; doctor presents it when present.
@@ -2563,6 +2572,10 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    // A worker thread copies its WAL back and keeps it bounded; the
+    // connection's own automatic checkpoint stays only as a backstop
+    // (wal-checkpoint-worker.ts).
+    const walCheckpoint = new WalCheckpointWorker(buffer.database);
     // Outcome facts intentionally live outside the capture ledger. Opening the
     // local read model here does not schedule collection; the only writer is
     // an explicit backfill command.
@@ -2615,13 +2628,10 @@ async function main() {
             heldMs: info.heldMs,
             attribution: info.attribution,
           });
-          const receipt = maintenanceStarvationReceipt(buffer.database);
-          if (receipt.starving) {
-            console.warn(JSON.stringify({
-              warning: "maintenance_starvation",
-              ...receipt,
-            }));
-          }
+          // Judged from a census that starts after this kill (below).
+          killsRecorded += 1;
+          starvationWarningAfterKill = killsRecorded;
+          refreshStarvationCensus();
         } catch {
           // Starvation bookkeeping must never mask the boundary failure.
         }
@@ -2655,14 +2665,67 @@ async function main() {
     }
     let refreshStatusSnapshot: (failure?: "maintenance_failed") => boolean = () => false;
     let retentionCadence: AutomaticRetentionCadence | undefined;
+    // The starvation census counts two queue tables (~280k pending links on
+    // the Studio0 ledger, ~0.8 s cold), so it runs on a read-only worker
+    // together with the kill counter it is judged against. /status labels the
+    // census with its time and never counts the queues on the event loop; a
+    // failed census keeps the last one (eco-6hoxj.163.24).
+    const readStarvationCensus = async (): Promise<MaintenanceStarvationCensus> => {
+      const observedAt = new Date().toISOString();
+      const count = (row: { n: unknown } | undefined) => {
+        const n = Number(row?.n);
+        return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+      };
+      const [fill, dirty, kills] = await readLedgerOffThread<{ n: unknown }>(buffer.database, [
+        { sql: MAINTENANCE_CENSUS_QUERIES.fillPendingEventLinks, params: {} },
+        { sql: MAINTENANCE_CENSUS_QUERIES.dirtyEnrichmentSessions, params: {} },
+        { sql: MAINTENANCE_CENSUS_QUERIES.deadlineKills, params: {} },
+      ]);
+      return {
+        backlog: { fillPendingEventLinks: count(fill), dirtyEnrichmentSessions: count(dirty) },
+        deadlineKills: count(kills),
+        observedAt,
+      };
+    };
+    let starvationCensus = await readStarvationCensus().catch(() => null);
     const readStarvationReceipt = () => {
       try {
-        return maintenanceStarvationReceipt(buffer.database);
+        return maintenanceStarvationStatus(buffer.database, starvationCensus);
       } catch {
         return null;
       }
     };
     let cachedStarvationReceipt = readStarvationReceipt();
+    let starvationCensusRead: Promise<void> | null = null;
+    let starvationCensusAgain = false;
+    let killsRecorded = 0;
+    let starvationWarningAfterKill = 0;
+    const refreshStarvationCensus = () => {
+      if (starvationCensusRead) {
+        starvationCensusAgain = true;
+        return;
+      }
+      const killsBefore = killsRecorded;
+      starvationCensusRead = readStarvationCensus()
+        .then((census) => {
+          starvationCensus = census;
+          cachedStarvationReceipt = readStarvationReceipt();
+          if (starvationWarningAfterKill > 0 && killsBefore >= starvationWarningAfterKill) {
+            starvationWarningAfterKill = 0;
+            if (cachedStarvationReceipt?.starving) {
+              console.warn(JSON.stringify({ warning: "maintenance_starvation", ...cachedStarvationReceipt }));
+            }
+          }
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          starvationCensusRead = null;
+          if (starvationCensusAgain) {
+            starvationCensusAgain = false;
+            refreshStarvationCensus();
+          }
+        });
+    };
     // Bead eco-6hoxj.61. Created before the listener so /status can read its
     // cached snapshot, armed with the other cadences below.
     let hookSpoolDrain: HookSpoolDrain | undefined;
@@ -2675,6 +2738,7 @@ async function main() {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
       syncStatus: () => syncBackoff.status(syncInFlight),
+      walCheckpointStatus: () => walCheckpoint.status(),
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the
@@ -2693,6 +2757,7 @@ async function main() {
       registerStatusRefresher: (refresh) => {
         refreshStatusSnapshot = (failure) => {
           cachedStarvationReceipt = readStarvationReceipt();
+          refreshStarvationCensus();
           try { cachedBaseline = captureBaselineStatus(buffer.database); } catch { /* retain last observation */ }
           return refresh(failure);
         };
@@ -2713,6 +2778,7 @@ async function main() {
     // refresh does not wait for `upload-history --sessions`.
     let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
     let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
+    let lastSessionPassAt = performance.now();
 
     const runSync = async () => {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
@@ -2736,9 +2802,15 @@ async function main() {
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
+      let catchUp = false;
+      let summaryCatchUp = false;
       try {
         let batches = 0;
+        let remainingDelivery = 0;
         while (batches < config.delivery.maxBatchesPerCycle) {
+          // A batch acknowledges, leases and seals in synchronous writer turns;
+          // intake and /status run between batches (eco-6hoxj.163.24).
+          if (batches > 0) await new Promise<void>((resolve) => setImmediate(resolve));
           const result = await uploadBufferedEvents(config, buffer, {
             includeLegacyRemainingUnuploaded: false,
             storageRetry,
@@ -2747,10 +2819,13 @@ async function main() {
           uploadedBatches.push(result.batch);
           uploaded += result.uploadedEvents;
           batches += 1;
+          remainingDelivery = result.remainingDelivery;
           // A partial batch can both acknowledge siblings and ask us to wait.
           serverRetryAfterMs = "retryAfterMs" in result.delivery ? Number(result.delivery.retryAfterMs) : 0;
           if (serverRetryAfterMs > 0 || result.remainingDelivery === 0) break;
         }
+        catchUp = batches >= config.delivery.maxBatchesPerCycle && serverRetryAfterMs === 0 &&
+          remainingDelivery > 0;
         if (uploaded > 0) {
           console.log(
             JSON.stringify({
@@ -2765,6 +2840,18 @@ async function main() {
         // Session snapshots share the ingest endpoint. Carry their identities
         // rather than issue another request inside a server-directed cooldown.
         if (serverRetryAfterMs > 0) { carrySessions(); return; }
+        // While more than a cycle of events is due, events drain first. A
+        // session snapshot re-reads every row of each touched session (1.88M
+        // for Studio0's busiest), seconds to minutes that would hold the next
+        // upload cycle; the identities are carried to the cycle that ends the
+        // backlog. The monotonic deadline gives sessions a turn even when a
+        // sustained backlog never empties (eco-6hoxj.163.75 S1).
+        if (shouldDeferDaemonSessionSync({
+          batchCapReached: catchUp,
+          remainingDelivery,
+          maxBatchesPerCycle: config.delivery.maxBatchesPerCycle,
+          elapsedSinceLastSessionPassMs: performance.now() - lastSessionPassAt,
+        })) { carrySessions(); return; }
 
         // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
         // plus durable pending, and a ledger catch-up until the first full
@@ -2798,13 +2885,28 @@ async function main() {
               excludedSessionIds: sessionPlan.state.blockedSessionIds,
               until: sessionPlan.until,
               ledgerDb: buffer.database,
+              incremental: true,
               log: () => undefined,
             });
-            if (sessionResult.ok) {
+            const summaryPending = sessionResult.pendingSummarySessionIds;
+            summaryCatchUp = summaryPending.length > 0;
+            if (sessionResult.ok && sessionResult.summaryComplete) {
               sessionSyncState = commitDaemonSessionSyncSuccess(
                 sessionSyncState,
                 sessionPlan.until,
                 sessionResult.rejectedSessionIds,
+              );
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
+            } else if (sessionResult.ok) {
+              // A bounded summary slice is a successful maintenance step, but
+              // it is not a valid daemon horizon advance until every touched
+              // session has a complete accumulator. Keep the exact ids for the
+              // next cycle and never send a partial snapshot.
+              sessionSyncState = commitDaemonSessionSyncFailure(
+                sessionSyncState,
+                sessionPlan.sessionIds === undefined
+                  ? undefined
+                  : [...sessionPlan.sessionIds, ...summaryPending],
               );
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             } else {
@@ -2812,7 +2914,7 @@ async function main() {
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             }
             persistSessionCarry();
-            if (sessionResult.ok && sessionResult.sentSessions > 0) {
+            if (sessionResult.ok && sessionResult.summaryComplete && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
                   status: "session_sync",
@@ -2822,8 +2924,17 @@ async function main() {
                   inserted: sessionResult.insertedSessions,
                   updated: sessionResult.updatedSessions,
                   skippedStale: sessionResult.skippedStaleSessions,
+                  rowsRead: sessionResult.summaryStats.rowsRead,
+                  summaryDurationMs: sessionResult.summaryStats.durationMs,
                 }),
               );
+            } else if (sessionResult.ok && !sessionResult.summaryComplete) {
+              console.log(JSON.stringify({
+                status: "session_sync_partial",
+                pendingSummaries: summaryPending.length,
+                rowsRead: sessionResult.summaryStats.rowsRead,
+                summaryDurationMs: sessionResult.summaryStats.durationMs,
+              }));
             } else if (!sessionResult.ok) {
               console.warn(
                 JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
@@ -2841,6 +2952,8 @@ async function main() {
           sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, touchedSessionIds);
           pendingSessionIds = sessionSyncState.pendingSessionIds;
           persistSessionCarry();
+        } finally {
+          lastSessionPassAt = performance.now();
         }
       } catch (error) {
         carrySessions();
@@ -2868,6 +2981,14 @@ async function main() {
         );
       } finally {
         syncInFlight = false;
+        // A cycle that stopped at its batch cap with delivery still due starts
+        // the next one shortly rather than at the next interval tick, so a
+        // backlog above one cycle drains at upload speed, not at 10k events
+        // per interval (eco-6hoxj.163.24). Failures and a server Retry-After
+        // never chain: they keep the scheduler's own backoff.
+        if ((catchUp || summaryCatchUp) && !shuttingDown) {
+          setTimeout(() => void runSync(), SYNC_CATCH_UP_DELAY_MS).unref();
+        }
       }
     };
 
@@ -2967,11 +3088,16 @@ async function main() {
         repairProgress: () => {
           const projection = buffer.projection.status();
           const repairs = automaticRepairServiceStatus(buffer.database);
+          // The one-time session context backfill keeps the repair cadence
+          // while each maintenance job's bounded slice still advances it.
+          const sessionIndex = sessionContextIndexStatus(buffer.database);
           return {
             pending: Object.values(projection.backlog).some(n => n > 0) ||
-              !projection.backfill.complete || !projection.backfill.parityComplete || !projection.backfill.metricComplete,
+              !projection.backfill.complete || !projection.backfill.parityComplete || !projection.backfill.metricComplete ||
+              sessionIndex.state === "backfilling",
             units: Object.values(repairs.stages).reduce((sum, stage) => sum + stage.rowsVisited, 0) +
-              projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited,
+              projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited +
+              sessionIndex.backfill.rowsVisited,
           };
         },
         retryNotBefore: () => {
@@ -3030,6 +3156,7 @@ async function main() {
     });
 
     retentionCadence.start();
+    walCheckpoint.start();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
@@ -3111,6 +3238,7 @@ async function main() {
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
+      void walCheckpoint.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
@@ -3161,6 +3289,7 @@ async function main() {
       }
       shuttingDown = true;
       flushRejectionSummaries();
+      void walCheckpoint.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
@@ -3448,8 +3577,10 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
+          sessionAttribution: sessionContextIndexStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
+          learningFacts: buffer.learningFacts.status(),
           // Hook events the collector could not accept live, and what the
           // drain has recovered since (bead eco-6hoxj.61).
           hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonState.hookSpool),
@@ -5639,16 +5770,23 @@ async function main() {
       // Session backfill (issue 0037): push one snapshot per stitched ledger
       // session; the cloud upserts grow-only by deterministic session id, so
       // re-running over the same --until changes nothing.
-      const sessions = await runSessionSync(config, {
+      const dryRun = flag("--dry-run");
+      const buffer = dryRun ? null : openBuffer(config, Boolean(optionValue("--url")));
+      try {
+        const sessions = await runSessionSync(config, {
         until: optionValue("--until"),
         batchSize: numberOption("--batch-size"),
         concurrency: numberOption("--concurrency"),
         delayMs: numberOption("--delay-ms"),
-        dryRun: flag("--dry-run"),
+        dryRun,
         url: optionValue("--url"),
         developmentLoopbackUrl: flag("--dev-loopback-url"),
-      });
-      if (!sessions.ok) process.exitCode = 1;
+        ...(buffer ? { ledgerDb: buffer.database, incremental: true } : {}),
+        });
+        if (!sessions.ok || !sessions.summaryComplete) process.exitCode = 1;
+      } finally {
+        buffer?.close();
+      }
       return;
     }
     const result = await runWorkspaceHistoryUpload(config, {

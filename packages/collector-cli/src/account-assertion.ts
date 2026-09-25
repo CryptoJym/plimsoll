@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
+import { fetchCollectorUrl } from "./http-transport";
 
 /**
  * Versioned account continuity contract.
@@ -456,7 +457,7 @@ async function boundedProviderJson(url: string, expectedOrigin: string): Promise
     }, CODEX_JWKS_TIMEOUT_MS);
   });
   const read = async () => {
-    const response = await fetch(target.href, {
+    const response = await fetchCollectorUrl(target, {
       method: "GET",
       redirect: "manual",
       signal: controller.signal,

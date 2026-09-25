@@ -1,16 +1,16 @@
 {
   "schema": "plimsoll.system-e2e-support-contract.v1",
-  "normalizationVersion": 7,
+  "normalizationVersion": 10,
   "phases": [
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:0f9f0225f879a930817bb6c7c7d609ba1b5c889bea7592cf0cff326bcccda1aa"
+      "expectedArtifactDigest": "sha256:6e65814f3d88c9dbc7fd0afcccf995d21f98a23fd781c48868272906e8726ebc"
     },
     {
       "name": "transactional_join",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:c471fd02e75ecabd34706cb1329012c922cee561cf0ff3b32be21a396ac38d97"
+      "expectedArtifactDigest": "sha256:d119aeb966d1dd0e8dd350bc12265fe26a4a784c11de2f808ca8e0ccdc543612"
     },
     {
       "name": "metadata_only_privacy",
@@ -20,12 +20,12 @@
     {
       "name": "canonical_lifecycle",
       "kind": "line_summary",
-      "expectedArtifactDigest": "sha256:000f8cae79f5dd82aad0bec5ea65703d71d7c1377c15f9bfa2dec58d89bc15d4"
+      "expectedArtifactDigest": "sha256:5fed56d9f01343580ebd630a125f4dab9ee12836021d4d1f630ccf5977e3d7f8"
     },
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:13c36f9b1b29b87744d72bf7bcdb1d1db32f6455f40d65fb7036f79eb72e4546"
+      "expectedArtifactDigest": "sha256:b3652398c04150a51dfb88b25f142c9f6ed34ed77ec048e6956bab8df00166b2"
     },
     {
       "name": "launch_agent_unload_terminal_truth",

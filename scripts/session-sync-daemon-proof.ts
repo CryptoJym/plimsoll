@@ -12,12 +12,14 @@ import {
   runSessionSync,
   saveDaemonSessionSyncState,
   sessionIdsFromBatches,
+  shouldDeferDaemonSessionSync,
 } from "../packages/collector-cli/src/session-sync";
+import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const completion = createProofCompletion("session-sync-daemon", 13);
+const completion = createProofCompletion("session-sync-daemon", 15);
 const root = process.env.PLIMSOLL_PROOF_ROOT!;
 const installKey = "session-sync-daemon-proof-key";
 const tenantId = "00000000-0000-4000-8000-000000000070";
@@ -90,6 +92,33 @@ function ingestFetch(options: { failTimes?: number; sent: string[][] }): typeof 
       { status: 200, headers: { "content-type": "application/json" } },
     );
   }) as typeof fetch;
+}
+
+function eventFetch(): typeof fetch {
+  return (async (_input, init) => {
+    const raw = String(init?.body ?? "");
+    return new Response(JSON.stringify(acceptedFixtureDelivery(raw, installKey)), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+}
+
+function deferSessionPass(input: {
+  batchCapReached: boolean;
+  remainingDelivery: number;
+  maxBatchesPerCycle: number;
+  elapsedSinceLastSessionPassMs: number;
+}) {
+  if (typeof shouldDeferDaemonSessionSync === "function") {
+    return shouldDeferDaemonSessionSync(input);
+  }
+  // The pinned pre-fix source has only the unconditional catchUp branch.
+  const source = fs.readFileSync(path.join(process.cwd(), "packages/collector-cli/src/cli.ts"), "utf8");
+  if (!source.includes("if (catchUp) { carrySessions(); return; }")) {
+    throw new Error("session_sync_daemon_gate_not_recognized");
+  }
+  return input.batchCapReached && input.remainingDelivery > 0;
 }
 
 async function daemonCycle(
@@ -313,6 +342,87 @@ async function main() {
       cliSource.indexOf("const touchedSessionIds =") >
         cliSource.indexOf("if (serverRetryAfterMs > 0) { carrySessions(); return; }") &&
       /try \{\s*const sessionPlan = planDaemonSessionSync/.test(cliSource),
+  );
+
+  const steady = openLedger("steady-small-remainder");
+  const steadySent: string[][] = [];
+  let steadyPasses = 0;
+  let firstPassCycle: number | null = null;
+  let lastPassAtMs = 0;
+  let smallRemainderEveryCycle = true;
+  try {
+    const steadyConfig = collectorConfigSchema.parse({
+      uploadUrl: config.uploadUrl,
+      tenantId,
+      installKey,
+      uploadSigningSecret: config.uploadSigningSecret,
+      delivery: { maxBatchesPerCycle: 2 },
+    });
+    let eventNumber = 100;
+    for (let cycle = 0; cycle < 8; cycle += 1) {
+      // Two small uploads complete each cycle while intake replenishes them;
+      // exactly one event remains due at every batch-cap boundary.
+      for (let arrived = 0; arrived < (cycle === 0 ? 3 : 2); arrived += 1) {
+        appendSession(steady, missedSession, eventNumber++);
+      }
+      const uploadedBatches: Parameters<typeof sessionIdsFromBatches>[0] = [];
+      let remainingDelivery = 0;
+      for (let batch = 0; batch < steadyConfig.delivery.maxBatchesPerCycle; batch += 1) {
+        const uploaded = await uploadBufferedEvents(steadyConfig, steady, {
+          limit: 1,
+          includeLegacyRemainingUnuploaded: false,
+          fetchImpl: eventFetch(),
+        });
+        if (uploaded.uploadedEvents !== 1) throw new Error(`small_batch_upload_failed_${cycle}_${batch}`);
+        uploadedBatches.push(uploaded.batch);
+        remainingDelivery = uploaded.remainingDelivery;
+      }
+      smallRemainderEveryCycle &&= remainingDelivery === 1;
+      const nowMs = cycle * 10_000;
+      const defer = deferSessionPass({
+        batchCapReached: true,
+        remainingDelivery,
+        maxBatchesPerCycle: steadyConfig.delivery.maxBatchesPerCycle,
+        elapsedSinceLastSessionPassMs: nowMs - lastPassAtMs,
+      });
+      if (!defer) {
+        const pass = await daemonCycle(steady, {
+          batches: uploadedBatches,
+          until: nowIso(),
+          fetchImpl: ingestFetch({ sent: steadySent }),
+        });
+        if (pass.result?.ok !== true) throw new Error(`session_pass_failed_${cycle}`);
+        steadyPasses += 1;
+        firstPassCycle ??= cycle;
+        lastPassAtMs = nowMs;
+      }
+    }
+    const state = loadDaemonSessionSyncState(steady.database);
+    completion.check(
+      "steady_small_batches_reach_session_sync_and_converge",
+      smallRemainderEveryCycle && steadyPasses > 0 &&
+        firstPassCycle !== null && firstPassCycle <= 6 &&
+        state.caughtUp && state.pendingSessionIds.length === 0 &&
+        steadySent.flat().includes(missedSession) &&
+        cliSource.includes("if (shouldDeferDaemonSessionSync({") &&
+        cliSource.includes("elapsedSinceLastSessionPassMs: performance.now() - lastSessionPassAt"),
+    );
+  } finally {
+    steady.close();
+  }
+
+  const backlogInput = {
+    batchCapReached: true,
+    remainingDelivery: 10_001,
+    maxBatchesPerCycle: 20,
+    elapsedSinceLastSessionPassMs: 0,
+  };
+  completion.check(
+    "real_backlog_drains_first_but_session_pass_is_forced_at_sixty_seconds",
+    deferSessionPass(backlogInput) &&
+      deferSessionPass({ ...backlogInput, remainingDelivery: 10_000 }) === false &&
+      deferSessionPass({ ...backlogInput, elapsedSinceLastSessionPassMs: 59_999 }) &&
+      deferSessionPass({ ...backlogInput, elapsedSinceLastSessionPassMs: 60_000 }) === false,
   );
 
   completion.complete();

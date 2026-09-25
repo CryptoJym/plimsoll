@@ -31,7 +31,7 @@ export function isolatedEnvironment(root: string): NodeJS.ProcessEnv {
   }
   // Deliberate proof inputs only; no provider credentials, loaders, live roots,
   // proxy settings, production collector configuration or inherited NODE_PATH.
-  for (const key of ["CI", "REJECTION_PROOF_SCALE", "PLIMSOLL_QUALIFICATION_ARTIFACT"]) {
+  for (const key of ["CI", "REJECTION_PROOF_SCALE", "PROJECTION_PUBLICATION_COST_SCALE"]) {
     if (process.env[key]) env[key] = process.env[key];
   }
   env.npm_config_cache = path.join(root, "home/.cache/npm");
@@ -41,6 +41,9 @@ export function isolatedEnvironment(root: string): NodeJS.ProcessEnv {
 
 export async function runProof(entry: string, options: { directNode?: boolean; args?: string[]; quiet?: boolean } = {}) {
   const absoluteEntry = path.resolve(entry);
+  if (options.directNode && absoluteEntry === path.join(repoRoot, "scripts/ci-coverage-proof.ts")) {
+    throw new Error("the CI coverage gate cannot run through --direct-node");
+  }
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-proof-")));
   const env = isolatedEnvironment(root);
   const nodeBefore = hash(process.execPath);
@@ -79,8 +82,13 @@ export async function runProof(entry: string, options: { directNode?: boolean; a
       receipt.counts.passed === receipt.checks.length && receipt.counts.failed === 0 &&
       receipt.checks.every((c: any) => typeof c.name === "string" && c.passed === true) &&
       (receipt.expectedChecks === null || receipt.expectedChecks === receipt.checks.length);
+    // eco-6hoxj.163.32 reads this wrapper from the checkout. Its final CI
+    // step accepts only a passed, checkout-rooted gate with no forwarded
+    // arguments, directNode false, and the expected fixture-plus-audit count.
     outcome = { schema: "plimsoll.proof-run.v1", status: child.status === 0 && valid && suiteComplete && nodeUnchanged && sentinelUnchanged && sourceUnchanged ? "passed" : "failed",
-      entry: path.relative(repoRoot, absoluteEntry), entrySha256: entryBefore, runnerSha256: runnerBefore, sourceUnchanged, directNode: Boolean(options.directNode),
+      entry: path.relative(repoRoot, absoluteEntry), root: fs.realpathSync(repoRoot), forwardedArgs: options.args ?? [],
+      entrySha256: entryBefore, runnerSha256: runnerBefore, sourceUnchanged, directNode: Boolean(options.directNode),
+      expectedChecks: typeof receipt?.expectedChecks === "number" ? receipt.expectedChecks : null,
       ...(declaredSubProofs ? { declaredSubProofs, suiteComplete } : {}),
       runtime: { node: process.versions.node, abi: process.versions.modules, platform: process.platform, arch: process.arch, sha256: nodeBefore },
       exitCode: child.status, signal: child.signal, error: child.error?.message ?? null,
