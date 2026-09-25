@@ -6487,13 +6487,20 @@ async function main() {
   if (command === "purge-local-data") {
     const confirmed = flag("--confirm");
     const includeConfig = flag("--include-config");
+    const ledgerPath = collectorBufferPath();
     const targets = [
       {
-        exists: fs.existsSync(collectorBufferPath()),
+        exists: fs.existsSync(ledgerPath),
         label: "local event buffer",
-        path: collectorBufferPath(),
+        path: ledgerPath,
         purged: false,
       },
+      ...(["-wal", "-shm"] as const).map((suffix) => ({
+        exists: fs.existsSync(`${ledgerPath}${suffix}`),
+        label: `local event buffer ${suffix.slice(1)}`,
+        path: `${ledgerPath}${suffix}`,
+        purged: false,
+      })),
       {
         exists: fs.existsSync(collectorLogPath("collector.pid")),
         label: "foreground daemon pid file",
@@ -6513,10 +6520,30 @@ async function main() {
     ];
 
     if (confirmed) {
+      const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
+      const pidState = pidRead.kind === "current" ? classifyProcessIdentity(pidRead.record)
+        : pidRead.kind === "legacy" ? (() => {
+          try { process.kill(pidRead.pid, 0); return "live"; }
+          catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "stale" : "indeterminate"; }
+        })() : pidRead.kind === "missing" ? "stale" : "indeterminate";
+      if (pidState !== "stale") throw new Error(`purge_requires_stopped_collector:${pidState}`);
+      const listener = await observeCollectorListener(config.port);
+      if (listener.kind !== "absent") throw new Error(`purge_requires_closed_listener:${listener.kind}`);
+      if (fs.existsSync(ledgerPath)) {
+        if (!fs.lstatSync(ledgerPath).isFile()) throw new Error("purge_ledger_not_regular_file");
+        const ledger = new Database(ledgerPath, { fileMustExist: true, timeout: 0 });
+        try {
+          const checkpoint = ledger.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
+          if (checkpoint[0]?.busy !== 0) throw new Error("purge_wal_checkpoint_busy");
+        } finally { ledger.close(); }
+      }
       for (const target of targets) {
-        if (!target.exists) continue;
+        if (!fs.existsSync(target.path)) continue;
         fs.rmSync(target.path, { force: true, recursive: false });
         target.purged = true;
+      }
+      if ([ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`].some((file) => fs.existsSync(file))) {
+        throw new Error("purge_ledger_sidecar_remains");
       }
     }
 
