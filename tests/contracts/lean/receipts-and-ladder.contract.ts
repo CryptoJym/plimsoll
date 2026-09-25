@@ -3,11 +3,14 @@
  * qualified rollback parity, and the abort rebuild bound (docs/lean/ARCHITECTURE.md §2.4, §5.2; MIGRATION.md §4, §8;
  * PROOF.md §5 items 2-2b, §6 item 7). Ports the collector halves of fixtures/b1_day_target_receipt.py,
  * sf1_ladder_rollback_parity.py and sf_abort_rebuild_bound.py. Pending until the named beads land lean/retention.ts and lean/rebuild.ts.
+ * Round 3 of B0 (review-r2 blocker 3a): test 2's three old rows are appended under a mocked Date at the epoch start, so their
+ * created_at, and the outbox's raw_created_at lineage copied from it, are old together; rewriting created_at afterwards broke the
+ * lineage and dead-lettered the rows (helper.contract.ts guards the premise: all four lease, three acknowledge).
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { event, fn, loadSurface, openTempBuffer, pending, sumDigest } from "./_pending";
+import { EPOCH_STARTED_AT, event, fn, loadSurface, openTempBuffer, pending, sumDigest } from "./_pending";
 
 test("B2a: a day target's ack fields are set only by a held or duplicate receipt with a matching digest; conflict and stale change nothing", pending("B2a"), async () => {
   const apply = fn(await loadSurface("../../../packages/collector-cli/src/lean/retention.ts"), "applyUploadReceipts") as (db: unknown, receipts: unknown[]) => number[];
@@ -30,15 +33,20 @@ test("B2a: a day target's ack fields are set only by a held or duplicate receipt
   } finally { close(); }
 });
 
-test("B10a/B10b: the ladder's release deletes only acknowledged rows older than retentionDays, with receipts, and the old path after rollback equals the pre-release path minus the receipted set", pending("B10b"), async () => {
+test("B10a/B10b: the ladder's release deletes only acknowledged rows older than retentionDays, with receipts, and the old path after rollback equals the pre-release path minus the receipted set", pending("B10b"), async (t) => {
   const release = fn(await loadSurface("../../../packages/collector-cli/src/lean/retention.ts"), "releaseUnderLadder") as (buffer: unknown, options: Record<string, unknown>) => { released: string[] };
   const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", delivery: { enabled: true } });
   try {
     const db = buffer.database;
-    const oldAcked1 = event({ observedAt: "2026-01-01T00:00:00.000Z" }), oldAcked2 = event({ observedAt: "2026-01-01T00:00:00.000Z" });
-    const oldPending = event({ observedAt: "2026-01-01T00:00:00.000Z" }), recent = event();
-    for (const e of [oldAcked1, oldAcked2, oldPending, recent]) buffer.append(e);
-    db.prepare("update buffered_events set created_at = '2026-01-01T00:00:00.000Z' where id in (?, ?, ?)").run(oldAcked1.id, oldAcked2.id, oldPending.id);
+    // the three old rows are appended under a clock pinned at the epoch start, so created_at (buffer.ts, new Date() at append) and the
+    // outbox lineage copied from it are old TOGETHER; the outbox refuses a later rewrite of either (trg_upload_outbox_lineage_immutable)
+    t.mock.timers.enable({ apis: ["Date"], now: new Date(EPOCH_STARTED_AT) });
+    const oldAcked1 = event({ observedAt: EPOCH_STARTED_AT }), oldAcked2 = event({ observedAt: EPOCH_STARTED_AT }), oldPending = event({ observedAt: EPOCH_STARTED_AT });
+    for (const e of [oldAcked1, oldAcked2, oldPending]) assert.equal(buffer.append(e), true);
+    t.mock.timers.reset();
+    const recent = event();
+    assert.equal(buffer.append(recent), true);
+    assert.equal((db.prepare("select count(*) as n from buffered_events where created_at = ?").get(EPOCH_STARTED_AT) as { n: number }).n, 3, "the old rows are old by created_at");
     const lease = buffer.delivery.lease({ leaseId: "lean-contract-lease", now: new Date() });
     assert.equal(lease.items.length, 4);
     buffer.delivery.acknowledge(lease.leaseId, [oldAcked1.id, oldAcked2.id, recent.id], new Date());

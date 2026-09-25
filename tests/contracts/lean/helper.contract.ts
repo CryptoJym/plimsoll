@@ -3,7 +3,10 @@
  * `observedAt` while a managed buffer refuses anything observed before its enrollment epoch, which the shipped constructor starts
  * at open time; eight pending tests therefore appended nothing and could never pass. `openTempBuffer` now pins the epoch at
  * EPOCH_STARTED_AT. This file proves that every buffer configuration the pending tests use admits the fixture events, and that
- * the trap is real (a buffer without the pinned epoch refuses the same event as `before_enrollment`).
+ * the trap is real (a buffer without the pinned epoch refuses the same event as `before_enrollment`). Round 3 of B0 (review-r2
+ * blocker 3): two more guards prove the premises the pending tests assume AFTER appending: the ladder test's old rows keep their
+ * outbox lineage under the mocked clock (all four lease, three acknowledge), and the retention test's reject row, appended through
+ * the buffer, is leased and acknowledged and would be deleted by today's prune at age (its red half).
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -50,6 +53,45 @@ test("helper guard: an explicit observedAt at the epoch start (the ladder test's
     const old = event({ observedAt: EPOCH_STARTED_AT });
     assert.equal(buffer.append(old), true);
     assert.equal(rows(buffer), 1);
+  } finally { close(); }
+});
+
+test("helper guard: the ladder test's premise (receipts-and-ladder 2): three rows appended under a Date mocked at the epoch start are old by created_at with a matching outbox lineage, so the lease sees all four and acknowledge acknowledges exactly three", (t) => {
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", delivery: { enabled: true } });
+  try {
+    const db = buffer.database;
+    t.mock.timers.enable({ apis: ["Date"], now: new Date(EPOCH_STARTED_AT) });
+    const old = [event({ observedAt: EPOCH_STARTED_AT }), event({ observedAt: EPOCH_STARTED_AT }), event({ observedAt: EPOCH_STARTED_AT })];
+    for (const e of old) assert.equal(buffer.append(e), true);
+    t.mock.timers.reset();
+    const recent = event();
+    assert.equal(buffer.append(recent), true);
+    const lineage = db.prepare("select e.id as id, e.created_at as createdAt, o.raw_created_at as rawCreatedAt from buffered_events e join upload_outbox o on o.raw_id = e.id order by e.rowid").all() as Array<{ id: string; createdAt: string; rawCreatedAt: string }>;
+    assert.equal(lineage.length, 4, "every appended row has an outbox row");
+    assert.deepEqual(lineage.slice(0, 3).map((r) => [r.createdAt, r.rawCreatedAt]), old.map(() => [EPOCH_STARTED_AT, EPOCH_STARTED_AT]), "the old rows are old by created_at and the outbox lineage agrees");
+    const lease = buffer.delivery.lease({ leaseId: "lean-contract-lease", now: new Date() });
+    assert.deepEqual([lease.items.length, lease.locallyDead], [4, 0], "all four lease; none is dead-lettered as a lineage violation");
+    const ack = buffer.delivery.acknowledge(lease.leaseId, [old[0].id, old[1].id, recent.id], new Date());
+    assert.deepEqual([ack.acknowledged, ack.markedUploaded], [3, 3]);
+    assert.equal((db.prepare("select count(*) as n from upload_receipts where terminal_state = 'acknowledged'").get() as { n: number }).n, 3);
+    assert.equal((db.prepare("select count(*) as n from buffered_events where uploaded_at is not null").get() as { n: number }).n, 3);
+  } finally { close(); }
+});
+
+test("helper guard: the retention test's premise (conversion-rejects 2): a raw row appended through the buffer is leased and acknowledged (uploaded_at set, an acknowledged receipt for its own id), and today's prune deletes it at age", () => {
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", delivery: { enabled: true }, lean: { write: false } } as never);
+  try {
+    const db = buffer.database;
+    const x1 = event({ eventType: "usage_rollout", observedAt: "2026-09-26T00:00:00.000Z" });
+    assert.equal(buffer.append(x1), true);
+    const lease = buffer.delivery.lease({ leaseId: "lean-contract-lease", now: new Date() });
+    assert.equal(lease.items.length, 1);
+    assert.equal(buffer.delivery.acknowledge(lease.leaseId, [x1.id], new Date()).acknowledged, 1);
+    const row = db.prepare("select uploaded_at as uploadedAt from buffered_events where id = ?").get(x1.id) as { uploadedAt: string | null };
+    assert.ok(row.uploadedAt, "uploaded_at is set");
+    const receipt = db.prepare("select terminal_state as state from upload_receipts where delivery_id = ?").get(x1.id) as { state: string } | undefined;
+    assert.equal(receipt?.state, "acknowledged", "an acknowledged receipt exists for the row's own id (the ladder's acknowledged-only rule)");
+    assert.equal((buffer.prune(0, { maxRows: 100, now: new Date("2036-01-01T00:00:00.000Z") }) as { events: number }).events, 1, "today's prune deletes it at age: the red half the retention rule must refuse while a reject is open");
   } finally { close(); }
 });
 

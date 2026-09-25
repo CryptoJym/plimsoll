@@ -280,13 +280,26 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `conversion_rejects` row), `retireSegment`; the raw-delete trigger on `buffered_events` nulls `conversion_rejects.raw_rowid`. (B2a, B10b; C3)
 - `packages/collector-cli/src/lean/rebuild.ts`: `abortRebuildBound`. (B13)
 
+**Test premises (round 9, review-r2 blocker 3).** Two pending tests could not pass against a correct implementation for reasons of
+their own set-up, not of the rule. `receipts-and-ladder.contract.ts` test 2 rewrote `buffered_events.created_at` after the appends,
+which broke the outbox lineage (`upload_outbox.raw_created_at` is copied from it and is immutable, `outbox.ts` trigger
+`trg_upload_outbox_lineage_immutable`), so the lease dead-lettered the rows: it now appends the three old rows under a `Date` mocked
+at the epoch start (`node:test` `mock.timers`, `apis: ["Date"]`), so `created_at` and the lineage are old together.
+`conversion-rejects.contract.ts` test 2 inserted its raw row by SQL, so it had no outbox row and could never be acknowledged: it now
+appends the row through the buffer, leases and acknowledges it (the reject row, not the stored timestamp string, is what the
+retention rule reads). `helper.contract.ts` gains two green guards for exactly these premises (all four ladder rows lease and three
+acknowledge; the reject row is acknowledged and today's prune deletes it at age), beside the eight append guards of round 8.
+
 A bead may rename a surface only by updating its test in the same change; the contract is the behaviour, the name is the handle.
 
 ## C7. What the tests do not prove
 
 They are contract tests against shipped code that does not implement the contract, so today every pending test fails for the
 reason "surface missing" or "old behaviour", never for a subtle reason; the fixtures in `fixtures/` are the in-memory rule models
-that show each rule is self-consistent. Row widths in C2 remain estimates until S2 measures them on a copy; the Studio4 census
+that show each rule is self-consistent. The cloud's Postgres proof (`actor-binding-stamp-postgres.contract.test.ts`) fails today at
+its missing surface before any cluster starts; once B6 removes its marker it needs the private cluster's binaries
+(`PLIMSOLL_PROOF_PG_BIN`) in the lean contract step. The R5 interleaving was reproduced in round 9 in a local PostgreSQL 16 cluster
+at the SQL level (`checks/r5-postgres-reproduction.log`), not through B6's code. Row widths in C2 remain estimates until S2 measures them on a copy; the Studio4 census
 counts are measured, the other hosts' are not (Studio1's sessions were measured in round 5; its day and segment counts are the
 plan's geometry). No live collector, hosted service or production database was written to; the Studio4 ledger was copied with
 `VACUUM INTO` from a read-only connection and the copy was deleted after the census.
