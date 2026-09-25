@@ -429,8 +429,11 @@ The predicate that decides which rows are usage records is the inline text of `p
 
 It is pinned in **both** repositories as `tests/contracts/lean/fixtures/usage_record_predicate.sql` with the pin
 `USAGE_RECORD_PREDICATE_PIN` = sha256 of the text after comment lines are dropped, whitespace is collapsed (none inside the outer
-parentheses) and case is folded. Guards (green today): the fixture text hashes to the pin in both repositories; the cloud's inline
-loader text hashes to it; the collector's cardinality census (`fixtures/host_cardinality_census.py`) counts usage rows with it.
+parentheses) and case is folded **outside single-quoted literals only** (round 9, review r2: `'usage_live'` → `'USAGE_LIVE'` is a
+different predicate and changes the pin; `OR` → `or` is the same predicate and does not; the pinned value is unchanged because the
+pinned literals are lower case). Guards (green today): the fixture text hashes to the pin in both repositories; a literal's case
+change breaks the pin and a keyword's does not; the cloud's inline loader text hashes to it; the collector's cardinality census
+(`fixtures/host_cardinality_census.py`) counts usage rows with it.
 Pending: cloud `usage-record-pin.contract.test.ts` (lane 2: `src/lib/economics/usage-record-predicate.ts` exports
 `USAGE_RECORD_PREDICATE_SQL` equal to the pin and `loader.ts` uses it; B0's successor re-pins on merge); collector
 `usage-record-pin.contract.ts` (B2a: `lean/usage-record.ts` exports `USAGE_RECORD_PREDICATE_SQL` equal to the pin and
