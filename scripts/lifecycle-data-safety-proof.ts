@@ -154,6 +154,11 @@ const CASES = {
     "unusable_restored_way_back_refuses_and_keeps_its_record_and_trash",
     "malformed_journal_prune_apply_refuses_without_a_receipt_or_removal",
   ],
+  r12Marker: [
+    "new_prune_record_is_fenced_before_its_first_move",
+    "new_update_retention_record_is_fenced_before_its_first_move",
+    "inherited_pending_record_is_fenced_before_a_refused_retry",
+  ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -1587,6 +1592,74 @@ async function r8PruneSafety() {
   });
 }
 
+/** No network or old binary is needed to pin the exact on-disk fence. */
+async function r12RemovalMarkers() {
+  const oldReaderAccepts = (value: Record<string, unknown>) =>
+    Object.keys(value).sort().join(",") === "items,operationId,schemaVersion";
+  const marked = (value: Record<string, unknown> | null) => value !== null &&
+    Object.keys(value).sort().join(",") === "items,operationId,requiresCliVersion,schemaVersion" &&
+    value.requiresCliVersion === "0.7.41" && !oldReaderAccepts(value);
+  const captureAtFirstMove = async (name: string, action: (fixture: Home) => Promise<unknown>) => {
+    const fixture = createHome(name);
+    await updatesWithoutRetention(fixture, [["m1", "36.1.0"], ["m2", "36.1.1"], ["m3", "36.1.2"]]);
+    const removalRoot = path.join(fixture.lifecycleRoot, "removals");
+    const trashRoot = path.join(fixture.lifecycleRoot, "trash");
+    const mutableFs = fs as typeof fs & { renameSync: (...args: Parameters<typeof fs.renameSync>) => void };
+    const originalRename = mutableFs.renameSync;
+    let captured: Record<string, unknown> | null = null;
+    let intercepted = false;
+    mutableFs.renameSync = (...args) => {
+      if (!intercepted && String(args[1]).startsWith(`${trashRoot}${path.sep}`)) {
+        intercepted = true;
+        const records = listDirectory(removalRoot).filter((entry) => entry.endsWith(".json"));
+        if (records.length === 1) captured = JSON.parse(fs.readFileSync(path.join(removalRoot, records[0]!), "utf8")) as Record<string, unknown>;
+        throw new Error("proof stops at the first retention move");
+      }
+      return originalRename.apply(fs, args);
+    };
+    try {
+      await rejection(() => action(fixture));
+    } finally {
+      mutableFs.renameSync = originalRename;
+    }
+    return { captured, intercepted };
+  };
+
+  await runCase([CASES.r12Marker[0]], async (record) => {
+    const result = await captureAtFirstMove("r12-new-prune-marker", (fixture) =>
+      fixture.manager().pruneSnapshots({ operationId: "r12-prune-marker", keep: 1, apply: true }));
+    record(CASES.r12Marker[0], result.intercepted && marked(result.captured), result);
+  });
+  await runCase([CASES.r12Marker[1]], async (record) => {
+    const result = await captureAtFirstMove("r12-new-update-marker", (fixture) =>
+      fixture.manager().update({ operationId: "m4", artifact: fixture.artifact("36.1.3") }));
+    record(CASES.r12Marker[1], result.intercepted && marked(result.captured), result);
+  });
+  await runCase([CASES.r12Marker[2]], async (record) => {
+    const fixture = createHome("r12-inherited-marker");
+    await updatesWithoutRetention(fixture, [["m1", "37.1.0"], ["m2", "37.1.1"], ["m3", "37.1.2"]]);
+    const removalRoot = path.join(fixture.lifecycleRoot, "removals");
+    fs.mkdirSync(removalRoot, { recursive: true, mode: 0o700 });
+    const removalRecord = path.join(removalRoot, "r12-inherited.json");
+    const source = path.join(fixture.lifecycleRoot, "snapshots", "m2");
+    const before = treeDigest(source);
+    fs.writeFileSync(removalRecord, `${JSON.stringify({ schemaVersion: 1, operationId: "r12-inherited", items: [
+      { kind: "snapshot", name: "m2", bytes: 0, trashName: "snapshot+m2+0123456789ab", origin: "planned" },
+    ] })}\n`, { mode: 0o600 });
+    fs.rmSync(path.join(fixture.lifecycleRoot, "versions", "37.1.1"), { recursive: true, force: true });
+    fs.rmSync(path.join(fixture.lifecycleRoot, "versions", "37.1.0"), { recursive: true, force: true });
+    const refused = await rejection(() => fixture.manager().pruneSnapshots({
+      operationId: "r12-inherited-retry", keep: 1, apply: true,
+    }));
+    const after = JSON.parse(fs.readFileSync(removalRecord, "utf8")) as Record<string, unknown>;
+    record(CASES.r12Marker[2],
+      refused !== null && /needed_restore_incomplete/.test(refused.message) && marked(after) &&
+        treeDigest(source) === before && listDirectory(path.join(fixture.lifecycleRoot, "trash")).length === 0 &&
+        fixture.receipt("r12-inherited-retry", "snapshots_prune") === null,
+      { error: refused?.message, record: after, snapshotUnchanged: treeDigest(source) === before });
+  });
+}
+
 // ---- r3: a ledger that is merely open counts as in use -------------------
 
 type Opener = { send: (command: string) => Promise<string>; exit: () => Promise<void> };
@@ -2451,6 +2524,7 @@ async function main() {
     await r3LeaseAndFence();
     await pruneRecoveryGuard();
     await r8PruneSafety();
+    await r12RemovalMarkers();
     await r3OpenHandles();
     await r3PreexistingDamage();
     await r3BlockedRetentionRepair();

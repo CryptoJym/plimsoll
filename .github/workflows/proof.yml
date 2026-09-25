@@ -212,6 +212,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-data-safety
 
+      - name: Prove published 0.7.38-0.7.40 leave interrupted 0.7.41 removals untouched
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-cross-version
+
       - name: Prove no lifecycle command removes a receipt and staging never changes an existing runtime (eco-6hoxj.163.49/.50)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-preservation

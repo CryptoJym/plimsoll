@@ -35,6 +35,7 @@
     "proof:lifecycle-manifest-rollback": "tsx scripts/run-proof.ts scripts/lifecycle-manifest-rollback-proof.ts",
     "proof:lifecycle-retention": "tsx scripts/run-proof.ts scripts/lifecycle-retention-proof.ts",
     "proof:lifecycle-data-safety": "tsx scripts/run-proof.ts scripts/lifecycle-data-safety-proof.ts",
+    "proof:lifecycle-cross-version": "tsx scripts/run-proof.ts scripts/lifecycle-cross-version-proof.ts",
     "proof:lifecycle-preservation": "tsx scripts/run-proof.ts scripts/lifecycle-preservation-proof.ts",
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
     "proof:collector-reliability": "tsx scripts/collector-reliability-proof.ts",
