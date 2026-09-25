@@ -403,7 +403,8 @@ async function runLeaseSafeIntakeCase() {
 
 async function runLeaseUpgradeCase() {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p41-lease-upgrade-"));
-  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const ledgerPath = path.join(fixture, "ledger.sqlite");
+  let buffer = new LocalEventBuffer(ledgerPath, { workspaceId: tenantId });
   const sessionId = uuid(46_000);
   try {
     ensureSessionSummarySchema(buffer.database);
@@ -425,6 +426,11 @@ async function runLeaseUpgradeCase() {
         where session_id = new.session_id and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
       begin select raise(abort, 'session_sync_upload_lease'); end;
     `);
+    buffer.close();
+    buffer = new LocalEventBuffer(ledgerPath, { workspaceId: tenantId });
+    assert.equal(buffer.database.prepare(
+      "select 1 from sqlite_master where name = 'trg_session_sync_upload_lease_insert'",
+    ).get(), undefined, "the old intake fence must be gone on the first ledger open");
     ensureSessionSummarySchema(buffer.database);
     assert.equal(buffer.database.prepare("select 1 from sqlite_master where name = 'trg_session_sync_upload_lease_insert'").get(), undefined);
     for (const name of ["trg_session_sync_upload_lease_dirty_insert", "trg_session_sync_upload_lease_dirty_update"]) {
