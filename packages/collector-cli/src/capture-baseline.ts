@@ -1820,6 +1820,39 @@ export function classifyCaptureBaselineFile(
   };
 }
 
+/** Read-only baseline size for a matching excluded generation. The coverage
+ * callback uses it to keep unchanged pre-enrollment files out of its queue. */
+export function captureBaselineExcludedSize(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  observation: CaptureBaselineFileObservation,
+): number | null {
+  const schema = database.prepare(`select count(*) as n from sqlite_master
+    where type='table' and name in (?,?,?)`).get(STATE_TABLE, GENERATION_TABLE, ERROR_TABLE) as {n:number};
+  if (schema.n !== 3) return null;
+  const normalized = normalizeObservation(observation);
+  const state = stateRow(database, source);
+  if (!normalized || !state || !stateIsValid(state) || state.status !== "complete") return null;
+  if (database.prepare(`select 1 from ${ERROR_TABLE} where source=? and path_key=? and resolved_at is null limit 1`)
+    .get(source, normalized.pathKey)) return null;
+  const row = database.prepare(
+    `select baseline_size as baselineSize from ${GENERATION_TABLE}
+     where source=? and run_id=? and generation_key=?`,
+  ).get(source, state.runId, normalized.generationKey) as { baselineSize: number } | undefined;
+  return row?.baselineSize ?? null;
+}
+
+/** A grown excluded generation can start at this recorded enrollment size.
+ * The reader must prove a newline or skip the unfinished boundary record. */
+export function captureBaselinePostEnrollmentOffset(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  observation: CaptureBaselineFileObservation,
+): number | null {
+  const size = captureBaselineExcludedSize(database, source, observation);
+  return size !== null && observation.size > size ? size : null;
+}
+
 /**
  * Advance growth watermarks after an exhaustive explicit scan. The rows stay
  * present: explicit history repair acknowledges coverage but never clears an

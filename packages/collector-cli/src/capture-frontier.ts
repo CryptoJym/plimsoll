@@ -3,6 +3,7 @@ import type fs from "node:fs";
 import type Database from "better-sqlite3";
 
 import { jsonlScanStateKey } from "./jsonl-byte-tailer";
+import { captureRecordLossGaps } from "./capture-record-loss";
 
 /**
  * Capture watermark v1 (eco-6hoxj.163.18) — the capture half.
@@ -548,7 +549,8 @@ export function mergeCaptureGaps(gaps: readonly CaptureGap[], max = CAPTURE_CLAI
 export function captureFrontier(database: Database.Database): CaptureFrontier | null {
   const epoch = currentEpoch(database);
   if (!epoch) return null;
-  if (!tableExists(database, "capture_coverage_state")) return { ...epoch, capturedThrough: null, gaps: [] };
+  if (!tableExists(database, "capture_coverage_state")) return { ...epoch, capturedThrough: null,
+    gaps: mergeCaptureGaps(captureRecordLossGaps(database, Date.parse(epoch.epochStartedAt), epoch.installationEpochId)) };
   const scope = [epoch.workspaceId, epoch.installationEpochId] as const;
   const rows = database
     .prepare(
@@ -582,5 +584,8 @@ export function captureFrontier(database: Database.Database): CaptureFrontier | 
       if (fromMs < throughMs) gaps.push({ fromMs, toMs: Math.max(fromMs, Date.parse(row.lastWriteAt)) });
     }
   }
+  // EOF closes the unread-file row; only skipped records that may hold usage
+  // remain as permanent claim gaps. Classified non-usage skips need no gap.
+  gaps.push(...captureRecordLossGaps(database, epochStartMs, epoch.installationEpochId));
   return { ...epoch, capturedThrough, gaps: mergeCaptureGaps(gaps) };
 }

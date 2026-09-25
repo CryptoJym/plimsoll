@@ -3,7 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { captureRootDigest, type CaptureRoot } from "./capture-root-inventory";
-import { jsonlScanStateKey, type JsonlScanCursor, type JsonlTailRead, type JsonlTailReadLimits, type JsonlTailerIo } from "./jsonl-byte-tailer";
+import { ABSOLUTE_MAX_READ_BYTES, jsonlScanStateKey, type JsonlScanCursor, type JsonlTailRead, type JsonlTailReadLimits, type JsonlTailerIo } from "./jsonl-byte-tailer";
+import { classifySkippedRecord, type CaptureSkippedRecord } from "./capture-record-loss";
 import { start, feed, checkpoint, restore, project, LIMITS } from "./oversized-extractor.mjs";
 import { fingerprint, extend, equal, resumePolicy, sameSnapshot, type Fingerprint, type Snapshot } from "./oversized-continuity.mjs";
 
@@ -13,7 +14,7 @@ import { fingerprint, extend, equal, resumePolicy, sameSnapshot, type Fingerprin
 export const CONTINUATION_VERSION = 1;
 export const MAX_ENVELOPE_BYTES = 48 * 1024;
 const sha = (value: string | Buffer) => crypto.createHash("sha256").update(value).digest("hex");
-const REFUSALS = new Set(["incomplete_record", "generation_changed", "rewrite_ambiguous", "generation_rewrite_ambiguous", "prior_cursor_invalid", "prefix_changed", "prior_cursor_changed", "source_changed", "malformed_json", "invalid_utf8", "max_depth", "allowed_scalar_too_large", "allowed_number_too_large", "allowed_projection_too_large", "offset_overflow", "newline_before_end", "parser_refused"]);
+const REFUSALS = new Set(["incomplete_record", "generation_changed", "rewrite_ambiguous", "generation_rewrite_ambiguous", "prior_cursor_invalid", "prefix_changed", "prior_cursor_changed", "source_changed", "malformed_json", "invalid_utf8", "max_depth", "allowed_scalar_too_large", "allowed_number_too_large", "allowed_projection_too_large", "offset_overflow", "newline_before_end", "parser_refused", "enrollment_boundary_fragment"]);
 const safe = (n: unknown): n is number => Number.isSafeInteger(n) && (n as number) >= 0;
 const digest = (value: unknown) => sha(JSON.stringify(value));
 const exact = (value: unknown, keys: string[]): value is Record<string, any> => !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).sort().join() === keys.sort().join();
@@ -21,7 +22,8 @@ type Provider = "codex" | "claude";
 type Binding = { provider: Provider; cursorKey: string; fileKey: string; root: string; profile: string; epoch: string; enrollment: string; baseline: string; inventory: string };
 type Envelope = { sha256?: string; version: 1; rollbackVersion: "0.7.4"; binding: Binding; priorCursor: string; ancestors: string; snapshot: Snapshot;
  parser: string; prefix: Fingerprint; verification: { snapshot: Snapshot; prefix: Fingerprint } | null;
- reason: string | null };
+ reason: string | null; skip?: { reason: string; offset: number; ended: boolean; classified: boolean;
+   kind: CaptureSkippedRecord["kind"]; usagePossible: boolean } };
 export type ContinuationProposal = {
  action: "checkpoint" | "complete" | "park"; reason: string | null; requiredMinimumBytes: number | null;
  scanBytesAdvanced: number; prefixBytesRead: number;
@@ -32,7 +34,7 @@ export type ContinuationProposal = {
 };
 export type ContinuationOptions = {
  database: Database.Database; provider: Provider; cursorKey: string; root?: CaptureRoot;
- directory: string; deadline: number;
+ directory: string; deadline: number; initialOffset?: number;
  /** Metadata-only eligibility check. Called before every body/probe/scalar read. */
  eligible(): boolean;
 };
@@ -71,18 +73,24 @@ function decode(raw: string): Envelope {
  if (Buffer.byteLength(raw) > MAX_ENVELOPE_BYTES) throw new Error("envelope_limit");
  const e = JSON.parse(raw);
  if (!validSeal(e)) throw new Error("corrupt_envelope");
- if (!exact(e, ["sha256", "version", "rollbackVersion", "binding", "priorCursor", "ancestors", "snapshot", "parser", "prefix", "verification", "reason"]) || e.version !== 1 || e.rollbackVersion !== "0.7.4" ||
+ if (!exact(e, ["sha256", "version", "rollbackVersion", "binding", "priorCursor", "ancestors", "snapshot", "parser", "prefix", "verification", "reason", ...(e.skip === undefined ? [] : ["skip"])]) || e.version !== 1 || e.rollbackVersion !== "0.7.4" ||
    !exact(e.binding, ["provider", "cursorKey", "fileKey", "root", "profile", "epoch", "enrollment", "baseline", "inventory"]) ||
    !["codex", "claude"].includes(e.binding.provider) || !Object.entries(e.binding).every(([k, v]) => k === "provider" || typeof v === "string" && /^[a-f0-9]{64}$/.test(v)) ||
    typeof e.priorCursor !== "string" || !/^[a-f0-9]{64}$/.test(e.priorCursor) || !validSnapshot(e.snapshot) || typeof e.ancestors !== "string" || !/^[a-f0-9]{64}$/.test(e.ancestors) ||
    !(e.reason === null || typeof e.reason === "string" && /^[a-z_]{1,64}$/.test(e.reason))) throw new Error("invalid_envelope");
  const p = restore(e.parser);
  equal(e.prefix, e.prefix);
- if (p.provider !== e.binding.provider || e.prefix.start !== p.recordStart || e.prefix.end !== p.scanOffset || p.scanOffset > e.snapshot.size) throw new Error("parser_fingerprint_mismatch");
+ if (p.provider !== e.binding.provider || e.prefix.start !== p.recordStart ||
+   (e.skip ? e.prefix.end !== e.skip.offset || p.scanOffset > e.skip.offset : e.prefix.end !== p.scanOffset) ||
+   e.prefix.end > e.snapshot.size) throw new Error("parser_fingerprint_mismatch");
+ if (e.skip !== undefined && (!exact(e.skip,["reason","offset","ended","classified","kind","usagePossible"]) ||
+   !REFUSALS.has(e.skip.reason) || !safe(e.skip.offset) || typeof e.skip.ended !== "boolean" ||
+   typeof e.skip.classified !== "boolean" || typeof e.skip.usagePossible !== "boolean" ||
+   !["codex_token_count","codex_non_usage","claude_assistant","claude_non_usage","unknown"].includes(e.skip.kind))) throw new Error("invalid_skip_state");
  if (e.verification !== null) {
    if (!exact(e.verification, ["snapshot", "prefix"]) || !validSnapshot(e.verification.snapshot)) throw new Error("invalid_verification");
    equal(e.verification.prefix, e.verification.prefix);
-   if (e.verification.prefix.start !== p.recordStart || e.verification.prefix.end > p.scanOffset ||
+   if (e.verification.prefix.start !== p.recordStart || e.verification.prefix.end > e.prefix.end ||
      e.verification.snapshot.identity !== e.snapshot.identity || e.verification.snapshot.size < e.snapshot.size) throw new Error("invalid_verification");
  }
  if (e.reason !== null && !REFUSALS.has(e.reason)) throw new Error("invalid_refusal");
@@ -113,7 +121,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
  const previousRaw = (db.prepare("select envelope_json from jsonl_continuations where provider=? and file_key=?").get(options.provider, b.fileKey) as { envelope_json: string } | undefined)?.envelope_json;
  const maxBytes = Math.min(LIMITS.sliceBytes, Math.max(0, Math.floor(limits.maxBytes ?? LIMITS.sliceBytes)));
  let bytesRead = 0, prefixBytesRead = 0, fd: number | undefined, current: Snapshot | undefined;
- let envelope: Envelope | undefined, initialOffset = 0, admittedAncestors: string | undefined;
+ let envelope: Envelope | undefined, initialOffset = cursor?.committedOffset ?? options.initialOffset ?? 0, admittedAncestors: string | undefined;
  let legacy: JsonlTailRead | undefined;
  let reason: string | null = null, requiredMinimumBytes: number | null = null, pendingFence: string | null = null;
  const close = () => { if (fd !== undefined) { fs.closeSync(fd); fd = undefined; } legacy?.close(); };
@@ -121,7 +129,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
    const row = db.prepare("select envelope_json from jsonl_continuations where provider=? and file_key=?").get(options.provider, b.fileKey) as {envelope_json:string}|undefined;
    if (db.prepare("select 1 from jsonl_continuations where file_key=? and provider<>? limit 1").get(b.fileKey, options.provider) || row?.envelope_json !== previousRaw || jsonlCursorDigest(db, options.cursorKey) !== priorCursor || digest(binding(options, file)) !== digest(b)) throw new Error("stale_continuation_proposal");
  };
- const result = (action: ContinuationProposal["action"], lines: string[] = [], committedOffset = cursor?.committedOffset ?? 0): JsonlTailRead => {
+ const result = (action: ContinuationProposal["action"], lines: string[] = [], committedOffset = cursor?.committedOffset ?? options.initialOffset ?? 0): JsonlTailRead => {
    const nextRaw = action === "checkpoint" ? pendingFence ?? (envelope ? encode(envelope) : null) : null;
    const snap = current ?? envelope?.snapshot;
    const proposal: ContinuationProposal = { action, reason, requiredMinimumBytes,
@@ -208,7 +216,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      if (retired) return park(retired);
      try { envelope = decode(previousRaw); } catch { return park("invalid_envelope"); }
      if (digest(envelope.binding) !== digest(b) || envelope.priorCursor !== priorCursor ||
-       (cursor && cursor.checkpointStatus !== "valid") || restore(envelope.parser).recordStart !== (cursor?.committedOffset ?? 0)) return park("binding_mismatch");
+       (cursor && cursor.checkpointStatus !== "valid") || restore(envelope.parser).recordStart !== (cursor?.committedOffset ?? options.initialOffset ?? 0)) return park("binding_mismatch");
      initialOffset = envelope.prefix.end;
      if (envelope.reason && envelope.reason !== "incomplete_record") return park(envelope.reason);
      const p = envelope.verification?.prefix ?? envelope.prefix;
@@ -223,10 +231,67 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      // The old reader performs its bounded head/boundary integrity checks. Its
      // unresolved result is a proposal only; never store its reset/scan fields.
      current = securePath();
-     legacy = io.readTail(file, stat, cursor, {...limits, maxBytes, beforeRead: () => {
+     if (!cursor && options.initialOffset && options.initialOffset > 0) {
+       fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+       check();
+       const newline = readAt(options.initialOffset - 1, 1)[0] === 0x0a;
+       if (!newline) {
+         envelope = { version:1, rollbackVersion:"0.7.4", binding:b, priorCursor,
+           ancestors:admittedAncestors!, snapshot:current,
+           parser:checkpoint(start(options.provider, options.initialOffset)),
+           prefix:fingerprint(options.initialOffset), verification:null, reason:null,
+           skip:{reason:"enrollment_boundary_fragment",offset:options.initialOffset,ended:false,classified:true,
+             kind:"unknown",usagePossible:true} };
+         return result("checkpoint");
+       }
+       fs.closeSync(fd); fd = undefined;
+     }
+     legacy = io.readTail(file, stat, cursor, {...limits, maxBytes, initialOffset: options.initialOffset, beforeRead: () => {
        if (!current || !sameSnapshot(securePath(), current)) throw new Error("source_changed");
        if (performance.now() >= options.deadline) throw new Error("read_budget_exhausted");
      }, onBytesRead: n => { bytesRead += n; }});
+     if (cursor?.checkpointStatus === "valid" && cursor.fileIdentity === current.identity &&
+         (cursor.unresolvedRecord?.reason === "generation_rewrite_ambiguous" ||
+          legacy?.unresolvedRecord?.reason === "generation_rewrite_ambiguous")) {
+       // The first record must prove the original session. Replaying that
+       // lineage from byte zero is safe because provider event identities are
+       // stable; a changed existing event remains a logical-source conflict.
+       const state = cursor.parserState as Record<string, unknown> | undefined;
+       const expected = options.provider === "codex" ? state?.conversationId : state?.sessionId;
+       legacy?.close(); legacy = undefined;
+       if (typeof expected === "string" && maxBytes - bytesRead >= 5120) {
+         fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+         check();
+         const probe = readAt(0, Math.min(4096, current.size));
+         const end = probe.indexOf(0x0a);
+         let proven = false;
+         if (end >= 0) {
+           try {
+             const first = JSON.parse(new TextDecoder("utf-8", {fatal:true}).decode(probe.subarray(0,end)));
+             const actual = options.provider === "codex"
+               ? first?.type === "session_meta" ? first.payload?.id : undefined
+               : first?.sessionId;
+             proven = typeof actual === "string" && actual.toLowerCase() === expected.toLowerCase();
+           } catch { /* An incomplete or invalid identity is not a replay boundary. */ }
+         }
+         fs.closeSync(fd); fd = undefined;
+         if (proven && maxBytes - bytesRead >= 1025) {
+           const replay = io.readTail(file, stat, undefined, {...limits, maxBytes:maxBytes - bytesRead,
+             beforeRead: () => {
+               if (!current || !sameSnapshot(securePath(), current)) throw new Error("source_changed");
+               if (performance.now() >= options.deadline) throw new Error("read_budget_exhausted");
+             }, onBytesRead: n => { bytesRead += n; }});
+           if (replay) {
+             replay.bytesRead = bytesRead;
+             replay.reset = true;
+             return protectLegacy(replay);
+           }
+         }
+       }
+       // The original ambiguity remains visible if identity was unproved.
+       reason = "generation_rewrite_ambiguous";
+       return result("park");
+     }
      const incomplete = legacy && !legacy.unresolvedRecord && legacy.lines.length === 0 && legacy.deferredBytes > 0;
      if (!legacy || !legacy.unresolvedRecord && !incomplete) {
        // Keep the established bounded fast path for unescaped records. An
@@ -256,7 +321,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      bytesRead = legacy.bytesRead;
      if (cursor && (cursor.checkpointStatus !== "valid" || legacy.reset || cursor.committedOffset === null)) return refuse("prior_cursor_invalid");
      current = securePath();
-     const offset = cursor?.committedOffset ?? 0;
+     const offset = cursor?.committedOffset ?? options.initialOffset ?? 0;
      initialOffset = offset;
      envelope = { version:1, rollbackVersion:"0.7.4", binding:b, priorCursor, ancestors:admittedAncestors!, snapshot:current,
        parser:checkpoint(start(options.provider, offset)), prefix:fingerprint(offset), verification:null, reason:null };
@@ -288,6 +353,47 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      envelope.snapshot = current; envelope.verification = null;
    }
    const parser = restore(envelope.parser);
+   if (envelope.skip) {
+     const skip = envelope.skip;
+     if (!skip.classified) {
+       const length = Math.min(2048, current.size - parser.recordStart);
+       if (maxBytes - bytesRead < length) return result("checkpoint");
+       Object.assign(skip, classifySkippedRecord(options.provider, readAt(parser.recordStart, length)));
+       skip.classified = true;
+     }
+     if (!skip.ended && skip.offset < current.size) {
+       const oldPartial = envelope.prefix.end - envelope.prefix.start - envelope.prefix.fullBytes;
+       const available = maxBytes - bytesRead - oldPartial;
+       if (available <= 1) return result("checkpoint");
+       const at = skip.offset;
+       const bytes = readAt(at, Math.min(available, current.size - at));
+       const newline = bytes.indexOf(0x0a);
+       const target = at + (newline < 0 ? bytes.length : newline + 1);
+       const next = extend(envelope.prefix, target, (position, n) => {
+         if (position >= at && position + n <= at + bytes.length) return bytes.subarray(position - at, position - at + n);
+         const old = readAt(position, at - position); prefixBytesRead += old.length;
+         return Buffer.concat([old, bytes.subarray(0, n - old.length)]);
+       }, {maxBytes: LIMITS.sliceBytes, deadline: options.deadline});
+       if (next.status === "changed") return refuse("prefix_changed");
+       if (next.status !== "complete") return result("checkpoint");
+       envelope.prefix = next.fingerprint;
+       skip.offset = target;
+       skip.ended = newline >= 0;
+     }
+     if (!skip.ended) return skip.offset === current.size ? refuse("incomplete_record") : result("checkpoint");
+     const skippedBytes = skip.offset - parser.recordStart;
+     if (skippedBytes <= ABSOLUTE_MAX_READ_BYTES && skip.reason !== "enrollment_boundary_fragment") return refuse(skip.reason);
+     const headBytes = Math.min(512, current.size), continuityBytes = Math.min(512, skip.offset);
+     if (maxBytes - bytesRead < headBytes + continuityBytes) return result("checkpoint");
+     const headHash = sha(readAt(0, headBytes));
+     const continuityHash = sha(readAt(skip.offset - continuityBytes, continuityBytes));
+     const completed = result("complete", [], skip.offset);
+     completed.headBytes = headBytes; completed.headHash = headHash;
+     completed.continuityBytes = continuityBytes; completed.continuityHash = continuityHash;
+     completed.skippedRecord = {offset: parser.recordStart, bytes: skippedBytes, reason: skip.reason,
+       kind: skip.kind, usagePossible: skip.usagePossible};
+     return completed;
+   }
    // One admitted parser read, leaving enough allowance for its old partial
    // fingerprint block. The reviewed fingerprint reuses these in-memory bytes.
    if (parser.status === "scanning" && parser.scanOffset < current.size) {
@@ -310,13 +416,21 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      if (next.status !== "complete") return result("checkpoint"); // parser proposal discarded
      envelope.parser = checkpoint(parser); envelope.prefix = next.fingerprint;
    }
-   if (parser.status === "refused") return refuse(parser.reason ?? "parser_refused");
+   if (parser.status === "refused") {
+     envelope.skip = {reason: parser.reason ?? "parser_refused", offset: parser.scanOffset,
+       ended: false, classified: false, kind: "unknown", usagePossible: true};
+     return result("checkpoint");
+   }
    if (parser.status !== "ready") {
      if (parser.scanOffset === current.size) return refuse("incomplete_record");
      return result("checkpoint");
    }
    const scalarBytes = parser.slots.reduce((n, slot) => n + (slot && ["string", "number"].includes(slot.kind) ? slot.end-slot.begin : 0), 0);
-   if (scalarBytes > LIMITS.projectionBytes) return refuse("allowed_projection_too_large");
+   if (scalarBytes > LIMITS.projectionBytes) {
+     envelope.skip = {reason: "allowed_projection_too_large", offset: parser.scanOffset,
+       ended: true, classified: false, kind: "unknown", usagePossible: true};
+     return result("checkpoint");
+   }
    const headBytes = Math.min(512, current.size), continuityBytes = Math.min(512, parser.scanOffset);
    if (maxBytes - bytesRead < scalarBytes + headBytes + continuityBytes) {
      if (!bytesRead) { requiredMinimumBytes = scalarBytes + headBytes + continuityBytes; return park("insufficient_budget"); }

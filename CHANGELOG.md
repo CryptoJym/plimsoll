@@ -105,6 +105,12 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Codex rollout and Claude transcript capture now revisits files left unread in
+  older folders, after partial reads, and after post-enrollment growth. Records
+  beyond the reader ceiling are passed in bounded chunks; skipped kinds and
+  bytes are counted, and any possible usage loss remains a capture gap after
+  the file reaches its end. Same-session rewrites with unchanged prior usage
+  events replay through stable identities so tokens are not counted again.
 - OTLP exports the ledger cannot commit in time are kept, not lost
   (`eco-6hoxj.163.17`). An authenticated, validated request that meets a busy
   ledger or runs out of its 1.5 s deadline — including one whose body arrived
