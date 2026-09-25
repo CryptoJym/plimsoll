@@ -6,7 +6,7 @@ import type Database from "better-sqlite3";
 import { DAEMON_SESSION_SYNC_STATE_KEY, readLedgerOffThread } from "./session-sync";
 
 const execFileAsync = promisify(execFile);
-export const BUDGET_SAMPLE_VERSION = 1;
+export const BUDGET_SAMPLE_VERSION = 2;
 export const BUDGET_RING_LIMIT = 1_440;
 export const BUDGET_DBSTAT_MAX_BYTES = 2 * 1024 ** 3;
 const DEAD_AGE_MAX_ROWS = 1_000;
@@ -27,8 +27,12 @@ export type BudgetSample = {
   dbBytes: number | null;
   walBytes: number | null;
   shmBytes: number | null;
-  /** File growth only. SQLite can rewrite a checkpointed WAL without growing it. */
-  walBytesWrittenMin: number | null;
+  /** Change in WAL file length, never a measure of physical writes. */
+  walFileGrowthBytes: number | null;
+  /** Node ru_oublock: filesystem output operations for this process, all files. */
+  fsWriteOperationsDelta: number | null;
+  fsWriteOperationsPerMinute: number | null;
+  fsWriteTotal: number;
   processes: BudgetProcess[];
   outboxPending: number | null;
   outboxDead: number | null;
@@ -36,7 +40,8 @@ export type BudgetSample = {
   outboxOldestDeadAgeSeconds: number | null;
   summaryLagSeconds: number | null;
   samplerElapsedMs: number;
-  samplerCpuMicros: number;
+  /** Unavailable: process CPU across an async interval includes unrelated work. */
+  samplerCpuMicros: null;
   samplerMainThreadMs: number;
   attemptedRowsDelta: number;
   unavailable: string[];
@@ -72,51 +77,53 @@ function timeMs(text: string): number | null {
   return Math.round((Number(dayPart) * 86_400 + seconds) * 1_000);
 }
 
-/** ps is asynchronous; only the collector PID and its direct child processes are read. */
+export type BudgetChildPid = { pid: number; role: "maintenance" | "enrichment" };
+
+/** The daemon uses Node counters. ps runs only when a tracked child exists. */
 export async function budgetProcessTree(
-  pid: number,
   atMs: number,
   previous?: BudgetSample,
+  childPids: BudgetChildPid[] = [],
 ): Promise<{ processes: BudgetProcess[]; unavailable: string[] }> {
-  if (process.platform !== "darwin" && process.platform !== "linux") {
-    return { processes: [], unavailable: ["process_accounting_platform_unsupported"] };
-  }
-  let children: number[] = [];
+  const cpu = process.cpuUsage();
+  const cpuTotalMs = (cpu.user + cpu.system) / 1_000;
+  const prior = previous?.processes.find((entry) => entry.pid === process.pid && entry.role === "daemon");
+  const elapsedMs = previous ? atMs - previous.atMs : 0;
+  const daemonDelta = prior && cpuTotalMs >= prior.cpuTotalMs ? cpuTotalMs - prior.cpuTotalMs : null;
+  const processes: BudgetProcess[] = [{ pid: process.pid, role: "daemon",
+    rssBytes: process.memoryUsage.rss(), cpuTotalMs, cpuDeltaMs: daemonDelta,
+    cpuCores: daemonDelta !== null && elapsedMs > 0 ? daemonDelta / elapsedMs : null }];
   const unavailable: string[] = [];
-  try {
-    const found = await execFileAsync("/usr/bin/pgrep", ["-P", String(pid)], { timeout: 1_000, maxBuffer: 16_384 });
-    children = found.stdout.split(/\s+/).map(Number).filter((value) => Number.isSafeInteger(value) && value > 0);
-  } catch (error) {
-    // Exit 1 means there are no children. Other failures lose child coverage.
-    if ((error as { code?: number }).code !== 1) unavailable.push("child_process_discovery_failed");
+  if (!childPids.length) return { processes, unavailable };
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    return { processes, unavailable: ["child_process_accounting_platform_unsupported"] };
   }
   const ps = process.platform === "darwin" ? "/bin/ps" : "/usr/bin/ps";
   let output: string;
   try {
-    output = (await execFileAsync(ps, ["-o", "pid=", "-o", "ppid=", "-o", "rss=", "-o", "time=", "-o", "command=", "-p", [pid, ...children].join(",")], {
-      timeout: 1_000, maxBuffer: 65_536,
+    output = (await execFileAsync(ps, ["-o", "pid=", "-o", "ppid=", "-o", "rss=", "-o", "time=", "-p",
+      childPids.map((child) => child.pid).join(",")], {
+      timeout: 1_000, maxBuffer: 16_384,
     })).stdout;
   } catch {
-    return { processes: [], unavailable: [...unavailable, "process_accounting_failed"] };
+    return { processes, unavailable: [...unavailable, "child_process_accounting_failed"] };
   }
-  const processes: BudgetProcess[] = [];
   for (const line of output.split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+([0-9:.\-]+)\s+(.+)$/);
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+([0-9:.\-]+)\s*$/);
     if (!match) continue;
     const currentPid = Number(match[1]);
-    if (currentPid !== pid && Number(match[2]) !== pid) continue;
-    const cpuTotalMs = timeMs(match[4]!);
-    if (cpuTotalMs === null) continue;
-    const prior = previous?.processes.find((entry) => entry.pid === currentPid);
-    const cpuDeltaMs = prior && cpuTotalMs >= prior.cpuTotalMs ? cpuTotalMs - prior.cpuTotalMs : null;
-    const elapsedMs = previous ? atMs - previous.atMs : 0;
-    const role = currentPid === pid ? "daemon"
-      : match[5]!.includes("__maintenance_worker") ? "maintenance"
-      : match[5]!.includes("__enrichment_worker") ? "enrichment" : "other_child";
-    processes.push({ pid: currentPid, role, rssBytes: Number(match[3]) * 1024,
-      cpuTotalMs, cpuDeltaMs, cpuCores: cpuDeltaMs !== null && elapsedMs > 0 ? cpuDeltaMs / elapsedMs : null });
+    const tracked = childPids.find((entry) => entry.pid === currentPid);
+    if (!tracked || Number(match[2]) !== process.pid) continue;
+    const childCpuTotalMs = timeMs(match[4]!);
+    if (childCpuTotalMs === null) continue;
+    const childPrior = previous?.processes.find((entry) => entry.pid === currentPid && entry.role === tracked.role);
+    const cpuDeltaMs = childPrior && childCpuTotalMs >= childPrior.cpuTotalMs
+      ? childCpuTotalMs - childPrior.cpuTotalMs : null;
+    processes.push({ pid: currentPid, role: tracked.role, rssBytes: Number(match[3]) * 1024,
+      cpuTotalMs: childCpuTotalMs, cpuDeltaMs,
+      cpuCores: cpuDeltaMs !== null && elapsedMs > 0 ? cpuDeltaMs / elapsedMs : null });
   }
-  if (!processes.some((entry) => entry.pid === pid)) unavailable.push("daemon_process_not_observed");
+  if (processes.length - 1 < childPids.length) unavailable.push("tracked_child_not_observed");
   return { processes, unavailable };
 }
 
@@ -165,31 +172,41 @@ export function budgetLedgerSnapshot(db: Database.Database, nowMs: number) {
 }
 
 export async function collectBudgetSample(db: Database.Database, ledgerPath: string, options: {
-  nowMs?: number; processPid?: number; previous?: BudgetSample;
+  nowMs?: number; previous?: BudgetSample; childPids?: BudgetChildPid[];
 } = {}): Promise<BudgetSample> {
   const started = performance.now();
-  const cpuBefore = process.cpuUsage();
   const nowMs = options.nowMs ?? Date.now();
+  const fsWrites = process.resourceUsage().fsWrite;
   const [dbBytes, walBytes, shmBytes, tree] = await Promise.all([
     fileBytes(ledgerPath), fileBytes(`${ledgerPath}-wal`), fileBytes(`${ledgerPath}-shm`),
-    budgetProcessTree(options.processPid ?? process.pid, nowMs, options.previous),
+    budgetProcessTree(nowMs, options.previous, options.childPids),
   ]);
   const ledgerStarted = performance.now();
   const ledger = budgetLedgerSnapshot(db, nowMs);
   const ledgerMs = performance.now() - ledgerStarted;
-  const cpu = process.cpuUsage(cpuBefore);
+  // A zero ru_oublock has proved uninformative after fsync on macOS; do not
+  // show a zero write rate as if it were a verified observation.
+  const fsWriteCounterValid = fsWrites > 0 || (options.previous?.fsWriteTotal ?? 0) > 0;
+  const fsWriteOperationsDelta = fsWriteCounterValid && options.previous?.fsWriteTotal != null
+    ? Math.max(0, fsWrites - options.previous.fsWriteTotal) : null;
+  const elapsedMinutes = options.previous ? (nowMs - options.previous.atMs) / 60_000 : 0;
   return {
     version: BUDGET_SAMPLE_VERSION, atMs: nowMs, dbBytes, walBytes, shmBytes,
-    walBytesWrittenMin: walBytes === null || options.previous?.walBytes == null ? null
+    walFileGrowthBytes: walBytes === null || options.previous?.walBytes == null ? null
       : walBytes >= options.previous.walBytes ? walBytes - options.previous.walBytes : walBytes,
+    fsWriteTotal: fsWrites, fsWriteOperationsDelta,
+    fsWriteOperationsPerMinute: fsWriteOperationsDelta !== null && elapsedMinutes > 0
+      ? fsWriteOperationsDelta / elapsedMinutes : null,
     processes: tree.processes,
     ...ledger,
     samplerElapsedMs: Math.round((performance.now() - started) * 100) / 100,
-    samplerCpuMicros: cpu.user + cpu.system,
+    samplerCpuMicros: null,
     samplerMainThreadMs: Math.round(ledgerMs * 100) / 100,
     attemptedRowsDelta: 0,
     unavailable: [...tree.unavailable, ...ledger.unavailable,
-      "exact_wal_write_bytes_unavailable_stat_only",
+      "physical_write_bytes_unavailable_fswrite_counts_process_output_operations",
+      ...(fsWriteCounterValid ? [] : ["fswrite_counter_zero_unverified"]),
+      "sampler_cpu_attribution_unavailable_concurrent_process_work",
       "thread_pool_accounted_in_process_not_separable",
       "other_process_admissions_and_counted_gaps_unavailable"],
   };
@@ -213,7 +230,8 @@ export function recordBudgetSample(db: Database.Database, sample: BudgetSample):
   })();
 }
 
-const METRICS = ["dbBytes", "walBytes", "shmBytes", "walBytesWrittenMin", "rssBytes", "cpuCores",
+const METRICS = ["dbBytes", "walBytes", "shmBytes", "walFileGrowthBytes",
+  "fsWriteOperationsDelta", "fsWriteOperationsPerMinute", "rssBytes", "cpuCores",
   "outboxPending", "outboxDead", "outboxOldestPendingAgeSeconds", "outboxOldestDeadAgeSeconds",
   "summaryLagSeconds", "samplerElapsedMs", "samplerCpuMicros", "samplerMainThreadMs"] as const;
 
@@ -240,7 +258,7 @@ function sampleMetric(sample: BudgetSample, metric: typeof METRICS[number]): num
     const deltas = sample.processes.map((entry) => entry.cpuCores).filter((value): value is number => value !== null);
     return deltas.length ? deltas.reduce((sum, value) => sum + value, 0) : null;
   }
-  return sample[metric];
+  return sample[metric] ?? null;
 }
 
 const TARGETS = {
@@ -265,13 +283,15 @@ function attemptedClass(db: Database.Database, nowMs: number) {
     : rate < 30_000 ? "light" : rate <= 150_000 ? "busy" : "studio0_scale";
   return { hostClass, attemptedRowsPerDay: rate, observedDays: days,
     provisional: days < 7 || completeDays < 7,
-    rateBasis: "local_raw_insert_attempts_flushed_each_minute; other_processes_and_counted_gaps_unavailable" };
+    rateBasis: "lower_bound_local_admitted_rows_only; counted_gaps_and_other_writers_unavailable" };
 }
 
 /** CLI read; the daemon calls this only after a sample, and /status uses its cached return. */
-function budgetSamples(db: Database.Database): BudgetSample[] {
+function budgetSamples(db: Database.Database, nowMs = Date.now()): BudgetSample[] {
   if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_samples'`).get()) return [];
-  return (db.prepare(`select sample_json as json from budget_samples order by id`).all() as Array<{ json: string }>)
+  return (db.prepare(`select sample_json as json from budget_samples where at_ms >= ?
+    order by id desc limit ?`).all(nowMs - DAY_MS, BUDGET_RING_LIMIT) as Array<{ json: string }>)
+    .reverse()
     .map((row) => JSON.parse(row.json) as BudgetSample);
 }
 
@@ -280,9 +300,10 @@ export function budgetStatus(db: Database.Database, nowMs = Date.now()) {
     return { mode: "advisory" as const, latest: null, p50: null, p95: null,
       hostClass: null, attemptedRowsPerDay: null, observedDays: 0, provisional: true,
       targets: null, targetStatus: "hypothesis" as const,
+      writeRateStatus: "uncalibrated_physical_bytes_unavailable" as const,
       unavailable: ["sampler_not_started"] };
   }
-  const samples = budgetSamples(db).reverse();
+  const samples = budgetSamples(db, nowMs).reverse();
   const summary = (fraction: number) => samples.length
     ? Object.fromEntries(METRICS.map((metric) => [metric, percentile(samples
       .map((sample) => sampleMetric(sample, metric)).filter((value): value is number => value !== null), fraction)]))
@@ -292,32 +313,39 @@ export function budgetStatus(db: Database.Database, nowMs = Date.now()) {
     p50: summary(0.5), p95: summary(0.95),
     ...host, targets: host.hostClass ? TARGETS[host.hostClass] : null,
     targetStatus: "hypothesis" as const,
+    writeRateStatus: "uncalibrated_physical_bytes_unavailable" as const,
     unavailable: samples[0]?.unavailable ?? ["no_sample_yet"] };
 }
 
-export function budgetCsv(db: Database.Database): string {
+export function budgetCsv(db: Database.Database, nowMs = Date.now()): string {
   if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_samples'`).get()) return "";
-  const rows = db.prepare(`select sample_json as json from budget_samples order by id`).all() as Array<{json:string}>;
-  const header = ["at", ...METRICS, "processes_json", "unavailable_json"];
+  const samples = budgetSamples(db, nowMs);
+  const daily = budgetDailyRows(db, nowMs);
+  const host = attemptedClass(db, nowMs);
+  const header = ["record_type", "at", ...METRICS, "attemptedRowsDelta", "processes_json",
+    "unavailable_json", "hostClass", "attemptedRowsPerDay", "provisional",
+    "rateBasis", "day", "dailyAttemptedRows", "dbstatStatus", "tablePagesJson"];
   const csv = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-  return [header.join(","), ...rows.map(({json}) => {
-    const sample = JSON.parse(json) as BudgetSample;
-    return [new Date(sample.atMs).toISOString(), ...METRICS.map((metric) => sampleMetric(sample, metric)),
-      JSON.stringify(sample.processes), JSON.stringify(sample.unavailable)].map(csv).join(",");
-  })].join("\n") + "\n";
+  return [header.join(","), ...samples.map((sample) => ["sample", new Date(sample.atMs).toISOString(),
+    ...METRICS.map((metric) => sampleMetric(sample, metric)), sample.attemptedRowsDelta,
+    JSON.stringify(sample.processes), JSON.stringify(sample.unavailable),
+    ...Array(8).fill(null)].map(csv).join(",")),
+    ["class", null, ...Array(METRICS.length + 3).fill(null), host.hostClass,
+      host.attemptedRowsPerDay, host.provisional, host.rateBasis,
+      ...Array(4).fill(null)].map(csv).join(","),
+    ...daily.map((row) => ["daily", null, ...Array(METRICS.length + 7).fill(null),
+      row.day, row.attemptedRows, row.dbstatStatus, row.tablePagesJson].map(csv).join(","))
+  ].join("\n") + "\n";
 }
 
-export function budgetExport(db: Database.Database) {
+export function budgetExport(db: Database.Database, nowMs = Date.now()) {
   const hasSamples = Boolean(db.prepare(`select 1 from sqlite_master where type='table' and name='budget_samples'`).get());
   const hasControl = Boolean(db.prepare(`select 1 from sqlite_master where type='table' and name='budget_control'`).get());
   const control = hasControl ? db.prepare(`select started_day as startedDay from budget_control where singleton=1`)
     .get() as { startedDay: string } | undefined : undefined;
-  const samples = hasSamples
-    ? (db.prepare(`select sample_json as json from budget_samples order by id`).all() as Array<{ json: string }>)
-      .map((row) => JSON.parse(row.json) as BudgetSample)
-    : [];
+  const samples = hasSamples ? budgetSamples(db, nowMs) : [];
   return { schema: "plimsoll-budget-export/v1", mode: "advisory" as const,
-    startedDay: control?.startedDay ?? null, samples, daily: budgetDailyRows(db) };
+    startedDay: control?.startedDay ?? null, samples, daily: budgetDailyRows(db, nowMs) };
 }
 
 /** dbstat reads every page. The stat size gate runs before the off-thread query. */
@@ -346,10 +374,11 @@ export async function recordDailyTableSizes(db: Database.Database, ledgerPath: s
   return status;
 }
 
-export function budgetDailyRows(db: Database.Database): DailyRow[] {
+export function budgetDailyRows(db: Database.Database, nowMs = Date.now()): DailyRow[] {
   if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_daily'`).get()) return [];
   return db.prepare(`select day, version, attempted_rows as attemptedRows, dbstat_status as dbstatStatus,
-    table_pages_json as tablePagesJson from budget_daily order by day`).all() as DailyRow[];
+    table_pages_json as tablePagesJson from budget_daily where day >= ? order by day`).all(
+      new Date(nowMs - 7 * DAY_MS).toISOString().slice(0, 10)) as DailyRow[];
 }
 
 export class BudgetSampler {
@@ -366,7 +395,8 @@ export class BudgetSampler {
   private lastAttemptedTotal: number;
 
   constructor(private readonly db: Database.Database, private readonly ledgerPath: string,
-    private readonly intervalMs = 60_000, private readonly attemptedTotal: () => number = () => 0) {
+    private readonly intervalMs = 60_000, private readonly attemptedTotal: () => number = () => 0,
+    private readonly childPids: () => BudgetChildPid[] = () => []) {
     ensureBudgetSchema(db);
     this.lastAttemptedTotal = attemptedTotal();
     this.history = budgetSamples(db);
@@ -400,6 +430,7 @@ export class BudgetSampler {
     return { mode: "advisory" as const, latest, p50: summary(0.5), p95: summary(0.95),
       ...host, targets: host.hostClass ? TARGETS[host.hostClass] : null,
       targetStatus: "hypothesis" as const,
+      writeRateStatus: "uncalibrated_physical_bytes_unavailable" as const,
       unavailable: latest?.unavailable ?? ["no_sample_yet"] };
   }
 
@@ -419,7 +450,8 @@ export class BudgetSampler {
     this.inFlight = true;
     try {
       const attemptedTotal = this.attemptedTotal();
-      const sample = await collectBudgetSample(this.db, this.ledgerPath, { previous: this.previous });
+      const sample = await collectBudgetSample(this.db, this.ledgerPath,
+        { previous: this.previous, childPids: this.childPids() });
       if (this.stopped) return;
       sample.attemptedRowsDelta = Math.max(0, attemptedTotal - this.lastAttemptedTotal);
       const writeStarted = performance.now();

@@ -2579,9 +2579,6 @@ async function main() {
     // connection's own automatic checkpoint stays only as a backstop
     // (wal-checkpoint-worker.ts).
     const walCheckpoint = new WalCheckpointWorker(buffer.database);
-    const budgetSampler = process.env.PLIMSOLL_BUDGET_SAMPLER === "off"
-      ? null : new BudgetSampler(buffer.database, collectorBufferPath(), 60_000,
-        () => buffer.budgetAttemptedTotal());
     // Outcome facts intentionally live outside the capture ledger. Opening the
     // local read model here does not schedule collection; the only writer is
     // an explicit backfill command.
@@ -2658,6 +2655,12 @@ async function main() {
       termGraceMs: 250,
       killGraceMs: 750,
     });
+    const budgetSampler = process.env.PLIMSOLL_BUDGET_SAMPLER === "off"
+      ? null : new BudgetSampler(buffer.database, collectorBufferPath(), 60_000,
+        () => buffer.budgetAttemptedTotal(), () => [
+          { pid: maintenanceBoundary.budgetChildPid(), role: "maintenance" as const },
+          { pid: enrichmentBoundary.budgetChildPid(), role: "enrichment" as const },
+        ].filter((child): child is { pid: number; role: "maintenance" | "enrichment" } => child.pid !== null));
     let detectedIdentities: Array<Record<string, unknown>> = [];
     try {
       detectedIdentities = readLocalIdentities().map((entry) => ({
@@ -2747,6 +2750,7 @@ async function main() {
       walCheckpointStatus: () => walCheckpoint.status(),
       budgetStatus: () => budgetSampler?.status() ?? { mode: "advisory", latest: null,
         p50: null, p95: null, hostClass: null, targets: null,
+        targetStatus: "hypothesis", writeRateStatus: "uncalibrated_physical_bytes_unavailable",
         unavailable: ["sampler_disabled"] },
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
