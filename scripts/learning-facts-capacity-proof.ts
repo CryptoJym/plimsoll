@@ -1176,6 +1176,87 @@ function exerciseDependentAdmission() {
       assertCounts(db, "unrelated_eviction_preserves_dependent_counts");
     } finally { db.close(); }
   }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { attempts: 1 });
+      const target = attempt(0, "overflow-retry");
+      const unrelated = attempt(1, "overflow-unrelated");
+      const insert = rawAttemptInsert(db);
+      insert.run(target.operationId, target.sessionId, target.startedAt, target.startedAt, target.startedAt);
+      insert.run(unrelated.operationId, unrelated.sessionId, unrelated.startedAt, unrelated.startedAt, unrelated.startedAt);
+      const key = db.prepare(
+        "update tool_attempt_facts set retention_ms = ?, retention_verified = 1 where operation_id = ?",
+      );
+      key.run(Date.parse(target.startedAt), target.operationId);
+      key.run(Date.parse(unrelated.startedAt), unrelated.operationId);
+      const retry = { ...attempt(2, "overflow-retry"), sessionId: target.sessionId,
+        retryOf: target.operationId, startedAt: timestamp(2) };
+      const rejected = store.recordToolSignal(retry);
+      check("overflow_retry_drop_does_not_evict_its_target",
+        rejected.dropped === true && rejected.dropReason === "protected_reference_at_capacity" &&
+        store.attempts().some(row => row.operationId === target.operationId) &&
+        store.status().tables.tool_attempt_facts.evictedCount === 0,
+        { rejected, attempts: store.attempts(), status: store.status() });
+      assertCounts(db, "overflow_retry_drop_preserves_counts");
+    } finally { db.close(); }
+  }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { episodes: 1 });
+      const parent = buildWorkEpisodeFact({ source: "codex", sessionId: "overflow-parent",
+        sourceEpisodeKey: "parent", workClass: "review", complexityBand: "medium",
+        startedAt: timestamp(0) });
+      const unrelated = buildWorkEpisodeFact({ source: "codex", sessionId: "overflow-unrelated",
+        sourceEpisodeKey: "unrelated", workClass: "review", complexityBand: "medium",
+        startedAt: timestamp(1) });
+      const insert = rawEpisodeInsert(db);
+      insert.run(parent.episodeId, parent.sessionId, parent.startedAt, null, null, parent.startedAt);
+      insert.run(unrelated.episodeId, unrelated.sessionId, unrelated.startedAt, null, null, unrelated.startedAt);
+      const key = db.prepare(
+        "update work_episode_facts set retention_ms = ?, retention_verified = 1 where episode_id = ?",
+      );
+      key.run(Date.parse(parent.startedAt), parent.episodeId);
+      key.run(Date.parse(unrelated.startedAt), unrelated.episodeId);
+      const child = buildWorkEpisodeFact({ source: "codex", sessionId: parent.sessionId,
+        sourceEpisodeKey: "child", parentEpisodeId: parent.episodeId,
+        workClass: "review", complexityBand: "medium", startedAt: timestamp(2) });
+      const rejected = store.recordWorkEpisode(child);
+      check("overflow_episode_drop_does_not_evict_its_parent",
+        rejected.dropped === true && rejected.dropReason === "protected_reference_at_capacity" &&
+        store.episodeById(parent.episodeId) !== undefined &&
+        store.status().tables.work_episode_facts.evictedCount === 0,
+        { rejected, episodes: store.episodes(), status: store.status() });
+      assertCounts(db, "overflow_episode_drop_preserves_counts");
+    } finally { db.close(); }
+  }
+}
+
+function exerciseOverflowRetentionAdmission() {
+  const db = new Database(":memory:");
+  try {
+    const store = new LearningFactStore(db, { attempts: 2 });
+    const insert = rawAttemptInsert(db);
+    for (const index of [0, 10, 20]) {
+      const fact = attempt(index, "overflow-retention");
+      insert.run(fact.operationId, fact.sessionId, fact.startedAt, fact.startedAt, fact.startedAt);
+    }
+    const before = store.attempts().map((row) => row.operationId).sort();
+    const rejected = store.recordToolSignal(attempt(5, "overflow-retention"));
+    check("overflow_retention_drop_preserves_every_existing_row",
+      rejected.dropped === true && rejected.dropReason === "outside_retention_window" &&
+      JSON.stringify(store.attempts().map((row) => row.operationId).sort()) === JSON.stringify(before) &&
+      store.status().tables.tool_attempt_facts.evictedCount === 0,
+      { rejected, before, after: store.attempts(), status: store.status() });
+    const admitted = store.recordToolSignal(attempt(30, "overflow-retention"));
+    check("admitted_overflow_write_keeps_existing_eviction_order_and_counts_all_deletions",
+      admitted.inserted === true && store.status().tables.tool_attempt_facts.rowCount === 2 &&
+      store.status().tables.tool_attempt_facts.evictedCount === 2 &&
+      store.attempts().some((row) => row.operationId === attempt(20, "overflow-retention").operationId),
+      { admitted, status: store.status() });
+    assertCounts(db, "overflow_admission_counts_exact");
+  } finally { db.close(); }
 }
 
 function exerciseAtomicInstantKeyUpgrade(root: string) {
@@ -1518,6 +1599,7 @@ async function main() {
     "offset-retention": exerciseOffsetRetention,
     "instant-key-edges": exerciseInstantKeyEdges,
     "dependent-admission": exerciseDependentAdmission,
+    "overflow-retention": exerciseOverflowRetentionAdmission,
     "instant-key-upgrade": () => exerciseAtomicInstantKeyUpgrade(root),
     "timestamp-property": () => exerciseTimestampProperty(root),
     "invalid-legacy-timestamp": exerciseInvalidLegacyTimestamp,

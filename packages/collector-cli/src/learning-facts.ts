@@ -905,8 +905,38 @@ export class LearningFactStore {
     if (!state) throw new Error(`LearningFactStateMissing:${definition.name}`);
     const limit = this.limits[definition.limit];
     if (state.rowCount > limit) {
-      // A legacy/raw writer can leave overflow. Repair only those rows before
-      // comparing the new candidate, so even a rejected write leaves a bound.
+      // Plan the existing overflow eviction before deleting anything. Its
+      // cascade can remove the incoming fact's required target, or expose a
+      // newer oldest row that would reject the candidate on retention order.
+      const roots = `select ${definition.idColumn} as id from ${definition.name}
+        order by retention_ms, ${definition.idColumn} limit ?`;
+      const parentColumn = table === "tool_attempt_facts" ? "retry_of"
+        : table === "work_episode_facts" ? "parent_episode_id" : null;
+      const victims = new Set((this.db.prepare(parentColumn
+        ? `with recursive roots(id) as (${roots}), victims(id) as (
+             select id from roots union
+             select child.${definition.idColumn} from ${definition.name} child
+               join victims on child.${parentColumn} = victims.id
+           ) select id from victims`
+        : roots).all(state.rowCount - limit) as Array<{ id: string }>).map((row) => row.id));
+      if (requiredId && victims.has(requiredId)) return "required_reference";
+      if (state.rowCount - victims.size === limit) {
+        const retained = this.db.prepare(
+          `select ${definition.idColumn} as id, retention_ms as retentionMs
+             from ${definition.name} order by retention_ms, ${definition.idColumn}`,
+        );
+        for (const row of retained.iterate() as Iterable<{ id: string; retentionMs: number }>) {
+          if (victims.has(row.id)) continue;
+          if (retentionMs < row.retentionMs || (retentionMs === row.retentionMs && id < row.id)) {
+            return "outside_retention_window";
+          }
+          if (requiredId && (table === "tool_attempt_facts" || table === "work_episode_facts") &&
+              this.evictionWouldRemoveRequired(table, row.id, requiredId)) return "required_reference";
+          break;
+        }
+      }
+      // Only an admissible candidate pays for overflow repair. Reuse the same
+      // oldest roots and deletion accounting as maintenance and normal writes.
       this.evictOldest(definition, state.rowCount - limit);
       state.rowCount = (this.db.prepare(
         `select row_count as rowCount from learning_fact_table_state where table_name = ?`,
@@ -1017,7 +1047,9 @@ export class LearningFactStore {
         if (start.retryOf && !this.db.prepare(
           `select 1 from tool_attempt_facts where operation_id = ?`,
         ).get(start.retryOf)) {
-          return this.dropFact<ToolAttemptFact>("retry_target_missing");
+          // Defensive invariant: an unexpected trigger must roll back this
+          // transaction's evictions, never commit a dropped fact's net loss.
+          throw new Error("ToolAttemptRetryTargetMissing");
         }
         const now = new Date().toISOString();
         this.db.prepare(
@@ -1162,7 +1194,7 @@ export class LearningFactStore {
           .get(fact.parentEpisodeId);
         // The parent may itself have been the oldest graph root. Do not write
         // a child that would be orphaned by the same bounded eviction.
-        if (!parentStillExists) return this.dropFact<WorkEpisodeFact>();
+        if (!parentStillExists) throw new Error("WorkEpisodeParentMissing");
       }
       this.db.prepare(
         `insert into work_episode_facts
@@ -1251,9 +1283,6 @@ export class LearningFactStore {
         }
         return { inserted: false, fact: stored };
       }
-      if (this.capacityPressure("technique_exposure_facts", fact.exposureId, exposureMs) !== "admit") {
-        return this.dropFact<TechniqueExposureFact>("outside_retention_window");
-      }
       const techniqueKey = deterministicLearningFactId([
         fact.techniqueId,
         fact.techniqueVersion ?? "",
@@ -1262,6 +1291,9 @@ export class LearningFactStore {
       const now = new Date().toISOString();
       const nowMs = retentionInstant(now);
       if (nowMs === null) return this.dropFact<TechniqueExposureFact>("invalid_retention_timestamp");
+      if (this.capacityPressure("technique_exposure_facts", fact.exposureId, exposureMs) !== "admit") {
+        return this.dropFact<TechniqueExposureFact>("outside_retention_window");
+      }
       if (this.capacityPressure("technique_identity_registry", techniqueKey, nowMs) === "admit") {
         this.db.prepare(
         `insert or ignore into technique_identity_registry
