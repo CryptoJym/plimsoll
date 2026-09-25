@@ -20,12 +20,12 @@
     {
       "name": "canonical_lifecycle",
       "kind": "line_summary",
-      "expectedArtifactDigest": "sha256:62dc842e9c8638f28a7592bdc43f2c98f74efe102cf65f6bb4b9fafaefbf87fa"
+      "expectedArtifactDigest": "sha256:5fed56d9f01343580ebd630a125f4dab9ee12836021d4d1f630ccf5977e3d7f8"
     },
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:197a7b5844a98205d6b0566e3796e902fe11ca2d20c92b36485dbfd282b675ac"
+      "expectedArtifactDigest": "sha256:55cbb7baf7c7efe537ce9d5471f049b0a759f47e1ecc8d0e71eec42d87214f89"
     },
     {
       "name": "launch_agent_unload_terminal_truth",
