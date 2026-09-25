@@ -2742,6 +2742,9 @@ async function main() {
       otlpSpool,
       syncStatus: () => syncBackoff.status(syncInFlight),
       walCheckpointStatus: () => walCheckpoint.status(),
+      budgetStatus: () => budgetSampler?.status() ?? { mode: "advisory", latest: null,
+        p50: null, p95: null, hostClass: null, targets: null,
+        unavailable: ["sampler_disabled"] },
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the

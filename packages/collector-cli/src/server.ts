@@ -686,6 +686,8 @@ export function createCollectorServer(
     syncStatus?: () => unknown;
     /** In-memory WAL checkpoint worker state (eco-6hoxj.163.24); no DB or filesystem work. */
     walCheckpointStatus?: () => unknown;
+    /** One in-memory footprint snapshot; the sampler owns all filesystem and ledger reads. */
+    budgetStatus?: () => unknown;
     /**
      * Environment the intake spool reads its kill switch and its home from.
      * Production is `process.env`, exactly as the drain's is.
@@ -1463,6 +1465,9 @@ export function createCollectorServer(
           body.otlpSpool = otlpSpool?.status() ?? null;
           body.sync = options.syncStatus?.() ?? null;
           body.walCheckpoint = options.walCheckpointStatus?.() ?? null;
+          body.budget = options.budgetStatus?.() ?? { mode: "advisory", latest: null,
+            p50: null, p95: null, hostClass: null, targets: null,
+            unavailable: ["sampler_not_connected"] };
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
             "x-plimsoll-projection-generation": String(cached.generation),
           });
