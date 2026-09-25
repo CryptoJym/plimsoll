@@ -59,7 +59,7 @@ export const CAPTURE_HOLD_LIMIT_MS = 60 * 60 * 1000;
 export const CAPTURE_COVERAGE_INTERVAL_MS = 15 * 60 * 1000;
 /** Wall time one maintenance cadence spends on a coverage check; the walk resumes on the next. */
 export const CAPTURE_COVERAGE_TURN_MS = 250;
-/** Directory entries one check may visit per source; beyond it the check is incomplete. */
+/** Classified entries one check may visit per source; beyond it the check is incomplete. */
 export const CAPTURE_COVERAGE_MAX_ENTRIES = 200_000;
 /** Deterministic units one coverage turn may process before yielding to the next cadence. */
 export const CAPTURE_COVERAGE_MAX_WORK_PER_TURN = 4_096;
@@ -112,6 +112,8 @@ export type CaptureCoverageEntry = { path: string; kind: "directory" | "file" | 
 export type CaptureCoverageDirectory = {
   read(): CaptureCoverageEntry | undefined | null;
   unchanged(): boolean;
+  /** Still the same directory after its stream closed; additions may follow in the next check. */
+  sameIdentity?(): boolean;
   close(): void;
 };
 
@@ -144,6 +146,14 @@ export function openCaptureCoverageDirectory(
       return false;
     }
   };
+  const sameIdentity = () => {
+    try {
+      const after = identity();
+      return after.isDirectory() && after.dev === before.dev && after.ino === before.ino;
+    } catch {
+      return false;
+    }
+  };
   if (!unchanged()) {
     close();
     throw new Error("capture_coverage_directory_changed");
@@ -154,6 +164,7 @@ export function openCaptureCoverageDirectory(
       return entry ? classify(entry) ?? undefined : null;
     },
     unchanged,
+    sameIdentity,
     close,
   };
 }
@@ -213,6 +224,7 @@ export class CaptureCoverageWalk {
   private readonly directories: Array<{ directory: string; depth: number }>;
   private readonly files: Array<{ path: string; link: boolean }> = [];
   private active: CaptureCoverageDirectory | null = null;
+  private closed: CaptureCoverageDirectory | null = null;
   private entries = 0;
   done = false;
   complete = true;
@@ -247,7 +259,32 @@ export class CaptureCoverageWalk {
       batch = [];
     };
     if (this.active && !this.active.unchanged()) this.fail();
+    if (this.closed && !this.closedIdentity()) this.fail();
     while (!this.done && work < limit && now() < deadline) {
+      // Finish a directory's entry stream before checking its files when it
+      // fits in one turn. Active day folders then close before the next cadence
+      // can add a file. Bound the pending paths for directories larger than a turn.
+      if (this.active && this.files.length < CAPTURE_COVERAGE_MAX_WORK_PER_TURN) {
+        work += 1;
+        try {
+          const entry = this.active.read();
+          if (entry === null) {
+            if (!this.active.unchanged()) this.fail();
+            else {
+              this.active.close();
+              this.closed = this.active;
+              this.active = null;
+            }
+          } else if (entry !== undefined) {
+            this.entries += 1;
+            if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) this.fail();
+            else if (entry.kind === "directory") {
+              this.directories.push({ directory: entry.path, depth: this.activeDepth + 1 });
+            } else this.files.push({ path: entry.path, link: entry.kind === "link" });
+          }
+        } catch { this.fail(); }
+        continue;
+      }
       const file = this.files.pop();
       if (file !== undefined) {
         work += 1;
@@ -260,21 +297,9 @@ export class CaptureCoverageWalk {
         if (batch.length >= CAPTURE_COVERAGE_BATCH) flush();
         continue;
       }
-      if (this.active) {
-        work += 1;
-        try {
-          const entry = this.active.read();
-          if (entry === null) {
-            if (!this.active.unchanged()) this.fail();
-            else { this.active.close(); this.active = null; }
-          } else {
-            this.entries += 1;
-            if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) this.fail();
-            else if (entry?.kind === "directory") {
-              this.directories.push({ directory: entry.path, depth: this.activeDepth + 1 });
-            } else if (entry) this.files.push({ path: entry.path, link: entry.kind === "link" });
-          }
-        } catch { this.fail(); }
+      if (this.closed) {
+        if (!this.closedIdentity()) this.fail();
+        this.closed = null;
         continue;
       }
       const next = this.directories.pop();
@@ -289,11 +314,16 @@ export class CaptureCoverageWalk {
       }
     }
     if (this.active && !this.active.unchanged()) this.fail();
+    if (this.closed && !this.closedIdentity()) this.fail();
     flush();
     return work;
   }
 
   private activeDepth = 0;
+
+  private closedIdentity() {
+    return this.closed?.sameIdentity?.() ?? this.closed?.unchanged() ?? true;
+  }
 
   /** Close a suspended directory when maintenance stops or discards a walk. */
   close() { if (!this.done) this.fail(); }
@@ -303,6 +333,7 @@ export class CaptureCoverageWalk {
     this.done = true;
     try { this.active?.close(); } catch { /* already failing closed */ }
     this.active = null;
+    this.closed = null;
     this.directories.length = 0;
     this.files.length = 0;
   }

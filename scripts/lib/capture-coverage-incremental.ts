@@ -18,64 +18,92 @@ export function incrementalCoverageChecks(check: Check) {
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "coverage-incremental-"));
 const large = path.join(root, "large");
 const changing = path.join(root, "changing");
+const active = path.join(root, "active");
+const ignored = path.join(root, "ignored");
+const removed = path.join(root, "removed");
 fs.mkdirSync(large);
 fs.mkdirSync(changing);
+fs.mkdirSync(active);
+fs.mkdirSync(ignored);
+fs.mkdirSync(removed);
 const total = 10_050;
 for (let index = 0; index < total; index += 1) {
   fs.writeFileSync(path.join(large, `session-${String(index).padStart(5, "0")}.jsonl`), "");
 }
 for (let index = 0; index < 40; index += 1) fs.writeFileSync(path.join(changing, `file-${index}`), "");
+for (let index = 0; index < 3_000; index += 1) {
+  fs.writeFileSync(path.join(active, `file-${String(index).padStart(5, "0")}`), "");
+}
+for (let index = 0; index < 30; index += 1) fs.writeFileSync(path.join(ignored, `other-${index}`), "");
+for (let index = 0; index < 5; index += 1) fs.writeFileSync(path.join(ignored, `keep-${index}`), "");
+for (let index = 0; index < 100; index += 1) fs.writeFileSync(path.join(removed, `file-${index}`), "");
 const handles = () => fs.readdirSync("/dev/fd").length;
 const beforeHandles = handles();
 const originalReaddir = fs.readdirSync;
 const originalOpen = fs.opendirSync;
 let wholeListingCalls = 0;
 let largestReadBuffer = 0;
+let realReads = 0;
+let realOpens = 0;
 fs.readdirSync = ((directory: fs.PathLike, ...args: unknown[]) => {
-  if (String(directory) === large || String(directory) === changing) {
+  if ([large, changing, active, ignored, removed].includes(String(directory))) {
     wholeListingCalls += 1;
     throw new Error("whole directory listing is forbidden in coverage");
   }
   return (originalReaddir as (...args: unknown[]) => unknown)(directory, ...args);
 }) as typeof fs.readdirSync;
 fs.opendirSync = ((directory: fs.PathLike, options?: { bufferSize?: number }) => {
-  if (String(directory) === large || String(directory) === changing) {
+  if ([large, changing, active, ignored, removed].includes(String(directory))) {
     largestReadBuffer = Math.max(largestReadBuffer, options?.bufferSize ?? 32);
+    realOpens += 1;
   }
-  return originalOpen(directory, options);
+  const handle = originalOpen(directory, options);
+  const read = handle.readSync.bind(handle);
+  handle.readSync = () => {
+    if ([large, changing, active, ignored, removed].includes(String(directory))) realReads += 1;
+    return read();
+  };
+  return handle;
 }) as typeof fs.opendirSync;
 
 const makeWalk = (directory: string, maxEntries?: number) => {
   let checked = 0;
+  const paths = new Map<string, number>();
   const walk = new CaptureCoverageWalk({
     roots: [directory],
     maxEntries,
     open: (target) => openCaptureCoverageDirectory(target, (entry) =>
       ({ path: path.join(target, entry.name), kind: "file" })),
-    check: () => { checked += 1; return null; },
+    check: (file) => { checked += 1; paths.set(file, (paths.get(file) ?? 0) + 1); return null; },
     checkLink: () => null,
   });
-  return { walk, checked: () => checked };
+  return { walk, checked: () => checked, paths };
 };
 
 try {
   const { walk, checked } = makeWalk(large);
   const times: number[] = [];
   const units: number[] = [];
+  const actualUnits: number[] = [];
   for (let turn = 0; turn < 20 && !walk.done; turn += 1) {
+    const beforeReads = realReads;
+    const beforeOpens = realOpens;
+    const beforeChecks = checked();
     const started = performance.now();
     units.push(walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0));
+    actualUnits.push(realReads - beforeReads + realOpens - beforeOpens + checked() - beforeChecks);
     times.push(performance.now() - started);
   }
   const sorted = [...times].sort((a, b) => a - b);
   check("release_ceiling_is_literal_and_large_directory_obeys_it",
     CAPTURE_COVERAGE_MAX_WORK_PER_TURN === RELEASE_MAX_WORK_PER_TURN &&
     times.length > 2 && units.every((work) => work <= RELEASE_MAX_WORK_PER_TURN) &&
-    largestReadBuffer > 0 && largestReadBuffer <= 32, { units, largestReadBuffer });
+    actualUnits.every((work) => work <= RELEASE_MAX_WORK_PER_TURN) &&
+    largestReadBuffer > 0 && largestReadBuffer <= 32, { units, actualUnits, largestReadBuffer });
   check("large_directory_finishes_with_each_file_checked_once_and_no_whole_listing",
     walk.done && walk.complete && checked() === total && wholeListingCalls === 0,
     { checked: checked(), total, wholeListingCalls });
-  console.log(JSON.stringify({ total, turns: times.length, workPerTurn: units,
+  console.log(JSON.stringify({ total, turns: times.length, workPerTurn: units, actualUnits,
     wallMs: { max: Math.max(...times), p95: sorted[Math.ceil(sorted.length * .95) - 1] },
     wholeListingCalls, largestReadBuffer }));
 
@@ -93,6 +121,48 @@ try {
   check("entry_ceiling_still_fails_closed",
     CAPTURE_COVERAGE_MAX_ENTRIES === 200_000 && capped.walk.done && !capped.walk.complete,
     { maxEntries: CAPTURE_COVERAGE_MAX_ENTRIES, done: capped.walk.done, complete: capped.walk.complete });
+
+  let kept = 0;
+  const ignoredWalk = new CaptureCoverageWalk({
+    roots: [ignored], maxEntries: 20,
+    open: (target) => openCaptureCoverageDirectory(target, (entry) =>
+      entry.name.startsWith("keep-") ? { path: path.join(target, entry.name), kind: "file" } : null),
+    check: () => { kept += 1; return null; },
+    checkLink: () => null,
+  });
+  for (let turn = 0; turn < 20 && !ignoredWalk.done; turn += 1) {
+    ignoredWalk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+  }
+  check("ignored_entries_cost_work_but_not_the_classified_entry_ceiling",
+    ignoredWalk.done && ignoredWalk.complete && kept === 5,
+    { done: ignoredWalk.done, complete: ignoredWalk.complete, kept });
+
+  const growing = makeWalk(active);
+  let additions = 0;
+  for (let turn = 0; turn < 20 && !growing.walk.done; turn += 1) {
+    growing.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+    if (!growing.walk.done) {
+      fs.writeFileSync(path.join(active, `new-${additions++}`), "");
+    }
+  }
+  const next = makeWalk(active);
+  for (let turn = 0; turn < 20 && !next.walk.done; turn += 1) {
+    next.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+  }
+  check("growing_directory_completes_and_next_check_sees_new_files",
+    growing.walk.done && growing.walk.complete &&
+    [...growing.paths.values()].every((count) => count === 1) &&
+    next.walk.done && next.walk.complete && next.checked() === 3_000 + additions,
+    { firstComplete: growing.walk.complete, firstChecked: growing.checked(),
+      additions, nextComplete: next.walk.complete, nextChecked: next.checked() });
+
+  const renamed = makeWalk(removed);
+  renamed.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0, 150);
+  fs.renameSync(removed, `${removed}-renamed`);
+  renamed.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+  check("renamed_directory_after_listing_fails_closed_before_files_finish",
+    renamed.walk.done && !renamed.walk.complete,
+    { done: renamed.walk.done, complete: renamed.walk.complete, checked: renamed.checked() });
 
   const closing = makeWalk(changing);
   closing.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0, 5);
