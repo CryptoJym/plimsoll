@@ -337,10 +337,10 @@ async function main() {
     cliSource.includes("planDaemonSessionSync") &&
       cliSource.includes("loadDaemonSessionSyncState") &&
       cliSource.includes("saveDaemonSessionSyncState") &&
-      cliSource.includes("if (serverRetryAfterMs > 0) { carrySessions(); return; }") &&
+      cliSource.includes("if (serverRetryAfterMs > 0) { await carrySessions(); return; }") &&
       cliSource.includes("const touchedSessionIds =") &&
       cliSource.indexOf("const touchedSessionIds =") >
-        cliSource.indexOf("if (serverRetryAfterMs > 0) { carrySessions(); return; }") &&
+        cliSource.indexOf("if (serverRetryAfterMs > 0) { await carrySessions(); return; }") &&
       /try \{\s*const sessionPlan = planDaemonSessionSync/.test(cliSource),
   );
 

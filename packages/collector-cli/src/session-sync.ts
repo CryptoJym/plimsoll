@@ -572,6 +572,15 @@ export function saveDaemonSessionSyncState(
   ).run(DAEMON_SESSION_SYNC_STATE_KEY, JSON.stringify(record), new Date().toISOString());
 }
 
+/** Retry only the local durable carry write; never replay a network send. */
+export async function saveDaemonSessionSyncStateWithRetry(
+  db: Database.Database,
+  state: DaemonSessionSyncState,
+  retry: SyncStorageRetryController,
+): Promise<void> {
+  await retry.run(() => saveDaemonSessionSyncState(db, state));
+}
+
 /** Eligible ledger session ids, optionally only those with created_at after `since`. */
 export function listLedgerSessionIds(
   ledger: Database.Database,

@@ -265,7 +265,7 @@ import {
   listLedgerSessionIdsOffThread,
   readLedgerOffThread,
   runSessionSync,
-  saveDaemonSessionSyncState,
+  saveDaemonSessionSyncStateWithRetry,
   sessionIdsFromBatches,
   shouldDeferDaemonSessionSync,
 } from "./session-sync";
@@ -2786,19 +2786,29 @@ async function main() {
       syncInFlight = true;
       const storageRetry = new SyncStorageRetryController();
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
-      const persistSessionCarry = () => {
+      const persistSessionCarry = async () => {
         sessionSyncState = { ...sessionSyncState, pendingSessionIds };
         try {
-          saveDaemonSessionSyncState(buffer.database, sessionSyncState);
-        } catch {
+          await saveDaemonSessionSyncStateWithRetry(
+            buffer.database, sessionSyncState,
+            new SyncStorageRetryController(),
+          );
+          return true;
+        } catch (error) {
           sessionSyncState = { ...sessionSyncState, caughtUp: false };
+          summaryCatchUp = true;
+          console.warn(JSON.stringify({
+            warning: "session_sync_state_write_failed",
+            message: error instanceof Error ? error.message : String(error),
+          }));
+          return false;
         }
       };
-      const carrySessions = () => {
+      const carrySessions = async () => {
         pendingSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
-        persistSessionCarry();
+        await persistSessionCarry();
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
@@ -2839,7 +2849,7 @@ async function main() {
         syncBackoff.success(uploaded, serverRetryAfterMs);
         // Session snapshots share the ingest endpoint. Carry their identities
         // rather than issue another request inside a server-directed cooldown.
-        if (serverRetryAfterMs > 0) { carrySessions(); return; }
+        if (serverRetryAfterMs > 0) { await carrySessions(); return; }
         // While more than a cycle of events is due, events drain first. A
         // session snapshot re-reads every row of each touched session (1.88M
         // for Studio0's busiest), seconds to minutes that would hold the next
@@ -2851,7 +2861,7 @@ async function main() {
           remainingDelivery,
           maxBatchesPerCycle: config.delivery.maxBatchesPerCycle,
           elapsedSinceLastSessionPassMs: performance.now() - lastSessionPassAt,
-        })) { carrySessions(); return; }
+        })) { await carrySessions(); return; }
 
         // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
         // plus durable pending, and a ledger catch-up until the first full
@@ -2878,7 +2888,7 @@ async function main() {
           });
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
-          persistSessionCarry();
+          if (!await persistSessionCarry()) return;
           if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
               ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
@@ -2913,7 +2923,7 @@ async function main() {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             }
-            persistSessionCarry();
+            if (!await persistSessionCarry()) return;
             if (sessionResult.ok && sessionResult.summaryComplete && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
@@ -2951,12 +2961,12 @@ async function main() {
           );
           sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, touchedSessionIds);
           pendingSessionIds = sessionSyncState.pendingSessionIds;
-          persistSessionCarry();
+          await persistSessionCarry();
         } finally {
           lastSessionPassAt = performance.now();
         }
       } catch (error) {
-        carrySessions();
+        await carrySessions();
         const scheduling = syncBackoff.failure(error, uploaded, Date.now(), maintenanceBoundary.status().state === "circuit_open");
         if (error instanceof SyncStorageBusyError) {
           console.warn(
