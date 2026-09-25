@@ -46,6 +46,11 @@ import { createProofCompletion } from "./lib/proof-completion";
 // maintenance.ts checkCaptureCoverage steps one coverage walk per source in a
 // turn: codex, claude_code and grok.
 const COVERAGE_SOURCES = 3;
+/** The 0.7.40 release's per-source coverage work ceiling, written here on
+ * purpose instead of read from the product: the checks below hold
+ * CAPTURE_COVERAGE_MAX_WORK_PER_TURN to it, so changing that constant fails
+ * this proof until the new ceiling is reviewed and written here. */
+const RELEASE_MAX_WORK_PER_TURN = 4_096;
 
 const completion = createProofCompletion("capture-claim-review-r4", 6);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
@@ -257,7 +262,7 @@ async function r3s5() {
 }
 
 function coverageTurnBudget() {
-  const files = Array.from({ length: CAPTURE_COVERAGE_MAX_WORK_PER_TURN * 2 + 17 },
+  const files = Array.from({ length: RELEASE_MAX_WORK_PER_TURN * 2 + 17 },
     (_, index) => `file-${index}`);
   let checked = 0;
   const walk = new CaptureCoverageWalk({
@@ -276,10 +281,12 @@ function coverageTurnBudget() {
   walk.step(8, () => undefined, () => virtualNow++);
   const afterDeadlineTurn = checked - afterBudgetTurn;
   check("R3_N4_coverage_walk_enforces_the_deterministic_turn_work_budget_and_deadline",
-    afterBudgetTurn === CAPTURE_COVERAGE_MAX_WORK_PER_TURN &&
+    CAPTURE_COVERAGE_MAX_WORK_PER_TURN === RELEASE_MAX_WORK_PER_TURN &&
+      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN &&
       afterDeadlineTurn === 8 &&
       !walk.done,
-    { maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+    { maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, releaseMaxWorkPerTurn: RELEASE_MAX_WORK_PER_TURN,
+      afterBudgetTurn, afterDeadlineTurn, done: walk.done });
 }
 
 async function r3n4() {
@@ -342,8 +349,8 @@ async function r3n4() {
   const unreadFiles = 2 * Math.floor(perSource / 2) + grokSessions;
   const maxTurnMs = Math.max(...turns);
   // One coverage turn steps each source's walk once (maintenance.ts
-  // checkCaptureCoverage), each capped at CAPTURE_COVERAGE_MAX_WORK_PER_TURN.
-  const perTurnWorkCap = COVERAGE_SOURCES * CAPTURE_COVERAGE_MAX_WORK_PER_TURN;
+  // checkCaptureCoverage), each capped at the release's RELEASE_MAX_WORK_PER_TURN.
+  const perTurnWorkCap = COVERAGE_SOURCES * RELEASE_MAX_WORK_PER_TURN;
   const minimumResumableTurns = Math.ceil(unreadFiles / perTurnWorkCap);
   const maxRowsPerTurn = Math.max(...rowsPerTurn);
   checks.close();

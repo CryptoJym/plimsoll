@@ -55,8 +55,9 @@ does not transfer its sessions to a tailer.
   second backoff without counting it as a failure or opening the worker
   circuit; repricing keeps its pending row until a retry succeeds. Multi-batch
   catch-ups converge, and under steady intake the daemon still runs session
-  sync once the event backlog fits in one cycle, or after at most 60 s of a
-  larger backlog (`.163.75`).
+  sync once the event backlog fits in one cycle, or, with a larger backlog, at
+  the end of the first upload cycle that finishes 60 s or more after the
+  previous session pass (`.163.75`).
 - The session context index keeps its checksum exact past 2^53, so very large
   ledgers no longer rebuild the index on every open (`.163.75`).
 - When a learning-fact table is full, a fact that would be refused anyway
