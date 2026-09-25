@@ -997,6 +997,26 @@ function automaticCaptureBudget() {
   } as unknown as CaptureBudgetLimits);
 }
 
+async function proveSoftCaps(root: string) {
+  // These cases prove the 112-frame work stop and exact resume position. The
+  // production wall clocks are separate controls; if a loaded runner spends
+  // 100 ms in discovery first, this case never reaches the frame stop at all.
+  // Freeze only this sequential fixture's clock so its work bound is the
+  // sole reason to yield, then restore the process clock for every other case.
+  const original = Object.getOwnPropertyDescriptor(performance, "now");
+  Object.defineProperty(performance, "now", {
+    configurable: true,
+    value: () => 0,
+  });
+  try {
+    await proveDiscoverySoftCapResume(root);
+    await proveJsonlOpenSoftCapResume(root);
+  } finally {
+    if (original) Object.defineProperty(performance, "now", original);
+    else delete (performance as { now?: () => number }).now;
+  }
+}
+
 async function proveDiscoverySoftCapResume(root: string) {
   const metadataRoot = path.join(root, "soft-cap-metadata");
   fs.mkdirSync(metadataRoot, { recursive: true });
@@ -1707,6 +1727,16 @@ async function proveIntegratedIdle(
 }
 
 async function main() {
+  if (process.env.PROBE_CASE === "soft_caps") {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-soft-cap-proof-"));
+    try {
+      await proveSoftCaps(root);
+      process.stdout.write(`${JSON.stringify({ status: "pass", checks }, null, 2)}\n`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+    return;
+  }
   if (process.env.PROBE_CASE === "lease_stage") {
     await proveLeaseRepairStageDefers();
     process.stdout.write(`${JSON.stringify({ status: "pass", checks }, null, 2)}\n`);
@@ -1741,8 +1771,7 @@ async function main() {
   try {
     await proveDurableSlowSourceFairness(root);
     await proveCrashResumeBindsExactPendingIdentities(root);
-    await proveDiscoverySoftCapResume(root);
-    await proveJsonlOpenSoftCapResume(root);
+    await proveSoftCaps(root);
     // Reopening proves additive schema/trigger creation is idempotent.
     buffer.close();
     buffer = new LocalEventBuffer(ledger);
