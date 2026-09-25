@@ -268,9 +268,9 @@ export type RequestBudget = {
   remainingMs: () => number;
 };
 
-export function createRequestBudget(): RequestBudget {
-  const deadlineAt = performance.now() + LOCAL_HTTP_LIMITS.requestDeadlineMs;
-  const remainingMs = () => Math.max(0, deadlineAt - performance.now());
+export function createRequestBudget(now: () => number = () => performance.now()): RequestBudget {
+  const deadlineAt = now() + LOCAL_HTTP_LIMITS.requestDeadlineMs;
+  const remainingMs = () => Math.max(0, deadlineAt - now());
   return {
     remainingMs,
     checkpoint() {
