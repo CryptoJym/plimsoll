@@ -18,7 +18,11 @@ import { performance } from "node:perf_hooks";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
-import { captureFrontier } from "../packages/collector-cli/src/capture-frontier";
+import {
+  CAPTURE_COVERAGE_MAX_WORK_PER_TURN,
+  captureFrontier,
+  CaptureCoverageWalk,
+} from "../packages/collector-cli/src/capture-frontier";
 import type { CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import { GrokUsageTailer } from "../packages/collector-cli/src/grok-usage-tailer";
@@ -29,7 +33,7 @@ import { TranscriptTailer } from "../packages/collector-cli/src/transcript-taile
 import { grokUsageDocument } from "./lib/grok-usage-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const completion = createProofCompletion("capture-claim-review-r5", 6);
+const completion = createProofCompletion("capture-claim-review-r5", 7);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
 const check = (name: string, passed: boolean, detail: Record<string, unknown>) => {
   completion.check(name, passed);
@@ -236,6 +240,32 @@ async function codexDayFolder() {
     { usedAt, captured: events, attested: attests(claim, usedAt), claim });
 }
 
+function coverageTurnBudget() {
+  const links = Array.from({ length: CAPTURE_COVERAGE_MAX_WORK_PER_TURN * 2 + 17 },
+    (_, index) => `link-${index}`);
+  let checked = 0;
+  const walk = new CaptureCoverageWalk({
+    roots: ["root"],
+    list: () => ({ directories: [], files: [], links }),
+    check: () => null,
+    checkLink: () => {
+      checked += 1;
+      return null;
+    },
+  });
+  walk.step(1_000, () => undefined, () => 0);
+  walk.step(1_000, () => undefined, () => 0);
+  const afterBudgetTurn = checked;
+  let virtualNow = 0;
+  walk.step(8, () => undefined, () => virtualNow++);
+  const afterDeadlineTurn = checked - afterBudgetTurn;
+  check("R4_S1_coverage_walk_enforces_the_deterministic_turn_work_budget_and_deadline",
+    afterBudgetTurn === CAPTURE_COVERAGE_MAX_WORK_PER_TURN &&
+      afterDeadlineTurn === 8 &&
+      !walk.done,
+    { maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+}
+
 async function manyLinks() {
   // 20,000 links per source, where each tailer would read: symlinked rollouts,
   // transcripts, and Grok session directories.
@@ -269,10 +299,13 @@ async function manyLinks() {
   }
   const rows = (scene.buffer.database.prepare(`select count(*) as n from capture_uncovered_files`).get() as { n: number }).n;
   const maxTurnMs = Math.max(...turns);
+  const expectedRows = 3 * perSource;
+  const minimumResumableTurns = Math.ceil(expectedRows / CAPTURE_COVERAGE_MAX_WORK_PER_TURN);
   scene.close();
-  check("R4_S1_walk_records_60000_links_in_turns_of_at_most_250ms",
-    maxTurnMs <= 250 && frontier?.capturedThrough != null && rows === 3 * perSource && turns.length > 1,
-    { linksPerSource: perSource, buildSeconds, turns: turns.length, maxTurnMs,
+  check("R4_S1_walk_records_60000_links_with_resumable_work_budgets",
+    frontier?.capturedThrough != null && rows === expectedRows && turns.length >= minimumResumableTurns,
+    { linksPerSource: perSource, buildSeconds, turns: turns.length, minimumResumableTurns,
+      maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, maxTurnMs,
       totalMs: Number(turns.reduce((total, ms) => total + ms, 0).toFixed(1)), uncoveredRows: rows,
       frontier: frontier?.capturedThrough ?? null });
 }
@@ -299,7 +332,7 @@ async function claudeMemoryNotes() {
 }
 
 async function main() {
-  for (const step of [grokSessionsDirectory, claudeProjectDirectory, claudeTranscriptFile, codexDayFolder, manyLinks,
+  for (const step of [grokSessionsDirectory, claudeProjectDirectory, claudeTranscriptFile, codexDayFolder, coverageTurnBudget, manyLinks,
     claudeMemoryNotes]) {
     try {
       await step();

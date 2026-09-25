@@ -61,6 +61,8 @@ export const CAPTURE_COVERAGE_INTERVAL_MS = 15 * 60 * 1000;
 export const CAPTURE_COVERAGE_TURN_MS = 250;
 /** Directory entries one check may visit per source; beyond it the check is incomplete. */
 export const CAPTURE_COVERAGE_MAX_ENTRIES = 200_000;
+/** Deterministic units one coverage turn may process before yielding to the next cadence. */
+export const CAPTURE_COVERAGE_MAX_WORK_PER_TURN = 4_096;
 /** Gaps one claim carries. Closer gaps merge first, which only widens them. */
 export const CAPTURE_CLAIM_MAX_GAPS = 8;
 /** Files checked between two ledger writes of a walk: keeps every write short. */
@@ -162,15 +164,22 @@ export class CaptureCoverageWalk {
     });
   }
 
-  step(deadline: number, onBatch: (files: CaptureCoverageFile[]) => void, now: () => number = () => performance.now()) {
+  step(
+    deadline: number,
+    onBatch: (files: CaptureCoverageFile[]) => void,
+    now: () => number = () => performance.now(),
+    maxWork = CAPTURE_COVERAGE_MAX_WORK_PER_TURN,
+  ) {
     let batch: CaptureCoverageFile[] = [];
+    let work = 0;
     const flush = () => {
       if (batch.length > 0) onBatch(batch);
       batch = [];
     };
-    while (!this.done && now() < deadline) {
+    while (!this.done && work < maxWork && now() < deadline) {
       const file = this.files.pop();
       if (file !== undefined) {
+        work += 1;
         try {
           const checked = file.link ? this.spec!.checkLink(file.path) : this.spec!.check(file.path);
           if (checked) batch.push(checked);
@@ -194,6 +203,7 @@ export class CaptureCoverageWalk {
         continue;
       }
       const links = listing.links ?? [];
+      work += 1 + listing.directories.length + listing.files.length + links.length;
       this.entries += listing.directories.length + listing.files.length + links.length;
       if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) {
         this.fail();
