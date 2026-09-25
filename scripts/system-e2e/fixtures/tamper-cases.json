@@ -297,6 +297,12 @@
       "mutations": [{ "pointer": "/measurements/idle/filesystemEnumerationFailedCalls", "replacement": 1 }],
       "resign": false,
       "expectedError": "idle failed enumeration calls disagree with the resource artifact"
+    },
+    {
+      "id": "idle_file_bytes_read_projection",
+      "mutations": [{ "pointer": "/measurements/idle/fileBytesRead", "replacement": 1 }],
+      "resign": false,
+      "expectedError": "idle file bytes read disagree with the resource artifact"
     }
   ]
 }

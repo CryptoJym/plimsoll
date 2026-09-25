@@ -265,6 +265,27 @@ function isolatedEnvironment(home: string, temp: string) {
   } satisfies NodeJS.ProcessEnv;
 }
 
+/** Bounded id, status and detail of each non-passing scenario in a JSON child's stdout receipt. */
+function failedJsonScenarios(stdout: string): Array<{ id: string; status: string; detail: string }> {
+  const start = stdout.indexOf("{");
+  if (start < 0) return [];
+  try {
+    const parsed = JSON.parse(stdout.slice(start)) as { scenarios?: unknown };
+    if (!Array.isArray(parsed.scenarios)) return [];
+    return parsed.scenarios
+      .filter((entry): entry is { id?: unknown; status?: unknown; detail?: unknown } =>
+        Boolean(entry) && typeof entry === "object" && (entry as { status?: unknown }).status !== "pass")
+      .slice(0, 16)
+      .map((entry) => ({
+        id: String(entry.id ?? "unknown").slice(0, 160),
+        status: String(entry.status ?? "unknown").slice(0, 40),
+        detail: String(entry.detail ?? "").slice(0, 300),
+      }));
+  } catch {
+    return [];
+  }
+}
+
 function runSupportingProof(options: {
   name: string;
   kind: SupportingKind;
@@ -294,7 +315,13 @@ function runSupportingProof(options: {
   // stderr. Preserve the bounded check names when the phase exits nonzero.
   const failedChecks = [...result.stdout.matchAll(/^FAIL ([a-z][a-z0-9_]{0,159})$/gm)]
     .slice(0, 32).map((match) => match[1]);
-  assert.equal(result.status, 0, `${options.name} failed checks=${JSON.stringify(failedChecks)}: ${result.stderr.slice(-2_000)}`);
+  // JSON children report failures as scenarios, not FAIL lines; name those too.
+  const failedScenarios = result.status === 0 ? [] : failedJsonScenarios(result.stdout);
+  assert.equal(
+    result.status,
+    0,
+    `${options.name} failed checks=${JSON.stringify(failedChecks)} scenarios=${JSON.stringify(failedScenarios)}: ${result.stderr.slice(-2_000)}`,
+  );
   for (const assertionName of options.requiredAssertions) {
     assert.ok(
       result.stdout.includes(assertionName),

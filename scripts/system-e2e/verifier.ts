@@ -321,6 +321,21 @@ function verifyMeasurements(
   assert.equal(setupCalls, pinned(idleArtifact.expectedSetupFilesystemEnumerationCalls, "expected setup calls"), "idle setup enumeration calls differ from the fixture topology");
   assert.equal(unchangedEntries, pinned(idleArtifact.expectedStableDirectoryEntries, "expected stable entries"), "idle unchanged entries differ from the fixture topology");
   assert.equal(unchangedCalls, pinned(idleArtifact.expectedStableEnumerationCalls, "expected stable calls"), "idle unchanged enumeration calls differ from the fixture topology");
+  // The history projection also comes from that scenario's counters.
+  for (const [label, projected, counter] of [
+    ["raw event writes", idle.rawEventWrites, "rawEventWrites"],
+    ["raw event rewrites", idle.rawEventRewrites, "rawEventRewrites"],
+    ["files opened", idle.filesOpened, "filesOpened"],
+    ["file bytes read", idle.fileBytesRead, "fileBytesRead"],
+    ["full history file reads", idle.fullHistoryFileReads, "fullHistoryFileReads"],
+    ["overlapping jobs", idle.overlappingJobs, "overlappingJobs"],
+  ] as const) {
+    assert.equal(
+      integer(projected, `idle ${label}`),
+      pinned(idleArtifactCounters[counter], label),
+      `idle ${label} disagree with the resource artifact`,
+    );
+  }
   const firstBoot = idleArtifact;
   assert.equal(firstBoot.firstBootRecentOnly, true);
   assert.equal(integer(firstBoot.oldContentReadsAtBoot, "old boot reads"), 0);
