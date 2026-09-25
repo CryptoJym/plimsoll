@@ -6,9 +6,11 @@
   outbox age, and session-summary lag once a minute. A local 24-hour history and
   CSV export help show its cost on each Mac. Small ledgers also get daily table
   sizes. The budget shown in status is advisory; it does not limit capture.
-- WAL file growth is reported as a lower bound on bytes written. SQLite may
-  reuse a checkpointed WAL without growing the file, so exact WAL writes remain
-  unavailable until a lower-level counter exists.
+- The daemon now uses its own process counters and checks only children it has
+  started. It reports filesystem output operations separately from WAL file
+  growth; neither is treated as physical write bytes. Export includes the daily
+  table sizes and attempted-row class. Purging a stopped collector also removes
+  the ledger's WAL and SHM files.
 
 ## 0.7.5 — 2026-09-08
 
