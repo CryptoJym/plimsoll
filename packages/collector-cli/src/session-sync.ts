@@ -2,6 +2,7 @@ import { buildWorkspaceEconomics } from "../../shared/src/economics/service";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
 import type { Period,UsageFact } from "../../shared/src/economics/contracts";
 import { createRequire } from "node:module";
+import crypto from "node:crypto";
 import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 
@@ -11,6 +12,7 @@ import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
 import { BOUNDED_SQL_READ_PREDICATE, BoundedSqlReadError, boundedSqlRows } from "./bounded-sql-read";
 import { TransportError } from "./http-transport";
+import { SyncStorageRetryController } from "./sqlite-contention";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import { deliveryItemId } from "./delivery-ack";
@@ -1175,6 +1177,7 @@ export async function runSessionSync(
   let skippedStaleSessions: number | null = null;
   let batches = 0;
   let abortReason: string | null = null;
+  let staleReason: string | null = null;
 
   const snapshotFresh = (sessionId: string): boolean => {
     if (!options.incremental) return true;
@@ -1218,38 +1221,64 @@ export async function runSessionSync(
       }),
     );
     const task = (async () => {
+      let sourceChanged = false;
+      const stale = () => {
+        sourceChanged = true;
+        rows.forEach((row) => markStale(row.session.id));
+        return new TransportError("source_changed");
+      };
       try {
+        const requestTimeoutMs = Math.min(120_000, config.delivery.requestTimeoutSeconds * 1_000);
         const fencedFetch: typeof fetch = options.incremental ? async (request, init) => {
-          // A separate connection owns the write reservation. The borrowed
-          // ledger handle must remain free for intake; a mutation from that
-          // handle or another process cannot commit while bytes are in flight.
-          if (ledger.name === ":memory:") {
-            rows.forEach((row) => markStale(row.session.id));
-            throw new TransportError("source_changed");
-          }
-          const fence = new Database(ledger.name, { fileMustExist: true, timeout: 0 });
-          let locked = false;
+          const leaseToken = crypto.randomUUID();
+          const retry = new SyncStorageRetryController({ budgetMs: 1_000, sleep });
+          // These callbacks are synchronous: only freshness/lease bookkeeping
+          // holds a write reservation. Network I/O never runs in a transaction.
+          await retry.run(() => ledger.transaction(() => {
+            ledger.prepare(`delete from session_sync_upload_leases
+              where lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')`).run();
+            if (!rows.every((row) => snapshotFresh(row.session.id))) throw stale();
+            const occupied = ledger.prepare(
+              "select 1 from session_sync_upload_leases where session_id = ?",
+            );
+            if (rows.some((row) => occupied.get(snapshotVersions.get(row.session.id)!.rawSessionId))) {
+              // Another uploader owns this session. Reuse the bounded network
+              // retry policy without labelling an unchanged source stale.
+              throw new TransportError("network_error");
+            }
+            const insert = ledger.prepare(`insert into session_sync_upload_leases
+              (session_id, lease_token, lease_expires_at, mutation_revision, high_water)
+              values (?, ?, ?, ?, ?)`);
+            const expiresAt = new Date(Date.now() + requestTimeoutMs + 5_000).toISOString();
+            for (const row of rows) {
+              const version = snapshotVersions.get(row.session.id)!;
+              insert.run(version.rawSessionId, leaseToken, expiresAt, version.mutationRevision, version.highWater);
+            }
+          }).immediate());
+          let released = false;
+          const clear = () => ledger.prepare(
+            "delete from session_sync_upload_leases where lease_token = ?",
+          ).run(leaseToken);
           try {
-            fence.exec("begin immediate");
-            locked = true;
-            const fresh = rows.every((row) => snapshotFresh(row.session.id));
+            // The HTTP deadline may expire while a short transaction retries.
+            // An aborted attempt must never start a delayed POST.
+            if (init?.signal?.aborted) throw new TransportError("deadline_exceeded");
+            const response = await fetchImpl(request, init);
+            const fresh = await retry.run(() => ledger.transaction(() => {
+              const current = rows.every((row) => snapshotFresh(row.session.id));
+              clear();
+              return current;
+            }).immediate());
+            released = true;
             if (!fresh) {
-              rows.forEach((row) => markStale(row.session.id));
-              throw new TransportError("source_changed");
+              void response.body?.cancel().catch(() => undefined);
+              throw stale();
             }
-            return await fetchImpl(request, init);
-          } catch (error) {
-            if (error instanceof Error && "code" in error && error.code === "SQLITE_BUSY") {
-              rows.forEach((row) => markStale(row.session.id));
-              throw new TransportError("source_changed");
-            }
-            throw error;
+            return response;
           } finally {
-            try {
-              if (locked) fence.exec("rollback");
-            } finally {
-              fence.close();
-            }
+            // A crashed/timed-out process leaves only an expiring lease. A
+            // live attempt clears only its own token, including failed sends.
+            if (!released) await retry.run(() => ledger.transaction(clear).immediate());
           }
         } : fetchImpl;
         const result = await postHistoryBatch({
@@ -1261,11 +1290,11 @@ export async function runSessionSync(
           fetchImpl: fencedFetch,
           sleep,
           maxAttempts,
-          timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
+          timeoutMs: requestTimeoutMs,
           allowPartial: true,
           beforeSend: () => {
             const fresh = rows.every((row) => snapshotFresh(row.session.id));
-            if (!fresh) rows.forEach((row) => markStale(row.session.id));
+            if (!fresh) stale();
             return fresh;
           },
           log,
@@ -1301,6 +1330,13 @@ export async function runSessionSync(
           }),
         );
       } catch (error) {
+        // A source change invalidates this body and leaves the summary dirty;
+        // the next catch-up pass will rebuild and retry it. It is not a fatal
+        // transport failure and must not abort later batches in this run.
+        if (sourceChanged) {
+          staleReason = error instanceof Error ? error.message : String(error);
+          return;
+        }
         abortReason = abortReason ?? (error instanceof Error ? error.message : String(error));
       }
     })();
@@ -1325,6 +1361,7 @@ export async function runSessionSync(
   }
 
   await Promise.allSettled([...inFlight]);
+  abortReason ??= staleReason;
 
   const durationMs = Date.now() - startedAt;
   const skippedSessions = Object.values(audit.skipped).reduce((sum, count) => sum + count, 0);

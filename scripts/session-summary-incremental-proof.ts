@@ -7,6 +7,8 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { markRawPrivacyDisposition } from "../packages/collector-cli/src/privacy-disposition";
+import { isSqliteContentionError } from "../packages/collector-cli/src/sqlite-contention";
+import { asHttpBoundaryRejection } from "../packages/collector-cli/src/http-boundary";
 import {
   buildSessionSyncRow,
   collectSessionSnapshots,
@@ -134,6 +136,257 @@ async function runIncremental(buffer: LocalEventBuffer, sessionIds: string[]) {
   throw new Error("session_summary_did_not_complete_within_20_bounded_slices");
 }
 
+async function runFenceMultiBatchCase(rttMs: number) {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), `p41-fence-${rttMs}-`));
+  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const external = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+  const sessionIds = Array.from({ length: 1_200 }, (_, index) => uuid(10_000 + index));
+  for (const [index, id] of sessionIds.entries()) {
+    const eventId = uuid(30_000 + index);
+    insertRaw(buffer, {
+      id: eventId,
+      sessionId: id,
+      observedAt: new Date(Date.parse("2026-09-20T00:00:00.000Z") + index * 1_000).toISOString(),
+      createdAt: new Date(Date.parse("2026-09-20T00:00:00.000Z") + index * 1_000).toISOString(),
+      inputTokens: 1,
+      outputTokens: 1,
+    });
+  }
+  // Keep the daemon-write probe outside the upload's leased session set. The
+  // old fence still blocks it because SQLite's write reservation is database
+  // wide; the repaired fence must leave this unrelated write free to commit.
+  const unrelatedId = uuid(90_001);
+  insertRaw(buffer, {
+    id: unrelatedId,
+    sessionId: uuid(90_000),
+    observedAt: "2026-09-20T23:59:00.000Z",
+    createdAt: "2026-09-20T23:59:00.000Z",
+    inputTokens: 1,
+    outputTokens: 1,
+  });
+  buffer.database.pragma("busy_timeout = 0");
+  let fetchCalls = 0;
+  let active = 0;
+  let peak = 0;
+  const daemonWrites: string[] = [];
+  try {
+    const result = await runSessionSync(config, {
+      ledgerDb: buffer.database,
+      incremental: true,
+      sessionIds,
+      until,
+      batchSize: 500,
+      concurrency: 2,
+      delayMs: 100,
+      maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        fetchCalls += 1;
+        active += 1;
+        peak = Math.max(peak, active);
+        for (const db of [buffer.database, external]) {
+          try {
+            const write = db.prepare(
+              "update buffered_events set output_tokens = output_tokens + 1 where id = ?",
+            ).run(unrelatedId);
+            daemonWrites.push(write.changes === 1 ? "succeeded" : `changes_${write.changes}`);
+          } catch (error) {
+            daemonWrites.push(error instanceof Error && "code" in error ? String(error.code) : String(error));
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, rttMs));
+        active -= 1;
+        const wire = String(init?.body ?? "");
+        return new Response(JSON.stringify({
+          ...acceptedFixtureDelivery(wire, installKey),
+          inserted: JSON.parse(wire).sessions.length,
+          updated: 0,
+          skippedStale: 0,
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }) as typeof fetch,
+      log: () => undefined,
+    });
+    console.log(JSON.stringify({ fenceProbe: { rttMs, fetchCalls, peak, daemonWrites,
+      ok: result.ok, sentSessions: result.sentSessions, acceptedSessions: result.acceptedSessions,
+      summaryComplete: result.summaryComplete, reason: result.reason } }));
+    assert.equal(result.ok, true, JSON.stringify({ reason: result.reason, sentSessions: result.sentSessions }));
+    assert.equal(result.summaryComplete, true, JSON.stringify(result));
+    assert.equal(result.sentSessions, 1_200, JSON.stringify(result));
+    assert.equal(result.acceptedSessions, 1_200, JSON.stringify(result));
+    assert.equal(fetchCalls, 3, JSON.stringify({ fetchCalls, result }));
+    assert.equal(peak, 2, JSON.stringify({ peak }));
+    assert.deepEqual(daemonWrites, Array(6).fill("succeeded"));
+    assert.deepEqual(result.pendingSummarySessionIds, []);
+    return { rttMs, fetchCalls, peak, daemonWrites, result: {
+      ok: result.ok,
+      sentSessions: result.sentSessions,
+      acceptedSessions: result.acceptedSessions,
+      summaryComplete: result.summaryComplete,
+      batches: result.batches,
+    } };
+  } finally {
+    external.close();
+    buffer.close();
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+async function runFenceErasureCase(kind: "delete" | "privacy" | "receipt") {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p41-fence-erasure-"));
+  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const external = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+  const targetSessionId = uuid(40_000);
+  const eventId = uuid(40_001);
+  insertRaw(buffer, {
+    id: eventId,
+    sessionId: targetSessionId,
+    observedAt: "2026-09-20T00:00:00.000Z",
+    createdAt: "2026-09-20T00:00:00.000Z",
+    inputTokens: 1,
+    outputTokens: 1,
+  });
+  const rowid = (buffer.database.prepare("select rowid from buffered_events where id = ?").get(eventId) as { rowid: number }).rowid;
+  const erase = () => kind === "delete"
+    ? external.prepare("delete from buffered_events where id = ?").run(eventId).changes
+    : kind === "privacy"
+      ? markRawPrivacyDisposition(external, rowid, "local_privacy_violation", new Date().toISOString())
+      : external.prepare(`insert into upload_receipts
+          (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
+          values (?, 'dead', 'local_privacy_violation', 'local', 0, ?, ?)`)
+        .run(eventId, until, until).changes;
+  let firstBody = "";
+  let erasureAttempt = "not_attempted";
+  try {
+    const first = await runSessionSync(config, {
+      ledgerDb: buffer.database,
+      incremental: true,
+      sessionIds: [targetSessionId],
+      until,
+      batchSize: 500,
+      concurrency: 1,
+      delayMs: 0,
+      maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        firstBody = String(init?.body ?? "");
+        try {
+          erasureAttempt = `committed_${erase()}`;
+        } catch (error) {
+          assert.equal(asHttpBoundaryRejection(error).reason, "storage_busy_retry");
+          erasureAttempt = error instanceof Error && error.message === "session_sync_upload_lease"
+            ? "deferred" : String(error);
+          assert.equal(collectSessionSnapshots(buffer.database, { until, sessionIds: [targetSessionId] })[0]?.events, 1);
+
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return new Response(JSON.stringify(acceptedFixtureDelivery(firstBody, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+      log: () => undefined,
+    });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.sentSessions, 1, JSON.stringify(first));
+    assert.ok(firstBody.includes(targetSessionId), firstBody);
+    assert.equal(erasureAttempt, "deferred", JSON.stringify({ erasureAttempt, first }));
+    const committed = erase();
+    assert.equal(committed, 1);
+
+    let secondBody = "";
+    const second = await runSessionSync(config, {
+      ledgerDb: buffer.database,
+      incremental: true,
+      sessionIds: [targetSessionId],
+      until,
+      batchSize: 500,
+      concurrency: 1,
+      delayMs: 0,
+      maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        secondBody = String(init?.body ?? "");
+        return new Response(JSON.stringify(acceptedFixtureDelivery(secondBody, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+      log: () => undefined,
+    });
+    assert.equal(second.sentSessions, 0, JSON.stringify(second));
+    assert.equal(secondBody, "", secondBody);
+    return { kind, erasureAttempt, firstSent: first.sentSessions, committed, secondSent: second.sentSessions };
+  } finally {
+    external.close();
+    buffer.close();
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+async function runStaleBeforePostCase() {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p41-fence-stale-"));
+  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const targetSessionId = uuid(50_000);
+  const eventId = uuid(50_001);
+  insertRaw(buffer, {
+    id: eventId,
+    sessionId: targetSessionId,
+    observedAt: "2026-09-20T00:00:00.000Z",
+    createdAt: "2026-09-20T00:00:00.000Z",
+    inputTokens: 1,
+    outputTokens: 1,
+  });
+  let fetchCalls = 0;
+  let mutateAtStart = true;
+  try {
+    const first = await runSessionSync(config, {
+      ledgerDb: buffer.database,
+      incremental: true,
+      sessionIds: [targetSessionId],
+      until,
+      batchSize: 500,
+      concurrency: 1,
+      delayMs: 0,
+      maxAttemptsPerBatch: 1,
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        throw new Error("stale_snapshot_was_sent");
+      }) as typeof fetch,
+      sleep: async () => undefined,
+      log: (line) => {
+        if (mutateAtStart && line.includes('"status":"session_sync_start"')) {
+          buffer.database.prepare("update buffered_events set output_tokens = output_tokens + 1 where id = ?").run(eventId);
+          mutateAtStart = false;
+        }
+      },
+    });
+    assert.equal(fetchCalls, 0, JSON.stringify(first));
+    assert.equal(first.sentSessions, 0, JSON.stringify(first));
+    assert.equal(first.summaryComplete, false, JSON.stringify(first));
+    assert.ok(first.pendingSummarySessionIds.includes(targetSessionId), JSON.stringify(first));
+    const second = await runSessionSync(config, {
+      ledgerDb: buffer.database,
+      incremental: true,
+      sessionIds: [targetSessionId],
+      until,
+      batchSize: 500,
+      concurrency: 1,
+      delayMs: 0,
+      maxAttemptsPerBatch: 1,
+      fetchImpl: (async (_input, init) => {
+        fetchCalls += 1;
+        const wire = String(init?.body ?? "");
+        return new Response(JSON.stringify(acceptedFixtureDelivery(wire, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+      sleep: async () => undefined,
+      log: () => undefined,
+    });
+    assert.equal(second.ok, true, JSON.stringify(second));
+    assert.equal(second.sentSessions, 1, JSON.stringify(second));
+    return { fetchCalls, firstSent: first.sentSessions, retriedSent: second.sentSessions, pending: first.pendingSummarySessionIds };
+  } finally {
+    buffer.close();
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
 function compareExact(buffer: LocalEventBuffer, sessionIds: string[], sent: unknown[]) {
   assert.deepEqual(
     sent.slice().sort((a, b) =>
@@ -142,6 +395,71 @@ function compareExact(buffer: LocalEventBuffer, sessionIds: string[], sent: unkn
       )),
     expectedSessions(buffer, sessionIds),
   );
+}
+
+async function runFenceContentionCase(point: "before" | "after" | "stale") {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "p40-fence-contention-"));
+  const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+  const writer = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+  buffer.database.pragma("busy_timeout = 0");
+  const sessionId = uuid(60_000);
+  const eventId = uuid(60_001);
+  insertRaw(buffer, {
+    id: eventId, sessionId, observedAt: "2026-09-20T00:00:00.000Z",
+    createdAt: "2026-09-20T00:00:00.000Z", inputTokens: 1, outputTokens: 1,
+  });
+  let fetches = 0;
+  let waits = 0;
+  try {
+    const result = await runSessionSync(config, {
+      ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+      delayMs: 0, maxAttemptsPerBatch: 1,
+      log: (line) => {
+        if (point !== "after" && line.includes('"status":"session_sync_start"')) {
+          writer.exec("begin immediate");
+        }
+      },
+      sleep: async () => {
+        waits += 1;
+        assert.equal(writer.inTransaction, true);
+        if (point === "stale") {
+          writer.prepare("update buffered_events set output_tokens = 42 where id = ?").run(eventId);
+        }
+        writer.exec("commit");
+      },
+      fetchImpl: (async (_url, init) => {
+        fetches += 1;
+        assert.equal(buffer.database.inTransaction, false, "network send held the daemon transaction");
+        const wire = String(init?.body ?? "");
+        if (point === "after") writer.exec("begin immediate");
+        return new Response(JSON.stringify(acceptedFixtureDelivery(wire, installKey)), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+    });
+    assert.equal(waits, 1, JSON.stringify({ point, waits, result }));
+    assert.equal(result.ok, point !== "stale", JSON.stringify(result));
+    assert.equal(fetches, point === "stale" ? 0 : 1);
+    assert.equal(result.summaryComplete, point !== "stale");
+    const leases = buffer.database.prepare("select count(*) as n from session_sync_upload_leases").get() as { n: number };
+    assert.equal(leases.n, 0);
+    if (point === "stale") {
+      const retried = await runIncremental(buffer, [sessionId]);
+      assert.equal(retried.result.sentSessions, 1);
+      compareExact(buffer, [sessionId], retried.sent);
+    }
+    // A process crash cannot leave a permanent mutation fence.
+    writer.prepare(`insert into session_sync_upload_leases
+      (session_id, lease_token, lease_expires_at, mutation_revision, high_water)
+      values (?, 'expired-process', '2000-01-01T00:00:00.000Z', 0, 0)`).run(sessionId);
+    assert.equal(writer.prepare("delete from buffered_events where id = ?").run(eventId).changes, 1);
+    return { point, waits, fetches, ok: result.ok, summaryComplete: result.summaryComplete };
+  } finally {
+    if (writer.inTransaction) writer.exec("rollback");
+    writer.close();
+    buffer.close();
+    fs.rmSync(fixture, { recursive: true, force: true });
+  }
 }
 
 async function reviewRegressions() {
@@ -153,6 +471,7 @@ async function reviewRegressions() {
     "interleaved_initial_insert", "trigger_upgrade", "privacy_handoff_erasure",
     "backdated_queue_planner", "stale_send_fast_retry",
     "pending_id_bounds", "sync_id_deadline", "same_time_seek",
+    "fence_multibatch", "fence_erasure", "fence_stale_before_post", "fence_contention",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -435,7 +754,7 @@ async function reviewRegressions() {
               try {
                 external.prepare("delete from buffered_events where id = ?").run(uuid(531));
               } catch (error) {
-                externalErasureBlocked = error instanceof Error && "code" in error && error.code === "SQLITE_BUSY";
+                externalErasureBlocked = isSqliteContentionError(error);
               }
               fullAtHandoff = collectSessionSnapshots(buffer.database, { until, sessionIds: [sessionId] })[0]?.events ?? 0;
               return new Response(JSON.stringify(acceptedFixtureDelivery(body, installKey)), {
@@ -590,6 +909,38 @@ async function reviewRegressions() {
         assert.deepEqual(complete.snapshot, collectSessionSnapshots(buffer.database, {
           until, sessionIds: [sessionId],
         })[0]);
+      } else if (name === "fence_multibatch") {
+        buffer.close();
+        const results = [];
+        const failures: string[] = [];
+        for (const rttMs of [300, 1_200]) {
+          try { results.push(await runFenceMultiBatchCase(rttMs)); }
+          catch (error) { failures.push(`${rttMs}: ${String(error)}`); }
+        }
+        assert.deepEqual(failures, []);
+        console.log(JSON.stringify({ reviewCase: name, result: "PASS", results }));
+        continue;
+      } else if (name === "fence_erasure") {
+        buffer.close();
+        const result = [];
+        for (const kind of ["delete", "privacy", "receipt"] as const) {
+          result.push(await runFenceErasureCase(kind));
+        }
+        console.log(JSON.stringify({ reviewCase: name, result: "PASS", detail: result }));
+        continue;
+      } else if (name === "fence_stale_before_post") {
+        buffer.close();
+        const result = await runStaleBeforePostCase();
+        console.log(JSON.stringify({ reviewCase: name, result: "PASS", detail: result }));
+        continue;
+      } else if (name === "fence_contention") {
+        buffer.close();
+        const results = [];
+        for (const point of ["before", "after", "stale"] as const) {
+          results.push(await runFenceContentionCase(point));
+        }
+        console.log(JSON.stringify({ reviewCase: name, result: "PASS", results }));
+        continue;
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
     } finally {

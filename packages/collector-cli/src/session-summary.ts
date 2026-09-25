@@ -191,6 +191,72 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       session_id text primary key,
       mutation_revision integer not null check (mutation_revision >= 0)
     );
+    -- A session-sync upload owns a short, per-session lease rather than the
+    -- database-wide write reservation. Raw mutations defer while the lease is
+    -- live, so an in-flight body cannot be overtaken by an erasure or another
+    -- source change. The transport clears these rows after the response (or
+    -- they become eligible for reuse after their bounded expiry).
+    create table if not exists session_sync_upload_leases (
+      session_id text primary key,
+      lease_token text not null,
+      lease_expires_at text not null,
+      mutation_revision integer not null,
+      high_water integer not null
+    );
+    create index if not exists idx_session_sync_upload_leases_expiry
+      on session_sync_upload_leases (lease_expires_at);
+    create trigger if not exists trg_session_sync_upload_lease_insert
+    before insert on buffered_events
+    when new.session_id is not null and exists (
+      select 1 from session_sync_upload_leases
+       where session_id = new.session_id
+         and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    )
+    begin
+      select raise(abort, 'session_sync_upload_lease');
+    end;
+    create trigger if not exists trg_session_sync_upload_lease_update
+    before update of id, source, event_type, data_mode, observed_at, created_at,
+      session_id, input_tokens, output_tokens, cache_read_tokens,
+      cache_creation_tokens, cost_usd, repo_hash, branch_hash, account_hash,
+      privacy_generation, privacy_disposition on buffered_events
+    when exists (
+      select 1 from session_sync_upload_leases
+       where lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         and (session_id = old.session_id or session_id = new.session_id)
+    )
+    begin
+      select raise(abort, 'session_sync_upload_lease');
+    end;
+    create trigger if not exists trg_session_sync_upload_lease_delete
+    before delete on buffered_events
+    when old.session_id is not null and exists (
+      select 1 from session_sync_upload_leases
+       where session_id = old.session_id
+         and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    )
+    begin
+      select raise(abort, 'session_sync_upload_lease');
+    end;
+    -- Privacy receipt/outbox changes also dirty the summary. Abort their
+    -- original statement so callers retain the work for retry; a no-op would
+    -- let a caller mistake a deferred erasure for a completed one.
+    create trigger if not exists trg_session_sync_upload_lease_dirty_insert
+    before insert on session_sync_summary_dirty
+    when exists (select 1 from session_sync_upload_leases
+      where session_id = new.session_id
+        and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    begin
+      select raise(abort, 'session_sync_upload_lease');
+    end;
+    create trigger if not exists trg_session_sync_upload_lease_dirty_update
+    before update on session_sync_summary_dirty
+    when exists (select 1 from session_sync_upload_leases
+      where session_id = new.session_id
+        and lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    begin
+      select raise(abort, 'session_sync_upload_lease');
+    end;
     create trigger if not exists trg_session_summary_dirty_insert_revision
     after insert on session_sync_summary_dirty
     begin

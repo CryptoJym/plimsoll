@@ -17,6 +17,11 @@ function sqliteCode(error: unknown): string | number | null {
 /** SQLite primary and extended BUSY/LOCKED codes, in string or numeric form. */
 export function isSqliteContentionError(error: unknown) {
   const code = sqliteCode(error);
+  // Session-sync leases defer only mutations of the sessions being sent.
+  // SQLite exposes RAISE(ABORT) as a constraint error; the exact marker makes
+  // intake retain/retry that work through the existing storage-busy path.
+  if (code === "SQLITE_CONSTRAINT_TRIGGER" && error instanceof Error &&
+      error.message === "session_sync_upload_lease") return true;
   if (typeof code === "string") {
     const canonical = code.toUpperCase();
     return canonical.startsWith("SQLITE_BUSY") || canonical.startsWith("SQLITE_LOCKED");
