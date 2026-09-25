@@ -335,6 +335,9 @@ collector is running and while an interrupted operation is in
 `rollback_required`, because freeing space may be needed for its restore. It
 never touches the ledger or what that operation references. A
 `rollback_complete` journal blocks prune until the rollback receipt is durable.
+If the journal is malformed or unreadable, the dry run reports
+`journal_unreadable`; `prune --apply` exits nonzero without a receipt or any
+removal. Preserve the journal for repair and retry after its state is known.
 Its output is
 value-blind: operation IDs, runtime names, dates, sizes, methods and
 decisions.

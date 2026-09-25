@@ -152,6 +152,7 @@ const CASES = {
     "partial_crash_restore_retry_keeps_the_last_usable_way_back",
     "incomplete_undo_retry_keeps_the_last_usable_way_back",
     "unusable_restored_way_back_refuses_and_keeps_its_record_and_trash",
+    "malformed_journal_prune_apply_refuses_without_a_receipt_or_removal",
   ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
@@ -1548,6 +1549,27 @@ async function r8PruneSafety() {
         fixture.receipt("r10-unusable-restored-prune", "snapshots_prune") === null,
       { error: refused?.message, recordKept: exists(removalRecord),
         snapshots: fixture.snapshots(), versions: fixture.versions(), trash: listDirectory(trashRoot) });
+  });
+
+  await runCase([CASES.r10PruneSafety[3]], async (record) => {
+    const fixture = createHome("r10-malformed-journal-prune");
+    await updatesWithoutRetention(fixture, [["j1", "35.1.0"], ["j2", "35.1.1"], ["j3", "35.1.2"]]);
+    const before = { snapshots: fixture.snapshots(), versions: fixture.versions() };
+    fs.writeFileSync(path.join(fixture.lifecycleRoot, "journal.json"), "{malformed\n", { mode: 0o600 });
+    const preview = await fixture.manager().pruneSnapshots({ operationId: "r10-journal-preview", keep: 1 });
+    const refused = await rejection(() => fixture.manager().pruneSnapshots({
+      operationId: "r10-journal-apply", keep: 1, apply: true,
+    }));
+    record(CASES.r10PruneSafety[3],
+      preview.receipt === null && preview.retention.status === "skipped" &&
+        preview.retention.skippedReason === "journal_unreadable" &&
+        refused !== null && !refused.message.includes(fixture.home) &&
+        fixture.receipt("r10-journal-apply", "snapshots_prune") === null &&
+        same(fixture.snapshots(), before.snapshots) && same(fixture.versions(), before.versions) &&
+        listDirectory(path.join(fixture.lifecycleRoot, "trash")).length === 0 &&
+        listDirectory(path.join(fixture.lifecycleRoot, "removals")).length === 0,
+      { preview: preview.retention, error: refused?.message,
+        snapshots: fixture.snapshots(), versions: fixture.versions() });
   });
 }
 
