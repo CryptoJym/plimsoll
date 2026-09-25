@@ -1,4 +1,4 @@
-# Migration: existing ledgers, cloud history, parity, reclaim, rollback (round 7 = B0 corrections on round 6)
+# Migration: existing ledgers, cloud history, parity, reclaim, rollback (round 8 = B0 round 2 corrections on round 7)
 
 **Bead:** eco-6hoxj.164.2 · **Round:** 6 · **As of:** 2026-09-25 MDT · Planning only. Citation style as in DECISION-METRICS.md §0; cloud citations at `067a8a4`; every citation re-validated this round (`out/checks/validate-citations.log`).
 

@@ -1,4 +1,4 @@
-# Footprint budgets per host class (round 7 = B0 corrections on round 6)
+# Footprint budgets per host class (round 8 = B0 round 2 corrections on round 7)
 
 **Bead:** eco-6hoxj.164.2 · **Round:** 6 · **As of:** 2026-09-25 MDT · Planning only. Every number is labelled **measured** (from the supplied inputs, shipped in `out/evidence/`), **derived** (arithmetic on measured inputs, reproducible in `out/checks/plan_arithmetic.py`) or **hypothesis** (a post-migration target that the rehearsal must calibrate before it becomes a gate). Nothing here was measured on a live collector by this lane.
 

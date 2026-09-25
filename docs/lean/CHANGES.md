@@ -1,12 +1,73 @@
-# Round 7 (B0) changes: each blocker and `b0Carries` item, where it changed, and which test binds it
+# Round 8 (B0 round 2) changes: each review-r1 blocker and should-fix, where it changed, and which fixture and test bind it
 
-**Bead:** eco-6hoxj.164.4 (B0) · **As of:** 2026-09-25 MDT · Inputs: `input/plan-r6/` (round-6 plan), `input/review-r6/`
-(VERDICT.json: 2 blockers, 5 should-fixes, 4 `b0Carries`, 3 `freezable`). Documents and tests only; no product code; read-only
-toward every hosted service and live collector; no push. Every round-6 sentence that changed is in `checks/docs-diff-r6-r7.patch`
-(65 changed lines across five documents), produced by the recorded, uniqueness-checked replacements in
-`checks/round7_doc_edits.py`. `CONTRACTS.md` holds the normative text (C1-C7); `FREEZE.md` the freeze list.
+**Bead:** eco-6hoxj.164.4 (B0, round 2) · **As of:** 2026-09-25 MDT · Inputs: `input/b0-r1/` (round 7 = B0 round 1: CONTRACTS.md
+C1-C7, the plan documents, 16 fixtures, FREEZE.md, the two branches) and `input/review-r1/` (VERDICT.json: **CHANGES_REQUIRED**, three
+blockers, eight should-fixes, nine freeze items agreed, two disagreed; `checks/review_c1_orderings.py`, `review_c2_runway.py`).
+Documents, fixtures and tests only; no product code; read-only toward every hosted service and live collector; no push. The two
+branches continue from their round-1 heads (collector `lane/eco-6hoxj.164.4` from 5daa387 on plimsoll 03445d3a; cloud from 612a44d
+on plimsoll-cloud 4954995), one commit per item (§4). `CONTRACTS.md` holds the normative text (C1-C8), `FREEZE.md` the freeze list,
+`checks/round8_doc_edits.py` the recorded, uniqueness-checked document edits and `checks/docs-diff-r7-r8.patch` their sum.
 
-## 1. Blockers and `b0Carries` → section → fixture → pending test
+## 1. Blockers → section → fixture → test
+
+| Blocker (review-r1 VERDICT.json `blocking`) | Contract | Sections changed | Fixture (red / green) | Tests (bead) | Commit |
+|---|---|---|---|---|---|
+| **1. C1/C4: stamps for a version issued later.** Validity was judged against `binding_version` "at judgment", so the same row flipped with time (stamp 2 delivered at 400: null; judged in its summary at 1000: C; a dead delivery replayed at 700: C); an honest collector reached it on re-join (a new `DeviceInstall` at version 0, the collector keeping its highest version). | **C1**: the stamp is the pair `(install, V)`; the answer for a pair is fixed at its **first sighting** (any echo, row or member) and recorded as the durable fact `stamp_not_issued(install, V)` when `V` was above the install's `binding_version` then; every judgment is a sighting, so ingest, replay and every summary revision agree; a not-issued pair is unallocated for ever, disclosed, repaired by a fresh rebind; the claim is restated as exactly that guarantee (four numbered statements). **C4**: the collector scopes the persisted pair to the install, replaces it on a response from another install, never lowers it within one, and clears it at a join, re-join or workspace transition; a pre-re-join outbox row keeps its pair and is judged against the old install. | CONTRACTS.md header, C1, C4, C6 (surfaces); ARCHITECTURE.md §1 (round-8 note), §5.1 (the pair on the wire; every request echoes; `heard_at`), §5.2 (stamp bullet; `binding_at_capture` bullet; the one-function paragraph), §11; BEADS.md B2a, B6 (§ "beads" group); MIGRATION.md round-8 note | `fixtures/b4_offline_rebind.py` rewritten: 36 checks; **r6 12/36 RED** (round 6 as written: case D splits null/B), **r7 20/36 RED** (cases I, J1, J1', Jf and the over-time probe split or flip), **r8 36/36 GREEN**. New cases: I (a stamp from a version issued later, on install W, with the replay, the poisoned legitimate row and the fresh-version repair), J0 (a pre-re-join outbox row, C's under X), J1/J3 (an honest re-join: D's, then F's), J1' (a join whose response carries no version: the disclosed null-stamp exception), Jf (a faulty collector carrying a stale version: refused for ever, never F's), K (A→B→A), and a probe of every sighted pair at every instant. | cloud `actor-binding-stamp.contract.test.ts` (B6, 10 cases: 3-4 the reviewer's row and the honest orderings, 6 the first-sighting rule with replay and repair, 7 the re-join, 9 `heard_at` from every request, 10 ingest by the pair with an unknown install failing closed); cloud `schema-additions.contract.test.ts` test 2 (the fact); collector `actor-stamp.contract.ts` (B2a, 6 cases: 5 the scope cleared by a re-join and a transition, 6 the pre-re-join row's pair on the wire) | collector 4a92b45; cloud 5df4872 |
+| **2. C2 rule 3: G remaining overstated the runway.** `max(0, G_gate − new_table_bytes_now)` counted every lean-table page, so S2's dual-write bytes passed for conversion progress and the rows admitted after the one-time census were never owed: 0.39-2.56 d overstated on Studio4's census; 5.0 d shown at a true 2.45 d; the 2.0 d abort at a true −0.55 d. The round-7 fixture's "true runway" was the rule's own `G − C`. | **C2 rule 3**: `G_owed = max(0, G_gate − C_conv) + g_gate × U` with `C_conv` the converter's own written bytes (never a page count) and `U` the raw bytes admitted since the census that no lean row covers; 0 once everything is folded; the guarantee stated (never overstates for widths ≤ 1.25 × the estimates; the only conservatism is the 1.25 allowance). **Rule 1** (census obligation): after the catch-up, at most a day before the S1b decision, re-taken before S3, the `VACUUM INTO` copy only with ledger + reserve free; the segment proxy. **Rule 4**: the receipt records them. | CONTRACTS.md C2, C6 (`holdRunway`, `censusPreflight`, `estimateHostG`); ARCHITECTURE.md §2.4 (runway and alarm bullets); BUDGETS.md header, §4.2, §4.3; MIGRATION.md S1b (d), S3, round-8 note; PROOF.md §6 item 8 (the drill uses an oracle independent of the collector's arithmetic); BEADS.md B1 | `fixtures/s1b_runway_host_bound.py` rewritten: 19 checks; **r6 9/19 RED**, **r7 9/19 RED** (the six reviewer scenarios overstate by up to 0.86 d in the model; the 5-day rung fires at a true 4.14 d; a census with no freshness or space rule), **r8 19/19 GREEN**. The truth is a byte-level simulation of the ledger (raw growth, dual-write at the true widths, the converter's bytes, the unfolded post-census rows) that never calls the rule; checks: never overstates in the six reviewer scenarios, the retained margin is exactly the 1.25 allowance, the 5-day and 2-day rungs never fire late across a free-space sweep, exact at width factor 1.25, 0 at completion, the census preflight, the segment proxy. | collector `runway.contract.ts` (B1, B10a; 5 cases: 1 the gate bound with the segment proxy, 2 the 63-day threshold, 3 G owed against the in-test simulation with the six scenarios and the rungs, 4 the round-6 geometry, 5 `censusPreflight`) | collector 35747e6 |
+| **3. The test helper made eight tests unpassable.** `event()` fixed `observedAt` at 2026-09-25T10:00Z while `openTempBuffer({workspaceId})` started the enrollment epoch at run time, so `buffer.ts` refused every append as `before_enrollment` (actor-stamp 1-3, membership 1-2, retention-hold 1-2, receipts-and-ladder 2). | test infrastructure: `openTempBuffer` pins the epoch at 2026-01-01 through the constructor's `enrollmentNow` option (`EPOCH_STARTED_AT`); `event()` keeps its fixed `EVENT_OBSERVED_AT` | `tests/contracts/lean/_pending.ts`; `helper.contract.ts` (new) | n/a | collector `helper.contract.ts`: 8 **green** guards (every buffer configuration the pending tests use admits the fixture event with `append() === true` and one stored row; the ladder's explicit old timestamp lands; a buffer without the pinned epoch still refuses the event as `before_enrollment`) | collector a63b36c |
+
+## 2. Should-fixes (review-r1 VERDICT.json `shouldFix`) → section → fixture → test
+
+| Should-fix | What changed | Where | Commit |
+|---|---|---|---|
+| 1. `b4_offline_rebind.py --rule r6` modelled `heard_at` at the 300 response, so case D did not split under r6 | r6 mode is round 6 **as written**: two validators with the first-echo `heard_at`; case D is null/B under r6 (12/36 RED, the split reproduced); the round-1 claim "case D splits null/B under r6" is now true, and this document and `RESULT.json` say what each red run shows | fixture docstring and `actor_for_stamp`; CONTRACTS.md C1 "The corrected timeline" | collector 4a92b45 (same file as blocker 1) |
+| 2. `heard_at` modelling: the delivery at 400 echoes v1; v0's `heard_at` differed (fixture 0, cloud test 50) | every request, upload deliveries included, echoes `max(persisted, highest stamp carried for the current install)`: `heard_at(0) = 50`, `heard_at(1) = 400` (the delivery that carries the stamp-1 row; the 300 response sets nothing), `heard_at(2) = 700`; the registration response is not an echo; disclosed in C1 and §5.1; `--rule r7` keeps the round-1 modelling so the correction is red under r7 | fixture timeline (three `heard_at` checks, the diagnostics check, the export window 200 → 400); CONTRACTS.md C1; ARCHITECTURE.md §5.1, §5.2; cloud test 9 `firstEchoHeardAt` expects `{0: 50, 1: 400, 2: 700}` | collector 4a92b45; cloud 5df4872 |
+| 3. C3: §2.3 not updated; no retention test; `raw_rowid` reuse | ARCHITECTURE.md §2.3 lists `conversion_rejects` and any raw row with an open reject; §2.2 and §3.5: the raw-delete trigger nulls `conversion_rejects.raw_rowid` for `old.id` so a reused rowid never aliases the reject; the prune and the ladder refuse a raw row with an open reject; a resolved reject releases it and keeps its record | CONTRACTS.md C3, C6; ARCHITECTURE.md §2.2, §2.3, §3.5; collector `conversion-rejects.contract.ts` (B2a: trigger and reuse; B10b: retention), pending | collector 8c631ff |
+| 4. The `<UR>` pin test promised by BEADS B0 and MIGRATION S1 was missing | **C8**: the predicate pinned as `tests/contracts/lean/fixtures/usage_record_predicate.sql` in both repositories with the same pin (sha256 after comments dropped, whitespace collapsed, case folded); guards green in both (fixture = pin; cloud: the inline `loader.ts` text = pin; collector: the census script's predicate = pin); pending: cloud lane 2 (`USAGE_RECORD_PREDICATE_SQL` exported and used), collector B2a (`lean/usage-record.ts`, `isUsageRecord`) | CONTRACTS.md C8; MIGRATION.md S1; `usage-record-pin.contract(.test).ts` both repos; `fixtures/host_cardinality_census.py` carried beside the collector fixtures | collector 1314ac6; cloud 0bf37d1 |
+| 5. C2 segments (1.2 × sessions was scaled, not counted); the `VACUUM INTO` census needs space | the census counts `segment_proxy` (sessions split at 7 days, `Σ 1 + ⌊span / 7⌋`) and `segments = max(1.2 × sessions, segment_proxy)`; the terminal-pause splits are declared covered by the 1.25 factor (the whole segment term is 2.3% of G on Studio4); the copy is made only with free space ≥ ledger + reserve; the census after the catch-up, at most a day old, re-taken before S3 | CONTRACTS.md C2 rule 1; BUDGETS.md §4.3; ARCHITECTURE.md §2.4; MIGRATION.md S1b, S3; fixture checks 7-8 and `census_preflight`; collector `runway.contract.ts` tests 1 and 5; `host_cardinality_census.py` `segment_proxy` | collector 35747e6 (rule) and 1314ac6 (census script) |
+| 6. Hygiene: committed `__pycache__`; re-serialised `package.json` description; cloud B22 tests marked `pending('B6')`; `DECISION-METRICS.md` missing from `docs/lean/`; static imports of today's modules | the `.pyc` removed and `__pycache__/` ignored; the literal em dash restored (the JSON value never changed); the three cloud tests are titled "B6 (B22 cloud half)" to agree with their marker; `DECISION-METRICS.md` carried; `loadSurface` for `dashboard-projection`, `config`, `upload`, `shared`, `outbound-envelope` (collector) and `ingest`, `delivery-ack-response`, `capture-watermark/contract` (cloud); READMEs updated | collector hygiene commit; cloud 8a06e39 | see §4 |
+| 7. `SUMMARY-FOR-JAMES.md`: inaccurate ("closes both", "nothing touched", "in both repositories"), 2,394 words | rewritten: this round's news only, under 600 words, accurate (C1 and C2 were not closed by round 7; the round-7 rule under-counted the runway; "read-only": Studio4's live ledger was copied in round 7, not touched in round 8); the round-6 recap is §6 of this document | `SUMMARY-FOR-JAMES.md`; this file §6 | docs commit |
+| 8. (Low) a rename of `validateBatchForStorage` etc. would turn CI red outside the pending mechanism | covered by 6 | | |
+
+## 3. Tests and fixtures after this round
+
+- **Collector** `pnpm contracts:lean` (Node 22.23.1 locally; CI uses Node 22): **46 tests, 12 pass, 34 todo, exit 0**. Green guards: `b22-documents`, the foreign-keys pragma, the 8 helper guards, the 2 `<UR>` pin guards. Pending: `schema` 7, `retention-hold` 2, `actor-stamp` 6, `membership` 2, `runway` 5, `day-key` 4, `converter` 1, `conversion-rejects` 2, `capture-gaps` 1, `receipts-and-ladder` 3, `usage-record-pin` 1. Every pending test fails at "contract surface missing: <path>" or on today's behaviour (`recordActorBindingVersion is not a function`, `conversion_rejects exists`, `no such column: hold_reason`, the receipts CHECK, the open gap counted complete) (`checks/collector-contracts.log`).
+- **Cloud** `pnpm test:contracts:lean`: **23 tests, 2 pass, 21 todo, exit 0**. Green: the 2 pin guards. Pending: `actor-binding-stamp` 10, `activity-summary` 2, `capture-coverage` 3, `schema-additions` 3, `token-volume` 2, `usage-record-pin` 1 (`checks/cloud-contracts.log`). `pnpm typecheck` and `pnpm lint` pass with the tests in place (`checks/cloud-typecheck.log`, `checks/cloud-lint.log`).
+- **Collector gates**: `tsc --noEmit` passes; the #397 `ci-coverage` gate passes as `proof.yml` runs it (`checks/collector-ci-coverage-gate.log`).
+- **Fixtures** (`checks/fixtures-summary.json`, `fixtures-r4.log` … `fixtures-r8.log`): the eight round-5 fixtures red r4 / green r5, the six round-6 fixtures red r5 / green r6, the two round-8 fixtures **red r6, red r7, green r8**.
+- The eight tests review-r1 blocker 3 named now append their rows (the helper guard proves the configurations) and fail only at their intended surface.
+
+## 4. Commits (one per item)
+
+Collector `lane/eco-6hoxj.164.4` on plimsoll 03445d3a, after 5daa387 (round 7):
+1. a63b36c blocker 3: pin the contract tests' enrollment epoch so fixture appends land; `helper.contract.ts`.
+2. 4a92b45 blocker 1 (+ should-fixes 1-2): the pair, the first-sighting rule, the re-join scope; `b4_offline_rebind.py`; `actor-stamp.contract.ts`.
+3. 35747e6 blocker 2 (+ should-fix 5): `G_owed`, the census obligation, the segment proxy; `s1b_runway_host_bound.py`; `runway.contract.ts`.
+4. 8c631ff should-fix 3: `conversion_rejects` retention and `raw_rowid`; `conversion-rejects.contract.ts`.
+5. 1314ac6 should-fix 4: the `<UR>` pin; `usage-record-pin.contract.ts`; the census script beside the fixtures.
+6. hygiene (should-fixes 6 and 8): bytecode, `.gitignore`, `package.json`, `DECISION-METRICS.md`, `loadSurface`, READMEs.
+7. documents (should-fix 7 and the freeze list): `BEADS.md`, `CHANGES.md`, `FREEZE.md`, `SUMMARY-FOR-JAMES.md`, `PROOF.md` note.
+
+Cloud `lane/eco-6hoxj.164.4` on plimsoll-cloud 4954995, after 612a44d (round 7):
+1. 5df4872 blocker 1 (+ should-fix 2): `actor-binding-stamp.contract.test.ts`, `schema-additions.contract.test.ts`.
+2. 0bf37d1 should-fix 4: `usage-record-pin.contract.test.ts` and its fixture.
+3. 8a06e39 hygiene (should-fixes 6 and 8): B22 titles, `loadSurface`, README.
+
+Heads and hashes: `RESULT.json`; thin bundles and patches: `collector/`, `cloud/`.
+
+## 5. Assumptions B0 made on the lead's behalf (decide ambiguous points, report them)
+
+- **The stamp is the pair `(install, version)`, not a bare version.** The reviewer's repair scoped the *stored* version to the install; without the install on the identity row and on the wire, the predicate's `install` argument is undefined for a row delivered after a re-join (a row still in the outbox would be judged against the new install and unallocated although its version was issued by the old one). One nullable column (`summary_members.actor_binding_install`), one allowlisted metadata key and a pair-keyed parts map close that gap; the alternative, resolving the install from the row's installation epoch on the cloud, is fragile because the epoch id is collector-generated and learned only from claims.
+- **The not-issued fact is sticky per `(install, version)`, so a faulty stamp poisons its version for that install** (rows the install later stamps legitimately with it are unallocated until an admin rebind issues a fresh version). A per-row verdict cannot make two rows with the same pair agree, and the cloud cannot tell a faulty stamp from a stamp issued later except by the order of sightings; the poisoning is disclosed on the certify with the affected row count. Honest collectors never produce a not-issued pair (C4 clears the pair at a re-join).
+- **`G_owed` keeps the reviewer's form `max(0, G_gate − C_conv)`** rather than a remainder proportional to converted rows: the converter's byte counter self-corrects to real widths, the proportional form would need per-class row accounting, and the fixture shows the retained margin is exactly the 1.25 allowance (the whole allowance on the census-era G until completion). Rung names for `holdRunway`: `none | converter_paused | release_acked_only | abort`.
+- **The Studio4 census was not re-run.** Re-running it means reading the live ledger again (read-only, 2 s); the rule and the fixture do not need it, so the segment proxy stays unmeasured on Studio4 and the fixture falls back to 1.2 × sessions there, declared covered by the 1.25 factor (2.3% of G).
+- **Should-fixes 1-2 ride in the blocker-1 commit** (the same fixture and the same model; a separate first commit would have shipped a fixture red under its own new rule) and should-fix 5 in the blocker-2 commit (the same C2 rule text); each is listed in §2 with its commit.
+- **The pin's normalisation** drops comment lines, collapses whitespace (none inside the outer parentheses) and folds case, so the fixture, the cloud's inline text and the census script's Python string hash identically; the pinned value is in both pin tests.
+- **The helper pins the epoch rather than moving `observedAt` to "now"**, so the fixtures keep their fixed, day-key-relevant timestamps; the guard shows the trap is real.
+
+## 6. Earlier rounds, for the record
+
+#### Round 7: blockers and `b0Carries` → section → fixture → pending test (as B0 round 1 recorded it; the C1 and C2 rows are superseded above)
 
 | Item (VERDICT.json) | Contract | Sections changed | Fixture (red r6 / green r7) | Pending tests (bead) |
 |---|---|---|---|---|
@@ -19,7 +80,7 @@ toward every hosted service and live collector; no push. Every round-6 sentence 
 | Should-fix 1 (fixture timeline) | in C1 | ARCHITECTURE.md §5.2 | `b4_offline_rebind.py` timeline checks (r6 red) | cloud test 5 (`firstEchoHeardAt`) |
 | Should-fix 3 (should-fix list item 3: `conversion_rejects` DDL) | C3 (above) | | | |
 
-## 2. Every fixture ported as a pending test (the round-5 and round-6 set)
+#### Round 7: every fixture ported as a pending test (the round-5 and round-6 set)
 
 | Fixture | Owning repository and test | Bead |
 |---|---|---|
@@ -41,38 +102,13 @@ toward every hosted service and live collector; no push. Every round-6 sentence 
 | Hold red/green (PROOF.md §5 item 1) | collector `retention-hold.contract.ts` | B10a |
 | Schema additions on the cloud (binding version, heard_at, parts, cloud gaps, lane closed) | cloud `schema-additions.contract.test.ts` | B6 |
 
-## 3. How the tests are pending, and what was run
 
-`node:test` `todo` (`pending("<bead>")` in each repository's `tests/contracts/lean/_pending.ts`): the tests run, print their
-failure and count under `# todo`; the process exits 0. Cloud: `pnpm test:contracts:lean` (`tests/contracts/lean/*.contract.test.ts`,
-outside the `tests/*.test.ts` glob of `pnpm test`; typechecked and linted, both green); a CI step after `Test` in `ci.yml`.
-Collector: `pnpm contracts:lean` (`tests/contracts/lean/*.contract.ts`, outside `tsconfig` `include` and not matching the
-proof-file rule of `scripts/ci-coverage-proof.ts`, which still passes); a CI step after `Typecheck` in `proof.yml`; run under
-Node 22 as in CI. Counts: cloud 17 tests, all pending and red; collector 30 tests, 28 pending and red, 2 guards green (the b22 documents and the
-foreign-keys pragma). Every pending test fails today for "contract surface missing: <path>" or an assertion on today's behaviour
-(`checks/cloud-contracts.log`, `checks/collector-contracts.log`).
+#### Round 6, in plain words (moved here from SUMMARY-FOR-JAMES.md)
 
-## 4. Kept unchanged
+- **A summary of each day can now be acknowledged by the cloud.** Deleting a raw row requires the cloud to have acknowledged every summary that used it, and one of those (the per-day summary) had no way to be sent or acknowledged, so in practice nothing would ever have been deleted. The upload protocol now carries it and acknowledges it like the others. Test: `b1_day_target_receipt`.
+- **Who owns activity captured while a Mac was offline is now the same answer whether or not it reached the cloud.** If an admin re-binds a Mac from person A to person B while it is offline, last round's rules could export the same activity as A's if it never uploaded and as B's if it did. Now both paths use the same stamp the collector wrote at capture, the cloud records when the Mac acknowledged the change, and the answer no longer depends on delivery. Test: `b4_offline_rebind` (seven orderings, the reviewer's included).
+- **Every timestamp the collector accepts now reaches the day totals.** The collector accepts some unusual but valid timestamp formats; last round's plan would have dropped those records from the dashboard's day sums as "contract violations". They are now folded into their real UTC day, and "contract violation" is reserved for a value the parser truly cannot read, which is then listed by id, never dropped silently. Test: `b5_non_iso_day_facts`.
+- **The disk-runway check before a Mac's no-delete hold used a stale growth figure.** The temporary tables the migration adds are about **59% of the raw table on Studio1, not 42%**, once the per-row identity and link rows are counted. The gate now computes the figure per Mac from its measured row counts, with a safety margin, and a rehearsal copy replaces the estimate on the busy Macs and Studio0. Test: `s1b_runway_geometry` (a Mac whose hold the old figure would have started and the corrected one refuses).
+- **The "unread file" rule is now the same in the bead and the acceptance drill as in the design.** An unparsed session file keeps a Mac's coverage "unknown" through the present, not just up to the file's last write. Test: `b22_false_complete`.
+- Also: a source that reports no cache tokens but sends some anyway is treated as ambiguous rather than counted (`sf_no_cache_columns_guard`); the size check after an aborted migration allows for the raw rows captured meanwhile (`sf_abort_rebuild_bound`); the two tailer fixes are tracked in collector 0.7.42; deleted usage rows count as tombstones too; the fleet half of dispatch tagging stays parked until its owner accepts the interface; and the timestamp proof is described honestly as a large finite corpus with a conservative census.
 
-The round-6 decisions the review verified (day receipt, non-ISO fold, open gap, 0.7.42 target, usage tombstones, abort bound,
-finite corpus) and the round-5 first wave and start order. `DECISION-METRICS.md` is copied unchanged. The one question for
-James (30 or 90 days of local history) stands.
-
-## 5. Assumptions B0 made on the lead's behalf (decide ambiguous points, report them)
-
-- **C1 resolves the issued-but-unheard stamp to the historical actor, not to unallocated.** The reviewer allowed either;
-  the stamp is the collector's attestation that it had persisted the version, the version exists in the cloud's own audit
-  table, and the alternative (null on the raw row) is permanent and unrepairable. The echo became a diagnostic so the
-  predicate has no timing input. If the lead prefers fail-closed, the change is one branch in `actorForStamp` and one
-  expectation in each of the two actor tests.
-- **Measured Studio4 on a copy.** The task allowed "measure the session/day/segment mix on a copy of each host"; only this
-  host's ledger was reachable, so the census ran here (read-only `VACUUM INTO`, 2 s; the copy was deleted afterwards). The
-  other hosts' counts stay estimates; the rule requires B1 to count them.
-- **Pending = `todo`**, not a skipped or excluded suite, so the failures stay visible in every CI run without blocking.
-- **Contract documents ride the collector branch** under `docs/lean/` (the b22 document test needs repository-relative
-  paths); the cloud branch carries a README that points at them. No product path was touched in either repository.
-- **Finding:** better-sqlite3 enforces foreign keys by default, so the collector's ledger connection already runs with
-  `PRAGMA foreign_keys = 1` at `03445d3a`; the corresponding test is a green guard, not a pending test, and CONTRACTS.md C6
-  says B2a must keep it on rather than set it.
-- The task said "plimsoll (main 03445d3a)" without shipping a bundle; the commit was fetched read-only from
-  `https://github.com/CryptoJym/plimsoll.git` after no local clone held it (`checks/source-pins.log`).

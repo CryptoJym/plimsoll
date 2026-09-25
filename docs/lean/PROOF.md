@@ -1,10 +1,12 @@
-# Acceptance proof (round 7 = B0 corrections on round 6)
+# Acceptance proof (round 8 = B0 round 2 corrections on round 7)
 
 **Bead:** eco-6hoxj.164.2 · **Round:** 6 · **As of:** 2026-09-25 MDT · This is the proof the program must produce before Studio0 is migrated and before the program bead closes. It is defined now so that every implementation bead knows what evidence it owes. Nothing here has been run.
 
 **What changed in round 5.** The eight runnable fixtures in `out/fixtures/` (`run_fixtures.py`; results in `out/checks/fixtures-r4.log`, `fixtures-r5.log`, `fixtures-summary.json`) are the seed of B0's failing tests and are named in the rows they prove. The membership certify checks identity rows and the two covering edges per raw row (B1); the day-table rows are summed over epochs (B2); the retirement proof and the autoincrement key are drilled (B3); the rights drill covers undelivered members by binding stamp and the unallocated part (B4); the dashboard parity is stated per census class with the per-cutoff boundary rule (B5); G3 is asserted with the unknown-volume gate before any share (B6); the unresolved-file row uses the open gap (should-fix 5); a ladder-rollback parity drill is added (should-fix 1). Cloud pins are `067a8a4`; every citation re-validated this round.
 
 **What changed in round 6.** The seven round-6 fixtures join the eight round-5 ones as B0's seed (§4 "Round-5 and round-6 fixtures" row). The ledger-growth expectation is 58.6% of raw bytes on a Studio1-shaped mix (§3); the tombstone count includes usage tombstones (§3); the abort bound is pre-S2 bytes plus the raw capture since (§3, §6 item 7); the deletion drill acknowledges the day target only through its `day_summary` receipt (§5 items 4 and 8); the dashboard parity names the canonical shape as the byte-parity set and folds non-ISO rows by their UTC day (§4); G3 withholds on a non-zero cache column under `no_cache_columns` (§4); the rights drill covers the offline rebind (§4); and §8 item 1 requires the open gap (`epoch_open`, null end) with `out/fixtures/b22_false_complete.py` at the B22 gate.
+
+**What changed in round 8 (B0 round 2).** §6 item 8's runway drill compares the published runway with an oracle computed on the copy from the true remaining conversion bytes, independently of the collector's arithmetic, after two replayed days of S2 dual-write (`CONTRACTS.md` C2; `fixtures/s1b_runway_host_bound.py`, whose truth is such a model). The actor drills of §4 and §5 read the stamp as the `(install, version)` pair and expect a pair the cloud first saw before it issued the version to stay unallocated after the version is issued (`CONTRACTS.md` C1; `fixtures/b4_offline_rebind.py`).
 
 ## 1. Two claims, two proofs
 
