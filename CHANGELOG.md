@@ -26,9 +26,14 @@ does not transfer its sessions to a tailer.
 
 ## 0.7.40 — 2026-09-24
 
-- Busy-session indexing validates reusable session context once per reopen and
-  keeps Studio0 uploads and WAL checkpoints off the event loop (`.163.21`,
-  `.163.24`).
+- Busy-session indexing records session context at capture time and validates
+  it once per reopen (`.163.21`).
+- On a busy host, uploads claim and acknowledge in 125-row slices and yield to
+  the event loop between batches; only ledger WAL checkpoints move to a worker
+  thread (`.163.24`).
+- Session sync keeps incremental session summaries in the ledger and catches up
+  on a bounded cadence from an indexed cursor instead of rescanning history
+  (`.163.41`).
 - Resource observation now covers the supported directory APIs and proves the
   stable fixture sweep and ownership isolation (`.163.31`).
 - Learning-facts maintenance is bounded and capacity-tested, and busy-host Grok
