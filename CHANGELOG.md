@@ -111,6 +111,13 @@ does not transfer its sessions to a tailer.
   bytes are counted, and any possible usage loss remains a capture gap after
   the file reaches its end. Same-session rewrites with unchanged prior usage
   events replay through stable identities so tokens are not counted again.
+  Skipped-record kinds use JSON nesting, so a nested `type` cannot hide an
+  oversized usage record. An unknown prefix remains a possible usage loss;
+  an older saved skip is reclassified on resume, and receipts distinguish
+  same-size rewrites by a short prefix hash. Earlier
+  pre-enrollment bytes remain excluded. Once post-enrollment growth advances
+  the shared cursor to EOF, those earlier bytes cannot be imported through
+  that cursor; a separate historical cursor and identity policy is needed.
 - OTLP exports the ledger cannot commit in time are kept, not lost
   (`eco-6hoxj.163.17`). An authenticated, validated request that meets a busy
   ledger or runs out of its 1.5 s deadline — including one whose body arrived
