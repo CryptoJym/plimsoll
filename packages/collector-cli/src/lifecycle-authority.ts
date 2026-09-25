@@ -99,9 +99,17 @@ type LeaseEntry = {
 export type LifecycleMutationLease = Readonly<{
   revision: number;
   ownerToken: string;
+  /** Current expiry; moves forward when the owner renews. */
   expiresAtMs: number;
+  /** Lease length granted at acquisition; renew() extends by this much from now. */
+  durationMs: number;
   /** Revalidates the exact fence; call immediately before every mutating step. */
   assertCurrent: () => LifecycleRevalidation;
+  /**
+   * Extends this lease while it is still current (never revives an expired,
+   * superseded or released one), for owners in a step longer than the lease.
+   */
+  renew: () => LifecycleRevalidation;
   /** Marks only this lease's own record released. Never touches successors. */
   release: () => LifecycleReleaseOutcome;
 }>;
@@ -465,16 +473,74 @@ function releaseLease(
   }
 }
 
-function buildLease(
+/**
+ * The owner's in-place expiry extension. Same checks as release: the exact
+ * record object, unchanged bytes, and a still-current fence. The new record
+ * has the same length (only the 13-digit expiry changes), so it is written
+ * over the old bytes without truncating; a concurrent reader that sees a
+ * partial record treats the domain as ambiguous and authorizes nothing.
+ */
+function renewLease(
   leasesDirectory: string,
   scan: () => DomainScan,
   owned: { record: LeaseRecord; raw: string; device: number; inode: number },
+  durationMs: number,
+): LifecycleRevalidation {
+  const current = revalidate(leasesDirectory, scan, owned);
+  if (!current.ok) return current;
+  const expiresAtMs = Date.now() + durationMs;
+  if (expiresAtMs <= owned.record.expiresAtMs) return current;
+  const record: LeaseRecord = { ...owned.record, expiresAtMs };
+  const raw = `${JSON.stringify(record)}\n`;
+  const file = path.join(leasesDirectory, leaseName(owned.record.revision));
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+    const stat = fs.fstatSync(descriptor);
+    if (stat.dev !== owned.device || stat.ino !== owned.inode) return { ok: false, reason: "ambiguous" };
+    const existing = Buffer.alloc(Buffer.byteLength(owned.raw) + 1);
+    const bytesRead = fs.readSync(descriptor, existing, 0, existing.length, 0);
+    if (existing.subarray(0, bytesRead).toString("utf8") !== owned.raw) return { ok: false, reason: "ambiguous" };
+    const content = Buffer.from(raw, "utf8");
+    if (content.length !== bytesRead) fs.ftruncateSync(descriptor, 0);
+    let offset = 0;
+    while (offset < content.length) {
+      offset += fs.writeSync(descriptor, content, offset, content.length - offset, offset);
+    }
+    fs.fsyncSync(descriptor);
+  } catch {
+    return { ok: false, reason: "ambiguous" };
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // Descriptor already closed.
+      }
+    }
+  }
+  owned.record = record;
+  owned.raw = raw;
+  return revalidate(leasesDirectory, scan, owned);
+}
+
+function buildLease(
+  leasesDirectory: string,
+  scan: () => DomainScan,
+  acquired: { record: LeaseRecord; raw: string; device: number; inode: number },
 ): LifecycleMutationLease {
+  // Renewal replaces the record and raw bytes this owner compares against.
+  const owned = { ...acquired };
+  const durationMs = Math.max(1, acquired.record.expiresAtMs - Date.parse(acquired.record.acquiredAt));
   return Object.freeze({
     revision: owned.record.revision,
     ownerToken: owned.record.ownerToken,
-    expiresAtMs: owned.record.expiresAtMs,
+    get expiresAtMs() {
+      return owned.record.expiresAtMs;
+    },
+    durationMs,
     assertCurrent: () => revalidate(leasesDirectory, scan, owned),
+    renew: () => renewLease(leasesDirectory, scan, owned, durationMs),
     release: () => releaseLease(leasesDirectory, owned),
   });
 }

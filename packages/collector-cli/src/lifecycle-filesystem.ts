@@ -3,21 +3,25 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  LIFECYCLE_RETAINED_SNAPSHOTS,
   LIFECYCLE_SCHEMA_VERSION,
   LifecycleInterruption,
   PURGE_CONFIRMATION,
   immutableRuntimeRelativePath,
   parseCompletionReceipt,
   planLifecycleRetention,
+  validRestoreRecord,
   type LifecycleAdapter,
   type LifecycleCloneFallback,
   type LifecycleCompletedOperation,
   type LifecycleJournal,
   type LifecycleReadiness,
   type LifecycleReceipt,
+  type LifecycleReconcileRecord,
   type LifecycleRemovedItem,
   type LifecycleRestoreRecord,
   type LifecycleRetentionInput,
+  type LifecycleRetentionPlan,
   type LifecycleRetentionRecord,
   type LifecycleSnapshotInventory,
   type LifecycleSnapshotMethod,
@@ -32,7 +36,8 @@ import { isStatusSummaryTempFile } from "./status-summary";
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const EXECUTABLE_MODE = 0o700;
-const MAX_MARKER_BYTES = 64 * 1024;
+/** A completion receipt, including a retention record naming thousands of removals. */
+const MAX_MARKER_BYTES = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const MAX_TREE_ENTRIES = 200_000;
 /** Trash entries are `<kind>+<name>+<nonce>`; `+` never occurs in an identifier. */
@@ -73,6 +78,21 @@ export type LifecycleDatabaseRestore = {
   method: "clone" | "copy";
   cloneFallback: "clone_unsupported" | null;
   databaseBytes: number;
+  /** "preexisting_damage": the restored copy fails integrity_check only in ways the live ledger already does. */
+  integrity?: "ok" | "preexisting_damage";
+};
+
+/**
+ * The operation's mutation fence, for database steps that can outlast the
+ * lease. Both throw LifecycleInterruption once the fence is lost; a caller
+ * must then stop without changing anything further.
+ */
+export type LifecycleFenceGuard = {
+  /** Extends the lease while it is still current; call at least every `keepAliveIntervalMs`. */
+  keepAlive(): void;
+  keepAliveIntervalMs: number;
+  /** Revalidates the fence; call immediately before replacing or removing the live ledger. */
+  assertCurrent(): void;
 };
 
 /** SQLite implementations must use the online backup API or an equivalent
@@ -81,14 +101,14 @@ export type LifecycleDatabaseRestore = {
  * Restore must leave the live ledger untouched unless the restored copy is
  * complete and valid; it may report how the copy was made. */
 export type LifecycleDatabaseAdapter = {
-  snapshot(input: { source: string; destination: string }): Promise<boolean | LifecycleDatabaseSnapshot>;
-  restore(input: { source: string; destination: string }): Promise<void | LifecycleDatabaseRestore>;
+  snapshot(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<boolean | LifecycleDatabaseSnapshot>;
+  restore(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<void | LifecycleDatabaseRestore>;
   /**
    * Removes the live ledger for a snapshot taken when no ledger existed, only
    * when no other connection has it open. Adapters without it get a plain
    * removal of the ledger files.
    */
-  discard?(input: { destination: string }): Promise<void>;
+  discard?(input: { destination: string; guard?: LifecycleFenceGuard }): Promise<void>;
   /**
    * Update --preflight for a snapshot of `source` under `destination` (which
    * may not exist yet). Read-only: creates, changes and removes nothing.
@@ -100,6 +120,12 @@ type SnapshotMetadata = {
   schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
   currentVersion: string | null;
   currentExecutable: string | null;
+  /**
+   * Digest of `currentExecutable` when the snapshot was taken (from 0.7.40):
+   * what a restore brings back. Older snapshots have none; releases up to
+   * 0.7.39 ignore it.
+   */
+  currentExecutableSha256?: string | null;
   present: Record<"config" | "database" | "service", boolean>;
   createdAt?: string;
   database?: {
@@ -168,7 +194,8 @@ function isLifecycleJournal(value: unknown): value is LifecycleJournal {
     (row.fromVersion === null || isBoundedIdentifier(row.fromVersion)) &&
     isBoundedIdentifier(row.toVersion) &&
     ["prepared", "snapshotted", "staged", "switched", "verified", "rollback_required", "rollback_complete"].includes(String(row.phase)) &&
-    row.snapshotId === row.operationId;
+    row.snapshotId === row.operationId &&
+    (row.restore === undefined || validRestoreRecord(row.restore));
 }
 
 function isSnapshotMetadata(value: unknown): value is SnapshotMetadata {
@@ -193,20 +220,53 @@ type CompletionOrderRecord = {
   schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
   lastSequence: number;
   legacyOperations: string[];
+  /** Written by `snapshots reconcile --keep-snapshots`; see LifecycleOrderSeal. */
+  seal?: { operationId: string; sequence: number; keep: string[]; covered: string[] };
 };
 
 const MAX_COMPLETION_MARKERS = 100_000;
 
+function identifierList(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > MAX_COMPLETION_MARKERS || !value.every(isBoundedIdentifier) ||
+      new Set(value).size !== value.length) return null;
+  return [...value];
+}
+
 function parseCompletionOrder(value: unknown): CompletionOrderRecord | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  const keys = Object.keys(row).sort().join(",");
+  const keys = Object.keys(row).filter((key) => key !== "seal").sort().join(",");
   if (keys !== "lastSequence,legacyOperations,schemaVersion" || row.schemaVersion !== 1) return null;
   if (typeof row.lastSequence !== "number" || !Number.isSafeInteger(row.lastSequence) || row.lastSequence < 0) return null;
-  const legacy = row.legacyOperations;
-  if (!Array.isArray(legacy) || legacy.length > MAX_COMPLETION_MARKERS || !legacy.every(isBoundedIdentifier) ||
-      new Set(legacy).size !== legacy.length) return null;
-  return { schemaVersion: 1, lastSequence: row.lastSequence, legacyOperations: [...legacy] };
+  const legacy = identifierList(row.legacyOperations);
+  if (!legacy) return null;
+  const record: CompletionOrderRecord = { schemaVersion: 1, lastSequence: row.lastSequence, legacyOperations: legacy };
+  if (!("seal" in row)) return record;
+  const seal = row.seal as Record<string, unknown> | null;
+  if (!seal || typeof seal !== "object" || Array.isArray(seal) ||
+      Object.keys(seal).sort().join(",") !== "covered,keep,operationId,sequence") return null;
+  const keep = identifierList(seal.keep);
+  const covered = identifierList(seal.covered);
+  if (!isBoundedIdentifier(seal.operationId) || typeof seal.sequence !== "number" || !Number.isSafeInteger(seal.sequence) ||
+      seal.sequence < 0 || seal.sequence > row.lastSequence || !keep || !covered || keep.length === 0 ||
+      !keep.every((id) => covered.includes(id))) return null;
+  return { ...record, seal: { operationId: seal.operationId, sequence: seal.sequence, keep, covered } };
+}
+
+/**
+ * Whether the receipts' sequences tell the same story as their versions: in
+ * sequence order each operation starts from the version the one before it
+ * left installed (its target, or its starting version when it rolled back),
+ * and the last one left the version installed now.
+ */
+function sequencesFollowVersionChain(operations: readonly LifecycleCompletedOperation[], installedVersion: string | null) {
+  const ordered = [...operations].sort((left, right) => left.sequence! - right.sequence!);
+  let installed: string | null | undefined;
+  for (const operation of ordered) {
+    if (installed !== undefined && operation.fromVersion !== installed) return false;
+    installed = operation.status === "completed" ? operation.toVersion : operation.fromVersion;
+  }
+  return installed === undefined || installed === installedVersion;
 }
 
 /** A marker that is plainly not an update or rollback (uninstall, purge, support bundle, prune). */
@@ -215,7 +275,7 @@ function isOtherOperationReceipt(value: unknown, operationId: string) {
   const row = value as Record<string, unknown>;
   return row.schemaVersion === 1 && row.operationId === operationId && row.toVersion === null &&
     row.restoredVersion === null &&
-    ["uninstall", "purge", "support_bundle", "snapshots_prune"].includes(String(row.operation));
+    ["uninstall", "purge", "support_bundle", "snapshots_prune", "snapshots_reconcile"].includes(String(row.operation));
 }
 
 /**
@@ -226,6 +286,16 @@ function isOtherOperationReceipt(value: unknown, operationId: string) {
  */
 type RemovalItem = LifecycleRemovedItem & { trashName: string; origin: "planned" | "orphan" };
 type RemovalRecord = { schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION; operationId: string; items: RemovalItem[] };
+
+class RetentionPlanChanged extends Error {
+  constructor(reason = "retention plan changed") {
+    super(`retention plan is no longer safe to apply: ${reason}`);
+    // The CLI prints thrown values directly. Keep this failure reason
+    // value-blind: it may name a managed item, but never include its path or
+    // contents even when its caller includes an Error stack.
+    this.stack = this.message;
+  }
+}
 
 const TRASH_NAME = /^(snapshot|runtime_version)\+([A-Za-z0-9][A-Za-z0-9._-]{0,95})\+[0-9a-f]{12}$/;
 
@@ -319,6 +389,15 @@ function sha256(file: string) {
   return `sha256:${createHash("sha256").update(fs.readFileSync(file)).digest("hex")}`;
 }
 
+/** Digest of a regular file (never through a symlink), or null when there is none to read. */
+function regularFileSha256(file: string) {
+  try {
+    return lstatIfPresent(file)?.isFile() ? sha256(file) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Apparent bytes of the regular files under target; never follows a symlink. */
 function treeBytes(target: string) {
   let total = 0;
@@ -339,6 +418,27 @@ function treeBytes(target: string) {
   };
   walk(target, 0);
   return total;
+}
+
+/** A path-free structural stamp used to catch a source changing after planning. */
+function treeStamp(target: string): string | null {
+  const rows: string[] = [];
+  const walk = (entry: string, relative: string, depth: number): boolean => {
+    const stat = lstatIfPresent(entry);
+    if (!stat || stat.isSymbolicLink() || depth > 32) return false;
+    if (stat.isFile()) {
+      rows.push(`f ${relative} ${stat.dev} ${stat.ino} ${stat.mode} ${stat.size} ${stat.mtimeMs}`);
+      return true;
+    }
+    if (!stat.isDirectory()) return false;
+    rows.push(`d ${relative} ${stat.dev} ${stat.ino} ${stat.mode} ${stat.mtimeMs}`);
+    for (const name of fs.readdirSync(entry).sort()) {
+      if (!walk(path.join(entry, name), path.posix.join(relative, name), depth + 1)) return false;
+    }
+    return true;
+  };
+  if (!walk(target, ".", 0)) return null;
+  return createHash("sha256").update(rows.join("\n")).digest("hex");
 }
 
 /** Makes completed renames in a directory durable before anything depends on them. */
@@ -389,6 +489,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private readonly currentPath: string;
   private readonly orderPath: string;
   private readonly removalsRoot: string;
+  private readonly unreadableRemovalsRoot: string;
   /**
    * Operation → the removal records its receipt accounts for and the items
    * that receipt must name before those records may be deleted.
@@ -441,6 +542,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     this.currentPath = path.join(this.root, "current");
     this.orderPath = path.join(this.root, "completion-order.json");
     this.removalsRoot = path.join(this.root, "removals");
+    this.unreadableRemovalsRoot = path.join(this.root, "removals-unreadable");
     if (fs.existsSync(paths.ownershipRoot) && fs.lstatSync(paths.ownershipRoot).isSymbolicLink()) {
       throw new Error("ownership root cannot be a symlink");
     }
@@ -517,19 +619,49 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   async assertFence(operationId: string) {
-    if (!this.authority) return;
+    this.assertFenceNow(operationId);
+  }
+
+  private heldLease(operationId: string) {
     const lease = this.fences.get(operationId);
     if (!lease) {
       // Invariant violation: a fenced mutating step ran without holding the
       // mutation lease. Fail closed rather than act unowned.
       throw new Error(`lifecycle fence is not held for operation ${operationId}`);
     }
-    const revalidation = lease.assertCurrent();
+    return lease;
+  }
+
+  private assertFenceNow(operationId: string) {
+    if (!this.authority) return;
+    const revalidation = this.heldLease(operationId).assertCurrent();
     if (!revalidation.ok) {
       throw new LifecycleInterruption(
         `lifecycle fence lost before a mutating step: ${revalidation.reason}`,
       );
     }
+  }
+
+  /** The operation's fence for long database steps: renewal plus a final check. */
+  private fenceGuard(operationId: string): LifecycleFenceGuard {
+    const lease = this.authority ? this.heldLease(operationId) : null;
+    const keepAliveIntervalMs = lease ? Math.max(50, Math.floor(lease.durationMs / 4)) : 60_000;
+    // Each renewal rescans the lease directory and rewrites and fsyncs the
+    // record. A step that reports progress often (the online backup, every
+    // 100 pages) renews at most twice per interval; the first call always does.
+    let renewedAt = Number.NEGATIVE_INFINITY;
+    return {
+      keepAliveIntervalMs,
+      keepAlive: () => {
+        if (!lease || Date.now() - renewedAt < keepAliveIntervalMs / 2) return;
+        const renewal = lease.renew();
+        if (!renewal.ok) {
+          throw new LifecycleInterruption(`lifecycle fence lost during a long step: ${renewal.reason}`);
+        }
+        renewedAt = Date.now();
+      },
+      assertCurrent: () => this.assertFenceNow(operationId),
+    };
   }
 
   async readJournal() {
@@ -602,6 +734,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       const outcome = await this.database.snapshot({
         source: this.paths.database,
         destination: path.join(snapshot, "database"),
+        guard: this.fenceGuard(operationId),
       });
       const database = typeof outcome === "boolean"
         ? { present: outcome, method: null, quiesced: false, cloneFallback: null }
@@ -621,6 +754,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         schemaVersion: 1,
         currentVersion: state?.version ?? null,
         currentExecutable: state?.executablePath ?? null,
+        currentExecutableSha256: state?.executablePath ? regularFileSha256(state.executablePath) : null,
         present,
         createdAt: new Date().toISOString(),
         ...(present.database
@@ -769,8 +903,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     return this.service.readiness(expectedVersion, input);
   }
 
-  async restore(snapshotId: string) {
+  async restore(snapshotId: string, operationId = snapshotId) {
     this.initialize();
+    const guard = this.fenceGuard(operationId);
     const snapshot = path.join(this.snapshotsRoot, snapshotId);
     assertNoSymlink(snapshot, this.snapshotsRoot);
     const metadataPath = path.join(snapshot, "snapshot.json");
@@ -791,20 +926,29 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       const outcome = await this.database.restore({
         source: databaseSnapshot,
         destination: this.paths.database,
+        guard,
       });
       assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
       const restoredDatabase = lstatIfPresent(this.paths.database);
       if (!restoredDatabase?.isFile()) throw new Error("restored database must be a regular file");
       record = outcome
-        ? { method: outcome.method, cloneFallback: outcome.cloneFallback, databaseBytes: outcome.databaseBytes }
+        ? {
+            method: outcome.method,
+            cloneFallback: outcome.cloneFallback,
+            databaseBytes: outcome.databaseBytes,
+            ...outcome.integrity ? { integrity: outcome.integrity } : {},
+          }
         : undefined;
     } else if (this.database.discard) {
-      await this.database.discard({ destination: this.paths.database });
+      await this.database.discard({ destination: this.paths.database, guard });
     } else {
+      guard.assertCurrent();
       fs.rmSync(this.paths.database, { force: true });
       fs.rmSync(`${this.paths.database}-wal`, { force: true });
       fs.rmSync(`${this.paths.database}-shm`, { force: true });
     }
+    // Config, runtime pointer and service follow only while the fence holds.
+    guard.assertCurrent();
     const restoreFile = (label: "config" | "service", destination: string) => {
       const source = path.join(snapshot, label);
       assertNoSymlink(source, snapshot);
@@ -906,6 +1050,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     fs.rmSync(this.trashRoot, { recursive: true, force: true });
     assertNoSymlink(this.removalsRoot, this.root);
     fs.rmSync(this.removalsRoot, { recursive: true, force: true });
+    assertNoSymlink(this.unreadableRemovalsRoot, this.root);
+    fs.rmSync(this.unreadableRemovalsRoot, { recursive: true, force: true });
     return targets;
   }
 
@@ -965,8 +1111,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private completionMarkers() {
     const operations: LifecycleCompletedOperation[] = [];
     const invalid: string[] = [];
+    const withoutSequence: string[] = [];
     const ids: string[] = [];
-    if (!lstatIfPresent(this.completedRoot)) return { operations, invalid, ids };
+    if (!lstatIfPresent(this.completedRoot)) return { operations, invalid, withoutSequence, ids };
     assertNoSymlink(this.completedRoot, this.root);
     for (const name of fs.readdirSync(this.completedRoot).sort()) {
       if (!name.endsWith(".json")) continue;
@@ -980,12 +1127,17 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         const value = JSON.parse(fs.readFileSync(path.join(this.completedRoot, name), "utf8")) as unknown;
         const operation = parseCompletionReceipt(value, id);
         if (operation) operations.push(operation);
-        else if (!isOtherOperationReceipt(value, id)) invalid.push(id);
+        else if (!isOtherOperationReceipt(value, id)) {
+          invalid.push(id);
+          // Complete but for its sequence: a command that could not read the
+          // order record wrote it (0.7.38 on a sealed host, or with the record lost).
+          if (parseCompletionReceipt(value, id, { sequenceOptional: true })) withoutSequence.push(id);
+        }
       } catch {
         invalid.push(id);
       }
     }
-    return { operations, invalid, ids };
+    return { operations, invalid, withoutSequence, ids };
   }
 
   private completionOrder(): { state: "absent" } | { state: "invalid" } | { state: "valid"; record: CompletionOrderRecord } {
@@ -1014,8 +1166,12 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         // sequenced completion, so record exactly which ones those are.
         record = { schemaVersion: 1, lastSequence: 0, legacyOperations: markers.ids.filter((id) => id !== operationId) };
       } else {
-        // A lost or damaged order record is never rebuilt from guesses.
-        return null;
+        // The order record is lost or damaged: retention stays blocked until
+        // `snapshots reconcile`, which never rebuilds it from guesses. This
+        // completion still gets a sequence above every receipt's, so its own
+        // receipt is not left unsequenced (and its snapshot unknown) for ever.
+        const fallback = Math.max(0, ...sequences) + 1;
+        return Number.isSafeInteger(fallback) ? fallback : null;
       }
       const next = Math.max(record.lastSequence, ...sequences) + 1;
       if (!Number.isSafeInteger(next)) return null;
@@ -1066,6 +1222,38 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     });
   }
 
+  /**
+   * Every fact about the completion order that retention and reconcile decide
+   * on. Proven only when the order record is readable (or sequencing has not
+   * begun), no two completions after the last reconcile share a sequence, no
+   * sequence is beyond the record, and every unsequenced receipt predates
+   * sequencing.
+   */
+  private orderEvidence() {
+    const markers = this.completionMarkers();
+    const order = this.completionOrder();
+    const record = order.state === "valid" ? order.record : null;
+    const seal = record?.seal ?? null;
+    const sequenced = markers.operations.filter((operation) => operation.sequence !== null);
+    const postSeal = seal ? sequenced.filter((operation) => operation.sequence! > seal.sequence) : sequenced;
+    const counts = new Map<number, number>();
+    for (const operation of postSeal) counts.set(operation.sequence!, (counts.get(operation.sequence!) ?? 0) + 1);
+    const duplicated = postSeal.filter((operation) => counts.get(operation.sequence!)! > 1).map((operation) => operation.id);
+    const beyondRecord = record
+      ? sequenced.filter((operation) => operation.sequence! > record.lastSequence).map((operation) => operation.id)
+      : [];
+    const predates = new Set(record?.legacyOperations ?? []);
+    // A receipt without a sequence written after sequencing began (an older
+    // collector ran an update or rollback later) has no provable place.
+    const unsequencedAfter = order.state !== "absent" || sequenced.length > 0
+      ? markers.operations.filter((operation) => operation.sequence === null && !predates.has(operation.id))
+        .map((operation) => operation.id)
+      : [];
+    const proven = order.state !== "invalid" && !(order.state === "absent" && sequenced.length > 0) &&
+      duplicated.length === 0 && beyondRecord.length === 0 && unsequencedAfter.length === 0;
+    return { markers, order, record, seal, sequenced, duplicated, beyondRecord, predates, unsequencedAfter, proven };
+  }
+
   /** Read-only view of everything retention decides over. */
   private retentionInput() {
     let blockedReason: LifecycleSnapshotInventory["blockedReason"] = null;
@@ -1073,7 +1261,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       installedVersion: null, pinnedVersions: [], journal: null, operations: [],
       order: { proven: true, legacyChain: false }, snapshots: [], versions: [],
     };
-    if (!lstatIfPresent(this.root)) return { input: empty, blockedReason, createdAt: new Map<string, string | null>() };
+    const unusable = new Map<string, string>();
+    if (!lstatIfPresent(this.root)) return { input: empty, blockedReason, createdAt: new Map<string, string | null>(), unusable };
     assertNoSymlink(this.root, this.paths.ownershipRoot);
     let installedVersion: string | null = null;
     try {
@@ -1091,6 +1280,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       blockedReason ??= "journal_unreadable";
     }
     const createdAt = new Map<string, string | null>();
+    const runtimeDigests = new Map<string, string | null>();
     const snapshots = this.childDirectories(this.snapshotsRoot).map((id) => {
       const directory = path.join(this.snapshotsRoot, id);
       const metadata = this.readSnapshotMetadata(directory);
@@ -1098,12 +1288,15 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         ? Date.parse(metadata.createdAt)
         : (lstatIfPresent(path.join(directory, "snapshot.json")) ?? fs.lstatSync(directory)).mtimeMs;
       createdAt.set(id, new Date(createdAtMs).toISOString());
+      const reason = metadata ? this.unrestorableReason(directory, metadata, runtimeDigests) : null;
+      if (reason) unusable.set(id, reason);
       return {
         id,
         bytes: treeBytes(directory),
         metadataValid: metadata !== null,
         restoresVersion: metadata?.currentVersion ?? null,
         method: metadata ? snapshotRecordFrom(metadata, 0).method : null,
+        restorable: reason === null,
       };
     });
     const versions = this.childDirectories(this.versionsRoot).map((version) => ({
@@ -1113,18 +1306,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
 
     // Completion order: durable sequences, checked against the order record.
     // Missing, duplicated or contradictory order evidence keeps everything.
-    const markers = this.completionMarkers();
-    const order = this.completionOrder();
-    const sequences = markers.operations.flatMap((operation) => operation.sequence === null ? [] : [operation.sequence]);
-    const predates = new Set(order.state === "valid" ? order.record.legacyOperations : []);
-    let proven = new Set(sequences).size === sequences.length;
-    if (order.state === "invalid" || (order.state === "absent" && sequences.length > 0)) proven = false;
-    if (order.state === "valid") {
-      if (sequences.some((sequence) => sequence > order.record.lastSequence)) proven = false;
-      // A pre-sequencing receipt that appeared after sequencing began (an
-      // older collector ran an update later) has no provable place.
-      if (markers.operations.some((operation) => operation.sequence === null && !predates.has(operation.id))) proven = false;
-    }
+    const { markers, proven, predates, seal } = this.orderEvidence();
     const known = new Set(markers.operations.map((operation) => operation.id));
     const markerIds = new Set(markers.ids);
     const legacyChain = markers.invalid.length === 0 &&
@@ -1139,11 +1321,52 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     return {
       input: {
         installedVersion, pinnedVersions: this.pinnedVersions(), journal, operations,
-        order: { proven, legacyChain }, snapshots, versions,
+        receiptsWithoutSequence: markers.withoutSequence,
+        order: { proven, legacyChain, seal }, snapshots, versions,
       },
       blockedReason,
       createdAt,
+      unusable,
     };
+  }
+
+  /**
+   * Why a snapshot could not actually be restored, or null when it can: its
+   * own files are present (the database copy at its recorded size), and the
+   * runtime it restores is still a regular file under versions/ that matches
+   * the digest the snapshot recorded (snapshots taken before 0.7.40 recorded
+   * none, so only its presence is checked). Read only; each runtime is hashed
+   * once per call.
+   */
+  private unrestorableReason(directory: string, metadata: SnapshotMetadata, runtimeDigests: Map<string, string | null>): string | null {
+    const regularFile = (file: string) => {
+      const stat = lstatIfPresent(file);
+      return stat?.isFile() ? stat : null;
+    };
+    for (const label of ["config", "service"] as const) {
+      if (metadata.present[label] && !regularFile(path.join(directory, label))) return `its ${label} copy is missing`;
+    }
+    if (metadata.present.database) {
+      const database = regularFile(path.join(directory, "database"));
+      if (!database) return "its database copy is missing";
+      if (metadata.database && database.size !== metadata.database.bytes) {
+        return `its database copy is ${database.size} bytes, but ${metadata.database.bytes} were recorded`;
+      }
+    }
+    if (!metadata.currentVersion || !metadata.currentExecutable) return null;
+    const executable = metadata.currentExecutable;
+    try {
+      assertAbsoluteOwnedPath(executable, this.versionsRoot, "snapshot runtime");
+      assertNoSymlink(executable, this.versionsRoot);
+    } catch {
+      return `runtime ${metadata.currentVersion} is not a lifecycle runtime`;
+    }
+    if (!regularFile(executable)) return `runtime ${metadata.currentVersion} executable is missing`;
+    const recorded = metadata.currentExecutableSha256;
+    if (recorded === undefined || recorded === null) return null;
+    if (!runtimeDigests.has(executable)) runtimeDigests.set(executable, regularFileSha256(executable));
+    return runtimeDigests.get(executable) === recorded ? null
+      : `runtime ${metadata.currentVersion} executable no longer matches the digest the snapshot recorded`;
   }
 
   /** Entries an earlier removal renamed into the trash but had not deleted yet. */
@@ -1207,7 +1430,13 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private async deleteTrashEntry(operationId: string, trashName: string) {
     await this.assertFence(operationId);
     assertNoSymlink(this.trashRoot, this.root);
-    fs.rmSync(path.join(this.trashRoot, trashName), { recursive: true, force: true });
+    try {
+      fs.rmSync(path.join(this.trashRoot, trashName), { recursive: true, force: true });
+    } catch {
+      const error = new Error("retention trash delete failed");
+      error.stack = error.message;
+      throw error;
+    }
   }
 
   async inspectSnapshots(input: { keep: number }): Promise<LifecycleSnapshotInventory> {
@@ -1253,6 +1482,122 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   /**
+   * Re-read all retention inputs immediately before a destructive step. The
+   * mutation lease protects cooperating lifecycle commands, while this check
+   * protects the retention plan from an uncooperating watcher changing a
+   * snapshot or its rollback runtime after the removal record is written.
+   */
+  private assertRetentionPlanStillSafe(
+    initial: LifecycleRetentionInput,
+    initialPlan: LifecycleRetentionPlan,
+    keep: number,
+    planned: readonly RemovalItem[],
+    moved: ReadonlySet<string>,
+    initialStamps: ReadonlyMap<string, string | null>,
+  ) {
+    try {
+      const fail = (reason: string): never => {
+        throw new RetentionPlanChanged(reason);
+      };
+      const currentResult = this.retentionInput();
+      if (currentResult.blockedReason) fail(`blocked:${currentResult.blockedReason}`);
+      const current = currentResult.input;
+      const basis = (value: LifecycleRetentionInput) => JSON.stringify({
+        installedVersion: value.installedVersion,
+        pinnedVersions: value.pinnedVersions,
+        journal: value.journal,
+        operations: value.operations,
+        receiptsWithoutSequence: value.receiptsWithoutSequence ?? [],
+        // `legacyChain` is derived from the visible snapshot set. A planned
+        // rename removes that row from the set, so its value can change as a
+        // result of this operation without any outside mutation. The durable
+        // order and seal are still compared above; marker and row changes are
+        // checked independently below.
+        order: { proven: value.order.proven, seal: value.order.seal ?? null },
+      });
+      if (basis(initial) !== basis(current)) fail("basis");
+
+      const initialSnapshots = new Map(initial.snapshots.map((row) => [`snapshot:${row.id}`, row] as const));
+      const currentSnapshots = new Map(current.snapshots.map((row) => [`snapshot:${row.id}`, row] as const));
+      const initialVersions = new Map(initial.versions.map((row) => [`runtime_version:${row.version}`, row] as const));
+      const currentVersions = new Map(current.versions.map((row) => [`runtime_version:${row.version}`, row] as const));
+      type RetentionRow = {
+        bytes: number;
+        metadataValid?: boolean;
+        restoresVersion?: string | null;
+        method?: LifecycleSnapshotMethod | null;
+        restorable?: boolean;
+      };
+      const initialRows = new Map<string, RetentionRow>();
+      const currentRows = new Map<string, RetentionRow>();
+      initialSnapshots.forEach((row, rowKey) => initialRows.set(rowKey, row));
+      initialVersions.forEach((row, rowKey) => initialRows.set(rowKey, row));
+      currentSnapshots.forEach((row, rowKey) => currentRows.set(rowKey, row));
+      currentVersions.forEach((row, rowKey) => currentRows.set(rowKey, row));
+      const key = (item: LifecycleRemovedItem) => `${item.kind}:${item.name}`;
+      const movedKeys = new Set(moved);
+      const plannedKeys = new Set(planned.map(key));
+      const rowSignature = (row: RetentionRow) => {
+        if ("metadataValid" in row) {
+          return JSON.stringify([
+            row.bytes, row.metadataValid, row.restoresVersion, row.method, row.restorable === false ? false : true,
+          ]);
+        }
+        return JSON.stringify([row.bytes]);
+      };
+      for (const [rowKey, before] of initialRows) {
+        const after = currentRows.get(rowKey);
+        if (movedKeys.has(rowKey)) {
+          const item = planned.find((candidate) => key(candidate) === rowKey);
+          if (!item) {
+            fail(`moved:${rowKey}`);
+          }
+          continue;
+        }
+        if (plannedKeys.has(rowKey) && initialStamps.get(rowKey) === null) fail(`unstampable:${rowKey}`);
+        if (!after || rowSignature(before) !== rowSignature(after) ||
+            (plannedKeys.has(rowKey) && treeStamp(this.removalSource({ kind: rowKey.startsWith("snapshot:") ? "snapshot" : "runtime_version", name: rowKey.slice(rowKey.indexOf(":") + 1), bytes: 0 })) !== initialStamps.get(rowKey))) {
+          fail(`row:${rowKey}`);
+        }
+      }
+      for (const rowKey of currentRows.keys()) {
+        if (!initialRows.has(rowKey) && !movedKeys.has(rowKey)) fail(`new-row:${rowKey}`);
+      }
+
+      const initialDecisions = new Map([
+        ...initialPlan.snapshots.map((row) => [`snapshot:${row.id}`, row.keep] as const),
+        ...initialPlan.versions.map((row) => [`runtime_version:${row.version}`, row.keep] as const),
+      ]);
+      const currentPlan = planLifecycleRetention(current, keep);
+      const currentDecisions = new Map([
+        ...currentPlan.snapshots.map((row) => [`snapshot:${row.id}`, row.keep] as const),
+        ...currentPlan.versions.map((row) => [`runtime_version:${row.version}`, row.keep] as const),
+      ]);
+      for (const [rowKey, before] of initialDecisions) {
+        if (movedKeys.has(rowKey)) continue;
+        if (currentDecisions.get(rowKey) !== before) fail(`decision:${rowKey}`);
+      }
+      for (const rowKey of currentDecisions.keys()) {
+        if (!initialDecisions.has(rowKey) && !movedKeys.has(rowKey)) fail(`new-decision:${rowKey}`);
+      }
+
+      // A kept snapshot that restores an earlier runtime is the way back. It
+      // must still be present and restorable before any older item moves.
+      for (const decision of initialPlan.snapshots.filter((row) => row.keep)) {
+        const snapshot = initialSnapshots.get(`snapshot:${decision.id}`);
+        if (snapshot && snapshot.metadataValid && snapshot.restoresVersion !== initial.installedVersion &&
+            snapshot.restorable !== false) {
+          const currentSnapshot = currentSnapshots.get(`snapshot:${decision.id}`);
+          if (!currentSnapshot || currentSnapshot.restorable === false) fail(`wayback:${decision.id}`);
+        }
+      }
+    } catch (error) {
+      if (error instanceof RetentionPlanChanged) throw error;
+      throw new RetentionPlanChanged();
+    }
+  }
+
+  /**
    * Crash-safe, audited removal. Before anything moves, this operation's
    * removal record (every planned item and every unaccounted trash entry,
    * each with its trash name) is written and fsynced. Items are then renamed
@@ -1261,7 +1606,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
    * receipt names every item, so a crash or a failed receipt write at any
    * point leaves a record that the next apply finishes and reports as
    * recovered. Nothing is deleted while retention is blocked.
-   */
+  */
   async retainSnapshots(input: { operationId: string; keep: number; apply: boolean }): Promise<LifecycleRetentionRecord> {
     if (this.keepAll && input.apply) {
       // Removes and recovers nothing; the read-only preview only informs the receipt.
@@ -1299,6 +1644,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       status: LifecycleRetentionRecord["status"],
       items: LifecycleRemovedItem[],
       recovered: LifecycleRemovedItem[],
+      resultPlan: LifecycleRetentionPlan = plan,
+      restored: LifecycleRemovedItem[] = [],
     ): LifecycleRetentionRecord => ({
       keepSnapshots: input.keep,
       status,
@@ -1306,64 +1653,354 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       removed: items,
       removedBytes: items.reduce((total, item) => total + item.bytes, 0),
       recovered,
-      keptSnapshots: status === "skipped" ? [] : plan.snapshots.filter((row) => row.keep).map((row) => row.id),
-      keptVersions: status === "skipped" ? [] : plan.versions.filter((row) => row.keep).map((row) => row.version),
+      ...(restored.length > 0 ? { restored } : {}),
+      keptSnapshots: status === "skipped" ? [] : resultPlan.snapshots.filter((row) => row.keep).map((row) => row.id),
+      keptVersions: status === "skipped" ? [] : resultPlan.versions.filter((row) => row.keep).map((row) => row.version),
     });
     if (blockedReason) return record("skipped", [], []);
     if (!input.apply) return record("preview", removed, []);
+    await this.assertFence(input.operationId);
+    this.removeStaleTemporaries();
 
-    // Finish what earlier operations recorded but no receipt accounts for.
-    const recovered: LifecycleRemovedItem[] = [];
-    const committed: string[] = [];
-    const earlier = this.removalRecords().records;
-    for (const pending of earlier) {
-      const alreadyRecorded = this.receiptNames(pending.operationId, pending.items);
-      for (const item of pending.items) {
-        if (lstatIfPresent(path.join(this.trashRoot, item.trashName))) {
-          await this.deleteTrashEntry(input.operationId, item.trashName);
-        } else if (lstatIfPresent(this.removalSource(item))) {
-          continue; // never moved: nothing was removed, and retention decides it afresh
-        }
-        if (!alreadyRecorded) recovered.push({ kind: item.kind, name: item.name, bytes: item.bytes });
-      }
-      committed.push(pending.operationId);
-    }
-    const accounted = new Set(earlier.flatMap((pending) => pending.items.map((item) => item.trashName)));
-    const orphans: RemovalItem[] = this.trashEntries().flatMap((entry) =>
-      accounted.has(entry.fileName) ? [] : [{ ...entry.item, trashName: entry.fileName, origin: "orphan" as const }]);
     const planned: RemovalItem[] = removed.map((item) => ({
       ...item,
       trashName: [item.kind, item.name, randomBytes(6).toString("hex")].join(TRASH_SEPARATOR),
       origin: "planned" as const,
     }));
-    // A retried operation (same ID) replaces its own earlier record, so that
-    // record's items are carried over until this receipt names them.
-    const carried = earlier.find((pending) => pending.operationId === input.operationId)?.items ?? [];
-    const items = [...planned, ...orphans, ...carried];
-    if (items.length > 0) {
-      await this.assertFence(input.operationId);
-      writeJsonDurable(path.join(this.removalsRoot, `${input.operationId}.json`),
-        { schemaVersion: 1, operationId: input.operationId, items } satisfies RemovalRecord, this.root);
-      committed.push(input.operationId);
+    const initialStamps = new Map<string, string | null>();
+    for (const snapshot of retention.snapshots) {
+      const stamp = treeStamp(this.removalSource({ kind: "snapshot", name: snapshot.id, bytes: snapshot.bytes }));
+      initialStamps.set(`snapshot:${snapshot.id}`, stamp);
     }
-    const report = (item: RemovalItem): LifecycleRemovedItem => ({ kind: item.kind, name: item.name, bytes: item.bytes });
-    const reportedRecovered = [...recovered, ...orphans.map(report)];
-    this.pendingCommits.set(input.operationId, { records: committed, named: [...planned.map(report), ...reportedRecovered] });
-    for (const item of planned) {
-      await this.assertFence(input.operationId);
-      const source = this.removalSource(item);
+    for (const version of retention.versions) {
+      const stamp = treeStamp(this.removalSource({ kind: "runtime_version", name: version.version, bytes: version.bytes }));
+      initialStamps.set(`runtime_version:${version.version}`, stamp);
+    }
+    const moved = new Set<string>();
+    const removalRecordPath = path.join(this.removalsRoot, `${input.operationId}.json`);
+    let carriedRecord = false;
+    let recovered: LifecycleRemovedItem[] = [];
+    const undoMoved = () => {
+      let complete = true;
+      for (const item of [...planned].reverse()) {
+        const itemKey = `${item.kind}:${item.name}`;
+        if (!moved.has(itemKey)) continue;
+        const source = this.removalSource(item);
+        const trash = path.join(this.trashRoot, item.trashName);
+        try {
+          if (lstatIfPresent(trash)) {
+            if (lstatIfPresent(source)) {
+              complete = false;
+              continue;
+            }
+            fs.renameSync(trash, source);
+          } else if (!lstatIfPresent(source)) {
+            complete = false;
+            continue;
+          }
+          moved.delete(itemKey);
+        } catch {
+          complete = false;
+        }
+      }
+      if (complete && moved.size === 0) {
+        if (lstatIfPresent(this.trashRoot)) fsyncDirectory(this.trashRoot);
+        if (planned.some((item) => item.kind === "snapshot") && lstatIfPresent(this.snapshotsRoot)) fsyncDirectory(this.snapshotsRoot);
+        if (planned.some((item) => item.kind === "runtime_version") && lstatIfPresent(this.versionsRoot)) fsyncDirectory(this.versionsRoot);
+      }
+      return complete && moved.size === 0;
+    };
+    const abortUnsafeRetention = (error: unknown): never => {
+      this.pendingCommits.delete(input.operationId);
+      // Put a partially moved item back before returning the refusal. This
+      // keeps the snapshot usable as a way back and leaves no false progress
+      // for a follow-up prune to delete. If undo itself fails, retain the
+      // durable record so the next prune can recover it.
+      const undone = undoMoved();
+      // If no item was moved or recovered, this operation's record must not
+      // claim work that did not happen. A carried record from an earlier
+      // same-ID attempt is retained even when this retry moved nothing.
+      if (undone && recovered.length === 0 && !carriedRecord) {
+        fs.rmSync(removalRecordPath, { force: true });
+        if (lstatIfPresent(this.removalsRoot)) fsyncDirectory(this.removalsRoot);
+      }
+      if (error instanceof RetentionPlanChanged) throw error;
+      throw error;
+    };
+
+    // Finish what earlier operations recorded but no receipt accounts for.
+    const committed: string[] = [];
+    try {
+      const earlier = this.removalRecords().records;
+      carriedRecord = earlier.some((pending) => pending.operationId === input.operationId && pending.items.length > 0);
+
+      // A crash can leave a snapshot in trash after the runtime of the newer
+      // kept snapshot disappears. In that state the trash entry may be the
+      // only usable way back. Restore the whole recorded move before any
+      // cleanup, then finish this prune with a recovery receipt. The next
+      // prune sees the restored rows and can make a fresh, safe decision.
+      const hasUsableWayBack = retention.snapshots.some((snapshot) =>
+        snapshot.metadataValid && snapshot.restoresVersion !== null &&
+        snapshot.restoresVersion !== retention.installedVersion && snapshot.restorable !== false);
+      const pendingWayBack = earlier.flatMap((pending) => pending.items)
+        .find((item) => item.kind === "snapshot" && lstatIfPresent(path.join(this.trashRoot, item.trashName)));
+      if (!hasUsableWayBack && pendingWayBack) {
+        const restored: LifecycleRemovedItem[] = [];
+        let complete = true;
+        for (const pending of earlier) {
+          for (const item of [...pending.items].reverse()) {
+            const trash = path.join(this.trashRoot, item.trashName);
+            const source = this.removalSource(item);
+            if (lstatIfPresent(trash)) {
+              await this.assertFence(input.operationId);
+              if (lstatIfPresent(source)) {
+                complete = false;
+                continue;
+              }
+              try {
+                fs.renameSync(trash, source);
+                restored.push({ kind: item.kind, name: item.name, bytes: item.bytes });
+              } catch {
+                complete = false;
+              }
+            }
+            if (lstatIfPresent(trash) || !lstatIfPresent(source)) complete = false;
+          }
+        }
+        if (!complete || restored.length === 0) {
+          throw new RetentionPlanChanged("needed_restore_incomplete");
+        }
+        if (lstatIfPresent(this.trashRoot)) fsyncDirectory(this.trashRoot);
+        if (restored.some((item) => item.kind === "snapshot") && lstatIfPresent(this.snapshotsRoot)) fsyncDirectory(this.snapshotsRoot);
+        if (restored.some((item) => item.kind === "runtime_version") && lstatIfPresent(this.versionsRoot)) fsyncDirectory(this.versionsRoot);
+        const refreshed = this.retentionInput();
+        const usableRestoredWayBack = refreshed.input.snapshots.some((snapshot) =>
+          snapshot.metadataValid && snapshot.restoresVersion !== null &&
+          snapshot.restoresVersion !== refreshed.input.installedVersion && snapshot.restorable !== false);
+        if (refreshed.blockedReason || !usableRestoredWayBack) {
+          throw new RetentionPlanChanged("needed_restore_unusable");
+        }
+        for (const pending of earlier) {
+          fs.rmSync(path.join(this.removalsRoot, `${pending.operationId}.json`), { force: true });
+        }
+        if (lstatIfPresent(this.removalsRoot)) fsyncDirectory(this.removalsRoot);
+        const refreshedPlan = planLifecycleRetention(refreshed.input, input.keep);
+        return record("applied", [], [], refreshedPlan, restored);
+      }
+      // A refused retry must leave earlier trash untouched. Validate planned
+      // removals before finishing an earlier record under the same operation ID.
+      this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+      for (const pending of earlier) {
+        const alreadyRecorded = this.receiptNames(pending.operationId, pending.items);
+        for (const item of pending.items) {
+          if (lstatIfPresent(path.join(this.trashRoot, item.trashName))) {
+            this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+            await this.deleteTrashEntry(input.operationId, item.trashName);
+          } else if (lstatIfPresent(this.removalSource(item))) {
+            continue; // never moved: nothing was removed, and retention decides it afresh
+          }
+          if (!alreadyRecorded) recovered.push({ kind: item.kind, name: item.name, bytes: item.bytes });
+        }
+        committed.push(pending.operationId);
+      }
+      const accounted = new Set(earlier.flatMap((pending) => pending.items.map((item) => item.trashName)));
+      const orphans: RemovalItem[] = this.trashEntries().flatMap((entry) =>
+        accounted.has(entry.fileName) ? [] : [{ ...entry.item, trashName: entry.fileName, origin: "orphan" as const }]);
+      // A retried operation (same ID) replaces its own earlier record, so that
+      // record's items are carried over until this receipt names them.
+      const carried = earlier.find((pending) => pending.operationId === input.operationId)?.items ?? [];
+      const items = [...planned, ...orphans, ...carried];
+      if (items.length > 0) {
+        await this.assertFence(input.operationId);
+        writeJsonDurable(removalRecordPath,
+          { schemaVersion: 1, operationId: input.operationId, items } satisfies RemovalRecord, this.root);
+        committed.push(input.operationId);
+      }
+      const report = (item: RemovalItem): LifecycleRemovedItem => ({ kind: item.kind, name: item.name, bytes: item.bytes });
+      const reportedRecovered = [...recovered, ...orphans.map(report)];
+      this.pendingCommits.set(input.operationId, { records: committed, named: [...planned.map(report), ...reportedRecovered] });
+      for (const item of planned) {
+        await this.assertFence(input.operationId);
+        this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+        const source = this.removalSource(item);
+        assertNoSymlink(source, this.root);
+        if (!fs.lstatSync(source).isDirectory()) throw new RetentionPlanChanged();
+        ensureDirectory(this.trashRoot, this.root);
+        try {
+          fs.renameSync(source, path.join(this.trashRoot, item.trashName));
+        } catch {
+          throw new RetentionPlanChanged();
+        }
+        moved.add(`${item.kind}:${item.name}`);
+      }
+      if (planned.length > 0) {
+        fsyncDirectory(this.trashRoot);
+        if (planned.some((item) => item.kind === "snapshot")) fsyncDirectory(this.snapshotsRoot);
+        if (planned.some((item) => item.kind === "runtime_version")) fsyncDirectory(this.versionsRoot);
+      }
+      for (const item of items) {
+        this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+        await this.deleteTrashEntry(input.operationId, item.trashName);
+      }
+      return record("applied", planned.map(report), reportedRecovered);
+    } catch (error) {
+      if (error instanceof RetentionPlanChanged) return abortUnsafeRetention(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Temporaries a crash can leave behind: an intent or order record written
+   * but never renamed into place. Nothing ever read them, so they are
+   * removed without a record.
+   */
+  private staleTemporaries() {
+    const found: string[] = [];
+    if (lstatIfPresent(this.removalsRoot)?.isDirectory()) {
+      assertNoSymlink(this.removalsRoot, this.root);
+      for (const name of fs.readdirSync(this.removalsRoot)) {
+        if (name.endsWith(".json.tmp")) found.push(path.join(this.removalsRoot, name));
+      }
+    }
+    if (lstatIfPresent(`${this.orderPath}.tmp`)) found.push(`${this.orderPath}.tmp`);
+    return found.filter((file) => lstatIfPresent(file)?.isFile());
+  }
+
+  private removeStaleTemporaries() {
+    for (const file of this.staleTemporaries()) {
+      assertNoSymlink(file, this.root);
+      fs.rmSync(file, { force: true });
+    }
+  }
+
+  async reconcileRetention(input: { operationId: string; keep: readonly string[] | null; apply: boolean; force?: boolean }): Promise<LifecycleReconcileRecord> {
+    if (!lstatIfPresent(this.root)) throw new Error("there is no lifecycle directory to reconcile");
+    if (await this.readJournal()) throw new Error("lifecycle recovery is required before reconcile");
+    const { input: retention, blockedReason, createdAt, unusable } = this.retentionInput();
+    const evidence = this.orderEvidence();
+    const removals = this.removalRecords();
+    const snapshotIds = retention.snapshots.map((snapshot) => snapshot.id);
+    const known = new Set(evidence.markers.operations.map((operation) => operation.id));
+    const snapshotsWithoutReceipt = snapshotIds.filter((id) => !known.has(id));
+    const withoutSequence = new Set(evidence.markers.withoutSequence);
+    const temporaries = this.staleTemporaries();
+    const quarantined = removals.invalid.map((name) => {
+      const file = path.join(this.removalsRoot, name);
+      // Never follows a link or reads a directory: those are only moved aside.
+      if (!lstatIfPresent(file)?.isFile()) return { name, bytes: 0, sha256: "not_a_regular_file" };
+      const bytes = fs.readFileSync(file);
+      return { name, bytes: bytes.length, sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}` };
+    });
+    // Provable: the order record is lost or damaged, but every receipt is
+    // readable and sequenced, no two share a sequence, every snapshot has
+    // one, and the sequences agree with the version chain. The receipts' own
+    // sequences are then the whole order.
+    const rebuildable = evidence.order.state !== "valid" && evidence.markers.invalid.length === 0 &&
+      evidence.markers.operations.every((operation) => operation.sequence !== null) &&
+      evidence.duplicated.length === 0 && snapshotsWithoutReceipt.length === 0 &&
+      sequencesFollowVersionChain(evidence.markers.operations, retention.installedVersion);
+    // Without a keep-set: nothing, a rebuild, or only the operator can decide:
+    // the order cannot be proved, or retention keeps a snapshot it cannot
+    // order or whose receipt it cannot read, which would otherwise stay for ever.
+    const undecided = planLifecycleRetention(retention, LIFECYCLE_RETAINED_SNAPSHOTS).snapshots
+      .filter((row) => row.reason === "operation_unknown" || row.reason === "receipt_without_sequence" ||
+        row.reason === "completion_order_unproven")
+      .map((row) => row.id);
+    const neededRepair: LifecycleReconcileRecord["neededRepair"] = !evidence.proven ? (rebuildable ? "rebuilt" : "needs_keep")
+      : undecided.length > 0 ? "needs_keep"
+      : "none";
+    const repair: LifecycleReconcileRecord["repair"] = input.keep ? "sealed" : neededRepair;
+    const keep = [...input.keep ?? []];
+    const missing = keep.filter((id) => !snapshotIds.includes(id));
+    if (missing.length > 0) throw new Error(`--keep-snapshots names snapshots that do not exist: ${missing.join(", ")}`);
+    // A way back restores an earlier version and actually can: the first
+    // install's snapshot restores none, and one whose own files or runtime are
+    // gone cannot. A seal never releases every usable way back, even forced.
+    const candidates = retention.snapshots.filter((snapshot) => snapshot.metadataValid && snapshot.restoresVersion !== null &&
+      snapshot.restoresVersion !== retention.installedVersion);
+    const unusableWaysBack = candidates.flatMap((snapshot) => unusable.has(snapshot.id)
+      ? [{ id: snapshot.id, restoresVersion: snapshot.restoresVersion!, reason: unusable.get(snapshot.id)! }] : []);
+    const waysBack = candidates.filter((snapshot) => !unusable.has(snapshot.id)).map((snapshot) => snapshot.id);
+    if (input.keep && waysBack.length > 0 && !keep.some((id) => waysBack.includes(id))) {
+      const keptButUnusable = unusableWaysBack.filter((row) => keep.includes(row.id))
+        .map((row) => `${row.id} cannot restore ${row.restoresVersion}: ${row.reason}`);
+      throw new Error("--keep-snapshots must keep a way back to an earlier version, a snapshot that can actually restore: " +
+        `name at least one of ${waysBack.join(", ")}${keptButUnusable.length > 0 ? ` (${keptButUnusable.join("; ")})` : ""}`);
+    }
+    const newestWayBack = [...waysBack].sort((left, right) =>
+      (createdAt.get(right) ?? "").localeCompare(createdAt.get(left) ?? ""))[0] ?? null;
+    const newestWayBackReleased = input.keep !== null && newestWayBack !== null && !keep.includes(newestWayBack);
+    const sequence = Math.max(evidence.record?.lastSequence ?? 0, ...evidence.sequenced.map((operation) => operation.sequence!));
+    const record: LifecycleReconcileRecord = {
+      status: input.apply ? "applied" : "preview",
+      blockedBefore: blockedReason,
+      findings: {
+        orderRecord: evidence.order.state,
+        duplicateSequences: evidence.duplicated,
+        sequencesBeyondRecord: evidence.beyondRecord,
+        unsequencedAfterSequencing: evidence.unsequencedAfter,
+        unreadableReceipts: evidence.markers.invalid.filter((id) => !withoutSequence.has(id)),
+        receiptsWithoutSequence: [...withoutSequence],
+        snapshotsWithoutReceipt,
+        undecidedSnapshots: undecided,
+        unreadableRemovalRecords: removals.invalid,
+        staleTemporaries: temporaries.length,
+      },
+      repair,
+      neededRepair,
+      forced: input.keep !== null && input.force === true && (neededRepair !== "needs_keep" || newestWayBackReleased),
+      keep,
+      released: repair === "sealed" ? snapshotIds.filter((id) => !keep.includes(id)) : [],
+      newestWayBack,
+      newestWayBackReleased,
+      unusableWaysBack,
+      quarantined,
+      lastSequence: repair === "none" ? evidence.record?.lastSequence ?? null : sequence,
+    };
+    if (!input.apply) return record;
+    if (repair === "needs_keep") {
+      throw new Error("these snapshots cannot be ordered from provable facts: review `plimsoll lifecycle snapshots " +
+        "reconcile` and name the snapshots to keep with --keep-snapshots ID[,ID...]");
+    }
+    if (repair === "sealed" && !input.force) {
+      if (neededRepair !== "needs_keep") {
+        throw new Error(neededRepair === "none"
+          ? "nothing needs a keep-set: the completion order is proven and every snapshot has a readable receipt " +
+            "(use `snapshots prune`, or pass --force to seal anyway)"
+          : "nothing needs a keep-set: the completion order can be rebuilt from the receipts " +
+            "(run `snapshots reconcile --apply` without --keep-snapshots, or pass --force to seal anyway)");
+      }
+      if (newestWayBackReleased) {
+        throw new Error(`--keep-snapshots would release ${newestWayBack}, the newest snapshot that restores an earlier ` +
+          "version: add it to the keep-set, or pass --force");
+      }
+    }
+    await this.assertFence(input.operationId);
+    for (const { name } of quarantined) {
+      ensureDirectory(this.unreadableRemovalsRoot, this.root);
+      const source = path.join(this.removalsRoot, name);
       assertNoSymlink(source, this.root);
-      if (!fs.lstatSync(source).isDirectory()) throw new Error("retention target must be a directory");
-      ensureDirectory(this.trashRoot, this.root);
-      fs.renameSync(source, path.join(this.trashRoot, item.trashName));
+      fs.renameSync(source, path.join(this.unreadableRemovalsRoot, `${name}.${randomBytes(6).toString("hex")}`));
     }
-    if (planned.length > 0) {
-      fsyncDirectory(this.trashRoot);
-      if (planned.some((item) => item.kind === "snapshot")) fsyncDirectory(this.snapshotsRoot);
-      if (planned.some((item) => item.kind === "runtime_version")) fsyncDirectory(this.versionsRoot);
+    if (quarantined.length > 0) {
+      fsyncDirectory(this.unreadableRemovalsRoot);
+      fsyncDirectory(this.removalsRoot);
     }
-    for (const item of items) await this.deleteTrashEntry(input.operationId, item.trashName);
-    return record("applied", planned.map(report), reportedRecovered);
+    this.removeStaleTemporaries();
+    if (repair === "rebuilt") {
+      await this.assertFence(input.operationId);
+      writeJsonDurable(this.orderPath, { schemaVersion: 1, lastSequence: sequence, legacyOperations: [] } satisfies CompletionOrderRecord, this.root);
+    } else if (repair === "sealed") {
+      // Every receipt present now predates every completion sequenced from here on.
+      await this.assertFence(input.operationId);
+      writeJsonDurable(this.orderPath, {
+        schemaVersion: 1,
+        lastSequence: sequence,
+        legacyOperations: evidence.markers.ids,
+        seal: { operationId: input.operationId, sequence, keep, covered: snapshotIds },
+      } satisfies CompletionOrderRecord, this.root);
+    }
+    return record;
   }
 
   /**

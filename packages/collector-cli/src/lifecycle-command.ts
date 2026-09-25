@@ -103,8 +103,8 @@ export async function runLifecycleCommand(input: {
 
 /**
  * Snapshot and disk commands: `update --preflight` (read-only, run before the
- * collector is stopped), `snapshots list` (read-only) and `snapshots prune`
- * (dry run unless --apply).
+ * collector is stopped), `snapshots list` (read-only), `snapshots prune` and
+ * `snapshots reconcile` (both dry runs unless --apply).
  */
 export async function runLifecycleSnapshotCommand(input: {
   argv: readonly string[];
@@ -115,7 +115,9 @@ export async function runLifecycleSnapshotCommand(input: {
   if (input.argv[0] === "update" && input.argv.includes("--preflight")) {
     return { kind: "preflight" as const, preflight: await manager.preflightUpdate(), boundary };
   }
-  if (input.argv[0] !== "snapshots") throw new Error("Expected lifecycle update --preflight or lifecycle snapshots list|prune");
+  if (input.argv[0] !== "snapshots") {
+    throw new Error("Expected lifecycle update --preflight or lifecycle snapshots list|prune|reconcile");
+  }
   const keep = keepOption(input.argv);
   if (input.argv[1] === "list") {
     return { kind: "list" as const, snapshots: await manager.listSnapshots({ ...(keep !== undefined ? { keep } : {}) }), boundary };
@@ -129,7 +131,18 @@ export async function runLifecycleSnapshotCommand(input: {
     });
     return { kind: "prune" as const, ...result, boundary };
   }
-  throw new Error("Expected lifecycle snapshots list|prune");
+  if (input.argv[1] === "reconcile") {
+    const keepSnapshots = option(input.argv, "--keep-snapshots");
+    const result = await manager.reconcileSnapshots({
+      operationId: option(input.argv, "--operation-id") ??
+        `snapshots-reconcile-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
+      ...(keepSnapshots !== undefined ? { keep: keepSnapshots.split(",").map((id) => id.trim()).filter(Boolean) } : {}),
+      apply: input.argv.includes("--apply"),
+      force: input.argv.includes("--force"),
+    });
+    return { kind: "reconcile" as const, ...result, boundary };
+  }
+  throw new Error("Expected lifecycle snapshots list|prune|reconcile");
 }
 
 function formatBytes(bytes: number) {
@@ -174,9 +187,21 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
       "the next prune --apply or completed update finishes it.");
   }
   lines.push("");
-  if (inventory.blockedReason === "completion_order_unproven") {
-    lines.push("Retention is blocked (completion_order_unproven): the order in which these operations completed " +
-      "cannot be proved, so nothing will be removed.");
+  const unknown = inventory.snapshots.filter((row) => row.reason === "operation_unknown" || row.reason === "receipt_without_sequence");
+  if (unknown.length > 0) {
+    const unsequenced = unknown.filter((row) => row.reason === "receipt_without_sequence").length;
+    lines.push(`${unknown.length} snapshot(s) are kept because their operation cannot be read or ordered` +
+      (unsequenced > 0
+        ? ` (${unsequenced} recorded without a completion sequence by a lifecycle command older than 0.7.40 that could not read this host's order record)`
+        : "") +
+      ". `plimsoll lifecycle snapshots reconcile` shows them and how to decide them with --keep-snapshots.");
+  }
+  if (inventory.blockedReason === "completion_order_unproven" || inventory.blockedReason === "removal_record_unreadable") {
+    lines.push(`Retention is blocked (${inventory.blockedReason}): ` +
+      (inventory.blockedReason === "completion_order_unproven"
+        ? "the order in which these operations completed cannot be proved"
+        : "a removal record cannot be read") +
+      ", so nothing will be removed. `plimsoll lifecycle snapshots reconcile` shows why and how to repair it.");
   } else if (inventory.blockedReason) {
     lines.push(`Retention is blocked (${inventory.blockedReason}); nothing will be removed until lifecycle recovery.`);
   } else {
