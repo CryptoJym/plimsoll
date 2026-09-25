@@ -41,6 +41,10 @@ async function main() {
     ensureBudgetSchema(db);
     db.prepare("insert into buffered_events values (?, ?)").run("second", "2026-09-25T13:10:00.000Z");
     assert.equal((db.prepare("select attempted_rows as n from budget_daily where day='2026-09-25'").get() as {n:number}).n, 1);
+    assert.equal(await recordDailyTableSizes(db, file, "2026-09-25"), "measured");
+    const pages = JSON.parse((db.prepare("select table_pages_json as pages from budget_daily where day='2026-09-25'").get() as {pages:string}).pages) as Record<string,number>;
+    const actualPages = (db.prepare("select count(*) as n from dbstat s join sqlite_master m on m.name=s.name where m.tbl_name='buffered_events'").get() as {n:number}).n;
+    assert.equal(pages.buffered_events, actualPages);
 
     const child = spawn(process.execPath, ["-e", "const a=Buffer.alloc(16*1024*1024);let n=0;while(n<2e8){n++}setTimeout(()=>process.exit(0),5000)", "__maintenance_worker"], { stdio: "ignore" });
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -67,6 +71,7 @@ async function main() {
       recordBudgetSample(db, { ...first, atMs: first.atMs + i * 60_000, dbBytes: i });
     }
     assert.equal((db.prepare("select count(*) as n from budget_samples").get() as {n:number}).n, BUDGET_RING_LIMIT);
+    assert.ok((db.prepare("select count(*) as n from budget_daily").get() as {n:number}).n <= 8);
     const status = budgetStatus(db, Date.parse("2026-10-02T13:30:00.000Z"));
     assert.equal(status.mode, "advisory");
     assert.equal(status.latest?.dbBytes, 9999);

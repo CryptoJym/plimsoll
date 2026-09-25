@@ -40,7 +40,7 @@ export type BudgetSample = {
   unavailable: string[];
 };
 
-type DailyRow = { day: string; attemptedRows: number; dbstatStatus: string; tablePagesJson: string | null };
+type DailyRow = { day: string; version: number; attemptedRows: number; dbstatStatus: string; tablePagesJson: string | null };
 
 /** Additive, constant-size schema. The trigger counts committed raw admissions, including child writers. */
 export function ensureBudgetSchema(db: Database.Database): void {
@@ -50,7 +50,7 @@ export function ensureBudgetSchema(db: Database.Database): void {
       sample_json text not null
     );
     create table if not exists budget_daily (
-      day text primary key, attempted_rows integer not null default 0,
+      day text primary key, version integer not null default 1, attempted_rows integer not null default 0,
       dbstat_status text not null default 'pending', table_pages_json text
     ) without rowid;
     create trigger if not exists trg_budget_attempted_insert
@@ -198,7 +198,7 @@ export function recordBudgetSample(db: Database.Database, sample: BudgetSample):
     db.prepare(`delete from budget_samples where id <= ? or at_ms < ?`)
       .run(Number(inserted.lastInsertRowid) - BUDGET_RING_LIMIT, sample.atMs - DAY_MS);
     db.prepare(`delete from budget_daily where day < ?`).run(
-      new Date(sample.atMs - 8 * DAY_MS).toISOString().slice(0, 10),
+      new Date(sample.atMs - 7 * DAY_MS).toISOString().slice(0, 10),
     );
   })();
 }
@@ -304,7 +304,7 @@ export async function recordDailyTableSizes(db: Database.Database, ledgerPath: s
 
 export function budgetDailyRows(db: Database.Database): DailyRow[] {
   if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_daily'`).get()) return [];
-  return db.prepare(`select day, attempted_rows as attemptedRows, dbstat_status as dbstatStatus,
+  return db.prepare(`select day, version, attempted_rows as attemptedRows, dbstat_status as dbstatStatus,
     table_pages_json as tablePagesJson from budget_daily order by day`).all() as DailyRow[];
 }
 
