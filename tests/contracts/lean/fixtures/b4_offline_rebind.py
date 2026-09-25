@@ -40,12 +40,16 @@ Round 9 rule (B0 round 3, review-r2 blockers 1-2 and should-fixes 1, 4; CONTRACT
       in-flight request or from a process that loaded its config before the re-join (cli.ts:2479), is ignored and counted and
       never replaces the pair (round 8 said "a response from a different install replaces it": review-r2 R4, 3 of 3 rows
       exported as the old install's person).
+  (e) A sighting that may record a fact reads `device_installs.binding_version` with the install row locked FOR SHARE (the
+      rebind's UPDATE takes the row lock and waits), then inserts the fact ON CONFLICT DO NOTHING and re-reads it, so a rebind
+      can never commit between the read and the fact (review-r2 R5: 1 of 12 READ COMMITTED interleavings flipped a pair).
   (g) `heard_at` exists only for an issued version (it lives on the audit row); a never-issued echo's instant is the fact's
       `first_seen_at`.
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
 ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (this rule). Red under r6, r7 and r8,
 green under r9.
 """
+import itertools
 import json
 from _common import Checks, rule_arg
 
@@ -301,5 +305,36 @@ print("    L (re-join, the old install's late answer): " + json.dumps({"straggle
 c.expect(straggler == "ignored" and col.ignored == 1, "L: after the re-join a response from the OLD install X is ignored and counted, never accepted (round 8 replaced the pair with (X, 2))", f"straggler={straggler} ignored={col.ignored}")
 c.expect(all(r["delivered"][0] == r["undelivered"][0] == r["truth"] for r in L_rows), "L: rows captured under Z's actor D after the late answer are D's on both paths (round 8 exported all three as C's, the wrong person)", json.dumps(L_rows))
 c.expect(col.pair == ("Z", 0) and col.echo() == 0, "L: the persisted pair stays (Z, 0) and the echo is the CURRENT install's version 0, not the old install's 2", f"pair={col.pair} echo={col.echo()}")
+
+# ---- 8. blocker 2 (review r2): the first-sighting fact must be serialized against the rebind that issues the version ---------------
+# T1: a faulty row stamped (X, 2) is judged: reads binding_version (1), writes the fact, commits. T2: the admin rebind that issues
+# v2 and commits. T3: another row stamped (X, 2), judged in one step. Round 8 (READ COMMITTED, no lock): T1 decides from what it
+# read. Round 9: T1 reads the install row FOR SHARE, so T2's UPDATE waits until T1 commits; an order that puts T2.commit between
+# T1.read and T1.commit is re-serialized with T2.commit after T1.commit (the lock is what the database does).
+def run_schedule(order):
+    order = list(order)
+    serialized = False
+    if R9 and order.index("T1.read") < order.index("T2.commit") < order.index("T1.commit"):
+        order.remove("T2.commit"); order.insert(order.index("T1.commit") + 1, "T2.commit"); serialized = True
+    committed, t1_seen, answers = {"bv": 1, "fact": False}, None, {}
+    for step in order:
+        if step == "T1.read": t1_seen = dict(committed)
+        elif step == "T1.commit":
+            if t1_seen["fact"]: answers["T1"] = None
+            elif t1_seen["bv"] >= 2: answers["T1"] = "C"
+            else: committed["fact"] = True; answers["T1"] = None          # insert ... on conflict do nothing
+        elif step == "T2.commit": committed["bv"] = 2
+        elif step == "T3":
+            if committed["fact"]: answers["T3"] = None
+            elif committed["bv"] >= 2: answers["T3"] = "C"
+            else: committed["fact"] = True; answers["T3"] = None
+    answers["later"] = None if committed["fact"] else ("C" if committed["bv"] >= 2 else None)
+    return tuple(order), answers, serialized
+schedules = [run_schedule(o) for o in itertools.permutations(["T1.read", "T1.commit", "T2.commit", "T3"]) if o.index("T1.read") < o.index("T1.commit")]
+flips = [(o, a) for o, a, _ in schedules if len(set(a.values())) > 1]
+serialized = sum(1 for _, _, s in schedules if s)
+print("    R5 (sighting vs rebind): " + json.dumps({"orderings": len(schedules), "flips": [[list(o), a] for o, a in flips], "serialized_by_the_row_lock": serialized}))
+c.expect(len(schedules) == 12 and not flips, "R5: in all 12 interleavings of a faulty sighting with the rebind that issues its version, every judgment of (X, 2) agrees (round 8 flipped in 1 of 12: T3 exported C, then T1 recorded the fact)", json.dumps([[list(o), a] for o, a in flips]))
+c.expect(serialized == 4, "R5: the FOR SHARE read makes the rebind wait in exactly the 4 orderings where it would otherwise commit between the sighting's read and its fact", f"serialized={serialized}")
 
 c.finish()

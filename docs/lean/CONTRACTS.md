@@ -54,7 +54,9 @@ install the pair names, never against the uploading install:
 **The guarantee (what `fixtures/b4_offline_rebind.py` and the tests prove).**
 1. **Fixed at the first sighting.** For every install and every `V`, the answer for `(install, V)` is decided the first time the
    cloud sees the pair and is never revisited: `actor_for_stamp` reads only the audit table and the `stamp_not_issued` facts, an
-   audit row created after the fact does not revive it, and no fact can be created once the audit row exists. Every judgment is a
+   audit row created after the fact does not revive it, and no fact can be created once the audit row exists **because the sighting
+   is serialized against the rebind** (below, round 9): a rebind cannot commit between a sighting's read of `binding_version` and
+   its fact. Every judgment is a
    sighting, so every judgment of a row stamped `(install, V)` (ingest, a dead delivery's replay, any summary revision, either
    path) returns the same actor or the same null. The fixture probes every sighted pair at every instant from its first sighting
    to the end of the timeline and finds one answer each (round 7 flipped for `(W, 2)` and `(Zf, 2)`).
@@ -75,10 +77,23 @@ install the pair names, never against the uploading install:
    row and `unallocated_no_stamp` once it has one, so a part sealed before the install's first rebind and a part sealed after it
    differ, and that is disclosed (review r2 R9).
 
-**Sightings and the durable fact.** `device_install_stamp_not_issued (tenant_id, device_install_id, version, first_seen_at,
-binding_version_then, source ∈ {echo, row, member})`, unique per `(device_install_id, version)`, written in the transaction of the
-request receipt, the ingest or the summary judgment that first saw the pair above the install's `binding_version`; never deleted
-except with the install by a tenant erasure. A refused batch (schema violation, 400) judges nothing and records nothing.
+**Sightings and the durable fact.** `device_install_stamp_not_issued (tenant_id, uploader_install_id, device_install_id, version,
+first_seen_at, binding_version_then, source ∈ {echo, row, member})`, unique per `(uploader_install_id, device_install_id, version)`,
+`device_install_id` a foreign key to `device_installs` without cascade, written in the transaction of the request receipt, the ingest
+or the summary judgment that first saw the pair above the install's `binding_version`; never deleted except by a tenant erasure
+(below). A refused batch (schema violation, 400) judges nothing and records nothing. **Serialization (round 9, review r2 R5).** A
+sighting that may record a fact reads `device_installs.binding_version` **with the install row locked `FOR SHARE`** in the
+transaction that records the fact. The rebind (`bindDeviceInstalls`, `reverseDeviceInstallBinding`) updates that row
+(`binding_version + 1`, the actor) and inserts the audit row in one transaction; its `UPDATE` takes the row's `FOR NO KEY UPDATE`
+lock, which conflicts with `FOR SHARE`, so either the rebind waits until the sighting commits (the fact then precedes the audit row
+and the pair is not issued for ever) or the sighting reads after the rebind committed and sees the issued version (no fact). An
+implementation may instead run both at `SERIALIZABLE` with retry. The fact is inserted `ON CONFLICT (uploader_install_id,
+device_install_id, version) DO NOTHING` and re-read, so two first sightings of the same pair on two paths at once (R6) leave one fact
+and both judge null; neither batch is refused. Of the 12 interleavings of a faulty sighting with the rebind that issues its version,
+0 flip under this rule and the rebind waits in 4 (`b4_offline_rebind.py` R5; round 8 flipped in 1); the same schedules were
+reproduced in a real PostgreSQL cluster in round 9 (`checks/r5-postgres-reproduction.log`: without the lock T3 exported C and T1
+then recorded the fact; with `FOR SHARE` `pg_blocking_pids` shows the rebind waiting). The durable proof is pending in the cloud:
+`actor-binding-stamp-postgres.contract.test.ts` (B6).
 
 **What the echo is for.** `actorBindingVersionHeard` on every request, **upload deliveries included**, is the collector's
 `max(persisted version of the current install, highest stamp carried for the current install)`. It is a diagnostic and a sighting,
@@ -109,7 +124,8 @@ is round 8 as written: the late answer replaces the pair, no lock, the fact keye
 
 **Judgment state.** Validity is decided at the first sighting of `(install, V)` and recorded; a version that did not exist then is
 invalid on both paths for ever. Parts are computed per received revision and frozen at the seal; a raw row's actor is bound once at
-ingest; because the fact precedes both, neither can differ from the other.
+ingest; because the fact precedes both, and the rebind cannot slip between a sighting's read and its fact, neither can differ from
+the other.
 
 **Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 11 cases): the reviewer's issued-but-unheard row,
 the honest orderings and the A→B→A reversal, the never-issued stamp, the first-sighting rule with the replay and the repair, the
@@ -283,6 +299,13 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 - `src/lib/ingest.ts`: `eventRowsForStorage(batch, tenantId, authorizedActorId, { uploadingInstallId, bindings })` binds the pair
   `metadata.actorBindingVersion` + `metadata.actorBindingInstall` through `actorForStamp` against `bindings[actorBindingInstall]`
   (a pair naming an install outside `bindings` fails closed); sets `metadata.actorStampInvalid`. (B6, C1)
+- `src/lib/actor-binding-stamp-store.ts` (round 9): `sightPairInTransaction(tx, { tenantId, uploaderInstallId, deviceInstallId,
+  version, source, at })` reads `device_installs.binding_version` `FOR SHARE`, judges, inserts the fact `ON CONFLICT DO NOTHING` when
+  the version is above it and re-reads → `{ issued, actorId, recorded, bindingVersionThen }`; `issueBindingVersionInTransaction(tx,
+  { tenantId, deviceInstallId, actorId, changedBy })` is the rebind's write (`binding_version + 1` on the install row, the audit row
+  carrying it) that `bindDeviceInstalls` and `reverseDeviceInstallBinding` call; `stampFactsFor(tx, { uploaderInstallId,
+  deviceInstallId })` lists the recorded versions. Proved on the repository's disposable Postgres cluster by
+  `actor-binding-stamp-postgres.contract.test.ts` (needs `PLIMSOLL_PROOF_PG_BIN` as `ci.yml`'s usage-projection step has). (B6, C1)
 - `src/lib/delivery-ack-response.ts`: `acknowledgedResponse` emits `actorBindingVersion` for a registered install
   (`CollectorUploadAuthorization` gains `actorBindingVersion: number`). (B6)
 - `src/lib/activity-summary/contract.ts`: `ACTIVITY_SUMMARY_PAYLOAD_KIND`, `isActivitySummaryPayload`, `activitySummaryBatchSchema`,
