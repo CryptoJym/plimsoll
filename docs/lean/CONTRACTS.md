@@ -290,3 +290,24 @@ that show each rule is self-consistent. Row widths in C2 remain estimates until 
 counts are measured, the other hosts' are not (Studio1's sessions were measured in round 5; its day and segment counts are the
 plan's geometry). No live collector, hosted service or production database was written to; the Studio4 ledger was copied with
 `VACUUM INTO` from a read-only connection and the copy was deleted after the census.
+
+## C8. The `<UR>` usage-record predicate pin (BEADS.md B0, MIGRATION.md S1; review-r1 should-fix 4)
+
+The predicate that decides which rows are usage records is the inline text of `plimsoll-cloud src/lib/economics/loader.ts`
+(`usageRecordPredicate`, unchanged since `067a8a4`, re-read at `4954995`):
+
+```sql
+( event_type IN ('usage_rollout','usage_transcript','usage_live')
+  OR input_tokens IS NOT NULL OR output_tokens IS NOT NULL
+  OR cache_read_tokens IS NOT NULL OR cache_creation_tokens IS NOT NULL
+  OR cost_usd IS NOT NULL )
+```
+
+It is pinned in **both** repositories as `tests/contracts/lean/fixtures/usage_record_predicate.sql` with the pin
+`USAGE_RECORD_PREDICATE_PIN` = sha256 of the text after comment lines are dropped, whitespace is collapsed (none inside the outer
+parentheses) and case is folded. Guards (green today): the fixture text hashes to the pin in both repositories; the cloud's inline
+loader text hashes to it; the collector's cardinality census (`fixtures/host_cardinality_census.py`) counts usage rows with it.
+Pending: cloud `usage-record-pin.contract.test.ts` (lane 2: `src/lib/economics/usage-record-predicate.ts` exports
+`USAGE_RECORD_PREDICATE_SQL` equal to the pin and `loader.ts` uses it; B0's successor re-pins on merge); collector
+`usage-record-pin.contract.ts` (B2a: `lean/usage-record.ts` exports `USAGE_RECORD_PREDICATE_SQL` equal to the pin and
+`isUsageRecord(row)`, the converter's rule, so the S3 fold and the cloud agree row for row).
