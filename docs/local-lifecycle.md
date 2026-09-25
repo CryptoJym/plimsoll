@@ -321,9 +321,27 @@ process stops at any point, or the receipt cannot be written, the next prune
 or completed update finishes the recorded removals and reports them under
 `retention.recovered` in its own receipt; items that never moved are decided
 again.
-If the trash holds the last usable way back, prune restores its recorded
-items and reports them under `retention.restored`. A failed or incomplete
-restore refuses prune and keeps the remaining trash and removal record.
+If a recorded removal would leave no usable way back, prune attempts to
+restore its items and reports successful moves under `retention.restored`.
+A snapshot can already be back under `snapshots/` while its runtime is still
+in `trash/`. The removal record stays until the snapshot and runtime are
+both back and form a usable way back. Prune restores the remaining item or
+refuses; it does not finish deleting that record's trash.
+
+`needed_restore_incomplete` means a recorded item is missing, blocked, or
+present in both places, or no item can be moved back while no usable way
+back exists. Remove a filesystem block and retry with 0.7.41 or later.
+If the files themselves are damaged, repair the runtime or complete a new
+update that creates a usable way back. Even a record written before any
+item moved can refuse on every prune when its snapshot is unusable; nothing
+needs to be in `trash/` for this refusal. A completed update can then
+finish that record.
+
+`needed_restore_unusable` means the moved-back files did not form a valid
+rollback point. The attempted moves are returned to their recorded trash
+names; if that return is blocked, the record still protects the next retry.
+Repair the runtime or complete an update before retrying prune. Both
+refusals leave the pending record and do not write a prune receipt.
 
 **Operator commands.**
 
