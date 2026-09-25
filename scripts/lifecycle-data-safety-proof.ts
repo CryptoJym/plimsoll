@@ -1493,17 +1493,31 @@ async function r8PruneSafety() {
     const partial = first !== null && /needed_restore_incomplete/.test(first.message) &&
       fixture.snapshots().includes("a2") && exists(removalRecord) &&
       exists(path.join(trashRoot, items[1].trashName));
+    const blockedPreview = await fixture.manager().pruneSnapshots({ operationId: "r11-blocked-preview", keep: 1 });
     fs.rmSync(runtime, { recursive: true, force: true });
+    const preview = await fixture.manager().pruneSnapshots({ operationId: "r11-pending-preview", keep: 1 });
+    const listing = await fixture.manager().listSnapshots({ keep: 1 });
+    const listText = formatSnapshotInventory(listing);
     const second = await rejection(() => fixture.manager().pruneSnapshots({
       operationId: "r10-partial-restore-second", keep: 1, apply: true,
     }));
     const receipt = fixture.receipt("r10-partial-restore-second", "snapshots_prune");
     record(CASES.r10PruneSafety[0],
-      partial && second === null && receipt?.status === "completed" &&
+      partial && blockedPreview.retention.status === "skipped" &&
+        blockedPreview.retention.skippedReason === "needed_restore_incomplete" &&
+        blockedPreview.retention.removed.length === 0 &&
+        preview.retention.status === "preview" && preview.retention.removed.length === 0 &&
+        same(preview.retention.pendingRestore?.wouldRestore.map((item) => `${item.kind}:${item.name}`) ?? [],
+          ["runtime_version:34.1.0"]) &&
+        listing.pendingRestore?.refusal === null && listing.bytes.prunable === 0 &&
+        listing.snapshots.find((item) => item.id === "a2")?.reason === "pending_restore" &&
+        /Pending way-back restore/.test(listText) && !/Prunable:/.test(listText) &&
+        second === null && receipt?.status === "completed" &&
         same(receipt.retention?.restored?.map((item) => `${item.kind}:${item.name}`) ?? [], ["runtime_version:34.1.0"]) &&
         fixture.snapshots().includes("a2") && fixture.versions().includes("34.1.0") &&
         !exists(removalRecord) && listDirectory(trashRoot).length === 0,
-      { first: first?.message, partial, second: second?.message, receipt,
+      { first: first?.message, partial, blockedPreview: blockedPreview.retention, preview: preview.retention,
+        listing, listText, second: second?.message, receipt,
         snapshots: fixture.snapshots(), versions: fixture.versions(), trash: listDirectory(trashRoot), recordKept: exists(removalRecord) });
   });
 

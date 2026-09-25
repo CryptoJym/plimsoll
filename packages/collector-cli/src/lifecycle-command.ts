@@ -182,7 +182,14 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
       ...inventory.versions.map((row) => [row.version, formatBytes(row.bytes), `${row.retention} (${row.reason})`]),
     ]));
   }
-  if (inventory.pendingRemoval.length > 0) {
+  if (inventory.pendingRestore) {
+    const pending = inventory.pendingRestore;
+    const names = pending.items.filter((item) => item.kind === "snapshot").map((item) => item.name);
+    lines.push("", `Pending way-back restore for snapshot(s) ${names.slice(0, 8).join(", ")}${names.length > 8 ? ` and ${names.length - 8} more` : ""}: ` +
+      (pending.refusal
+        ? `the next prune --apply refuses (${pending.refusal}); repair the way back or complete an update with 0.7.41 or later.`
+        : `the next prune --apply attempts to restore ${pending.wouldRestore.length} recorded item(s) and refuses if they are incomplete or unusable. Use 0.7.41 or later.`));
+  } else if (inventory.pendingRemoval.length > 0) {
     lines.push("", `Interrupted removal pending: ${inventory.pendingRemoval.length} item(s), ${formatBytes(inventory.bytes.pendingRemoval)}; ` +
       "the next prune --apply or completed update finishes it.");
   }
@@ -196,7 +203,9 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
         : "") +
       ". `plimsoll lifecycle snapshots reconcile` shows them and how to decide them with --keep-snapshots.");
   }
-  if (inventory.blockedReason === "completion_order_unproven" || inventory.blockedReason === "removal_record_unreadable") {
+  if (inventory.pendingRestore) {
+    lines.push("No pending way-back item is scheduled for removal.");
+  } else if (inventory.blockedReason === "completion_order_unproven" || inventory.blockedReason === "removal_record_unreadable") {
     lines.push(`Retention is blocked (${inventory.blockedReason}): ` +
       (inventory.blockedReason === "completion_order_unproven"
         ? "the order in which these operations completed cannot be proved"

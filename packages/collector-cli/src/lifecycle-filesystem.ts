@@ -15,6 +15,7 @@ import {
   type LifecycleCloneFallback,
   type LifecycleCompletedOperation,
   type LifecycleJournal,
+  type LifecyclePendingRestore,
   type LifecycleReadiness,
   type LifecycleReceipt,
   type LifecycleReconcileRecord,
@@ -1436,6 +1437,30 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     return path.join(item.kind === "snapshot" ? this.snapshotsRoot : this.versionsRoot, item.name);
   }
 
+  /** Read-only view of the same way-back condition handled before any apply removal. */
+  private pendingWayBackRestore(retention: LifecycleRetentionInput, records: readonly RemovalRecord[]): LifecyclePendingRestore | null {
+    const hasUsableWayBack = retention.snapshots.some((snapshot) =>
+      snapshot.metadataValid && snapshot.restoresVersion !== null &&
+      snapshot.restoresVersion !== retention.installedVersion && snapshot.restorable !== false);
+    const items = records.flatMap((record) => record.items);
+    const pendingWayBack = items.some((item) => item.kind === "snapshot" &&
+      (lstatIfPresent(path.join(this.trashRoot, item.trashName)) || lstatIfPresent(this.removalSource(item))));
+    if (hasUsableWayBack || !pendingWayBack) return null;
+    let complete = true;
+    const wouldRestore: LifecycleRemovedItem[] = [];
+    for (const item of items) {
+      const inTrash = lstatIfPresent(path.join(this.trashRoot, item.trashName));
+      const atSource = lstatIfPresent(this.removalSource(item));
+      if ((inTrash && atSource) || (!inTrash && !atSource)) complete = false;
+      if (inTrash) wouldRestore.push({ kind: item.kind, name: item.name, bytes: item.bytes });
+    }
+    return {
+      items: items.map((item) => ({ kind: item.kind, name: item.name, bytes: item.bytes })),
+      wouldRestore,
+      refusal: complete && wouldRestore.length > 0 ? null : "needed_restore_incomplete",
+    };
+  }
+
   /** Deletes one trash entry (never following a link); its removal is already durably recorded. */
   private async deleteTrashEntry(operationId: string, trashName: string) {
     await this.assertFence(operationId);
@@ -1452,6 +1477,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   async inspectSnapshots(input: { keep: number }): Promise<LifecycleSnapshotInventory> {
     const { input: retention, blockedReason, createdAt } = this.retentionInput();
     const plan = planLifecycleRetention(retention, input.keep);
+    const pendingRestore = blockedReason ? null : this.pendingWayBackRestore(retention, this.removalRecords().records);
+    const pendingSnapshots = new Set(pendingRestore?.items.filter((item) => item.kind === "snapshot").map((item) => item.name));
     const byId = new Map(retention.snapshots.map((snapshot) => [snapshot.id, snapshot]));
     const snapshots = plan.snapshots.map((decision) => {
       const snapshot = byId.get(decision.id)!;
@@ -1462,16 +1489,16 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         method: snapshot.method ?? "unrecorded" as const,
         restoresVersion: snapshot.restoresVersion,
         operationState: decision.state,
-        retention: decision.keep ? "keep" as const : "prune" as const,
-        reason: decision.reason,
+        retention: decision.keep || pendingRestore ? "keep" as const : "prune" as const,
+        reason: pendingRestore && (!decision.keep || pendingSnapshots.has(decision.id)) ? "pending_restore" as const : decision.reason,
       };
     }).sort((left, right) => (right.createdAt ?? "").localeCompare(left.createdAt ?? "") || right.id.localeCompare(left.id));
     const versionBytes = new Map(retention.versions.map((version) => [version.version, version.bytes]));
     const versions = plan.versions.map((decision) => ({
       version: decision.version,
       bytes: versionBytes.get(decision.version) ?? 0,
-      retention: decision.keep ? "keep" as const : "prune" as const,
-      reason: decision.reason,
+      retention: decision.keep || pendingRestore ? "keep" as const : "prune" as const,
+      reason: pendingRestore && !decision.keep ? "pending_restore" as const : decision.reason,
     })).sort((left, right) => right.version.localeCompare(left.version, undefined, { numeric: true }));
     const pendingRemoval = this.trashEntries().map((entry) => entry.item);
     const sum = (rows: readonly { bytes: number }[]) => rows.reduce((total, row) => total + row.bytes, 0);
@@ -1482,10 +1509,11 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       snapshots,
       versions,
       pendingRemoval,
+      pendingRestore,
       bytes: {
         snapshots: sum(snapshots),
         versions: sum(versions),
-        prunable: blockedReason ? 0 : sum([...snapshots, ...versions].filter((row) => row.retention === "prune")),
+        prunable: blockedReason || pendingRestore ? 0 : sum([...snapshots, ...versions].filter((row) => row.retention === "prune")),
         pendingRemoval: sum(pendingRemoval),
       },
     };
@@ -1668,7 +1696,22 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       keptVersions: status === "skipped" ? [] : resultPlan.versions.filter((row) => row.keep).map((row) => row.version),
     });
     if (blockedReason) return record("skipped", [], []);
-    if (!input.apply) return record("preview", removed, []);
+    if (!input.apply) {
+      const pendingRestore = this.pendingWayBackRestore(retention, this.removalRecords().records);
+      if (pendingRestore) {
+        const preview = record(pendingRestore.refusal ? "skipped" : "preview", [], []);
+        return {
+          ...preview,
+          skippedReason: pendingRestore.refusal,
+          pendingRestore,
+          keptSnapshots: [...new Set([...retention.snapshots.map((item) => item.id),
+            ...pendingRestore.items.filter((item) => item.kind === "snapshot").map((item) => item.name)])],
+          keptVersions: [...new Set([...retention.versions.map((item) => item.version),
+            ...pendingRestore.items.filter((item) => item.kind === "runtime_version").map((item) => item.name)])],
+        };
+      }
+      return record("preview", removed, []);
+    }
     await this.assertFence(input.operationId);
     this.removeStaleTemporaries();
 
@@ -1748,13 +1791,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       // failed undo may already have returned its snapshot while its runtime
       // remains in trash. Keep the whole removal record pending in either
       // state until the way back is usable again.
-      const hasUsableWayBack = retention.snapshots.some((snapshot) =>
-        snapshot.metadataValid && snapshot.restoresVersion !== null &&
-        snapshot.restoresVersion !== retention.installedVersion && snapshot.restorable !== false);
-      const pendingWayBack = earlier.flatMap((pending) => pending.items)
-        .find((item) => item.kind === "snapshot" &&
-          (lstatIfPresent(path.join(this.trashRoot, item.trashName)) || lstatIfPresent(this.removalSource(item))));
-      if (!hasUsableWayBack && pendingWayBack) {
+      if (this.pendingWayBackRestore(retention, earlier)) {
         // Records written before this guard may also reach this state. Mark
         // them durably before any restore attempt so a 0.7.38-0.7.40 retry
         // refuses the unfamiliar record instead of deleting the last way back.

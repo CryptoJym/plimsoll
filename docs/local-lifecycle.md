@@ -330,7 +330,7 @@ restore refuses prune and keeps the remaining trash and removal record.
 ```sh
 plimsoll lifecycle snapshots list            # id, created, size, method, operation state, keep/prune and why
 plimsoll lifecycle snapshots list --json
-plimsoll lifecycle snapshots prune           # dry run: exactly what would go, changes nothing
+plimsoll lifecycle snapshots prune           # dry run: planned removals or pending restore, changes nothing
 plimsoll lifecycle snapshots prune --apply   # holds the lifecycle lease; same protections as retention
 plimsoll lifecycle snapshots prune --keep 1 --apply
 ```
@@ -341,6 +341,11 @@ collector is running and while an interrupted operation is in
 `rollback_required`, because freeing space may be needed for its restore. It
 never touches the ledger or what that operation references. A
 `rollback_complete` journal blocks prune until the rollback receipt is durable.
+When a recorded way back needs restoring, the dry run reports `pendingRestore`
+and no planned removals. `snapshots list` marks the affected decisions
+`pending_restore`. Apply attempts the named restore and refuses if the files
+are incomplete or unusable; a dry run cannot promise that a rename or
+validation will succeed.
 If the journal is malformed or unreadable, the dry run reports
 `journal_unreadable`; `prune --apply` exits nonzero without a receipt or any
 removal. Preserve the journal for repair and retry after its state is known.

@@ -180,6 +180,13 @@ export type LifecycleRemovedItem = {
   bytes: number;
 };
 
+/** A recorded way back that prune must restore, or refuse to touch. */
+export type LifecyclePendingRestore = {
+  items: LifecycleRemovedItem[];
+  wouldRestore: LifecycleRemovedItem[];
+  refusal: "needed_restore_incomplete" | null;
+};
+
 export type LifecycleRetentionRecord = {
   keepSnapshots: number;
   status: "applied" | "preview" | "skipped";
@@ -190,6 +197,7 @@ export type LifecycleRetentionRecord = {
     | "removal_record_unreadable"
     | "retention_failed"
     | "skipped_by_operator"
+    | "needed_restore_incomplete"
     | null;
   removed: LifecycleRemovedItem[];
   removedBytes: number;
@@ -197,6 +205,8 @@ export type LifecycleRetentionRecord = {
   recovered: LifecycleRemovedItem[];
   /** Recorded trash entries restored to their original locations to preserve a usable way back. */
   restored?: LifecycleRemovedItem[];
+  /** Read-only prune preview: pending recorded items and the attempted restore. */
+  pendingRestore?: LifecyclePendingRestore;
   keptSnapshots: string[];
   keptVersions: string[];
   /**
@@ -260,13 +270,15 @@ export type LifecycleSnapshotRetentionReason =
   | "released_by_reconcile"
   | "older_completed"
   | "rolled_back_operation"
-  | "incomplete_snapshot";
+  | "incomplete_snapshot"
+  | "pending_restore";
 export type LifecycleVersionRetentionReason =
   | "current"
   | "service_manifest"
   | "unfinished_operation"
   | "restore_target"
   | "restore_target_unknown"
+  | "pending_restore"
   | "unreferenced";
 
 export type LifecycleRetentionSnapshot = {
@@ -366,6 +378,7 @@ export type LifecycleSnapshotInventory = {
     reason: LifecycleVersionRetentionReason;
   }>;
   pendingRemoval: LifecycleRemovedItem[];
+  pendingRestore: LifecyclePendingRestore | null;
   bytes: { snapshots: number; versions: number; prunable: number; pendingRemoval: number };
 };
 
