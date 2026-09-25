@@ -1096,7 +1096,8 @@ export async function runSessionSync(
       if (!options.ledgerDb) {
         throw new Error("incremental_session_sync_requires_writable_ledger");
       }
-      ensureSessionSummarySchema(ledger);
+      const summaryWriteRetry = new SyncStorageRetryController({ budgetMs: 1_000, sleep });
+      await summaryWriteRetry.run(() => ensureSessionSummarySchema(ledger));
       summaryReader = createPersistentLedgerReader(ledger);
       const ids = options.sessionIds !== undefined
         ? options.sessionIds
@@ -1113,6 +1114,7 @@ export async function runSessionSync(
           read: summaryReader.read,
           maxRows: options.summaryMaxRows,
           maxMs: options.summaryMaxMs,
+          writeRetry: summaryWriteRetry,
         });
         summaryStats.rowsRead += update.rowsRead;
         summaryStats.rowsApplied += update.rowsApplied;

@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 
 import { BOUNDED_SQL_READ_PREDICATE, boundedSqlRows } from "./bounded-sql-read";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import { SyncStorageRetryController } from "./sqlite-contention";
 
 /** A read query that can be executed by the session-summary read worker. */
 export type SessionReadQuery = {
@@ -110,6 +111,8 @@ export type SessionSummaryUpdateOptions = {
   maxRows?: number;
   maxMs?: number;
   read: SessionSummaryRead;
+  /** Share one bounded wait budget across schema setup and summary writes in a daemon pass. */
+  writeRetry?: SyncStorageRetryController;
 };
 
 export type SessionSummaryUpdateResult = {
@@ -913,6 +916,7 @@ export async function updateSessionSummary(
   options: SessionSummaryUpdateOptions,
 ): Promise<SessionSummaryUpdateResult> {
   const started = performance.now();
+  const writeRetry = options.writeRetry ?? new SyncStorageRetryController({ budgetMs: 1_000 });
   const requestedRows = options.maxRows ?? SESSION_SUMMARY_DEFAULT_MAX_ROWS;
   const requestedMs = options.maxMs ?? SESSION_SUMMARY_DEFAULT_MAX_MS;
   const maxRows = Math.max(1, Math.min(
@@ -963,7 +967,7 @@ export async function updateSessionSummary(
     // Freeze the old rowid range while installing the trigger-visible state.
     // Rows inserted afterward enter the append queue, even if their observed
     // time sorts behind the historical cursor.
-    state = db.transaction(() => {
+    state = await writeRetry.run(() => db.transaction(() => {
       if (needsFallback) {
         db.prepare(
           `update session_sync_summary_control
@@ -990,7 +994,7 @@ export async function updateSessionSummary(
       };
       writeState(db, fresh);
       return fresh;
-    }).immediate();
+    }).immediate());
   } else if (parsed) {
     state = stateFromStored(stored, parsed);
   } else {
@@ -1123,7 +1127,7 @@ export async function updateSessionSummary(
   // Revision, queued-row check, and state write share one write transaction.
   // A concurrent append can land before it (and is observed) or afterward
   // (and remains in the queue for the upload fence).
-  const stable = db.transaction(() => {
+  const stable = await writeRetry.run(() => db.transaction(() => {
     const revisionStable = sessionRevision(db, sessionId) === state.mutationRevision;
     const noQueuedRows = !queuedRowsAfter(db, sessionId, state.highWater, until);
     const finalComplete = complete && revisionStable && noQueuedRows;
@@ -1136,7 +1140,7 @@ export async function updateSessionSummary(
         .run(sessionId, state.highWater);
     }
     return revisionStable && noQueuedRows;
-  }).immediate();
+  }).immediate());
 
   const finalMode: SessionSummaryUpdateResult["mode"] = fullRecompute
     ? "fallback"

@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { markRawPrivacyDisposition } from "../packages/collector-cli/src/privacy-disposition";
-import { isSqliteContentionError } from "../packages/collector-cli/src/sqlite-contention";
+import { isSqliteContentionError, SyncStorageBusyError } from "../packages/collector-cli/src/sqlite-contention";
 import { asHttpBoundaryRejection } from "../packages/collector-cli/src/http-boundary";
 import {
   buildSessionSyncRow,
@@ -472,6 +472,7 @@ async function reviewRegressions() {
     "backdated_queue_planner", "stale_send_fast_retry",
     "pending_id_bounds", "sync_id_deadline", "same_time_seek",
     "fence_multibatch", "fence_erasure", "fence_stale_before_post", "fence_contention",
+    "summary_busy_state", "summary_busy_stable", "summary_busy_daemon", "summary_busy_budget",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -660,6 +661,95 @@ async function reviewRegressions() {
         const resumed = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
         assert.equal(resumed.complete, true);
         assert.deepEqual(resumed.snapshot, collectSessionSnapshots(buffer.database, { until, sessionIds: [sessionId] })[0]);
+      } else if (name === "summary_busy_state" || name === "summary_busy_stable") {
+        add(1);
+        buffer.database.pragma("busy_timeout = 0");
+        const writer = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+        let release: ReturnType<typeof setTimeout> | undefined;
+        let lockedAtScan = false;
+        const unlock = () => { if (writer.inTransaction) writer.exec("commit"); };
+        try {
+          if (name === "summary_busy_state") {
+            writer.exec("begin immediate");
+            release = setTimeout(unlock, 90);
+          }
+          const read = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
+            const rows = await directRead<T>(queries);
+            if (name === "summary_busy_stable" && !lockedAtScan &&
+                queries.some((query) => /order by (?:e\.observed_at, e\.rowid|scan\.sort_observed_at, scan\.raw_rowid) asc/.test(query.sql))) {
+              lockedAtScan = true;
+              writer.exec("begin immediate");
+              release = setTimeout(unlock, 90);
+            }
+            return rows;
+          };
+          const result = await updateSessionSummary(buffer.database, sessionId, until, { read });
+          assert.equal(result.complete, true);
+          assert.deepEqual(result.snapshot, collectSessionSnapshots(buffer.database, {
+            until, sessionIds: [sessionId],
+          })[0]);
+          if (name === "summary_busy_stable") assert.equal(lockedAtScan, true);
+          console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
+        } finally {
+          if (release) clearTimeout(release);
+          if (writer.inTransaction) writer.exec("rollback");
+          writer.close();
+        }
+      } else if (name === "summary_busy_daemon" || name === "summary_busy_budget") {
+        add(1);
+        buffer.database.pragma("busy_timeout = 0");
+        const writer = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+        const bodies: string[] = [];
+        const sync = () => runSessionSync(config, {
+          ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+          delayMs: 0, maxAttemptsPerBatch: 1,
+          fetchImpl: (async (_url, init) => {
+            const body = String(init?.body ?? "");
+            bodies.push(body);
+            return new Response(JSON.stringify({
+              ...acceptedFixtureDelivery(body, installKey), inserted: 1, updated: 0, skippedStale: 0,
+            }), { status: 200, headers: { "content-type": "application/json" } });
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+        try {
+          writer.exec("begin immediate");
+          if (name === "summary_busy_daemon") {
+            const bursts = (async () => {
+              for (let index = 0; index < 4; index += 1) {
+                await new Promise<void>((resolve) => setTimeout(resolve, 35));
+                if (writer.inTransaction) writer.exec("commit");
+                if (index < 3) {
+                  await new Promise<void>((resolve) => setTimeout(resolve, 5));
+                  try { writer.exec("begin immediate"); }
+                  catch (error) { if (!isSqliteContentionError(error)) throw error; }
+                }
+              }
+            })();
+            let result: Awaited<ReturnType<typeof sync>>;
+            try { result = await sync(); } finally { await bursts; }
+            assert.equal(result.ok, true);
+            assert.equal(result.summaryComplete, true);
+            assert.equal(result.sentSessions, 1);
+            assert.equal(bodies.length, 1);
+          } else {
+            let failure: unknown;
+            try { await sync(); } catch (error) { failure = error; }
+            assert.ok(failure instanceof SyncStorageBusyError, String(failure));
+            assert.equal(bodies.length, 0, "no body may leave while the summary is blocked");
+            assert.equal((buffer.database.prepare("select count(*) as count from buffered_events where session_id = ?")
+              .get(sessionId) as { count: number }).count, 1);
+            writer.exec("commit");
+            const result = await sync();
+            assert.equal(result.ok, true);
+            assert.equal(result.sentSessions, 1);
+            assert.equal(bodies.length, 1);
+          }
+          console.log(JSON.stringify({ reviewCase: name, result: "PASS", sent: bodies.length }));
+        } finally {
+          if (writer.inTransaction) writer.exec("rollback");
+          writer.close();
+        }
       } else if (name === "future_horizon") {
         insertRaw(buffer, {
           id: uuid(501), sessionId,
