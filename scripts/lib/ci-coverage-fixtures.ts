@@ -28,6 +28,8 @@ export type FixtureCase = {
   covered?: string[];
   error?: RegExp;
   gateNotFirst?: boolean;
+  /** A counted self-test that does not apply after a legitimate workflow edit. */
+  skip?: string;
 };
 
 export type Fixture = {
@@ -45,9 +47,21 @@ export type Fixture = {
 
 type Target = { line: string; script: string; unit: string };
 
+// Fixture builders only copy their inputs. Reuse the real checkout's coverage
+// model instead of parsing the same workflow again for every target lookup.
+const coverageCache = new WeakMap<CoverageInput, CoverageReport>();
+function coverage(input: CoverageInput): CoverageReport {
+  let report = coverageCache.get(input);
+  if (!report) {
+    report = proofCiCoverage(input);
+    coverageCache.set(input, report);
+  }
+  return report;
+}
+
 /** The workflow whose step runs the gate (counted or not, as an edit may have changed that): the one the fixtures edit. */
 export function fixtureWorkflow(input: CoverageInput) {
-  const gate = proofCiCoverage(input).units.find((unit) => unit.unit === GATE_ENTRY);
+  const gate = coverage(input).units.find((unit) => unit.unit === GATE_ENTRY);
   const invocation = gate?.covered[0] ?? gate?.ignored[0];
   if (!invocation) throw new Error(`no workflow step runs ${GATE_ENTRY}, so the fixtures have no workflow to edit`);
   return invocation.workflow;
@@ -62,7 +76,7 @@ export function fixtureTargets(input: CoverageInput): Target[] {
   const workflow = fixtureWorkflow(input);
   const text = workflowText(input);
   const targets: Target[] = [];
-  for (const unit of proofCiCoverage(input).units) {
+  for (const unit of coverage(input).units) {
     if (unit.status !== "ci") continue;
     for (const invocation of unit.covered) {
       const script = /^pnpm (proof:[\w:.-]+)$/.exec(invocation.command.trim())?.[1];
@@ -93,6 +107,15 @@ export function fixtureHolds(fixtureCase: FixtureCase, report: CoverageReport, g
 function workflowText(input: CoverageInput) {
   const path = fixtureWorkflow(input);
   return input.workflows.find((candidate) => candidate.path === path)!.text;
+}
+
+/** Resolve a fixture's target from this checkout's workflow, including pnpm run and run-proof forms. */
+function proofLine(input: CoverageInput, unit: string) {
+  const workflow = fixtureWorkflow(input);
+  const line = coverage(input).units.find((candidate) => candidate.unit === unit)?.covered
+    .find((invocation) => invocation.workflow === workflow)?.command;
+  if (!line) throw new Error(`fixture target ${unit} is not covered in ${workflow}`);
+  return line;
 }
 
 function withWorkflowText(input: CoverageInput, text: string, path = fixtureWorkflow(input)): CoverageInput {
@@ -200,7 +223,10 @@ function outOfCi(input: CoverageInput, target: Target) {
 function asException(input: CoverageInput, section: "localOnly" | "quarantined", entry: Record<string, unknown>) {
   const [target] = fixtureTargets(input);
   return withExceptions(outOfCi(input, target!), (exceptions) => {
-    exceptions[section] = { ...exceptions[section], [target!.unit]: entry };
+    const reviewed = section === "localOnly"
+      ? { reviewedOn: input.today, expires: daysFromToday(input, MAX_QUARANTINE_DAYS), ...entry }
+      : entry;
+    exceptions[section] = { ...exceptions[section], [target!.unit]: reviewed };
   });
 }
 
@@ -476,10 +502,14 @@ export const FIXTURES: Fixture[] = [
     origin: "gate",
     expectGateGreen: false,
     describe: "typecheck sets continue-on-error, so `steps.typecheck.outcome == 'success'` can be false in a green run",
-    build: onTarget(
-      (input) => editWorkflow(input, (document) => findStep(document, "pnpm exec tsc --noEmit").step.set("continue-on-error", true)),
-      "uncovered",
-    ),
+    build: (input) => {
+      const edited = editWorkflow(input, (document) => findStep(document, "pnpm exec tsc --noEmit").step.set("continue-on-error", true));
+      const target = fixtureTargets(input)[0];
+      const targetStatus = proofCiCoverage(edited).units.find((unit) => unit.unit === target?.unit)?.status;
+      return targetStatus === "ci"
+        ? { input: edited, skip: "target remains covered because its workflow condition does not depend on typecheck" }
+        : { input: edited, uncovered: target ? [target.unit] : [] };
+    },
   },
   {
     name: "entry_file_invocation_counts",
@@ -498,7 +528,7 @@ export const FIXTURES: Fixture[] = [
     describe: "a proof runs before the gate in the gate's own step",
     build: (input) => {
       const [t] = fixtureTargets(input);
-      const gateLine = proofCiCoverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0]?.command;
+      const gateLine = coverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0]?.command;
       if (!gateLine) throw new Error("the gate is not run by CI");
       return { input: editRun(input, gateLine, (line) => [line.replace(gateLine, t!.line), line]), gateNotFirst: true };
     },
@@ -588,7 +618,7 @@ export const FIXTURES: Fixture[] = [
     describe: "a local-only entry names an input its proof never reads",
     build: (input) => ({
       input: asException(input, "localOnly", { owner: "fixture", needs: ["PLIMSOLL_FIXTURE_INPUT"], reason: "fixture" }),
-      error: /does not read process\.env\.PLIMSOLL_FIXTURE_INPUT/,
+      error: /does not require process\.env\.PLIMSOLL_FIXTURE_INPUT/,
     }),
     replayableOnTextualGate: false,
   },
@@ -599,6 +629,90 @@ export const FIXTURES: Fixture[] = [
     describe: "a local-only entry names an input CI always sets",
     build: (input) => ({ input: asException(input, "localOnly", { owner: "fixture", needs: ["GITHUB_SHA"], reason: "fixture" }), error: /CI provides GITHUB_SHA/ }),
     replayableOnTextualGate: false,
+  },
+  {
+    name: "local_only_review_metadata_required",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a local-only entry without a reviewedOn date and expiry cannot park a proof",
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      const edited = withExceptions(outOfCi(input, target!), (exceptions) => {
+        exceptions.localOnly = {
+          ...exceptions.localOnly,
+          [target!.unit]: { owner: "fixture", needs: ["PLIMSOLL_FIXTURE_INPUT"], reason: "fixture" },
+        };
+      });
+      return { input: edited, error: /reviewedOn/ };
+    },
+    replayableOnTextualGate: false,
+  },
+  ...([
+    ["assigned_variable", "scripts/provider-capacity-adapters-proof.ts", "FAKE_BEHAVIOR"],
+    ["optional_knob", "scripts/otlp-intake-spool-proof.ts", "OTLP_SPOOL_PROOF_ONLY"],
+  ] as const).map(([name, unit, need]): Fixture => ({
+    name: `local_only_${name}_cannot_qualify`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `${need} does not establish an input CI lacks`,
+    build: (input) => {
+      const edited = editRun(input, proofLine(input, unit), () => ["echo moved out of CI"]);
+      return {
+        input: withExceptions(edited, (exceptions) => {
+          exceptions.localOnly = { ...exceptions.localOnly, [unit]: {
+            owner: "fixture", needs: [need], reviewedOn: input.today,
+            expires: daysFromToday(input, MAX_QUARANTINE_DAYS), reason: "fixture",
+          } };
+        }),
+        error: new RegExp(`does not require process\\.env\\.${need}`),
+      };
+    },
+  })),
+  {
+    name: "local_only_optional_knob_with_review_cannot_qualify",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a reviewed local-only declaration cannot claim a proof whose environment read has an OR fallback",
+    build: (input) => {
+      const unit = "scripts/otlp-intake-spool-proof.ts";
+      const line = proofLine(input, unit);
+      const edited = editRun(input, line, () => ["echo moved out of CI"]);
+      const source = input.readFile(unit) ?? "";
+      const fallback = source.replace(
+        'const only = process.env.OTLP_SPOOL_PROOF_ONLY?.split(",");',
+        'const only = (process.env.OTLP_SPOOL_PROOF_ONLY || "") ? process.env.OTLP_SPOOL_PROOF_ONLY!.split(",") : undefined;',
+      );
+      return {
+        input: withExceptions(withFiles(edited, { [unit]: fallback }), (exceptions) => {
+          exceptions.localOnly = {
+            ...exceptions.localOnly,
+            [unit]: {
+              owner: "fixture",
+              needs: ["OTLP_SPOOL_PROOF_ONLY"],
+              reviewedOn: input.today,
+              expires: daysFromToday(input, MAX_QUARANTINE_DAYS),
+              reason: "optional fallback",
+            },
+          };
+        }),
+        error: /does not require process\.env\.OTLP_SPOOL_PROOF_ONLY/,
+      };
+    },
+  },
+  {
+    name: "local_only_stale_review_fresh_expiry",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a recent expiry cannot extend a review from 2025",
+    build: (input) => ({
+      input: withExceptions(input, (exceptions) => {
+        const entry = exceptions.localOnly?.["scripts/oversized-continuation-rollback-proof.ts"];
+        if (!entry) throw new Error("rollback local-only entry missing");
+        entry.reviewedOn = "2025-01-01";
+        entry.expires = daysFromToday(input, 26);
+      }),
+      error: /more than 30 days after reviewedOn/,
+    }),
   },
   {
     name: "stale_exception_entry",
@@ -765,6 +879,32 @@ export const FIXTURES: Fixture[] = [
       "covered",
     ),
   },
+  {
+    name: "local_only_parked_with_optional_knob",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an optional proof knob alone cannot justify a local-only declaration without review metadata",
+    build: (input) => {
+      let edited = editWorkflow(input, (document) => {
+        const found = findStep(document, proofLine(input, "scripts/otlp-intake-spool-proof.ts"));
+        const steps = found.job.get("steps", true);
+        if (!isSeq(steps)) throw new Error("fixture workflow has no steps");
+        steps.items.splice(found.index, 1);
+      });
+      edited = withExceptions(edited, (exceptions) => {
+        exceptions.localOnly = {
+          ...exceptions.localOnly,
+          "scripts/otlp-intake-spool-proof.ts": {
+            owner: "fixture",
+            needs: ["OTLP_SPOOL_PROOF_ONLY"],
+            reason: "optional knob",
+          },
+        };
+      });
+      return { input: edited, error: /reviewedOn/ };
+    },
+    replayableOnTextualGate: false,
+  },
   // ---- Review 2: nothing may change how the proofs run ---------------------
   {
     name: "review2_npm_config_script_shell_prefix",
@@ -807,7 +947,7 @@ export const FIXTURES: Fixture[] = [
     build: (input) => {
       const [t] = fixtureTargets(input);
       const run = 'echo "NODE_OPTIONS=--require ./.github/ci-exit0.cjs" >> "$GITHUB_ENV"';
-      return { input: insertStepBefore(input, t!.line, { name: "Tune Node", run }), error: /names NODE_OPTIONS/ };
+      return { input: insertStepBefore(input, t!.line, { name: "Tune Node", run }), error: /NODE_OPTIONS.*environment allow-list/ };
     },
   },
   {
@@ -830,6 +970,143 @@ export const FIXTURES: Fixture[] = [
       return { input: insertStepBefore(input, t!.line, { uses: "example/setup-anything@v1" }), error: /runs action example\/setup-anything@v1/ };
     },
   },
+  // ---- Legitimate command forms that should remain green ------------------
+  {
+    name: "legit_pnpm_run_form",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "pnpm run <script> is equivalent to pnpm <script>",
+    build: onTarget((input, t) => editRun(input, t.line, (line) => [line.replace(t.line, `pnpm run ${t.script}`)]), "covered"),
+  },
+  {
+    name: "legit_node_memory_flag_on_line",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "node's benign --max-old-space-size=N flag is accepted",
+    build: onTarget((input, t) => editRun(input, t.line, (line) => [line.replace(t.line, `node --max-old-space-size=8192 --import tsx ${t.unit}`)]), "covered"),
+  },
+  {
+    name: "legit_set_euo_pipefail_preamble",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "an explicit errexit/pipefail preamble is harmless",
+    build: onTarget((input, t) => editRun(input, t.line, (line) => ["set -euo pipefail", line]), "covered"),
+  },
+  {
+    name: "legit_group_echo_lines",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "GitHub group markers around a proof are harmless",
+    build: onTarget(
+      (input, t) => editRun(input, t.line, (line) => ['echo "::group::proof"', line, 'echo "::endgroup::"']),
+      "covered",
+    ),
+  },
+  {
+    name: "legit_github_sha_arg",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "github.sha is an inert proof argument",
+    build: onTarget((input, t) => editRun(input, t.line, (line) => [`${line} --commit \"\${{ github.sha }}\"`]), "covered"),
+  },
+  {
+    name: "legit_job_env_node_memory",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "a benign job-level NODE_OPTIONS heap limit is accepted",
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      return { input: setJobKey(input, target!.line, "env", { NODE_OPTIONS: "--max-old-space-size=8192" }), covered: [target!.unit] };
+    },
+  },
+  {
+    name: "legit_actions_cache_before_proofs",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "the standard actions/cache action is allowed before proofs",
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      return { input: insertStepBefore(input, target!.line, { uses: "actions/cache@v4", with: { path: ".cache/fixtures", key: "fixtures-v1" } }), covered: [target!.unit] };
+    },
+  },
+  ...(["~/.npmrc", "node_modules", ".pnpmfile.cjs", "pnpm-workspace.yaml", ".config/pnpm/rc"] as const).map((cachePath): Fixture => ({
+    name: `cache_proof_control_${cachePath.replace(/[^a-z]+/gi, "_")}`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `actions/cache cannot restore ${cachePath} before proofs`,
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, GATE_ENTRY), { uses: "actions/cache@v4", with: { path: cachePath, key: "fixture-v1" } }),
+      error: /caches a proof-controlling path/,
+    }),
+  })),
+  {
+    name: "xdg_config_home_checked_in_pnpm_rc",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof step cannot redirect XDG_CONFIG_HOME to a checked-in pnpm rc",
+    files: {
+      ".github/pmcfg/pnpm/rc": "script-shell=/usr/bin/true\n",
+    },
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      const edited = setStepKey(input, target!.line, "env", {
+        XDG_CONFIG_HOME: "${{ github.workspace }}/.github/pmcfg",
+      });
+      return {
+        input: withFiles(edited, { ".github/pmcfg/pnpm/rc": "script-shell=/usr/bin/true\n" }),
+        error: /XDG_CONFIG_HOME.*pnpm rc/,
+      };
+    },
+  },
+  {
+    name: "projection_scale_valid",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "a finite projection publication cost scale within 0.01 through 1.0 is accepted",
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      return {
+        input: setStepKey(input, target!.line, "env", { PROJECTION_PUBLICATION_COST_SCALE: "0.5" }),
+        covered: [target!.unit],
+      };
+    },
+  },
+  ...([
+    ["empty", ""],
+    ["below_minimum", "0.005"],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["above_maximum", "1.01"],
+    ["two", "2"],
+    ["nonnumeric", "nonsense"],
+    ["infinite", "Infinity"],
+  ] as const).map(([name, value]): Fixture => ({
+    name: `projection_scale_${name}`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `a projection publication cost scale of ${JSON.stringify(value)} is refused`,
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      return {
+        input: setStepKey(input, target!.line, "env", { PROJECTION_PUBLICATION_COST_SCALE: value }),
+        error: /PROJECTION_PUBLICATION_COST_SCALE.*0\.01.*1/,
+      };
+    },
+  })),
+  {
+    name: "legit_runner_temp_expression",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "runner.temp is inert when passed as a proof argument",
+    build: onTarget((input, t) => editRun(input, t.line, (line) => [line.replace(t.line, `${t.line} --tmp \"\${{ runner.temp }}\"`)]), "covered"),
+  },
+  {
+    name: "legit_github_workspace_expression",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "github.workspace is inert when passed as a proof argument",
+    build: onTarget((input, t) => editRun(input, t.line, (line) => [line.replace(t.line, `${t.line} --root \"\${{ github.workspace }}\"`)]), "covered"),
+  },
   ...([
     ["review2_npmrc_script_shell", "review2", ".npmrc", "script-shell=/usr/bin/true\n", /\.npmrc sets script-shell/],
     ["npmrc_node_options", "gate", ".npmrc", "node-options=--require ./exit0.cjs\n", /\.npmrc sets node-options/],
@@ -844,6 +1121,174 @@ export const FIXTURES: Fixture[] = [
     files: { [file]: text },
     replayableOnTextualGate: false,
   })),
+  // ---- Round 3 follow-ups --------------------------------------------------
+  ...(["--today 2026-10-06", "--root /tmp/other-checkout", "--audit-only"] as const).map((argument, index): Fixture => ({
+    name: ["gate_today_pinned", "gate_root_argument", "gate_audit_only_argument"][index]!,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `the gate's own CI invocation cannot pass ${argument}`,
+    build: (input) => {
+      const gate = coverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0];
+      if (!gate) throw new Error("the gate is not run by CI");
+      return { input: editRun(input, gate.command, (line) => [`${line} ${argument}`]), error: /passes arguments to .*ci-coverage-proof/ };
+    },
+  })),
+  {
+    name: "gate_direct_node_flag",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "the gate may not be bundled into a disposable root",
+    build: (input) => {
+      const gate = proofLine(input, GATE_ENTRY);
+      return {
+        input: editRun(input, gate, () => [gate.replace(GATE_ENTRY, `--direct-node ${GATE_ENTRY}`)]),
+        error: /passes arguments to .*ci-coverage-proof/,
+      };
+    },
+  },
+  ...(["none", "busy"] as const).map((value): Fixture => ({
+    name: `otlp_only_env_prefix_${value === "none" ? "none" : "one_stage"}`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `the OTLP proof line sets its own OTLP_SPOOL_PROOF_ONLY=${value} setting`,
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), (line) => [`OTLP_SPOOL_PROOF_ONLY=${value} ${line}`]),
+      error: /proof-owned CI settings/,
+    }),
+  })),
+  ...(["step", "job", "workflow"] as const).map((level): Fixture => ({
+    name: `otlp_only_${level}_env_none`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `the ${level} env sets OTLP_SPOOL_PROOF_ONLY=none for the counted OTLP proof`,
+    build: (input) => {
+      const line = proofLine(input, "scripts/otlp-intake-spool-proof.ts");
+      const env = { OTLP_SPOOL_PROOF_ONLY: "none" };
+      const edited = level === "step" ? setStepKey(input, line, "env", env)
+        : level === "job" ? setJobKey(input, line, "env", env)
+        : editWorkflow(input, (document) => document.set("env", env));
+      return { input: edited, error: /proof-owned CI settings/ };
+    },
+  })),
+  {
+    name: "pnpm_config_set_script_shell_line",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof step cannot rewrite pnpm's script shell before running the proof",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), (line) => ["pnpm config set script-shell /usr/bin/true", line]),
+      error: /package-manager config\/set command/,
+    }),
+  },
+  {
+    name: "home_npmrc_written_before_proofs",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a step before proofs cannot write a user npmrc/pnpm rc file",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure package manager", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/.npmrc"' }),
+      error: /writes a package-manager rc file/,
+    }),
+  },
+  {
+    name: "npm_config_set_script_shell_line",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof step cannot rewrite npm config before running the proof",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), (line) => ["npm config set script-shell /usr/bin/true", line]),
+      error: /package-manager config\/set command/,
+    }),
+  },
+  {
+    name: "pnpm_rc_written_before_proofs",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof step cannot write a pnpm rc file",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure pnpm rc", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/pnpm/rc"' }),
+      error: /writes a package-manager rc file/,
+    }),
+  },
+  ...([
+    ["pnpm_c_set", "pnpm c set script-shell /usr/bin/true"],
+    ["npm_set", "npm set script-shell=/usr/bin/true"],
+    ["pnpm_flag_config_set", "pnpm --dir . config set script-shell /usr/bin/true"],
+    ["continued_config_set", "pnpm \\\n config set script-shell /usr/bin/true"],
+  ] as const).map(([name, command]): Fixture => ({
+    name,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `package-manager settings cannot be changed with ${name}`,
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure package manager", run: command }),
+      error: /package-manager config\/set command/,
+    }),
+  })),
+  {
+    name: "copy_rc_before_proof",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a copy cannot replace the user's npmrc before a proof",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Copy npmrc", run: 'cp .github/ci.rc "$HOME/.npmrc"' }),
+      error: /writes a package-manager rc file/,
+    }),
+  },
+  {
+    name: "otlp_export_before_proof",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof knob exported in its step cannot skip the OTLP stages",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), (line) => ["export OTLP_SPOOL_PROOF_ONLY=none", line]),
+      error: /OTLP_SPOOL_PROOF_ONLY.*environment allow-list/,
+    }),
+  },
+  {
+    name: "otlp_github_env_before_proof",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an earlier GITHUB_ENV write cannot skip the OTLP stages",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), { name: "Set OTLP knob", run: 'echo "OTLP_SPOOL_PROOF_ONLY=none" >> "$GITHUB_ENV"' }),
+      error: /OTLP_SPOOL_PROOF_ONLY.*environment allow-list/,
+    }),
+  },
+  {
+    name: "qualification_artifact_export",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof cannot select a prebuilt qualification artifact in CI",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/lifecycle-operator-proof.ts"), (line) => ["export PLIMSOLL_QUALIFICATION_ARTIFACT=evidence/other-cli.mjs", line]),
+      error: /PLIMSOLL_QUALIFICATION_ARTIFACT.*environment allow-list/,
+    }),
+  },
+  {
+    name: "computed_export_name",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an export with a computed variable name is not reviewable",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), (line) => [
+        "name=OTLP_SPOOL_PROOF_ONLY", 'export "$name=none"', line,
+      ]),
+      error: /exports a nonliteral or multiple environment variables/,
+    }),
+  },
+  {
+    name: "github_env_group_multiple_commands",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a grouped GITHUB_ENV write may contain only one reviewed assignment per line",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), {
+        name: "Set two values", run: '{\n  echo "HOME=$TMPDIR"; echo "OTLP_SPOOL_PROOF_ONLY=none"\n} >> "$GITHUB_ENV"',
+      }),
+      error: /writes a nonliteral value to \$GITHUB_ENV/,
+    }),
+  },
   // ---- Review 2: YAML the gate cannot read the way GitHub does -----------
   {
     name: "review2_merge_key_disabled_step",

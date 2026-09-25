@@ -5,6 +5,7 @@ import { parse } from "yaml";
 
 import {
   INERT_EXPRESSION,
+  INERT_EXPRESSIONS,
   RUN_PROOF_WRAPPER,
   isRepoFile,
   mentionedWords,
@@ -37,7 +38,14 @@ import { PROOF_SUITES, readProofSuites } from "./proof-suites";
  * (env maps, assignments, exports, $GITHUB_ENV or $GITHUB_PATH), run an
  * unknown action before its proofs or run in a container, and the repository
  * may not configure how pnpm runs scripts (script-shell, node-options, a
- * pnpmfile). Every other unit needs a reviewed entry in
+ * pnpmfile). A counted proof may not receive a variable it reads from a
+ * workflow assignment or workflow/job/step `env:`; the explicit allow-list is
+ * `PLIMSOLL_PROOF_HOME`, `REJECTION_PROOF_SCALE`, and the reviewed
+ * `PROJECTION_PUBLICATION_COST_SCALE` input. Both scale inputs are bounded by
+ * their proof contracts to 0.01 through 1.0 inclusive, and the gate validates
+ * that the projection value is finite before forwarding it. `DEVELOPER_DIR` is a
+ * non-proof toolchain selector used by the macOS menubar tests. Runtime pnpm/npm config
+ * writes are refused through the last proof. Every other unit needs a reviewed entry in
  * scripts/proof-local-only.json.
  */
 
@@ -51,10 +59,77 @@ const PROOF_SCRIPT = /^proof(?::|$)/;
  * rather than what it reads (review 2): BASH_ENV, NODE_OPTIONS or
  * npm_config_script_shell each turned a proof into a successful no-op.
  */
-const EXECUTION_ENV = ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "NODE_OPTIONS", "PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
+const EXECUTION_ENV = ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
 const EXECUTION_WORD = new RegExp(`(?<![A-Za-z0-9_])(?:${EXECUTION_ENV.join("|")}|BASH_FUNC_\\w*)(?![A-Za-z0-9_])`);
 const CONFIG_WORD = /(?<![A-Za-z0-9_])p?npm_config_\w*/i;
-export const changesExecution = (name: string) => EXECUTION_WORD.test(name) || CONFIG_WORD.test(name);
+const BENIGN_NODE_OPTIONS = /^--max-old-space-size=[1-9][0-9]*$/;
+/** Proof-specific settings that are intentionally permitted on a counted line. */
+export const PROOF_ENV_ALLOWLIST = new Set([
+  "PLIMSOLL_PROOF_HOME",
+  "REJECTION_PROOF_SCALE",
+  "PROJECTION_PUBLICATION_COST_SCALE",
+]);
+const WORKFLOW_ENV_ALLOWLIST = new Set([
+  ...PROOF_ENV_ALLOWLIST, "HOME", "USERPROFILE", "PLIMSOLL_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+  "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR", "DEVELOPER_DIR",
+]);
+const PROJECTION_SCALE_MIN = 0.01;
+const PROJECTION_SCALE_MAX = 1.0;
+const environmentProblem = (name: string, value?: unknown): string | null => {
+  if (!WORKFLOW_ENV_ALLOWLIST.has(name) && !(name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim()))) {
+    return `${name} outside the environment allow-list`;
+  }
+  if (name === "PROJECTION_PUBLICATION_COST_SCALE") {
+    const number = typeof value === "number" ? value
+      : typeof value === "string" && value.trim() !== "" ? Number(value.trim()) : Number.NaN;
+    if (!Number.isFinite(number) || number < PROJECTION_SCALE_MIN || number > PROJECTION_SCALE_MAX) {
+      return `${name} must be a finite value from ${PROJECTION_SCALE_MIN} through ${PROJECTION_SCALE_MAX}`;
+    }
+  }
+  return null;
+};
+export const changesExecution = (name: string, value?: unknown) =>
+  !(name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim())) &&
+  (name === "NODE_OPTIONS" || EXECUTION_WORD.test(name) || CONFIG_WORD.test(name));
+
+function readsProcessEnvironment(source: string, name: string) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("process\\.env(?:\\." + escaped + "(?![A-Za-z0-9_])|\\[\\s*[\"'`]" + escaped + "[\"'`]\\s*\\])").test(source);
+}
+
+/**
+ * A `needs` declaration must name an input read by the proof, not one it writes
+ * or treats as optional. A literal `||` fallback (including a fallback wrapped
+ * in a conditional expression) therefore cannot justify local-only status.
+ * Nullish defaults to a machine path remain accepted for the reviewed proofs
+ * whose environment variable is still the declared external input.
+ */
+function requiresProcessEnvironment(source: string, name: string) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const access = new RegExp("process\\.env(?:\\." + escaped + "(?![A-Za-z0-9_])|\\[\\s*[\"'`]" + escaped + "[\"'`]\\s*\\])", "g");
+  let hasOptionalFallback = false;
+  let hasRequiredAccess = false;
+  for (const match of source.matchAll(access)) {
+    const before = source.slice(Math.max(0, match.index - 12), match.index);
+    const after = source.slice(match.index + match[0].length).trimStart();
+    if (/\bdelete\s*$/.test(before) || /^=(?!=)/.test(after) || /^\?\./.test(after)) continue;
+    if (/^\|\|/.test(after) || /^\?\?\s*(?:[\d"'`]|true\b|false\b)/.test(after)) {
+      hasOptionalFallback = true;
+      continue;
+    }
+    if (hasOptionalFallback) continue;
+    hasRequiredAccess = true;
+  }
+  return hasRequiredAccess && !hasOptionalFallback;
+}
+
+function proofOwnedEnvironmentProblems(source: string, names: string[], where: string, values?: Record<string, unknown> | null) {
+  return names
+    .filter((name) => !PROOF_ENV_ALLOWLIST.has(name) &&
+      !(name === "NODE_OPTIONS" && !changesExecution(name, values?.[name])) &&
+      readsProcessEnvironment(source, name))
+    .map((name) => `${where} sets ${name}, which is read by the counted proof; proof-owned CI settings are not allowed (allow-list: ${[...PROOF_ENV_ALLOWLIST].join(", ")})`);
+}
 
 /**
  * A quarantine (a known-red proof) lasts at most this many days from today,
@@ -76,7 +151,7 @@ const PROVIDED_IN_CI =
   /^(?:CI|HOME|USERPROFILE|PATH|TMPDIR|TEMP|TMP|USER|SHELL|LANG|TZ|PWD|GITHUB_\w+|RUNNER_\w+|ACTIONS_\w+|XDG_\w+|PLIMSOLL_PROOF_\w+|PLIMSOLL_FIXTURE_ROOT|PLIMSOLL_HOME|CODEX_HOME|CLAUDE_CONFIG_DIR|GROK_HOME)$/;
 
 /** Actions a proof job may run before its last proof: checkout, pnpm and Node setup, evidence upload. */
-const KNOWN_ACTIONS = ["actions/checkout", "actions/setup-node", "pnpm/action-setup", "actions/upload-artifact"];
+const KNOWN_ACTIONS = ["actions/checkout", "actions/setup-node", "pnpm/action-setup", "actions/upload-artifact", "actions/cache"];
 const actionName = (uses: string) => uses.split("@")[0]!.split("/").slice(0, 2).join("/");
 
 /**
@@ -147,7 +222,7 @@ export function isProofEntry(file: string) {
   return /^index\.[cm]?[jt]s$/.test(base) && path.posix.basename(path.posix.dirname(file)).endsWith("-proof");
 }
 
-type Resolved = { file: string; via: string[] } | Problem;
+type Resolved = { file: string; via: string[]; args: string[] } | Problem;
 
 /**
  * Follow a package script through pure aliases to the one file it runs, or
@@ -169,8 +244,8 @@ function scriptResolver(scripts: Record<string, string>) {
       if ("problem" in form) result = { problem: `\`${name}\`: ${form.problem}` };
       else if ("alias" in form) {
         const inner = resolve(form.alias, [...chain, name]);
-        result = "problem" in inner ? inner : { file: inner.file, via: [name, ...inner.via] };
-      } else result = { file: form.file, via: [name] };
+        result = "problem" in inner ? inner : { file: inner.file, via: [name, ...inner.via], args: inner.args };
+      } else result = { file: form.file, via: [name], args: form.args };
     }
     cache.set(name, result);
     return result;
@@ -219,6 +294,60 @@ function packageManagerProblems(input: CoverageInput): string[] {
   return problems;
 }
 
+/** A literal XDG_CONFIG_HOME that points at a checked-in pnpm/rc changes every proof. */
+function checkedInPnpmRcProblem(input: CoverageInput, name: string, value?: unknown): string | null {
+  if (name !== "XDG_CONFIG_HOME" || typeof value !== "string") return null;
+  const relative = value
+    .replace(/\$\{\{\s*github\.workspace\s*\}\}/gi, "")
+    .replace(/\$GITHUB_WORKSPACE\b/gi, "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+  if (relative === "" || relative.startsWith("$") || relative.includes("${{")) return null;
+  const normalized = path.posix.normalize(relative);
+  if (normalized === "." || normalized === ".." || normalized.startsWith("../")) return null;
+  const rc = path.posix.join(normalized, "pnpm/rc");
+  return input.readFile(rc) === null ? null : `${name} points at checked-in ${rc} (pnpm rc)`;
+}
+
+/** Runtime package-manager configuration writes can turn a later proof into a no-op. */
+function runtimePackageManagerWrite(line: string): string | null {
+  const text = line.trim();
+  if (text === "" || text.startsWith("#")) return null;
+  // The command can carry flags before or between `config`/`c` and `set`.
+  // Refuse any package-manager `set` rather than trying to model its flags.
+  const commands = text.split(/[;&|]/);
+  if (commands.some((command) => /\b(?:pnpm|npm|yarn)\b[^;&|]*\bset\b/i.test(command))) {
+    return "runs a package-manager config/set command before the last proof";
+  }
+  const rcFile = String.raw`(?:\.(?:npm|pnpm|yarn)rc(?:\.yml)?|[/\\](?:pnpm|yarn)[/\\]rc)(?![A-Za-z0-9_])`;
+  if (new RegExp(String.raw`(?:>>?|\b(?:cp|mv|tee|install)\b)[^;&|\n]*${rcFile}`, "i").test(text)) {
+    return "writes a package-manager rc file before the last proof";
+  }
+  return null;
+}
+
+/** Only literal, reviewed assignments may cross GitHub's step environment boundary. */
+function githubEnvironmentWriteProblem(runText: string): string | null {
+  if (!runText.includes("GITHUB_ENV")) return null;
+  const group = /\{\s*\n([\s\S]*?)\}\s*>>\s*"?\$GITHUB_ENV"?/g;
+  let remaining = runText.replace(group, (_whole, body: string) => {
+    const assignments = body.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (assignments.some((line) => !/^echo\s+"[A-Z][A-Z0-9_]*=[^";&|]*"$/.test(line))) return "INVALID_GITHUB_ENV_WRITE";
+    return assignments.join("\n");
+  });
+  if (remaining.includes("INVALID_GITHUB_ENV_WRITE")) return "writes a nonliteral value to $GITHUB_ENV";
+  for (const line of remaining.split("\n").filter((candidate) => candidate.includes("GITHUB_ENV"))) {
+    if (!/^\s*echo\s+"[A-Z][A-Z0-9_]*=[^";&|]*"\s*>>\s*"\$GITHUB_ENV"\s*$/.test(line)) {
+      return "writes a nonliteral value to $GITHUB_ENV";
+    }
+  }
+  const names = [...remaining.matchAll(/\becho\s+["']?([A-Z][A-Z0-9_]*)=([^"'\n]*)/g)];
+  const denied = names.map((match) => ({ match, problem: environmentProblem(match[1]!, match[2]) })).find((entry) => entry.problem);
+  return denied ? `writes ${denied.problem} to $GITHUB_ENV` : null;
+}
+
 export function proofCiCoverage(input: CoverageInput): CoverageReport {
   const errors: string[] = [];
   const resolve = scriptResolver(input.scripts);
@@ -235,7 +364,12 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
     if (PROOF_SCRIPT.test(name)) {
       const resolved = resolve(name);
       if ("problem" in resolved) errors.push(`package.json "${name}" is not a canonical proof command: ${resolved.problem}`);
-      else addUnit(resolved.file, "proof script leaf", name);
+      else {
+        if (resolved.file === GATE_ENTRY && (resolved.args.length > 0 || resolved.via.some((script) => input.scripts[script]?.includes("--direct-node")))) {
+          errors.push(`package.json "${name}" passes arguments to ${GATE_ENTRY}; the CI gate script must use its exact invocation so audit dates and roots cannot be pinned`);
+        }
+        addUnit(resolved.file, "proof script leaf", name);
+      }
     }
     for (const word of mentionedWords(input.scripts[name]!)) {
       const file = normalizeFile(word);
@@ -269,8 +403,10 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
       // value can add `|| true`, `exit 0` or a new line. From the first such
       // step, no proof line later in the job can be trusted.
       const lastProof = proofSteps.at(-1)!.stepIndex;
+      const inertExpressions = [INERT_EXPRESSION, ...Object.keys(INERT_EXPRESSIONS).filter((expression) => expression !== INERT_EXPRESSION)];
+      const withoutInertExpressions = (text: string) => inertExpressions.reduce((value, expression) => value.split(expression).join(""), text);
       const tainted = steps.find(
-        (step) => step.stepIndex <= lastProof && step.run !== null && step.run.split(INERT_EXPRESSION).join("").includes("${{"),
+        (step) => step.stepIndex <= lastProof && step.run !== null && withoutInertExpressions(step.run).includes("${{"),
       );
       if (tainted) {
         errors.push(
@@ -278,30 +414,68 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         );
       }
       // Nothing a proof sees may change how bash, Node or pnpm run it.
-      const checkEnv = (names: string[] | null, where: string) => {
+      const checkEnv = (names: string[] | null, values: Record<string, unknown> | null, where: string) => {
         if (names === null) errors.push(`${where} env: is not a literal mapping, so it could set anything`);
-        for (const name of names ?? []) if (changesExecution(name)) errors.push(`${where} env: sets ${name}, which changes how the proofs run`);
+        for (const name of names ?? []) {
+          const value = values?.[name];
+          const problem = environmentProblem(name, value);
+          if (problem) errors.push(`${where} env: sets ${problem}`);
+          else if (changesExecution(name, value)) errors.push(`${where} env: sets ${name}, which changes how the proofs run`);
+          const configProblem = checkedInPnpmRcProblem(input, name, value);
+          if (configProblem) errors.push(`${where} env: ${configProblem}`);
+        }
       };
-      checkEnv(model.env, model.path);
-      checkEnv(model.jobs[job]?.env ?? null, `${model.path} job "${job}"`);
+      checkEnv(model.env, model.envValues, model.path);
+      checkEnv(model.jobs[job]?.env ?? null, model.jobs[job]?.envValues ?? null, `${model.path} job "${job}"`);
       if (model.jobs[job]?.container) errors.push(`${model.path} job "${job}" runs in a container, which the gate does not model`);
       for (const step of steps.filter((candidate) => candidate.stepIndex <= lastProof)) {
         const where = `${model.path} step "${step.name}"`;
-        checkEnv(step.env, where);
+        const runText = (step.run ?? "").replace(/\\\r?\n\s*/g, " ");
+        const activeRun = runText.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
+        checkEnv(step.env, step.envValues, where);
         if (step.uses !== null && !KNOWN_ACTIONS.includes(actionName(step.uses))) {
           errors.push(`${where} runs action ${step.uses} before the job's last proof; only ${KNOWN_ACTIONS.join(", ")} may`);
         }
-        const word = step.run?.match(EXECUTION_WORD)?.[0] ?? step.run?.match(CONFIG_WORD)?.[0];
+        if (step.uses !== null && actionName(step.uses) === "actions/cache") {
+          const cachePath = step.withValues?.path;
+          const unsafe = typeof cachePath !== "string" || cachePath.split(/\s+/).some((entry) =>
+            entry.startsWith("~") || entry.includes("$") ||
+            /(?:^|[/\\])(?:node_modules|pnpm-workspace\.yaml|\.(?:npm|pnpm|yarn)rc(?:\.yml)?|\.config[/\\]pnpm[/\\]rc|\.pnpmfile(?:\.[cm]?js)?)(?:[/\\]|$)/i.test(entry));
+          if (unsafe) errors.push(`${where} caches a proof-controlling path (HOME dotfile, rc file, workspace manifest, node_modules or pnpmfile)`);
+        }
+        const word = activeRun.match(EXECUTION_WORD)?.[0] ?? activeRun.match(CONFIG_WORD)?.[0];
         if (word) errors.push(`${where} names ${word} in its script; setting it (as a prefix, with export or through $GITHUB_ENV) changes how the proofs run`);
-        if (step.run?.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
+        if (activeRun.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
+        const githubEnvironmentProblem = githubEnvironmentWriteProblem(activeRun);
+        if (githubEnvironmentProblem) errors.push(`${where} ${githubEnvironmentProblem}`);
+        for (const line of activeRun.split("\n").filter((candidate) => /(?:^|[;&|])\s*export\b/.test(candidate))) {
+          const literal = /^\s*export\s+([A-Z][A-Z0-9_]*)=(.+)$/.exec(line);
+          if (!literal || /[;&|]/.test(line) || /\b[A-Z][A-Z0-9_]*=/.test(literal[2]!)) {
+            errors.push(`${where} exports a nonliteral or multiple environment variables`);
+          } else {
+            const problem = environmentProblem(literal[1]!, literal[2]!.replace(/^['"]|['"]$/g, ""));
+            if (problem) errors.push(`${where} exports ${problem}`);
+          }
+        }
+        for (const match of activeRun.matchAll(/\b(?:export\s+)?([A-Z][A-Z0-9_]*)=([^\s"']*)/g)) {
+          const problem = environmentProblem(match[1]!, match[2]);
+          if (problem) errors.push(`${where} sets ${problem}`);
+        }
+        for (const line of activeRun.split("\n")) {
+          const packageManagerProblem = runtimePackageManagerWrite(line);
+          if (packageManagerProblem) errors.push(`${where} ${packageManagerProblem}: ${line.trim()}`);
+        }
       }
       for (const step of proofSteps) {
         const where = `${model.path} step "${step.name}"`;
+        const benignLine = (text: string) =>
+          text === "set -euo pipefail" ||
+          /^echo \"::(?:group::[A-Za-z0-9_.:/ -]+|endgroup::)\"$/.test(text);
         const lines = step
           .run!.split("\n")
           .map((text, index) => ({ number: index + 1, text: text.trim() }))
           .filter((line) => line.text !== "" && !line.text.startsWith("#"))
-          .map((line) => ({ ...line, form: workflowLineForm(line.text) }));
+          .map((line) => ({ ...line, form: benignLine(line.text) ? ({ kind: "benign" } as const) : workflowLineForm(line.text) }));
         const bad = lines.find((line) => "problem" in line.form);
         if (bad) {
           errors.push(`${where} line ${bad.number} is not canonical (${(bad.form as Problem).problem}): ${bad.text}`);
@@ -312,10 +486,14 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         for (const [position, line] of lines.entries()) {
           if (!("kind" in line.form) || line.form.kind !== "command") continue;
           const words = line.form.words;
-          let reached: { file: string; via: string[] } | null = null;
+          let reached: { file: string; via: string[]; args: string[] } | null = null;
           let problem = "it names a proof but runs it in a form the gate does not count";
+          let workflowExtraArgs: string[] = [];
           if (words[0] === "pnpm") {
-            const script = words[1] ?? "";
+            const runForm = words[1] === "run";
+            const scriptIndex = runForm ? 2 : 1;
+            const script = words[scriptIndex] ?? "";
+            workflowExtraArgs = words.slice(scriptIndex + 1);
             if (!script.startsWith("-") && !PNPM_BUILTINS.has(script) && Object.hasOwn(input.scripts, script)) {
               const resolved = resolve(script);
               if ("problem" in resolved) problem = `\`pnpm ${script}\` is not a canonical command: ${resolved.problem}`;
@@ -326,14 +504,23 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           } else {
             const invocation = runnerInvocation(words);
             if ("problem" in invocation) problem = invocation.problem;
-            else reached = { file: invocation.file, via: [] };
+            else reached = { file: invocation.file, via: [], args: invocation.args };
           }
           if (!reached) {
             // A non-canonical proof script is reported once, in the inventory.
-            const reported = words[0] === "pnpm" && PROOF_SCRIPT.test(words[1] ?? "") && Object.hasOwn(input.scripts, words[1]!);
+            const reportedScript = words[1] === "run" ? words[2] ?? "" : words[1] ?? "";
+            const reported = words[0] === "pnpm" && PROOF_SCRIPT.test(reportedScript) && Object.hasOwn(input.scripts, reportedScript);
             if (namesProof(line.text) && !reported) errors.push(`${where} line ${line.number}: ${problem}: ${line.text}`);
             continue;
           }
+          if (reached.file === GATE_ENTRY && (reached.args.length > 0 || workflowExtraArgs.length > 0 || line.text.includes("--direct-node") || reached.via.some((script) => input.scripts[script]?.includes("--direct-node")))) {
+            errors.push(`${where} line ${line.number} passes arguments to ${GATE_ENTRY}; the CI gate line must use its exact invocation so audit dates and roots cannot be pinned`);
+          }
+          const source = input.readFile(reached.file) ?? "";
+          errors.push(...proofOwnedEnvironmentProblems(source, line.form.assignments, `${where} line ${line.number}`));
+          errors.push(...proofOwnedEnvironmentProblems(source, model.env ?? [], `${model.path} env`, model.envValues));
+          errors.push(...proofOwnedEnvironmentProblems(source, model.jobs[job]?.env ?? [], `${model.path} job "${job}" env`, model.jobs[job]?.envValues));
+          errors.push(...proofOwnedEnvironmentProblems(source, step.env ?? [], `${where} env`, step.envValues));
           const unit = units.get(reached.file);
           if (!unit) continue;
           const invocation = { workflow: model.path, job, step: step.name, stepIndex: step.stepIndex, position, line: step.line, command: line.text, via: reached.via };
@@ -407,7 +594,7 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         errors.push(`${where}: ${PROOF_SUITES} declares it as a sub-proof of ${suiteOf.get(unitId)} (remove one)`);
         continue;
       }
-      const fields = section === "localOnly" ? ["owner", "needs", "reason"] : ["owner", "expires", "reason"];
+      const fields = section === "localOnly" ? ["owner", "needs", "reviewedOn", "expires", "reason"] : ["owner", "expires", "reason"];
       if (!isRecord(raw)) {
         errors.push(`${where}: entry must be a mapping of ${fields.join(", ")}`);
         continue;
@@ -442,6 +629,30 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           continue;
         }
       } else {
+        const reviewedOn = calendarDay(entry.reviewedOn as string);
+        const expires = calendarDay(entry.expires as string);
+        const today = calendarDay(input.today);
+        if (reviewedOn === null || expires === null || today === null) {
+          errors.push(`${where}: reviewedOn (${String(entry.reviewedOn)}), expires (${String(entry.expires)}) and today (${input.today}) must be real calendar dates, YYYY-MM-DD`);
+          continue;
+        }
+        if (reviewedOn > today) {
+          errors.push(`${where}: reviewedOn ${entry.reviewedOn} is in the future (review the local-only declaration before using it)`);
+          continue;
+        }
+        if (expires < reviewedOn) {
+          errors.push(`${where}: expires ${entry.expires} is before reviewedOn ${entry.reviewedOn}`);
+          continue;
+        }
+        if (today > expires) {
+          errors.push(`${where}: local-only review expired on ${entry.expires} (owner ${entry.owner}); renew the reviewed declaration or wire the proof into CI`);
+          continue;
+        }
+        if (expires - reviewedOn > MAX_QUARANTINE_DAYS * DAY_MS) {
+          const latest = new Date(reviewedOn + MAX_QUARANTINE_DAYS * DAY_MS).toISOString().slice(0, 10);
+          errors.push(`${where}: expires ${entry.expires}, more than ${MAX_QUARANTINE_DAYS} days after reviewedOn (latest allowed: ${latest}); renew it in review instead`);
+          continue;
+        }
         // A local-only proof needs an input CI does not have. The gate checks
         // that the proof reads each named variable and that neither CI nor
         // any workflow provides it; a proof that simply fails cannot say that.
@@ -452,8 +663,7 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           const word = new RegExp(`(?<![A-Za-z0-9_])${need}(?![A-Za-z0-9_])`);
           const workflow = input.workflows.find((candidate) => word.test(candidate.text));
           if (workflow) return [`${workflow.path} mentions ${need}, so CI may provide it`];
-          const read = new RegExp(`process\\.env(?:\\.${need}(?![A-Za-z0-9_])|\\[\\s*["'\`]${need}["'\`]\\s*\\])`);
-          return read.test(source) ? [] : [`${unitId} does not read process.env.${need}`];
+          return requiresProcessEnvironment(source, need) ? [] : [`${unitId} does not require process.env.${need}`];
         });
         if (needProblems.length > 0) {
           errors.push(`${where}: ${needProblems.join("; ")} (local-only needs an input CI lacks; a red proof belongs under quarantined)`);
