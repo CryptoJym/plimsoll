@@ -9,7 +9,7 @@ import path from "node:path";
 const repo = path.resolve(import.meta.dirname, "../..");
 const root = fs.mkdtempSync(path.join(fs.realpathSync(process.env.PLIMSOLL_PROOF_HOME ?? os.tmpdir()), "loss-claim-mutants-"));
 const removeWholeRecordProof = {
-  before: 'if (!proof || !probe || probe.escaped) return false;\n  return proof === "top_type" ? probe.typeCount === 1 :\n    probe.typeCount === 2 && probe.payloadCount === 1;',
+  before: 'if (!proof || !probe || probe.escaped || probe.scanned !== recordBytes ||\n    probe.typeCount >= 3 || probe.payloadCount >= 2) return false;\n  return proof === "top_type" ? probe.typeCount === 1 :\n    probe.typeCount === 2 && probe.payloadCount === 1;',
   after: 'return true;',
 };
 const mutations = [

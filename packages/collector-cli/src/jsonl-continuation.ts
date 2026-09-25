@@ -408,7 +408,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      if (!skip.ended) return skip.offset === current.size ? refuse("incomplete_record") : result("checkpoint");
      const skippedBytes = skip.offset - parser.recordStart;
      if (skippedBytes <= ABSOLUTE_MAX_READ_BYTES && skip.reason !== "enrollment_boundary_fragment") return refuse(skip.reason);
-     if (!skip.usagePossible && !proveSkippedNonUsage(skip.nonUsageProof,envelope.discriminatorProbe)) {
+     if (!skip.usagePossible && !proveSkippedNonUsage(skip.nonUsageProof,envelope.discriminatorProbe,skippedBytes)) {
        skip.kind = "unknown"; skip.usagePossible = true;
      }
      const headBytes = Math.min(512, current.size), continuityBytes = Math.min(512, skip.offset);

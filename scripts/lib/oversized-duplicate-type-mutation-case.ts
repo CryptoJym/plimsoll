@@ -15,7 +15,7 @@ try {
   fs.symlinkSync(path.join(repo,"node_modules"),path.join(mutant,"node_modules"),"dir");
   const target=path.join(mutant,"packages/collector-cli/src/capture-record-loss.ts");
   const source=fs.readFileSync(target,"utf8");
-  const before='return proof === "top_type" ? probe.typeCount === 1 :\n    probe.typeCount === 2 && probe.payloadCount === 1;';
+  const before='if (!proof || !probe || probe.escaped || probe.scanned !== recordBytes ||\n    probe.typeCount >= 3 || probe.payloadCount >= 2) return false;\n  return proof === "top_type" ? probe.typeCount === 1 :\n    probe.typeCount === 2 && probe.payloadCount === 1;';
   assert(source.includes(before),"prefix-only mutation anchor missing");
   fs.writeFileSync(target,source.replace(before,"return true;"));
   const run=spawnSync(process.execPath,[path.join(repo,"node_modules/tsx/dist/cli.mjs"),
@@ -25,7 +25,7 @@ try {
   let rejected=false;
   try {
     const result=JSON.parse(run.stdout) as {passed:boolean;results:Array<{eof:boolean;receipts:Array<{usagePossible:number}>;gaps:unknown[];passed:boolean}>};
-    rejected=run.status===1 && result.passed===false && result.results.length===3 &&
+    rejected=run.status===1 && result.passed===false && result.results.length===5 &&
       result.results.every(row=>row.eof && !row.passed && row.receipts.length===1 &&
         row.receipts[0]?.usagePossible===0 && row.gaps.length===0);
   } catch { /* A crash is not a rejected behavioral mutation. */ }

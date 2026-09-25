@@ -23,10 +23,18 @@ if (process.env.PLIMSOLL_SKIP_CLASSIFIER_CASES !== "1") {
   const splitProbe=newSkippedDiscriminatorProbe();
   observeSkippedDiscriminators(splitProbe,Buffer.from('{"type":"user","padding":"abc","ty'));
   observeSkippedDiscriminators(splitProbe,Buffer.from('pe":"assistant"}'));
-  assert.equal(proveSkippedNonUsage("top_type",splitProbe),false,"a key split across slices must remain visible");
+  assert.equal(proveSkippedNonUsage("top_type",splitProbe,splitProbe.scanned),false,"a key split across slices must remain visible");
   const plainProbe=newSkippedDiscriminatorProbe();
   observeSkippedDiscriminators(plainProbe,Buffer.from('{"type":"user","padding":"plain"}'));
-  assert.equal(proveSkippedNonUsage("top_type",plainProbe),true,"a complete unique type is known non-usage");
+  assert.equal(proveSkippedNonUsage("top_type",plainProbe,plainProbe.scanned),true,"a complete unique type is known non-usage");
+  assert.equal(proveSkippedNonUsage("top_type",plainProbe,plainProbe.scanned+1),false,"an incomplete scan is unknown");
+  const saturatedProbe={...plainProbe,payloadCount:2};
+  assert.equal(proveSkippedNonUsage("top_type",saturatedProbe,saturatedProbe.scanned),false,"an old saturated continuation is unknown");
+  const capProbe=newSkippedDiscriminatorProbe();
+  observeSkippedDiscriminators(capProbe,Buffer.from('{"type":"user","payload":{},"payload":{},"padding":"plain"'));
+  observeSkippedDiscriminators(capProbe,Buffer.from(',"type":"assistant"}'));
+  assert.equal(capProbe.typeCount,2,"type must keep scanning after the payload cap");
+  assert.equal(proveSkippedNonUsage("top_type",capProbe,capProbe.scanned),false,"a later usage type is unknown");
 }
 
 type Provider = "codex"|"claude";
@@ -41,6 +49,10 @@ const cases:Case[] = [
     `{"type":"user","padding":${JSON.stringify(p)},"type":"assistant","sessionId":${JSON.stringify(id)},"timestamp":${JSON.stringify(s)},"message":{"id":"usage-1","model":${JSON.stringify(claudeModel(p))},"usage":{"input_tokens":11,"output_tokens":1}}}`},
   {name:"duplicate_codex_payload_type",provider:"codex",build:(id,s,p)=>
     `{"type":"event_msg","timestamp":${JSON.stringify(s)},"payload":{"type":"user_message","padding":${JSON.stringify(p)},"type":"token_count","info":${JSON.stringify(usage.info)},"rate_limits":${JSON.stringify(codexPayload(p).rate_limits)}}}`},
+  {name:"payload_cap_claude_duplicate_type",provider:"claude",build:(id,s,p)=>
+    `{"type":"user","payload":{},"payload":{},"padding":${JSON.stringify(p)},"type":"assistant","sessionId":${JSON.stringify(id)},"timestamp":${JSON.stringify(s)},"message":{"id":"usage-1","model":${JSON.stringify(claudeModel(p))},"usage":{"input_tokens":11,"output_tokens":1}}}`},
+  {name:"saturated_payload_then_codex_usage",provider:"codex",build:(id,s,p)=>
+    `{"type":"session_meta","payload":{"id":${JSON.stringify(id)}},"payload":{},"padding":${JSON.stringify(p)},"type":"event_msg","timestamp":${JSON.stringify(s)},"payload":${JSON.stringify(codexPayload(p))}}`},
 ];
 
 const fixtureRoot=fs.mkdtempSync(path.join(fs.realpathSync(process.env.PLIMSOLL_PROOF_HOME ?? os.tmpdir()),"duplicate-type-claim-"));
@@ -75,7 +87,9 @@ try {
       const large=c.build(id,stamp,"x".repeat(17*1024*1024));
       const small=c.build(controlId,stamp,"");
       const parsed=JSON.parse(small);
-      const validUsage=c.provider==="codex"?parsed.type==="event_msg"&&parsed.payload?.type==="token_count":parsed.type==="assistant"&&!!parsed.message?.usage;
+      const parsedLarge=JSON.parse(large);
+      const validUsage=(c.provider==="codex"?parsed.type==="event_msg"&&parsed.payload?.type==="token_count":parsed.type==="assistant"&&!!parsed.message?.usage)&&
+        (c.provider==="codex"?parsedLarge.type==="event_msg"&&parsedLarge.payload?.type==="token_count":parsedLarge.type==="assistant"&&!!parsedLarge.message?.usage);
       fs.writeFileSync(file,[...pre(id),large].join("\n")+"\n");
       fs.writeFileSync(control,[...pre(controlId),small].join("\n")+"\n");
       const cursor=(f:string)=>(buffer.database.prepare("select committed_offset as offset from rollout_scan_state where file=?")

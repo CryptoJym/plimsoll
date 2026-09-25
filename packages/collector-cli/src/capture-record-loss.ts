@@ -118,9 +118,14 @@ export function observeSkippedDiscriminators(probe: SkippedDiscriminatorProbe, b
     }
     probe[match]=state;
   };
-  if (!probe.escaped && probe.typeCount<3 && probe.payloadCount<2) {
+  if (!probe.escaped) {
     probe.escaped=bytes.includes(0x5c);
-    if (!probe.escaped) {count(TYPE_KEY,"typeMatch","typeCount",3);count(PAYLOAD_KEY,"payloadMatch","payloadCount",2);}
+    if (!probe.escaped) {
+      // Each key must keep scanning until its own counter saturates. A full
+      // payload counter must not stop a later usage type from being seen.
+      if (probe.typeCount<3) count(TYPE_KEY,"typeMatch","typeCount",3);
+      if (probe.payloadCount<2) count(PAYLOAD_KEY,"payloadMatch","payloadCount",2);
+    }
   }
   probe.scanned += bytes.length;
 }
@@ -161,8 +166,11 @@ export function classifySkippedRecord(provider: "codex" | "claude", prefix: Buff
  * extra spelling of the relevant keys. Any escape or extra candidate is a
  * possible usage loss, even when the extra bytes were inside a string. */
 export function proveSkippedNonUsage(proof: SkippedPrefixClassification["nonUsageProof"],
-  probe: SkippedDiscriminatorProbe | undefined): boolean {
-  if (!proof || !probe || probe.escaped) return false;
+  probe: SkippedDiscriminatorProbe | undefined, recordBytes: number): boolean {
+  // A saturated counter might have stopped in an earlier sealed continuation.
+  // A partial scan cannot prove the later bytes contained no usage keys.
+  if (!proof || !probe || probe.escaped || probe.scanned !== recordBytes ||
+    probe.typeCount >= 3 || probe.payloadCount >= 2) return false;
   return proof === "top_type" ? probe.typeCount === 1 :
     probe.typeCount === 2 && probe.payloadCount === 1;
 }
