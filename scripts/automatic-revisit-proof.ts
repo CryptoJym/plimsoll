@@ -14,6 +14,7 @@ import { AUTOMATIC_CAPTURE_LIMITS } from "../packages/collector-cli/src/capture-
 import { DEFAULT_JSONL_TAILER_IO, jsonlScanStateKey, readJsonlTail } from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { rootCursorKey, type CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { maintenanceCandidateHash } from "../packages/collector-cli/src/maintenance-progress";
+import { runUncoveredCatchupCase } from "./uncovered-catchup-case";
 
 type Visit = { cadence: number; offset: number; deferred: number; retained?: boolean };
 async function prove(source: CaptureRoot["source"]) {
@@ -258,8 +259,10 @@ async function prove(source: CaptureRoot["source"]) {
 async function main() {
   const proofs = [];
   for (const source of ["codex", "claude_code"] as const) proofs.push(await prove(source));
-  const passed = proofs.every(p => p.passed);
-  console.log(JSON.stringify({ schema: "plimsoll.automatic-revisit-proof.v1", syntheticOnly: true, proofs, passed }, null, 2));
+  const catchupPassed = await runUncoveredCatchupCase();
+  const passed = proofs.every(p => p.passed) && catchupPassed;
+  console.log(JSON.stringify({ schema: "plimsoll.automatic-revisit-proof.v1", syntheticOnly: true, proofs,
+    uncoveredCatchupPassed:catchupPassed, passed }, null, 2));
   if (!passed) process.exitCode = 1;
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

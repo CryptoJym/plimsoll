@@ -371,6 +371,11 @@ export async function runBoundedCaptureContract(
   const preinstall = path.join(day, `rollout-preinstall-${uuid(1)}.jsonl`);
   fs.writeFileSync(preinstall, "", { mode: 0o600 });
   fs.truncateSync(preinstall, PREINSTALL_BYTES);
+  // Keep an untouched excluded generation for the explicit history pass.
+  // The grown generation below has a separate automatic EOF cursor.
+  const untouchedPreinstall = path.join(day, `rollout-preinstall-${uuid(9)}.jsonl`);
+  fs.writeFileSync(untouchedPreinstall, "", { mode: 0o600 });
+  fs.truncateSync(untouchedPreinstall, PREINSTALL_BYTES);
   const recoveryPreinstall = path.join(day, `rollout-recovery-${uuid(8)}.jsonl`);
   fs.writeFileSync(recoveryPreinstall, "{}\n", { mode: 0o600 });
   const externalClaudeDirectory = path.join(root, "external-claude-directory");
@@ -391,7 +396,7 @@ export async function runBoundedCaptureContract(
     readTail: (...args: Parameters<typeof DEFAULT_JSONL_TAILER_IO.readTail>) => {
       const read = DEFAULT_JSONL_TAILER_IO.readTail(...args);
       if (read) {
-        if (path.resolve(args[0]) === path.resolve(preinstall)) preinstallBodyReads += 1;
+        if ([preinstall, untouchedPreinstall].some((file) => path.resolve(args[0]) === path.resolve(file))) preinstallBodyReads += 1;
         if (path.resolve(args[0]) === path.resolve(recoveryPreinstall)) recoveryBodyReads += 1;
         totalBodyOpens += 1;
         totalBodyBytesRead += read.bytesRead;
@@ -433,15 +438,36 @@ export async function runBoundedCaptureContract(
     baselineRun.rawEventWrites === 0 &&
     baselineRun.rollout.bytesRead === 0 &&
     preinstallBodyReads === 0 &&
-    excludedRun.rollout.excludedGenerations === 2 &&
+    excludedRun.rollout.excludedGenerations === 3 &&
     irrelevantSymlinkBaselineSafe;
 
   fs.appendFileSync(preinstall, `${tokenLine(uuid(1), 1)}\n`);
-  const growthRun = await maintenance.runRecent();
-  const preinstallGrowthExcluded =
-    growthRun.rollout.filesRead === 0 &&
-    growthRun.rollout.eventsAppended === 0 &&
-    preinstallBodyReads === 0;
+  const growthRuns: Array<Awaited<ReturnType<CollectorMaintenance["runRecent"]>>> = [];
+  for (let turn = 0; turn < 12; turn += 1) {
+    growthRuns.push(await maintenance.runRecent());
+    if (buffer.database.prepare(`select 1 from rollout_scan_state where file=? and committed_offset=?`)
+      .get(jsonlScanStateKey(preinstall), fs.statSync(preinstall).size)) break;
+  }
+  // The 500 MiB prefix ends mid-record (NUL), so its first appended line has
+  // no provable boundary. Advance to LF and disclose a possible usage loss.
+  const boundaryLoss = buffer.database.prepare(`select 1 from sqlite_master where type='table' and name='capture_record_losses'`).get()
+    ? buffer.database.prepare(`select reason, usage_possible as possible
+      from capture_record_losses where source='codex' and reason='enrollment_boundary_fragment' limit 1`)
+      .get() as { reason: string; possible: number } | undefined : undefined;
+  const growthReads = growthRuns.reduce((sum, run) => sum + run.rollout.filesRead, 0);
+  const growthBytes = growthRuns.reduce((sum, run) => sum + run.rollout.bytesRead, 0);
+  const growthCursorAtEnd = Boolean(buffer.database.prepare(`select 1 from rollout_scan_state where file=? and committed_offset=?`)
+    .get(jsonlScanStateKey(preinstall), fs.statSync(preinstall).size));
+  const growthRunDetail = growthRuns.map((run) => ({read:run.rollout.filesRead, bytes:run.rollout.bytesRead,
+    unresolved:run.rollout.unresolvedRecords, reasons:run.rollout.continuationReasons, commits:run.rollout.slicesCommitted,
+    errors:run.rollout.readErrors}));
+  const preinstallGrowthHandled =
+    growthReads >= 1 && growthReads <= 12 &&
+    growthBytes > 0 && growthBytes <= 12 * 2048 &&
+    growthRuns.every((run) => run.rollout.eventsAppended === 0) &&
+    preinstallBodyReads === 0 &&
+    boundaryLoss?.possible === 1 &&
+    growthCursorAtEnd;
   const automaticPreinstallBodyReads = preinstallBodyReads;
 
   fs.truncateSync(recoveryPreinstall, 0);
@@ -604,7 +630,11 @@ export async function runBoundedCaptureContract(
     (buffer.database.prepare(`select count(*) as count from buffered_events where session_id in (?, ?)`)
       .get(uuid(6), uuid(7)) as { count: number }).count === 2;
 
-  const full = await new RolloutTailer(buffer, codexRoot, () => [], io).scan({ scope: "full" });
+  // One bounded explicit-history open proves the large excluded generation
+  // remains readable. Keep this resource fixture from importing 500 MiB; the
+  // history claim must remain incomplete after an interrupted pass.
+  const full = await new RolloutTailer(buffer, codexRoot, () => [], io).scan({ scope: "full",
+    onProgress: () => preinstallBodyReads === automaticPreinstallBodyReads });
   const fullCoverage = recordExplicitFullHistoryCoverage(buffer.database, "codex", full);
   const exclusionAfterFull = captureBaselineStatus(buffer.database).sources.find(
     (source) => source.source === "codex",
@@ -612,7 +642,7 @@ export async function runBoundedCaptureContract(
   const historyTruth =
     !fullCoverage.promoted &&
     historyCoverageStatus(buffer.database).status === "incomplete" &&
-    exclusionAfterFull?.excludedGenerations === 2;
+    exclusionAfterFull?.excludedGenerations === 3;
 
   const statusResponse = await fetch(`http://127.0.0.1:${port}/status`);
   const statusText = await statusResponse.text();
@@ -662,7 +692,7 @@ export async function runBoundedCaptureContract(
     preinstallFixtureLarge: PREINSTALL_BYTES >= 500 * 1024 * 1024,
     denseFixtureLarge: denseBytes >= 13 * 1024 * 1024,
     baselineNoBody,
-    preinstallGrowthExcluded,
+    preinstallGrowthHandled,
     truncationBlockedWithoutRead,
     replacementRecoveredExactlyOnce,
     firstCadenceBounded,
@@ -686,7 +716,7 @@ export async function runBoundedCaptureContract(
     status: passed ? "pass" : "fail",
     detail: passed
       ? "A 500 MiB pre-install generation and an irrelevant external-directory alias were metadata-only handled without body reads; candidate aliases/nonregular entries failed closed, while a dense 13+ MiB new generation resumed across bounded cadences/restart with responsive HTTP, exact tokens, private state, and graceful in-work SIGTERM cleanup."
-      : `Bounded capture predicates failed: ${JSON.stringify({ failedPredicates, denseTotals, signalCleanup })}`,
+      : `Bounded capture predicates failed: ${JSON.stringify({ failedPredicates, growth: { filesRead:growthReads, bytesRead:growthBytes, cursorAtEnd:growthCursorAtEnd, boundaryLoss, bodyReads:preinstallBodyReads, runs:growthRunDetail }, denseTotals, signalCleanup })}`,
     durationMs: Math.round((performance.now() - started) * 100) / 100,
     counters,
     measurements: {
@@ -705,7 +735,7 @@ export async function runBoundedCaptureContract(
       realDirectoriesStillRecurse: discoveryEntryPolicy.realDirectoriesStillRecurse,
       ignoredAliasEntriesVisited: discoveryEntryPolicy.ignoredAliasEntriesVisited,
       claudePreinstallBodyReads,
-      preinstallGrowthExcluded,
+      preinstallGrowthHandled,
       truncationBlockedWithoutRead,
       replacementRecoveredExactlyOnce,
       recoveryBodyReads,
