@@ -1,4 +1,4 @@
-export const RESOURCE_PROOF_SCHEMA = "plimsoll.resource-proof.v1" as const;
+export const RESOURCE_PROOF_SCHEMA = "plimsoll.resource-proof.v2" as const;
 
 export const WORK_COUNTER_NAMES = [
   "eventsObserved",

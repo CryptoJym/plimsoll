@@ -60,7 +60,7 @@ listenersCreated, restartRequests
 filesystemEntriesScanned
 ```
 
-Counters are per scenario and reset before each action phase. Production lanes may add counters, but changing a counter's meaning requires a receipt schema version change.
+Counters are per scenario and reset before each action phase. Production lanes may add counters, but changing a counter's meaning requires a receipt schema version change. On 2026-09-24, release 0.7.40 broadened `filesystemEntriesScanned` to include successful entries from every observed directory API; the resource receipt is now `plimsoll.resource-proof.v2`.
 
 ## Adversarial scenarios
 

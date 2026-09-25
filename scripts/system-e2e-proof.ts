@@ -1216,9 +1216,12 @@ async function main() {
   // These exact values come from the receipt's generated fixture topology.
   // Keeping both the expected values and the raw measurements in the artifact
   // makes a partial walk or a new scan visible to the digest and the gate.
+  // The stable phase walks each stable fixture entry exactly once. These
+  // ceilings only stop the fixture from silently growing; the exact topology
+  // and enumeration-call assertions above remain the regression guards.
   assert.ok(filesystemEntriesScanned <= 8_192);
   assert.ok(setupFilesystemEntriesScanned <= 7_680);
-  assert.ok(unchangedFilesystemEntriesScanned <= 512);
+  assert.ok(unchangedFilesystemEntriesScanned <= 2_048);
   assert.ok(filesystemEnumerationCalls <= 32);
   assert.ok(unchangedFilesystemEnumerationCalls <= 8);
   assert.equal(idle?.measurements.stableSweepCursorReset, true);

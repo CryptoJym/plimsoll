@@ -389,7 +389,7 @@ function assertResourceReceipt(receipt: unknown) {
     ["schema", "generatedAt", "overall", "gateReady", "requireIntegrated", "environment", "summary", "scenarios"],
     "resource receipt",
   );
-  assert.equal(receipt.schema, "plimsoll.resource-proof.v1");
+  assert.equal(receipt.schema, "plimsoll.resource-proof.v2");
   assert.equal(receipt.overall, "pass");
   assert.equal(receipt.gateReady, true);
   assert.equal(receipt.requireIntegrated, true);
