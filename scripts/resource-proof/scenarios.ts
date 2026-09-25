@@ -2630,6 +2630,7 @@ export async function runNoChangeConstantWorkContract(
       firstRun.transcript.filesRead +
       restartRun.rollout.filesRead +
       restartRun.transcript.filesRead +
+      excludedAppendRuns.reduce((total, run) => total + run.rollout.filesRead + run.transcript.filesRead, 0) +
       appendedRuns.reduce((total, run) => total + run.rollout.filesRead + run.transcript.filesRead, 0) +
       afterAppendRun.rollout.filesRead +
       afterAppendRun.transcript.filesRead +
@@ -2638,6 +2639,7 @@ export async function runNoChangeConstantWorkContract(
     counters.fileBytesRead =
       firstRun.rollout.bytesRead +
       firstRun.transcript.bytesRead +
+      excludedAppendRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
       appendedRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
       replayRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
       transcriptPartial.bytesRead +
