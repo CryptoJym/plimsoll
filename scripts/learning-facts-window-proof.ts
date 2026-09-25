@@ -11,7 +11,8 @@ import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { deterministicLearningFactId, buildWorkEpisodeFact } from "../packages/collector-cli/src/learning-facts";
+import { deterministicLearningFactId, buildWorkEpisodeFact,
+  buildTechniqueExposureFact } from "../packages/collector-cli/src/learning-facts";
 import { runLearningMaterialization } from "../packages/collector-cli/src/learning-materializer";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
@@ -283,6 +284,57 @@ function x6b() {
   } finally { store.close(); }
 }
 
+function x6d() {
+  const file = path.join(root, "x6d.sqlite");
+  const now = Date.now();
+  const store = buffer(file, { episodes: 2 });
+  try {
+    const episode = (key: string, at: number, parentEpisodeId?: string) =>
+      buildWorkEpisodeFact({ source: "codex", sessionId: "r2-session",
+        sourceEpisodeKey: key, workClass: "other", complexityBand: "unknown",
+        startedAt: iso(at), ...(parentEpisodeId ? { parentEpisodeId } : {}) });
+    const parent = episode("x6d-parent", now - 6 * DAY);
+    store.learningFacts.recordWorkEpisode(parent);
+    store.learningFacts.recordWorkEpisode(episode("x6d-second", now - 5 * DAY));
+    store.learningFacts.recordWorkEpisode(episode("x6d-third", now - 4 * DAY));
+    const lostAt = now - HOUR;
+    const lost = store.learningFacts.recordWorkEpisode(
+      episode("x6d-child", lostAt, parent.episodeId));
+    assert.equal(lost.dropReason, "stale_reference");
+    const window = store.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(lostAt),
+      "a child whose parent the episode cap evicted was lost inside the claimed window");
+    return { case: "X6d", lostAt: iso(lostAt), effectiveStart: window.effectiveStartInclusive };
+  } finally { store.close(); }
+}
+
+function x6e() {
+  const file = path.join(root, "x6e.sqlite");
+  const now = Date.now();
+  const store = buffer(file, { episodes: 2 });
+  try {
+    const episode = (key: string, at: number) => buildWorkEpisodeFact({
+      source: "codex", sessionId: "r2-session", sourceEpisodeKey: key,
+      workClass: "other", complexityBand: "unknown", startedAt: iso(at) });
+    const parent = episode("x6e-parent", now - 6 * DAY);
+    store.learningFacts.recordWorkEpisode(parent);
+    store.learningFacts.recordWorkEpisode(episode("x6e-second", now - 5 * DAY));
+    store.learningFacts.recordWorkEpisode(episode("x6e-third", now - 4 * DAY));
+    const lostAt = now - HOUR;
+    const lost = store.learningFacts.recordTechniqueExposure(buildTechniqueExposureFact({
+      episodeId: parent.episodeId, techniqueId: "x6e-tech", techniqueVersion: "1",
+      assignmentId: "x6e-assignment", workClass: "other", complexityBand: "unknown",
+      exposedAt: iso(lostAt), mode: "treatment" }));
+    assert.equal(lost.dropReason, "stale_reference");
+    const window = store.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(lostAt),
+      "an exposure whose episode the cap evicted was lost inside the claimed window");
+    return { case: "X6e", lostAt: iso(lostAt), effectiveStart: window.effectiveStartInclusive };
+  } finally { store.close(); }
+}
+
 function legacyClockFixture(name: string, now: number, futureAt?: number) {
   const file = path.join(root, `${name}.sqlite`);
   const store = buffer(file, { attempts: 5 });
@@ -462,6 +514,8 @@ async function main() {
     if (selected === "all" || selected === "w8") results.push(w8());
     if (selected === "all" || selected === "x6a") results.push(x6a());
     if (selected === "all" || selected === "x6b") results.push(x6b());
+    if (selected === "all" || selected === "x6d") results.push(x6d());
+    if (selected === "all" || selected === "x6e") results.push(x6e());
     if (selected === "all" || selected === "x5a") results.push(x5a());
     if (selected === "all" || selected === "x5b") results.push(x5b());
     if (selected === "all" || selected === "x5f") results.push(x5f());

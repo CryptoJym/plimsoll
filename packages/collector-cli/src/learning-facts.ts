@@ -905,15 +905,16 @@ export class LearningFactStore {
       where table_name = 'tool_attempt_facts'`).run(capacityDropCount(this.db));
   }
 
-  private noteAttemptLostToEvictedReference(
-    referenceTable: "tool_attempt_facts" | "work_episode_facts", startedAt: string,
+  private noteFactLostToEvictedReference(
+    lostTable: LearningFactTableDefinition,
+    referenceTable: "tool_attempt_facts" | "work_episode_facts", occurredAt: string,
   ): boolean {
     const state = this.db.prepare(`select evicted_count as n from learning_fact_table_state
       where table_name = ?`).get(referenceTable) as { n: number } | undefined;
     if (!state?.n) return false;
-    const at = retentionInstant(startedAt);
+    const at = retentionInstant(occurredAt);
     if (at === null) return false;
-    this.advanceLossCutoff(LEARNING_FACT_TABLES[0]!, at + 1);
+    this.advanceLossCutoff(lostTable, at + 1);
     return true;
   }
 
@@ -1199,7 +1200,8 @@ export class LearningFactStore {
               endedAt: string | null;
             } | undefined;
           if (!episode) {
-            this.noteAttemptLostToEvictedReference("work_episode_facts", start.startedAt);
+            this.noteFactLostToEvictedReference(
+              LEARNING_FACT_TABLES[0]!, "work_episode_facts", start.startedAt);
             return this.dropFact<ToolAttemptFact>();
           }
           if (episode.source !== start.source || episode.sessionId !== start.sessionId) {
@@ -1220,7 +1222,8 @@ export class LearningFactStore {
             .prepare(`${ATTEMPT_SELECT} where operation_id = ?`)
             .get(start.retryOf) as AttemptRow | undefined;
           if (!retryTarget) {
-            if (this.noteAttemptLostToEvictedReference("tool_attempt_facts", start.startedAt)) {
+            if (this.noteFactLostToEvictedReference(
+              LEARNING_FACT_TABLES[0]!, "tool_attempt_facts", start.startedAt)) {
               return this.dropFact<ToolAttemptFact>("retry_target_missing");
             }
             throw new Error("ToolAttemptRetryTargetMissing");
@@ -1347,7 +1350,11 @@ export class LearningFactStore {
             sessionId: string;
             startedAt: string;
           } | undefined;
-        if (!parent) return this.dropFact<WorkEpisodeFact>();
+        if (!parent) {
+          this.noteFactLostToEvictedReference(
+            LEARNING_FACT_TABLES[1]!, "work_episode_facts", fact.startedAt);
+          return this.dropFact<WorkEpisodeFact>();
+        }
         if (parent.source !== fact.source || parent.sessionId !== fact.sessionId) {
           throw new Error("WorkEpisodeParentIdentityConflict");
         }
@@ -1448,7 +1455,11 @@ export class LearningFactStore {
           startedAt: string;
           endedAt: string | null;
         } | undefined;
-      if (!episode) return this.dropFact<TechniqueExposureFact>();
+      if (!episode) {
+        this.noteFactLostToEvictedReference(
+          LEARNING_FACT_TABLES[2]!, "work_episode_facts", fact.exposedAt);
+        return this.dropFact<TechniqueExposureFact>();
+      }
       if (
         episode.workClass !== fact.workClass ||
         episode.complexityBand !== fact.complexityBand
