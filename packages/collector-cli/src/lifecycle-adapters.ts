@@ -1,6 +1,7 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
@@ -28,6 +29,7 @@ import {
   type LifecycleDatabaseAdapter,
   type LifecycleDatabaseRestore,
   type LifecycleDatabaseSnapshot,
+  type LifecycleFenceGuard,
   type LifecycleServiceAdapter,
   type ManagedLifecyclePaths,
 } from "./lifecycle-filesystem";
@@ -658,10 +660,24 @@ const CLONE_TIMEOUT_MS = 5 * 60_000;
 /** clonefile(2) from libSystem; flag 1 is CLONE_NOFOLLOW. Prints 0 or -1. */
 const CLONEFILE_SCRIPT =
   'ObjC.bindFunction("clonefile", ["int", ["char *", "char *", "unsigned int"]]); ' +
-  "function run(argv) { return String($.clonefile(argv[0], argv[1], 1)); }";
+  "function run(argv) { const status = $.clonefile(argv[0], argv[1], 1); " +
+  "if (status === 0) { const data = $.NSString.alloc.initWithString('clonefile').dataUsingEncoding($.NSUTF8StringEncoding); " +
+  "$.NSFileManager.defaultManager.createFileAtPathContentsAttributes(argv[1] + '.plimsoll-clonefile', data, undefined); } " +
+  "return String(status); }";
 
-/** Returns true only when `destination` is now an APFS clone of `source`. */
-export type FileCloner = (source: string, destination: string) => boolean;
+/**
+ * Evidence returned only by the clonefile(2) helper. A plain boolean is not
+ * accepted: a byte-copy mutation must fall back to the audited copy path
+ * instead of being labelled as a clone.
+ */
+const CLONE_EVIDENCE = Symbol("clonefile-evidence");
+export type CloneEvidence = { readonly method: "clonefile"; readonly [CLONE_EVIDENCE]: true };
+export type FileCloner = (source: string, destination: string) => CloneEvidence | false;
+
+function isCloneEvidence(value: CloneEvidence | false): value is CloneEvidence {
+  return typeof value === "object" && value !== null && value.method === "clonefile" &&
+    value[CLONE_EVIDENCE] === true;
+}
 
 /** Read-only: whether `source` can be cloned to a file created at or under `destination`. */
 export type CloneSupport = (source: string, destination: string) => boolean;
@@ -710,8 +726,11 @@ export const volumeSupportsClone: CloneSupport = (source, destination) => {
  * this process never opens (and closes) a descriptor on the source, which
  * would release the SQLite POSIX locks that keep a quiesced ledger quiet.
  */
-export const cloneFileOrFail: FileCloner = (source, destination) => {
-  if (process.platform !== "darwin") return false;
+const cloneEvidenceMarker = (destination: string) => `${destination}.plimsoll-clonefile`;
+
+function cloneFileStatus(source: string, destination: string) {
+  const marker = cloneEvidenceMarker(destination);
+  fs.rmSync(marker, { force: true });
   const result = spawnSync(CLONE_HELPER, ["-l", "JavaScript", "-e", CLONEFILE_SCRIPT, source, destination], {
     encoding: "utf8",
     env: { PATH: "/usr/bin:/bin" },
@@ -720,6 +739,24 @@ export const cloneFileOrFail: FileCloner = (source, destination) => {
     maxBuffer: 4096,
   });
   return result.status === 0 && result.stdout.trim() === "0";
+}
+
+export const cloneFileOrFail: FileCloner = (source, destination) => {
+  if (process.platform !== "darwin") return false;
+  const marker = cloneEvidenceMarker(destination);
+  if (!cloneFileStatus(source, destination)) return false;
+  try {
+    const marked = lstatIfPresent(marker)?.isFile() === true;
+    fs.rmSync(marker, { force: true });
+    if (!marked) {
+      fs.rmSync(destination, { force: true });
+      return false;
+    }
+    return { method: "clonefile", [CLONE_EVIDENCE]: true };
+  } catch {
+    fs.rmSync(marker, { force: true });
+    return false;
+  }
 };
 
 /** Size by lstat only; never opens a descriptor. Absent is 0. */
@@ -792,9 +829,14 @@ function fsyncDirectory(directory: string) {
 /** Restore temporaries live beside the ledger: `<ledger>.restore-<nonce>`. */
 const RESTORE_TEMPORARY = /^(.+)\.restore-[0-9a-f]{12}$/;
 
-/** Removes temporaries an interrupted earlier restore of `destination` left behind. */
+/**
+ * Removes temporaries an interrupted earlier restore of `destination` left
+ * behind (a byte copy is as large as the ledger). Only a restore under the
+ * lifecycle lock creates one, and a superseded restore never swaps it in.
+ */
 function removeRestoreTemporaries(destination: string) {
   const directory = path.dirname(destination);
+  if (!lstatIfPresent(directory)?.isDirectory()) return;
   for (const name of fs.readdirSync(directory)) {
     const base = RESTORE_TEMPORARY.exec(name.replace(/-(wal|shm|journal)$/, ""))?.[1];
     if (base !== path.basename(destination)) continue;
@@ -802,6 +844,145 @@ function removeRestoreTemporaries(destination: string) {
     if (stat.isFile()) fs.rmSync(path.join(directory, name), { force: true });
   }
 }
+
+/** What PRAGMA integrity_check found, capped at MAX_INTEGRITY_COMPLAINTS. */
+export type LedgerIntegrity =
+  | { status: "ok" }
+  | { status: "damaged"; complaints: string[]; truncated: boolean }
+  | { status: "unreadable"; code: string };
+
+/** Checks one ledger file; long checks must keep the operation's lease alive. */
+export type LedgerIntegrityCheck = (file: string, guard?: LifecycleFenceGuard) => Promise<LedgerIntegrity>;
+
+const MAX_INTEGRITY_COMPLAINTS = 1000;
+/** better-sqlite3 as this module loads it, so a helper process opens files the same way. */
+const BETTER_SQLITE3_ENTRY = createRequire(import.meta.url).resolve("better-sqlite3");
+const INTEGRITY_CHECK_SCRIPT = `
+const [entry, file, limit] = process.argv.slice(1);
+let db = null;
+let result;
+try {
+  const Database = require(entry);
+  db = new Database(file, { fileMustExist: true, timeout: 0 });
+  db.pragma("locking_mode = EXCLUSIVE");
+  const rows = db.pragma("integrity_check(" + (Number(limit) + 1) + ")").map((row) => String(Object.values(row)[0]));
+  const complaints = rows.flatMap((row) => row.split("\\n")).map((line) => line.trim())
+    .filter((line) => line && line !== "ok" && line !== "*** in database main ***");
+  result = complaints.length === 0
+    ? { status: "ok" }
+    : { status: "damaged", complaints: complaints.slice(0, Number(limit)), truncated: complaints.length > Number(limit) };
+} catch (error) {
+  result = { status: "unreadable", code: String((error && (error.code || error.message)) || error).slice(0, 64) };
+} finally {
+  try { if (db) db.close(); } catch {}
+}
+process.stdout.write(JSON.stringify(result));`;
+
+function integrityComplaints(rows: unknown[]) {
+  return rows.flatMap((row) => String(Object.values(row as Record<string, unknown>)[0]).split("\n"))
+    .map((line) => line.trim())
+    .filter((line) => line && line !== "ok" && line !== "*** in database main ***");
+}
+
+/** The same check in this process: the fallback when no helper process can start. */
+function integrityCheckInProcess(file: string): LedgerIntegrity {
+  let db: InstanceType<typeof Database> | null = null;
+  try {
+    db = new Database(file, { fileMustExist: true, timeout: 0 });
+    db.pragma("locking_mode = EXCLUSIVE");
+    const complaints = integrityComplaints(db.pragma(`integrity_check(${MAX_INTEGRITY_COMPLAINTS + 1})`) as unknown[]);
+    return complaints.length === 0
+      ? { status: "ok" }
+      : { status: "damaged", complaints: complaints.slice(0, MAX_INTEGRITY_COMPLAINTS), truncated: complaints.length > MAX_INTEGRITY_COMPLAINTS };
+  } catch (error) {
+    return { status: "unreadable", code: String((error as { code?: unknown }).code ?? "error").slice(0, 64) };
+  } finally {
+    db?.close();
+  }
+}
+
+/**
+ * Waits for `work` while renewing the operation's lease every
+ * `keepAliveIntervalMs`. Once the fence is lost it calls `abort` and rejects
+ * with the interruption at once, so nothing further is done in its name.
+ */
+export function whileKeepingLease<T>(guard: LifecycleFenceGuard | undefined, work: Promise<T>, abort?: () => void): Promise<T> {
+  if (!guard) return work;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const renewal = setInterval(() => {
+      try {
+        guard.keepAlive();
+      } catch (error) {
+        if (settled) return;
+        settled = true;
+        clearInterval(renewal);
+        abort?.();
+        reject(error);
+      }
+    }, guard.keepAliveIntervalMs);
+    work.then((value) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(renewal);
+      resolve(value);
+    }, (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(renewal);
+      reject(error);
+    });
+  });
+}
+
+/**
+ * PRAGMA integrity_check reads the whole ledger: minutes on a large one
+ * (measured about 265 MiB/s, so over 4 minutes for 69 GB). It runs in a
+ * helper process so this process stays free to renew the operation's lease
+ * while it runs; a lost fence stops the check and the restore.
+ */
+export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(process.execPath, ["-e", INTEGRITY_CHECK_SCRIPT, BETTER_SQLITE3_ENTRY, file, String(MAX_INTEGRITY_COMPLAINTS)], {
+      env: { PATH: "/usr/bin:/bin" },
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    guard?.keepAlive();
+    return Promise.resolve(integrityCheckInProcess(file));
+  }
+  const checked = new Promise<LedgerIntegrity>((resolve) => {
+    let stdout = "";
+    let settled = false;
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      if (stdout.length < 1024 * 1024) stdout += chunk;
+    });
+    child.once("error", () => {
+      if (settled) return;
+      settled = true;
+      // The helper could not start: check here instead (the caller renews the
+      // lease before and verifies the fence after).
+      resolve(integrityCheckInProcess(file));
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      try {
+        const parsed = JSON.parse(stdout) as LedgerIntegrity;
+        if (code === 0 && (parsed.status === "ok" || parsed.status === "damaged" || parsed.status === "unreadable")) {
+          resolve(parsed);
+          return;
+        }
+      } catch {
+        // Unparseable helper output proves nothing.
+      }
+      resolve({ status: "unreadable", code: "integrity_helper_failed" });
+    });
+  });
+  return whileKeepingLease(guard, checked, () => child.kill("SIGKILL"));
+};
 
 /**
  * Opens a database file in EXCLUSIVE locking mode and takes the write lock
@@ -822,6 +1003,54 @@ function openExclusive(file: string) {
   }
 }
 
+const LSOF = "/usr/sbin/lsof";
+/** A handle probe is advisory; a hung system utility must fail closed quickly. */
+const LSOF_TIMEOUT_MS = 60_000;
+
+/**
+ * Other processes that have any of `files` open; null when that cannot be
+ * established. SQLite's locks only show connections that have used the
+ * ledger: one opened but not yet used holds no lock, and after a swap it
+ * would pair the replaced file with the new ledger's -wal/-shm by name.
+ */
+export type OpenHandleCheck = (files: readonly string[]) => number[] | null;
+
+/** lsof over the ledger and its sidecars, ignoring this process. */
+export const otherProcessesWithFilesOpen: OpenHandleCheck = (files) => {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const present = files.filter((file) => lstatIfPresent(file));
+    if (present.length === 0) return [];
+    let result = spawnSync(LSOF, ["-S", "2", "-t", "-w", "--", ...present], {
+      encoding: "utf8",
+      env: { PATH: "/usr/bin:/bin:/usr/sbin" },
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: LSOF_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: 1024 * 1024,
+    });
+    if (result.error || (result.status !== 0 && result.status !== 1)) return null;
+    const pids = (result.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean).map(Number);
+    if (pids.some((pid) => !Number.isSafeInteger(pid) || pid <= 0)) return null;
+    const others = [...new Set(pids)].filter((pid) => pid !== process.pid);
+    if (others.length > 0) return others;
+    // lsof exits 1 both when nobody has the files open and on errors, and
+    // this process always has the ledger open while it checks: an error about
+    // any file means it is unknown who has that file open.
+    if ((result.stderr ?? "").trim() === "") return [];
+    // A sidecar that vanished between listing and lsof: look again once.
+    if (!present.every((file) => lstatIfPresent(file))) continue;
+    return null;
+  }
+  return null;
+};
+
+/** In use unless proven otherwise: another process has the ledger, its -wal or its -shm open. */
+function openElsewhere(ledger: string, openHandles: OpenHandleCheck): "ledger_in_use" | "quiescence_unproven" | null {
+  const others = openHandles([ledger, `${ledger}-wal`, `${ledger}-shm`]);
+  if (others === null) return "quiescence_unproven";
+  return others.length > 0 ? "ledger_in_use" : null;
+}
+
 /** The live ledger held exclusively for replacement, with our own descriptor on its inode. */
 type LiveLedgerLock = { connection: InstanceType<typeof Database>; descriptor: number };
 
@@ -831,14 +1060,16 @@ function sqliteBusy(error: unknown) {
 }
 
 /**
- * Proves no other connection in any process has the live ledger open and
- * keeps it that way until released: every attached WAL connection holds a
- * shared lock on the database file for its whole life, so the exclusive lock
- * is refused (SQLITE_BUSY, no waiting) while one exists. Holding it, a
- * TRUNCATE checkpoint leaves nothing the connection could write back into the
- * file after it is replaced. Null when there is no live ledger.
+ * Proves no other process has the live ledger open and keeps it that way
+ * until released: every attached WAL connection holds a shared lock on the
+ * database file for its whole life, so the exclusive lock is refused
+ * (SQLITE_BUSY, no waiting) while one exists; a connection opened but never
+ * used holds no lock, so lsof must also find no other process with the
+ * ledger, -wal or -shm open. Holding the lock, a TRUNCATE checkpoint leaves
+ * nothing the connection could write back into the file after it is
+ * replaced. Null when there is no live ledger.
  */
-function lockLiveLedger(destination: string): LiveLedgerLock | null {
+function lockLiveLedger(destination: string, openHandles: OpenHandleCheck): LiveLedgerLock | null {
   const before = lstatIfPresent(destination);
   if (!before) return null;
   if (!before.isFile()) throw new Error("the live ledger must be a regular file");
@@ -855,12 +1086,16 @@ function lockLiveLedger(destination: string): LiveLedgerLock | null {
   let descriptor: number | null = null;
   try {
     if (connection.pragma("journal_mode", { simple: true }) === "wal") {
+      connection.pragma("checkpoint_fullfsync = ON");
       const [checkpoint] = connection.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
       if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== 0) throw new Error("live ledger WAL did not empty");
     }
     descriptor = fs.openSync(destination, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
     const opened = fs.fstatSync(descriptor);
     if (opened.ino !== before.ino || opened.dev !== before.dev) throw new Error("the live ledger changed while locking");
+    // No lock proves a connection that was opened but never used; lsof does.
+    const elsewhere = openElsewhere(destination, openHandles);
+    if (elsewhere) throw new LifecycleRestoreRefusal({ reason: elsewhere, requiredFreeBytes: null, freeBytes: null });
     return { connection, descriptor };
   } catch (error) {
     // Close the connection before our own descriptor: closing any descriptor
@@ -875,12 +1110,12 @@ function lockLiveLedger(destination: string): LiveLedgerLock | null {
 /**
  * Releases a live ledger that a rename or unlink has just replaced. While the
  * exclusive lock still holds, no connection can be attached to the old file,
- * but a process could have opened it an instant before and be waiting for
- * the lock. Zeroing the old file's header (it has no name left) makes such a
- * late opener fail with "not a database" instead of writing to an unlinked
- * file, and removing the old -wal/-shm/-journal names keeps it from pairing
- * with the new ledger's sidecars. A file that is still linked elsewhere is
- * never written.
+ * and lsof found no other process with it open a moment earlier; a process
+ * that opened it in between is the only one left. Zeroing the old file's
+ * header (it has no name left) makes such a late opener fail with "not a
+ * database" as long as the restored ledger has no WAL yet, and removing the
+ * old -wal/-shm/-journal names keeps it from pairing with them. A file that
+ * is still linked elsewhere is never written.
  */
 function releaseReplacedLedger(live: LiveLedgerLock, destination: string) {
   try {
@@ -902,15 +1137,26 @@ function releaseReplacedLedger(live: LiveLedgerLock, destination: string) {
  * when the volume has room for it while the live ledger still exists, since a
  * clone snapshot shares its blocks with the live ledger and deleting the live
  * name would free little), made durable, and must pass PRAGMA
- * integrity_check. Then, holding exclusive locks on both the restored copy
+ * integrity_check, or fail it only with complaints the live ledger it
+ * replaces already has. Then, holding exclusive locks on both the restored copy
  * and the live ledger (refused if any other connection has the live ledger
  * open), one atomic rename replaces the destination. Any failure before the
  * rename leaves the live ledger exactly as it was.
+ *
+ * The integrity check can take minutes, so the operation's lease is renewed
+ * while it runs, and the fence is checked again immediately before the
+ * rename: an operation that lost its lease never replaces the ledger.
  */
 async function restoreLedger(
-  input: { source: string; destination: string },
-  options: { clone: FileCloner; freeBytes: (directory: string) => number },
+  input: { source: string; destination: string; guard?: LifecycleFenceGuard },
+  options: {
+    clone: FileCloner;
+    freeBytes: (directory: string) => number;
+    integrityCheck: LedgerIntegrityCheck;
+    openHandles: OpenHandleCheck;
+  },
 ): Promise<LifecycleDatabaseRestore> {
+  const guard = input.guard;
   const stat = fs.lstatSync(input.source);
   if (!stat.isFile()) throw new Error("database restore source must be a regular file");
   removeRestoreTemporaries(input.destination);
@@ -919,7 +1165,8 @@ async function restoreLedger(
   let restored: InstanceType<typeof Database> | null = null;
   let live: LiveLedgerLock | null = null;
   try {
-    if (!(options.clone(input.source, temporary) && isCloneResult(input.source, temporary))) {
+    guard?.keepAlive();
+    if (!(isCloneEvidence(options.clone(input.source, temporary)) && isCloneResult(input.source, temporary))) {
       fs.rmSync(temporary, { force: true });
       method = "copy";
       const headroomBytes = snapshotHeadroomBytes(stat.size);
@@ -931,17 +1178,43 @@ async function restoreLedger(
           freeBytes,
         });
       }
-      fs.copyFileSync(input.source, temporary, fs.constants.COPYFILE_EXCL);
+      // A byte copy of a large ledger can take minutes on a slow or busy disk:
+      // renew the lease while it runs, and let an abandoned copy finish before
+      // the cleanup below removes its file.
+      const copying = fs.promises.copyFile(input.source, temporary, fs.constants.COPYFILE_EXCL);
+      try {
+        await whileKeepingLease(guard, copying);
+      } catch (error) {
+        await copying.catch(() => undefined);
+        throw error;
+      }
+      guard?.keepAlive();
     }
     fs.chmodSync(temporary, 0o600);
     fsyncFile(temporary);
+    let integrity: "ok" | "preexisting_damage" = "ok";
+    const copyCheck = await options.integrityCheck(temporary, guard);
+    if (copyCheck.status !== "ok") {
+      // A snapshot of a ledger that was already damaged carries that damage.
+      // Restoring it is no worse than keeping the live ledger when the live
+      // ledger has every complaint the copy has; anything else is refused.
+      const liveCheck = copyCheck.status === "damaged" && !copyCheck.truncated && lstatIfPresent(input.destination)
+        ? await options.integrityCheck(input.destination, guard)
+        : null;
+      const liveComplaints = new Set(liveCheck?.status === "damaged" && !liveCheck.truncated ? liveCheck.complaints : []);
+      if (!(copyCheck.status === "damaged" && liveComplaints.size > 0 &&
+            copyCheck.complaints.every((complaint) => liveComplaints.has(complaint)))) {
+        throw new LifecycleRestoreRefusal({ reason: "integrity_check_failed", requiredFreeBytes: null, freeBytes: null });
+      }
+      integrity = "preexisting_damage";
+    }
+    guard?.keepAlive();
     // Held until the swap is done, so nothing can open the restored ledger
     // under its final name before the replaced one is released.
     restored = openExclusive(temporary);
-    if (restored.pragma("integrity_check", { simple: true }) !== "ok") {
-      throw new LifecycleRestoreRefusal({ reason: "integrity_check_failed", requiredFreeBytes: null, freeBytes: null });
-    }
-    live = lockLiveLedger(input.destination);
+    live = lockLiveLedger(input.destination, options.openHandles);
+    // The last moment to stop: nothing live has changed yet.
+    guard?.assertCurrent();
     if (live) {
       const replaced = live;
       live = null;
@@ -973,7 +1246,12 @@ async function restoreLedger(
     restored.close();
     restored = null;
     removeSqliteFiles(temporary);
-    return { method, cloneFallback: method === "clone" ? null : "clone_unsupported", databaseBytes: stat.size };
+    return {
+      method,
+      cloneFallback: method === "clone" ? null : "clone_unsupported",
+      databaseBytes: stat.size,
+      integrity,
+    };
   } catch (error) {
     if (live) {
       live.connection.close();
@@ -988,15 +1266,18 @@ async function restoreLedger(
 
 /**
  * Removes the live ledger for a snapshot taken before any ledger existed,
- * under the same proof that no other connection has it open.
+ * under the same proof that no other connection has it open, and only while
+ * the operation still holds its fence.
  */
-async function discardLedger(destination: string) {
-  const live = lockLiveLedger(destination);
+async function discardLedger(destination: string, openHandles: OpenHandleCheck, guard?: LifecycleFenceGuard) {
+  const live = lockLiveLedger(destination, openHandles);
   if (!live) {
+    guard?.assertCurrent();
     for (const suffix of ["-wal", "-shm", "-journal"]) fs.rmSync(`${destination}${suffix}`, { force: true });
     return;
   }
   try {
+    guard?.assertCurrent();
     fs.unlinkSync(destination);
   } catch (error) {
     live.connection.close();
@@ -1020,7 +1301,7 @@ async function discardLedger(destination: string) {
  * frame into the database file and empties the WAL: the database file alone
  * is then the complete ledger, and nothing can change it until close.
  */
-function quiesceLedger(source: string):
+function quiesceLedger(source: string, openHandles: OpenHandleCheck):
   | { connection: InstanceType<typeof Database> }
   | { fallback: LifecycleCloneFallback } {
   let connection: InstanceType<typeof Database>;
@@ -1033,10 +1314,19 @@ function quiesceLedger(source: string):
     connection.pragma("locking_mode = EXCLUSIVE");
     connection.exec("BEGIN EXCLUSIVE");
     connection.exec("COMMIT");
+    // Opened but unused connections hold no lock; only lsof can see them.
+    const elsewhere = openElsewhere(source, openHandles);
+    if (elsewhere) {
+      connection.close();
+      return { fallback: elsewhere };
+    }
     if (connection.pragma("journal_mode", { simple: true }) !== "wal") {
       connection.close();
       return { fallback: "ledger_not_wal" };
     }
+    // The ledger file must be on stable storage before the WAL is emptied: a
+    // plain fsync on macOS leaves both in the drive's cache, in any order.
+    connection.pragma("checkpoint_fullfsync = ON");
     const [checkpoint] = connection.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
     if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== 0 || regularFileBytes(`${source}-wal`) !== 0) {
       connection.close();
@@ -1064,22 +1354,32 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
   private readonly freeBytes: (directory: string) => number;
   private readonly backup = new SqliteOnlineBackupAdapter();
 
+  private readonly integrityCheck: LedgerIntegrityCheck;
+  private readonly openHandles: OpenHandleCheck;
+
   constructor(options: {
     clone?: FileCloner;
     cloneSupported?: CloneSupport;
     freeBytes?: (directory: string) => number;
+    integrityCheck?: LedgerIntegrityCheck;
+    openHandles?: OpenHandleCheck;
   } = {}) {
     this.clone = options.clone ?? cloneFileOrFail;
     this.cloneSupported = options.cloneSupported ?? volumeSupportsClone;
     this.freeBytes = options.freeBytes ?? volumeFreeBytes;
+    this.integrityCheck = options.integrityCheck ?? integrityCheckOffThread;
+    this.openHandles = options.openHandles ?? otherProcessesWithFilesOpen;
   }
 
-  async snapshot(input: { source: string; destination: string }): Promise<LifecycleDatabaseSnapshot> {
+  async snapshot(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<LifecycleDatabaseSnapshot> {
+    // Before free space is measured: a crashed byte-copy restore's leftover.
+    removeRestoreTemporaries(input.source);
     if (!fs.existsSync(input.source)) {
       return { present: false, method: null, quiesced: false, cloneFallback: null };
     }
     removeSqliteFiles(input.destination);
-    const quiesced = quiesceLedger(input.source);
+    input.guard?.keepAlive();
+    const quiesced = quiesceLedger(input.source, this.openHandles);
     if ("fallback" in quiesced && (quiesced.fallback === "ledger_in_use" || quiesced.fallback === "quiescence_unproven")) {
       // A rollback of this update would have to replace the ledger while that
       // connection could keep writing to the replaced file. Refuse first.
@@ -1097,7 +1397,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     let cloneFallback: LifecycleCloneFallback;
     if ("connection" in quiesced) {
       try {
-        if (this.clone(input.source, input.destination) && isCloneResult(input.source, input.destination)) {
+        if (isCloneEvidence(this.clone(input.source, input.destination)) && isCloneResult(input.source, input.destination)) {
           fs.chmodSync(input.destination, 0o600);
           return { present: true, method: "clone", quiesced: true, cloneFallback: null };
         }
@@ -1128,12 +1428,17 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     return { present: true, method: "online_backup", quiesced: "connection" in quiesced, cloneFallback };
   }
 
-  restore(input: { source: string; destination: string }): Promise<LifecycleDatabaseRestore> {
-    return restoreLedger(input, { clone: this.clone, freeBytes: this.freeBytes });
+  restore(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<LifecycleDatabaseRestore> {
+    return restoreLedger(input, {
+      clone: this.clone,
+      freeBytes: this.freeBytes,
+      integrityCheck: this.integrityCheck,
+      openHandles: this.openHandles,
+    });
   }
 
-  discard(input: { destination: string }): Promise<void> {
-    return discardLedger(input.destination);
+  discard(input: { destination: string; guard?: LifecycleFenceGuard }): Promise<void> {
+    return discardLedger(input.destination, this.openHandles, input.guard);
   }
 
   /**
@@ -1171,7 +1476,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
 
 /** Quiesced SQLite snapshots via the online backup API; never a raw WAL copy. */
 export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
-  snapshot(input: { source: string; destination: string }): Promise<boolean> {
+  snapshot(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<boolean> {
     return (async () => {
       if (!fs.existsSync(input.source)) return false;
       fs.rmSync(input.destination, { force: true });
@@ -1179,7 +1484,10 @@ export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
       fs.rmSync(`${input.destination}-shm`, { force: true });
       const db = new Database(input.source, { readonly: true, fileMustExist: true });
       try {
-        await db.backup(input.destination);
+        // A full copy of a large ledger takes minutes: keep the lease alive between steps.
+        await db.backup(input.destination, input.guard
+          ? { progress: () => { input.guard!.keepAlive(); return 100; } }
+          : undefined);
       } finally {
         db.close();
       }
@@ -1188,12 +1496,17 @@ export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
     })();
   }
 
-  restore(input: { source: string; destination: string }): Promise<LifecycleDatabaseRestore> {
-    return restoreLedger(input, { clone: cloneFileOrFail, freeBytes: volumeFreeBytes });
+  restore(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<LifecycleDatabaseRestore> {
+    return restoreLedger(input, {
+      clone: cloneFileOrFail,
+      freeBytes: volumeFreeBytes,
+      integrityCheck: integrityCheckOffThread,
+      openHandles: otherProcessesWithFilesOpen,
+    });
   }
 
-  discard(input: { destination: string }): Promise<void> {
-    return discardLedger(input.destination);
+  discard(input: { destination: string; guard?: LifecycleFenceGuard }): Promise<void> {
+    return discardLedger(input.destination, otherProcessesWithFilesOpen, input.guard);
   }
 }
 

@@ -530,6 +530,16 @@ Config tools:
       proved, and the runtimes those restore. Every removal is recorded
       durably before it happens. Every completed update also applies this
       with the default count.
+  lifecycle snapshots reconcile [--keep-snapshots ID[,ID...]] [--apply] [--force] [--operation-id ID]
+      When retention is blocked or a snapshot's operation cannot be read
+      (list says why): shows what blocks it (default, changes nothing), or
+      repairs it. The completion order is rebuilt only from the receipts' own
+      sequences, and only when they agree with the version chain; otherwise
+      name the snapshots to keep with --keep-snapshots and every other
+      existing snapshot becomes removable. The keep-set must include a
+      snapshot that restores an earlier version; sealing when nothing needs
+      it, or releasing the newest way back, needs --force. Unreadable removal
+      records are moved aside, not deleted. Deletes no snapshot itself.
 `);
 }
 

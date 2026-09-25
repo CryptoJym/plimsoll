@@ -103,8 +103,8 @@ export async function runLifecycleCommand(input: {
 
 /**
  * Snapshot and disk commands: `update --preflight` (read-only, run before the
- * collector is stopped), `snapshots list` (read-only) and `snapshots prune`
- * (dry run unless --apply).
+ * collector is stopped), `snapshots list` (read-only), `snapshots prune` and
+ * `snapshots reconcile` (both dry runs unless --apply).
  */
 export async function runLifecycleSnapshotCommand(input: {
   argv: readonly string[];
@@ -115,7 +115,9 @@ export async function runLifecycleSnapshotCommand(input: {
   if (input.argv[0] === "update" && input.argv.includes("--preflight")) {
     return { kind: "preflight" as const, preflight: await manager.preflightUpdate(), boundary };
   }
-  if (input.argv[0] !== "snapshots") throw new Error("Expected lifecycle update --preflight or lifecycle snapshots list|prune");
+  if (input.argv[0] !== "snapshots") {
+    throw new Error("Expected lifecycle update --preflight or lifecycle snapshots list|prune|reconcile");
+  }
   const keep = keepOption(input.argv);
   if (input.argv[1] === "list") {
     return { kind: "list" as const, snapshots: await manager.listSnapshots({ ...(keep !== undefined ? { keep } : {}) }), boundary };
@@ -129,7 +131,18 @@ export async function runLifecycleSnapshotCommand(input: {
     });
     return { kind: "prune" as const, ...result, boundary };
   }
-  throw new Error("Expected lifecycle snapshots list|prune");
+  if (input.argv[1] === "reconcile") {
+    const keepSnapshots = option(input.argv, "--keep-snapshots");
+    const result = await manager.reconcileSnapshots({
+      operationId: option(input.argv, "--operation-id") ??
+        `snapshots-reconcile-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
+      ...(keepSnapshots !== undefined ? { keep: keepSnapshots.split(",").map((id) => id.trim()).filter(Boolean) } : {}),
+      apply: input.argv.includes("--apply"),
+      force: input.argv.includes("--force"),
+    });
+    return { kind: "reconcile" as const, ...result, boundary };
+  }
+  throw new Error("Expected lifecycle snapshots list|prune|reconcile");
 }
 
 function formatBytes(bytes: number) {
@@ -151,7 +164,7 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
   ];
   if (inventory.snapshots.length > 0) {
     lines.push("", table([
-      ["ID", "CREATED (UTC)", "SIZE", "METHOD", "OPERATION", "RESTORES", "RETENTION"],
+      ["ID", "CREATED (UTC)", "SIZE", "METHOD", "OPERATION", "RESTORES", "RESTORE CHECK", "RETENTION"],
       ...inventory.snapshots.map((row) => [
         row.id,
         row.createdAt?.slice(0, 16).replace("T", " ") ?? "-",
@@ -159,6 +172,7 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
         row.method,
         row.operationState,
         row.restoresVersion ?? "-",
+        row.cannotRestoreReason ? `cannot restore (${row.cannotRestoreReason})` : "can restore",
         `${row.retention} (${row.reason})`,
       ]),
     ]));
@@ -169,14 +183,38 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
       ...inventory.versions.map((row) => [row.version, formatBytes(row.bytes), `${row.retention} (${row.reason})`]),
     ]));
   }
-  if (inventory.pendingRemoval.length > 0) {
+  if (inventory.pendingRestore) {
+    const pending = inventory.pendingRestore;
+    const names = pending.items.filter((item) => item.kind === "snapshot").map((item) => item.name);
+    lines.push("", `Pending way-back restore for snapshot(s) ${names.slice(0, 8).join(", ")}${names.length > 8 ? ` and ${names.length - 8} more` : ""}: ` +
+      (pending.refusal
+        ? `the next prune --apply refuses (${pending.refusal}); remove the block, repair the recorded items under lifecycle/trash/ (or lifecycle/snapshots/ and lifecycle/versions/ if never moved), or complete an update with 0.7.41 or later.`
+        : `the next prune --apply attempts to restore ${pending.wouldRestore.length} recorded item(s) and refuses if they are incomplete or unusable. Use 0.7.41 or later.`));
+  } else if (inventory.pendingRemoval.length > 0) {
     lines.push("", `Interrupted removal pending: ${inventory.pendingRemoval.length} item(s), ${formatBytes(inventory.bytes.pendingRemoval)}; ` +
-      "the next prune --apply or completed update finishes it.");
+      "the next 0.7.41 or later prune --apply or completed update finishes it; 0.7.38–0.7.40 skip retention.");
+  }
+  if (inventory.snapshots.some((row) => row.cannotRestoreReason !== null)) {
+    lines.push("", "A snapshot that cannot restore is present. Do not run 0.7.38–0.7.40 snapshots prune --keep 1; use 0.7.41 or later.");
   }
   lines.push("");
-  if (inventory.blockedReason === "completion_order_unproven") {
-    lines.push("Retention is blocked (completion_order_unproven): the order in which these operations completed " +
-      "cannot be proved, so nothing will be removed.");
+  const unknown = inventory.snapshots.filter((row) => row.reason === "operation_unknown" || row.reason === "receipt_without_sequence");
+  if (unknown.length > 0) {
+    const unsequenced = unknown.filter((row) => row.reason === "receipt_without_sequence").length;
+    lines.push(`${unknown.length} snapshot(s) are kept because their operation cannot be read or ordered` +
+      (unsequenced > 0
+        ? ` (${unsequenced} recorded without a completion sequence by a lifecycle command older than 0.7.41 that could not read this host's order record)`
+        : "") +
+      ". `plimsoll lifecycle snapshots reconcile` shows them and how to decide them with --keep-snapshots.");
+  }
+  if (inventory.pendingRestore) {
+    lines.push("No pending way-back item is scheduled for removal.");
+  } else if (inventory.blockedReason === "completion_order_unproven" || inventory.blockedReason === "removal_record_unreadable") {
+    lines.push(`Retention is blocked (${inventory.blockedReason}): ` +
+      (inventory.blockedReason === "completion_order_unproven"
+        ? "the order in which these operations completed cannot be proved"
+        : "a removal record cannot be read") +
+      ", so nothing will be removed. `plimsoll lifecycle snapshots reconcile` shows why and how to repair it.");
   } else if (inventory.blockedReason) {
     lines.push(`Retention is blocked (${inventory.blockedReason}); nothing will be removed until lifecycle recovery.`);
   } else {
