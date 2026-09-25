@@ -52,6 +52,12 @@ const SENTINELS = [
 const CODEX_OTEL_EXPORT_BATCH_RECORDS = 512;
 const CODEX_RICH_EXPORT_BATCH_RECORDS = 128;
 const DEFERRED_CONTEXT_OWNERSHIP_RECORDS = 128;
+const CODEX_RECORD_BASE_NANOS = 1_760_000_000_000_000_000n;
+
+function expectedCodexObservedAt(records: number) {
+  const firstMs = Number(CODEX_RECORD_BASE_NANOS / 1_000_000n);
+  return Array.from({ length: records }, (_, index) => new Date(firstMs + index).toISOString());
+}
 
 function check(name: string, passed: boolean, detail: unknown) {
   checks.push({ name, passed, detail });
@@ -416,7 +422,7 @@ function representativeCodexBatchBody(records: number, richAttributes: boolean) 
         logRecords: Array.from({ length: records }, (_, index) => {
           const timestamp = new Date(Date.UTC(2026, 8, 11, 17, 0, 0, index)).toISOString();
           return {
-            timeUnixNano: String(1_760_000_000_000_000_000n + BigInt(index)),
+            timeUnixNano: String(CODEX_RECORD_BASE_NANOS + BigInt(index) * 1_000_000n),
             ...(richAttributes ? {
               observedTimeUnixNano: String(1_760_000_000_100_000_000n + BigInt(index)),
               severityNumber: 9,
@@ -459,6 +465,7 @@ async function isolatedOtlpRun(
   body: string,
   expectedEvents: number,
   forceSpoolAfterFirstChunk = false,
+  expectedObservedAt?: string[],
 ) {
   // Heavy admissions have their own clean ledger and the spool that the
   // production daemon wires. A real deadline may split ledger and spool
@@ -506,6 +513,12 @@ async function isolatedOtlpRun(
       drainPasses += 1;
     }
     const storedEvents = countEvents();
+    const observedAt = (buffer.database.prepare(
+      "select observed_at as observedAt from buffered_events order by observed_at",
+    ).all() as Array<{ observedAt: string }>).map((row) => row.observedAt);
+    const exactObservedAt = expectedObservedAt === undefined ||
+      (observedAt.length === expectedObservedAt.length &&
+        observedAt.every((value, index) => value === expectedObservedAt[index]));
     const spoolStatus = spool.status();
     return {
       result,
@@ -515,6 +528,7 @@ async function isolatedOtlpRun(
       spooledEvents,
       drainPasses,
       storedEvents,
+      exactObservedAt,
       pendingAfterDrain: spoolStatus.pendingFiles,
       rejectedOnReplay: spoolStatus.rejectedOnReplay,
       exactDurability: result.status === 202 &&
@@ -524,6 +538,7 @@ async function isolatedOtlpRun(
             committedBeforeDrain < expectedEvents)) &&
         committedBeforeDrain + spooledEvents === expectedEvents &&
         storedEvents === expectedEvents &&
+        exactObservedAt &&
         spoolStatus.pendingFiles === 0 && spoolStatus.rejectedOnReplay === 0,
     };
   } finally {
@@ -547,6 +562,7 @@ async function checkRepresentativeBatch() {
   const body = representativeCodexBatchBody(CODEX_OTEL_EXPORT_BATCH_RECORDS, true);
   const rich = await isolatedOtlpRun(
     "/v1/logs", body, CODEX_OTEL_EXPORT_BATCH_RECORDS,
+    false, expectedCodexObservedAt(CODEX_OTEL_EXPORT_BATCH_RECORDS),
   );
   check(
     "codex_rich_512_record_export_is_exactly_durable_or_spooled",
@@ -563,6 +579,7 @@ async function checkRepresentativeBatch() {
       committedBeforeDrain: rich.committedBeforeDrain,
       spooledEvents: rich.spooledEvents,
       storedEvents: rich.storedEvents,
+      exactObservedAt: rich.exactObservedAt,
       pendingAfterDrain: rich.pendingAfterDrain,
       deadlineMs: LOCAL_HTTP_LIMITS.requestDeadlineMs,
     },
@@ -572,6 +589,7 @@ async function checkRepresentativeBatch() {
     representativeCodexBatchBody(CODEX_RICH_EXPORT_BATCH_RECORDS, true),
     CODEX_RICH_EXPORT_BATCH_RECORDS,
     true,
+    expectedCodexObservedAt(CODEX_RICH_EXPORT_BATCH_RECORDS),
   );
   check(
     "codex_rich_128_record_partial_commit_spools_and_replays_exactly_once",
@@ -590,6 +608,7 @@ async function checkRepresentativeBatch() {
       committedBeforeDrain: smaller.committedBeforeDrain,
       spooledEvents: smaller.spooledEvents,
       storedEvents: smaller.storedEvents,
+      exactObservedAt: smaller.exactObservedAt,
       deadlineMs: LOCAL_HTTP_LIMITS.requestDeadlineMs,
     },
   );
@@ -630,6 +649,12 @@ async function checkPartialDeadlineRetry() {
     const committedAfter408 = countEvents();
     const retry = await request(port, "/v1/logs", body, { "x-plimsoll-source": "codex" });
     const storedAfterRetry = countEvents();
+    const observedAt = (buffer.database.prepare(
+      "select observed_at as observedAt from buffered_events order by observed_at",
+    ).all() as Array<{ observedAt: string }>).map((row) => row.observedAt);
+    const expectedObservedAt = expectedCodexObservedAt(17);
+    const exactObservedAt = observedAt.length === expectedObservedAt.length &&
+      observedAt.every((value, index) => value === expectedObservedAt[index]);
     check(
       "partial_commit_408_retry_is_exactly_once",
       stableRejection(first, "request_deadline_exceeded", 408) &&
@@ -638,7 +663,7 @@ async function checkPartialDeadlineRetry() {
         retry.status === 202 && retry.body.accepted === true &&
         retry.body.recordCount === 17 &&
         retry.body.deduplicated === 16 &&
-        storedAfterRetry === 17,
+        storedAfterRetry === 17 && exactObservedAt,
       {
         firstStatus: first.status,
         firstReason: first.body.reason,
@@ -647,6 +672,7 @@ async function checkPartialDeadlineRetry() {
         retryStatus: retry.status,
         retryDeduplicated: retry.body.deduplicated,
         storedAfterRetry,
+        exactObservedAt,
       },
     );
   } finally {
