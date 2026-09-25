@@ -2,7 +2,7 @@
   "name": "@plimsoll/monorepo",
   "version": "0.1.0",
   "private": true,
-  "description": "Plimsoll — the load line for your AI spend. Local-first telemetry for Claude Code & Codex that joins token usage to shipped outcomes.",
+  "description": "Plimsoll \u2014 the load line for your AI spend. Local-first telemetry for Claude Code & Codex that joins token usage to shipped outcomes.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -14,6 +14,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "contracts:lean": "node --import tsx --test tests/contracts/lean/*.contract.ts",
     "collector": "tsx packages/collector-cli/src/cli.ts",
     "proof": "tsx scripts/run-proof.ts scripts/signal-fidelity-proof.ts",
     "proof:gemini-adapter": "tsx scripts/gemini-adapter-proof.ts",
