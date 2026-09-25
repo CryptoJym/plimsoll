@@ -48,7 +48,9 @@ does not transfer its sessions to a tailer.
 - Session sync no longer holds the ledger's write lock during an upload. Each
   send takes a short per-session lease; intake and maintenance writes to the
   sessions in flight retry through the storage-busy path, and an erasure waits
-  for the send so it is never overtaken. Multi-batch catch-ups converge
+  for the send so it is never overtaken. Multi-batch catch-ups converge, and
+  under steady intake the daemon still runs session sync once the event
+  backlog fits in one cycle, or after at most 60 s of a larger backlog
   (`.163.75`).
 - The session context index keeps its checksum exact past 2^53, so very large
   ledgers no longer rebuild the index on every open (`.163.75`).
