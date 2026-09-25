@@ -1,11 +1,12 @@
-"""Shared helpers for the round-5, round-6, round-7 and round-8 (B0, eco-6hoxj.164.4, rounds 1-2) fixtures.
+"""Shared helpers for the round-5, round-6, round-7, round-8 and round-9 (B0, eco-6hoxj.164.4, rounds 1-3) fixtures.
 
-Every fixture is a standalone script: `python3 <fixture>.py --rule r4|r5|r6|r7|r8`.
+Every fixture is a standalone script: `python3 <fixture>.py --rule r4|r5|r6|r7|r8|r9`.
 It builds the minimal in-memory SQLite (or plain Python) state for the reviewer's counterexample, applies the rule of the
 named round, and asserts the outcome the plan promises. Round-5 fixtures are red under `--rule r4` and green under
 `--rule r5`; round-6 fixtures are red under `--rule r5` and green under `--rule r6`; the round-7 (B0 round 1) fixtures were
 red under `--rule r6` and green under `--rule r7`; the round-8 (B0 round 2) versions of the same two fixtures are red under
-`--rule r6` and `--rule r7` and green under `--rule r8` (exit 1 = RED, exit 0 = GREEN).
+`--rule r6` and `--rule r7` and green under `--rule r8`; the round-9 (B0 round 3) versions of the same two fixtures are red under
+`--rule r6`, `r7` and `r8` and green under `--rule r9` (exit 1 = RED, exit 0 = GREEN).
 No collector, ledger, network or hosted service is touched.
 """
 from __future__ import annotations
@@ -28,7 +29,7 @@ def digest16(payload: str) -> bytes:
 
 def rule_arg() -> str:
     p = argparse.ArgumentParser()
-    p.add_argument("--rule", choices=("r4", "r5", "r6", "r7", "r8"), required=True, help="which round's rule to apply")
+    p.add_argument("--rule", choices=("r4", "r5", "r6", "r7", "r8", "r9"), required=True, help="which round's rule to apply")
     return p.parse_args().rule
 
 class Checks:

@@ -34,15 +34,25 @@ Round 8 rule (CONTRACTS.md r8 C1, C4):
       included, echoes max(persisted version, highest stamp carried), so `heard_at(V)` is the first such request: the delivery at
       400 that carries the stamp-1 row is the first echo of 1 (heard_at(1) = 400, not 650) and heard_at(0) = 50 (the first
       request, not the registration response).
+Round 9 rule (B0 round 3, review-r2 blockers 1-2 and should-fixes 1, 4; CONTRACTS.md r9 C1, C4):
+  (d) The collector accepts a versioned response only from the install its ledger is JOINED with (recorded at join activation,
+      `collector_workspace_binding.joined_install`); a response from any other install, e.g. the OLD install's answer to an
+      in-flight request or from a process that loaded its config before the re-join (cli.ts:2479), is ignored and counted and
+      never replaces the pair (round 8 said "a response from a different install replaces it": review-r2 R4, 3 of 3 rows
+      exported as the old install's person).
+  (g) `heard_at` exists only for an issued version (it lives on the audit row); a never-issued echo's instant is the fact's
+      `first_seen_at`.
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
-ingest instants and heard_at(0) is the registration), r8 (this rule). Red under r6 and r7, green under r8.
+ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (this rule). Red under r6, r7 and r8,
+green under r9.
 """
 import json
 from _common import Checks, rule_arg
 
 rule = rule_arg()
 c = Checks("b4_offline_rebind", rule)
-R8 = rule == "r8"
+R8 = rule in ("r8", "r9")          # the round-8 machinery (the pair, the first-sighting fact) is kept by round 9
+R9 = rule == "r9"
 
 # ---- installs: version -> (actor bound, changed_at on the cloud clock); version 0 = the registration or join binding ---------
 INSTALLS = {
@@ -132,7 +142,8 @@ for install in INSTALLS:
             echo = max([v for v in [persisted, *carried] if v is not None], default=None)
         if echo is None: continue
         REQUESTS[install].append((at, kind, echo))
-        heard_at[install].setdefault(echo, at)
+        if not R9 or echo <= current_version(at, install):        # round 9 (g): no audit row exists for a never-issued version
+            heard_at[install].setdefault(echo, at)
         if R8:
             sight(install, echo, at, "echo")
             diagnostics[install].append({"at": at, "echo": echo, "echo_ahead_of_binding": echo > current_version(at, install),
@@ -257,4 +268,38 @@ c.expect(diag.get(400, {}).get("stamp_ahead_of_echo") is False and diag.get(710,
          "diagnostics: the honest 400 delivery never trips stamp_ahead_of_echo; G's delivery echoes 5 > binding_version 2 (echo_ahead_of_binding) and its sighting is stamp_not_issued(X, 5), ownership unchanged", json.dumps(diagnostics["X"]))
 note = f"captured under binding v{D['stamp']} at 350, before the cloud heard v{D['stamp']} (heard_at {heard_at['X'].get(D['stamp'])}); rebind changed_at {INSTALLS['X'][1][1]}"
 c.expect("heard_at 400" in note and "changed_at 200" in note, "the export names the changed_at -> heard_at window (200 -> 400) for the reviewer's row from stored facts", note)
+c.expect(5 not in heard_at["X"] and (not R8 or SIGHT.get(("X", 5), {}).get("first_seen_at") == 710),
+         "heard_at exists only for issued versions (it lives on the audit row): the never-issued 5 has no heard_at; its echo instant 710 is the fact's first_seen_at", f"heard_at={heard_at['X']} fact={SIGHT.get(('X', 5))}")
+
+# ---- 7. blocker 1 (review r2): the OLD install's late answer after a re-join must never overwrite the current install's pair ---------
+class CollectorPair:
+    """C4: the persisted pair. Round 8 as written: a response from a different install replaces it. Round 9: only a response
+    from the install the ledger is joined with is accepted; the rest are ignored and counted."""
+    def __init__(self): self.pair, self.joined, self.ignored = None, None, 0
+    def join(self, install, version):                 # join activation: clears the pair, records the joined install and the handshake's version
+        self.pair, self.joined = None, install
+        if version is not None: self.pair = (install, version)
+    def response(self, install, version):
+        if R9 and install != self.joined:
+            self.ignored += 1; return "ignored"
+        if self.pair is None or self.pair[0] != install:
+            self.pair = (install, version); return "replaced"
+        if version > self.pair[1]:
+            self.pair = (install, version); return "raised"
+        return "kept"
+    def echo(self): return self.pair[1] if self.pair else None
+col = CollectorPair()
+col.join("X", 0); col.response("X", 1); col.response("X", 2)          # X's collector reached v2 (the 650 response)
+col.join("Z", 0)                                                       # re-join at 800: the grant's install Z, the handshake supplied Z's 0
+straggler = col.response("X", 2)                                       # 805: X's answer to an in-flight request (or a stale-config daemon) arrives
+L_rows = []
+for captured in (810, 850, 890):
+    inst, v = col.pair
+    d, u = actor_for_stamp(v, captured + 5, "delivered", inst), actor_for_stamp(v, SUMMARY_AT, "undelivered", inst)
+    L_rows.append({"captured": captured, "stamp": (inst, v), "delivered": d, "undelivered": u, "truth": current_actor(captured, "Z")})
+print("    L (re-join, the old install's late answer): " + json.dumps({"straggler": straggler, "ignored": col.ignored, "rows": L_rows}))
+c.expect(straggler == "ignored" and col.ignored == 1, "L: after the re-join a response from the OLD install X is ignored and counted, never accepted (round 8 replaced the pair with (X, 2))", f"straggler={straggler} ignored={col.ignored}")
+c.expect(all(r["delivered"][0] == r["undelivered"][0] == r["truth"] for r in L_rows), "L: rows captured under Z's actor D after the late answer are D's on both paths (round 8 exported all three as C's, the wrong person)", json.dumps(L_rows))
+c.expect(col.pair == ("Z", 0) and col.echo() == 0, "L: the persisted pair stays (Z, 0) and the echo is the CURRENT install's version 0, not the old install's 2", f"pair={col.pair} echo={col.echo()}")
+
 c.finish()
