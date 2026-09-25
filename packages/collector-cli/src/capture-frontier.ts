@@ -61,7 +61,7 @@ export const CAPTURE_COVERAGE_INTERVAL_MS = 15 * 60 * 1000;
 export const CAPTURE_COVERAGE_TURN_MS = 250;
 /** Classified entries one check may visit per source; beyond it the check is incomplete. */
 export const CAPTURE_COVERAGE_MAX_ENTRIES = 200_000;
-/** Deterministic units one coverage turn may process before yielding to the next cadence. */
+/** Directory opens, physical entry reads and file checks allowed per source and turn. */
 export const CAPTURE_COVERAGE_MAX_WORK_PER_TURN = 4_096;
 /** Gaps one claim carries. Closer gaps merge first, which only widens them. */
 export const CAPTURE_CLAIM_MAX_GAPS = 8;
@@ -111,32 +111,68 @@ export type CaptureCoverageEntry = { path: string; kind: "directory" | "file" | 
 /** One directory cursor; `undefined` is an ignored entry and `null` is EOF. */
 export type CaptureCoverageDirectory = {
   read(): CaptureCoverageEntry | undefined | null;
+  /** Reusing a verified in-memory listing does not issue a directory read. */
+  readWork?: 0;
   unchanged(): boolean;
   /** Still the same directory after its stream closed; additions may follow in the next check. */
   sameIdentity?(): boolean;
   close(): void;
 };
 
+/** Keep only small, unchanged listings between checks; file stats still run every check. */
+export class CaptureCoverageDirectoryCache {
+  private readonly listings = new Map<string, { stat: fs.BigIntStats; entries: CaptureCoverageEntry[] }>();
+  private entries = 0;
+
+  get(directory: string, depth: number, stat: fs.BigIntStats) {
+    const key = `${depth}\0${directory}`;
+    const saved = this.listings.get(key);
+    if (!saved) return null;
+    if (saved.stat.dev !== stat.dev || saved.stat.ino !== stat.ino ||
+        saved.stat.mtimeNs !== stat.mtimeNs || saved.stat.ctimeNs !== stat.ctimeNs) {
+      this.drop(key);
+      return null;
+    }
+    this.listings.delete(key);
+    this.listings.set(key, saved);
+    return saved.entries;
+  }
+
+  put(directory: string, depth: number, stat: fs.BigIntStats, entries: CaptureCoverageEntry[]) {
+    if (entries.length > 256) return;
+    const key = `${depth}\0${directory}`;
+    this.drop(key);
+    while (this.entries + entries.length > CAPTURE_COVERAGE_MAX_WORK_PER_TURN || this.listings.size >= 256) {
+      this.drop(this.listings.keys().next().value!);
+    }
+    this.listings.set(key, { stat, entries });
+    this.entries += entries.length;
+  }
+
+  clear() { this.listings.clear(); this.entries = 0; }
+
+  private drop(key: string) {
+    const saved = this.listings.get(key);
+    if (saved) this.entries -= saved.entries.length;
+    this.listings.delete(key);
+  }
+}
+
 /**
  * Open without materializing a listing. Node may prefetch at most one 32-entry
- * batch; each returned entry is charged before the walk reads the next one.
+ * batch; each physical read is charged before the walk reads the next one.
+ * A verified small listing may be served from memory on later checks.
  * Directory identity and change times are checked across turns and at EOF.
  */
 export function openCaptureCoverageDirectory(
   directory: string,
   classify: (entry: fs.Dirent) => CaptureCoverageEntry | null,
+  cache?: CaptureCoverageDirectoryCache,
+  depth = 0,
 ): CaptureCoverageDirectory {
   const identity = () => fs.lstatSync(directory, { bigint: true });
   const before = identity();
   if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("capture_coverage_not_directory");
-  const handle = fs.opendirSync(directory, { bufferSize: 32 });
-  let closed = false;
-  const close = () => {
-    if (!closed) {
-      closed = true;
-      handle.closeSync();
-    }
-  };
   const unchanged = () => {
     try {
       const after = identity();
@@ -154,14 +190,38 @@ export function openCaptureCoverageDirectory(
       return false;
     }
   };
+  const cached = cache?.get(directory, depth, before);
+  if (cached) {
+    if (!unchanged()) throw new Error("capture_coverage_directory_changed");
+    let next = 0;
+    return { read: () => cached[next++] ?? null, readWork: 0, unchanged, sameIdentity, close: () => undefined };
+  }
+  const handle = fs.opendirSync(directory, { bufferSize: 32 });
+  let closed = false;
+  const close = () => {
+    if (!closed) {
+      closed = true;
+      handle.closeSync();
+    }
+  };
   if (!unchanged()) {
     close();
     throw new Error("capture_coverage_directory_changed");
   }
+  let staged: CaptureCoverageEntry[] | null = cache ? [] : null;
   return {
     read: () => {
       const entry = handle.readSync();
-      return entry ? classify(entry) ?? undefined : null;
+      if (!entry) {
+        if (staged && unchanged()) cache!.put(directory, depth, before, staged);
+        return null;
+      }
+      const classified = classify(entry) ?? undefined;
+      if (classified && staged) {
+        if (staged.length < 256) staged.push(classified);
+        else staged = null;
+      }
+      return classified;
     },
     unchanged,
     sameIdentity,
@@ -224,6 +284,10 @@ export class CaptureCoverageWalk {
   private readonly directories: Array<{ directory: string; depth: number }>;
   private readonly files: Array<{ path: string; link: boolean }> = [];
   private active: CaptureCoverageDirectory | null = null;
+  private activeDirectory = "";
+  private readonly activeSeen = new Map<string, CaptureCoverageEntry["kind"]>();
+  private activeExpected = new Set<string>();
+  private activeChecked = false;
   private closed: CaptureCoverageDirectory | null = null;
   private entries = 0;
   done = false;
@@ -258,35 +322,61 @@ export class CaptureCoverageWalk {
       if (batch.length > 0) onBatch(batch);
       batch = [];
     };
-    if (this.active && !this.active.unchanged()) this.fail();
+    let restart = !!this.active && !this.active.unchanged();
+    if (restart && !this.canRestartActive()) this.fail();
     if (this.closed && !this.closedIdentity()) this.fail();
     while (!this.done && work < limit && now() < deadline) {
+      if (restart) {
+        // A live day folder can gain a session while its cursor is suspended.
+        // Reopen only this folder. Each raw read, including a duplicate on the
+        // new cursor, still costs a unit; queued paths are never queued twice.
+        work += 1;
+        try { this.restartActive(); } catch { this.fail(); }
+        restart = false;
+        continue;
+      }
       // Finish a directory's entry stream before checking its files when it
       // fits in one turn. Active day folders then close before the next cadence
       // can add a file. Bound the pending paths for directories larger than a turn.
       if (this.active && this.files.length < CAPTURE_COVERAGE_MAX_WORK_PER_TURN) {
-        work += 1;
+        work += this.active.readWork ?? 1;
         try {
           const entry = this.active.read();
           if (entry === null) {
-            if (!this.active.unchanged()) this.fail();
-            else {
+            if (!this.active.unchanged()) {
+              if (!this.canRestartActive()) this.fail();
+              else restart = true;
+            } else if (this.activeExpected.size > 0) {
+              // A previously queued path vanished during a local restart.
+              this.fail();
+            } else {
               this.active.close();
               this.closed = this.active;
               this.active = null;
+              this.activeSeen.clear();
             }
           } else if (entry !== undefined) {
-            this.entries += 1;
-            if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) this.fail();
-            else if (entry.kind === "directory") {
-              this.directories.push({ directory: entry.path, depth: this.activeDepth + 1 });
-            } else this.files.push({ path: entry.path, link: entry.kind === "link" });
+            const prior = this.activeSeen.get(entry.path);
+            if (prior && prior !== entry.kind) this.fail();
+            else if (prior) this.activeExpected.delete(entry.path);
+            else {
+              if (!this.activeChecked) this.activeSeen.set(entry.path, entry.kind);
+              this.entries += 1;
+              if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) this.fail();
+              else if (entry.kind === "directory") {
+                this.directories.push({ directory: entry.path, depth: this.activeDepth + 1 });
+              } else this.files.push({ path: entry.path, link: entry.kind === "link" });
+            }
           }
         } catch { this.fail(); }
         continue;
       }
       const file = this.files.pop();
       if (file !== undefined) {
+        if (this.active && !this.activeChecked) {
+          this.activeChecked = true;
+          this.activeSeen.clear();
+        }
         work += 1;
         try {
           const checked = file.link ? this.spec!.checkLink(file.path) : this.spec!.check(file.path);
@@ -307,19 +397,40 @@ export class CaptureCoverageWalk {
       work += 1;
       try {
         this.active = this.spec!.open(next.directory, next.depth);
+        this.activeDirectory = next.directory;
         this.activeDepth = next.depth;
+        this.activeSeen.clear();
+        this.activeExpected.clear();
+        this.activeChecked = false;
       } catch (error) {
         // A missing root holds no files, as it does for the tailers' scans.
         if (!(next.depth === 0 && errorCode(error) === "ENOENT")) this.fail();
       }
     }
-    if (this.active && !this.active.unchanged()) this.fail();
+    if (this.active && !this.active.unchanged() && !this.canRestartActive()) this.fail();
     if (this.closed && !this.closedIdentity()) this.fail();
     flush();
     return work;
   }
 
   private activeDepth = 0;
+
+  private canRestartActive() {
+    return !this.activeChecked && (this.active?.sameIdentity?.() ?? false);
+  }
+
+  private restartActive() {
+    if (!this.canRestartActive()) throw new Error("capture_coverage_directory_replaced");
+    const previous = this.active!;
+    previous.close();
+    const opened = this.spec!.open(this.activeDirectory, this.activeDepth);
+    if (!previous.sameIdentity?.()) {
+      opened.close();
+      throw new Error("capture_coverage_directory_replaced");
+    }
+    this.active = opened;
+    this.activeExpected = new Set(this.activeSeen.keys());
+  }
 
   private closedIdentity() {
     return this.closed?.sameIdentity?.() ?? this.closed?.unchanged() ?? true;
@@ -334,6 +445,8 @@ export class CaptureCoverageWalk {
     try { this.active?.close(); } catch { /* already failing closed */ }
     this.active = null;
     this.closed = null;
+    this.activeSeen.clear();
+    this.activeExpected.clear();
     this.directories.length = 0;
     this.files.length = 0;
   }

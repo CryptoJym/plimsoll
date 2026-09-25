@@ -17,7 +17,7 @@ import {
   type GrokUsageSweepCounters,
 } from "./history-coverage";
 import type { CaptureBudgetStatus, CaptureWorkBudget } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, linkCaptureCoverageDirectory, linkCoverageFile, openCaptureCoverageDirectory } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, linkCaptureCoverageDirectory, linkCoverageFile, openCaptureCoverageDirectory } from "./capture-frontier";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import { attachRepoContextId, canonicalRepoContextCwd } from "./repo-context";
 
@@ -793,6 +793,7 @@ function writeMaintenanceState(database: Database.Database, key: string, value: 
 }
 
 export class GrokUsageTailer {
+  private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private sweep: Sweep | null = null;
   private pending: Candidate[] = [];
   /** The recent lane and the walk can meet the same file; queue it once. */
@@ -811,6 +812,7 @@ export class GrokUsageTailer {
   }
 
   close() {
+    this.coverageDirectoryCache.clear();
     // A queued file this worker never read may belong to a session the
     // cursor has passed: this sweep can no longer claim it read everything.
     if (this.sweep && this.pending.length > 0 && !this.sweep.unclean) {
@@ -886,7 +888,7 @@ export class GrokUsageTailer {
               { path: path.join(full, GROK_USAGE_FILE_NAME), kind: "file" };
           }
           return entry.isSymbolicLink() ? { path: full, kind: "link" } : null;
-        });
+        }, this.coverageDirectoryCache, depth);
       },
       check: (file) => {
         let stat: fs.BigIntStats;

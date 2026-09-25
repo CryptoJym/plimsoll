@@ -47,7 +47,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -342,6 +342,7 @@ function restoreResultMutationSnapshot(
 }
 
 export class TranscriptTailer {
+  private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
@@ -379,7 +380,7 @@ export class TranscriptTailer {
           return { path: full, kind: "link" };
         }
         return null;
-      }),
+      }, this.coverageDirectoryCache, depth),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
         return stat ? verdict(this.cursorKey(file), stat) : null;
@@ -451,6 +452,7 @@ export class TranscriptTailer {
   }
 
   close() {
+    this.coverageDirectoryCache.clear();
     this.baselineAttempt?.discovery.close();
     this.captureAttempt?.discovery.close();
     this.baselineAttempt = null;
