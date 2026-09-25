@@ -17,6 +17,7 @@ import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import { deliveryItemId } from "./delivery-ack";
 import { pinnedUploadUrl } from "./http-transport";
+import { MAX_EVENT_UPLOAD_BATCH_SIZE } from "./upload";
 import {
   aiWorkSessionSyncBatchSchema,
   type AiWorkIngestBatch,
@@ -33,6 +34,20 @@ import {
 } from "./session-summary";
 
 export type { SessionSnapshot } from "./session-summary";
+
+/** Even a sustained event backlog must give the session planner a turn. */
+export const SESSION_SYNC_MAX_DEFERRAL_MS = 60_000;
+
+export function shouldDeferDaemonSessionSync(input: {
+  batchCapReached: boolean;
+  remainingDelivery: number;
+  maxBatchesPerCycle: number;
+  elapsedSinceLastSessionPassMs: number;
+}): boolean {
+  return input.batchCapReached &&
+    input.remainingDelivery > input.maxBatchesPerCycle * MAX_EVENT_UPLOAD_BATCH_SIZE &&
+    input.elapsedSinceLastSessionPassMs < SESSION_SYNC_MAX_DEFERRAL_MS;
+}
 
 /**
  * Session sync (issue 0037 / cloud Phase D1): the ledger stitches sessions

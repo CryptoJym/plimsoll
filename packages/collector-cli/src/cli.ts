@@ -267,6 +267,7 @@ import {
   runSessionSync,
   saveDaemonSessionSyncState,
   sessionIdsFromBatches,
+  shouldDeferDaemonSessionSync,
 } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
@@ -2777,6 +2778,7 @@ async function main() {
     // refresh does not wait for `upload-history --sessions`.
     let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
     let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
+    let lastSessionPassAt = performance.now();
 
     const runSync = async () => {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
@@ -2842,8 +2844,14 @@ async function main() {
         // session snapshot re-reads every row of each touched session (1.88M
         // for Studio0's busiest), seconds to minutes that would hold the next
         // upload cycle; the identities are carried to the cycle that ends the
-        // backlog (eco-6hoxj.163.24).
-        if (catchUp) { carrySessions(); return; }
+        // backlog. The monotonic deadline gives sessions a turn even when a
+        // sustained backlog never empties (eco-6hoxj.163.75 S1).
+        if (shouldDeferDaemonSessionSync({
+          batchCapReached: catchUp,
+          remainingDelivery,
+          maxBatchesPerCycle: config.delivery.maxBatchesPerCycle,
+          elapsedSinceLastSessionPassMs: performance.now() - lastSessionPassAt,
+        })) { carrySessions(); return; }
 
         // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
         // plus durable pending, and a ledger catch-up until the first full
@@ -2944,6 +2952,8 @@ async function main() {
           sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, touchedSessionIds);
           pendingSessionIds = sessionSyncState.pendingSessionIds;
           persistSessionCarry();
+        } finally {
+          lastSessionPassAt = performance.now();
         }
       } catch (error) {
         carrySessions();

@@ -26,6 +26,9 @@ import {
   SessionAttributionBatch,
 } from "./session-attribution";
 
+/** Maximum events one upload request can take, including daemon requests. */
+export const MAX_EVENT_UPLOAD_BATCH_SIZE = 500;
+
 /**
  * Project attribution parity (issue 0036): the ledger's per-event repo
  * linkage lives in columns, not in the payload. Fill it only when the payload
@@ -47,7 +50,7 @@ export function buildIngestBatch(
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
   buffer.useWorkspace(config.tenantId, config.deviceId);
   const candidateRows = buffer.listUnuploaded({
-    maxRows: options.limit ?? 500,
+    maxRows: options.limit ?? MAX_EVENT_UPLOAD_BATCH_SIZE,
     maxBytes: options.maxBytes,
   });
 
@@ -276,7 +279,7 @@ async function uploadStateless(
   // mode. This mode intentionally mutates no retry or upload state.
   const { batch } = buildIngestBatch(config, buffer, {
     ...options,
-    limit: 500,
+    limit: MAX_EVENT_UPLOAD_BATCH_SIZE,
     maxBytes: 1_500_000,
   });
   if (!batch) {
@@ -299,7 +302,7 @@ async function uploadStateless(
     attemptCount: 0,
   }));
   const maxRequestBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
-  const outputLimit = Math.max(1, Math.min(Math.trunc(options.limit ?? 500), 500));
+  const outputLimit = Math.max(1, Math.min(Math.trunc(options.limit ?? MAX_EVENT_UPLOAD_BATCH_SIZE), MAX_EVENT_UPLOAD_BATCH_SIZE));
   const items: LeasedDeliveryItem[] = [];
   for (const item of candidateItems) {
     if (items.length >= outputLimit) break;
@@ -487,8 +490,8 @@ export async function uploadBufferedEvents(
   const outputLimit = Math.max(
     1,
     Math.min(
-      Number.isFinite(options.limit) ? Math.trunc(options.limit!) : 500,
-      500,
+      Number.isFinite(options.limit) ? Math.trunc(options.limit!) : MAX_EVENT_UPLOAD_BATCH_SIZE,
+      MAX_EVENT_UPLOAD_BATCH_SIZE,
     ),
   );
   const maxProbes = Math.max(
