@@ -12,6 +12,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { Worker } from "node:worker_threads";
 import zlib from "node:zlib";
 
@@ -21,7 +22,8 @@ import {
   LOCAL_HTTP_LIMITS,
   isAllowedLocalHostValue,
 } from "../packages/collector-cli/src/http-boundary";
-import { OtlpIntakeSpool } from "../packages/collector-cli/src/otlp-spool";
+import { OTLP_COMMIT_CHUNK_SIZE, OtlpIntakeSpool } from "../packages/collector-cli/src/otlp-spool";
+import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 
 type Receipt = { error?: unknown; reason?: unknown; [key: string]: unknown };
@@ -47,11 +49,18 @@ const SENTINELS = [
 // value is not source-bound. Full 512-record and rich-attribute shapes are
 // covered with the production OTLP spool enabled: a busy disk may spend the
 // real 1.5 s deadline after some chunks commit, so the remainder must be
-// durable and replayable. The separate deadline check below keeps the real
-// wall-clock budget and the 408/retry behavior pinned.
+// durable and replayable. The direct-202 check below uses the real server
+// clock; the partial-commit and retry checks advance the injected budget only
+// after a real commit, so host scheduling cannot choose the partition.
 const CODEX_OTEL_EXPORT_BATCH_RECORDS = 512;
 const CODEX_RICH_EXPORT_BATCH_RECORDS = 128;
 const DEFERRED_CONTEXT_OWNERSHIP_RECORDS = 128;
+const HEAVY_FIXTURE_CLIENT_TIMEOUT_MS = 30_000;
+// This is a process-CPU work guard, not a response-time contract. It covers
+// parser work under loaded runs (the independent review observed 54.4 ms)
+// while still rejecting hundreds of ms of extra cardinality work; zero
+// ledger writes is asserted separately below.
+const CARDINALITY_REJECT_CPU_CEILING_MS = 200;
 const CODEX_RECORD_BASE_NANOS = 1_760_000_000_000_000_000n;
 
 function expectedCodexObservedAt(records: number) {
@@ -68,11 +77,28 @@ function elapsedProcessCpuMs(start: NodeJS.CpuUsage) {
   return (used.user + used.system) / 1_000;
 }
 
+type ServerTiming = { route: string; status: number; elapsedMs: number };
+
+function observeServerTimings(server: http.Server) {
+  const timings: ServerTiming[] = [];
+  // Prepend the listener so the clock starts at server arrival, before the
+  // production handler runs. No request clock or server behavior is replaced.
+  server.prependListener("request", (request, response) => {
+    const started = process.hrtime.bigint();
+    response.once("finish", () => timings.push({
+      route: request.url ?? "",
+      status: response.statusCode,
+      elapsedMs: Number(process.hrtime.bigint() - started) / 1_000_000,
+    }));
+  });
+  return timings;
+}
+
 function appendWaitAdjustedClock(buffer: LocalEventBuffer) {
   // The max-128 handoff fixture counts admitted work and handoffs. SQLite
   // fsync latency is host load, while the CPU assertion below still bounds
   // the work. Only this fixture's request budget uses the adjusted clock;
-  // every production request and the deadline/retry fixtures use real time.
+  // production requests and the direct-response deadline fixture use real time.
   const appendMany = buffer.appendMany.bind(buffer);
   let appendMs = 0;
   buffer.appendMany = (...args: Parameters<LocalEventBuffer["appendMany"]>) => {
@@ -217,7 +243,7 @@ function slowRequest(port: number) {
   });
 }
 
-async function prepareStatusProbeDuringAppend(port: number, signal: SharedArrayBuffer) {
+async function prepareStatusProbeDuringAppend(port: number, signal: SharedArrayBuffer, confirmSend = false) {
   const worker = new Worker(
     `
       const http = require("node:http");
@@ -247,9 +273,13 @@ async function prepareStatusProbeDuringAppend(port: number, signal: SharedArrayB
         request.setTimeout(5_000, () => request.destroy(new Error("StatusProbeTimeout")));
         request.on("error", () => parentPort.postMessage({ error: "StatusProbeFailed" }));
         request.end();
+        if (workerData.confirmSend) {
+          Atomics.store(state, 0, 2);
+          Atomics.notify(state, 0);
+        }
       }
     `,
-    { eval: true, workerData: { port, signal } },
+    { eval: true, workerData: { port, signal, confirmSend } },
   );
   await new Promise<void>((resolve, reject) => {
     worker.once("online", resolve);
@@ -476,21 +506,32 @@ async function isolatedOtlpRun(
   const previousHome = process.env.PLIMSOLL_HOME;
   process.env.PLIMSOLL_HOME = home;
   const buffer = new LocalEventBuffer(path.join(home, "ledger.sqlite"));
+  let proofNow = 0;
   if (forceSpoolAfterFirstChunk) {
     const appendMany = buffer.appendMany.bind(buffer);
-    const stall = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
-    let pause = true;
+    let first = true;
     buffer.appendMany = (...args: Parameters<LocalEventBuffer["appendMany"]>) => {
       const result = appendMany(...args);
-      if (pause) {
-        pause = false;
-        Atomics.wait(stall, 0, 0, LOCAL_HTTP_LIMITS.requestDeadlineMs + 100);
+      if (first) {
+        first = false;
+        // The first 16 rows really committed. Advance only the request-budget
+        // clock so the next chunk deterministically takes the spool path.
+        proofNow += LOCAL_HTTP_LIMITS.requestDeadlineMs + 1;
       }
       return result;
     };
   }
   const spool = new OtlpIntakeSpool({ home });
-  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer, { otlpSpool: spool });
+  const config = collectorConfigSchema.parse({});
+  const normalizedExpectedEvents = explodeOtlpPayload(JSON.parse(body), {
+    policy: config.policy,
+    source: "codex",
+    transportPath: route,
+  }).events;
+  const server = createCollectorServer(config, buffer, {
+    otlpSpool: spool,
+    ...(forceSpoolAfterFirstChunk ? { requestBudgetNow: () => proofNow } : {}),
+  });
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -505,7 +546,7 @@ async function isolatedOtlpRun(
       // A post-deadline spool flush is asynchronous. A short proof-client
       // timeout would destroy the socket and tear down this temporary home
       // while the file is still being flushed, inventing a write failure.
-      30_000,
+      HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
     );
     const countEvents = () => Number((buffer.database.prepare(
       "select count(*) as count from buffered_events",
@@ -514,11 +555,35 @@ async function isolatedOtlpRun(
     const pendingBeforeDrain = spool.status().pendingFiles;
     const spooledEvents = spool.status().spooled.events;
     let drainPasses = 0;
-    for (let pass = 0; pass < 128 && spool.status().pendingFiles > 0; pass += 1) {
+    // A drain pass may consume its 250 ms allowance while this process is
+    // descheduled. Keep draining until the work is done; the guard scales with
+    // records and catches a genuinely stalled replay, not a fixed host speed.
+    const maxDrainPasses = Math.ceil(expectedEvents / OTLP_COMMIT_CHUNK_SIZE) * 128;
+    while (spool.status().pendingFiles > 0 && drainPasses < maxDrainPasses) {
       await spool.drain(buffer);
       drainPasses += 1;
     }
     const storedEvents = countEvents();
+    const persistedRows = (buffer.database.prepare(
+      "select id, source, event_type as eventType, observed_at as observedAt, payload_json as payloadJson from buffered_events order by id",
+    ).all() as Array<{
+      id: string; source: string; eventType: string; observedAt: string; payloadJson: string;
+    }>).map((row) => ({
+      id: row.id,
+      source: row.source,
+      eventType: row.eventType,
+      observedAt: row.observedAt,
+      payload: JSON.parse(row.payloadJson) as Record<string, unknown>,
+    }));
+    const sortedExpected = [...normalizedExpectedEvents].sort((a, b) => a.event.id.localeCompare(b.event.id));
+    const exactPayloadRows = persistedRows.length === sortedExpected.length &&
+      persistedRows.every((row, index) => {
+        const expected = sortedExpected[index]?.event;
+        return expected !== undefined && row.id === expected.id &&
+          row.source === expected.source && row.eventType === expected.eventType &&
+          row.observedAt === expected.observedAt &&
+          JSON.stringify(row.payload) === JSON.stringify(expected);
+      });
     const observedAt = (buffer.database.prepare(
       "select observed_at as observedAt from buffered_events order by observed_at",
     ).all() as Array<{ observedAt: string }>).map((row) => row.observedAt);
@@ -533,7 +598,10 @@ async function isolatedOtlpRun(
       pendingBeforeDrain,
       spooledEvents,
       drainPasses,
+      maxDrainPasses,
       storedEvents,
+      persistedRows,
+      exactPayloadRows,
       exactObservedAt,
       pendingAfterDrain: spoolStatus.pendingFiles,
       rejectedOnReplay: spoolStatus.rejectedOnReplay,
@@ -544,6 +612,7 @@ async function isolatedOtlpRun(
             committedBeforeDrain < expectedEvents)) &&
         committedBeforeDrain + spooledEvents === expectedEvents &&
         storedEvents === expectedEvents &&
+        exactPayloadRows &&
         exactObservedAt &&
         spoolStatus.pendingFiles === 0 && spoolStatus.rejectedOnReplay === 0,
     };
@@ -561,8 +630,10 @@ async function isolatedOtlpRun(
 async function checkRepresentativeBatch() {
   // 1,500 ms is the wall-clock request budget in the server and documented
   // retry/spool behavior. These checks pin the count and attribute shapes and
-  // exact durability across both valid 202 outcomes, even on a busy disk.
-  // The forced partial-commit case below checks the deadline itself.
+  // exact durability across both valid 202 outcomes, even on a busy disk. The
+  // fixture client waits 30 s for an asynchronous spool flush; this does not
+  // establish behavior for exporters with shorter client timeouts.
+  // The forced partial-commit case below checks the checkpoint after a commit.
   check("request_deadline_contract_is_1500_ms", LOCAL_HTTP_LIMITS.requestDeadlineMs === 1_500,
     { deadlineMs: LOCAL_HTTP_LIMITS.requestDeadlineMs });
   const body = representativeCodexBatchBody(CODEX_OTEL_EXPORT_BATCH_RECORDS, true);
@@ -584,10 +655,13 @@ async function checkRepresentativeBatch() {
       elapsedMs: Math.round(rich.result.elapsedMs * 100) / 100,
       committedBeforeDrain: rich.committedBeforeDrain,
       spooledEvents: rich.spooledEvents,
+      drainPasses: rich.drainPasses,
+      maxDrainPasses: rich.maxDrainPasses,
       storedEvents: rich.storedEvents,
       exactObservedAt: rich.exactObservedAt,
       pendingAfterDrain: rich.pendingAfterDrain,
       deadlineMs: LOCAL_HTTP_LIMITS.requestDeadlineMs,
+      clientTimeoutMs: HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
     },
   );
   const smaller = await isolatedOtlpRun(
@@ -613,34 +687,40 @@ async function checkRepresentativeBatch() {
       elapsedMs: Math.round(smaller.result.elapsedMs * 100) / 100,
       committedBeforeDrain: smaller.committedBeforeDrain,
       spooledEvents: smaller.spooledEvents,
+      drainPasses: smaller.drainPasses,
+      maxDrainPasses: smaller.maxDrainPasses,
       storedEvents: smaller.storedEvents,
       exactObservedAt: smaller.exactObservedAt,
       deadlineMs: LOCAL_HTTP_LIMITS.requestDeadlineMs,
+      clientTimeoutMs: HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
     },
   );
   await checkPartialDeadlineRetry();
+  await checkDirectSuccessDeadline();
 }
 
 async function checkPartialDeadlineRetry() {
-  // The kill-switch route may answer 408 after a committed chunk. Pause only
-  // the first request after that commit, beyond the real deadline, then retry
-  // the identical body. Stable event IDs must make the retry exactly once.
+  // The kill-switch route may answer 408 after a committed chunk. Advance the
+  // request budget after that commit, then retry the identical body. Stable
+  // event IDs must make the retry exactly once, regardless of host scheduling.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-http-retry-"));
   const previousHome = process.env.PLIMSOLL_HOME;
   process.env.PLIMSOLL_HOME = home;
   const buffer = new LocalEventBuffer(path.join(home, "ledger.sqlite"));
   const originalAppendMany = buffer.appendMany.bind(buffer);
-  const stall = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  let proofNow = 0;
   let pauseAfterFirstChunk = true;
   buffer.appendMany = (...args: Parameters<LocalEventBuffer["appendMany"]>) => {
     const result = originalAppendMany(...args);
     if (pauseAfterFirstChunk) {
       pauseAfterFirstChunk = false;
-      Atomics.wait(stall, 0, 0, LOCAL_HTTP_LIMITS.requestDeadlineMs + 100);
+      proofNow += LOCAL_HTTP_LIMITS.requestDeadlineMs + 1;
     }
     return result;
   };
-  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer);
+  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer, {
+    requestBudgetNow: () => proofNow,
+  });
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -664,7 +744,7 @@ async function checkPartialDeadlineRetry() {
     check(
       "partial_commit_408_retry_is_exactly_once",
       stableRejection(first, "request_deadline_exceeded", 408) &&
-        first.elapsedMs >= LOCAL_HTTP_LIMITS.requestDeadlineMs &&
+        !pauseAfterFirstChunk &&
         committedAfter408 === 16 &&
         retry.status === 202 && retry.body.accepted === true &&
         retry.body.recordCount === 17 &&
@@ -674,11 +754,149 @@ async function checkPartialDeadlineRetry() {
         firstStatus: first.status,
         firstReason: first.body.reason,
         firstElapsedMs: Math.round(first.elapsedMs * 100) / 100,
+        budgetAdvancedAfterCommit: !pauseAfterFirstChunk,
         committedAfter408,
         retryStatus: retry.status,
         retryDeduplicated: retry.body.deduplicated,
         storedAfterRetry,
         exactObservedAt,
+      },
+    );
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    buffer.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = previousHome;
+  }
+}
+
+async function checkDirectSuccessDeadline() {
+  // This small, real-clock request checks the successful response boundary.
+  // Heavy durability fixtures may correctly spool after the request budget;
+  // a direct 202 for one row has no such excuse. Measure at server arrival so
+  // client scheduling and transport do not dilute the 1,500 ms contract.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-http-direct-deadline-"));
+  const previousHome = process.env.PLIMSOLL_HOME;
+  process.env.PLIMSOLL_HOME = home;
+  const buffer = new LocalEventBuffer(path.join(home, "ledger.sqlite"));
+  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer);
+  const timings = observeServerTimings(server);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const result = await request(
+      (server.address() as AddressInfo).port,
+      "/v1/logs",
+      representativeCodexBatchBody(1, false),
+      { "x-plimsoll-source": "codex" },
+      "POST",
+      HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
+    );
+    const timing = timings.find((row) => row.route === "/v1/logs");
+    const stored = Number((buffer.database.prepare(
+      "select count(*) as count from buffered_events",
+    ).get() as { count: number }).count);
+    check(
+      "direct_202_finishes_within_real_server_deadline",
+      result.status === 202 && result.body.accepted === true &&
+        result.body.recordCount === 1 && stored === 1 &&
+        timing?.status === 202 && timing.elapsedMs <= LOCAL_HTTP_LIMITS.requestDeadlineMs,
+      {
+        status: result.status,
+        outcome: result.body.status ?? (result.body.accepted ? "accepted" : null),
+        stored,
+        serverElapsedMs: timing?.elapsedMs ?? null,
+        clientElapsedMs: result.elapsedMs,
+        deadlineMs: LOCAL_HTTP_LIMITS.requestDeadlineMs,
+      },
+    );
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    buffer.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = previousHome;
+  }
+}
+
+async function checkInServerBlockingLatency() {
+  // Keep the latency signal off the disk whose fsync can legitimately stall
+  // under host load. This is the same HTTP handler and appendMany code on a
+  // memory SQLite ledger. A SQL trigger hands a concurrent /status request to
+  // another thread before the first append completes.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-http-latency-"));
+  const previousHome = process.env.PLIMSOLL_HOME;
+  process.env.PLIMSOLL_HOME = home;
+  const buffer = new LocalEventBuffer(":memory:");
+  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer);
+  const timings = observeServerTimings(server);
+  const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const state = new Int32Array(signal);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (server.address() as AddressInfo).port;
+    buffer.database.function("proof_latency_append_notify", () => {
+      Atomics.store(state, 0, 1);
+      Atomics.notify(state, 0);
+      Atomics.wait(state, 0, 1, 500);
+      return 1;
+    });
+    buffer.database.exec(`
+      create temp table proof_latency_append_gate (singleton integer primary key check (singleton = 1));
+      create temp trigger proof_latency_append_started
+      after insert on main.buffered_events
+      when not exists (select 1 from proof_latency_append_gate)
+      begin
+        insert into proof_latency_append_gate values (1);
+        select proof_latency_append_notify();
+      end;
+    `);
+    const { result: statusPromise } = await prepareStatusProbeDuringAppend(port, signal, true);
+    const eventLoopDelay = monitorEventLoopDelay({ resolution: 10 });
+    eventLoopDelay.enable();
+    // Let the monitor arm its first timer before the synchronous append begins.
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    const accepted = await request(
+      port, "/v1/logs", representativeCodexBatchBody(128, false),
+      { "x-plimsoll-source": "codex" }, "POST", HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
+    );
+    const status = await statusPromise;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    eventLoopDelay.disable();
+    const maxEventLoopDelayMs = eventLoopDelay.max / 1_000_000;
+    const acceptedTiming = timings.find((row) => row.route === "/v1/logs");
+    const statusTiming = timings.find((row) => row.route === "/status");
+    const stored = Number((buffer.database.prepare(
+      "select count(*) as count from buffered_events",
+    ).get() as { count: number }).count);
+    check(
+      "in_server_append_keeps_concurrent_status_responsive",
+      accepted.status === 202 && accepted.body.accepted === true &&
+        accepted.body.recordCount === 128 && stored === 128 &&
+        status.status === 200 && Atomics.load(state, 0) === 2 &&
+        status.startedAtMs <= status.settledAtMs &&
+        acceptedTiming?.status === 202 && statusTiming?.status === 200 &&
+        maxEventLoopDelayMs < 900 && status.elapsedMs < 900 &&
+        statusTiming.elapsedMs < 900,
+      {
+        acceptedStatus: accepted.status,
+        stored,
+        probeSentDuringAppend: Atomics.load(state, 0) === 2,
+        serverAcceptedElapsedMs: acceptedTiming?.elapsedMs ?? null,
+        serverStatusElapsedMs: statusTiming?.elapsedMs ?? null,
+        statusProbeElapsedMs: status.elapsedMs,
+        maxEventLoopDelayMs,
+        latencyCeilingMs: 900,
       },
     );
   } finally {
@@ -787,6 +1005,7 @@ async function isolatedMaxRecordRun(index: number) {
 
 async function main() {
   if (process.env.PROBE_CASE === "http_512") {
+    await checkInServerBlockingLatency();
     await checkRepresentativeBatch();
     for (const result of checks) {
       console.log(`${result.passed ? "PASS" : "FAIL"} ${result.name} ${JSON.stringify(result.detail)}`);
@@ -1091,7 +1310,7 @@ async function main() {
     check(
       "otlp_record_cardinality_rejected_before_write",
       stableRejection(highRecords, "otlp_record_limit_exceeded", 413) &&
-        highRecordsCpuMs < 50 &&
+        highRecordsCpuMs < CARDINALITY_REJECT_CPU_CEILING_MS &&
         changesAfterHighRecords === changesBeforeHighRecords &&
         buffer.repoContextQueueStatus().queued === 0,
       {
@@ -1145,7 +1364,7 @@ async function main() {
     check(
       "otlp_nested_record_cardinality_rejected_before_write",
       stableRejection(highNested, "otlp_record_limit_exceeded", 413) &&
-        highNestedCpuMs < 50 &&
+        highNestedCpuMs < CARDINALITY_REJECT_CPU_CEILING_MS &&
         totalChanges(buffer) === changesBeforeHighNested &&
         buffer.repoContextQueueStatus().queued === 0,
       {
@@ -1460,17 +1679,30 @@ async function main() {
       isolatedMaxRuns,
     );
 
+    await checkInServerBlockingLatency();
     await checkRepresentativeBatch();
 
     const fullSpanBatch = codexFullSpanExportBody();
     const fullSpanBatchResult = await isolatedOtlpRun(
       "/v1/traces", fullSpanBatch, CODEX_OTEL_EXPORT_BATCH_RECORDS,
     );
+    const spanRows = [...fullSpanBatchResult.persistedRows]
+      .sort((a, b) => a.observedAt.localeCompare(b.observedAt));
+    const exactSpanContents = spanRows.length === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
+      spanRows.every((row, index) => {
+        const metadata = row.payload.metadata as Record<string, unknown> | undefined;
+        return row.source === "codex" && row.eventType === "assistant_response" &&
+          row.observedAt === new Date(Number(CODEX_RECORD_BASE_NANOS / 1_000_000n) + index).toISOString() &&
+          row.payload.inputTokens === 3 && row.payload.outputTokens === 5 &&
+          metadata?.traceId === (0x1000_0000_0000_0000n + BigInt(index)).toString(16).padStart(32, "0") &&
+          metadata?.spanId === (0x2000_0000n + BigInt(index)).toString(16).padStart(16, "0") &&
+          metadata?.otelEventName === (index % 2 === 0 ? "codex.tool_call" : "codex.model_request");
+      });
     check(
       "codex_full_512_span_export_with_span_events_is_exactly_durable_or_spooled",
       Buffer.byteLength(fullSpanBatch) <= LOCAL_HTTP_LIMITS.decodedBodyBytes &&
         fullSpanBatchResult.result.body.recordCount === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
-        fullSpanBatchResult.exactDurability,
+        fullSpanBatchResult.exactDurability && exactSpanContents,
       {
         spans: CODEX_OTEL_EXPORT_BATCH_RECORDS,
         spanEvents: CODEX_SPAN_EVENTS_IN_FULL_EXPORT,
@@ -1480,8 +1712,13 @@ async function main() {
           (fullSpanBatchResult.result.body.accepted ? "accepted" : null),
         recordCount: fullSpanBatchResult.result.body.recordCount,
         storedEvents: fullSpanBatchResult.storedEvents,
+        drainPasses: fullSpanBatchResult.drainPasses,
+        maxDrainPasses: fullSpanBatchResult.maxDrainPasses,
+        exactPayloadRows: fullSpanBatchResult.exactPayloadRows,
+        exactSpanContents,
         spooledEvents: fullSpanBatchResult.spooledEvents,
         elapsedMs: Math.round(fullSpanBatchResult.result.elapsedMs * 100) / 100,
+        clientTimeoutMs: HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
       },
     );
 
@@ -1490,12 +1727,23 @@ async function main() {
     const overPreviousCapResult = await isolatedOtlpRun(
       "/v1/logs", overPreviousCap, CODEX_OTEL_EXPORT_BATCH_RECORDS,
     );
+    const identityRows = overPreviousCapResult.persistedRows;
+    const identityIds = new Set(identityRows.map((row) => row.id));
+    const exactIdentityContents = identityRows.length === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
+      identityIds.size === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
+      identityRows.every((row) =>
+        row.source === "codex" && row.eventType === "assistant_response" &&
+        row.observedAt === new Date(Number(CODEX_RECORD_BASE_NANOS / 1_000_000n)).toISOString() &&
+        row.payload.inputTokens === 3 && row.payload.outputTokens === 5 &&
+        !JSON.stringify(row.payload).includes("HTTP_OVER_2MIB_PRIVATE_CWD") &&
+        !JSON.stringify(row.payload).includes("proof.padding"),
+      );
     check(
       "identity_encoded_body_over_previous_2mib_cap_is_exactly_durable_or_spooled",
       overPreviousCapBytes > PREVIOUS_WIRE_CAP_BYTES &&
         overPreviousCapBytes <= LOCAL_HTTP_LIMITS.compressedBodyBytes &&
         overPreviousCapResult.result.body.recordCount === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
-        overPreviousCapResult.exactDurability,
+        overPreviousCapResult.exactDurability && exactIdentityContents,
       {
         bodyBytes: overPreviousCapBytes,
         previousCap: PREVIOUS_WIRE_CAP_BYTES,
@@ -1505,8 +1753,13 @@ async function main() {
           (overPreviousCapResult.result.body.accepted ? "accepted" : null),
         recordCount: overPreviousCapResult.result.body.recordCount,
         storedEvents: overPreviousCapResult.storedEvents,
+        drainPasses: overPreviousCapResult.drainPasses,
+        maxDrainPasses: overPreviousCapResult.maxDrainPasses,
+        exactPayloadRows: overPreviousCapResult.exactPayloadRows,
+        exactIdentityContents,
         spooledEvents: overPreviousCapResult.spooledEvents,
         elapsedMs: Math.round(overPreviousCapResult.result.elapsedMs * 100) / 100,
+        clientTimeoutMs: HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
       },
     );
 
