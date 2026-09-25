@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { AutomaticRetentionCadence } from "./retention-cadence";
-import { BudgetSampler } from "./budget-sampler";
+import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -318,6 +318,7 @@ function printHelp() {
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
   status                Print local buffer and policy status as JSON
+  status --budget [--csv]  Print the advisory footprint and 24-hour sample CSV
                         (credentialed daemon /status; liveness is GET /healthz)
   maintenance --disable-account-assertion SOURCE --yes
                         Toggle one adapter; writes only account assertion state
@@ -352,6 +353,7 @@ Commands:
                         Read-only join of producer hook counters to collector
                         admission and the local ledger for one window
   export                Print buffered events as JSON
+  export --budget [--csv]  Export local footprint samples and daily table sizes
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   forward-hook-http SOURCE
                         Forward stdin to the authenticated loopback hook boundary without argv secrets.
@@ -2578,7 +2580,8 @@ async function main() {
     // (wal-checkpoint-worker.ts).
     const walCheckpoint = new WalCheckpointWorker(buffer.database);
     const budgetSampler = process.env.PLIMSOLL_BUDGET_SAMPLER === "off"
-      ? null : new BudgetSampler(buffer.database, collectorBufferPath());
+      ? null : new BudgetSampler(buffer.database, collectorBufferPath(), 60_000,
+        () => buffer.budgetAttemptedTotal());
     // Outcome facts intentionally live outside the capture ledger. Opening the
     // local read model here does not schedule collection; the only writer is
     // an explicit backfill command.
@@ -3524,6 +3527,20 @@ async function main() {
   }
 
   if (command === "status") {
+    if (flag("--budget")) {
+      const ledgerPath = collectorBufferPath();
+      if (!fs.existsSync(ledgerPath)) {
+        console.log(flag("--csv") ? "" : JSON.stringify({ mode: "advisory", latest: null,
+          unavailable: ["ledger_missing"] }, null, 2));
+        return;
+      }
+      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      try {
+        console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
+          : JSON.stringify({ ...budgetStatus(ledger), daily: budgetDailyRows(ledger) }, null, 2));
+      } finally { ledger.close(); }
+      return;
+    }
     const buffer = openBuffer(config);
     // Bead eco-6hoxj.61 (review r1, F5): the hook spool's kill switch belongs
     // to the daemon, which reads it once when its drain starts. Ask the daemon.
@@ -5685,6 +5702,20 @@ async function main() {
   }
 
   if (command === "export") {
+    if (flag("--budget")) {
+      const ledgerPath = collectorBufferPath();
+      if (!fs.existsSync(ledgerPath)) {
+        console.log(flag("--csv") ? "" : JSON.stringify({ schema: "plimsoll-budget-export/v1",
+          mode: "advisory", startedDay: null, samples: [], daily: [] }, null, 2));
+        return;
+      }
+      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      try {
+        console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
+          : JSON.stringify(budgetExport(ledger), null, 2));
+      } finally { ledger.close(); }
+      return;
+    }
     const buffer = openBuffer(config);
     const requestedLimit = optionValue("--limit") ? Number(optionValue("--limit")) : 5;
     const limit = Number.isFinite(requestedLimit)

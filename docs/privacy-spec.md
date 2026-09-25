@@ -407,6 +407,11 @@ Raw event retention and projection compaction do not remove these independent pr
 
 Eviction counters are aggregate state, not per-fact logs. SQLite deletion provides the product's logical erasure guarantee; the collector does not claim forensic secure deletion. Proofs: `episode_eviction_removes_related_attempts_and_exposures_atomically`, `fact_tables_never_enter_upload_envelopes`, and `whole_ledger_purge_removes_fact_rows_and_state_together`.
 
+### Collector footprint measurements
+
+The local `budget_samples` table keeps at most 1,440 versioned minute samples and no sample older than 24 hours. It records ledger file sizes, per-process PID/role/RSS/CPU time, WAL file-growth lower bound, outbox counts and ages, summary lag, sampler cost, and availability codes. It stores no payload content, command line, or filesystem path. Thread-pool CPU and memory are included in their owning process; the collector does not claim a separate per-thread RSS.
+The local `budget_daily` table keeps the current UTC day and seven prior days: local raw-insert attempts flushed once per minute and, only for ledgers at or below 2 GiB, per-table page counts. A large ledger stores `skipped: size`. Table names are schema names, never user paths. The intake counter retains no event identity and adds no per-row database write. Attempts from other processes and counted gaps are unavailable, and a crash can omit the last unflushed minute. One `budget_control` row holds only the UTC day measurement began, so a partial first week is labelled provisional. These tables are not uploaded. `plimsoll status --budget --csv` and `plimsoll export --budget` export them locally; `purge-local-data --confirm` removes them with the ledger. There is no actor-specific row to erase.
+
 ## Regeneration
 
     pnpm docs:privacy          # regenerate this page

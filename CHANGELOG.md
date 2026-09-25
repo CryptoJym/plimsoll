@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.41 — Unreleased
+
+- The collector now measures its own ledger size, process memory and CPU time,
+  outbox age, and session-summary lag once a minute. A local 24-hour history and
+  CSV export help show its cost on each Mac. Small ledgers also get daily table
+  sizes. The budget shown in status is advisory; it does not limit capture.
+- WAL file growth is reported as a lower bound on bytes written. SQLite may
+  reuse a checkpointed WAL without growing the file, so exact WAL writes remain
+  unavailable until a lower-level counter exists.
+
 ## 0.7.5 — 2026-09-08
 
 - Stable and finitely growing oversized Codex and Claude JSONL records can

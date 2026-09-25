@@ -37,29 +37,29 @@ export type BudgetSample = {
   summaryLagSeconds: number | null;
   samplerElapsedMs: number;
   samplerCpuMicros: number;
+  samplerMainThreadMs: number;
+  attemptedRowsDelta: number;
   unavailable: string[];
 };
 
 type DailyRow = { day: string; version: number; attemptedRows: number; dbstatStatus: string; tablePagesJson: string | null };
 
-/** Additive, constant-size schema. The trigger counts committed raw admissions, including child writers. */
+/** Additive, constant-size schema. Admission totals are flushed once per sample. */
 export function ensureBudgetSchema(db: Database.Database): void {
   db.exec(`
     create table if not exists budget_samples (
       id integer primary key, at_ms integer not null, version integer not null,
       sample_json text not null
     );
+    create index if not exists idx_budget_samples_at_ms on budget_samples(at_ms);
     create table if not exists budget_daily (
       day text primary key, version integer not null default 1, attempted_rows integer not null default 0,
       dbstat_status text not null default 'pending', table_pages_json text
     ) without rowid;
-    create trigger if not exists trg_budget_attempted_insert
-    after insert on buffered_events
-    begin
-      insert into budget_daily(day, attempted_rows)
-      values(substr(new.created_at, 1, 10), 1)
-      on conflict(day) do update set attempted_rows = attempted_rows + 1;
-    end;
+    create table if not exists budget_control (
+      singleton integer primary key check(singleton=1), started_day text not null
+    );
+    insert or ignore into budget_control(singleton,started_day) values(1,strftime('%Y-%m-%d','now'));
   `);
 }
 
@@ -141,7 +141,7 @@ export function budgetLedgerSnapshot(db: Database.Database, nowMs: number) {
     } | undefined;
   let oldestDead: string | null = null;
   if (control && control.dead <= DEAD_AGE_MAX_ROWS && control.dead > 0) {
-    oldestDead = (db.prepare(`select min(created_at) as at from upload_receipts
+    oldestDead = (db.prepare(`select min(terminal_at) as at from upload_receipts
       indexed by idx_upload_receipts_state where terminal_state='dead'`).get() as { at: string | null }).at;
   } else if (control && control.dead > DEAD_AGE_MAX_ROWS) unavailable.push("dead_age_scan_cap");
   const latest = db.prepare(`select created_at as at from buffered_events
@@ -174,7 +174,9 @@ export async function collectBudgetSample(db: Database.Database, ledgerPath: str
     fileBytes(ledgerPath), fileBytes(`${ledgerPath}-wal`), fileBytes(`${ledgerPath}-shm`),
     budgetProcessTree(options.processPid ?? process.pid, nowMs, options.previous),
   ]);
+  const ledgerStarted = performance.now();
   const ledger = budgetLedgerSnapshot(db, nowMs);
+  const ledgerMs = performance.now() - ledgerStarted;
   const cpu = process.cpuUsage(cpuBefore);
   return {
     version: BUDGET_SAMPLE_VERSION, atMs: nowMs, dbBytes, walBytes, shmBytes,
@@ -184,9 +186,12 @@ export async function collectBudgetSample(db: Database.Database, ledgerPath: str
     ...ledger,
     samplerElapsedMs: Math.round((performance.now() - started) * 100) / 100,
     samplerCpuMicros: cpu.user + cpu.system,
+    samplerMainThreadMs: Math.round(ledgerMs * 100) / 100,
+    attemptedRowsDelta: 0,
     unavailable: [...tree.unavailable, ...ledger.unavailable,
       "exact_wal_write_bytes_unavailable_stat_only",
-      "thread_pool_accounted_in_process_not_separable"],
+      "thread_pool_accounted_in_process_not_separable",
+      "other_process_admissions_and_counted_gaps_unavailable"],
   };
 }
 
@@ -195,6 +200,11 @@ export function recordBudgetSample(db: Database.Database, sample: BudgetSample):
   db.transaction(() => {
     const inserted = db.prepare(`insert into budget_samples(at_ms,version,sample_json) values(?,?,?)`)
       .run(sample.atMs, sample.version, JSON.stringify(sample));
+    db.prepare(`insert into budget_daily(day,attempted_rows) values(?,?)
+      on conflict(day) do update set attempted_rows=attempted_rows+excluded.attempted_rows
+      where excluded.attempted_rows>0`).run(
+      new Date(sample.atMs).toISOString().slice(0, 10), sample.attemptedRowsDelta,
+    );
     db.prepare(`delete from budget_samples where id <= ? or at_ms < ?`)
       .run(Number(inserted.lastInsertRowid) - BUDGET_RING_LIMIT, sample.atMs - DAY_MS);
     db.prepare(`delete from budget_daily where day < ?`).run(
@@ -205,12 +215,22 @@ export function recordBudgetSample(db: Database.Database, sample: BudgetSample):
 
 const METRICS = ["dbBytes", "walBytes", "shmBytes", "walBytesWrittenMin", "rssBytes", "cpuCores",
   "outboxPending", "outboxDead", "outboxOldestPendingAgeSeconds", "outboxOldestDeadAgeSeconds",
-  "summaryLagSeconds", "samplerElapsedMs", "samplerCpuMicros"] as const;
+  "summaryLagSeconds", "samplerElapsedMs", "samplerCpuMicros", "samplerMainThreadMs"] as const;
 
 function percentile(values: number[], fraction: number): number | null {
   if (!values.length) return null;
   values.sort((a, b) => a - b);
   return values[Math.ceil(values.length * fraction) - 1] ?? null;
+}
+
+function sortedPosition(values: number[], value: number): number {
+  let low = 0, high = values.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (values[middle]! < value) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 function sampleMetric(sample: BudgetSample, metric: typeof METRICS[number]): number | null {
@@ -237,12 +257,24 @@ function attemptedClass(db: Database.Database, nowMs: number) {
   const attemptedRows = rows.reduce((sum, row) => sum + row.attemptedRows, 0);
   const days = rows.length;
   const rate = days ? attemptedRows / days : null;
+  const started = db.prepare(`select started_day as day from budget_control where singleton=1`)
+    .get() as { day: string } | undefined;
+  const completeDays = started ? Math.floor((Date.parse(`${day}T00:00:00.000Z`) -
+    Date.parse(`${started.day}T00:00:00.000Z`)) / DAY_MS) - 1 : 0;
   const hostClass: keyof typeof TARGETS | null = rate === null ? null
     : rate < 30_000 ? "light" : rate <= 150_000 ? "busy" : "studio0_scale";
-  return { hostClass, attemptedRowsPerDay: rate, observedDays: days, provisional: days < 7 };
+  return { hostClass, attemptedRowsPerDay: rate, observedDays: days,
+    provisional: days < 7 || completeDays < 7,
+    rateBasis: "local_raw_insert_attempts_flushed_each_minute; other_processes_and_counted_gaps_unavailable" };
 }
 
 /** CLI read; the daemon calls this only after a sample, and /status uses its cached return. */
+function budgetSamples(db: Database.Database): BudgetSample[] {
+  if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_samples'`).get()) return [];
+  return (db.prepare(`select sample_json as json from budget_samples order by id`).all() as Array<{ json: string }>)
+    .map((row) => JSON.parse(row.json) as BudgetSample);
+}
+
 export function budgetStatus(db: Database.Database, nowMs = Date.now()) {
   if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_samples'`).get()) {
     return { mode: "advisory" as const, latest: null, p50: null, p95: null,
@@ -250,8 +282,7 @@ export function budgetStatus(db: Database.Database, nowMs = Date.now()) {
       targets: null, targetStatus: "hypothesis" as const,
       unavailable: ["sampler_not_started"] };
   }
-  const samples = (db.prepare(`select sample_json as json from budget_samples order by id desc limit ?`)
-    .all(BUDGET_RING_LIMIT) as Array<{ json: string }>).map((row) => JSON.parse(row.json) as BudgetSample);
+  const samples = budgetSamples(db).reverse();
   const summary = (fraction: number) => samples.length
     ? Object.fromEntries(METRICS.map((metric) => [metric, percentile(samples
       .map((sample) => sampleMetric(sample, metric)).filter((value): value is number => value !== null), fraction)]))
@@ -276,6 +307,19 @@ export function budgetCsv(db: Database.Database): string {
   })].join("\n") + "\n";
 }
 
+export function budgetExport(db: Database.Database) {
+  const hasSamples = Boolean(db.prepare(`select 1 from sqlite_master where type='table' and name='budget_samples'`).get());
+  const hasControl = Boolean(db.prepare(`select 1 from sqlite_master where type='table' and name='budget_control'`).get());
+  const control = hasControl ? db.prepare(`select started_day as startedDay from budget_control where singleton=1`)
+    .get() as { startedDay: string } | undefined : undefined;
+  const samples = hasSamples
+    ? (db.prepare(`select sample_json as json from budget_samples order by id`).all() as Array<{ json: string }>)
+      .map((row) => JSON.parse(row.json) as BudgetSample)
+    : [];
+  return { schema: "plimsoll-budget-export/v1", mode: "advisory" as const,
+    startedDay: control?.startedDay ?? null, samples, daily: budgetDailyRows(db) };
+}
+
 /** dbstat reads every page. The stat size gate runs before the off-thread query. */
 export async function recordDailyTableSizes(db: Database.Database, ledgerPath: string, day: string,
   scan?: () => Promise<Array<{ name: string; pages: number }>>): Promise<string> {
@@ -290,7 +334,7 @@ export async function recordDailyTableSizes(db: Database.Database, ledgerPath: s
       const rows = scan ? await scan() : await readLedgerOffThread<{ name: string; pages: number }>(db, [{
         sql: `select coalesce(m.tbl_name, s.name) as name, count(*) as pages
           from dbstat s left join sqlite_master m on m.name=s.name
-          group by coalesce(m.tbl_name, s.name) order by name`, params: {}, maxMs: 120_000,
+          group by coalesce(m.tbl_name, s.name) order by name`, params: {}, maxMs: 30_000,
       }]);
       pages = Object.fromEntries(rows.map((row) => [row.name, row.pages]));
       status = "measured";
@@ -312,14 +356,51 @@ export class BudgetSampler {
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
   private previous: BudgetSample | undefined;
-  private cache: ReturnType<typeof budgetStatus>;
+  private cache: ReturnType<BudgetSampler["cachedStatus"]> & { lastMainThreadMs: number | null };
+  private readonly history: BudgetSample[];
+  private readonly sorted = Object.fromEntries(METRICS.map((metric) => [metric, [] as number[]])) as
+    Record<typeof METRICS[number], number[]>;
   private dailyInFlight = false;
+  private lastDailyDay: string | null = null;
+  private inFlight = false;
+  private lastAttemptedTotal: number;
 
   constructor(private readonly db: Database.Database, private readonly ledgerPath: string,
-    private readonly intervalMs = 60_000) {
+    private readonly intervalMs = 60_000, private readonly attemptedTotal: () => number = () => 0) {
     ensureBudgetSchema(db);
-    this.cache = budgetStatus(db);
+    this.lastAttemptedTotal = attemptedTotal();
+    this.history = budgetSamples(db);
+    for (const sample of this.history) this.index(sample, true);
+    this.cache = { ...this.cachedStatus(Date.now()), lastMainThreadMs: null };
     this.previous = this.cache.latest ?? undefined;
+    const today = new Date().toISOString().slice(0, 10);
+    if (budgetDailyRows(db).some((row) => row.day === today && row.dbstatStatus !== "pending")) {
+      this.lastDailyDay = today;
+    }
+  }
+
+  private index(sample: BudgetSample, add: boolean) {
+    for (const metric of METRICS) {
+      const value = sampleMetric(sample, metric);
+      if (value === null) continue;
+      const values = this.sorted[metric];
+      const position = sortedPosition(values, value);
+      if (add) values.splice(position, 0, value);
+      else if (values[position] === value) values.splice(position, 1);
+    }
+  }
+
+  private cachedStatus(nowMs: number) {
+    const latest = this.history.at(-1) ?? null;
+    const host = attemptedClass(this.db, nowMs);
+    const summary = (fraction: number) => latest ? Object.fromEntries(METRICS.map((metric) => {
+      const values = this.sorted[metric];
+      return [metric, values[Math.ceil(values.length * fraction) - 1] ?? null];
+    })) as Record<typeof METRICS[number], number | null> : null;
+    return { mode: "advisory" as const, latest, p50: summary(0.5), p95: summary(0.95),
+      ...host, targets: host.hostClass ? TARGETS[host.hostClass] : null,
+      targetStatus: "hypothesis" as const,
+      unavailable: latest?.unavailable ?? ["no_sample_yet"] };
   }
 
   status() { return this.cache; }
@@ -334,23 +415,43 @@ export class BudgetSampler {
   stop() { this.stopped = true; if (this.timer) clearInterval(this.timer); this.timer = null; }
 
   async sample() {
-    if (this.stopped) return;
+    if (this.stopped || this.inFlight) return;
+    this.inFlight = true;
     try {
+      const attemptedTotal = this.attemptedTotal();
       const sample = await collectBudgetSample(this.db, this.ledgerPath, { previous: this.previous });
       if (this.stopped) return;
+      sample.attemptedRowsDelta = Math.max(0, attemptedTotal - this.lastAttemptedTotal);
+      const writeStarted = performance.now();
       recordBudgetSample(this.db, sample);
+      this.lastAttemptedTotal = attemptedTotal;
+      const writeMs = performance.now() - writeStarted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.stopped) return;
+      const indexStarted = performance.now();
       this.previous = sample;
-      this.cache = budgetStatus(this.db, sample.atMs);
+      this.history.push(sample);
+      this.index(sample, true);
+      while (this.history.length > BUDGET_RING_LIMIT ||
+        this.history[0]!.atMs < sample.atMs - DAY_MS) this.index(this.history.shift()!, false);
       const day = new Date(sample.atMs).toISOString().slice(0, 10);
-      const today = budgetDailyRows(this.db).find((row) => row.day === day);
-      if (!this.dailyInFlight && (!today || today.dbstatStatus === "pending")) {
+      if (!this.dailyInFlight && this.lastDailyDay !== day) {
         this.dailyInFlight = true;
         void recordDailyTableSizes(this.db, this.ledgerPath, day)
+          .then(() => { this.lastDailyDay = day; })
           .catch(() => undefined).finally(() => { this.dailyInFlight = false; });
       }
+      const indexMs = performance.now() - indexStarted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.stopped) return;
+      const statusStarted = performance.now();
+      const status = this.cachedStatus(sample.atMs);
+      const statusMs = performance.now() - statusStarted;
+      this.cache = { ...status,
+        lastMainThreadMs: Math.round(Math.max(sample.samplerMainThreadMs, writeMs, indexMs, statusMs) * 100) / 100 };
     } catch {
       // Observation may be skipped under a writer lock; capture must proceed.
       this.cache = { ...this.cache, unavailable: [...this.cache.unavailable, "sampler_tick_failed"] };
-    }
+    } finally { this.inFlight = false; }
   }
 }
