@@ -2,13 +2,16 @@
  * B1 / B10a (collector): the S1b runway with G per host from counted cardinalities, one G, and G OWED while conversion runs
  * (docs/lean/CONTRACTS.md C2; BUDGETS.md §3, §4.2, §4.3; ARCHITECTURE.md §2.4). Ports fixtures/s1b_runway_host_bound.py (round 8:
  * the reviewer's 333-session counterexample, the Studio4 census, the dual-write and post-census scenarios, the census gate and the
- * segment proxy) and s1b_runway_geometry.py. The "true runway" in test 3 is a byte-level simulation independent of holdRunway.
- * Pending until B1 lands packages/collector-cli/src/lean/runway.ts.
+ * segment proxy) and s1b_runway_geometry.py. The "true runway" in test 3 is a byte-level simulation independent of holdRunway
+ * (note, review r2: it reuses rule 2's growth figure as the daily loss, so it tests the owed bytes, not the growth rate). Round 3
+ * of B0 (review-r2 should-fix 5): C_conv is MEASURED as the converter's own page allocation (test 6, B2a's
+ * lean/converter.ts `withMeasuredWrite`).
+ * Pending until B1 lands packages/collector-cli/src/lean/runway.ts (tests 1-5) and B2a lean/converter.ts (test 6).
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fn, loadSurface, pending } from "./_pending";
+import { fn, loadSurface, openTempBuffer, pending } from "./_pending";
 
 const MB = 1_000_000, GiB = 1024 ** 3;
 const F = 700 * 1.5, T = 280 * 1.3, S = 1300, SD = 260 * 1.5, DR = 260 * 1.5, RB = 400, SEG = 830, I = 125 + 2 * 92;
@@ -121,4 +124,30 @@ test("B1 C2 (round 2): the census gives a gate value only when taken after the c
   const tight = censusPreflight({ censusAtMs: 7 * day, catchUpCompleteAtMs: 3 * day, decisionAtMs: 7 * day, freeBytes: L + reserve - 1, ledgerBytes: L, reserveBytes: reserve });
   assert.deepEqual(tight, { ok: false, reasons: ["no_space_for_vacuum_into"] });
   assert.deepEqual(censusPreflight({ censusAtMs: 7 * day, catchUpCompleteAtMs: 3 * day, decisionAtMs: 7 * day, freeBytes: L + reserve, ledgerBytes: L, reserveBytes: reserve }), { ok: true, reasons: [] });
+});
+
+test("B2a C2 (round 3): C_conv is measured as the converter's own page allocation, delta(page_count - freelist_count) x page_size inside its write transaction, and excludes pages another writer allocated between its transactions", pending("B2a"), async () => {
+  const withMeasuredWrite = fn(await loadSurface("../../../packages/collector-cli/src/lean/converter.ts"), "withMeasuredWrite") as (db: unknown, write: () => void) => { writtenBytes: number };
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", lean: { write: true } });
+  try {
+    const db = buffer.database;
+    db.exec("create table lean_scratch_conv (id integer primary key, payload text not null)");
+    const livePages = () => (db.pragma("page_count", { simple: true }) as number) - (db.pragma("freelist_count", { simple: true }) as number);
+    const pageSize = db.pragma("page_size", { simple: true }) as number;
+    const insert = db.prepare("insert into lean_scratch_conv (payload) values (?)");
+    const write = (rows: number) => { for (let i = 0; i < rows; i += 1) insert.run("x".repeat(900)); };
+    // (a) the measurement equals the independent page delta around the converter's transaction
+    const before = livePages();
+    const first = withMeasuredWrite(db, () => write(2_000));
+    assert.equal(first.writtenBytes, (livePages() - before) * pageSize, "written bytes = the pages the transaction allocated x page_size");
+    assert.ok(first.writtenBytes >= 2_000 * 900, "at least the payload bytes");
+    assert.equal(db.inTransaction, false, "the chunk was committed with its measurement");
+    // (b) another writer's pages between two converter transactions (the live writer's dual-write) are not counted
+    const betweenBefore = livePages();
+    write(1_000);                                                                   // unmeasured: the live writer
+    const live = (livePages() - betweenBefore) * pageSize;
+    const second = withMeasuredWrite(db, () => write(2_000));
+    assert.ok(live > 0 && second.writtenBytes < live + second.writtenBytes, "the live writer's pages are outside the converter's counter");
+    assert.ok(Math.abs(second.writtenBytes - first.writtenBytes) <= 2 * pageSize, "two equal chunks measure alike, whatever ran between them");
+  } finally { close(); }
 });

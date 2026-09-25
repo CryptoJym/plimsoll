@@ -159,7 +159,7 @@ both keys allowlisted through the seal, the scope cleared by a re-join and a tra
 activation recording the new install with the handshake's version while a pre-re-join row keeps its pair, and the old install's
 late answer ignored and counted.
 
-## C2. S1b runway: G per host, one G, G owed (review-r6 blocker 2 and should-fix 5; review-r1 blocker 2 and should-fix 5; B1 and B10a collector)
+## C2. S1b runway: G per host, one G, G owed (review-r6 blocker 2 and should-fix 5; review-r1 blocker 2 and should-fix 5; review-r2 should-fixes 5-6; B1, B10a and B2a collector)
 
 **The defect (review r6).** `G_host = usage_rows × 1,632 B + raw_rows × 309 B` embeds Studio1's session, day and segment density in the
 1,632 B. At 333 sessions per 1,000 usage rows the same row widths need 507 MB against a 457 MB gate, and a host exactly at
@@ -201,10 +201,15 @@ segment proxy is therefore unmeasured and the fixture falls back to the 1.2 × s
    multiplier: `g_gate = G_gate / raw_bytes_at_census`, `hold_growth_per_day = p95_7d(gross growth) × (1 + g_gate × raw_share)`.
 3. **G owed (round 8).** While conversion runs,
    `G_owed = max(0, G_gate − C_conv) + g_gate × U`,
-   where `C_conv` is the bytes the **converter itself has written** for census-era history (its own counter, carried in its
-   checkpoint; never a page count of the lean tables, which from S2 on also holds the live writer's rows) and `U` is the bytes of
-   the raw rows admitted **after the census** that no lean row covers yet (neither converted nor dual-written; rows admitted after
-   S2 are dual-written at admission and are growth, already in `free_disk` and in the multiplier, not conversion work). `G_owed = 0`
+   where `C_conv` is the bytes the **converter itself has written** for census-era history, **measured** (round 9, review r2) as
+   its own page allocation: inside each converter write transaction, `Δ(page_count − freelist_count) × page_size` from `PRAGMA
+   page_count` and `PRAGMA freelist_count` read at the transaction's start and again before its commit (SQLite has one writer at a
+   time, so the delta is the converter's alone), summed into the converter's checkpoint row and committed with the chunk
+   (`withMeasuredWrite`, §C6); never a page count of the lean tables, which from S2 on also holds the live writer's rows, and never
+   the rows written × the estimated widths (which misses by the width factor); and `U` is the bytes of the raw rows admitted **after
+   the census** that no lean row covers yet (neither converted nor dual-written; rows admitted after S2 are dual-written at
+   admission and are growth, already in `free_disk` and in the multiplier, not conversion work), in the **census's raw-bytes
+   basis**: `U = unfolded_rows × raw_bytes_at_census / raw_rows_at_census`, so `g_gate × U` is `G_gate` per raw row × rows. `G_owed = 0`
    once every census-era and post-census row is folded. `runway_days = (free_disk − reserve − G_owed − rebuild_headroom) /
    hold_growth_per_day`. The abort ladder's rungs read this runway. A `/status` field `runway.g = {gate, owed, converterWritten,
    unfoldedRawBytes, leanTableBytes, basis: census | copy_peak}` discloses the terms; `leanTableBytes` is disclosure only.
@@ -212,7 +217,10 @@ segment proxy is therefore unmeasured and the fixture falls back to the 1.2 × s
    never calls the rule): with true widths at or below 1.25 × the estimates the published runway never exceeds the true runway in
    any of the reviewer's dual-write and post-census scenarios, no rung fires later than the truth, and the only conservatism is the
    1.25 allowance itself (0.25 × the census-era G until completion plus 0.25 × the post-census owed bytes); with widths above 1.25 ×
-   the estimates the rule overstates, which is why the **numbers** stay open until S2 measures the widths (FREEZE.md).
+   the estimates the rule overstates, which is why the **numbers** stay open until S2 measures the widths (FREEZE.md). The rule does
+   **not** self-correct to real widths (round 9 corrects the round-8 CHANGES.md): with `max(0, G_gate − C_conv)`, real widths above
+   the estimate drive the first term to 0 early, so it is exact at 1.25 × and safe only up to it. The fixture's truth divides by
+   rule 2's own growth figure, so it tests the owed bytes, not the growth rate (review r2, noted).
 4. **Preflight receipt.** The S1b receipt records the census (counts, the segment proxy, when, on which copy, the free space at the
    copy, that it followed the catch-up), `G_gate`, its basis, the measured conversion size and abort peak where a copy exists, and
    the runway series.
@@ -366,6 +374,9 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   ledgerBytes })` → `{ runwayDays, gOwedBytes, holdGrowthPerDay, rung ∈ none | converter_paused | release_acked_only | abort }`;
   `censusPreflight({ censusAtMs, catchUpCompleteAtMs, decisionAtMs, freeBytes, ledgerBytes, reserveBytes })` → `{ ok, reasons ⊆
   {census_before_catchup, census_stale, no_space_for_vacuum_into} }`. (B1, B10a; C2)
+- `packages/collector-cli/src/lean/converter.ts`: `withMeasuredWrite(db, write)` runs `write` in one transaction and returns
+  `{ writtenBytes }` = `Δ(page_count − freelist_count) × page_size` across it, the converter's `C_conv` increment, committed with the
+  chunk into its checkpoint (round 9; C2).
 - `packages/collector-cli/src/lean/day-key.ts`: `utcDayOf`, `censusClass`, `dashboardWindowSince`; `DASHBOARD_SCHEMA_VERSION = 3`. (B5)
 - `packages/collector-cli/src/lean/converter.ts`: `convertLedgerHistory(buffer, options)`. (B2a; C3)
 - `packages/collector-cli/src/lean/capture-gaps.ts`: `declareUnresolvedFileGap`, `resolveCaptureGap`, `coverageCompleteForPeriod`. (B22; C5)

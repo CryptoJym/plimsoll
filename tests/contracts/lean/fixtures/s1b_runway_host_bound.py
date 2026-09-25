@@ -25,14 +25,22 @@ Round 8 rule (CONTRACTS.md r8 C2 rule 3):
   `VACUUM INTO` copy is refused unless free space >= ledger bytes + reserve. Segments: the census counts a proxy (sessions split
   at 7 days) where it has one, and the terminal-pause splits are declared covered by the 1.25 factor (the segment term is about
   2% of G on Studio4).
-Modes: --rule r6 (round 6), r7 (round-1 C2 as written), r8 (this rule). Red under r6 and r7, green under r8.
+Round 9 (B0 round 3, review-r2 should-fixes 5-6; CONTRACTS.md r9 C2): the FORMULA is unchanged. Two definitions are added:
+  C_conv is a MEASUREMENT, the converter's own page allocation: inside each of its write transactions
+           delta(page_count - freelist_count) x page_size, summed into its checkpoint and committed with the chunk (SQLite has one
+           writer at a time, so those pages are the converter's alone); never rows x estimated widths (round 8 said "its own
+           counter" without a basis) and never a lean-table page count (round 7). U is in the census's raw-bytes basis:
+           unfolded post-census raw rows x (raw_bytes_at_census / raw_rows_at_census).
+Modes: --rule r6 (round 6), r7 (round-1 C2 as written), r8 (round-2 C2 as written), r9 (this rule). Red under r6, r7 and r8,
+green under r9.
 """
 import json
 from _common import Checks, rule_arg
 
 rule = rule_arg()
 c = Checks("s1b_runway_host_bound", rule)
-R8 = rule == "r8"
+R8 = rule in ("r8", "r9")          # the round-8 formula is kept by round 9
+R9 = rule == "r9"
 MB = 1_000_000; GiB = 1024 ** 3; KiB = 1024
 # round-5 row widths incl. indexes (ESTIMATES until S2 measures them on a copy; plan-arithmetic.log "Round 5"/"Round 6")
 F, T, S, SD, DR, RB, SEG, I = 700 * 1.5, 280 * 1.3, 1300, 260 * 1.5, 260 * 1.5, 400, 830, 125 + 2 * 92
@@ -164,7 +172,7 @@ c.expect(w125["rule_days"] <= w125["true_days"] + 1e-6, "with true widths 1.25 x
 c.expect(rule_owed(G_gate(h4), h4["raw_bytes"], G_actual(h4), G_actual(h4) + 50 * MB, 0, True) == 0, "once every census-era and post-census row is folded G_owed is 0 and only the rebuild headroom is still subtracted")
 
 # ---- 7. the census obligation (should-fix 5): fresh, after the catch-up, and only with room for the VACUUM INTO copy ---------------
-def census_preflight(census_day, catchup_complete_day, decision_day, free_bytes, ledger_bytes, reserve_bytes):
+def census_preflight(census_day, catchup_complete_day, decision_day, free_bytes, ledger_bytes, reserve_bytes, during_hold=False, rebuild_headroom=0, g_owed=0):
     if not R8: return {"ok": True, "reasons": []}                                # round 7: a one-time census with no freshness or space rule
     reasons = []
     if census_day < catchup_complete_day: reasons.append("census_before_catchup")
@@ -185,4 +193,46 @@ print(f"    studio4 segment term: {100 * seg_share:.1f}% of G at 1.2 x sessions 
 with_proxy = dict(h4, segment_proxy=2.0 * h4["sessions"])       # a census that counted sessions split at 7 days: 2 segments per session
 c.expect(G_actual(with_proxy) > G_actual(h4) and G_gate(with_proxy) > G_gate(h4), "a census that carries a segment proxy above 1.2 x sessions raises G_host and G_gate; the geometry ratio is only the fallback", f"G with proxy {G_actual(with_proxy) / MB:.1f} MB vs {G_actual(h4) / MB:.1f} MB")
 c.expect(seg_share < 0.03, "sanity: on Studio4 the segment term is under 3% of G, so the terminal-pause splits the proxy does not count are covered by the 1.25 factor", f"{100 * seg_share:.1f}%")
+
+# ---- 9. should-fix 5 (review r2): C_conv is MEASURED as the converter's own page allocation, not inferred --------------------------
+# A page-level model of the ledger file: the converter and the live writer take turns as SQLite's single writer. Each write
+# transaction allocates whole pages (freelist pages first, then new pages). The converter measures its own transaction as
+# delta(page_count - freelist_count) x page_size and sums it into its checkpoint. Round 8's text ("its own counter") had no
+# basis: an implementer could sum the ESTIMATED widths of the rows it wrote (the only byte figure the plan gives), which is off by
+# the width factor; round 7 used the lean tables' page count, which holds the live writer's pages too.
+PAGE = 4096
+class LedgerFile:
+    def __init__(self, pages, freelist): self.page_count, self.freelist = pages, freelist
+    def live_pages(self): return self.page_count - self.freelist
+    def write(self, bytes_):
+        need = -(-bytes_ // PAGE)                                                 # whole pages, ceiling
+        reuse = min(need, self.freelist); self.freelist -= reuse; self.page_count += need - reuse
+def convert_with_live_writer(width_factor, chunks=40, rows_per_chunk=5000, live_rows_between=800):
+    ledger, est_row, true_row = LedgerFile(pages=367_296, freelist=1_200), (F + T) * 0.4 + I, ((F + T) * 0.4 + I) * width_factor
+    checkpoint, estimated_counter, lean_pages_before, true_bytes = 0, 0, ledger.live_pages(), 0
+    for _ in range(chunks):
+        before = ledger.live_pages()                                              # PRAGMA page_count, freelist_count at BEGIN
+        ledger.write(rows_per_chunk * true_row); true_bytes += rows_per_chunk * true_row
+        checkpoint += (ledger.live_pages() - before) * PAGE                       # committed with the chunk
+        estimated_counter += rows_per_chunk * est_row                            # round 8 reading: rows x estimated widths
+        ledger.write(live_rows_between * true_row)                                # the live writer's own transactions (dual-write), between the converter's
+    lean_pages_now = (ledger.live_pages() - lean_pages_before) * PAGE            # round 7: every lean-table page, both writers
+    return {"true_bytes": true_bytes, "measured": checkpoint, "estimated_counter": estimated_counter, "lean_pages_now": lean_pages_now, "chunks": chunks}
+def c_conv_basis(m):
+    if rule == "r7" or rule == "r6": return m["lean_pages_now"]                  # rounds 6-7: the lean tables' page count
+    if not R9: return m["estimated_counter"]                                      # round 8: a counter with no stated basis (rows x estimated widths)
+    return m["measured"]                                                          # round 9: the converter's own page allocation
+m125 = convert_with_live_writer(1.25)
+basis = c_conv_basis(m125)
+print(f"    C_conv at width factor 1.25: true {m125['true_bytes'] / MB:.1f} MB, converter's page allocation {m125['measured'] / MB:.1f} MB, rows x estimates {m125['estimated_counter'] / MB:.1f} MB, lean pages {m125['lean_pages_now'] / MB:.1f} MB; rule uses {basis / MB:.1f} MB")
+c.expect(abs(basis - m125["true_bytes"]) <= m125["chunks"] * PAGE, "C_conv equals the bytes the converter really wrote (within one page per transaction) when true widths are 1.25 x the estimates: it is measured from the converter's own page allocation, not inferred from row widths or read from the lean tables", f"rule {basis / MB:.2f} MB vs true {m125['true_bytes'] / MB:.2f} MB")
+c.expect(basis < m125["lean_pages_now"] - 1, "the live writer's interleaved dual-write pages are not in C_conv (a lean-table page count would include them)", f"C_conv {basis / MB:.1f} MB, lean pages {m125['lean_pages_now'] / MB:.1f} MB")
+m080 = convert_with_live_writer(0.8)
+c.expect(abs(c_conv_basis(m080) - m080["true_bytes"]) <= m080["chunks"] * PAGE, "the same measurement is exact when true widths are BELOW the estimates (0.8 x): the basis does not depend on the width factor", f"rule {c_conv_basis(m080) / MB:.2f} MB vs true {m080['true_bytes'] / MB:.2f} MB")
+# U in the census's raw-bytes basis (definitional; green under r8 and r9 because the fixture already used bytes per raw row)
+raw_bytes_per_row = h4["raw_bytes"] / h4["raw"]
+U_rows = 12_345
+c.expect(abs(rule_owed(G_gate(h4), h4["raw_bytes"], G_gate(h4), 0, U_rows * raw_bytes_per_row, False) - (G_gate(h4) / h4["raw"]) * U_rows) < 1e-6,
+         "U is the unfolded post-census raw rows x the census's bytes per raw row, so g_gate x U equals G_gate per raw row x rows (the census's basis, not payload bytes)", f"g_gate x U = {rule_owed(G_gate(h4), h4['raw_bytes'], G_gate(h4), 0, U_rows * raw_bytes_per_row, False) / MB:.2f} MB")
+
 c.finish()
