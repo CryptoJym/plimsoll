@@ -95,14 +95,14 @@ does not transfer its sessions to a tailer.
 ### Changed
 
 - Capture coverage reads large directories a few entries at a time and keeps
-  each source within 4,096 work units per turn. It finishes listing a folder
-  before checking its files, so files added after listing are picked up by the
-  next check. If a folder grows while it is still being listed, coverage
-  reopens that folder without checking a file twice. A folder removed or
-  renamed during a check still makes the check incomplete. A folder larger
-  than one turn also stays incomplete if it changes after file checks start.
-  Small unchanged folders reuse a bounded list of names on later checks;
-  every file is still checked for changes. Ignored names
+  each source within 4,096 work units per turn. A large Codex day folder can
+  keep growing while coverage works through it; the check resumes its open
+  directory cursor and finishes, and later files are picked up by this check
+  or the next one. The queue stays at 4,096 files. A folder removed or renamed,
+  or a listed Codex or Claude file removed before its check, makes the check
+  incomplete. Small changed folders get one verifying restart. Small unchanged
+  folders reuse a bounded list of names on later checks; every file is still
+  checked for changes. Ignored names
   use work but do not count toward the 200,000 relevant-entry ceiling. Codex,
   Claude Code, and Grok each get a share of every turn, with the first source
   rotating and unused time returning to active sources. Legacy symlinked

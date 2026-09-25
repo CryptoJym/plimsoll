@@ -371,6 +371,7 @@ export class TranscriptTailer {
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.projectsDir],
       maxEntries,
+      failOnMissing: true,
       open: (directory, depth) => openCaptureCoverageDirectory(directory, (entry) => {
         const full = path.join(directory, entry.name);
         if (entry.isDirectory()) return { path: full, kind: "directory" };

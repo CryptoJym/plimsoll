@@ -114,6 +114,71 @@ try {
     wallMs: { max: Math.max(...times), p95: sorted[Math.ceil(sorted.length * .95) - 1] },
     wholeListingCalls, largestReadBuffer }));
 
+  const liveLarge = makeWalk(large);
+  const liveUnits: number[] = [];
+  let liveAdditions = 0;
+  for (let turn = 0; turn < 40 && !liveLarge.walk.done; turn += 1) {
+    const beforeReads = realReads;
+    const beforeOpens = realOpens;
+    const beforeChecks = liveLarge.checked();
+    const charged = liveLarge.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+    const actual = realReads - beforeReads + realOpens - beforeOpens + liveLarge.checked() - beforeChecks;
+    liveUnits.push(actual);
+    if (charged !== actual) throw new Error(`coverage work mismatch: ${charged} charged, ${actual} actual`);
+    if (!liveLarge.walk.done) {
+      fs.writeFileSync(path.join(large, `session-live-${String(liveAdditions++).padStart(5, "0")}.jsonl`), "");
+    }
+  }
+  const liveNext = makeWalk(large);
+  for (let turn = 0; turn < 40 && !liveNext.walk.done; turn += 1) {
+    liveNext.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+  }
+  const originalOnce = Array.from({ length: total }, (_, index) =>
+    liveLarge.paths.get(path.join(large, `session-${String(index).padStart(5, "0")}.jsonl`)) === 1).every(Boolean);
+  check("large_growing_directory_completes_and_covers_each_start_file_once",
+    liveLarge.walk.done && liveLarge.walk.complete && originalOnce &&
+    [...liveLarge.paths.values()].every((count) => count === 1) &&
+    liveUnits.every((units) => units <= RELEASE_MAX_WORK_PER_TURN) &&
+    liveNext.walk.done && liveNext.walk.complete && liveNext.checked() === total + liveAdditions &&
+    handles() === beforeHandles,
+    { done: liveLarge.walk.done, complete: liveLarge.walk.complete, originalOnce,
+      checked: liveLarge.checked(), additions: liveAdditions, turns: liveUnits.length,
+      maxActualUnits: Math.max(...liveUnits), nextChecked: liveNext.checked(),
+      handlesBefore: beforeHandles, handlesAfter: handles() });
+
+  const slowLarge = makeWalk(large);
+  const slowAtStart = total + liveAdditions;
+  const slowUnits: number[] = [];
+  let slowAdditions = 0;
+  for (let turn = 0; turn < 300 && !slowLarge.walk.done; turn += 1) {
+    const beforeReads = realReads;
+    const beforeOpens = realOpens;
+    const beforeChecks = slowLarge.checked();
+    slowLarge.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0, 128);
+    slowUnits.push(realReads - beforeReads + realOpens - beforeOpens + slowLarge.checked() - beforeChecks);
+    if (!slowLarge.walk.done) {
+      fs.writeFileSync(path.join(large, `session-slow-${String(slowAdditions++).padStart(5, "0")}.jsonl`), "");
+    }
+  }
+  const slowNext = makeWalk(large);
+  for (let turn = 0; turn < 20 && !slowNext.walk.done; turn += 1) {
+    slowNext.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+  }
+  const slowStartPaths = [
+    ...Array.from({ length: total }, (_, index) => path.join(large, `session-${String(index).padStart(5, "0")}.jsonl`)),
+    ...Array.from({ length: liveAdditions }, (_, index) => path.join(large, `session-live-${String(index).padStart(5, "0")}.jsonl`)),
+  ];
+  const slowStartMissed = slowStartPaths.filter((file) => slowLarge.paths.get(file) !== 1).length;
+  check("large_growing_directory_converges_with_small_turn_share",
+    slowLarge.walk.done && slowLarge.walk.complete &&
+    slowStartMissed === 0 &&
+    [...slowLarge.paths.values()].every((count) => count === 1) &&
+    slowUnits.every((units) => units <= 128) &&
+    slowNext.walk.done && slowNext.walk.complete && slowNext.checked() === slowAtStart + slowAdditions,
+    { done: slowLarge.walk.done, complete: slowLarge.walk.complete, checked: slowLarge.checked(),
+      atStart: slowAtStart, startMissed: slowStartMissed, turns: slowUnits.length, maxActualUnits: Math.max(...slowUnits),
+      additions: slowAdditions, nextChecked: slowNext.checked() });
+
   const mutable = makeWalk(changing);
   const restartUnits: number[] = [];
   const stepRestart = (subject: ReturnType<typeof makeWalk>, limit = RELEASE_MAX_WORK_PER_TURN) => {
@@ -219,6 +284,30 @@ try {
     cachedChecks[1]!.checked === 200 && cachedChecks[1]!.reads === 0 &&
     cachedChecks[2]!.checked === 201 && cachedChecks[2]!.reads >= 201,
     { cachedChecks });
+
+  const strictChecked = new Set<string>();
+  const strict = new CaptureCoverageWalk({
+    roots: [removed], failOnMissing: true,
+    open: (target) => openCaptureCoverageDirectory(target, (entry) =>
+      ({ path: path.join(target, entry.name), kind: "file" })),
+    check: (file) => {
+      strictChecked.add(file);
+      return fs.existsSync(file)
+        ? { key: file, mtimeMs: 0, birthtimeMs: 0, extent: 0, progress: 0, fullyRead: true }
+        : null;
+    },
+    checkLink: () => null,
+  });
+  strict.step(Number.POSITIVE_INFINITY, () => undefined, () => 0, 110);
+  const unvisited = Array.from({ length: 100 }, (_, index) => path.join(removed, `file-${index}`))
+    .find((file) => !strictChecked.has(file));
+  if (!unvisited) throw new Error("missing unvisited fixture file");
+  fs.unlinkSync(unvisited);
+  for (let turn = 0; turn < 20 && !strict.done; turn += 1) {
+    strict.step(Number.POSITIVE_INFINITY, () => undefined, () => 0);
+  }
+  check("listed_file_removed_before_its_check_fails_closed",
+    strict.done && !strict.complete, { done: strict.done, complete: strict.complete });
 
   const renamed = makeWalk(removed);
   renamed.walk.step(Number.POSITIVE_INFINITY, () => undefined, () => 0, 150);

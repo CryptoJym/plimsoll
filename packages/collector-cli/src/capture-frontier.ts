@@ -263,6 +263,8 @@ export type CaptureCoverageWalkSpec = {
   check(file: string): CaptureCoverageFile | null;
   /** The `link` verdict for a listed symlink (lstat only); null once it is gone or no longer a link. */
   checkLink(link: string): CaptureCoverageFile | null;
+  /** A listed file going missing invalidates a check for sources that require it. */
+  failOnMissing?: boolean;
   maxEntries?: number;
 };
 
@@ -288,6 +290,8 @@ export class CaptureCoverageWalk {
   private readonly activeSeen = new Map<string, CaptureCoverageEntry["kind"]>();
   private activeExpected = new Set<string>();
   private activeChecked = false;
+  private activeRestarts = 0;
+  private activeReads = 0;
   private closed: CaptureCoverageDirectory | null = null;
   private entries = 0;
   done = false;
@@ -322,8 +326,8 @@ export class CaptureCoverageWalk {
       if (batch.length > 0) onBatch(batch);
       batch = [];
     };
-    let restart = !!this.active && !this.active.unchanged();
-    if (restart && !this.canRestartActive()) this.fail();
+    let restart = !!this.active && !this.active.unchanged() && !this.allowsActiveGrowth();
+    if (this.active && !this.active.unchanged() && !this.active.sameIdentity?.()) this.fail();
     if (this.closed && !this.closedIdentity()) this.fail();
     while (!this.done && work < limit && now() < deadline) {
       if (restart) {
@@ -335,17 +339,19 @@ export class CaptureCoverageWalk {
         restart = false;
         continue;
       }
-      // Finish a directory's entry stream before checking its files when it
-      // fits in one turn. Active day folders then close before the next cadence
-      // can add a file. Bound the pending paths for directories larger than a turn.
+      // A bounded queue alternates reads and checks in a large folder. Keep
+      // its cursor across turns even after checks begin, so new sessions do
+      // not force a large active folder to fail on every cadence.
       if (this.active && this.files.length < CAPTURE_COVERAGE_MAX_WORK_PER_TURN) {
         work += this.active.readWork ?? 1;
         try {
           const entry = this.active.read();
+          this.activeReads += this.active.readWork ?? 1;
           if (entry === null) {
-            if (!this.active.unchanged()) {
-              if (!this.canRestartActive()) this.fail();
-              else restart = true;
+            if (!this.active.sameIdentity?.() && !this.active.unchanged()) {
+              this.fail();
+            } else if (!this.active.unchanged() && !this.allowsActiveGrowth()) {
+              restart = true;
             } else if (this.activeExpected.size > 0) {
               // A previously queued path vanished during a local restart.
               this.fail();
@@ -360,7 +366,7 @@ export class CaptureCoverageWalk {
             if (prior && prior !== entry.kind) this.fail();
             else if (prior) this.activeExpected.delete(entry.path);
             else {
-              if (!this.activeChecked) this.activeSeen.set(entry.path, entry.kind);
+              this.activeSeen.set(entry.path, entry.kind);
               this.entries += 1;
               if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) this.fail();
               else if (entry.kind === "directory") {
@@ -373,14 +379,12 @@ export class CaptureCoverageWalk {
       }
       const file = this.files.pop();
       if (file !== undefined) {
-        if (this.active && !this.activeChecked) {
-          this.activeChecked = true;
-          this.activeSeen.clear();
-        }
+        if (this.active) this.activeChecked = true;
         work += 1;
         try {
           const checked = file.link ? this.spec!.checkLink(file.path) : this.spec!.check(file.path);
           if (checked) batch.push(checked);
+          else if (this.spec!.failOnMissing) this.fail();
         } catch {
           this.fail();
         }
@@ -402,12 +406,14 @@ export class CaptureCoverageWalk {
         this.activeSeen.clear();
         this.activeExpected.clear();
         this.activeChecked = false;
+        this.activeRestarts = 0;
+        this.activeReads = 0;
       } catch (error) {
         // A missing root holds no files, as it does for the tailers' scans.
         if (!(next.depth === 0 && errorCode(error) === "ENOENT")) this.fail();
       }
     }
-    if (this.active && !this.active.unchanged() && !this.canRestartActive()) this.fail();
+    if (this.active && !this.active.unchanged() && !this.active.sameIdentity?.()) this.fail();
     if (this.closed && !this.closedIdentity()) this.fail();
     flush();
     return work;
@@ -415,8 +421,15 @@ export class CaptureCoverageWalk {
 
   private activeDepth = 0;
 
+  private allowsActiveGrowth() {
+    // One changed small folder gets a verifying restart. A large folder must
+    // keep its open cursor: restarting it every cadence cannot reach EOF.
+    return this.activeChecked || this.activeRestarts > 0 ||
+      this.activeReads >= CAPTURE_COVERAGE_MAX_WORK_PER_TURN / 4;
+  }
+
   private canRestartActive() {
-    return !this.activeChecked && (this.active?.sameIdentity?.() ?? false);
+    return !this.allowsActiveGrowth() && (this.active?.sameIdentity?.() ?? false);
   }
 
   private restartActive() {
@@ -429,6 +442,7 @@ export class CaptureCoverageWalk {
       throw new Error("capture_coverage_directory_replaced");
     }
     this.active = opened;
+    this.activeRestarts += 1;
     this.activeExpected = new Set(this.activeSeen.keys());
   }
 
