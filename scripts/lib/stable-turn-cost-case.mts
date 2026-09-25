@@ -44,9 +44,12 @@ try {
   const originals=Object.fromEntries(methods.map(name=>[name,(fs as any)[name]])) as Record<string,Function>;
   const originalPrepare=buffer.database.prepare;
   let counts:Record<string,number>={};
+  const statementPreparations=new Map<string,number>();
   for(const name of methods) (fs as any)[name]=function(...args:unknown[]){counts[name]=(counts[name]??0)+1;
     return originals[name]!.apply(fs,args);};
   buffer.database.prepare=function(...args:unknown[]){counts.sqlitePrepare=(counts.sqlitePrepare??0)+1;
+    const statement=String(args[0]).replace(/\s+/g," ").trim();
+    statementPreparations.set(statement,(statementPreparations.get(statement)??0)+1);
     return originalPrepare.apply(this,args);};
   const turns:Array<Record<string,number>>=[];
   try {
@@ -71,5 +74,7 @@ try {
   const metrics=Object.fromEntries(["cpuMs","wallMs","bytesRead","filesRead",...methods,"sqlitePrepare"].map(key=>[key,metric(key)]));
   assert(turns.every(row=>row.bytesRead===0&&row.filesRead===0),"unchanged turns must not read source bodies");
   console.log(JSON.stringify({schema:"plimsoll.stable-turn-cost.v1",sourceRoot,roots:roots.length,
-    excludedFiles:248,turns:turns.length,metrics,raw:turns,passed:true},null,2));
+    excludedFiles:248,turns:turns.length,metrics,
+    statementPreparations:[...statementPreparations].sort((a,b)=>b[1]-a[1]).slice(0,30),
+    raw:turns,passed:true},null,2));
 } finally {maintenance?.close();buffer?.close();fs.rmSync(home,{recursive:true,force:true});}

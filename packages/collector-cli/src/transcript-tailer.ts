@@ -932,10 +932,7 @@ export class TranscriptTailer {
         continue;
       }
       const observation = baselineObservation(file, stat, discovered.precise);
-      const cursor = loadJsonlScanCursor<TranscriptParserState>(
-        this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateTranscriptParserState,
-      );
-      let initialOffset: number | undefined;
+      let growthStart: number | null = null;
       if (automatic?.phase === "capture") {
         const decision = classifyCaptureBaselineFile(
           this.buffer.database,
@@ -944,15 +941,13 @@ export class TranscriptTailer {
           { mode: "automatic", observedAt: scanNow.toISOString() },
         );
         if (decision.decision === "exclude") {
-          const growthStart = captureBaselinePostEnrollmentOffset(this.buffer.database, "claude_code", observation);
-          if (growthStart === null || (cursor &&
-            (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart))) {
+          if (stat.size <= decision.baselineSize) {
             result.excludedGenerations += 1;
             result.excludedBytes += stat.size;
             consumeAutomaticFile(file);
             continue;
           }
-          if (!cursor) initialOffset = growthStart;
+          growthStart = decision.baselineSize;
         }
         if (decision.decision === "block") {
           result.statErrors += 1;
@@ -972,6 +967,19 @@ export class TranscriptTailer {
           consumeAutomaticFile(file);
           continue;
         }
+      }
+      const cursor = loadJsonlScanCursor<TranscriptParserState>(
+        this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateTranscriptParserState,
+      );
+      let initialOffset: number | undefined;
+      if (growthStart !== null) {
+        if (cursor && (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart)) {
+          result.excludedGenerations += 1;
+          result.excludedBytes += stat.size;
+          consumeAutomaticFile(file);
+          continue;
+        }
+        if (!cursor) initialOffset = growthStart;
       }
       candidates.push({ file, stat, cursor, initialOffset });
     }

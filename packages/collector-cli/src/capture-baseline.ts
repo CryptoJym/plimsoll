@@ -492,6 +492,8 @@ export type CaptureBaselineDecision =
       decision: "exclude";
       reason: "preexisting_generation";
       matchedExcludedGeneration: true;
+      /** Enrollment boundary already read for this classification. */
+      baselineSize: number;
       observedGrowth: boolean;
       historyInvalidated: boolean;
     }
@@ -1815,6 +1817,7 @@ export function classifyCaptureBaselineFile(
     decision: "exclude",
     reason: "preexisting_generation",
     matchedExcludedGeneration: true,
+    baselineSize: matching.baselineSize,
     observedGrowth,
     historyInvalidated,
   };
