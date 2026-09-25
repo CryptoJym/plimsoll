@@ -188,7 +188,7 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
     const names = pending.items.filter((item) => item.kind === "snapshot").map((item) => item.name);
     lines.push("", `Pending way-back restore for snapshot(s) ${names.slice(0, 8).join(", ")}${names.length > 8 ? ` and ${names.length - 8} more` : ""}: ` +
       (pending.refusal
-        ? `the next prune --apply refuses (${pending.refusal}); repair the way back or complete an update with 0.7.41 or later.`
+        ? `the next prune --apply refuses (${pending.refusal}); remove the block, repair the runtime under lifecycle/trash/runtime_version+<version>+<hex>/, or complete an update with 0.7.41 or later.`
         : `the next prune --apply attempts to restore ${pending.wouldRestore.length} recorded item(s) and refuses if they are incomplete or unusable. Use 0.7.41 or later.`));
   } else if (inventory.pendingRemoval.length > 0) {
     lines.push("", `Interrupted removal pending: ${inventory.pendingRemoval.length} item(s), ${formatBytes(inventory.bytes.pendingRemoval)}; ` +
