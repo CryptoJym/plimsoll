@@ -1,6 +1,6 @@
 {
   "schema": "plimsoll.system-e2e-support-contract.v1",
-  "normalizationVersion": 10,
+  "normalizationVersion": 11,
   "phases": [
     {
       "name": "install_doctor",

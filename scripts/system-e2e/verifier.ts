@@ -337,6 +337,9 @@ function verifyMeasurements(
     );
   }
   const firstBoot = idleArtifact;
+  assert.equal(firstBoot.stableRuns, "<volatile-number>");
+  assert.equal(firstBoot.stableRunsUnchanged, true);
+  assert.equal(firstBoot.stableSweepCompleted, true);
   assert.equal(firstBoot.firstBootRecentOnly, true);
   assert.equal(integer(firstBoot.oldContentReadsAtBoot, "old boot reads"), 0);
   assert.equal(firstBoot.restartZeroWork, true);
