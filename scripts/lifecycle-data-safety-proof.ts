@@ -148,6 +148,10 @@ const CASES = {
     "crashed_prune_restores_the_last_usable_way_back",
     "failed_crash_restore_refuses_and_preserves_the_removal_record",
   ],
+  r10PruneSafety: [
+    "partial_crash_restore_retry_keeps_the_last_usable_way_back",
+    "incomplete_undo_retry_keeps_the_last_usable_way_back",
+  ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -1475,6 +1479,57 @@ async function r8PruneSafety() {
         exists(removalRecord) && exists(path.join(trashRoot, items[0].trashName)) &&
         fixture.receipt("r9-crash-restore-refused", "snapshots_prune") === null,
       { error: refused?.message, recordKept: exists(removalRecord), trash: listDirectory(trashRoot) });
+  });
+
+  await runCase([CASES.r10PruneSafety[0]], async (record) => {
+    const { fixture, trashRoot, removalRecord, items } = await crashedPrune("r10-partial-restore");
+    const runtime = path.join(fixture.lifecycleRoot, "versions", "34.1.0");
+    fs.mkdirSync(runtime, { mode: 0o700 });
+    const first = await rejection(() => fixture.manager().pruneSnapshots({
+      operationId: "r10-partial-restore-first", keep: 1, apply: true,
+    }));
+    const partial = first !== null && /needed_restore_incomplete/.test(first.message) &&
+      fixture.snapshots().includes("a2") && exists(removalRecord) &&
+      exists(path.join(trashRoot, items[1].trashName));
+    fs.rmSync(runtime, { recursive: true, force: true });
+    const second = await rejection(() => fixture.manager().pruneSnapshots({
+      operationId: "r10-partial-restore-second", keep: 1, apply: true,
+    }));
+    const receipt = fixture.receipt("r10-partial-restore-second", "snapshots_prune");
+    record(CASES.r10PruneSafety[0],
+      partial && second === null && receipt?.status === "completed" &&
+        same(receipt.retention?.restored?.map((item) => `${item.kind}:${item.name}`) ?? [], ["runtime_version:34.1.0"]) &&
+        fixture.snapshots().includes("a2") && fixture.versions().includes("34.1.0") &&
+        !exists(removalRecord) && listDirectory(trashRoot).length === 0,
+      { first: first?.message, partial, second: second?.message, receipt,
+        snapshots: fixture.snapshots(), versions: fixture.versions(), trash: listDirectory(trashRoot), recordKept: exists(removalRecord) });
+  });
+
+  await runCase([CASES.r10PruneSafety[1]], async (record) => {
+    const { fixture, trashRoot, removalRecord, items } = await crashedPrune("r10-partial-undo");
+    // This is the durable state left when undo returned the snapshot but its
+    // runtime rename failed after the kept snapshot lost its own runtime.
+    fs.renameSync(path.join(trashRoot, items[0].trashName), path.join(fixture.lifecycleRoot, "snapshots", "a2"));
+    const runtime = path.join(fixture.lifecycleRoot, "versions", "34.1.0");
+    fs.mkdirSync(runtime, { mode: 0o700 });
+    const first = await rejection(() => fixture.manager().pruneSnapshots({
+      operationId: "r10-partial-undo-first", keep: 1, apply: true,
+    }));
+    const refused = first !== null && /needed_restore_incomplete/.test(first.message) &&
+      fixture.snapshots().includes("a2") && exists(removalRecord) &&
+      exists(path.join(trashRoot, items[1].trashName));
+    fs.rmSync(runtime, { recursive: true, force: true });
+    const second = await rejection(() => fixture.manager().pruneSnapshots({
+      operationId: "r10-partial-undo-second", keep: 1, apply: true,
+    }));
+    const receipt = fixture.receipt("r10-partial-undo-second", "snapshots_prune");
+    record(CASES.r10PruneSafety[1],
+      refused && second === null && receipt?.status === "completed" &&
+        same(receipt.retention?.restored?.map((item) => `${item.kind}:${item.name}`) ?? [], ["runtime_version:34.1.0"]) &&
+        fixture.snapshots().includes("a2") && fixture.versions().includes("34.1.0") &&
+        !exists(removalRecord) && listDirectory(trashRoot).length === 0,
+      { first: first?.message, refused, second: second?.message, receipt,
+        snapshots: fixture.snapshots(), versions: fixture.versions(), trash: listDirectory(trashRoot), recordKept: exists(removalRecord) });
   });
 }
 

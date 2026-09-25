@@ -1734,16 +1734,16 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       const earlier = this.removalRecords().records;
       carriedRecord = earlier.some((pending) => pending.operationId === input.operationId && pending.items.length > 0);
 
-      // A crash can leave a snapshot in trash after the runtime of the newer
-      // kept snapshot disappears. In that state the trash entry may be the
-      // only usable way back. Restore the whole recorded move before any
-      // cleanup, then finish this prune with a recovery receipt. The next
-      // prune sees the restored rows and can make a fresh, safe decision.
+      // A crash can leave the last way back in trash. A refused restore or
+      // failed undo may already have returned its snapshot while its runtime
+      // remains in trash. Keep the whole removal record pending in either
+      // state until the way back is usable again.
       const hasUsableWayBack = retention.snapshots.some((snapshot) =>
         snapshot.metadataValid && snapshot.restoresVersion !== null &&
         snapshot.restoresVersion !== retention.installedVersion && snapshot.restorable !== false);
       const pendingWayBack = earlier.flatMap((pending) => pending.items)
-        .find((item) => item.kind === "snapshot" && lstatIfPresent(path.join(this.trashRoot, item.trashName)));
+        .find((item) => item.kind === "snapshot" &&
+          (lstatIfPresent(path.join(this.trashRoot, item.trashName)) || lstatIfPresent(this.removalSource(item))));
       if (!hasUsableWayBack && pendingWayBack) {
         const restored: LifecycleRemovedItem[] = [];
         let complete = true;
