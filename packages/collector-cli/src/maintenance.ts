@@ -25,6 +25,7 @@ import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budg
 import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
 import { DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH } from "./learning-facts";
+import { isSessionSyncUploadLeaseError } from "./sqlite-contention";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
@@ -1000,7 +1001,11 @@ export class CollectorMaintenance {
           counter.rowsVisited += rows;
           counter.lastSuccessAt = new Date(Date.now()).toISOString();
         } catch (error) {
-          counter.failures += 1;
+          // A live session send lease refuses this transaction temporarily.
+          // The work remains queued, so this attempt is deferred, not failed.
+          if (isSessionSyncUploadLeaseError(error)) {
+            repairService.next = REPAIR_STAGES.indexOf(stage);
+          } else counter.failures += 1;
           throw error;
         } finally { saveRepairService(); }
       }
@@ -1337,6 +1342,7 @@ export class CoalescingMaintenanceScheduler<
   private async drain() {
     const results: T[] = [];
     let firstError: unknown;
+    let firstFailure: unknown;
     while (this.pending) {
       this.pending = false;
       this.runCount += 1;
@@ -1360,7 +1366,10 @@ export class CoalescingMaintenanceScheduler<
         this.enrichmentRowsVisited += completed.enrichment.rowsVisited;
         results.push(result);
       } catch (error) {
-        this.failedRuns += 1;
+        if (!isSessionSyncUploadLeaseError(error)) {
+          this.failedRuns += 1;
+          firstFailure ??= error;
+        }
         firstError ??= error;
       } finally {
         this.activeJobs -= 1;
@@ -1375,7 +1384,8 @@ export class CoalescingMaintenanceScheduler<
     const waiters = this.waiters;
     this.waiters = [];
     for (const waiter of waiters) {
-      if (firstError !== undefined) waiter.reject(firstError);
+      if (firstFailure !== undefined) waiter.reject(firstFailure);
+      else if (firstError !== undefined) waiter.reject(firstError);
       else waiter.resolve(results);
     }
   }
@@ -1393,12 +1403,14 @@ export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOu
 
 export const AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS = 5_000;
 export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
+const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS = 1_000;
+const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS = 5_000;
 const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
 
 export type AutomaticMaintenanceCadenceStatus = {
   accepting: boolean;
   inFlight: boolean;
-  retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal" | null;
+  retryClass: "boot" | "startup" | "repair" | "capture" | "storage_busy" | "circuit" | "normal" | null;
   nextRetryAt: string | null;
   startupIntervalMs: number;
   normalIntervalMs: number;
@@ -1429,10 +1441,11 @@ export class AutomaticMaintenanceCadence<
   private accepting = true;
   private inFlight = false;
   private timer: unknown | null = null;
-  private retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal" | null = null;
+  private retryClass: AutomaticMaintenanceCadenceStatus["retryClass"] = null;
   private nextRetryAt: string | null = null;
   private triggerCount = 0;
   private failedTriggers = 0;
+  private storageBusyDeferrals = 0;
   private captureFollowups = 0;
 
   constructor(
@@ -1517,12 +1530,17 @@ export class AutomaticMaintenanceCadence<
     return after.state === "in_progress" && advanced ? "startup" : "normal";
   }
 
-  private schedule(retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal") {
+  private schedule(retryClass: Exclude<AutomaticMaintenanceCadenceStatus["retryClass"], null>) {
     if (!this.accepting || this.timer) return;
     const now = this.timerApi().now();
     const notBefore = this.options.retryNotBefore?.() ?? null;
     const delay = notBefore !== null && notBefore > now ? notBefore - now
-      : retryClass === "normal" ? this.normalIntervalMs() : this.startupIntervalMs();
+      : retryClass === "normal" ? this.normalIntervalMs()
+        : retryClass === "storage_busy"
+          ? Math.min(AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS,
+            AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS *
+              2 ** Math.max(0, this.storageBusyDeferrals - 1))
+          : this.startupIntervalMs();
     if (notBefore !== null && notBefore > now) retryClass = "circuit";
     this.retryClass = retryClass;
     const timerApi = this.timerApi();
@@ -1544,6 +1562,7 @@ export class AutomaticMaintenanceCadence<
     this.inFlight = true;
     this.triggerCount += 1;
     let failed = false;
+    let storageBusy = false;
     let discoveryAdvanced = false;
     let baselineBefore: ReturnType<typeof captureBaselineStatus>["progress"] | null = null;
     let repairBefore: { pending: boolean; units: number } | null = null;
@@ -1552,6 +1571,7 @@ export class AutomaticMaintenanceCadence<
       baselineBefore = this.baselineStatus().progress;
       repairBefore = this.options.repairProgress?.() ?? null;
       const results = await requestAutomaticRecentMaintenance(this.scheduler);
+      this.storageBusyDeferrals = 0;
       // Preserve a short retry burst across discovery/frame deferrals. Only
       // committed records or new durable scan bytes renew it; prefix rereads,
       // refused/idle work and failed transactions cannot renew the burst.
@@ -1573,19 +1593,29 @@ export class AutomaticMaintenanceCadence<
           ),
       );
     } catch (error) {
-      failed = true;
-      this.captureFollowups = 0;
-      this.failedTriggers += 1;
-      this.options.onError?.(error);
+      if (isSessionSyncUploadLeaseError(error)) {
+        storageBusy = true;
+        // Cap the backoff at five seconds under consecutive session sends.
+        this.storageBusyDeferrals = Math.min(4, this.storageBusyDeferrals + 1);
+      } else {
+        failed = true;
+        this.storageBusyDeferrals = 0;
+        this.captureFollowups = 0;
+        this.failedTriggers += 1;
+        this.options.onError?.(error);
+      }
     } finally {
       this.inFlight = false;
       if (this.accepting) {
-        let retry: "normal" | "repair" | "startup" | "capture" = "normal";
+        let retry: "normal" | "repair" | "startup" | "capture" | "storage_busy" =
+          storageBusy ? "storage_busy" : "normal";
         try {
-          const baselineAfter = this.baselineStatus().progress;
-          if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
-            : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
-              : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
+          if (!storageBusy) {
+            const baselineAfter = this.baselineStatus().progress;
+            if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
+              : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
+                : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
+          }
         } catch (error) {
           this.captureFollowups = 0;
           this.failedTriggers += 1;

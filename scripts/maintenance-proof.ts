@@ -16,6 +16,7 @@ import {
   AutomaticMaintenanceCadence,
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
+  automaticRepairServiceStatus,
   drainProjectionMigration,
   requestAutomaticRecentMaintenance,
   runRepoEnrichmentMaintenance,
@@ -23,6 +24,7 @@ import {
   type AutomaticMaintenanceCadenceTimer,
   type CollectorMaintenanceRunResult,
 } from "../packages/collector-cli/src/maintenance";
+import { ensureSessionSummarySchema } from "../packages/collector-cli/src/session-summary";
 import {
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
@@ -318,6 +320,139 @@ function fakeCadenceTimer() {
       }
     },
   };
+}
+
+function leasedRepricingFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "p40i-maintenance-lease-"));
+  const rolloutRoot = path.join(root, "rollouts");
+  const transcriptRoot = path.join(root, "transcripts");
+  fs.mkdirSync(rolloutRoot);
+  fs.mkdirSync(transcriptRoot);
+  const buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
+  const db = buffer.database;
+  ensureSessionSummarySchema(db);
+  const sessionId = "00000000-0000-4000-8000-000000000321";
+  const eventId = "00000000-0000-4000-8000-000000000322";
+  const now = new Date().toISOString();
+  db.prepare(`insert into buffered_events
+    (id, source, event_type, data_mode, observed_at, payload_json,
+     suppressed_fields_json, created_at, session_id, model,
+     input_tokens, output_tokens, privacy_generation)
+    values (?, 'codex', 'usage_rollout', 'metadata', ?, '{}', '[]', ?, ?,
+            'gpt-5.2', 1000, 1000, ?)`)
+    .run(eventId, now, now, sessionId, "00000000-0000-4000-8000-000000000323");
+  db.prepare(`insert or ignore into reprice_dirty_events (event_id, queued_at) values (?, ?)`)
+    .run(eventId, now);
+  db.prepare(`insert into session_sync_upload_leases
+    (session_id, lease_token, lease_expires_at, mutation_revision, high_water)
+    values (?, ?, ?, 0, 0)`)
+    .run(sessionId, "first-send", new Date(Date.now() + 60_000).toISOString());
+  const state = () => ({
+    costUsd: (db.prepare(`select cost_usd as costUsd from buffered_events where id = ?`)
+      .get(eventId) as { costUsd: number | null }).costUsd,
+    pending: (db.prepare(`select count(*) as n from reprice_dirty_events where event_id = ?`)
+      .get(eventId) as { n: number }).n,
+  });
+  return {
+    buffer, db, sessionId, rolloutRoot, transcriptRoot, state,
+    close: () => { buffer.close(); fs.rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+async function proveLeaseRepairStageDefers() {
+  const fixture = leasedRepricingFixture();
+  const { db, buffer } = fixture;
+  try {
+    db.prepare(`insert into maintenance_state (key, value, updated_at) values (?, ?, ?)`)
+      .run("automatic_repair_service_v1", JSON.stringify({ next: 2, cycles: 0, stages: {} }), new Date().toISOString());
+    const maintenance = new CollectorMaintenance(
+      buffer,
+      new RolloutTailer(buffer, fixture.rolloutRoot, () => []),
+      new TranscriptTailer(buffer, fixture.transcriptRoot),
+    );
+    await assert.rejects(maintenance.runRecent(), /session_sync_upload_lease/);
+    const service = automaticRepairServiceStatus(db);
+    const stage = service.stages.repricing;
+    const row = fixture.state();
+    check("leased_repricing_preserves_queue_without_recording_stage_failure",
+      stage.attempts === 1 && stage.failures === 0 && service.next === 2 &&
+      row.costUsd === null && row.pending === 1,
+      { stage, nextRepair: service.next, row });
+  } finally {
+    fixture.close();
+  }
+}
+
+async function proveLeaseCadenceRetry() {
+  const fixture = leasedRepricingFixture();
+  const { db, sessionId } = fixture;
+  try {
+    const clock = fakeCadenceTimer();
+    let errors = 0;
+    const scheduler = new CoalescingMaintenanceScheduler(async () => {
+      runRepricingMaintenance(db, { backfillLimit: 1, candidateLimit: 1 });
+      return fakeRun();
+    });
+    const cadence = new AutomaticMaintenanceCadence(
+      scheduler,
+      () => fakeBaselineStatus("complete"),
+      { timer: clock.timer, onError: () => { errors += 1; } },
+    );
+    const delayUntilRetry = () => Date.parse(cadence.status().nextRetryAt ?? "") - clock.timer.now();
+    cadence.start();
+    await clock.advance(5_000);
+    const first = cadence.status();
+    const firstDelay = delayUntilRetry();
+    const duringFirst = fixture.state();
+    check("first_send_lease_uses_short_retry_without_failure_counters",
+      first.retryClass === "storage_busy" && firstDelay > 0 && firstDelay <= 5_000 &&
+      first.failedTriggers === 0 && scheduler.status().failedRuns === 0 && errors === 0 &&
+      duringFirst.costUsd === null && duringFirst.pending === 1,
+      { first, firstDelay, scheduler: scheduler.status(), errors, duringFirst });
+
+    // The first send ends and a second send of the same session starts before
+    // the next maintenance attempt. Its lease must defer that attempt too.
+    db.prepare(`update session_sync_upload_leases set lease_token = ?, lease_expires_at = ?
+      where session_id = ?`).run("second-send", new Date(Date.now() + 60_000).toISOString(), sessionId);
+    await clock.advance(firstDelay);
+    const second = cadence.status();
+    const secondDelay = delayUntilRetry();
+    const duringSecond = fixture.state();
+    check("second_send_lease_backs_off_within_a_bounded_delay",
+      second.retryClass === "storage_busy" && secondDelay >= firstDelay && secondDelay <= 5_000 &&
+      second.failedTriggers === 0 && scheduler.status().failedRuns === 0 && errors === 0 &&
+      duringSecond.costUsd === null && duringSecond.pending === 1,
+      { second, secondDelay, scheduler: scheduler.status(), errors, duringSecond });
+
+    db.prepare(`delete from session_sync_upload_leases where session_id = ?`).run(sessionId);
+    await clock.advance(secondDelay);
+    const after = fixture.state();
+    const final = cadence.status();
+    cadence.stop();
+    check("leased_repricing_converges_on_next_retry_after_two_sends",
+      after.costUsd !== null && after.costUsd > 0 && after.pending === 0 &&
+      final.retryClass === "normal" && final.failedTriggers === 0 &&
+      scheduler.status().failedRuns === 0 && errors === 0,
+      { after, final, scheduler: scheduler.status(), errors });
+  } finally {
+    fixture.close();
+  }
+}
+
+async function proveLeaseDoesNotMaskRealFailure() {
+  let attempts = 0;
+  const scheduler = new CoalescingMaintenanceScheduler(async () => {
+    attempts += 1;
+    throw new Error(attempts === 1 ? "session_sync_upload_lease" : "maintenance-real-failure");
+  });
+  const first = scheduler.trigger();
+  const followup = scheduler.trigger();
+  const outcomes = await Promise.allSettled([first, followup]);
+  assert.ok(outcomes.every(result => result.status === "rejected" &&
+    result.reason instanceof Error && result.reason.message === "maintenance-real-failure"));
+  check("lease_deferral_does_not_mask_later_real_failure",
+    attempts === 2 && scheduler.status().failedRuns === 1,
+    { attempts, scheduler: scheduler.status() });
 }
 
 async function proveAdaptiveBaselineCadence() {
@@ -1545,9 +1680,27 @@ async function proveIntegratedIdle(
 }
 
 async function main() {
+  if (process.env.PROBE_CASE === "lease_stage") {
+    await proveLeaseRepairStageDefers();
+    process.stdout.write(`${JSON.stringify({ status: "pass", checks }, null, 2)}\n`);
+    return;
+  }
+  if (process.env.PROBE_CASE === "lease_cadence") {
+    await proveLeaseCadenceRetry();
+    process.stdout.write(`${JSON.stringify({ status: "pass", checks }, null, 2)}\n`);
+    return;
+  }
+  if (process.env.PROBE_CASE === "lease_error_priority") {
+    await proveLeaseDoesNotMaskRealFailure();
+    process.stdout.write(`${JSON.stringify({ status: "pass", checks }, null, 2)}\n`);
+    return;
+  }
   await proveCoalescing();
   await proveStoppingCancelsPendingFollowup();
   await proveAdaptiveBaselineCadence();
+  await proveLeaseRepairStageDefers();
+  await proveLeaseCadenceRetry();
+  await proveLeaseDoesNotMaskRealFailure();
   await proveDiscoveryEntriesRetryClass();
   await proveProjectionDutyCycle();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-maintenance-proof-"));

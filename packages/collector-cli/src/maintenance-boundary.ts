@@ -7,6 +7,7 @@ import type {
   MaintenanceStageTimings,
 } from "./maintenance";
 import type { MaintenanceProgress } from "./maintenance-progress";
+import { isSessionSyncUploadLeaseError } from "./sqlite-contention";
 import {
   MAINTENANCE_PROTOCOL_MAX_BYTES,
   MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB,
@@ -73,7 +74,7 @@ export type MaintenanceBoundaryStatus = {
     stageTimings: MaintenanceStageTimings | null;
   } | null;
   lastFailure: string | null;
-  lastOutcome: "completed" | "PARTIAL_OK" | "timed_out" | "failed" | null;
+  lastOutcome: "completed" | "PARTIAL_OK" | "deferred" | "timed_out" | "failed" | null;
   lastTimedOutAt: string | null;
   circuit: {
     failureCount: number;
@@ -301,7 +302,7 @@ export class MaintenanceProcessBoundary {
   private lastDurationMs: number | null = null;
   private lastResult: MaintenanceBoundaryStatus["lastResult"] = null;
   private lastFailure: string | null = null;
-  private lastOutcome: "completed" | "PARTIAL_OK" | "timed_out" | "failed" | null = null;
+  private lastOutcome: MaintenanceBoundaryStatus["lastOutcome"] = null;
   private lastTimedOutAt: string | null = null;
   private activeProgress: MaintenanceProgress | null = null;
   private activeProgressAtMs: number | null = null;
@@ -866,6 +867,8 @@ export class MaintenanceProcessBoundary {
   ) {
     const active = this.active;
     if (!active || active.settled) return;
+    const leaseDeferred = !timedOut && diagnostic?.errorClass === "SQLITE_CONSTRAINT_TRIGGER" &&
+      isSessionSyncUploadLeaseError(diagnostic);
     active.settled = true;
     this.clearTimer(active.timer);
     this.active = null;
@@ -927,10 +930,16 @@ export class MaintenanceProcessBoundary {
         // Deadline bookkeeping must never mask the boundary outcome itself.
       }
     }
-    this.recordOutcome(partialOk ? "PARTIAL_OK" : timedOut ? "timed_out" : "failed", this.lastCompletedAtMs);
+    this.recordOutcome(leaseDeferred ? "deferred" : partialOk ? "PARTIAL_OK"
+      : timedOut ? "timed_out" : "failed", this.lastCompletedAtMs);
     this.state = timedOut ? "timed_out" : "recovering";
     this.stage = "terminating";
-    await this.terminateChild(reason);
+    const reaped = await this.terminateChild(reason);
+    if (leaseDeferred && (!reaped || this.orphanRisk)) {
+      // Failed worker reap is a real boundary failure even if its original
+      // SQLite transaction was only deferred by the session lease.
+      this.recordOutcome("failed", this.lastCompletedAtMs);
+    }
     if (partialOk) {
       this.failureCount = 0;
       this.markCircuitClosed();
@@ -938,6 +947,15 @@ export class MaintenanceProcessBoundary {
       this.state = "ready";
       this.stage = "idle";
       active.resolve({ outcome: "PARTIAL_OK", progress: acknowledgedJobProgress });
+      return;
+    }
+    if (leaseDeferred && reaped && !this.orphanRisk) {
+      this.failureCount = 0;
+      this.markCircuitClosed();
+      this.lastFailure = null;
+      this.state = "ready";
+      this.stage = "idle";
+      active.reject(new Error("session_sync_upload_lease"));
       return;
     }
     this.openCircuit(reason);
@@ -1227,7 +1245,7 @@ export class MaintenanceProcessBoundary {
     return observed;
   }
 
-  private recordOutcome(state: "completed" | "PARTIAL_OK" | "timed_out" | "failed", atMs: number) {
+  private recordOutcome(state: Exclude<MaintenanceBoundaryStatus["lastOutcome"], null>, atMs: number) {
     const at = new Date(atMs).toISOString();
     this.lastOutcome = state;
     if (state === "timed_out") this.lastTimedOutAt = at;
