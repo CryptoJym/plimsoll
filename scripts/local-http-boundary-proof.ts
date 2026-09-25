@@ -92,6 +92,7 @@ function request(
   body: Buffer | string,
   headers: Record<string, string> = {},
   method = "POST",
+  timeoutMs = 5_000,
 ) {
   const startedAt = performance.now();
   const bodyBuffer = Buffer.isBuffer(body) ? body : Buffer.from(body);
@@ -130,7 +131,7 @@ function request(
         });
       },
     );
-    client.setTimeout(5_000, () => client.destroy(new Error("ProofClientTimeout")));
+    client.setTimeout(timeoutMs, () => client.destroy(new Error("ProofClientTimeout")));
     client.on("error", reject);
     client.end(bodyBuffer);
   });
@@ -500,6 +501,11 @@ async function isolatedOtlpRun(
       route,
       body,
       { "x-plimsoll-source": "codex" },
+      "POST",
+      // A post-deadline spool flush is asynchronous. A short proof-client
+      // timeout would destroy the socket and tear down this temporary home
+      // while the file is still being flushed, inventing a write failure.
+      30_000,
     );
     const countEvents = () => Number((buffer.database.prepare(
       "select count(*) as count from buffered_events",
