@@ -603,6 +603,65 @@ async function checksumBeyondSafeInteger(dir: string) {
   });
 }
 
+async function checksumMismatchBeyondSafeInteger(dir: string) {
+  for (const mismatch of ["control", "aggregate"] as const) {
+    await check(`checksum_one_unit_${mismatch}_mismatch_after_reopen_is_not_complete`, () => {
+      const api = indexApi();
+      const file = path.join(dir, `checksum-one-unit-${mismatch}.sqlite`);
+      const seed = openLedger(file);
+      const at = "2026-09-20T00:00:00.000Z";
+      try {
+        seed.database.prepare(`
+          insert into buffered_events
+            (rowid, id, source, event_type, data_mode, observed_at, payload_json,
+             suppressed_fields_json, created_at, session_id, repo_hash, workspace_id,
+             privacy_generation)
+          values (?, ?, 'codex', 'tool_result', 'metadata', ?, '{}', '[]', ?, ?, ?, ?, ?)
+        `).run(9_007_199_254_740_000, uuid(mismatch === "control" ? 0x40_0001 : 0x40_0002),
+          at, at, "checksum-session", REPO_A, WORKSPACE, "checksum-generation");
+        expect(api.sessionContextIndexState(seed.database) === "complete", "seed index was not complete");
+        const original = seed.database.prepare(`select indexed_key_checksum as checksum
+          from session_repo_context_control where singleton = 1`).safeIntegers()
+          .get() as { checksum: bigint };
+        expect(original.checksum > 9_007_199_254_740_992n && original.checksum % 2n === 0n,
+          "seed checksum must exceed 2^53 and have a one-unit rounding neighbor");
+      } finally {
+        seed.close();
+      }
+
+      const raw = new Database(file);
+      let exact: { indexed: bigint; ledger: bigint; equal: bigint };
+      try {
+        raw.prepare(`update session_repo_context_control set
+          ${mismatch === "control"
+            ? "ledger_key_checksum = ledger_key_checksum + 1"
+            : "indexed_key_checksum = indexed_key_checksum + 1, ledger_key_checksum = ledger_key_checksum + 1"}
+          where singleton = 1`).run();
+        exact = raw.prepare(`select indexed_key_checksum as indexed,
+          ledger_key_checksum as ledger,
+          indexed_key_checksum = ledger_key_checksum as equal
+          from session_repo_context_control where singleton = 1`).safeIntegers()
+          .get() as { indexed: bigint; ledger: bigint; equal: bigint };
+      } finally {
+        raw.close();
+      }
+      const reopened = openLedger(file);
+      let state: SessionContextIndex.SessionContextIndexState;
+      try {
+        state = api.sessionContextIndexState(reopened.database);
+      } finally {
+        reopened.close();
+      }
+      const detail = {
+        mismatch, indexed: exact.indexed.toString(), ledger: exact.ledger.toString(),
+        exactSqlEqual: Number(exact.equal), state,
+      };
+      expect(state !== "complete", "a one-unit checksum mismatch was trusted after reopen", detail);
+      return detail;
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 1b. Corruption, rollback and downgrade safety
 
@@ -1714,7 +1773,15 @@ async function main() {
       if (failed.length > 0) process.exitCode = 1;
       return;
     }
+    if (process.env.PROBE_CASE === "checksum_mismatch_over_2_53") {
+      await checksumMismatchBeyondSafeInteger(dir);
+      const failed = checks.filter((entry) => !entry.ok);
+      console.log(JSON.stringify({ status: failed.length === 0 ? "PASS" : "FAIL", checks, failed: failed.length }, null, 2));
+      if (failed.length > 0) process.exitCode = 1;
+      return;
+    }
     await checksumBeyondSafeInteger(dir);
+    await checksumMismatchBeyondSafeInteger(dir);
     await consistency(dir);
     await corruptionSafety(dir);
     await equivalence(dir);

@@ -205,8 +205,7 @@ type ControlRow = {
   completedAt: string | null;
   indexedRows: number;
   ledgerContextRows: number;
-  indexedKeyChecksum: number;
-  ledgerKeyChecksum: number;
+  checksumsEqual: number;
   integrityState: "valid" | "invalid";
   integrityFailures: number;
   integrityLastFailureAt: string | null;
@@ -229,8 +228,7 @@ function readControl(db: Database.Database): ControlRow | null {
          backfill_batches as batches, backfill_last_batch_at as lastBatchAt,
          backfill_completed_at as completedAt, indexed_rows as indexedRows,
          ledger_context_rows as ledgerContextRows,
-         indexed_key_checksum as indexedKeyChecksum,
-         ledger_key_checksum as ledgerKeyChecksum,
+         indexed_key_checksum = ledger_key_checksum as checksumsEqual,
          integrity_state as integrityState,
          integrity_failures as integrityFailures,
          integrity_last_failure_at as integrityLastFailureAt,
@@ -277,7 +275,7 @@ function countsAgree(control: ControlRow) {
 }
 
 function checksumsAgree(control: ControlRow) {
-  return control.indexedKeyChecksum === control.ledgerKeyChecksum;
+  return control.checksumsEqual === 1;
 }
 
 function controlTableUsable(db: Database.Database) {
@@ -298,12 +296,15 @@ function controlTableUsable(db: Database.Database) {
   }
 }
 
-function recomputedIndexChecksum(db: Database.Database) {
+function recomputedIndexChecksumAgrees(db: Database.Database) {
+  // SQLite compares INTEGER values exactly. Reading either checksum into a
+  // JavaScript number would round away one-unit drift above 2^53.
   const row = db.prepare(
-    `select coalesce(sum(${keyChecksum("session_repo_contexts")}), 0) as checksum
+    `select coalesce(sum(${keyChecksum("session_repo_contexts")}), 0) =
+         (select indexed_key_checksum from session_repo_context_control where singleton = 1) as agrees
        from session_repo_contexts`,
-  ).get() as { checksum: number };
-  return row.checksum;
+  ).get() as { agrees: number };
+  return row.agrees === 1;
 }
 
 // A stale row can be discovered from a read-only history connection. Keep an
@@ -344,8 +345,7 @@ function invariantAgrees(db: Database.Database, control: ControlRow) {
   // this catches an out-of-band UPDATE that did not fire a checksum trigger.
   if (control.complete !== 1) return true;
   if (validatedIndexes.has(db)) return true;
-  const recomputed = recomputedIndexChecksum(db);
-  if (recomputed !== control.indexedKeyChecksum) return false;
+  if (!recomputedIndexChecksumAgrees(db)) return false;
   validatedIndexes.add(db);
   return true;
 }
