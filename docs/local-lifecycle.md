@@ -375,8 +375,8 @@ never touches the ledger or what that operation references. A
 When a recorded way back needs restoring, the dry run reports `pendingRestore`
 and no planned removals. `snapshots list` marks the affected decisions
 `pending_restore`. Apply attempts the named restore and refuses if the files
-are incomplete or unusable; a dry run cannot promise that a rename or
-validation will succeed.
+are incomplete or unusable. The dry run predicts known validation failures;
+a rename or filesystem access can still fail during apply.
 If the journal is malformed or unreadable, the dry run reports
 `journal_unreadable`; `prune --apply` exits nonzero without a receipt or any
 removal. Preserve the journal for repair and retry after its state is known.
