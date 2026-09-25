@@ -34,10 +34,20 @@ export function fn(surface: Record<string, unknown>, name: string): (...args: un
 }
 
 type BufferOptions = NonNullable<ConstructorParameters<typeof LocalEventBuffer>[1]> & { lean?: { write?: boolean } };
-/** A buffer on a private temporary ledger; `lean.write` is the B2a flag (unknown to the shipped constructor today). */
+/**
+ * The enrollment epoch every temporary ledger starts at. A managed (workspace-bound) buffer refuses any event whose
+ * `observedAt` precedes its enrollment epoch as `before_enrollment` (buffer.ts `eventAdmissionReason`), and the shipped
+ * constructor starts the epoch at the time the buffer is opened. The fixtures use fixed 2026 timestamps, so the epoch is
+ * pinned before all of them (round 2 of B0, review-r1 blocker 3: eight tests appended nothing). `helper.contract.ts` guards it.
+ */
+export const EPOCH_STARTED_AT = "2026-01-01T00:00:00.000Z";
+/** The fixed `observedAt` of `event()`: after EPOCH_STARTED_AT, inside every fixture's 2026-09 window. */
+export const EVENT_OBSERVED_AT = "2026-09-25T10:00:00.000Z";
+/** A buffer on a private temporary ledger with its enrollment epoch pinned at EPOCH_STARTED_AT; `lean.write` is the B2a flag (unknown to the shipped constructor today). */
 export function openTempBuffer(options: BufferOptions = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-lean-contract-"));
-  const buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"), options as ConstructorParameters<typeof LocalEventBuffer>[1]);
+  const withEpoch = { enrollmentNow: () => new Date(EPOCH_STARTED_AT), ...options } as ConstructorParameters<typeof LocalEventBuffer>[1];
+  const buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"), withEpoch);
   const close = () => {
     try { buffer.close(); } catch { /* already closed */ }
     fs.rmSync(root, { recursive: true, force: true });
@@ -54,7 +64,7 @@ export function event(overrides: Record<string, unknown> = {}): AiInteractionEve
     source: "codex",
     dataMode: "metadata",
     eventType: "assistant_response",
-    observedAt: "2026-09-25T10:00:00.000Z",
+    observedAt: EVENT_OBSERVED_AT,
     actionClass: "other",
     inputTokens: 1,
     outputTokens: 1,
