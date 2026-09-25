@@ -1349,7 +1349,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
    * none, so only its presence is checked). Read only; each runtime is hashed
    * once per call.
    */
-  private unrestorableReason(directory: string, metadata: SnapshotMetadata, runtimeDigests: Map<string, string | null>): string | null {
+  private unrestorableReason(directory: string, metadata: SnapshotMetadata, runtimeDigests: Map<string, string | null>,
+    runtimeRoot = this.versionsRoot): string | null {
     const regularFile = (file: string) => {
       const stat = lstatIfPresent(file);
       return stat?.isFile() ? stat : null;
@@ -1367,8 +1368,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     if (!metadata.currentVersion || !metadata.currentExecutable) return null;
     const executable = metadata.currentExecutable;
     try {
-      assertAbsoluteOwnedPath(executable, this.versionsRoot, "snapshot runtime");
-      assertNoSymlink(executable, this.versionsRoot);
+      assertAbsoluteOwnedPath(executable, runtimeRoot, "snapshot runtime");
+      assertNoSymlink(executable, runtimeRoot);
     } catch {
       return `runtime ${metadata.currentVersion} is not a lifecycle runtime`;
     }
@@ -1454,10 +1455,36 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       if ((inTrash && atSource) || (!inTrash && !atSource)) complete = false;
       if (inTrash) wouldRestore.push({ kind: item.kind, name: item.name, bytes: item.bytes });
     }
+    let refusal: LifecyclePendingRestore["refusal"] = "needed_restore_incomplete";
+    if (complete && wouldRestore.length > 0) {
+      const runtimeDigests = new Map<string, string | null>();
+      const usable = items.filter((item) => item.kind === "snapshot").some((item) => {
+        const snapshotSource = this.removalSource(item);
+        const directory = lstatIfPresent(snapshotSource) ? snapshotSource : path.join(this.trashRoot, item.trashName);
+        const metadata = this.readSnapshotMetadata(directory);
+        if (!metadata?.currentVersion || metadata.currentVersion === retention.installedVersion) return false;
+        let executable = metadata.currentExecutable;
+        let runtimeRoot = this.versionsRoot;
+        const runtime = items.find((candidate) => candidate.kind === "runtime_version" && candidate.name === metadata.currentVersion);
+        if (runtime && executable && !lstatIfPresent(this.removalSource(runtime))) {
+          const sourceRoot = this.removalSource(runtime);
+          const relative = path.relative(sourceRoot, executable);
+          if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+          runtimeRoot = this.trashRoot;
+          executable = path.join(this.trashRoot, runtime.trashName, relative);
+        }
+        try {
+          return this.unrestorableReason(directory, { ...metadata, currentExecutable: executable }, runtimeDigests, runtimeRoot) === null;
+        } catch {
+          return false;
+        }
+      });
+      refusal = usable ? null : "needed_restore_unusable";
+    }
     return {
       items: items.map((item) => ({ kind: item.kind, name: item.name, bytes: item.bytes })),
       wouldRestore,
-      refusal: complete && wouldRestore.length > 0 ? null : "needed_restore_incomplete",
+      refusal,
     };
   }
 

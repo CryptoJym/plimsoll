@@ -184,7 +184,7 @@ export type LifecycleRemovedItem = {
 export type LifecyclePendingRestore = {
   items: LifecycleRemovedItem[];
   wouldRestore: LifecycleRemovedItem[];
-  refusal: "needed_restore_incomplete" | null;
+  refusal: "needed_restore_incomplete" | "needed_restore_unusable" | null;
 };
 
 export type LifecycleRetentionRecord = {
@@ -198,6 +198,7 @@ export type LifecycleRetentionRecord = {
     | "retention_failed"
     | "skipped_by_operator"
     | "needed_restore_incomplete"
+    | "needed_restore_unusable"
     | null;
   removed: LifecycleRemovedItem[];
   removedBytes: number;

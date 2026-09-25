@@ -159,6 +159,7 @@ const CASES = {
     "new_update_retention_record_is_fenced_before_its_first_move",
     "inherited_pending_record_is_fenced_before_a_refused_retry",
   ],
+  r12Preview: ["unusable_restore_preview_and_list_refuse_before_apply"],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -1557,9 +1558,18 @@ async function r8PruneSafety() {
     const { fixture, trashRoot, removalRecord, items } = await crashedPrune("r10-unusable-restored");
     const executable = path.join(trashRoot, items[1].trashName, `darwin-${ARCHITECTURE}`, "bin", "plimsoll.mjs");
     fs.appendFileSync(executable, "// digest changed after the snapshot\n");
+    const preview = await fixture.manager().pruneSnapshots({ operationId: "r12-unusable-preview", keep: 1 });
+    const listing = await fixture.manager().listSnapshots({ keep: 1 });
+    const listText = formatSnapshotInventory(listing);
     const refused = await rejection(() => fixture.manager().pruneSnapshots({
       operationId: "r10-unusable-restored-prune", keep: 1, apply: true,
     }));
+    record(CASES.r12Preview[0],
+      preview.retention.status === "skipped" && preview.retention.skippedReason === "needed_restore_unusable" &&
+        preview.retention.pendingRestore?.refusal === "needed_restore_unusable" &&
+        preview.retention.removed.length === 0 && listing.pendingRestore?.refusal === "needed_restore_unusable" &&
+        /needed_restore_unusable/.test(listText) && refused !== null && /needed_restore_unusable/.test(refused.message),
+      { preview: preview.retention, listing: listing.pendingRestore, listText, error: refused?.message });
     record(CASES.r10PruneSafety[2],
       refused !== null && /needed_restore_unusable/.test(refused.message) &&
         !refused.message.includes(fixture.home) &&
