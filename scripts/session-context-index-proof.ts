@@ -540,6 +540,69 @@ function finishBackfill(db: Database.Database, api: IndexApi) {
   return batches;
 }
 
+async function checksumBeyondSafeInteger(dir: string) {
+  await check("checksum_crossing_2_to_the_53rd_power_completes_exactly", () => {
+    const api = indexApi();
+    const file = path.join(dir, "checksum-over-2-to-the-53rd.sqlite");
+    const seed = openLedger(file);
+    const insert = seed.database.prepare(`
+      insert into buffered_events
+        (rowid, id, source, event_type, data_mode, observed_at, payload_json,
+         suppressed_fields_json, created_at, session_id, repo_hash, workspace_id,
+         device_id, privacy_generation)
+      values (?, ?, 'codex', 'tool_result', 'metadata', ?, '{}', '[]', ?, ?, ?, ?, ?, ?)
+    `);
+    seed.database.transaction(() => {
+      for (let index = 0; index < 12; index += 1) {
+        // Keep the per-row key near 1e15 while making the aggregate's low
+        // bits observable. A changing timestamp adds the row index twice and
+        // can accidentally land on a representable IEEE-754 value.
+        const at = new Date(T0).toISOString();
+        insert.run(
+          1_000_000_000_000_000 + index,
+          uuid(0x30_0000 + index),
+          at,
+          at,
+          "checksum-session",
+          REPO_A,
+          WORKSPACE,
+          DEVICE,
+          `checksum-generation-${index}`,
+        );
+      }
+    })();
+    seed.close();
+    downgradeTo0736(file).close();
+
+    const buffer = openLedger(file);
+    const db = buffer.database;
+    let batches = 0;
+    while (api.sessionContextIndexState(db) === "backfilling" && batches < 20) {
+      api.backfillSessionContextIndex(db, 31);
+      batches += 1;
+    }
+    const equality = db.prepare(`
+      select indexed_rows = ledger_context_rows as counts_equal,
+             indexed_key_checksum = ledger_key_checksum as checksums_equal,
+             ledger_key_checksum > 9007199254740992 as crossed_safe_integer,
+             backfill_complete as complete
+        from session_repo_context_control where singleton = 1
+    `).get() as {
+      counts_equal: number;
+      checksums_equal: number;
+      crossed_safe_integer: number;
+      complete: number;
+    };
+    const status = api.sessionContextIndexStatus(db);
+    buffer.close();
+    const detail = { batches, equality, status };
+    expect(equality.counts_equal === 1 && equality.checksums_equal === 1 &&
+      equality.crossed_safe_integer === 1 && equality.complete === 1 &&
+      status.state === "complete", "checksum drifted after 2^53", detail);
+    return detail;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // 1b. Corruption, rollback and downgrade safety
 
@@ -1645,6 +1708,14 @@ async function main() {
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "session-context-index-"));
   try {
+    if (process.env.PROBE_CASE === "checksum_over_2_53") {
+      await checksumBeyondSafeInteger(dir);
+      const failed = checks.filter((entry) => !entry.ok);
+      console.log(JSON.stringify({ status: failed.length === 0 ? "PASS" : "FAIL", checks, failed: failed.length }, null, 2));
+      if (failed.length > 0) process.exitCode = 1;
+      return;
+    }
+    await checksumBeyondSafeInteger(dir);
     await consistency(dir);
     await corruptionSafety(dir);
     await equivalence(dir);

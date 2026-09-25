@@ -576,16 +576,19 @@ export function backfillSessionContextIndex(
     const sourceChecksum = db.prepare(
       `select coalesce(rowid, 0) + coalesce(unixepoch(observed_at), 0) as checksum
          from buffered_events where rowid = ?`,
-    );
+    ).safeIntegers();
     let indexed = 0;
-    let indexedChecksum = 0;
+    // SQLite's checksum is an INTEGER. Keep the delta as a bigint all the
+    // way through the write so better-sqlite3 binds an INTEGER instead of a
+    // lossy REAL once the ledger crosses JavaScript's 2^53 safe-integer limit.
+    let indexedChecksum = 0n;
     let visited = 0;
     for (const row of rows) {
       if (backfillOptions.shouldContinue && !backfillOptions.shouldContinue()) break;
       const changes = index.run(row.rowid).changes;
       indexed += changes;
       if (changes > 0) {
-        indexedChecksum += (sourceChecksum.get(row.rowid) as { checksum: number } | undefined)?.checksum ?? 0;
+        indexedChecksum += (sourceChecksum.get(row.rowid) as { checksum: bigint } | undefined)?.checksum ?? 0n;
       }
       visited += 1;
     }
