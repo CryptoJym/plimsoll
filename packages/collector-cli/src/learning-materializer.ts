@@ -18,6 +18,7 @@ import {
   type TechniqueExposureFact,
 } from "../../shared/src/index";
 import { parseOutcomePerformanceRecord, type OutcomePerformanceRecord } from "./performance-layer";
+import { readLearningFactWindow, type LearningFactWindow } from "./learning-facts";
 import { PLIMSOLL_VERSION } from "./version";
 
 export const LEARNING_MATERIALIZATION_SCHEMA = "plimsoll.learning-materialization.v1" as const;
@@ -238,7 +239,7 @@ export type LearningMaterializationReceipt = {
   localOnly: true;
   status: "computed" | "unchanged" | "blocked_dependencies";
   sources: LearningMaterializationSources;
-  window: { startInclusive: string; endExclusive: string; days: number };
+  window: LearningFactWindow;
   until: string;
   scanned: {
     newUsageRows: number;
@@ -312,7 +313,12 @@ export function runLearningMaterialization(
     throw new Error("maxNewUsageEvents expects a non-negative integer");
   }
   const windowStartMs = untilMs - input.windowDays * 24 * 60 * 60 * 1000;
-  const windowStart = new Date(windowStartMs).toISOString();
+  let windowStart = new Date(windowStartMs).toISOString();
+  let window: LearningFactWindow = {
+    requestedStartInclusive: windowStart, effectiveStartInclusive: null,
+    startInclusive: until, endExclusive: until, days: input.windowDays,
+    effectiveDays: null, shortenedByRetention: null, reason: "coverage_unknown",
+  };
 
   const stateStore = new LearningMaterializationStateStore(input.statePath);
   let ledger: Database.Database | null = null;
@@ -332,7 +338,7 @@ export function runLearningMaterialization(
           outcomeStorePresent: false,
           ledgerAbsentReason: `no local ledger at ${input.ledgerPath}`,
         },
-        window: { startInclusive: windowStart, endExclusive: until, days: input.windowDays },
+        window,
         until,
         scanned: {
           newUsageRows: 0,
@@ -359,6 +365,36 @@ export function runLearningMaterialization(
     }
     ledger = openReadonlyDatabase(input.ledgerPath)!;
     outcomeDb = input.outcomeStorePath ? openReadonlyDatabase(input.outcomeStorePath) : null;
+    // The boundary and every ledger fact must come from one WAL read snapshot.
+    // An eviction committed between separate autocommit reads could otherwise
+    // make a shortened fact set appear to cover the original full window.
+    ledger.exec("begin");
+    window = readLearningFactWindow(ledger, until, input.windowDays);
+    if (window.effectiveStartInclusive === null || window.effectiveStartInclusive >= until) {
+      ledger.exec("commit");
+      return {
+        schema: LEARNING_MATERIALIZATION_SCHEMA,
+        scheduled: false, continuousLoop: false, modelCalls: 0, localOnly: true,
+        status: "blocked_dependencies",
+        sources: { ledgerPresent: true, outcomeStorePresent: Boolean(outcomeDb) },
+        window, until,
+        scanned: { newUsageRows: 0, usageBacklogRemaining: 0, episodes: 0,
+          attempts: 0, unresolvedAttemptOperations: 0, exposures: 0,
+          outcomePerformanceRecords: 0 },
+        usageHighWater: { before: stateBefore.usageHighWaterRowId,
+          after: stateBefore.usageHighWaterRowId },
+        conservation: stateBefore.conservation,
+        unvalidatedLineageEvents: stateBefore.unvalidatedLineageEvents,
+        shortfalls: emptyShortfalls(),
+        pairing: { candidateAssignments: 0, formedPairs: 0, techniqueContracts: 0 },
+        dependencyReasons: [window.effectiveStartInclusive === null
+          ? "learning_fact_coverage_unknown" : "learning_window_empty_after_retention"],
+        sourceFingerprint: null, generation: stateBefore.generation,
+        packetClaimClass: null, notEstimableReasons: [],
+        outputWritten: false, outputPath: null,
+      };
+    }
+    windowStart = window.effectiveStartInclusive;
     const shortfalls = emptyShortfalls();
 
     // 1. Bounded incremental usage scan behind the durable high-water mark.
@@ -412,6 +448,15 @@ export function runLearningMaterialization(
          where episode_id is not null and result_status = 'unknown'`,
       ).all() as Array<{ episodeId: string }>).map((row) => row.episodeId),
     );
+    const labelRows = ledger.prepare(
+      `select repo_hash as repoHash, label from repo_labels order by repo_hash, label`,
+    ).all() as Array<{ repoHash: string; label: string }>;
+    const sessionRows = ledger.prepare(
+      `select session_id as sessionId, model, machine, repo_hash as repoHash, head_sha as headSha
+       from buffered_events where model is not null and session_id is not null`,
+    ).all() as Array<{ sessionId: string; model: string; machine: string | null;
+      repoHash: string | null; headSha: string | null }>;
+    ledger.exec("commit");
 
     // 3. Materialized immutable-outcome surfaces only. Raw provider history is
     //    never fetched; the deterministic session→pull binding comes from the
@@ -458,9 +503,6 @@ export function runLearningMaterialization(
 
     // 4. Truthful project allocation from stored repo labels only.
     const repoHashToExternalId = new Map<string, string>();
-    const labelRows = ledger.prepare(
-      `select repo_hash as repoHash, label from repo_labels order by repo_hash, label`,
-    ).all() as Array<{ repoHash: string; label: string }>;
     for (const row of labelRows) {
       if (repoHashToExternalId.has(row.repoHash)) continue;
       const externalId = repoLabelToExternalId(row.label);
@@ -475,10 +517,7 @@ export function runLearningMaterialization(
       repoHashes: Set<string>;
       headShas: Set<string>;
     }>();
-    for (const row of ledger.prepare(
-      `select session_id as sessionId, model, machine, repo_hash as repoHash, head_sha as headSha
-       from buffered_events where model is not null and session_id is not null`,
-    ).all() as Array<{ sessionId: string; model: string; machine: string | null; repoHash: string | null; headSha: string | null }>) {
+    for (const row of sessionRows) {
       let entry = sessionIndex.get(row.sessionId);
       if (!entry) {
         entry = { models: new Map(), machines: new Set(), repoHashes: new Set(), headShas: new Set() };
@@ -659,7 +698,7 @@ export function runLearningMaterialization(
         localOnly: true,
         status: "blocked_dependencies",
         sources,
-        window: { startInclusive: windowStart, endExclusive: until, days: input.windowDays },
+        window,
         until,
         scanned,
         usageHighWater: { before: stateBefore.usageHighWaterRowId, after: usageHighWaterAfter },
@@ -771,7 +810,7 @@ export function runLearningMaterialization(
       localOnly: true,
       status: run.status,
       sources,
-      window: { startInclusive: windowStart, endExclusive: until, days: input.windowDays },
+      window,
       until,
       scanned,
       usageHighWater: { before: stateBefore.usageHighWaterRowId, after: usageHighWaterAfter },

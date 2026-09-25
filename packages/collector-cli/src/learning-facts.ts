@@ -68,6 +68,17 @@ export type LearningFactStatus = {
   maintenanceNeeded: boolean;
 };
 
+export type LearningFactWindow = {
+  requestedStartInclusive: string;
+  effectiveStartInclusive: string | null;
+  startInclusive: string;
+  endExclusive: string;
+  days: number;
+  effectiveDays: number | null;
+  shortenedByRetention: boolean | null;
+  reason: "retention" | "coverage_unknown" | null;
+};
+
 export type LearningFactMaintenanceResult = {
   /** Maximum oldest roots selected per table; dependent rows are additional. */
   requested: number;
@@ -152,6 +163,64 @@ function retentionInstant(timestamp: string): number | null {
   if (!value || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
   const milliseconds = Date.parse(value);
   return Number.isFinite(milliseconds) ? milliseconds : null;
+}
+
+function capacityDropCount(db: Database.Database): number {
+  if (!db.prepare(`select 1 from sqlite_master where type='table'
+    and name='runtime_fact_drops'`).get()) return 0;
+  return (db.prepare(`select coalesce(sum(dropped_count), 0) as n from runtime_fact_drops
+    where reason in ('outside_retention_window', 'protected_reference_at_capacity')`
+  ).get() as { n: number }).n;
+}
+
+/** Read-only coverage boundary for status and the materializer. */
+export function readLearningFactWindow(db: Database.Database, until: string, days: number): LearningFactWindow {
+  const untilMs = Date.parse(until);
+  const requestedMs = untilMs - days * 86_400_000;
+  const requestedStartInclusive = new Date(requestedMs).toISOString();
+  const unknown = (): LearningFactWindow => ({ requestedStartInclusive,
+    effectiveStartInclusive: null, startInclusive: until,
+    endExclusive: until, days, effectiveDays: null,
+    shortenedByRetention: null, reason: "coverage_unknown" });
+  const stateTable = db.prepare(`select 1 from sqlite_master where type='table'
+    and name='learning_fact_table_state'`).get();
+  if (!stateTable) return unknown();
+  const columns = new Set((db.pragma("table_info(learning_fact_table_state)") as
+    Array<{ name: string }>).map((column) => column.name));
+  if (!columns.has("loss_through_ms") || !columns.has("loss_evicted_count") ||
+      !columns.has("loss_drop_count")) return unknown();
+  const states = db.prepare(`select table_name as tableName, evicted_count as evictedCount,
+    loss_through_ms as lossThroughMs, loss_evicted_count as lossEvictedCount,
+    loss_drop_count as lossDropCount
+    from learning_fact_table_state`).all() as Array<{
+      tableName: LearningFactTableName; evictedCount: number;
+      lossThroughMs: number | null; lossEvictedCount: number; lossDropCount: number;
+  }>;
+  if (states.length !== LEARNING_FACT_TABLES.length ||
+      states.some((state) => state.evictedCount !== state.lossEvictedCount) ||
+      states.find((state) => state.tableName === "tool_attempt_facts")?.lossDropCount !==
+        capacityDropCount(db)) return unknown();
+  let effectiveMs = requestedMs;
+  for (const state of states) {
+    if (state.tableName === "technique_identity_registry") continue;
+    if (state.lossThroughMs !== null) effectiveMs = Math.max(effectiveMs, state.lossThroughMs);
+  }
+  if (db.prepare(`select 1 from sqlite_master where type='table'
+    and name='runtime_fact_drops'`).get()) {
+    // 0.7.39 refused all new attempts on Studio0 at its hard cap. Its last
+    // refusal is a conservative boundary for continuous coverage.
+    const drop = db.prepare(`select last_dropped_at as at from runtime_fact_drops
+      where reason = 'capacity_exceeded'`).get() as { at: string } | undefined;
+    const droppedMs = drop ? Date.parse(drop.at) : NaN;
+    if (Number.isFinite(droppedMs)) effectiveMs = Math.max(effectiveMs, droppedMs + 1);
+  }
+  effectiveMs = Math.min(effectiveMs, untilMs);
+  const effectiveStartInclusive = new Date(effectiveMs).toISOString();
+  const shortenedByRetention = effectiveMs > requestedMs;
+  return { requestedStartInclusive, effectiveStartInclusive,
+    startInclusive: effectiveStartInclusive, endExclusive: until, days,
+    effectiveDays: Number(((untilMs - effectiveMs) / 86_400_000).toFixed(3)),
+    shortenedByRetention, reason: shortenedByRetention ? "retention" : null };
 }
 
 function boundedDimensionId(value: string, name: string) {
@@ -575,6 +644,18 @@ export class LearningFactStore {
         );
         requiresRecount = true;
       }
+      const firstCoverageOpen = !stateColumns.has("loss_through_ms");
+      if (firstCoverageOpen) {
+        this.db.exec(`alter table learning_fact_table_state add column loss_through_ms integer`);
+      }
+      if (!stateColumns.has("loss_evicted_count")) {
+        this.db.exec(`alter table learning_fact_table_state
+          add column loss_evicted_count integer not null default 0`);
+      }
+      if (!stateColumns.has("loss_drop_count")) {
+        this.db.exec(`alter table learning_fact_table_state
+          add column loss_drop_count integer not null default 0`);
+      }
 
       const triggerNames = new Set(
         (this.db.prepare(
@@ -629,6 +710,29 @@ export class LearningFactStore {
              where table_name = '${definition.name}';
           end;
         `);
+      }
+
+      // 0.7.40 counted evictions but did not record the deleted timestamps.
+      // On the first 0.7.41 open (or after an older binary evicts again),
+      // discard claims about history before this open. The marker is durable;
+      // later 0.7.41 deletions advance it by their actual fact timestamps.
+      const openedAt = Date.now() + 1;
+      this.db.prepare(`update learning_fact_table_state
+        set loss_through_ms = max(coalesce(loss_through_ms, ?), ?),
+            loss_evicted_count = evicted_count
+        where evicted_count > loss_evicted_count`).run(openedAt, openedAt);
+      const dropCount = capacityDropCount(this.db);
+      const trackedDrops = (this.db.prepare(`select loss_drop_count as n
+        from learning_fact_table_state where table_name = 'tool_attempt_facts'`
+      ).get() as { n: number }).n;
+      if (dropCount !== trackedDrops) {
+        // An older binary can refuse a fact without changing evicted_count.
+        // Its counter changed without this marker, so use this open as the bound.
+        this.db.prepare(`update learning_fact_table_state
+          set loss_through_ms = max(coalesce(loss_through_ms, ?), ?)
+          where table_name != 'technique_identity_registry'`).run(openedAt, openedAt);
+        this.db.prepare(`update learning_fact_table_state set loss_drop_count = ?
+          where table_name = 'tool_attempt_facts'`).run(dropCount);
       }
 
       if (requiresRecount) {
@@ -766,12 +870,25 @@ export class LearningFactStore {
         this.db.prepare(
           `update learning_fact_table_state
               set evicted_count = evicted_count + ?,
+                  loss_evicted_count = evicted_count + ?,
                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             where table_name = ?`,
-        ).run(evicted, definition.name);
+        ).run(evicted, evicted, definition.name);
       }
       if (evicted > 0) this.markMaintenance(definition);
     }
+  }
+
+  private advanceLossCutoff(definition: LearningFactTableDefinition, throughMs: number | null) {
+    if (throughMs === null) return;
+    this.db.prepare(`update learning_fact_table_state
+      set loss_through_ms = max(coalesce(loss_through_ms, ?), ?)
+      where table_name = ?`).run(throughMs, throughMs, definition.name);
+  }
+
+  private syncCapacityDropCount() {
+    this.db.prepare(`update learning_fact_table_state set loss_drop_count = ?
+      where table_name = 'tool_attempt_facts'`).run(capacityDropCount(this.db));
   }
 
   private deleteEpisodeGraph(rootIds: string[], countEviction = true): LearningFactEvictionCounts {
@@ -796,6 +913,13 @@ export class LearningFactStore {
     const removeEpisodes = this.db.prepare(`delete from work_episode_facts where episode_id = ?`);
     // Remove dependent facts and child episodes in the same transaction.
     for (const episodeId of [...episodeIds].reverse()) {
+      if (countEviction) {
+        for (const definition of LEARNING_FACT_TABLES.slice(0, 3)) {
+          const last = this.db.prepare(`select max(retention_ms) as ms from ${definition.name}
+            where episode_id = ?`).get(episodeId) as { ms: number | null };
+          this.advanceLossCutoff(definition, last.ms === null ? null : last.ms + 1);
+        }
+      }
       counts.tool_attempt_facts += removeAttempts.run(episodeId).changes;
       counts.technique_exposure_facts += removeExposures.run(episodeId).changes;
       counts.work_episode_facts += removeEpisodes.run(episodeId).changes;
@@ -844,7 +968,19 @@ export class LearningFactStore {
     const remove = this.db.prepare(
       `delete from ${definition.name} where ${definition.idColumn} = ?`,
     );
-    for (const row of ids) counts[definition.name] += remove.run(row.id).changes;
+    const readRetention = countEviction ? this.db.prepare(
+      `select retention_ms as ms from ${definition.name} where ${definition.idColumn} = ?`,
+    ) : null;
+    let lastDeletedMs: number | null = null;
+    for (const row of ids) {
+      const victim = readRetention?.get(row.id) as { ms: number | null } | undefined;
+      if (typeof victim?.ms === "number") {
+        lastDeletedMs = Math.max(lastDeletedMs ?? victim.ms, victim.ms);
+      }
+      counts[definition.name] += remove.run(row.id).changes;
+    }
+    if (countEviction) this.advanceLossCutoff(definition,
+      lastDeletedMs === null ? null : lastDeletedMs + 1);
     if (countEviction) this.addEvictionCounts(counts);
     else for (const table of LEARNING_FACT_TABLES) this.markMaintenance(table);
     return counts;
@@ -919,20 +1055,32 @@ export class LearningFactStore {
                join victims on child.${parentColumn} = victims.id
            ) select id from victims`
         : roots).all(state.rowCount - limit) as Array<{ id: string }>).map((row) => row.id));
-      if (requiredId && victims.has(requiredId)) return "required_reference";
+      if (requiredId && victims.has(requiredId)) {
+        this.advanceLossCutoff(definition, retentionMs + 1);
+        return "required_reference";
+      }
       if (state.rowCount - victims.size === limit) {
         const retained = this.db.prepare(
           `select ${definition.idColumn} as id, retention_ms as retentionMs
              from ${definition.name} order by retention_ms, ${definition.idColumn}`,
         );
+        let rejected: CapacityDecision | null = null;
         for (const row of retained.iterate() as Iterable<{ id: string; retentionMs: number }>) {
           if (victims.has(row.id)) continue;
           if (retentionMs < row.retentionMs || (retentionMs === row.retentionMs && id < row.id)) {
-            return "outside_retention_window";
+            rejected = "outside_retention_window";
+            break;
           }
           if (requiredId && (table === "tool_attempt_facts" || table === "work_episode_facts") &&
-              this.evictionWouldRemoveRequired(table, row.id, requiredId)) return "required_reference";
+              this.evictionWouldRemoveRequired(table, row.id, requiredId)) {
+            rejected = "required_reference";
+            break;
+          }
           break;
+        }
+        if (rejected) {
+          this.advanceLossCutoff(definition, retentionMs + 1);
+          return rejected;
         }
       }
       // Only an admissible candidate pays for overflow repair. Reuse the same
@@ -954,11 +1102,13 @@ export class LearningFactStore {
     // strings would misorder offset-bearing timestamps at day boundaries.
     if (retentionMs < oldest.retentionMs ||
         (retentionMs === oldest.retentionMs && id < oldest.id)) {
+      this.advanceLossCutoff(definition, retentionMs + 1);
       return "outside_retention_window";
     }
     if (requiredId &&
         (table === "tool_attempt_facts" || table === "work_episode_facts") &&
         this.evictionWouldRemoveRequired(table, oldest.id, requiredId)) {
+      this.advanceLossCutoff(definition, retentionMs + 1);
       return "required_reference";
     }
     this.evictOldest(definition, 1);
@@ -967,6 +1117,9 @@ export class LearningFactStore {
 
   private dropFact<T>(reason: RuntimeFactDropReason = "stale_reference"): LearningFactWriteResult<T> {
     recordRuntimeFactDrop(this.db, reason);
+    if (reason === "outside_retention_window" || reason === "protected_reference_at_capacity") {
+      this.syncCapacityDropCount();
+    }
     return { inserted: false, fact: null, dropped: true, dropReason: reason };
   }
 
@@ -1311,6 +1464,7 @@ export class LearningFactStore {
         });
       } else {
         recordRuntimeFactDrop(this.db, "outside_retention_window");
+        this.syncCapacityDropCount();
       }
       this.db.prepare(
         `insert into technique_exposure_facts
@@ -1367,6 +1521,13 @@ export class LearningFactStore {
       maintenanceNeeded ||= needsMaintenance;
     }
     return { tables, totalRows, totalLimit, totalEvicted, maintenanceNeeded };
+  }
+
+  statusWithWindow(until = new Date().toISOString(), days = 7): LearningFactStatus & {
+    analysisWindow: LearningFactWindow;
+  } {
+    return this.db.transaction(() => ({ ...this.status(),
+      analysisWindow: readLearningFactWindow(this.db, until, days) }))();
   }
 
   /**

@@ -66,6 +66,8 @@ does not transfer its sessions to a tailer.
 
 ## Unreleased
 
+Learning results and status now show the effective start when local retention shortens the requested window.
+
 ### Added
 
 - `doctor --read-only --json` reports `producerProcesses`: the local Codex,

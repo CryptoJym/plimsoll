@@ -399,6 +399,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:learning-facts-capacity
 
+      - name: Prove honest learning windows after retention and cap refusals
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:learning-facts-window
+
       - name: Prove runtime capture promotes bounded learning facts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:runtime-facts
