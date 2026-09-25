@@ -28,10 +28,11 @@ function buffer(file: string, limits: { attempts?: number; episodes?: number }) 
   return new LocalEventBuffer(file, { delivery: { enabled: false }, learningFacts: { limits } });
 }
 
-function attempt(store: LocalEventBuffer["learningFacts"], key: string, at: number, retryOf?: string) {
+function attempt(store: LocalEventBuffer["learningFacts"], key: string, at: number,
+  retryOf?: string, episodeId?: string) {
   return store.recordToolSignal({ kind: "attempt", operationId: deterministicLearningFactId(["r2", key]),
     source: "codex", sessionId: "r2-session", toolClass: "compute", toolName: "shell",
-    startedAt: iso(at), ...(retryOf ? { retryOf } : {}) });
+    startedAt: iso(at), ...(retryOf ? { retryOf } : {}), ...(episodeId ? { episodeId } : {}) });
 }
 
 function materialize(file: string, name: string, until = UNTIL) {
@@ -242,6 +243,45 @@ function w8() {
   } finally { reopened.close(); }
 }
 
+function x6a() {
+  const file = path.join(root, "x6a.sqlite");
+  const now = Date.now();
+  const store = buffer(file, { attempts: 5 });
+  try {
+    for (let index = 0; index < 5; index += 1) {
+      attempt(store.learningFacts, `x6a-${index}`, now - (6 - index) * DAY);
+    }
+    attempt(store.learningFacts, "x6a-new", now - 12 * HOUR);
+    const lostAt = now - HOUR;
+    const lost = attempt(store.learningFacts, "x6a-retry", lostAt,
+      deterministicLearningFactId(["r2", "x6a-0"]));
+    assert.equal(lost.dropReason, "retry_target_missing");
+    const window = store.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(lostAt));
+    return { case: "X6a", lostAt: iso(lostAt), effectiveStart: window.effectiveStartInclusive };
+  } finally { store.close(); }
+}
+
+function x6b() {
+  const file = path.join(root, "x6b.sqlite");
+  const now = Date.now();
+  const store = buffer(file, { episodes: 2 });
+  try {
+    const episodes = [0, 1, 2].map((index) => buildWorkEpisodeFact({ source: "codex",
+      sessionId: "r2-session", sourceEpisodeKey: `x6b-${index}`, workClass: "other",
+      complexityBand: "unknown", startedAt: iso(now - (6 - index) * DAY) }));
+    for (const episode of episodes) store.learningFacts.recordWorkEpisode(episode);
+    const lostAt = now - HOUR;
+    const lost = attempt(store.learningFacts, "x6b-lost", lostAt, undefined, episodes[0].episodeId);
+    assert.equal(lost.dropReason, "stale_reference");
+    const window = store.learningFacts.statusWithWindow(iso(now + HOUR), 7).analysisWindow;
+    assert.ok(window.effectiveStartInclusive !== null &&
+      window.effectiveStartInclusive > iso(lostAt));
+    return { case: "X6b", lostAt: iso(lostAt), effectiveStart: window.effectiveStartInclusive };
+  } finally { store.close(); }
+}
+
 async function main() {
   try {
     const results: unknown[] = [];
@@ -251,6 +291,8 @@ async function main() {
     if (selected === "all" || selected === "w6") results.push(w6());
     if (selected === "all" || selected === "w7") results.push(w7());
     if (selected === "all" || selected === "w8") results.push(w8());
+    if (selected === "all" || selected === "x6a") results.push(x6a());
+    if (selected === "all" || selected === "x6b") results.push(x6b());
     if (results.length === 0) throw new Error(`unknown case: ${selected}`);
     console.log(JSON.stringify({ proof: "learning-facts-window", passed: true, cases: results }));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

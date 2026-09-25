@@ -891,6 +891,18 @@ export class LearningFactStore {
       where table_name = 'tool_attempt_facts'`).run(capacityDropCount(this.db));
   }
 
+  private noteAttemptLostToEvictedReference(
+    referenceTable: "tool_attempt_facts" | "work_episode_facts", startedAt: string,
+  ): boolean {
+    const state = this.db.prepare(`select evicted_count as n from learning_fact_table_state
+      where table_name = ?`).get(referenceTable) as { n: number } | undefined;
+    if (!state?.n) return false;
+    const at = retentionInstant(startedAt);
+    if (at === null) return false;
+    this.advanceLossCutoff(LEARNING_FACT_TABLES[0]!, at + 1);
+    return true;
+  }
+
   private deleteEpisodeGraph(rootIds: string[], countEviction = true): LearningFactEvictionCounts {
     const counts = this.emptyEvictionCounts();
     const episodeIds = new Set(rootIds);
@@ -1158,7 +1170,10 @@ export class LearningFactStore {
               startedAt: string;
               endedAt: string | null;
             } | undefined;
-          if (!episode) return this.dropFact<ToolAttemptFact>();
+          if (!episode) {
+            this.noteAttemptLostToEvictedReference("work_episode_facts", start.startedAt);
+            return this.dropFact<ToolAttemptFact>();
+          }
           if (episode.source !== start.source || episode.sessionId !== start.sessionId) {
             throw new Error("ToolAttemptEpisodeIdentityConflict");
           }
@@ -1176,7 +1191,12 @@ export class LearningFactStore {
           const retryTarget = this.db
             .prepare(`${ATTEMPT_SELECT} where operation_id = ?`)
             .get(start.retryOf) as AttemptRow | undefined;
-          if (!retryTarget) throw new Error("ToolAttemptRetryTargetMissing");
+          if (!retryTarget) {
+            if (this.noteAttemptLostToEvictedReference("tool_attempt_facts", start.startedAt)) {
+              return this.dropFact<ToolAttemptFact>("retry_target_missing");
+            }
+            throw new Error("ToolAttemptRetryTargetMissing");
+          }
           const target = attemptFromRow(retryTarget);
           if (
             target.source !== start.source ||
