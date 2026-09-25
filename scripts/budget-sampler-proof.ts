@@ -13,6 +13,7 @@ import {
   budgetCsv,
   recordBudgetSample,
   recordDailyTableSizes,
+  BudgetSampler,
 } from "../packages/collector-cli/src/budget-sampler";
 
 const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "plimsoll-budget-"));
@@ -66,6 +67,14 @@ async function main() {
     });
     assert.ok(second.processes.find((entry) => entry.pid === process.pid)?.cpuDeltaMs !== null);
     child.kill();
+
+    const sampler = new BudgetSampler(db, file, 60_000);
+    sampler.start();
+    for (let i = 0; i < 40 && sampler.status().latest === null; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(sampler.status().latest, "timer writes an initial sample without a request");
+    sampler.stop();
 
     for (let i = 0; i < 10_000; i++) {
       recordBudgetSample(db, { ...first, atMs: first.atMs + i * 60_000, dbBytes: i });

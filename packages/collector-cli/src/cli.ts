@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { AutomaticRetentionCadence } from "./retention-cadence";
+import { BudgetSampler } from "./budget-sampler";
 import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -2576,6 +2577,8 @@ async function main() {
     // connection's own automatic checkpoint stays only as a backstop
     // (wal-checkpoint-worker.ts).
     const walCheckpoint = new WalCheckpointWorker(buffer.database);
+    const budgetSampler = process.env.PLIMSOLL_BUDGET_SAMPLER === "off"
+      ? null : new BudgetSampler(buffer.database, collectorBufferPath());
     // Outcome facts intentionally live outside the capture ledger. Opening the
     // local read model here does not schedule collection; the only writer is
     // an explicit backfill command.
@@ -3157,6 +3160,7 @@ async function main() {
 
     retentionCadence.start();
     walCheckpoint.start();
+    budgetSampler?.start();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
@@ -3239,6 +3243,7 @@ async function main() {
 
     const stopMaintenanceBeforeFatalExit = async () => {
       void walCheckpoint.stop();
+      budgetSampler?.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
@@ -3290,6 +3295,7 @@ async function main() {
       shuttingDown = true;
       flushRejectionSummaries();
       void walCheckpoint.stop();
+      budgetSampler?.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
