@@ -24,6 +24,23 @@ entire downgrade: older binaries ignore continuation and retirement state. Keep
 the ledger, source files and session authority intact. Disabling the live observer
 does not transfer its sessions to a tailer.
 
+## 0.7.40 — 2026-09-24
+
+- Busy-session indexing validates reusable session context once per reopen and
+  keeps Studio0 uploads and WAL checkpoints off the event loop (`.163.21`,
+  `.163.24`).
+- Resource observation now covers the supported directory APIs and proves the
+  stable fixture sweep and ownership isolation (`.163.31`).
+- Learning-facts maintenance is bounded and capacity-tested, and busy-host Grok
+  capture keeps progress durable through worker replacement (`.163.38`,
+  `.163.42`).
+- Loopback transport is direct and bounded, while lifecycle updates stage runtime
+  files transactionally and preserve recovery evidence (`.163.48`, `.163.49`,
+  `.163.50`).
+- System-e2e path fields are normalized for the CI layout, and the coverage gate
+  runs the newly covered proofs with host-only scopes recorded (`.163.59`,
+  `.163.45`).
+
 ## Unreleased
 
 ### Added
