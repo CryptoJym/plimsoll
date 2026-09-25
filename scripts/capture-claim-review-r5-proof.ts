@@ -278,11 +278,12 @@ function coverageTurnBudget() {
   check("R4_S1_coverage_walk_enforces_the_deterministic_turn_work_budget_and_deadline",
     CAPTURE_COVERAGE_MAX_WORK_PER_TURN === RELEASE_MAX_WORK_PER_TURN &&
       firstWork === RELEASE_MAX_WORK_PER_TURN && secondWork === RELEASE_MAX_WORK_PER_TURN &&
-      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN - 1 &&
+      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN / 2 &&
+      next === RELEASE_MAX_WORK_PER_TURN + RELEASE_MAX_WORK_PER_TURN / 2 + 3 &&
       deadlineWork === 8 && afterDeadlineTurn === 4 &&
       !walk.done,
     { maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, releaseMaxWorkPerTurn: RELEASE_MAX_WORK_PER_TURN,
-      firstWork, secondWork, deadlineWork, afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+      firstWork, secondWork, deadlineWork, afterBudgetTurn, afterDeadlineTurn, listed: next, done: walk.done });
   walk.close();
 }
 
