@@ -25,7 +25,7 @@ test("B2a: summary_members carries one identity row per raw row with its row_cla
   assert.ok(members, "summary_members exists");
   for (const cls of ["usage_session", "usage_sessionless", "activity_session", "activity_sessionless"]) assert.ok(members.includes(cls), cls);
   const names = columns(db, "summary_members").map((c) => c.name);
-  for (const col of ["event_id", "raw_generation", "raw_rowid", "row_class", "state", "payload_digest16", "actor_binding_version", "deleted_at_ms", "readmissions"]) assert.ok(names.includes(col), col);
+  for (const col of ["event_id", "raw_generation", "raw_rowid", "row_class", "state", "payload_digest16", "actor_binding_version", "actor_binding_install", "deleted_at_ms", "readmissions"]) assert.ok(names.includes(col), col);
   assert.ok(tableSql(db, "summary_member_edges"), "summary_member_edges exists");
   assert.ok(tableSql(db, "sealed_member_mutations"), "sealed_member_mutations exists");
 }));
@@ -59,9 +59,10 @@ test("B2a C3: conversion_rejects is durable, identity-keyed, reasoned and linked
   assert.match(sql, /gap_id\s+text\s+not\s+null\s+references\s+capture_gaps/i);
 }));
 
-test("B10a: raw_retention_control.hold_reason and collector_workspace_binding.actor_binding_version exist", pending("B10a", "hold column; B2a for the binding version"), () => withBuffer((db) => {
+test("B10a: raw_retention_control.hold_reason exists; B2a: collector_workspace_binding carries the pair (actor_binding_version, actor_binding_install) and the joined_install (round 3, C4)", pending("B10a", "hold column; B2a for the binding pair and the joined install"), () => withBuffer((db) => {
   assert.ok(columns(db, "raw_retention_control").some((c) => c.name === "hold_reason"), "raw_retention_control.hold_reason");
-  assert.ok(columns(db, "collector_workspace_binding").some((c) => c.name === "actor_binding_version"), "collector_workspace_binding.actor_binding_version");
+  const binding = columns(db, "collector_workspace_binding").map((c) => c.name);
+  for (const col of ["actor_binding_version", "actor_binding_install", "joined_install"]) assert.ok(binding.includes(col), `collector_workspace_binding.${col}`);
 }));
 
 test("B10b: raw_retention_receipts accepts the three lean reasons beside retention_window_elapsed", pending("B10b"), () => withBuffer((db) => {
