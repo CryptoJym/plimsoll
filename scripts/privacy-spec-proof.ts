@@ -8,8 +8,10 @@
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
+import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { appendToCiLines, disableScripts, disableSteps } from "./lib/ci-coverage-fixtures";
 import {
   WORKFLOW_DIRECTORY,
@@ -67,6 +69,41 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
 const docPath = path.join(repoRoot, "docs", "privacy-spec.md");
 assert.ok(fs.existsSync(docPath), `missing ${docPath}; run pnpm docs:privacy first`);
 const committedDoc = fs.readFileSync(docPath, "utf8");
+
+check(
+  "learning_fact_state_schema_and_status_drop_read_are_documented",
+  false,
+  () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-privacy-state-"));
+    fs.chmodSync(root, 0o700);
+    let buffer: LocalEventBuffer | null = null;
+    try {
+      buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"), { delivery: { enabled: false } });
+      const row = committedDoc.split("\n").find((line) =>
+        line.startsWith("| `learning_fact_table_state` |"));
+      assert.ok(row, "privacy spec has no learning_fact_table_state row");
+      const columns = (buffer.database.pragma("table_info(learning_fact_table_state)") as
+        Array<{ name: string }>).map((column) => column.name);
+      for (const column of columns) {
+        assert.ok(row.includes(`\`${column}\``), `privacy spec omits ${column}`);
+      }
+      assert.match(row, /status refresh[^|]*`runtime_fact_drops`/);
+      const now = Date.now();
+      buffer.database.exec(`create table if not exists runtime_fact_drops (
+        reason text primary key, dropped_count integer not null, last_dropped_at text not null)`);
+      buffer.database.prepare(`insert into runtime_fact_drops
+        (reason, dropped_count, last_dropped_at) values ('capacity_exceeded', 1, ?)`
+      ).run(new Date(now).toISOString());
+      const window = buffer.learningFacts.statusWithWindow(new Date(now + 86_400_000).toISOString(), 7)
+        .analysisWindow;
+      assert.equal(window.effectiveStartInclusive, new Date(now + 1).toISOString(),
+        "status refresh must read the local capacity-drop history");
+    } finally {
+      buffer?.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 check(
   "render_is_byte_deterministic_across_runs",
