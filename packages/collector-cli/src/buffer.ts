@@ -17,6 +17,11 @@ import {
 import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
+import {
+  CODEX_USAGE_DUPLICATE_REASON,
+  ensureCodexUsagePairingSchema,
+  pairCodexUsageEvent,
+} from "./codex-usage-pairing";
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
@@ -193,6 +198,8 @@ const EVENT_COLUMNS = [
   "privacy_generation text",
   "privacy_disposition text",
   "privacy_disposed_at text",
+  "usage_duplicate_reason text",
+  "usage_paired_event_id text",
 ] as const;
 
 const enrollmentTimestampSchema = z.string().datetime({ offset: true });
@@ -754,6 +761,7 @@ export class LocalEventBuffer {
     markOpenStep("ledger.session_context_index");
     ensureCodexReconciliationSchema(this.db);
     markOpenStep("ledger.codex_reconciliation_schema");
+    ensureCodexUsagePairingSchema(this.db);
     this.learningFacts = new LearningFactStore(
       this.db,
       options.learningFacts?.limits,
@@ -2393,6 +2401,11 @@ export class LocalEventBuffer {
         privacyGeneration,
       });
     if (result.changes > 0) {
+      const usagePair = pairCodexUsageEvent(this.db, event.id);
+      const pairedLogPayload = usagePair?.logId === event.id
+        ? (this.db.prepare(`select payload_json as payloadJson from buffered_events where id = ?`)
+            .get(event.id) as { payloadJson: string }).payloadJson
+        : payloadJson;
       if (repoContextId) {
         this.db.prepare(
           `insert into repo_context_event_links
@@ -2416,13 +2429,15 @@ export class LocalEventBuffer {
         dataMode: event.dataMode,
         createdAt,
         uploadedAt: null,
-        payloadJson,
+        payloadJson: pairedLogPayload,
         suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         repoHash,
         branchHash,
         workspaceId: this.workspaceId,
         privacyGeneration,
         privacyDisposition: null,
+        usageDuplicateReason: usagePair?.spanId === event.id
+          ? CODEX_USAGE_DUPLICATE_REASON : null,
         deviceId: this.deviceId,
       });
       if (repoContextConflict && repoContextId && existingRepoHash && resolvedRepoContext.repoHash) {

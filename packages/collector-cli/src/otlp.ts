@@ -329,6 +329,13 @@ function buildLogEvent(
 
   const observedAt = recordTimestamp(safeRecord, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
+  // OTLP log records can carry the trace context of the response span. Keep
+  // this bounded identifier so the two usage shapes can be paired without
+  // guessing from token counts across concurrent Codex sessions.
+  const validatedTraceId = validatedMetadataAttribute("traceId", safeRecord.traceId);
+  const traceId = validatedTraceId.accepted && typeof validatedTraceId.value === "string"
+    ? validatedTraceId.value
+    : undefined;
 
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
@@ -370,6 +377,7 @@ function buildLogEvent(
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
       ...(context.serviceVersion ? { serviceVersion: context.serviceVersion } : {}),
+      ...(traceId ? { traceId } : {}),
       ...(gitContext ? { git: gitContext } : {}),
       ...(costEstimated ? { costEstimated: true } : {}),
     },
@@ -385,6 +393,7 @@ function buildLogEvent(
       ...(context.containerSuppressedFields ?? []),
       ...metadataAttrs.suppressedFields,
       ...(context.policy.dataMode !== "evidence" && "body" in safeRecord ? ["body"] : []),
+      ...(safeRecord.traceId !== undefined && traceId === undefined ? ["traceId"] : []),
     ]),
   };
 }

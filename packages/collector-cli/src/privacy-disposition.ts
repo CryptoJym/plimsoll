@@ -48,6 +48,12 @@ export function terminalPrivacyEligibilitySql(
   if (rawColumns.has("privacy_disposition")) {
     terms.push(`${alias}.privacy_disposition is null`);
   }
+  // A Codex response span retained as evidence for an SSE usage event is not
+  // a second accounting event. This one predicate feeds projections, session
+  // summaries, local lists, and the legacy upload path.
+  if (rawColumns.has("usage_duplicate_reason")) {
+    terms.push(`${alias}.usage_duplicate_reason is null`);
+  }
   if (rawColumns.has("privacy_generation")) {
     // Rows created before the stable-lineage upgrade remain local until the
     // bounded raw migration assigns their one-time generation.

@@ -63,6 +63,7 @@ export type DeliveryReceiptReason =
   | "local_schema_invalid"
   | "local_privacy_violation"
   | "local_item_oversize"
+  | "local_usage_duplicate"
   | "remote_rejected_exhausted"
   | "remote_validation_rejected";
 
@@ -246,6 +247,7 @@ type RawDeliveryRow = {
   rawId: string;
   privacyGeneration: string | null;
   privacyDisposition: TerminalPrivacyReason | null;
+  usageDuplicateReason?: string | null;
   dataMode: string;
   createdAt: string;
   uploadedAt: string | null;
@@ -281,6 +283,7 @@ type RawPrivacyRow = {
   createdAt: string;
   privacyGeneration: string | null;
   privacyDisposition: TerminalPrivacyReason | null;
+  usageDuplicateReason: string | null;
   dataMode: string;
   uploadedAt: string | null;
 };
@@ -352,6 +355,42 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDel
     repoHash: canonicalLinkage(row.repoHash),
     branchHash: canonicalLinkage(row.branchHash),
   };
+}
+
+/** Refresh only a never-attempted envelope after pairing adds cached tokens. */
+export function refreshUnsentRawDelivery(
+  db: Database.Database,
+  rawId: string,
+  maxItemBytes = DEFAULT_DELIVERY_LIMITS.maxItemBytes,
+) {
+  const raw = db.prepare(
+    `select rowid as rawRowid, id as rawId, created_at as createdAt,
+       data_mode as dataMode, uploaded_at as uploadedAt,
+       payload_json as payloadJson, suppressed_fields_json as suppressedFieldsJson,
+       repo_hash as repoHash, branch_hash as branchHash,
+       workspace_id as workspaceId, device_id as deviceId,
+       privacy_generation as privacyGeneration,
+       privacy_disposition as privacyDisposition,
+       usage_duplicate_reason as usageDuplicateReason
+     from buffered_events where id = ?`,
+  ).get(rawId) as RawDeliveryRow | undefined;
+  if (!raw || raw.uploadedAt || raw.usageDuplicateReason) return false;
+  const prepared = prepareDelivery(raw, maxItemBytes);
+  if (!prepared.ok) return false;
+  return db.prepare(
+    `update upload_outbox set base_envelope_json = @baseEnvelopeJson,
+       base_bytes = @baseBytes, sealed_envelope_json = null, sealed_bytes = null,
+       updated_at = @now
+     where delivery_id = @deliveryId and state in ('pending','retry')
+       and attempt_count = 0`,
+  ).run({ ...prepared, now: new Date().toISOString() }).changes > 0;
+}
+
+/** A paired span stays in the raw ledger but must not enter a new upload. */
+export function retirePairedSpanDelivery(db: Database.Database, spanId: string) {
+  return db.prepare(
+    `delete from upload_outbox where delivery_id = ? and state in ('pending','retry')`,
+  ).run(ensureUuidEventId(spanId).id).changes;
 }
 
 function attachFillOnlyLinkage(
@@ -1008,6 +1047,7 @@ export class DeliveryOutbox {
   enqueueRaw(row: RawDeliveryRow) {
     if (!this.enabled || row.uploadedAt) return { enqueued: 0, dead: 0 };
     if (row.privacyDisposition) return { enqueued: 0, dead: 0 };
+    if (row.usageDuplicateReason) return { enqueued: 0, dead: 0 };
     const existingReceipt = this.db
       .prepare(`select reason from upload_receipts where delivery_id = ?`)
       .get(ensureUuidEventId(row.rawId).id) as { reason: string } | undefined;
@@ -1064,7 +1104,25 @@ export class DeliveryOutbox {
     // next_attempt_at is the lease-eligibility gate. It must come from the
     // injectable clock: a wall-clock stamp here can silently fall after a
     // caller's injected lease clock and empty every future claim (issue 0182).
-    const now = this.clock().toISOString();
+    const nowDate = this.clock();
+    const now = nowDate.toISOString();
+    // The app server emits the SSE event and response span in separate OTLP
+    // batches. Give their first upload one bounded pairing interval; a lone
+    // shape remains deliverable when the interval expires.
+    let nextAttemptAt = now;
+    try {
+      const event = (JSON.parse(row.payloadJson) as { source?: string; eventType?: string;
+        metadata?: { serviceName?: string; otelEventName?: string } });
+      if (event.source === "codex" && event.eventType === "assistant_response" &&
+          event.metadata?.serviceName === "codex-app-server" &&
+          (event.metadata.otelEventName === "codex.sse_event" ||
+           event.metadata.otelEventName === "handle_responses")) {
+        nextAttemptAt = new Date(nowDate.getTime() + 60_000).toISOString();
+      }
+    } catch {
+      // prepareDelivery already validates the payload; this is only a grace
+      // hint, so an older shape keeps the ordinary upload cadence.
+    }
     const inserted = this.db
       .prepare(
         `insert or ignore into upload_outbox
@@ -1073,7 +1131,7 @@ export class DeliveryOutbox {
            state, attempt_count, next_attempt_at, last_failure_class, created_at, updated_at)
          select @deliveryId, @rawRowid, @rawId, @createdAt, @privacyGeneration, @workspaceId, @deviceId,
            @baseEnvelopeJson, @baseBytes, @repoHash, @branchHash,
-           'pending', 0, @now, 'none', @createdAt, @now
+           'pending', 0, @nextAttemptAt, 'none', @createdAt, @now
          where not exists (
            select 1 from upload_receipts where delivery_id = @deliveryId
          )`,
@@ -1087,6 +1145,7 @@ export class DeliveryOutbox {
         deviceId: row.deviceId,
         createdAt: row.createdAt,
         now,
+        nextAttemptAt,
       }).changes;
     return { enqueued: inserted, dead: 0 };
   }
@@ -1103,7 +1162,8 @@ export class DeliveryOutbox {
            workspace_id as workspaceId,
            device_id as deviceId,
            privacy_generation as privacyGeneration,
-           privacy_disposition as privacyDisposition
+           privacy_disposition as privacyDisposition,
+           usage_duplicate_reason as usageDuplicateReason
          from buffered_events where id = ?`,
       )
       .get(rawId) as RawDeliveryRow | undefined;
@@ -1275,6 +1335,7 @@ export class DeliveryOutbox {
            repo_hash as repoHash, branch_hash as branchHash,
            workspace_id as workspaceId, device_id as deviceId,
            privacy_generation as privacyGeneration, privacy_disposition as privacyDisposition,
+           usage_duplicate_reason as usageDuplicateReason,
            length(cast(payload_json as blob)) +
              length(cast(suppressed_fields_json as blob)) as rowBytes
          from buffered_events where id = ?`,
@@ -1303,7 +1364,7 @@ export class DeliveryOutbox {
             summary.skipped.missingRaw += 1;
             continue;
           }
-          if (raw.privacyDisposition) {
+          if (raw.privacyDisposition || raw.usageDuplicateReason) {
             summary.skipped.privacyDisposed += 1;
             continue;
           }
@@ -1472,6 +1533,7 @@ export class DeliveryOutbox {
          workspace_id as workspaceId, device_id as deviceId,
          privacy_generation as privacyGeneration,
          privacy_disposition as privacyDisposition,
+         usage_duplicate_reason as usageDuplicateReason,
          length(cast(payload_json as blob)) +
            length(cast(suppressed_fields_json as blob)) as rowBytes
        from buffered_events where rowid = ?`,
@@ -1528,7 +1590,7 @@ export class DeliveryOutbox {
           });
           continue;
         }
-        if (row.privacyDisposition) continue;
+        if (row.privacyDisposition || row.usageDuplicateReason) continue;
         // A pre-outbox legacy row can be arbitrarily large. Classify a row
         // already above the item ceiling from its SQLite length metadata;
         // never materialize it into the migration process merely to reject it.
@@ -2382,6 +2444,8 @@ export class DeliveryOutbox {
     if (receipt) {
       return receipt.reason === "local_evidence_quarantined"
         ? "local_evidence_quarantined"
+        : receipt.reason === "local_usage_duplicate"
+          ? "local_usage_duplicate"
         : "local_privacy_violation";
     }
     if (lineage.rawRowid === null) return "local_privacy_violation";
@@ -2390,6 +2454,7 @@ export class DeliveryOutbox {
         `select id as rawId, created_at as createdAt,
            privacy_generation as privacyGeneration,
            privacy_disposition as privacyDisposition,
+           usage_duplicate_reason as usageDuplicateReason,
            data_mode as dataMode, uploaded_at as uploadedAt
          from buffered_events where rowid = ?`,
       )
@@ -2401,6 +2466,7 @@ export class DeliveryOutbox {
       return this.rawRetentionExpired(lineage) ? null : "local_privacy_violation";
     }
     if (raw.uploadedAt !== null) return "local_privacy_violation";
+    if (raw.usageDuplicateReason) return "local_usage_duplicate";
     if (raw.privacyDisposition) return raw.privacyDisposition;
     if (raw.dataMode === "evidence") return "local_evidence_quarantined";
     if (raw.dataMode !== "metadata") return "local_privacy_violation";
