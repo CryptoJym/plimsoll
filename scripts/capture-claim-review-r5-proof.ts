@@ -32,6 +32,7 @@ import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { grokUsageDocument } from "./lib/grok-usage-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
+import { fairnessCoverageChecks } from "./lib/capture-coverage-fairness";
 
 // maintenance.ts checkCaptureCoverage steps one coverage walk per source in a
 // turn: codex, claude_code and grok.
@@ -42,7 +43,7 @@ const COVERAGE_SOURCES = 3;
  * this proof until the new ceiling is reviewed and written here. */
 const RELEASE_MAX_WORK_PER_TURN = 4_096;
 
-const completion = createProofCompletion("capture-claim-review-r5", 7);
+const completion = createProofCompletion("capture-claim-review-r5", 9);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
 const check = (name: string, passed: boolean, detail: Record<string, unknown>) => {
   completion.check(name, passed);
@@ -365,7 +366,8 @@ async function claudeMemoryNotes() {
 }
 
 async function main() {
-  for (const step of [grokSessionsDirectory, claudeProjectDirectory, claudeTranscriptFile, codexDayFolder, coverageTurnBudget, manyLinks,
+  for (const step of [grokSessionsDirectory, claudeProjectDirectory, claudeTranscriptFile, codexDayFolder, coverageTurnBudget,
+    () => fairnessCoverageChecks(check), manyLinks,
     claudeMemoryNotes]) {
     try {
       await step();

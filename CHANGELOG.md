@@ -94,6 +94,11 @@ does not transfer its sessions to a tailer.
 
 ### Changed
 
+- Capture coverage reads large directories a few entries at a time and keeps
+  each source within 4,096 work units per turn. A directory that changes
+  during a walk stops that check without moving its coverage frontier. Codex,
+  Claude Code, and Grok each get a share of every turn, with the first source
+  rotating between turns.
 - When the OTLP intake spool cannot hold a refused request (full, or the disk
   refuses), a deadline refusal is answered `503` with `Retry-After: 1` instead
   of `408`, which OTLP exporters do not retry. A body that never finished

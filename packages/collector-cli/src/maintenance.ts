@@ -801,6 +801,7 @@ export class CollectorMaintenance {
 
   /** Coverage walks in progress, one per source; they resume on the next cadence. */
   private coverageWalks: Array<{ check: CaptureCoverageCheck; walk: CaptureCoverageWalk }> | null = null;
+  private coverageSourceTurn = 0;
 
   /**
    * eco-6hoxj.163.18 (review r2 B1, r3 N4): the capture frontier the upload
@@ -814,8 +815,6 @@ export class CollectorMaintenance {
    * so there is none to cover.
    */
   private checkCaptureCoverage() {
-    const deadline = performance.now() + (this.options.captureCoverageTurnMs ?? CAPTURE_COVERAGE_TURN_MS) -
-      CAPTURE_COVERAGE_TURN_MARGIN_MS;
     const database = this.buffer.database;
     try {
       if (!this.coverageWalks) {
@@ -835,15 +834,26 @@ export class CollectorMaintenance {
           if (check) this.coverageWalks.push({ check, walk: walk() });
         }
       }
-      for (const { check, walk } of this.coverageWalks) {
-        if (this.signal?.aborted || performance.now() >= deadline) break;
+      const walks = this.coverageWalks;
+      const shareMs = Math.max(1, (this.options.captureCoverageTurnMs ?? CAPTURE_COVERAGE_TURN_MS) -
+        CAPTURE_COVERAGE_TURN_MARGIN_MS) / Math.max(1, walks.length);
+      const first = this.coverageSourceTurn++ % Math.max(1, walks.length);
+      for (let offset = 0; offset < walks.length; offset += 1) {
+        if (this.signal?.aborted) break;
+        const { check, walk } = walks[(first + offset) % walks.length]!;
         if (walk.done) continue;
-        walk.step(deadline, (files) => applyCaptureCoverage(database, check, files));
+        walk.step(performance.now() + shareMs, (files) => applyCaptureCoverage(database, check, files));
         if (walk.done && walk.complete) finishCaptureCoverage(database, check);
+      }
+      if (this.signal?.aborted) {
+        walks.forEach(({ walk }) => walk.close());
+        this.coverageWalks = null;
+        return;
       }
       if (this.coverageWalks.every(({ walk }) => walk.done)) this.coverageWalks = null;
     } catch {
       // A failed check leaves the frontier where it was; capture goes on.
+      this.coverageWalks?.forEach(({ walk }) => walk.close());
       this.coverageWalks = null;
     }
   }
@@ -861,6 +871,8 @@ export class CollectorMaintenance {
   }
 
   close() {
+    this.coverageWalks?.forEach(({ walk }) => walk.close());
+    this.coverageWalks = null;
     this.rolloutTailer.close();
     this.transcriptTailer.close();
     this.grokTailer?.close();
