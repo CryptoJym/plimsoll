@@ -1,4 +1,4 @@
-# Lean Plimsoll contract register (round 12 = B0 round 6, eco-6hoxj.164.4)
+# Lean Plimsoll contract register (round 13 = B0 round 7, eco-6hoxj.164.4)
 
 **As of:** 2026-09-25 MDT · **Owner:** B0 (contract owner; documents and failing tests only). This file is normative for the
 items the round-6 review left to B0 (two blockers, four `b0Carries`; `input/review-r6/VERDICT.json`) and for the repairs the
@@ -10,15 +10,17 @@ reads the facts, and one ledger uploaded by two installs must read one fact; and
 after round 10 required (`input/read-c1-r10/VERDICT.json`: a pair naming an install of another ledger must never own the uploader's
 row, and a re-join that cannot prove the previous key must not split an old row; and its should-fixes) and the independent read of
 C1 after round 11 required (`input/read-c1-r11/VERDICT.json`: the admin link must move a whole ledger into a canonical destination,
-or refuse; and its should-fix). Where it and another document disagree, this file wins and the other carries a "round 7", "round
-8", "round 9", "round 10", "round 11" or "round 12" note pointing here. Every rule below has (a) a runnable fixture in `fixtures/`
-(the round-12 fixture `b4_offline_rebind.py` is red under `--rule r6`, `r7`, `r8`, `r9`, `r10` and `r11` and green under `--rule
-r12`; `s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green under `r9`;
+or refuse; and its should-fix) and the independent read of C1 after round 12 required (`input/read-c1-r12/VERDICT.json`: a C1
+transaction PostgreSQL aborts in a deadlock must be retried under a stated rule, and the 400 refusal must name the ledger it judged).
+Where it and another document disagree, this file wins and the other carries a "round 7", "round 8", "round 9", "round 10", "round
+11", "round 12" or "round 13" note pointing here. Every rule below has (a) a runnable fixture in `fixtures/` (the round-13 fixture
+`b4_offline_rebind.py` is red under `--rule r6`, `r7`, `r8`, `r9`, `r10`, `r11` and `r12` and green under `--rule r13`;
+`s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green under `r9`;
 `checks/fixtures-summary.json`) and (b) a **pending test** in the repository that owns the rule (§C6), which fails today and names
 the bead that turns it green. Nothing here is implemented;
 nothing here is frozen until the lead signs the freeze list (`FREEZE.md`).
 
-## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5, read-c1-r10 blockers 1-2 and should-fixes 1-4, read-c1-r11 blocking and should-fix; B6 cloud, B2a collector)
+## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5, read-c1-r10 blockers 1-2 and should-fixes 1-4, read-c1-r11 blocking and should-fix, read-c1-r12 blocking 1-2; B6 cloud, B2a collector)
 
 **The defect (review r6).** Round 6 wrote two validators. A delivered stamp had to satisfy `V exists, V ≤ actorBindingVersionHeard
 ≤ current`; an undelivered stamp only `V exists, V ≤ current`. For a version the cloud had issued but the collector had not yet
@@ -81,6 +83,21 @@ ledger, never an install** (every install of the source ledger, with the source 
 locks, with one audit row), into a destination that is **the root of its own ledger in the same tenant**, and the join's lineage
 step holds the previous install's row so a join and a merge of one chain serialize.
 
+**The defect (the read of C1 after round 12).** Round 12 left two gaps around the merge (`input/read-c1-r12/VERDICT.json`,
+`checks/pg-lock-order.log`, `checks/pg-probe-r12.log` `MERGE_THEN_SIGHTING`). (1) Two lock orders. A sighting that names several
+installs locks them `FOR SHARE` in ascending id order; the merge locks the two roots `FOR UPDATE` first and only then the source
+ledger's members. When a member V sorts before its root U, a legitimate batch naming V and U holds V and waits for U while a U→X
+merge holds U and waits for V; PostgreSQL aborted the merge (`deadlock detected`, SQLSTATE `40P01`), and the text said nothing about
+an aborted transaction, so the admin's link did not take effect and the rows it was to release stayed parked. (2) The 400
+`stamp_from_other_ledger` refusal carried `reason` and `pairs` but no ledger, while a parked row is released only when a later
+response names a ledger other than "the one the refusing response named"; no wire field carried that value, and the collector test
+supplied it by hand. The value matters under the merge: the uploader's ledger is read as U for the request's authorization, U→X
+can commit before the named install is locked, and the refusal is then judged against U; a collector that parked under X, the
+current ledger, would keep the row parked on every later response naming X, while one that parks under U releases it on the next.
+Round 13 closes both below: **a C1 transaction PostgreSQL aborts is retried from its start, at most three attempts, and nothing is
+acknowledged before its commit** ("Serialization"), and **the 400 names the ledger it judged**, `ledgerInstallId`, the value the
+collector parks under ("Outside the ledger", "The link is the release").
+
 **The rule.** A stamp is the **pair** `(install, V)`: the `DeviceInstall` id of the response that supplied `V` and the version. The
 collector persists the pair, stamps it on the identity row (`summary_members.actor_binding_version`, `.actor_binding_install`) and
 sends it on the wire (`metadata.actorBindingVersion`, `metadata.actorBindingInstall`); the summary item's per-segment parts are
@@ -91,7 +108,7 @@ install the pair names, never against the uploading install:
 |---|---|---|
 | `(install, V)` **issued at its first sighting**: `V = 0`, or the audit row for `V` existed when the cloud first saw `(install, V)` in any request echo, delivered row or summary member | `actor_id = actor_of(install, V)`; basis `raw_ingest` (identical to `binding_at_capture` by construction) | `actor_id = actor_of(install, V)`, basis `binding_at_capture` |
 | `(install, V)` **not issued at its first sighting** (`V > binding_version` then), recorded once as the durable fact `stamp_not_issued(ledger, install, V)` in the same transaction, keyed by the uploader's **ledger** (round 10: the first install of the uploader's chain of installs on one Mac, so the old install judging a summary member and the new install delivering the row after a re-join read one fact; round 9 keyed it by the uploader); or a pair naming an install the tenant does not have (judged closed, **nothing recorded**) | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify; **stays null after the cloud issues `V`**, at ingest, on replay and in every summary revision | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
-| `(install, V)` naming an install **outside the uploader's ledger** (round 11: another Mac of the tenant, or the previous chain of a re-join that could not prove the previous install's key) | **not judged**: the batch is refused (400 `stamp_from_other_ledger`, its body listing the refused pairs), **nothing recorded** in any ledger; the collector parks the rows (`outbox_row_parked`: undelivered, retained, never leased while parked) until the ledger is linked, or an admin releases them undelivered and never judged | **not judged**: the segment is parked (`summary_segment_parked`, exactly as for the flood refusal) and the rest of the batch is resubmitted |
+| `(install, V)` naming an install **outside the uploader's ledger** (round 11: another Mac of the tenant, or the previous chain of a re-join that could not prove the previous install's key) | **not judged**: the batch is refused (400 `stamp_from_other_ledger`, its body listing the refused pairs and, round 13, naming `ledgerInstallId`, the uploader's ledger the refusal was judged against), **nothing recorded** in any ledger; the collector parks the rows (`outbox_row_parked`: undelivered, retained, never leased while parked) until the ledger is linked, or an admin releases them undelivered and never judged | **not judged**: the segment is parked (`summary_segment_parked`, exactly as for the flood refusal) and the rest of the batch is resubmitted |
 | `null` (a collector older than B2a, or a B2a collector before the first versioned response of its **current** install, C4) | today's ingest binding (the uploading install's actor at ingest); basis `ingest_current` | `single_binding` (the install has no audit row and a non-null actor) else `unallocated_no_stamp` |
 
 **The guarantee (what `fixtures/b4_offline_rebind.py` and the tests prove).**
@@ -149,7 +166,37 @@ issued for ever) or the sighting waits for a rebind that holds the row and reads
 PostgreSQL grants a `FOR SHARE` at once while a `FOR UPDATE` is merely waiting (compatible row locks do not queue), so a sighting
 never waits for a waiting rebind, only for one that holds the row (`checks/round10-sql-orderings.log` S5c). A sighting or a view
 that names several installs locks them in **ascending id order**, and B6 gives `lockInstalls` the same `ORDER BY`, so two lockers of
-the same installs cannot deadlock (round 10, low). An implementation may instead run both at `SERIALIZABLE` with retry. The fact is
+the same installs cannot deadlock (round 10, low). An implementation may instead run both at `SERIALIZABLE` with retry. **The merge
+is the one C1 locker with another order, and a C1 transaction PostgreSQL aborts is retried from its start (round 13, read c1 r12
+blocking 1).** The merge must hold the two roots before it can know the source ledger's members, so it locks the roots first and the
+members in a later statement ("The link is the release"); a sighting or rebind that holds a member sorting before its root and then
+asks for the root can therefore deadlock with a merge that holds the root and asks for the member (a two-pair batch naming V and U,
+V < U, against U→X: the reader's `pg-lock-order.log`). PostgreSQL detects the cycle after `deadlock_timeout` and aborts exactly one
+transaction, the one whose timeout fires first, with SQLSTATE `40P01`; nothing of it is committed. **The rule:** every C1
+transaction (a sighting on either path, the rebind, the join's lineage step, the admin's merge) that PostgreSQL aborts with `40P01`
+(`deadlock_detected`) or `40001` (`serialization_failure`, which arises only for an implementation that runs at `SERIALIZABLE` or
+`REPEATABLE READ`) is rolled back and run again as a **fresh transaction from its first statement**, fresh locks and every judgment
+input re-read under them (the lock-then-read rule applies to the retry unchanged), **at most 3 attempts in all** (the first and two
+retries), with no wait of its own between attempts: the surviving transaction holds the contested rows, so the retry waits on those
+locks and proceeds when it commits. Two lockers cost one abort and one retry (PostgreSQL hands the released row to the transaction
+already waiting for it); a second abort needs a third concurrent locker, so three attempts bound the added latency to about two
+`deadlock_timeout`s, inside the ingest route's budget. **Nothing is acknowledged, recorded or receipted before the transaction that
+did the work commits**: an aborted attempt sends no response, leaves no fact (its insert is rolled back with it), moves no install and
+writes no audit row, so a retry never sees its own earlier attempt, and the answer the caller receives is one committed transaction's,
+which is why the first-sighting guarantee is untouched by the retry. When the last attempt is aborted too, the request fails **503
+`transaction_retry_exhausted`** with `Retry-After` and the body `{ error, operation, attempts, sqlstate }`: for a sighting that is the
+ingest or summary route's ordinary retryable answer (the collector's transient-failure path returns the batch's rows to the outbox
+for a later delivery; a 503 parks, acknowledges and judges nothing); for the admin's merge the same 503 is the receipt (nothing moved,
+no audit row, the rows it would have released still parked) and the admin re-issues the link. A merge that commits on its second or
+third attempt releases the parked rows exactly as a first-attempt merge does: the next authenticated response names the new ledger.
+A common global lock order was not chosen: the merge cannot know its member set before it holds the source root, and a join that
+commits while the merge waits can add a member whose id sorts below the ones already held, so "everything in ascending id order"
+would still need a restart when re-enumeration finds a lower id, a retry in disguise, and it would leave the rebind's and the view's
+ascending orders against the merge unaddressed; the retry covers every C1 locker uniformly. Red under round 12 and green under round
+13: `b4_offline_rebind.py` section 16 (every statement-level interleaving of a two-pair sighting with the merge, either transaction
+as PostgreSQL's victim, with the hand-off and without it for the cap); `checks/round13-sql-orderings.log` S15 (the reader's order
+and its mirror on PostgreSQL 17: the abort observed with its SQLSTATE and, as round 12 wrote it, the link not taking effect or the
+batch unanswered; under round 13 the aborted operation run again from its start and committed). The fact is
 inserted `ON CONFLICT (ledger_install_id, device_install_id, version) DO NOTHING` and re-read, so two first sightings of the same pair
 on two paths at once (R6) leave one fact and both judge null; neither batch is refused. Of the 12 interleavings of a faulty sighting
 with the rebind that issues its version, 0 flip under this rule and the rebind waits in 4 (`b4_offline_rebind.py` R5; round 8 flipped
@@ -176,11 +223,15 @@ version (round 9 keyed the fact by the uploader and gave that row to the person 
 under r9; `checks/round10-sql-orderings.log` S3, S3b). **Outside the ledger (round 11, read c1 r10 blockers 1-2).** A pair naming an
 install of the tenant that is **not in the uploader's ledger** is **refused before any judgment**: the sighting reads the named
 install's `ledger_install_id` under its lock, and when it differs from the uploader's ledger the batch is refused (400
-`stamp_from_other_ledger`, its body listing the refused pairs), nothing is judged and **nothing is recorded** in any ledger; on a
+`stamp_from_other_ledger`, its body listing the refused pairs and, **round 13, naming `ledgerInstallId`: the uploader's ledger the
+refusal was judged against**, that is the ledger the request was authorized with, read before the lock; a merge that commits
+between that read and the lock makes the refusal conservative, never wrong, and the release below corrects it), nothing is judged
+and **nothing is recorded** in any ledger; on a
 summary batch the collector parks the segments whose parts name a refused pair and resubmits the rest exactly as for the flood
 refusal (C4's `partitionFloodRefusal` takes either reason); on a delivery it parks the refused rows in the outbox
-(`outbox_row_parked`, `partitionRefusedRows`: undelivered, retained under the ordinary rules, never leased while parked, listed in
-`/status` as `parkedRows` beside the `lineage` and on the certify) and resubmits the rest at once. Round 10 judged such a pair
+(`outbox_row_parked`, `partitionRefusedRows`: undelivered, retained under the ordinary rules, never leased while parked, parked
+**under the ledger the 400 named** (round 13; never a value the collector supplied or learned itself, and a 400 that names no
+ledger parks nothing), listed in `/status` as `parkedRows` beside the `lineage` and on the certify) and resubmits the rest at once. Round 10 judged such a pair
 against the install it named and read only the uploader's ledger's facts, so another Mac's issued pair assigned the uploader's row to
 that Mac's actor (S8), and an unlinked re-join's delivery of an old faulty row was someone's while the old install's summary said
 nobody (S9). So one Mac's faulty or hostile traffic can neither poison another Mac's next version (R7 stays closed, now by
@@ -198,7 +249,9 @@ naming the destination's root for the admin to use instead; a destination of ano
 itself `source_is_target`; a refusal moves nothing); (2) **every install whose `ledger_install_id` is the source** locked `FOR
 UPDATE` in ascending id order by a statement issued after those locks (its snapshot follows them), re-enumerated in a further
 statement until no unlocked member remains (a join into the chain that is in progress holds its previous install's row `FOR SHARE`,
-below, so it commits before this lock is granted and the fresh statement sees the install it joined); (3) every member, the source
+below, so it commits before this lock is granted and the fresh statement sees the install it joined; a sighting or rebind that
+already holds a member sorting before the root and then asks for the root deadlocks here with the merge, and the transaction
+PostgreSQL aborts is run again from its start, "Serialization", round 13); (3) every member, the source
 root included, set to the destination's `ledger_install_id` and stamped `ledger_linked_at` and `ledger_linked_by` with the admin
 (who and when, per moved install); (4) **the facts of the source ledger re-keyed** to the destination, so a pair poisoned in the
 source ledger stays poisoned after the link (`checks/round11-sql-orderings.log` S10) and a member's fact never leaves its member's
@@ -219,8 +272,12 @@ member made one chain with two ledger ids whose installs refused one another's p
 red under round 11 and green under round 12 (`b4_offline_rebind.py` section 15; `checks/round12-sql-orderings.log` S12, S13). The
 next authenticated response then reports `lineage: linked` **and the ledger, `ledgerInstallId`** (round 12: a member of a merged
 chain sees its ledger change while its lineage was already `linked`), and the collector resubmits the rows it parked under a
-different ledger, which are judged in that ledger, where they read the facts and audit rows the old install's summary read: the
-same answer (`b4_offline_rebind.py` S9, red under r10; `checks/round11-sql-orderings.log` S9, S9h). A row an admin releases without a link is acknowledged `undeliverable_unlinked_ledger`
+ledger other than the one the response names (round 13: the ledger a row is parked under is the one its 400 carried, so the release
+compares two server-supplied values; a row refused against a stale view U after U→X had committed is parked under U and released by
+the first response naming X, whereas parking under the current ledger X, the only value round 12's text let a collector find, would
+have kept it parked on every later X response: `b4_offline_rebind.py` section 17, red under r12; `checks/round13-sql-orderings.log`
+S15b, S16), which are judged in that ledger, where they read the facts and audit rows the old install's summary read: the same
+answer (`b4_offline_rebind.py` S9, red under r10; `checks/round11-sql-orderings.log` S9, S9h). A row an admin releases without a link is acknowledged `undeliverable_unlinked_ledger`
 under the admin's receipt: never delivered, never judged, listed on the certify, so the old install's summary answer stands alone.
 An honest B2a collector links at join whenever it still holds the previous install's key, so the hold is reached only when that key
 is gone (a lost config, a rotated key) or by a faulty or hostile collector, and it costs an honest collector a delay, never an
