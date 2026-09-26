@@ -342,24 +342,33 @@ certify (f) lists every open row by id. Tests: collector `tests/contracts/lean/s
 `conversion-rejects.contract.ts` (round 8: B2a, the trigger nulls the pointer and a reused rowid does not alias; B10b, an open
 reject is never released by the prune or the ladder, the reject row survives both, a resolved reject releases its raw row).
 
-## C4. Null stamps before the first response, and the joined-install scope of the pair (b0Carries 3b; review-r1 blocker 1; review-r2 blocker 1; B2a collector, B6 cloud)
+## C4. Null stamps before the first response, and the joined-install scope of the pair (b0Carries 3b; review-r1 blocker 1; review-r2 blocker 1; read-c1c4 should-fixes 6-7; B2a collector, B6 cloud)
 
 A B2a collector stamps every raw row with the pair `(install, version)` it has **persisted**: the `DeviceInstall` id and the
 `actorBindingVersion` of the latest authenticated response **of the install its ledger is joined with**. **The joined install
 (round 9).** Join activation records the grant's `DeviceInstall` id (`stagedConfig.cloudDeviceId`, `plimsoll@03445d3a
 packages/collector-cli/src/join.ts:225,660`) in the active ledger's binding row (`collector_workspace_binding.joined_install`) in
 the same step as `useWorkspace`/`transitionWorkspace` with the new installation epoch (`join.ts:605-621`), together with the
-handshake response's `actorBindingVersion` where the response carried one (the handshake ran on a temporary ledger,
-`join.ts:537-583`, so the active ledger never saw it): `recordJoinedInstall(installId, version | null)`. A versioned response is
+handshake response's `actorBindingVersion` where the response carried one **and named the grant's install** (`deviceId` equal to
+`stagedConfig.cloudDeviceId`; a handshake response naming another install leaves the pair null and is counted, round 10; the handshake
+ran on a temporary ledger, `join.ts:537-583`, so the active ledger never saw it): `recordJoinedInstall(installId, version | null)`.
+The join request carries the previous install's id with proof of possession of its key, so the cloud can link the new install to the
+ledger's lineage (C1 "Scope", round 10). A versioned response is
 **accepted only when its `deviceId` equals the ledger's `joined_install`** and only upward (a lower version from the joined install
 never lowers the pair); a response from any other install is **ignored and counted** (`actorBinding.ignoredResponses`), never a
 replacement: so the old install's answer to a request that was in flight at the re-join, or from a collector process that loaded its
 config before the join (`cli.ts:2479`; the cloud keeps the old install valid, `join-token-store.ts:83-104`), changes nothing, and
 the daemon reads the joined install from the ledger, never from its start-up config. Round 8's "a response from a different install
 replaces it" is withdrawn (review r2 R4). A ledger joined before B2a and not re-joined since has no `joined_install`: B2a's first
-start seeds it from the config's `cloudDeviceId` when the config carries one (config and ledger are written together at a join,
-`join.ts:605-640`, so at start they agree); otherwise every response is ignored and counted, rows are null-stamped, `/status` says
-`joined_install_unknown`, and the next join records it. A join, re-join or workspace transition (`buffer.ts` `useWorkspace` with a
+start seeds it from the config's `cloudDeviceId` when the config carries one (`seedJoinedInstall`; config and ledger are written
+together at a join, `join.ts:605-648`, so at start they agree; a recorded joined install is never overwritten by a seed); otherwise
+every response is ignored and counted, rows are null-stamped, `/status` says `joined_install_unknown`, and the next join records it.
+**The partial join (round 10, read c1c4 should-fix 6).** Activation changes the ledger (`useWorkspace` or `transitionWorkspace` at
+`join.ts:605/:618`, and with B2a `joined_install`) before it writes the config (`:648`) and does not roll the ledger back if the
+config write fails: the daemon then authenticates as the old install while the ledger's joined install is the new one, every
+response is ignored and counted, and `/status` reports `actorBinding.state = join_incomplete` (the ledger's joined install and the
+config's `cloudDeviceId` differ) until `join --resume` completes the activation; the batch's echo names the ledger's joined install
+(C1), so the cloud never attributes it to the config's install. A join, re-join or workspace transition (`buffer.ts` `useWorkspace` with a
 new installation epoch, `transitionWorkspace`) clears the pair **and** the joined install to null; the join that follows records
 the new one. Until the first versioned response of the **joined** install the collector writes **null**, exactly like a pre-B2a
 collector: a fresh install's rows before its first contact, an upgraded install's rows before its first post-upgrade response, and a
@@ -367,13 +376,17 @@ re-joined ledger's rows between the join and the new install's first versioned r
 join records the new install's version 0 where the handshake response carried it, so that window is normally empty. Rows already
 in the outbox at a re-join keep the pair they were stamped with and are judged against that install (C1). The cloud treats every
 null stamp by the C1 exception, so the exception is stated as "stamp = null on an install rebound before the seal", not as "older
-collectors". The collector's `/status` shows `actorBinding = {joinedInstall, install, version, heardAt, stampedRows,
-nullStampedRows, earlierInstallRows, ignoredResponses}` so the size of the exception, of the re-join tail and of the ignored late
-answers is visible per host, and B2a's acceptance counts the null-stamped rows admitted before the first response on the Studio5
-copy. Test: collector `actor-stamp.contract.ts` (7 cases: null until the first response; stamped after; the joined install
-recorded and cleared by a re-join and a transition; the pre-re-join row keeps its pair; the old install's late answer ignored and
-counted, the echo the joined install's); cloud `actor-binding-stamp.contract.test.ts` (C4 case, the re-join cases). Fixture:
-`b4_offline_rebind.py` case L (red under r8).
+collectors". The collector's `/status` shows `actorBinding = {state ∈ ok | joined_install_unknown | join_incomplete,
+joinedInstall, install, version, heardAt, stampedRows, nullStampedRows, earlierInstallRows, ignoredResponses, lineage ∈ linked |
+unlinked, parkedSegments}` so the size of the exception, of the re-join tail, of the ignored late answers and of the degraded states
+is visible per host, and B2a's acceptance counts the null-stamped rows admitted before the first response on the Studio5 copy. Test:
+collector `actor-stamp.contract.ts` (11 cases: null until the first response; stamped after; the joined install recorded and cleared by
+a re-join and a transition; the pre-re-join row keeps its pair; the old install's late answer ignored and counted, the echo the joined
+install's; round 10: join activation driven through `join.ts` with a fake cloud, the handshake's version recorded only when its
+`deviceId` is the grant's install, the join request's lineage proof; the pre-B2a seed and `joined_install_unknown`; the partial join
+as `join_incomplete` with the echo naming the ledger's install; the flood split) with `helper.contract.ts` proving the `join.ts` premise;
+cloud `actor-binding-stamp.contract.test.ts` (C4 case, the re-join cases). Fixture: `b4_offline_rebind.py` case L (red under r8) and
+the join-lineage check of section 11 (red under r9).
 
 ## C5. `b22_false_complete.py` with repository-relative paths (b0Carries 4; B22 collector, B6 cloud)
 

@@ -6,7 +6,10 @@
  * the trap is real (a buffer without the pinned epoch refuses the same event as `before_enrollment`). Round 3 of B0 (review-r2
  * blocker 3): two more guards prove the premises the pending tests assume AFTER appending: the ladder test's old rows keep their
  * outbox lineage under the mocked clock (all four lease, three acknowledge), and the retention test's reject row, appended through
- * the buffer, is leased and acknowledged and would be deleted by today's prune at age (its red half).
+ * the buffer, is leased and acknowledged and would be deleted by today's prune at age (its red half). Round 4 of B0 (round 10): one
+ * more guard proves the premise of actor-stamp test 8, which drives join.ts activation with a fake cloud: on today's code the join
+ * redeems the token, runs its one-event handshake and activates the config and the active ledger, so the pending test can fail only at
+ * the B2a surfaces it binds (joined_install, the pair, the join request's previousInstall proof), never at its set-up.
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -107,4 +110,37 @@ test("helper guard: the trap is real: without the pinned epoch a managed buffer 
     try { buffer.close(); } catch { /* closed */ }
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("helper guard (round 4): join.ts activation completes on today's code with a fake cloud (a grant for install Z, a handshake answered with accepted: 1), leaving an active ledger bound to the tenant and the activated config", async () => {
+  const [join, config] = await Promise.all([import("../../../packages/collector-cli/src/join"), import("../../../packages/collector-cli/src/config")]);
+  const { acknowledgingFetch } = await import("../../../scripts/fixtures/delivery-ack-fixture");
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-lean-join-guard-"));
+  try {
+    const INSTALL_X = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa001", INSTALL_Z = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa002";
+    const old = config.collectorConfigSchema.parse({ tenantId: "tenant-lean-contract", installKey: "pli_previous_install_key_x", cloudDeviceId: INSTALL_X, uploadUrl: "https://cloud.example/api/work-intelligence/ingest", managed: true, port: 49123 });
+    const configPath = config.collectorConfigPath(homeDir);
+    fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(configPath, `${JSON.stringify(old, null, 2)}\n`, { mode: 0o600 });
+    const requests: string[] = [];
+    const cloud = acknowledgingFetch((async (input, init) => {
+      const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url);
+      requests.push(url.pathname);
+      const json = (body: unknown, status: number) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+      if (url.pathname.endsWith("/join")) return json({ ok: true, tenantId: "tenant-lean-contract", deviceId: INSTALL_Z, installKey: "pli_new_install_key_z", uploadUrl: "https://cloud.example/api/work-intelligence/ingest" }, 201);
+      void init;
+      return json({ ok: true, accepted: 1, deviceId: INSTALL_Z, actorBindingVersion: 0 }, 200);
+    }) as typeof fetch);
+    const result = await join.performJoin({ target: "https://cloud.example#pljt_lean-contract-token", homeDir, reassign: true, fetchImpl: cloud, temporaryRoot: path.join(homeDir, "handshake-tmp") });
+    assert.equal(result.joined, true, JSON.stringify(result));
+    assert.deepEqual(requests, ["/api/work-intelligence/join", "/api/work-intelligence/ingest"], "the token is redeemed, then the one-event handshake runs");
+    const activated = config.collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    assert.deepEqual([activated.cloudDeviceId, activated.installKey], [INSTALL_Z, "pli_new_install_key_z"], "the grant replaced the hosted credential set");
+    const ledger = new LocalEventBuffer(config.collectorBufferPath(homeDir));
+    try {
+      const binding = ledger.workspaceBinding();
+      assert.equal(binding?.currentWorkspaceId, "tenant-lean-contract");
+      assert.ok(binding?.currentInstallationEpochId, "activation ran useWorkspace/transitionWorkspace with the join's installation epoch (join.ts:605-621), the step that will also record the joined install");
+    } finally { ledger.close(); }
+  } finally { fs.rmSync(homeDir, { recursive: true, force: true }); }
 });
