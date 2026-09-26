@@ -411,23 +411,37 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 
 **Surfaces the cloud tests bind (plimsoll-cloud, `tests/contracts/lean/`).**
 - `src/lib/actor-binding-stamp.ts`: `actorForStamp({ stamp, path, binding })` → `{ actorId, basis, stampInvalid? }` where `binding =
-  { installId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued: number[] }` is the state of the install the
-  stamp's pair names; `sightStamp(binding, stamp)` → the binding with `notIssued` extended when the stamp is above `currentVersion`
-  (pure; persisting the fact is B6's); `firstEchoHeardAt(requests)` over every request kind; `stampDiagnostics({ stamps, echoed,
-  currentVersion })` → `{ stampAheadOfEcho, echoAheadOfBinding, ownershipChanged }`. (B6, C1, C4)
-- `src/lib/ingest.ts`: `eventRowsForStorage(batch, tenantId, authorizedActorId, { uploadingInstallId, bindings, sightings })` binds
-  the pair `metadata.actorBindingVersion` + `metadata.actorBindingInstall` through `actorForStamp` against
-  `bindings[actorBindingInstall]`, the uploader's view of that install (its facts only); a pair naming an install outside `bindings`
-  fails closed and records nothing; sets `metadata.actorStampInvalid`; appends every new not-issued fact
-  `{ uploaderInstallId, deviceInstallId, version, source }` to `sightings`, which the route persists in the ingest transaction
-  (round 9). (B6, C1)
-- `src/lib/actor-binding-stamp-store.ts` (round 9): `sightPairInTransaction(tx, { tenantId, uploaderInstallId, deviceInstallId,
-  version, source, at })` reads `device_installs.binding_version` `FOR SHARE`, judges, inserts the fact `ON CONFLICT DO NOTHING` when
-  the version is above it and re-reads → `{ issued, actorId, recorded, bindingVersionThen }`; `issueBindingVersionInTransaction(tx,
+  { installId, ledgerInstallId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued: number[], lifecycle }` is the
+  state of the install the stamp's pair names as `loadSightingView` returned it under the lock, `notIssued` being the facts of the
+  reading ledger's view; `lifecycle` is carried, never judged (round 10); `sightStamp(binding, stamp)` → the binding with `notIssued`
+  extended when the stamp is above `currentVersion` (pure; persisting the fact is B6's); `firstEchoHeardAt(requests)` over every
+  request kind, a request `{ at, echoed, install?, echoedInstall? }` counted only when `echoedInstall` is absent or equal to `install`
+  (round 10); `stampDiagnostics({ stamps, echoed, currentVersion })` → `{ stampAheadOfEcho, echoAheadOfBinding, ownershipChanged }`.
+  (B6, C1, C4)
+- `src/lib/ingest.ts`: `eventRowsForStorage(batch, tenantId, authorizedActorId, { uploadingInstallId, ledgerInstallId, bindings,
+  sightings })` binds the pair `metadata.actorBindingVersion` + `metadata.actorBindingInstall` through `actorForStamp` against
+  `bindings[actorBindingInstall]`; `bindings` **is the record `loadSightingView` returned in the ingest transaction, after the lock,
+  for the installs the batch's pairs name** (round 10; the function stays pure, the route may not hand it a view loaded earlier); a pair
+  naming an install outside `bindings` fails closed and records nothing; sets `metadata.actorStampInvalid`; appends every new
+  not-issued fact `{ ledgerInstallId, recordedByInstallId, deviceInstallId, version, source }` to `sightings`, which the route persists
+  in the same transaction (round 9). The summary path (`actorPartsForSegment`) takes its `install` view from the same call in the
+  judgment's transaction. (B6, C1)
+- `src/lib/actor-binding-stamp-store.ts` (rounds 9-10): `loadSightingView(tx, { tenantId, ledgerInstallId, installIds })` locks the
+  named installs' rows `FOR SHARE` in ascending id order **first**, then reads `binding_version`, the audit rows and the ledger's
+  facts under the lock → `Record<installId, binding>` (an install the tenant does not have is absent; a revoked or suspended one is
+  present); `sightPairInTransaction(tx, { tenantId, ledgerInstallId, recordedByInstallId, deviceInstallId, version, source, at })`
+  takes the row `FOR SHARE`, then reads and judges, inserts the fact `ON CONFLICT DO NOTHING` when the version is above
+  `binding_version` and re-reads → `{ issued, actorId, recorded, bindingVersionThen }`; `issueBindingVersionInTransaction(tx,
   { tenantId, deviceInstallId, actorId, changedBy })` is the rebind's write (`binding_version + 1` on the install row, the audit row
-  carrying it) that `bindDeviceInstalls` and `reverseDeviceInstallBinding` call; `stampFactsFor(tx, { uploaderInstallId,
-  deviceInstallId })` lists the recorded versions. Proved on the repository's disposable Postgres cluster by
-  `actor-binding-stamp-postgres.contract.test.ts` (needs `PLIMSOLL_PROOF_PG_BIN` as `ci.yml`'s usage-projection step has). (B6, C1)
+  carrying it) that `bindDeviceInstalls` and `reverseDeviceInstallActorBindings` call after `lockInstalls` (which gains `ORDER BY id`);
+  `stampFactsFor(tx, { ledgerInstallId, deviceInstallId })` lists the recorded versions; `linkLedgerAtJoin(tx, { tenantId,
+  newInstallId, previousInstallId, token, proof })` is the join route's lineage step → `{ linked, ledgerInstallId }` (linked only when
+  `proof = HMAC-SHA256(previous install's install_key, token)` verifies; the join route reads `previousInstall` from the request and
+  answers `lineage`). Proved on the repository's disposable Postgres cluster by `actor-binding-stamp-postgres.contract.test.ts`
+  (needs `PLIMSOLL_PROOF_PG_BIN` as `ci.yml`'s usage-projection step has; the harness applies `0_init` first, connects as the cluster's
+  superuser through the socket with the port in the authority, inserts `work_tenants.updated_at`, and runs the erasure in a child
+  process bound to the cluster, `tests/contracts/lean/fixtures/erase-tenant-child.ts`; `checks/postgres-harness-repaired-probe.log`).
+  (B6, C1)
 - `src/lib/delivery-ack-response.ts`: `acknowledgedResponse` emits `actorBindingVersion` for a registered install
   (`CollectorUploadAuthorization` gains `actorBindingVersion: number`). (B6)
 - `src/lib/activity-summary/contract.ts`: `ACTIVITY_SUMMARY_PAYLOAD_KIND`, `isActivitySummaryPayload`, `activitySummaryBatchSchema`,
@@ -435,12 +449,18 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `src/lib/activity-summary/actor-parts.ts`: `actorPartsForSegment({ members, install })`. (B6)
 - `src/lib/capture-watermark/contract.ts`: `captureCoverageForPeriod` with `until: null` open gaps and `resolvedAt`. (B6, C5)
 - `src/lib/economics/token-volume.ts`: `tokenVolumeState`, `normalisedTokens`, `pricingGate`. (B15)
-- `src/lib/work-intelligence/subject-rights.ts`: the tenant-scoped delete list names `DeviceInstallStampNotIssued` before
-  `DeviceInstall`, and `countTenantResidue` counts it (round 9). (B6, C1)
-- `prisma/schema.prisma`: `DeviceInstall.bindingVersion`, `DeviceInstall.activityLaneClosedAt`, `DeviceInstallActorBindingAudit.bindingVersion`
-  and `.heardAt`, models `AiSummaryActorPart`, `CaptureGap` and `DeviceInstallStampNotIssued` (`tenantId`, `uploaderInstallId`,
-  `deviceInstallId`, `version`, `firstSeenAt`, `bindingVersionThen`, `source`, unique per `(uploaderInstallId, deviceInstallId,
-  version)`, a relation to `DeviceInstall` without cascade; round 9). (B6, C1)
+- `src/lib/work-intelligence/tenant-erasure-plan.ts`: `TENANT_COLUMN_MODELS` lists `DeviceInstallStampNotIssued` before
+  `DeviceInstall` (the order erasure runs, `subject-rights.ts:549`; the CI proof holds the list against the schema);
+  `src/lib/work-intelligence/subject-rights.ts`: the tenant-scoped delete list names it (bound to the plan by `satisfies`) and
+  `countTenantResidue` counts it (rounds 9-10). (B6, C1)
+- `prisma/migrations/<B6>/migration.sql`: the erasure-only delete trigger on `device_installs` (`BEFORE DELETE`, allowed only while
+  `current_setting('plimsoll.erasing_tenant', true)` is the row's tenant, else `RAISE EXCEPTION … erasure`), the `ledger_install_id`
+  column backfilled with the row's own id, `lockInstalls`' `ORDER BY`. (B6, C1)
+- `prisma/schema.prisma`: `DeviceInstall.bindingVersion`, `DeviceInstall.ledgerInstallId`, `DeviceInstall.activityLaneClosedAt`,
+  `DeviceInstallActorBindingAudit.bindingVersion` and `.heardAt`, models `AiSummaryActorPart`, `CaptureGap` and
+  `DeviceInstallStampNotIssued` (`tenantId`, `ledgerInstallId`, `recordedByInstallId`, `deviceInstallId`, `version`, `firstSeenAt`,
+  `bindingVersionThen`, `source`, unique per `(ledgerInstallId, deviceInstallId, version)`, a relation to `DeviceInstall` without
+  cascade; round 10). (B6, C1)
 
 **Surfaces the collector tests bind (plimsoll, `tests/contracts/lean/`).**
 - `packages/collector-cli/src/lean/schema.ts`: `ensureLeanSchema(db)` (ARCHITECTURE.md §3 DDL v3 plus C3) on the ledger connection
@@ -451,16 +471,26 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `.joined_install` (round 9); `raw_retention_receipts` accepting the four reasons. (B2a, B10a, B10b)
 - `packages/collector-cli/src/buffer.ts`: `prune` deletes nothing while `hold_reason` is set; `retentionProgressStatus().hold`;
   `recordJoinedInstall(installId, version | null)` (join activation: the grant's install becomes `collector_workspace_binding.
-  joined_install`, the handshake's version the pair, round 9); `recordActorBindingVersion(version, installId)` → `"accepted"` (the
-  joined install, upward) | `"kept"` (the joined install, not above the persisted version) | `"ignored"` (any other install, or no
-  joined install known; counted in `workspaceBinding().ignoredResponses`); `workspaceBinding().actorBindingVersion`,
-  `.actorBindingInstall` and `.joinedInstall`, all cleared by `useWorkspace` with a new installation epoch and by
-  `transitionWorkspace`; `summary_members` written at `append` with the pair (`actor_binding_version`, `actor_binding_install`) and
-  two edges when `lean.write` is on (`new LocalEventBuffer(path, { lean: { write: true } })`). (B10a, B2a; C1, C4)
+  joined_install`, the handshake's version the pair, round 9; the version only when the handshake response's `deviceId` is the grant's
+  install, round 10); `seedJoinedInstall(cloudDeviceId | undefined)` → `"seeded"` | `"kept"` | `"unknown"` (B2a's first start on a
+  pre-B2a ledger, round 10); `recordActorBindingVersion(version, installId)` → `"accepted"` (the joined install, upward) | `"kept"`
+  (the joined install, not above the persisted version) | `"ignored"` (any other install, or no joined install known; counted in
+  `workspaceBinding().ignoredResponses`); `workspaceBinding().actorBindingVersion`, `.actorBindingInstall` and `.joinedInstall`, all
+  cleared by `useWorkspace` with a new installation epoch and by `transitionWorkspace`; `summary_members` written at `append` with the
+  pair (`actor_binding_version`, `actor_binding_install`) and two edges when `lean.write` is on (`new LocalEventBuffer(path, { lean:
+  { write: true } })`). (B10a, B2a; C1, C4)
+- `packages/collector-cli/src/join.ts` (round 10): activation calls `recordJoinedInstall` in the same step as `useWorkspace` /
+  `transitionWorkspace` (`:605-621`) with the handshake response's `actorBindingVersion` when its `deviceId` equals the grant's
+  install; the join request body carries `previousInstall = { deviceId: existing cloudDeviceId, proof: HMAC-SHA256(existing installKey,
+  token) }` when the existing config has both; `lean/actor-binding-status.ts`: `actorBindingStatus({ binding, config })` → `{ state ∈
+  ok | joined_install_unknown | join_incomplete, joinedInstall, configInstall }` for `/status`; `lean/summary-upload.ts`:
+  `partitionFloodRefusal(items, { pairs })` → `{ resubmit, parked }` (the segments whose parts name a refused pair parked, everything
+  else resubmitted). (B2a; C1, C4)
 - `packages/collector-cli/src/upload.ts`: `buildIngestBatch(...).batch.actorBindingVersionHeard` (the current install's version;
-  earlier installs' stamps do not raise it) and the pair on every event's metadata; `packages/shared/src/schemas.ts`:
-  `aiWorkIngestBatchSchema` accepts it; `analytical-metadata.ts`: `metadataKeyDisposition("actorBindingVersion")` and
-  `("actorBindingInstall")` are identifiers; `outbound-envelope.ts`: `sealOutboundEnvelope` keeps both. (B2a)
+  earlier installs' stamps do not raise it) and `.actorBindingInstallHeard` (the ledger's joined install the echo is for, round 10),
+  and the pair on every event's metadata; `packages/shared/src/schemas.ts`: `aiWorkIngestBatchSchema` accepts both;
+  `analytical-metadata.ts`: `metadataKeyDisposition("actorBindingVersion")` and `("actorBindingInstall")` are identifiers;
+  `outbound-envelope.ts`: `sealOutboundEnvelope` keeps both. (B2a)
 - `packages/collector-cli/src/lean/runway.ts`: `LEAN_ROW_WIDTHS`; `estimateHostG(census)` (with the optional `segmentProxy`;
   `null` for an unmeasured census); `holdRunway({ freeBytes, reserveBytes, rebuildHeadroomBytes, gGateBytes, rawBytesAtCensus,
   converterWrittenBytes, rawUnfoldedBytesSinceCensus, conversionComplete, leanTableBytesNow?, grossGrowthP95PerDay, rawBytes,
@@ -497,8 +527,15 @@ They are contract tests against shipped code that does not implement the contrac
 reason "surface missing" or "old behaviour", never for a subtle reason; the fixtures in `fixtures/` are the in-memory rule models
 that show each rule is self-consistent. The cloud's Postgres proof (`actor-binding-stamp-postgres.contract.test.ts`) fails today at
 its missing surface before any cluster starts; once B6 removes its marker it needs the private cluster's binaries
-(`PLIMSOLL_PROOF_PG_BIN`) in the lean contract step. The R5 interleaving was reproduced in round 9 in a local PostgreSQL 16 cluster
-at the SQL level (`checks/r5-postgres-reproduction.log`), not through B6's code. Row widths in C2 remain estimates until S2 measures them on a copy; the Studio4 census
+(`PLIMSOLL_PROOF_PG_BIN`) in the lean contract step; its harness was run step by step against today's schema in round 10
+(`checks/postgres-harness-repaired-probe.log`: the migrations with `0_init`, the Prisma connection, the tenant row, the erasure child;
+only B6's own columns are missing), so the five set-up faults the read found are gone. The R5 interleaving was reproduced in round 9
+in a local PostgreSQL 16 cluster at the SQL level (`checks/r5-postgres-reproduction.log`), and the round-10 rules (the facts read before
+the lock, the two installs of one ledger, the mirror order, the view under a held lock, PostgreSQL's grant of a `FOR SHARE` while a
+`FOR UPDATE` waits, lifecycle, the erasure-only guard) in round 10 (`checks/round10-sql-orderings.log`), not through B6's code. What
+no test can bind is where a future route *calls* `loadSightingView`: the pending proof shows the call itself locks first and returns
+a consistent view, and C6 requires the call in the judging transaction; a route that loaded the view earlier would pass the proof
+and break C1, so B6's review must read the route. Row widths in C2 remain estimates until S2 measures them on a copy; the Studio4 census
 counts are measured, the other hosts' are not (Studio1's sessions were measured in round 5; its day and segment counts are the
 plan's geometry). No live collector, hosted service or production database was written to; the Studio4 ledger was copied with
 `VACUUM INTO` from a read-only connection and the copy was deleted after the census.
