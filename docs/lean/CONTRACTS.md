@@ -196,8 +196,13 @@ transaction, the one whose timeout fires first, with SQLSTATE `40P01`; nothing o
 transaction (a sighting on either path, the rebind, the join's lineage step, the admin's merge) that PostgreSQL aborts with `40P01`
 (`deadlock_detected`) or `40001` (`serialization_failure`, which arises only for an implementation that runs at `SERIALIZABLE` or
 `REPEATABLE READ`) is rolled back and run again as a **fresh transaction from its first statement**, fresh locks and every judgment
-input re-read under them (the lock-then-read rule applies to the retry unchanged), **at most 3 attempts in all** (the first and two
-retries), with no wait of its own between attempts: the surviving transaction holds the contested rows, so the retry waits on those
+input re-read under them (the lock-then-read rule applies to the retry unchanged), **except the request context fixed at its
+authorization (round 14, read c1 r13 should-fix 2)**: the uploader's ledger U, read with the authenticated install for the request's
+authorization before the transaction, is kept by a retry and not re-read, while the named install's `ledger_install_id`, its
+`binding_version`, the audit rows and the facts are re-read under the fresh locks and compared with U; a retry that runs after a
+merge U→X committed therefore reads X under its locks, refuses conservatively against U naming U, and the next response naming X
+releases the rows ("Outside the ledger"; `b4_offline_rebind.py` section 16, S15/fixed U; the cloud Postgres case 8 c2), **at most 3
+attempts in all** (the first and two retries), with no wait of its own between attempts: the surviving transaction holds the contested rows, so the retry waits on those
 locks and proceeds when it commits. Two lockers cost one abort and one retry (PostgreSQL hands the released row to the transaction
 already waiting for it); a second abort needs a third concurrent locker, so three attempts bound the added latency to about two
 `deadlock_timeout`s, inside the ingest route's budget. **Nothing is acknowledged, recorded or receipted before the transaction that
