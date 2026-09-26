@@ -145,6 +145,7 @@ import {
   validateCaptureRoots,
   type CaptureRoot,
 } from "./capture-root-inventory";
+import { bindDispatch,closeDispatch,restampDispatch } from "./dispatch-command";
 import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
 import { OtlpIntakeSpool } from "./otlp-spool";
 import {
@@ -345,6 +346,17 @@ Commands:
                         --allow-scan-errors registers a root whose walk is
                         ambiguous: the entries are named in the receipt and
                         left unfenced (so they are captured, not excluded)
+  dispatch bind --session-id S --work-item-id KEY --project-key sha256:HASH --attempt-id LANE
+                [--parent-attempt-id LEAD_SESSION] [--role author|reviewer|lead]
+                [--work-class C] [--complexity-band B]
+                [--technique-id T --technique-version V --assignment-id A --arm control|treatment]
+                [--launched-by PERSON] --valid-from ISO [--valid-until ISO]
+                        Bind a session before its first event in every enrolled capture root
+  dispatch close --attempt-id LANE
+                        Close the lane's binding and prune old bindings
+  dispatch restamp --attempt-id LANE
+                        Correct unsent local rows captured before bind; rows
+                        already attempted for upload remain unchanged
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   producer-parity [--hours 6]
@@ -2460,6 +2472,7 @@ async function main() {
 
   const noCreateConfigCommands = new Set([
     "capture-roots",
+    "dispatch",
     "doctor",
     "setup",
     "install-launch-agent",
@@ -2481,6 +2494,23 @@ async function main() {
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
+
+  if (command === "dispatch") {
+    if (configRead?.status !== "valid") throw new Error("dispatch_config_not_valid");
+    const action = process.argv[3];
+    const args = process.argv.slice(4);
+    let result;
+    if (action === "bind") result = bindDispatch(args);
+    else if (action === "close") result = closeDispatch(args);
+    else if (action === "restamp") {
+      if (!fs.existsSync(collectorBufferPath())) throw new Error("dispatch_ledger_missing");
+      const buffer = openBuffer(config);
+      try { result = restampDispatch(args,buffer,config.captureRoots ?? []); }
+      finally { buffer.close(); }
+    } else throw new Error("Expected dispatch bind|close|restamp");
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
 
   if (command === "enroll-codex-live-producer") {
     const optionNames = new Set(["--producer-id", "--credential-id", "--capture-root-id"]);

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { recordRuntimeFactDrop, type RuntimeFactDropReason } from "./runtime-fact-drops";
+import { dispatchBindingForSession } from "./capture-root-inventory";
 
 import {
   adaptToolInteractionEvent,
@@ -25,7 +26,8 @@ import type {
  * Outcome truth comes exclusively from collector-generated protocol signals
  * (`otelHasError`/`otelStatusCode` are produced by our own OTLP boundary from
  * validated inputs; producer attributes cannot set them because their
- * metadata disposition is generated-only).
+ * metadata disposition is generated-only). Prospective technique exposure
+ * comes only from the collector's validated dispatch inventory.
  *
  * Operation correlation stays ephemeral: raw producer correlation keys are
  * read solely to derive the ledger-local one-way operation identity and are
@@ -133,20 +135,24 @@ export function promoteRuntimeLearningFacts(
   // A result for an evicted attempt must not recreate its old episode (and
   // thereby evict a newer graph just to discard the unpaired result).
   if (event.eventType === "tool_use") {
+    const binding = event.source === "codex" || event.source === "claude_code"
+      ? dispatchBindingForSession(event.source,event.sessionId,event.observedAt) : null;
     const implicitEpisode = buildWorkEpisodeFact({
       source: event.source,
       sessionId: event.sessionId,
       sourceEpisodeKey: IMPLICIT_EPISODE_KEY,
-      workClass: IMPLICIT_WORK_CLASS,
-      complexityBand: IMPLICIT_COMPLEXITY_BAND,
+      workClass: binding?.workClass ?? IMPLICIT_WORK_CLASS,
+      complexityBand: binding?.complexityBand ?? IMPLICIT_COMPLEXITY_BAND,
       startedAt: event.observedAt,
     });
+    let openedEpisode = false;
     try {
       const episodeWrite = store.recordWorkEpisode(implicitEpisode);
       if (episodeWrite.dropped) {
         return { attempted: true, attemptInserted: false, resultApplied: false };
       } else {
         episodeId = implicitEpisode.episodeId;
+        openedEpisode = episodeWrite.inserted;
       }
     } catch {
       if (store.episodeById(implicitEpisode.episodeId)) {
@@ -154,6 +160,20 @@ export function promoteRuntimeLearningFacts(
       } else {
         recordRuntimeFactDrop(target.database, "episode_seed_failed");
         return { attempted: true, attemptInserted: false, resultApplied: false };
+      }
+    }
+    if (openedEpisode && binding?.techniqueId && binding.techniqueVersion && binding.assignmentId && binding.arm) {
+      try {
+        const exposure = recordExplicitTechniqueAssignment(target, {
+          episodeId: implicitEpisode.episodeId,
+          techniqueId: binding.techniqueId,techniqueVersion: binding.techniqueVersion,
+          assignmentId: binding.assignmentId,workClass: implicitEpisode.workClass,
+          complexityBand: implicitEpisode.complexityBand,exposedAt: implicitEpisode.startedAt,
+          mode: binding.arm,
+        });
+        if (exposure.dropped) recordRuntimeFactDrop(target.database,exposure.dropReason ?? "invalid_signal");
+      } catch (error) {
+        recordRuntimeFactDrop(target.database,errorReasonFor(error));
       }
     }
   }
@@ -239,7 +259,8 @@ export function promoteRuntimeLearningFacts(
  * Exposure exists solely as an explicit prospective operator assignment
  * carrying technique identity, assignment id, exposure time, and mode; the
  * wrapper enforces prospectiveness against wall-clock time so retrospective
- * assignments fail closed. Capture code never calls this.
+ * assignments fail closed. The dispatch inventory calls this only when the
+ * first tool event opens its session episode.
  */
 export function recordExplicitTechniqueAssignment(
   target: { learningFacts: LearningFactStore },
