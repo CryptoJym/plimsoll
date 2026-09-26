@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
+import { gzipSync } from "node:zlib";
 import type Database from "better-sqlite3";
 
 import { LOCAL_TENANT_ID } from "../../shared/src/index";
 import type { CollectorConfig } from "./config";
 import { authenticatedJsonPost, MAX_POST_BYTES, validatedTransportUrl } from "./http-transport";
-import { aggregateToolStatsWeek, utcWeekStart } from "./weekly-tool-stats";
+import { aggregateToolStatsWeek, countsOnlyToolStats, foldToolStatsVersions, selectToolStatsSessions,
+  utcWeekStart, type UploadWeeklyToolStats } from "./weekly-tool-stats";
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -17,6 +19,16 @@ function digest(value: unknown): string {
   return crypto.createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
+function reportBody(input: { tenantId: string; deviceId: string; reportSequence: number;
+  observedAt: string; toolStats: UploadWeeklyToolStats; compressed?: boolean }): string {
+  const toolStats = input.compressed
+    ? { encoding: "gzip-base64", data: gzipSync(JSON.stringify(input.toolStats), { level: 9 }).toString("base64") }
+    : input.toolStats;
+  return JSON.stringify({ schema: "fleet-device-report/v1", kind: "tool_stats",
+    tenantId: input.tenantId, deviceId: input.deviceId, reportSequence: input.reportSequence,
+    observedAt: input.observedAt, toolStats });
+}
+
 type Pending = { weekStart: string; reportSequence: number; digest: string; bodyJson: string; delivered: number };
 type Receipt = { schema?: unknown; deviceId?: unknown; reportSequence?: unknown;
   disposition?: unknown; nextReportSequence?: unknown; toolStatsDigest?: unknown };
@@ -25,12 +37,15 @@ type Receipt = { schema?: unknown; deviceId?: unknown; reportSequence?: unknown;
 export async function uploadCompletedToolStatsWeek(
   config: CollectorConfig,
   db: Database.Database,
-  options: { now?: () => Date; fetchImpl?: typeof fetch } = {},
+  options: { now?: () => Date; fetchImpl?: typeof fetch; maxReportBytes?: number } = {},
 ): Promise<"not_joined" | "not_due" | "accepted" | "retry" | "conflict"> {
   if (!config.uploadUrl || !config.cloudDeviceId || !config.deviceId ||
     config.tenantId === LOCAL_TENANT_ID || config.installKey === "local-dev" ||
     config.policy.dataMode !== "metadata") return "not_joined";
   const now = (options.now ?? (() => new Date()))();
+  const maxReportBytes = options.maxReportBytes === undefined || !Number.isFinite(options.maxReportBytes)
+    ? MAX_POST_BYTES :
+    Math.min(MAX_POST_BYTES, Math.max(512, Math.floor(options.maxReportBytes)));
   const currentWeek = utcWeekStart(now);
   db.prepare(`insert or ignore into weekly_tool_stats_control(workspace_id,device_id,first_week) values(?,?,?)`)
     .run(config.tenantId, config.deviceId, currentWeek);
@@ -49,12 +64,27 @@ export async function uploadCompletedToolStatsWeek(
     if (last.weekStart) weekStart.setUTCDate(weekStart.getUTCDate() + 7);
     if (weekStart.toISOString().slice(0, 10) >= currentWeek) return "not_due";
     const date = weekStart.toISOString().slice(0, 10);
-    const toolStats = aggregateToolStatsWeek(db, { workspaceId: config.tenantId, deviceId: config.deviceId, weekStart: date });
+    let toolStats = selectToolStatsSessions(aggregateToolStatsWeek(db,
+      { workspaceId: config.tenantId, deviceId: config.deviceId, weekStart: date }));
     const reportSequence = (last.reportSequence ?? 0) + 1;
-    const bodyJson = JSON.stringify({ schema: "fleet-device-report/v1", kind: "tool_stats",
-      tenantId: config.tenantId, deviceId: config.cloudDeviceId, reportSequence,
-      observedAt: now.toISOString(), toolStats });
-    if (Buffer.byteLength(bodyJson) > MAX_POST_BYTES) throw new Error("tool_stats_report_too_large");
+    const identity = { tenantId: config.tenantId, deviceId: config.cloudDeviceId,
+      reportSequence, observedAt: now.toISOString() };
+    let bodyJson = reportBody({ ...identity, toolStats });
+    if (Buffer.byteLength(bodyJson) > maxReportBytes) {
+      toolStats = countsOnlyToolStats(toolStats);
+      bodyJson = reportBody({ ...identity, toolStats });
+    }
+    if (Buffer.byteLength(bodyJson) > maxReportBytes) {
+      bodyJson = reportBody({ ...identity, toolStats, compressed: true });
+    }
+    if (Buffer.byteLength(bodyJson) > maxReportBytes) {
+      toolStats = foldToolStatsVersions(toolStats);
+      bodyJson = reportBody({ ...identity, toolStats });
+    }
+    if (Buffer.byteLength(bodyJson) > maxReportBytes) {
+      bodyJson = reportBody({ ...identity, toolStats, compressed: true });
+    }
+    if (Buffer.byteLength(bodyJson) > maxReportBytes) throw new Error("tool_stats_report_too_large");
     const reportDigest = digest(toolStats);
     db.prepare(`insert into weekly_tool_stats_uploads
       (workspace_id,device_id,week_start,report_sequence,digest,body_json) values(?,?,?,?,?,?)`)

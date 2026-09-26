@@ -70,6 +70,19 @@ export type WeeklyToolStats = {
   cells: ToolStatsCell[];
 };
 
+export type SessionListState = "complete" | "below_floor" | "capped" | "counts_only";
+export type UploadToolStatsCell = ToolStatsCell & {
+  sessionListState: SessionListState;
+  sessionTotal?: number;
+};
+export type UploadWeeklyToolStats = Omit<WeeklyToolStats, "cells"> & {
+  countsOnly: boolean;
+  versionsFolded?: boolean;
+  cells: UploadToolStatsCell[];
+};
+export const TOOL_STATS_KNOWN_ATTEMPT_FLOOR = 50;
+export const TOOL_STATS_SESSION_LIST_LIMIT = 64;
+
 export function utcWeekStart(at: Date): string {
   const day = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()));
   day.setUTCDate(day.getUTCDate() - ((day.getUTCDay() + 6) % 7));
@@ -176,4 +189,45 @@ export function aggregateToolStatsWeek(db: Database.Database, input: {
     cells: [...cells.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, cell]) => ({
       ...cell, sessions: cell.sessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
     })) };
+}
+
+/** Keep D2 candidates, with a deterministic cap that favors failures and retries. */
+export function selectToolStatsSessions(week: WeeklyToolStats): UploadWeeklyToolStats {
+  return { weekStart: week.weekStart, coverage: week.coverage, countsOnly: false,
+    cells: week.cells.map((cell) => {
+      const sessionTotal = cell.sessions.length;
+      if (cell.attempts - cell.unknown < TOOL_STATS_KNOWN_ATTEMPT_FLOOR) {
+        return { ...cell, sessions: [], sessionTotal, sessionListState: "below_floor" as const };
+      }
+      const sessions = [...cell.sessions].sort((left, right) =>
+        right.failures - left.failures || right.retries - left.retries ||
+        right.attempts - left.attempts || left.sessionId.localeCompare(right.sessionId));
+      return { ...cell, sessions: sessions.slice(0, TOOL_STATS_SESSION_LIST_LIMIT), sessionTotal,
+        sessionListState: sessionTotal > TOOL_STATS_SESSION_LIST_LIMIT ? "capped" as const : "complete" as const };
+    }) };
+}
+
+/** Preserve every count and coverage row when even selected session lists do not fit. */
+export function countsOnlyToolStats(week: UploadWeeklyToolStats): UploadWeeklyToolStats {
+  return { ...week, countsOnly: true,
+    cells: week.cells.map((cell) => ({ ...cell, sessions: [], sessionListState: "counts_only" as const })) };
+}
+
+/** Last-resort bounded shape: retain every class/name/runtime count, with version detail flagged unavailable. */
+export function foldToolStatsVersions(week: UploadWeeklyToolStats): UploadWeeklyToolStats {
+  const cells = new Map<string, UploadToolStatsCell>();
+  for (const cell of week.cells) {
+    const key = JSON.stringify([cell.toolClass, cell.toolName, cell.runtime]);
+    const folded = cells.get(key) ?? { ...cell, runtimeVersion: "unknown", collectorVersion: "unknown",
+      attempts: 0, failures: 0, unknown: 0, retries: 0, longestChain: 0,
+      sessions: [], sessionTotal: undefined, sessionListState: "counts_only" as const };
+    folded.attempts += cell.attempts;
+    folded.failures += cell.failures;
+    folded.unknown += cell.unknown;
+    folded.retries += cell.retries;
+    folded.longestChain = Math.max(folded.longestChain, cell.longestChain);
+    cells.set(key, folded);
+  }
+  return { ...week, countsOnly: true, versionsFolded: true,
+    cells: [...cells.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, cell]) => cell) };
 }
