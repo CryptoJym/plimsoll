@@ -960,7 +960,10 @@ function plantedBodies() {
     },
     metrics: {
       resourceMetrics: [{
-        resource,
+        resource: { attributes: [
+          { key: "service.name", value: { stringValue: "claude-code" } },
+          { key: "process.command_line", value: secret("PLANTED_RESOURCE_COMMAND_LINE") },
+        ] },
         scopeMetrics: [{
           scope,
           metrics: [{

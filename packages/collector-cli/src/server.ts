@@ -28,7 +28,7 @@ import {
   classifyProducerOutcome,
   readProducerEventIdHeader,
 } from "./producer-parity";
-import { explodeOtlpPayload } from "./otlp";
+import { conflictingOtlpServiceSource, explodeOtlpPayload } from "./otlp";
 import {
   otlpBatchRemainder,
   otlpChunk,
@@ -1840,6 +1840,9 @@ export function createCollectorServer(
         const parsedEnvelope = parseBoundedJson(body.text);
         assertBoundedOtlpCardinality(parsedEnvelope, body.decodedBytes);
         if (hasLiveUsageClaim(parsedEnvelope)) throw new HttpBoundaryRejection("source_not_allowed", 403);
+        if (conflictingOtlpServiceSource(parsedEnvelope, source)) {
+          throw new HttpBoundaryRejection("source_mismatch", 401);
+        }
 
         const transportPath = canonicalOtlpTransportPath(request.url);
         const repoLabels: Array<{ hash: string; label: string }> = [];

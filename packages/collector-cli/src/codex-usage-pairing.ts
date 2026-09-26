@@ -99,6 +99,7 @@ type Shape = {
   kind: "log" | "span";
   traceId: string | null;
   spanEndAt: string | null;
+  authoritativeSession: boolean;
 };
 
 function shape(row: UsageRow): Shape | null {
@@ -115,6 +116,8 @@ function shape(row: UsageRow): Shape | null {
       kind,
       traceId: typeof metadata.traceId === "string" ? metadata.traceId : null,
       spanEndAt: typeof metadata.otelSpanEndAt === "string" ? metadata.otelSpanEndAt : null,
+      authoritativeSession: metadata.sessionLinkBasis === "otel_trace" ||
+        metadata.sessionLinkBasis === "span_attribute",
     };
   } catch {
     return null;
@@ -136,6 +139,8 @@ function compatible(log: UsageRow, span: UsageRow, logShape: Shape, spanShape: S
   if (logShape.traceId && spanShape.traceId) {
     if (logShape.traceId !== spanShape.traceId) return false;
   }
+  if (spanShape.authoritativeSession && span.sessionId && log.sessionId &&
+      span.sessionId !== log.sessionId) return false;
   // Real Codex usage logs have no trace context and response spans have no
   // session. Do not make the time_window session guess a pairing prerequisite.
   // Mutual uniqueness, exact counts and the bounded time window guard this key.
