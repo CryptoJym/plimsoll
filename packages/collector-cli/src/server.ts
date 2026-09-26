@@ -709,6 +709,8 @@ export function createCollectorServer(
      * take is refused exactly as before: 503 busy, 408 deadline.
      */
     otlpSpool?: OtlpIntakeSpool;
+    /** Proof clock for request work; production uses performance.now. */
+    requestBudgetNow?: () => number;
   } = {},
 ) {
   assertCollectorPrivacyMode(config, "collector server");
@@ -1281,7 +1283,7 @@ export function createCollectorServer(
   options.registerStatusRefresher?.(refreshStatus);
 
   const httpServer = http.createServer(async (request, response) => {
-    const budget = createRequestBudget();
+    const budget = createRequestBudget(options.requestBudgetNow);
     // The daemon's request receive time. A hook post the intake has to spool
     // carries this into the envelope's `receivedAt`, so the drain replays the
     // event with the time it arrived here (bead eco-6hoxj.61).
