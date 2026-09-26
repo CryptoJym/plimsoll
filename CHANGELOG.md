@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.42 — 2026-09-26
+
+- Busy-session summaries preserve rebuild progress while unread rows change.
+  A terminal receipt retarget advances the old session revision so a 0.7.41
+  worker rejects stale data during a downgrade (`eco-6hoxj.163.87`).
+- Codex and Claude tailers keep skipped usage visible as a possible loss when
+  a JSON discriminator probe saturates. A revisit queue resumes partial files
+  without losing the capture claim gap (`eco-6hoxj.163.81`).
+- Coverage walks page saved partial cursors and record a gap when a known
+  partial file vanishes before its directory entry is reached. A file created
+  and removed entirely between walks remains outside this claim
+  (`eco-6hoxj.163.82`).
+- B1 observe-only budget sampling records ledger size, process memory and CPU,
+  outbox age, and summary lag. Status and CSV show advisory targets and local
+  history; no capture budget is enforced. A stopped collector purge also
+  removes ledger WAL and SHM files (`eco-6hoxj.164.3`).
+- Codex SSE logs and matching response spans pair in the local ledger before
+  usage upload, so a response counts once while the duplicate span remains
+  available as raw evidence. The stopped-service pairing index upgrade can be
+  repeated after a 0.7.41 rollback to refresh the historical cursor and target
+  (`eco-6hoxj.163.95`).
+- HTTP deadline proofs cover file-backed status probes, and maintenance FIFO
+  proofs bound deadline-to-reap and absolute hook latency. The runtime keeps
+  the bounded HTTP request behavior (`eco-6hoxj.163.83`).
+
+The replaced dashboard and session-summary triggers remain safe for a 0.7.41
+downgrade (F14).
+
 ## 0.7.5 — 2026-09-08
 
 - Stable and finitely growing oversized Codex and Claude JSONL records can
@@ -128,6 +156,29 @@ does not transfer its sessions to a tailer.
 
 ### Changed
 
+- Capture coverage reads large directories a few entries at a time and keeps
+  each source within 4,096 work units per turn. A large Codex day folder can
+  keep growing while coverage works through it; the check resumes its open
+  directory cursor and finishes, and later files are picked up by this check
+  or the next one. The queue stays at 4,096 files. A folder removed or renamed
+  makes the check incomplete. If a listed Codex or Claude file disappears,
+  coverage uses its saved capture progress to mark it finished or record a
+  gap; repeated file removals no longer hold the source frontier indefinitely.
+  On a source's first coverage walk, a changed folder records an uncertainty
+  gap for any file removed before its open cursor could list it. Later walks
+  compare saved partial capture cursors with the files checked, so a known
+  partial file deleted before listing becomes a gap. Small changed folders get
+  one verifying restart. Small unchanged folders reuse a bounded
+  list of names on later checks; every file is still checked for changes.
+  Files created and removed between walks without ever being listed cannot be
+  detected without a filesystem journal; coverage does not attest those files.
+  Ignored names use work but do not count toward the 200,000 relevant-entry
+  ceiling. Codex, Claude Code, and Grok each get a share of every turn, with
+  the first source rotating and unused time returning to active sources.
+  Legacy symlinked Codex or Claude roots now make coverage incomplete, like
+  configured roots.
+  The 250 ms coverage turn is a target: a synchronous directory read, file
+  stat, or database write can run past it.
 - When the OTLP intake spool cannot hold a refused request (full, or the disk
   refuses), a deadline refusal is answered `503` with `Retry-After: 1` instead
   of `408`, which OTLP exporters do not retry. A body that never finished
@@ -139,6 +190,23 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Codex rollout and Claude transcript capture now revisits files left unread in
+  older folders, after partial reads, and after post-enrollment growth. Records
+  beyond the reader ceiling are passed in bounded chunks; skipped kinds and
+  bytes are counted, and any possible usage loss remains a capture gap after
+  the file reaches its end. Same-session rewrites with unchanged prior usage
+  events replay through stable identities so tokens are not counted again.
+  Skipped-record kinds use JSON nesting. The bounded reader also checks the
+  whole skipped record for duplicate or escaped discriminator keys before it
+  calls a skip known non-usage. An uncertain skip stays a possible usage loss
+  in the cloud claim, even after its file reaches EOF. Each key counter keeps
+  scanning independently; a saturated or incomplete counter cannot certify
+  non-usage even across a saved continuation. An older saved skip is
+  reclassified on resume. Receipt identity includes a hash of the first 2 KiB:
+  same-offset, same-size rewrites sharing that prefix still share one receipt.
+  Earlier pre-enrollment bytes remain excluded. Once post-enrollment growth
+  advances the shared cursor to EOF, those earlier bytes cannot be imported
+  through that cursor; a separate historical cursor and identity policy is needed.
 - OTLP exports the ledger cannot commit in time are kept, not lost
   (`eco-6hoxj.163.17`). An authenticated, validated request that meets a busy
   ledger or runs out of its 1.5 s deadline — including one whose body arrived

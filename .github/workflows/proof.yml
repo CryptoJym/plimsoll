@@ -247,6 +247,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-reconciliation
 
+      - name: Prove real Codex usage pairing and ledger upgrade
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-usage-pairing
+
       - name: Prove fair capture progress across concurrent generations
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-fairness
@@ -289,6 +293,14 @@ jobs:
       - name: Prove session summaries resume across moving daemon horizons (eco-6hoxj.163.86)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-cycle-resume
+
+      - name: Prove active-session edits and delivery acks do not stall summary sync (eco-6hoxj.163.87)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-live-churn
+
+      - name: Prove 0.7.41 and 0.7.39 downgrade privacy safety (eco-6hoxj.163.87)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-downgrade
 
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

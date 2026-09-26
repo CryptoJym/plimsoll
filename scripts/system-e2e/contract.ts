@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 10 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 11 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -226,7 +226,7 @@ const VOLATILE_NUMBER_KEYS = /^(?:pid|port|unreachablePort|standInDefaultPort|du
 // sweep the scheduler runs first, so normalize only that environmental split;
 // keep totals and unchanged counters in the semantic artifact.
 const RESOURCE_VOLATILE_NUMBER_PATH =
-  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata|startupFilesystemEntriesScanned|startupFilesystemEnumerationCalls|baselineFilesystemEntriesScanned|baselineFilesystemEnumerationCalls)))$/;
+  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|stableRuns|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata|startupFilesystemEntriesScanned|startupFilesystemEnumerationCalls|baselineFilesystemEntriesScanned|baselineFilesystemEnumerationCalls)))$/;
 
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
@@ -491,6 +491,14 @@ function assertResourceReceipt(receipt: unknown) {
     scenario("no_change_constant_work").measurements,
     "no-change measurements",
   );
+  // A wall-capped metadata sweep can take one extra zero-work turn. Bind the
+  // actual work and a fixture-derived turn ceiling before hiding that split.
+  const stableRuns = integer(noChangeMeasurements.stableRuns, "stable sweep turns");
+  assert.ok(stableRuns >= 1 && stableRuns <= 58, "stable sweep turn count exceeded fixture cap");
+  assert.equal(noChangeMeasurements.stableRunsUnchanged, true);
+  assert.equal(noChangeMeasurements.stableSweepCompleted, true);
+  assert.equal(integer(noChangeMeasurements.unchangedFilesystemEntriesScanned, "stable entries"), 1_706);
+  assert.equal(integer(noChangeMeasurements.unchangedFilesystemEnumerationCalls, "stable calls"), 6);
   assert.equal(integer(noChangeMeasurements.replayRolloutFilesRead, "replay rollout reads"), 1);
   assert.equal(integer(noChangeMeasurements.replayTranscriptFilesRead, "replay transcript reads"), 1);
   assert.equal(integer(noChangeMeasurements.replayEventsAppended, "replay appended events"), 0);

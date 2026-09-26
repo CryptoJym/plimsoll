@@ -116,6 +116,8 @@ test("helper guard (round 4): join.ts activation completes on today's code with 
   const [join, config] = await Promise.all([import("../../../packages/collector-cli/src/join"), import("../../../packages/collector-cli/src/config")]);
   const { acknowledgingFetch } = await import("../../../scripts/fixtures/delivery-ack-fixture");
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-lean-join-guard-"));
+  const previousPlimsollHome = process.env.PLIMSOLL_HOME;
+  process.env.PLIMSOLL_HOME = path.join(homeDir, ".plimsoll");
   try {
     const INSTALL_X = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa001", INSTALL_Z = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa002";
     const old = config.collectorConfigSchema.parse({ tenantId: "tenant-lean-contract", installKey: "pli_previous_install_key_x", cloudDeviceId: INSTALL_X, uploadUrl: "https://cloud.example/api/work-intelligence/ingest", managed: true, port: 49123 });
@@ -142,5 +144,9 @@ test("helper guard (round 4): join.ts activation completes on today's code with 
       assert.equal(binding?.currentWorkspaceId, "tenant-lean-contract");
       assert.ok(binding?.currentInstallationEpochId, "activation ran useWorkspace/transitionWorkspace with the join's installation epoch (join.ts:605-621), the step that will also record the joined install");
     } finally { ledger.close(); }
-  } finally { fs.rmSync(homeDir, { recursive: true, force: true }); }
+  } finally {
+    if (previousPlimsollHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = previousPlimsollHome;
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
 });

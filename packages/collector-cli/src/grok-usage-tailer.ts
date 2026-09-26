@@ -17,7 +17,7 @@ import {
   type GrokUsageSweepCounters,
 } from "./history-coverage";
 import type { CaptureBudgetStatus, CaptureWorkBudget } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, linkCoverageFile } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, linkCaptureCoverageDirectory, linkCoverageFile, openCaptureCoverageDirectory } from "./capture-frontier";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import { attachRepoContextId, canonicalRepoContextCwd } from "./repo-context";
 
@@ -793,6 +793,7 @@ function writeMaintenanceState(database: Database.Database, key: string, value: 
 }
 
 export class GrokUsageTailer {
+  private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private sweep: Sweep | null = null;
   private pending: Candidate[] = [];
   /** The recent lane and the walk can meet the same file; queue it once. */
@@ -811,6 +812,7 @@ export class GrokUsageTailer {
   }
 
   close() {
+    this.coverageDirectoryCache.clear();
     // A queued file this worker never read may belong to a session the
     // cursor has passed: this sweep can no longer claim it read everything.
     if (this.sweep && this.pending.length > 0 && !this.sweep.unclean) {
@@ -859,39 +861,34 @@ export class GrokUsageTailer {
       `select device, inode, size, mtime_ns as mtimeNs, ctime_ns as ctimeNs, mtime_ms as mtimeMs, status
        from ${FILE_STATE_TABLE} where file_key = ?`,
     );
-    const directories = (directory: string, limit: number) => {
-      const names: string[] = [];
-      const links: string[] = [];
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        if (entry.name.startsWith(".")) continue;
-        if (entry.isDirectory()) names.push(entry.name);
-        else if (entry.isSymbolicLink()) links.push(path.join(directory, entry.name));
-      }
-      // The sweep never reaches past its own limits, so neither can the check.
-      if (names.length > limit) throw new Error("grok_usage_coverage_over_limit");
-      return { names, links };
-    };
     const linkVerdict = (link: string, stat: fs.BigIntStats) =>
       linkCoverageFile(sha256(`plimsoll-grok-usage-v1\0${link}\0symlink`), Number(stat.birthtimeNs / 1_000_000n));
     return new CaptureCoverageWalk({
       roots: [root],
       maxEntries,
-      list: (directory, depth) => {
+      open: (directory, depth) => {
         if (depth === 0) {
           if (!realDirectory(directory)) {
             // The scan reads nothing through a symlinked sessions directory.
-            return { directories: [], files: [], links: isSymlink(directory) ? [directory] : [] };
+            return isSymlink(directory) ? linkCaptureCoverageDirectory(directory) : {
+              read: () => null, unchanged: () => !realDirectory(directory) && !isSymlink(directory),
+              close: () => undefined,
+            };
           }
-          const groups = directories(directory, this.limits.maxGroups);
-          return { directories: groups.names.map((name) => path.join(directory, name)), files: [], links: groups.links };
         }
-        if (!realDirectory(directory)) throw new Error("grok_usage_group_not_directory");
-        const sessions = directories(directory, this.limits.maxSessionsPerGroup);
-        return {
-          directories: [],
-          files: sessions.names.map((name) => path.join(directory, name, GROK_USAGE_FILE_NAME)),
-          links: sessions.links,
-        };
+        if (depth > 0 && !realDirectory(directory)) throw new Error("grok_usage_group_not_directory");
+        const limit = depth === 0 ? this.limits.maxGroups : this.limits.maxSessionsPerGroup;
+        let directories = 0;
+        return openCaptureCoverageDirectory(directory, (entry) => {
+          if (entry.name.startsWith(".")) return null;
+          const full = path.join(directory, entry.name);
+          if (entry.isDirectory()) {
+            if (++directories > limit) throw new Error("grok_usage_coverage_over_limit");
+            return depth === 0 ? { path: full, kind: "directory" } :
+              { path: path.join(full, GROK_USAGE_FILE_NAME), kind: "file" };
+          }
+          return entry.isSymbolicLink() ? { path: full, kind: "link" } : null;
+        }, this.coverageDirectoryCache, depth);
       },
       check: (file) => {
         let stat: fs.BigIntStats;

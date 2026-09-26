@@ -338,6 +338,8 @@ export class MaintenanceProcessBoundary {
 
   constructor(private readonly options: MaintenanceBoundaryOptions) {}
 
+  budgetChildPid(): number | null { return this.child?.pid ?? null; }
+
   status(): MaintenanceBoundaryStatus {
     return {
       state: this.state,

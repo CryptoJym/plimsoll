@@ -49,9 +49,15 @@ async function main() {
   for(const r of roots) for(let i=0;i<(r.source==='codex'?8:2);i++) {
     const f=path.join(leaf(r),`rollout-history-${i}.jsonl`);fs.writeFileSync(f,'PRIVATE_SYNTHETIC_HISTORY\n');history.add(f);
   }
-  let privateReads=0,maxSliceRecords=0,maxSliceBytes=0,oldDirectoriesOpened=0;
+  let privateReads=0,maxSliceRecords=0,maxSliceBytes=0,oldDirectoriesOpened=0,coverageOldDirectoriesOpened=0;
   const originalOpen=fs.opendirSync;
-  fs.opendirSync=((dir:any,...args:any[])=>{if(String(dir).includes(oldDir))oldDirectoriesOpened++;return (originalOpen as any)(dir,...args);}) as any;
+  fs.opendirSync=((dir:any,...args:any[])=>{
+    if(String(dir).includes(oldDir)){
+      if(new Error().stack?.includes('openCaptureCoverageDirectory'))coverageOldDirectoriesOpened++;
+      else oldDirectoriesOpened++;
+    }
+    return (originalOpen as any)(dir,...args);
+  }) as any;
   const io={...DEFAULT_JSONL_TAILER_IO,readTail:(...args:Parameters<typeof readJsonlTail>)=>{
     if(history.has(args[0])||args[0].startsWith(oldDir))privateReads++;
     maxSliceRecords=Math.max(maxSliceRecords,args[3]?.maxRecords??0);maxSliceBytes=Math.max(maxSliceBytes,args[3]?.maxBytes??0);
@@ -132,7 +138,7 @@ async function main() {
       check('new file discovered and captured amid existing backlog',Boolean(db.prepare('select 1 from buffered_events where session_id=? limit 1').get(sentinel)));
     }
     check('no pre-enrollment content read',privateReads===0);
-    check('no old-day enumeration / full rescan',oldDirectoriesOpened===0);
+    check('no old-day enumeration / full rescan',oldDirectoriesOpened===0&&coverageOldDirectoriesOpened>0);
     check('64-record and byte slice limits',maxSliceRecords<=64&&maxSliceBytes<=524288);
     check('actual projection transaction excludes competing writer',delayCalls>0&&competingBusy===delayCalls);
 
@@ -162,7 +168,7 @@ async function main() {
     manyTailer.close(); manyBuffer.close();
     const dbBytes=fs.statSync(path.join(base,'ledger.sqlite')).size;
     const summary={mode,passed:checks.every(c=>c.passed),expectedBaselineFailure:mode==='baseline'&&!advanced,
-      fixture:{codexFilesAtStart:16940,oldDayFiles:16906,preEnrollmentRecentFiles:history.size,newCodexFiles:26,newClaudeFiles:7,dirtySessionsSeeded:31421,ledgerBytes:dbBytes,projectionDelayMs:305,delayCalls,competingBusy,privateReads,oldDirectoriesOpened,maxSliceRecords,maxSliceBytes},
+      fixture:{codexFilesAtStart:16940,oldDayFiles:16906,preEnrollmentRecentFiles:history.size,newCodexFiles:26,newClaudeFiles:7,dirtySessionsSeeded:31421,ledgerBytes:dbBytes,projectionDelayMs:305,delayCalls,competingBusy,privateReads,oldDirectoriesOpened,coverageOldDirectoriesOpened,maxSliceRecords,maxSliceBytes},
       limits:'Real 200 ms cooperative clock and actual worker/tailers/SQLite; 60 s idle waits elided; synchronous injected repair may exceed 200 ms exactly as production permits. No physical 29.4 GB ledger or process deadline-kill recreation.',baselineRuns,checks,jobs};
     console.log(JSON.stringify(summary,null,2));
     process.exitCode=summary.passed?0:1;

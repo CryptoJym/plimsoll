@@ -1,4 +1,4 @@
-"""Real, SHA-pinned 0.7.38–0.7.40 packages against interrupted 0.7.41 retention.
+"""Real, SHA-pinned 0.7.38–0.7.40 packages against current 0.7.41+ retention.
 
 Called only by lifecycle-cross-version-proof.ts under a disposable CI HOME.
 The released cli.mjs bytes come from the published tarballs; the package's
@@ -189,7 +189,7 @@ def scenario(fixture, name):
 
 def main():
     require(NODE is not None and HEAD.is_file() and HOOK.is_file(), "Node, head build or fixture hook missing")
-    require(read_json(REPO / "packages/collector-cli/package.json")["version"] == "0.7.41", "head package version changed")
+    require(read_json(REPO / "packages/collector-cli/package.json")["version"] == "0.7.42", "head package version changed")
     temp = Path(os.environ["TMPDIR"]).resolve()
     require(temp.is_dir(), "CI TMPDIR is missing")
     # Packaged lifecycle paths require the install tree to be a strict child

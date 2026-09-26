@@ -1313,7 +1313,7 @@ async function main() {
   assert.equal(idle?.measurements.filesystemEnumerationObserved, true);
   assert.equal(idle?.measurements.filesystemMetadataObserved, true);
   assert.equal(idle?.measurements.filesystemMetadataFailuresBounded, true);
-  assert.equal(idle?.counters.fullHistoryFileReads, 2_610);
+  assert.equal(idle?.counters.fullHistoryFileReads, 2_608);
   assert.equal(idle?.counters.filesOpened, 2_614);
   assert.ok((idle?.counters.fileBytesRead ?? 0) > 0);
   assert.equal(idle?.counters.overlappingJobs, 0);

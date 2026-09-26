@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { AutomaticRetentionCadence } from "./retention-cadence";
+import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -120,6 +121,11 @@ import {
   type MaintenanceAttemptOutcome,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import {
+  buildCodexUsagePairingIndexes,
+  codexUsagePairingProgress,
+  codexUsagePairingStatus,
+} from "./codex-usage-pairing";
 import { sessionContextIndexStatus } from "./session-context-index";
 import {
   historyCoverageStatus,
@@ -189,6 +195,7 @@ import {
 } from "./lifecycle-command";
 import {
   composeLifecycleAdapter,
+  otherProcessesWithFilesOpen,
   resolveArtifactFromBundle,
   resolveSelfArtifact,
 } from "./lifecycle-adapters";
@@ -317,6 +324,7 @@ function printHelp() {
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
   status                Print local buffer and policy status as JSON
+  status --budget [--csv]  Print the advisory footprint and 24-hour sample CSV
                         (credentialed daemon /status; liveness is GET /healthz)
   maintenance --disable-account-assertion SOURCE --yes
                         Toggle one adapter; writes only account assertion state
@@ -351,6 +359,7 @@ Commands:
                         Read-only join of producer hook counters to collector
                         admission and the local ledger for one window
   export                Print buffered events as JSON
+  export --budget [--csv]  Export local footprint samples and daily table sizes
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   forward-hook-http SOURCE
                         Forward stdin to the authenticated loopback hook boundary without argv secrets.
@@ -519,6 +528,10 @@ Config tools:
       twice the ledger size (snapshot plus a rollback's copy) plus
       max(2 GiB, 5%). Clone-capable volumes need no copy space. The update
       itself refuses while any other process has the ledger open.
+  lifecycle pairing-indexes [--apply]
+      Preview index readiness, or build the three Codex usage pairing indexes
+      while the collector is stopped and producers spool. Refuses an open or
+      unprovably quiescent ledger; run before lifecycle update and restart.
   lifecycle snapshots list [--keep N] [--json]
       Every update snapshot and runtime version: created, size, method, the
       operation's state, and whether retention keeps it. Read-only.
@@ -2582,6 +2595,11 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    const pairingStatus = codexUsagePairingStatus(buffer.database);
+    if (!pairingStatus.enabled) {
+      console.warn(JSON.stringify({ warning: "codex_usage_pairing_disabled", reason: pairingStatus.reason,
+        missingIndexes: pairingStatus.missingIndexes }));
+    }
     // A worker thread copies its WAL back and keeps it bounded; the
     // connection's own automatic checkpoint stays only as a backstop
     // (wal-checkpoint-worker.ts).
@@ -2662,6 +2680,12 @@ async function main() {
       termGraceMs: 250,
       killGraceMs: 750,
     });
+    const budgetSampler = process.env.PLIMSOLL_BUDGET_SAMPLER === "off"
+      ? null : new BudgetSampler(buffer.database, collectorBufferPath(), 60_000,
+        () => buffer.budgetAttemptedTotal(), () => [
+          { pid: maintenanceBoundary.budgetChildPid(), role: "maintenance" as const },
+          { pid: enrichmentBoundary.budgetChildPid(), role: "enrichment" as const },
+        ].filter((child): child is { pid: number; role: "maintenance" | "enrichment" } => child.pid !== null));
     let detectedIdentities: Array<Record<string, unknown>> = [];
     try {
       detectedIdentities = readLocalIdentities().map((entry) => ({
@@ -2749,6 +2773,10 @@ async function main() {
       otlpSpool,
       syncStatus: () => syncBackoff.status(syncInFlight),
       walCheckpointStatus: () => walCheckpoint.status(),
+      budgetStatus: () => budgetSampler?.status() ?? { mode: "advisory", latest: null,
+        p50: null, p95: null, hostClass: null, targets: null,
+        targetStatus: "hypothesis", writeRateStatus: "uncalibrated_physical_bytes_unavailable",
+        unavailable: ["sampler_disabled"] },
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the
@@ -3113,13 +3141,14 @@ async function main() {
           // The one-time session context backfill keeps the repair cadence
           // while each maintenance job's bounded slice still advances it.
           const sessionIndex = sessionContextIndexStatus(buffer.database);
+          const pairing = codexUsagePairingProgress(buffer.database);
           return {
             pending: Object.values(projection.backlog).some(n => n > 0) ||
               !projection.backfill.complete || !projection.backfill.parityComplete || !projection.backfill.metricComplete ||
-              sessionIndex.state === "backfilling",
+              sessionIndex.state === "backfilling" || pairing.pending,
             units: Object.values(repairs.stages).reduce((sum, stage) => sum + stage.rowsVisited, 0) +
               projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited +
-              sessionIndex.backfill.rowsVisited,
+              sessionIndex.backfill.rowsVisited + pairing.units,
           };
         },
         retryNotBefore: () => {
@@ -3179,6 +3208,7 @@ async function main() {
 
     retentionCadence.start();
     walCheckpoint.start();
+    budgetSampler?.start();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
@@ -3261,6 +3291,7 @@ async function main() {
 
     const stopMaintenanceBeforeFatalExit = async () => {
       void walCheckpoint.stop();
+      budgetSampler?.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
@@ -3312,6 +3343,7 @@ async function main() {
       shuttingDown = true;
       flushRejectionSummaries();
       void walCheckpoint.stop();
+      budgetSampler?.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
@@ -3537,6 +3569,20 @@ async function main() {
   }
 
   if (command === "status") {
+    if (flag("--budget")) {
+      const ledgerPath = collectorBufferPath();
+      if (!fs.existsSync(ledgerPath)) {
+        console.log(flag("--csv") ? "" : JSON.stringify({ mode: "advisory", latest: null,
+          unavailable: ["ledger_missing"] }, null, 2));
+        return;
+      }
+      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      try {
+        console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
+          : JSON.stringify({ ...budgetStatus(ledger), daily: budgetDailyRows(ledger) }, null, 2));
+      } finally { ledger.close(); }
+      return;
+    }
     const buffer = openBuffer(config);
     // Bead eco-6hoxj.61 (review r1, F5): the hook spool's kill switch belongs
     // to the daemon, which reads it once when its drain starts. Ask the daemon.
@@ -3599,6 +3645,7 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
+          codexUsagePairing: codexUsagePairingStatus(buffer.database),
           sessionAttribution: sessionContextIndexStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
@@ -5698,6 +5745,20 @@ async function main() {
   }
 
   if (command === "export") {
+    if (flag("--budget")) {
+      const ledgerPath = collectorBufferPath();
+      if (!fs.existsSync(ledgerPath)) {
+        console.log(flag("--csv") ? "" : JSON.stringify({ schema: "plimsoll-budget-export/v1",
+          mode: "advisory", startedDay: null, samples: [], daily: [] }, null, 2));
+        return;
+      }
+      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      try {
+        console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
+          : JSON.stringify(budgetExport(ledger), null, 2));
+      } finally { ledger.close(); }
+      return;
+    }
     const buffer = openBuffer(config);
     const requestedLimit = optionValue("--limit") ? Number(optionValue("--limit")) : 5;
     const limit = Number.isFinite(requestedLimit)
@@ -6221,8 +6282,48 @@ async function main() {
 
   if (command === "lifecycle") {
     const action = process.argv[3] ?? "";
-    if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots"].includes(action)) {
-      throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots");
+    if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots", "pairing-indexes"].includes(action)) {
+      throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots|pairing-indexes");
+    }
+    if (action === "pairing-indexes") {
+      if (process.argv.slice(4).some((arg) => arg !== "--apply") ||
+          process.argv.slice(4).filter((arg) => arg === "--apply").length > 1) {
+        throw new Error("lifecycle pairing-indexes takes only an optional --apply");
+      }
+      const apply = flag("--apply");
+      const ledgerPath = collectorBufferPath();
+      if (!fs.existsSync(ledgerPath) || !fs.lstatSync(ledgerPath).isFile()) {
+        throw new Error("pairing index upgrade requires an existing regular ledger");
+      }
+      const openFiles = [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`];
+      const others = otherProcessesWithFilesOpen(openFiles);
+      if (apply && (others === null || others.length > 0)) {
+        throw new Error(others === null ? "pairing index upgrade cannot prove ledger quiescence" :
+          "pairing index upgrade requires every other ledger connection to be stopped");
+      }
+      const database = new Database(ledgerPath, { readonly: !apply, fileMustExist: true, timeout: 0 });
+      try {
+        const before = codexUsagePairingStatus(database);
+        if (!apply) {
+          console.log(JSON.stringify({ operation: "pairing_indexes", applied: false, ...before }, null, 2));
+          return;
+        }
+        // WAL EXCLUSIVE mode retains the ledger lock between the three atomic
+        // CREATE INDEX statements. An idle second connection is caught by lsof.
+        database.pragma("locking_mode = EXCLUSIVE");
+        database.exec("BEGIN EXCLUSIVE; COMMIT");
+        const stillOpen = otherProcessesWithFilesOpen(openFiles);
+        if (stillOpen === null || stillOpen.length > 0) {
+          throw new Error("pairing index upgrade lost exclusive ledger ownership");
+        }
+        const timings = buildCodexUsagePairingIndexes(database);
+        const after = codexUsagePairingStatus(database);
+        if (!after.enabled) throw new Error("pairing index upgrade did not build every index");
+        console.log(JSON.stringify({ operation: "pairing_indexes", applied: true, before, after, timings }, null, 2));
+      } finally {
+        database.close();
+      }
+      return;
     }
     // Checked before any action runs, so a misplaced or mistyped --retention never falls back to pruning.
     const keepAll = lifecycleRetentionKeepAll([action, ...process.argv.slice(4)]);
@@ -6465,13 +6566,20 @@ async function main() {
   if (command === "purge-local-data") {
     const confirmed = flag("--confirm");
     const includeConfig = flag("--include-config");
+    const ledgerPath = collectorBufferPath();
     const targets = [
       {
-        exists: fs.existsSync(collectorBufferPath()),
+        exists: fs.existsSync(ledgerPath),
         label: "local event buffer",
-        path: collectorBufferPath(),
+        path: ledgerPath,
         purged: false,
       },
+      ...(["-wal", "-shm"] as const).map((suffix) => ({
+        exists: fs.existsSync(`${ledgerPath}${suffix}`),
+        label: `local event buffer ${suffix.slice(1)}`,
+        path: `${ledgerPath}${suffix}`,
+        purged: false,
+      })),
       {
         exists: fs.existsSync(collectorLogPath("collector.pid")),
         label: "foreground daemon pid file",
@@ -6491,10 +6599,30 @@ async function main() {
     ];
 
     if (confirmed) {
+      const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
+      const pidState = pidRead.kind === "current" ? classifyProcessIdentity(pidRead.record)
+        : pidRead.kind === "legacy" ? (() => {
+          try { process.kill(pidRead.pid, 0); return "live"; }
+          catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "stale" : "indeterminate"; }
+        })() : pidRead.kind === "missing" ? "stale" : "indeterminate";
+      if (pidState !== "stale") throw new Error(`purge_requires_stopped_collector:${pidState}`);
+      const listener = await observeCollectorListener(config.port);
+      if (listener.kind !== "absent") throw new Error(`purge_requires_closed_listener:${listener.kind}`);
+      if (fs.existsSync(ledgerPath)) {
+        if (!fs.lstatSync(ledgerPath).isFile()) throw new Error("purge_ledger_not_regular_file");
+        const ledger = new Database(ledgerPath, { fileMustExist: true, timeout: 0 });
+        try {
+          const checkpoint = ledger.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
+          if (checkpoint[0]?.busy !== 0) throw new Error("purge_wal_checkpoint_busy");
+        } finally { ledger.close(); }
+      }
       for (const target of targets) {
-        if (!target.exists) continue;
+        if (!fs.existsSync(target.path)) continue;
         fs.rmSync(target.path, { force: true, recursive: false });
         target.purged = true;
+      }
+      if ([ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`].some((file) => fs.existsSync(file))) {
+        throw new Error("purge_ledger_sidecar_remains");
       }
     }
 

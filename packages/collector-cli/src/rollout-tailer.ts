@@ -14,6 +14,7 @@ import {
 import {
   DEFAULT_JSONL_TAILER_IO,
   ensureJsonlScanState,
+  jsonlScanStateKey,
   loadJsonlScanCursor,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
@@ -31,6 +32,8 @@ import {
   type CaptureScanProgress,
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
+  captureBaselineExcludedSize,
+  captureBaselinePostEnrollmentOffset,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -46,7 +49,9 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
+import { CaptureRevisitQueue } from "./capture-revisit-queue";
+import { recordCaptureRecordLoss } from "./capture-record-loss";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -135,6 +140,9 @@ export type RolloutScanResult = {
   parseErrors: number;
   unresolvedRecords: number;
   recordsParsed: number;
+  skippedRecords?: number;
+  skippedBytes?: number;
+  skippedKinds?: Record<string, { records: number; bytes: number }>;
   /** Complete records included in successful cursor transactions. */
   recordsCommitted?: number;
   continuationBytesAdvanced?: number;
@@ -190,6 +198,7 @@ type RolloutParserState = {
   planType?: string;
   previous: TokenTotals;
   tokenCountIndex: number;
+  counterUncertain?: boolean;
   contextOccurrenceIndex: number;
   activeRepoContextId?: string;
 };
@@ -252,6 +261,7 @@ function validateRolloutParserState(value: unknown): RolloutParserState | undefi
       "planType",
       "previous",
       "tokenCountIndex",
+      "counterUncertain",
       "contextOccurrenceIndex",
       "activeRepoContextId",
       // Accepted only to migrate old checkpoints without rebuilding or
@@ -265,6 +275,7 @@ function validateRolloutParserState(value: unknown): RolloutParserState | undefi
     return undefined;
   }
   if (!isTokenTotals(value.previous)) return undefined;
+  if (value.counterUncertain !== undefined && typeof value.counterUncertain !== "boolean") return undefined;
   if (
     typeof value.tokenCountIndex !== "number" ||
     !Number.isSafeInteger(value.tokenCountIndex) ||
@@ -302,6 +313,7 @@ function validateRolloutParserState(value: unknown): RolloutParserState | undefi
     checkpointVersion: CHECKPOINT_VERSION,
     previous: { ...value.previous },
     tokenCountIndex: value.tokenCountIndex,
+    ...(value.counterUncertain ? { counterUncertain: true } : {}),
     contextOccurrenceIndex,
     ...(conversationId ? { conversationId: conversationId.toLowerCase() } : {}),
     ...(sessionStartedAt ? { sessionStartedAt } : {}),
@@ -401,6 +413,8 @@ function restoreResultMutationSnapshot(
 }
 
 export class RolloutTailer {
+  private readonly revisit = new CaptureRevisitQueue();
+  private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
@@ -424,32 +438,44 @@ export class RolloutTailer {
       return new CaptureCoverageWalk(null);
     }
     const verdict = jsonlCoverageCheck(this.buffer.database);
+    const baselineComplete = captureBaselineStatus(this.buffer.database).status === "complete";
+    const known = new KnownPartialJsonlFiles(this.buffer.database, PARSER_KIND);
+    const firstCheck = !hasCompleteCaptureCoverage(this.buffer.database, "codex");
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.sessionsDir],
       maxEntries,
-      list: (directory, depth) => {
+      failOnMissing: true,
+      missingFromRestart: true,
+      prepareKnown: (maxRows) => known.prepare(maxRows),
+      unlistedFiles: () => known.unlistedFiles(),
+      changedDirectory: firstCheck ? (directory) => changedDirectoryCoverageFile("codex", directory) : undefined,
+      open: (directory, depth) => openCaptureCoverageDirectory(directory, (entry) => {
+        const full = path.join(directory, entry.name);
         if (depth < 3) {
-          const listing = { directories: [] as string[], files: [], links: [] as string[] };
-          for (const entry of this.io.readDirents(directory)) {
-            if (entry.isDirectory()) listing.directories.push(path.join(directory, entry.name));
-            else if (entry.isSymbolicLink()) listing.links.push(path.join(directory, entry.name));
-          }
-          return listing;
+          if (entry.isDirectory()) return { path: full, kind: "directory" };
+          if (entry.isSymbolicLink()) return { path: full, kind: "link" };
+        } else if (entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
+          // The check below classifies symlinked rollouts as uncovered links.
+          return { path: full, kind: "file" };
         }
-        // A symlinked rollout is listed here and checked as a link.
-        return {
-          directories: [],
-          files: this.io.readNames(directory).filter((name) => name.startsWith("rollout-") && name.endsWith(".jsonl"))
-            .map((name) => path.join(directory, name)),
-        };
-      },
+        return null;
+      }, this.coverageDirectoryCache, depth),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
-        return stat ? verdict(this.cursorKey(file), stat) : null;
+        const checked = verdict(this.cursorKey(file), stat);
+        if (checked && stat?.isFile() && !checked.fullyRead) {
+          const baselineSize = baselineComplete
+            ? captureBaselineExcludedSize(this.buffer.database, "codex", baselineObservation(file, stat)) : null;
+          if (baselineSize === null || stat.size > baselineSize) this.revisit.offer(file);
+          else this.revisit.remove(file);
+        } else this.revisit.remove(file);
+        if (checked) known.checked(checked.key);
+        return checked;
       },
       checkLink: (link) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), link);
-        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat) : null;
+        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat)
+          : stat === null ? linkCoverageFile(jsonlScanStateKey(`${this.cursorKey(link)}\0symlink`), 0) : null;
       },
     });
   }
@@ -488,6 +514,7 @@ export class RolloutTailer {
   }
 
   close() {
+    this.coverageDirectoryCache.clear();
     this.baselineAttempt?.discovery.close();
     this.captureAttempt?.discovery.close();
     this.baselineAttempt = null;
@@ -660,6 +687,7 @@ export class RolloutTailer {
       this.captureAttempt?.discovery.close();
       this.baselineAttempt = null;
       this.captureAttempt = null;
+      this.revisit.clear();
       rememberCaptureSweepResume(this.buffer.database, "codex", null);
     }
     if (options.deferredBeforeIo) {
@@ -887,9 +915,13 @@ export class RolloutTailer {
     const discoveredFiles: Array<{ file: string; stat?: fs.Stats; precise?: fs.BigIntStats; servicedCadences?: number }> = automaticDiscovery
       ? automaticDiscovery.files
       : explicitDiscovery!.files.map((file) => ({ file }));
+    if (automatic?.phase === "capture") {
+      const known = new Set(discoveredFiles.map((entry) => entry.file));
+      for (const file of this.revisit.next()) if (!known.has(file)) discoveredFiles.push({ file });
+    }
     result.activity.truncated = discovery.truncated;
     result.discoveryErrors = discovery.errors + rootErrors;
-    result.filesSeen = discovery.files.length;
+    result.filesSeen = discoveredFiles.length;
     // Directory entries visited this cadence, never the files they matched:
     // this number is published as `entriesThisTick` beside `entriesThisSweep`,
     // which counts entries too. `discovery.files` on the automatic path is the
@@ -901,6 +933,7 @@ export class RolloutTailer {
       file: string;
       stat: fs.Stats;
       cursor: JsonlScanCursor<RolloutParserState> | undefined;
+      initialOffset?: number;
     }> = [];
     const automaticFilesConsumed = new Set<string>();
     const automaticFilesPartial = new Set<string>();
@@ -952,6 +985,7 @@ export class RolloutTailer {
       }
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
       const observation = baselineObservation(file, stat, discovered.precise);
+      let growthStart: number | null = null;
       if (automatic?.phase === "capture") {
         const decision = classifyCaptureBaselineFile(
           this.buffer.database,
@@ -960,10 +994,13 @@ export class RolloutTailer {
           { mode: "automatic", observedAt: scanNow.toISOString() },
         );
         if (decision.decision === "exclude") {
-          result.excludedGenerations += 1;
-          result.excludedBytes += stat.size;
-          consumeAutomaticFile(file);
-          continue;
+          if (stat.size <= decision.baselineSize) {
+            result.excludedGenerations += 1;
+            result.excludedBytes += stat.size;
+            consumeAutomaticFile(file);
+            continue;
+          }
+          growthStart = decision.baselineSize;
         }
         if (decision.decision === "block") {
           result.statErrors += 1;
@@ -985,13 +1022,19 @@ export class RolloutTailer {
         }
       }
       const cursor = loadJsonlScanCursor<RolloutParserState>(
-        this.buffer.database,
-        this.cursorKey(file),
-        PARSER_KIND,
-        CHECKPOINT_VERSION,
-        validateRolloutParserState,
+        this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateRolloutParserState,
       );
-      candidates.push({ file, stat, cursor });
+      let initialOffset: number | undefined;
+      if (growthStart !== null) {
+        if (cursor && (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart)) {
+          result.excludedGenerations += 1;
+          result.excludedBytes += stat.size;
+          consumeAutomaticFile(file);
+          continue;
+        }
+        if (!cursor) initialOffset = growthStart;
+      }
+      candidates.push({ file, stat, cursor, initialOffset });
     }
 
     // Resume already-cursored growth first, then newest new generations. A
@@ -1066,15 +1109,18 @@ export class RolloutTailer {
             const root = rootForFile(this.captureRoots, candidate.file);
             const next = readJsonlContinuation(candidate.file, candidate.stat, cursor, limits, this.io, {
               database: this.buffer.database, provider: "codex", cursorKey: this.cursorKey(candidate.file), root: root ?? undefined,
-              directory: root?.directory ?? this.sessionsDir,
+              directory: root?.directory ?? this.sessionsDir, initialOffset: candidate.initialOffset,
               deadline: automatic ? automatic.budget.unitDeadline() : performance.now() + 200,
               eligible: () => {
                 if (options.signal?.aborted) return false;
                 if (this.inventoryConfigured && !root) return false;
                 if (automatic?.phase !== "capture") return true;
                 const fresh = this.regularFileStat(candidate.file);
-                return classifyCaptureBaselineFile(this.buffer.database, "codex", baselineObservation(candidate.file, fresh),
-                  {mode:"automatic", observedAt:scanNow.toISOString()}).decision === "capture";
+                const observation = baselineObservation(candidate.file, fresh);
+                const decision = classifyCaptureBaselineFile(this.buffer.database, "codex", observation,
+                  {mode:"automatic", observedAt:scanNow.toISOString()});
+                return decision.decision === "capture" || decision.decision === "exclude" &&
+                  captureBaselinePostEnrollmentOffset(this.buffer.database, "codex", observation) !== null;
               },
             });
             if (!next) {
@@ -1157,6 +1203,15 @@ export class RolloutTailer {
                 return;
               }
               const parseErrorsBefore = result.parseErrors;
+              if (read.skippedRecord) {
+                recordCaptureRecordLoss(this.buffer.database, {
+                  source: "codex", fileKey: jsonlScanStateKey(this.cursorKey(candidate.file)), record: read.skippedRecord,
+                });
+                if (read.skippedRecord.usagePossible) {
+                  initialState.counterUncertain = true;
+                  initialState.tokenCountIndex += 1;
+                }
+              }
               const parserState = this.ingestLines(
                 read.lines,
                 result,
@@ -1178,6 +1233,14 @@ export class RolloutTailer {
               );
             });
             committed = true;
+            if (read.skippedRecord) {
+              result.skippedRecords = (result.skippedRecords ?? 0) + 1;
+              result.skippedBytes = (result.skippedBytes ?? 0) + read.skippedRecord.bytes;
+              result.skippedKinds ??= {};
+              const kind = read.skippedRecord.kind;
+              const count = result.skippedKinds[kind] ?? { records: 0, bytes: 0 };
+              result.skippedKinds[kind] = { records: count.records + 1, bytes: count.bytes + read.skippedRecord.bytes };
+            }
             if (read.lines.length || read.continuation?.scanBytesAdvanced) this.continuationAdmission.progressed(candidateHash);
             result.continuationBytesAdvanced = (result.continuationBytesAdvanced ?? 0) + (read.continuation?.scanBytesAdvanced ?? 0);
             if (read.continuation?.reason) {
@@ -1371,6 +1434,7 @@ export class RolloutTailer {
 
   private consumeAutomaticCaptureFiles(files: ReadonlySet<string>, partial: ReadonlySet<string>) {
     const attempt = this.captureAttempt;
+    for (const file of files) if (!partial.has(file)) this.revisit.remove(file);
     if (!attempt) return;
     attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
@@ -1616,11 +1680,12 @@ export class RolloutTailer {
         // first total legitimately anchors the baseline: later deltas from
         // that observed zero are validated marginals (tokenCountIndex > 0).
         const lineageFirstUnknown =
-          state.tokenCountIndex === 0 && isZeroTotals(state.previous) && !isZeroTotals(totals)
+          (state.counterUncertain || state.tokenCountIndex === 0 && isZeroTotals(state.previous)) && !isZeroTotals(totals)
             ? totals
             : undefined;
         const delta = diff(totals, state.previous);
         state.previous = totals;
+        state.counterUncertain = false;
         if (delta.input === 0 && delta.output === 0) continue; // periodic no-op emission
         pending.push({
           index: state.tokenCountIndex,

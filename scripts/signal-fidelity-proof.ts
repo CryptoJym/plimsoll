@@ -1974,6 +1974,12 @@ async function main() {
   const before = buffer.stats().unuploadedCount;
   const first = await uploadBufferedEvents(uploadConfig, buffer, { limit: 4 });
   const second = await uploadBufferedEvents(uploadConfig, buffer, { limit: 500 });
+  // Codex response usage waits 60 s for its matching SSE log/span. Prove the
+  // ordinary watermark drain leaves exactly that held row, then releases it.
+  const heldAtSecond = buffer.delivery.status();
+  const afterHold = await uploadBufferedEvents(uploadConfig, buffer, {
+    limit: 500, now: () => new Date(Date.now() + 61_000),
+  });
   const deliveryAfterUpload = buffer.delivery.status();
   const deliveryReceiptReasons = buffer.database
     .prepare(`select terminal_state as state, reason, count(*) as n from upload_receipts group by terminal_state, reason order by state, reason`)
@@ -1992,14 +1998,20 @@ async function main() {
     "upload_watermark_drains",
     before > 0 &&
       first.markedUploaded === 4 &&
-      second.remainingUnuploaded === 0 &&
-      second.remainingDelivery === 0 &&
+      second.remainingUnuploaded === 1 &&
+      second.remainingDelivery === 1 &&
+      heldAtSecond.remainingDelivery === 1 &&
+      afterHold.markedUploaded === 1 &&
+      afterHold.remainingUnuploaded === 0 &&
+      afterHold.remainingDelivery === 0 &&
       deliveryAfterUpload.remainingDelivery === 0 &&
       deliveryAfterUpload.receipts.dead === 0 &&
       buffer.stats().unuploadedCount === 0,
     JSON.stringify({
       before,
       firstMarked: first.markedUploaded,
+      heldAfterSecond: heldAtSecond.remainingDelivery,
+      releasedAfterHold: afterHold.markedUploaded,
       after: buffer.stats().unuploadedCount,
       remainingDelivery: deliveryAfterUpload.remainingDelivery,
       receipts: deliveryReceiptReasons,

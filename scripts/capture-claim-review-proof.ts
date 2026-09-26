@@ -6,9 +6,9 @@
  * shape. Since r4 it imports the frontier API by name: a namespace import of
  * that module would trip proof:capacity's conservative rule. The scenarios:
  *
- * - B1: the reviewer's Codex day-folder scenario (real tailers, real
- *   maintenance cadences), then the Claude transcript left unread past the
- *   48-hour window. Time passing is a shifted wall clock.
+ * - B1: the reviewer's old Codex day-folder and aged Claude transcript
+ *   scenarios (real tailers, real maintenance cadences). They must now be
+ *   captured before a later claim attests them. Time is a shifted wall clock.
  * - B3: a claim that cannot attest says why, so the cloud withdraws.
  * - S2: dead letters are bounded gaps; privacy refusals are withheld, not gaps.
  * - S4: spooled push events bound the claim; rejected or expired ones are gaps.
@@ -184,7 +184,7 @@ async function b1CodexDayFolder() {
   writeSession(3, older, new Date(Date.now() - 3 * DAY).toISOString(), usageAt);
   for (let i = 0; i < 3; i += 1) await world.run();
   const claimNow = world.finalClaim();
-  // Three hours later, still never read: the automatic cadences keep running.
+  // Three hours later, both files have been read and the lagged claim can attest.
   clockShiftMs = 3 * HOUR;
   for (let i = 0; i < 3; i += 1) await world.run();
   const claimLater = world.finalClaim();
@@ -195,8 +195,8 @@ async function b1CodexDayFolder() {
   };
   world.maintenance.close();
   world.buffer.close();
-  check("B1_codex_rollout_in_older_day_folder_is_never_attested",
-    detail.todayEvents > 0 && detail.olderEvents === 0 && !attests(claimNow, usageAt) && !attests(claimLater, usageAt) &&
+  check("B1_codex_rollout_in_older_day_folder_is_captured_before_attestation",
+    detail.todayEvents === 2 && detail.olderEvents === 2 && !attests(claimNow, usageAt) && attests(claimLater, usageAt) &&
       claimLater.through !== null && claimLater.through > usageAt,
     detail);
 }
@@ -220,8 +220,8 @@ async function b1ClaudeTranscriptPast48Hours() {
   const detail = { baseline: world.baseline, usageAt, sessionEvents: world.eventsFor(session), claim };
   world.maintenance.close();
   world.buffer.close();
-  check("B1_claude_transcript_left_unread_past_48_hours_is_never_attested",
-    detail.sessionEvents === 0 && !attests(claim, usageAt) && claim.through !== null && claim.through > usageAt,
+  check("B1_claude_transcript_past_48_hours_is_captured_before_attestation",
+    detail.sessionEvents === 1 && attests(claim, usageAt) && claim.through !== null && claim.through > usageAt,
     detail);
 }
 
