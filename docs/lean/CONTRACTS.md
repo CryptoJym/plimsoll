@@ -302,16 +302,23 @@ the answer is an actor of the uploader's own ledger or nobody) and S9 (the unlin
 nobody's at 300, U re-joins without proof at 500, X is rebound to C as 2 at 600, U's delivery at 700 is held, the admin links U at
 800 and the delivery at 850 is nobody's like the member; the honest `(X, 1)` is B's on both paths; the link's re-key keeps U's own
 poisoned `(U, 1)` nobody's after U is rebound to 1; a linked re-join is judged at once as in round 10; a copied key passes the
-possession proof): 60 checks, r6 21/60, r7 29/60, r8 44/60, r9 47/60, **r10 54/60**, r11 60/60 (`--rule r8` is round 8 as written:
-the late answer replaces the pair, no lock, the fact keyed by the named install; `--rule r9` is round 9 as written: the lock on the
-read of `binding_version` only, the fact keyed by the uploader, no lifecycle rule; `--rule r10` is round 10 as written: a pair judged
-against the install it names in the uploader's ledger's view, whichever ledger uploads it).
+possession proof); **round 12** adds section 15 (the chain: U, an unlinked root, has a proof-linked child V whose own future pair
+`(V, 1)` is a fact in ledger U; the admin links U into X at 800 and V is rebound to E as 1 at 900: `(V, 1)` is nobody's on V's own
+judgment and on U's upload, nothing is left in ledger U, one audit row records 2 installs moved and 1 fact re-keyed with every
+moved install stamped, and a second link of U or V is refused; the destination: a link of a fresh root F into Zl, a member of X's
+ledger, is refused naming X, a link into another tenant's root is refused, the link into X succeeds and F's rows naming X's pairs
+are judged; links compose: X linked into Y moves X, Zl, U, V and F with every fact): 69 checks, r6 23/69, r7 31/69, r8 46/69,
+r9 48/69, r10 56/69, **r11 60/69**, r12 69/69 (`--rule r8` is round 8 as written: the late answer replaces the pair, no lock, the
+fact keyed by the named install; `--rule r9` is round 9 as written: the lock on the read of `binding_version` only, the fact keyed
+by the uploader, no lifecycle rule; `--rule r10` is round 10 as written: a pair judged against the install it names in the
+uploader's ledger's view, whichever ledger uploads it; `--rule r11` is round 11 as written: the admin link moves one install and
+re-keys its old ledger's facts, with no destination check).
 
 **Judgment state.** Validity is decided at the first sighting of `(install, V)` and recorded; a version that did not exist then is
 invalid on both paths for ever. Parts are computed per received revision and frozen at the seal; a raw row's actor is bound once at
 ingest; because the fact precedes both, the rebind cannot slip between a sighting's read and its fact, every input is read after the
-lock, every install of the ledger reads the same fact (round 10), and a pair naming an install outside the ledger is never judged
-until the ledger is linked (round 11), neither can differ from the other.
+lock, every install of the ledger reads the same fact (round 10), a pair naming an install outside the ledger is never judged
+until the ledger is linked (round 11), and a link moves a ledger whole with its facts (round 12), neither can differ from the other.
 
 **Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 15 cases): the reviewer's issued-but-unheard row,
 the honest orderings and the A→B→A reversal, the never-issued stamp, the first-sighting rule with the replay and the repair, the
@@ -319,7 +326,7 @@ re-join (honest, pre-re-join outbox row, faulty, null after the join), C4, `firs
 attributed only to the install it names, and the diagnostics, `eventRowsForStorage` binding by the pair against the view loaded under
 the lock (a not-issued pair yields one new fact for the uploader's ledger, an unknown install fails closed and records **no** fact),
 the ledger-keyed fact across a re-join (X's fact binds Z and Z's binds X, before and after X is rebound up to the version), lifecycle,
-`acknowledgedResponse` (with `lineage`, round 11), the per-actor parts, and (round 11) another Mac's install refused before any
+`acknowledgedResponse` (with `lineage`, round 11, and `ledgerInstallId`, round 12), the per-actor parts, and (round 11) another Mac's install refused before any
 judgment with no fact anywhere (R7, test 11), S8 on both paths and through `eventRowsForStorage` (test 14), S9 held and then judged
 after the link with the null-stamp exception untouched (test 15); `actor-binding-stamp-postgres.contract.test.ts` (B6, 9 cases on the
 repository's disposable Postgres cluster, set up as `checks/postgres-harness-repaired-probe.log` proves): the fact in the sighting's own
@@ -327,10 +334,15 @@ transaction, replay after the version is issued and a revoked install's issued p
 and the concurrent mirror order, R6 and R7 by the ledger, `loadSightingView` lock-first with the reviewer's ordering replayed through
 it, one ledger under two installs with the join's lineage proof, retention with the erasure-only guard and erasure with zero residue,
 and (round 11) `cluster()` stopping the cluster on any set-up failure, R7 refusing (case 4), S8, S9 with the admin link, its re-key
-and the linked-once rule (case 8), and the join route driven through `fixtures/join-route-child.ts` (case 9: a reused token refused
-with no install created, a proof replayed under a fresh token and a previous install of another tenant joining unlinked, the linked
-grant with `lineage`); `schema-additions.contract.test.ts` (5 cases: the columns with the link's audit columns (round 11), the fact with its tenant, ledger, recording install and install reference,
-the plan's erasure order and the residue check, the guard migration, the other additions). Collector
+and the linked-once rule, and (round 12) the link as a whole-ledger merge: the chain (a proof-linked child moves with its unlinked
+root, its poisoned pair never flips, nothing is stranded), a member as source, a non-root destination, another tenant's install and
+the source itself refused with nothing moved, one audit row, links composing, and the merge serializing against a join into the
+chain in both orders and against a sighting holding a member (case 8, with P seeded server-bound to B as the S8 ordering has it),
+and the join route driven through `fixtures/join-route-child.ts` (case 9: a reused token refused with no install created, a proof
+replayed under a fresh token and a previous install of another tenant joining unlinked, the linked grant with `lineage`);
+`schema-additions.contract.test.ts` (5 cases: the columns with the link's audit columns (round 11) and the one-row ledger-link audit
+table (round 12), the fact with its tenant, ledger, recording install and install reference, the plan's erasure order (the link audit
+rows included, round 12) and the residue check, the guard migration, the other additions). Collector
 `tests/contracts/lean/actor-stamp.contract.ts` (B2a, 12 cases): null before the first response, the pair on the identity row and never
 lowered within one install, the echo with its install and the pair on the wire, both keys allowlisted through the seal, the scope
 cleared by a re-join and a transition with the new install's 0 accepted, join activation recording the new install with the
@@ -338,8 +350,9 @@ handshake's version while a pre-re-join row keeps its pair, the old install's la
 through `join.ts` with a fake cloud (the handshake's version recorded only when its `deviceId` is the grant's install; the join request's
 `previousInstall` proof), the pre-B2a seed and `joined_install_unknown`, the partial join reported as `join_incomplete` with the echo
 naming the ledger's install, the flood refusal splitting a summary batch, and (round 11) a delivery refused as
-`stamp_from_other_ledger` split the same way, its rows parked and never judged, retried on `lineage: linked` or released by an
-admin as undeliverable (test 12); `helper.contract.ts` gains a green guard proving that `join.ts` activation completes on today's
+`stamp_from_other_ledger` split the same way, its rows parked and never judged, retried when a response names a ledger other than
+the one they were parked under (round 12: the response names the ledger beside its lineage, so a member of a merged chain retries
+too, and a response for the same ledger changes nothing) or released by an admin as undeliverable (test 12); `helper.contract.ts` gains a green guard proving that `join.ts` activation completes on today's
 code with a fake cloud.
 
 ## C2. S1b runway: G per host, one G, G owed (review-r6 blocker 2 and should-fix 5; review-r1 blocker 2 and should-fix 5; review-r2 should-fixes 5-6; B1, B10a and B2a collector)
