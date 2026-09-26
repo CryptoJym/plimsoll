@@ -43,6 +43,7 @@ import { TranscriptTailer } from "../packages/collector-cli/src/transcript-taile
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
 import { incrementalCoverageChecks } from "./lib/capture-coverage-incremental";
+import { deletionCoverageChecks } from "./lib/capture-coverage-deletions";
 
 // maintenance.ts checkCaptureCoverage steps one coverage walk per source in a
 // turn: codex, claude_code and grok.
@@ -53,7 +54,7 @@ const COVERAGE_SOURCES = 3;
  * this proof until the new ceiling is reviewed and written here. */
 const RELEASE_MAX_WORK_PER_TURN = 4_096;
 
-const completion = createProofCompletion("capture-claim-review-r4", 21);
+const completion = createProofCompletion("capture-claim-review-r4", 24);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
 const check = (name: string, passed: boolean, detail: Record<string, unknown>) => {
   completion.check(name, passed);
@@ -420,7 +421,8 @@ async function grokCoverage() {
 }
 
 async function main() {
-  for (const step of [r3s2, r3s4, r3s5, coverageTurnBudget, () => incrementalCoverageChecks(check), r3n4, grokCoverage]) {
+  for (const step of [r3s2, r3s4, r3s5, coverageTurnBudget, () => incrementalCoverageChecks(check),
+    () => deletionCoverageChecks(check), r3n4, grokCoverage]) {
     try {
       await step();
     } catch (error) {

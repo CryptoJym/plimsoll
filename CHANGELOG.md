@@ -98,15 +98,21 @@ does not transfer its sessions to a tailer.
   each source within 4,096 work units per turn. A large Codex day folder can
   keep growing while coverage works through it; the check resumes its open
   directory cursor and finishes, and later files are picked up by this check
-  or the next one. The queue stays at 4,096 files. A folder removed or renamed,
-  or a listed Codex or Claude file removed before its check, makes the check
-  incomplete. Small changed folders get one verifying restart. Small unchanged
-  folders reuse a bounded list of names on later checks; every file is still
-  checked for changes. Ignored names
-  use work but do not count toward the 200,000 relevant-entry ceiling. Codex,
+  or the next one. The queue stays at 4,096 files. A folder removed or renamed
+  makes the check incomplete. If a listed Codex or Claude file disappears,
+  coverage uses its saved capture progress to mark it finished or record a
+  gap; repeated file removals no longer hold the source frontier indefinitely.
+  On a source's first coverage walk, a changed folder records an uncertainty
+  gap for any file removed before its open cursor could list it. Small changed
+  folders get one verifying restart. Small unchanged folders reuse a bounded
+  list of names on later checks; every file is still checked for changes.
+  Ignored names use work but do not count toward the 200,000 relevant-entry
+  ceiling. Codex,
   Claude Code, and Grok each get a share of every turn, with the first source
   rotating and unused time returning to active sources. Legacy symlinked
   Codex or Claude roots now make coverage incomplete, like configured roots.
+  The 250 ms coverage turn is a target: a synchronous directory read, file
+  stat, or database write can run past it.
 - When the OTLP intake spool cannot hold a refused request (full, or the disk
   refuses), a deadline refusal is answered `503` with `Retry-After: 1` instead
   of `408`, which OTLP exporters do not retry. A body that never finished

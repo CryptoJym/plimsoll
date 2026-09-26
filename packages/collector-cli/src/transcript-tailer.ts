@@ -15,6 +15,7 @@ import {
 import {
   DEFAULT_JSONL_TAILER_IO,
   ensureJsonlScanState,
+  jsonlScanStateKey,
   loadJsonlScanCursor,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
@@ -47,7 +48,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -372,6 +373,9 @@ export class TranscriptTailer {
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.projectsDir],
       maxEntries,
       failOnMissing: true,
+      missingFromRestart: true,
+      changedDirectory: hasCompleteCaptureCoverage(this.buffer.database, "claude_code")
+        ? undefined : (directory) => changedDirectoryCoverageFile("claude_code", directory),
       open: (directory, depth) => openCaptureCoverageDirectory(directory, (entry) => {
         const full = path.join(directory, entry.name);
         if (entry.isDirectory()) return { path: full, kind: "directory" };
@@ -384,11 +388,12 @@ export class TranscriptTailer {
       }, this.coverageDirectoryCache, depth),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
-        return stat ? verdict(this.cursorKey(file), stat) : null;
+        return verdict(this.cursorKey(file), stat);
       },
       checkLink: (link) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), link);
-        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat) : null;
+        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat)
+          : stat === null ? linkCoverageFile(jsonlScanStateKey(`${this.cursorKey(link)}\0symlink`), 0) : null;
       },
     });
   }
