@@ -24,6 +24,7 @@ type UsageRow = {
   costKind: string | null;
   accountHash: string | null;
   workspaceId: string | null;
+  deviceId: string | null;
   payloadJson: string;
   usagePairedEventId: string | null;
 };
@@ -63,16 +64,15 @@ function isUsageRow(row: UsageRow) {
 function compatible(log: UsageRow, span: UsageRow, logShape: Shape, spanShape: Shape) {
   if (logShape.kind !== "log" || spanShape.kind !== "span" || !log.accountHash) return false;
   if (log.workspaceId && span.workspaceId && log.workspaceId !== span.workspaceId) return false;
+  if (log.deviceId && span.deviceId && log.deviceId !== span.deviceId) return false;
   if (log.cacheReadTokens !== null && span.cacheReadTokens !== null &&
       log.cacheReadTokens !== span.cacheReadTokens) return false;
   if (logShape.traceId && spanShape.traceId) {
     if (logShape.traceId !== spanShape.traceId) return false;
-  } else if (!log.sessionId || !span.sessionId || log.sessionId !== span.sessionId) {
-    // A null-session span needs a shared trace. Time and token equality alone
-    // cannot distinguish concurrent sessions.
-    return false;
   }
-  if (log.sessionId && span.sessionId && log.sessionId !== span.sessionId) return false;
+  // Real Codex usage logs have no trace context and response spans have no
+  // session. Do not make the time_window session guess a pairing prerequisite.
+  // Mutual uniqueness, exact counts and the bounded time window guard this key.
   const logTime = Date.parse(log.observedAt);
   const spanTime = Date.parse(span.observedAt);
   const endTime = spanShape.spanEndAt ? Date.parse(spanShape.spanEndAt) : NaN;
@@ -87,7 +87,7 @@ const ROW_COLUMNS = `rowid, id, source, event_type as eventType,
   cache_read_tokens as cacheReadTokens,
   cache_creation_tokens as cacheCreationTokens, cost_usd as costUsd,
   cost_kind as costKind, account_hash as accountHash,
-  workspace_id as workspaceId, payload_json as payloadJson,
+  workspace_id as workspaceId, device_id as deviceId, payload_json as payloadJson,
   usage_paired_event_id as usagePairedEventId`;
 
 function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {

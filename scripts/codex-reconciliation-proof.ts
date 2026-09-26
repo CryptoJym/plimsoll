@@ -312,7 +312,7 @@ function proveAppServerResponsePair(root: string) {
         sessionId: "019e9100-0000-7000-8000-000000000001",
         actorId: "synthetic-account",
         cacheReadTokens: undefined,
-        metadata: { otelEventName: "codex.sse_event", traceId,
+        metadata: { otelEventName: "codex.sse_event",
           serviceName: "codex-app-server" },
       });
       const span = aiInteractionEventSchema.parse({
@@ -342,6 +342,11 @@ function proveAppServerResponsePair(root: string) {
         total.inputTokens === 2_400 && total.outputTokens === 510 &&
         total.cacheReadTokens === 1_800 && queued.n === 1,
         { total, queued });
+      const savedSpan = buffer.database.prepare(
+        `select session_id as sessionId from buffered_events where id = ?`,
+      ).get(span.id) as { sessionId: string | null };
+      check(`app_server_response_pair_${order}_avoids_stitch`,
+        savedSpan.sessionId === null, { savedSpan });
     } finally {
       buffer.close();
     }
