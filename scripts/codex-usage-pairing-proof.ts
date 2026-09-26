@@ -237,6 +237,45 @@ async function main() {
     } finally { h.close(); }
   }
 
+  {
+    const h = new Harness("rollback-forward-upgrade");
+    try {
+      const logId = h.append(logEvent(R()));
+      const spanId = h.append(spanEvent(R()));
+      const db = h.buffer.database;
+      // Reproduce the ledger state left by 0.7.41: it keeps the indexes but
+      // writes unpaired usage after the previous 0.7.42 target was completed.
+      db.prepare(`update buffered_events set usage_paired_event_id = null,
+        usage_duplicate_reason = null where id in (?, ?)`).run(logId, spanId);
+      db.prepare(`update buffered_events set event_type = 'assistant_response',
+        input_tokens = ?, output_tokens = ?, cache_read_tokens = ? where id = ?`)
+        .run(R().input, R().output, R().cache, spanId);
+      db.exec(`update codex_usage_pairing_control set cursor_observed_at = '',
+        cursor_rowid = 0, target_rowid = 0, complete = 1`);
+      const stale = codexUsagePairingStatus(db);
+      check("rollback_writes_make_old_target_stale",
+        stale.enabled && stale.reason === "historical_target_stale_run_lifecycle_pairing_indexes", stale);
+      const timings = buildCodexUsagePairingIndexes(db);
+      const pending = codexUsagePairingStatus(db);
+      check("reupgrade_refreshes_target_without_rebuilding_indexes",
+        timings.every((timing) => !timing.created) && pending.reason === "historical_backfill_pending",
+        { timings, pending });
+      const first = runCodexUsagePairingWriterSlice(db, { maxMs: 100 });
+      const rows = db.prepare(`select count(*) as total,
+        sum(case when usage_duplicate_reason is null then 1 else 0 end) as eligible,
+        sum(case when usage_duplicate_reason = 'codex_sse_event_span' then 1 else 0 end) as marked
+        from buffered_events where id in (?, ?)`).get(logId, spanId) as
+        { total: number; eligible: number; marked: number };
+      check("reupgrade_pairs_legacy_rows_once",
+        first.paired === 1 && rows.total === 2 && rows.eligible === 1 && rows.marked === 1 &&
+          codexUsagePairingStatus(db).reason === "ready", { first, rows });
+      buildCodexUsagePairingIndexes(db);
+      const repeat = runCodexUsagePairingWriterSlice(db, { maxMs: 100 });
+      check("reupgrade_repeat_is_idempotent",
+        repeat.paired === 0 && codexUsagePairingStatus(db).reason === "ready", repeat);
+    } finally { h.close(); }
+  }
+
   for (const order of ["log-first", "span-first"] as const) {
     const h = new Harness(order);
     try {

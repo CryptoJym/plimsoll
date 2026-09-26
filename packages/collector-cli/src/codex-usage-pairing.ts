@@ -29,15 +29,38 @@ const PAIRING_INDEXES = [
 ] as const;
 const pairingReady = new WeakMap<Database.Database, boolean>();
 
-/** A catalog lookup only: ordinary opens never scan buffered_events. */
+/** Cheap status only: ordinary opens never build indexes or scan buffered_events. */
 export function codexUsagePairingStatus(db: Database.Database) {
   const present = new Set((db.prepare(`select name from sqlite_master
     where type = 'index' and name in (?, ?, ?)`).all(...PAIRING_INDEXES) as
     Array<{ name: string }>).map((row) => row.name));
   const missingIndexes = PAIRING_INDEXES.filter((name) => !present.has(name));
+  if (missingIndexes.length > 0) {
+    return { enabled: false, reason: "pairing_indexes_missing_run_lifecycle_pairing_indexes",
+      missingIndexes };
+  }
+  const controlExists = db.prepare(`select 1 from sqlite_master
+    where type = 'table' and name = 'codex_usage_pairing_control'`).get();
+  if (!controlExists) {
+    return { enabled: false, reason: "pairing_control_missing_run_lifecycle_pairing_indexes",
+      missingIndexes };
+  }
+  const control = db.prepare(`select target_rowid as targetRowid, complete
+    from codex_usage_pairing_control where singleton = 1`).get() as
+    { targetRowid: number; complete: number } | undefined;
+  if (!control) {
+    return { enabled: false, reason: "pairing_control_missing_run_lifecycle_pairing_indexes",
+      missingIndexes };
+  }
+  // MAX(rowid) uses the rowid B-tree's right edge; it never scans payloads.
+  // A prior 0.7.41 rollback can append usage after the last completed pass.
+  const currentRowid = (db.prepare(`select coalesce(max(rowid), 0) as value
+    from buffered_events`).get() as { value: number }).value;
   return {
-    enabled: missingIndexes.length === 0,
-    reason: missingIndexes.length === 0 ? "ready" : "pairing_indexes_missing_run_lifecycle_pairing_indexes",
+    enabled: true,
+    reason: control.targetRowid < currentRowid
+      ? "historical_target_stale_run_lifecycle_pairing_indexes"
+      : control.complete === 0 ? "historical_backfill_pending" : "ready",
     missingIndexes,
   };
 }
@@ -315,15 +338,14 @@ export function ensureCodexUsagePairingSchema(db: Database.Database) {
 /** Run only on a new empty ledger or during the stopped-service upgrade window. */
 export function buildCodexUsagePairingIndexes(db: Database.Database) {
   ensureCodexUsagePairingSchema(db);
-  if (!codexUsagePairingStatus(db).enabled) {
-    // A status/open may have seeded this target before the old collector's
-    // last writes. Reset only when an upgrade still has indexes to create.
-    db.exec(`update codex_usage_pairing_control
-      set cursor_observed_at = '', cursor_rowid = 0,
-          target_rowid = (select coalesce(max(rowid), 0) from buffered_events),
-          complete = case when (select max(rowid) from buffered_events) is null then 1 else 0 end
-      where singleton = 1`);
-  }
+  // The explicit upgrade also runs after a rollback to 0.7.41. Existing
+  // indexes do not imply that its last historical target included legacy
+  // writes, so refresh the bounded snapshot and revisit unmatched spans.
+  db.exec(`update codex_usage_pairing_control
+    set cursor_observed_at = '', cursor_rowid = 0,
+        target_rowid = (select coalesce(max(rowid), 0) from buffered_events),
+        complete = case when (select max(rowid) from buffered_events) is null then 1 else 0 end
+    where singleton = 1`);
   const timings: Array<{ name: string; elapsedMs: number; created: boolean }> = [];
   // An accountless SSE log can be genuine usage; only the span side needs
   // historical discovery. The ordinary account index includes many unrelated
