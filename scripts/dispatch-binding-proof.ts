@@ -5,11 +5,13 @@ import path from "node:path";
 import Database from "better-sqlite3";
 
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { namespacedWorkItemIdSchema, rootEventMetadata } from "../packages/collector-cli/src/capture-root-inventory";
+import { dispatchBindingMetadata, dispatchBindingSchema, namespacedWorkItemIdSchema, rootEventMetadata } from "../packages/collector-cli/src/capture-root-inventory";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
+import { remoteLinkageHash } from "../packages/shared/src/linkage";
+import { validatedMetadataAttribute } from "../packages/shared/src/analytical-metadata";
 import { createProofCompletion } from "./lib/proof-completion";
 
 const proof = createProofCompletion("dispatch-binding");
@@ -47,11 +49,45 @@ function cli(args: string[]) {
 }
 
 const key = `sha256:${"a".repeat(64)}`;
-for (const valid of ["beads:eco-6hoxj.165.3", "github:CryptoJym/plimsoll/pull/42", "jira:PLIM-42"])
+for (const valid of ["beads:eco-6hoxj.165.3", "github:CryptoJym/plimsoll/pull/42", "github:123456/pull/42",
+  `github:sha256:${"a".repeat(64)}/pull/42`, "jira:PLIM-42"])
   assert.equal(namespacedWorkItemIdSchema.parse(valid), valid);
 for (const invalid of ["eco-6hoxj.165.3", "github:CryptoJym/plimsoll/pull/0", "jira:"])
   assert.equal(namespacedWorkItemIdSchema.safeParse(invalid).success, false);
 proof.check("work_item_namespace_contract");
+const githubRepoHash = remoteLinkageHash("https://github.com/CryptoJym/plimsoll.git");
+assert.ok(githubRepoHash);
+for (const [index, workItemId, outboundWorkItemId] of [
+  [0, "beads:eco-6hoxj.165.3", "beads:eco-6hoxj.165.3"],
+  [1, "github:CryptoJym/plimsoll/pull/42", `github:${githubRepoHash}/pull/42`],
+  [2, "github:123456/pull/42", "github:123456/pull/42"],
+  [3, "jira:PLIM-42", "jira:PLIM-42"],
+] as const) {
+  const binding = dispatchBindingSchema.parse({ sessionId: `delivery-${index}`, workItemId,
+    projectKey: key, companyRef: null, attemptId: `delivery-attempt-${index}`,
+    parentAttemptId: null, acceptedOutcomeId: null,
+    validFrom: "2026-09-25T00:00:00.000Z", validUntil: null, evidenceRef: `delivery-evidence-${index}` });
+  const id = `delivery-event-${index}`;
+  assert.equal(buffer.append({ id, source: "codex", eventType: "assistant_response", dataMode: "metadata",
+    observedAt: "2026-09-25T00:00:01.000Z", sessionId: binding.sessionId,
+    actionClass: "other", intent: "unknown", inputTokens: 1, outputTokens: 1,
+    metadata: dispatchBindingMetadata(binding) }, []), true);
+  const raw = buffer.database.prepare("select privacy_disposition as disposition from buffered_events where id=?")
+    .get(id) as { disposition: string | null };
+  assert.equal(raw.disposition, null, workItemId);
+  const queued = buffer.database.prepare("select base_envelope_json as envelope from upload_outbox where raw_id=?")
+    .get(id) as { envelope: string } | undefined;
+  assert.ok(queued, workItemId);
+  assert.equal(JSON.parse(queued.envelope).event.metadata.workItemId, outboundWorkItemId);
+  assert.equal(queued.envelope.includes("CryptoJym/plimsoll"), false);
+}
+proof.check("all_supported_work_item_namespaces_queue_private_outbound_usage");
+for (const malformed of ["github:CryptoJym/plimsoll/issues/42", "github:CryptoJym/plimsoll/pull/0",
+  "github:CryptoJym/plimsoll/pull/42/extra", "github:../plimsoll/pull/42", "github:plimsoll"]) {
+  assert.equal(namespacedWorkItemIdSchema.safeParse(malformed).success, false);
+  assert.equal(validatedMetadataAttribute("workItemId", malformed).accepted, false);
+}
+proof.check("malformed_github_work_items_remain_refused");
 const bound = cli(["dispatch", "bind", "--session-id", "codex-session", "--work-item-id", "beads:eco-6hoxj.165.3",
   "--project-key", key, "--attempt-id", "lane-1", "--parent-attempt-id", "lead-session",
   "--role", "author", "--work-class", "implementation", "--complexity-band", "medium",

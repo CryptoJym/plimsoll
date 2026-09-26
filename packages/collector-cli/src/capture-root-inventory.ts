@@ -8,8 +8,9 @@ import { resolveCollectorHome } from "./collector-home";
 import { workClassSchema, workComplexityBandSchema } from "../../shared/src/schemas";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 export const namespacedWorkItemIdSchema=z.string().max(256).regex(
-  /^(?:beads:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|github:[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?\/pull\/[1-9][0-9]*|jira:[A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/,
-);
+  /^(?:beads:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|github:(?:sha256:[a-f0-9]{64}|[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?)\/pull\/[1-9][0-9]*|jira:[A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/,
+).refine(value => !value.startsWith("github:") ||
+  !value.slice(7,value.lastIndexOf("/pull/")).split("/").some(segment => segment === "." || segment === ".."));
 const legacyAccountSchema=z.object({
   actorHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id
