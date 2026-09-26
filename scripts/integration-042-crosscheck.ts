@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -16,6 +17,7 @@ import { CollectorMaintenance } from "../packages/collector-cli/src/maintenance"
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { runSessionSync } from "../packages/collector-cli/src/session-sync";
+import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 
@@ -173,6 +175,33 @@ async function sync() {
   check("summary_sync_sends_on_shared_ledger", result.ok && result.sentSessions === 1 && sent.length === 1);
 }
 
+async function statusOnSharedLedger() {
+  let clockReads = 0;
+  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer, {
+    requestBudgetNow: () => { clockReads += 1; return performance.now(); },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (server.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+      headers: { connection: "close" }, signal: AbortSignal.timeout(5_000),
+    });
+    await response.json();
+    check("http_budget_clock_reads_shared_pairing_and_coverage_ledger",
+      response.status === 200 && clockReads > 0 &&
+      hasCompleteCaptureCoverage(buffer.database, "codex") &&
+      hasCompleteCaptureCoverage(buffer.database, "claude_code"));
+  } finally {
+    if (server.listening) {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  }
+}
+
 async function main() {
 try {
   for (const source of ["codex", "claude_code"] as const) {
@@ -216,6 +245,9 @@ try {
   const after = (buffer.database.prepare(`select activity_revision as n from session_sync_summary_activity
     where session_id=?`).get(sid) as { n: number } | undefined)?.n ?? 0;
   check("summary_activity_revision_survives_capture_and_budget", after > before);
+  await statusOnSharedLedger();
+  check("http_status_preserves_summary_revision", (buffer.database.prepare(`select activity_revision as n
+    from session_sync_summary_activity where session_id=?`).get(sid) as { n: number }).n === after);
   await sync();
   console.log(JSON.stringify({ proof: "integration-042-crosscheck", checks, observations, maintenanceTurns,
     passed: true }, null, 2));
