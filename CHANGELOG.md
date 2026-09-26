@@ -1,15 +1,6 @@
 # Changelog
 
-## 0.7.42 — Draft (second integration pass)
-
-- Codex SSE logs and matching response spans pair in the local ledger before
-  usage upload, so a response counts once while the duplicate span remains
-  available as raw evidence. The stopped-service pairing index upgrade can be
-  repeated after a 0.7.41 rollback to refresh the historical cursor and target
-  (`eco-6hoxj.163.95`).
-- HTTP deadline proofs cover file-backed status probes, and maintenance FIFO
-  proofs bound deadline-to-reap and absolute hook latency. The runtime keeps
-  the bounded HTTP request behavior (`eco-6hoxj.163.83`).
+## 0.7.42 — 2026-09-26
 
 - Busy-session summaries preserve rebuild progress while unread rows change.
   A terminal receipt retarget advances the old session revision so a 0.7.41
@@ -21,10 +12,21 @@
   partial file vanishes before its directory entry is reached. A file created
   and removed entirely between walks remains outside this claim
   (`eco-6hoxj.163.82`).
-- Observe-only budget sampling records ledger size, process memory and CPU,
+- B1 observe-only budget sampling records ledger size, process memory and CPU,
   outbox age, and summary lag. Status and CSV show advisory targets and local
   history; no capture budget is enforced. A stopped collector purge also
   removes ledger WAL and SHM files (`eco-6hoxj.164.3`).
+- Codex SSE logs and matching response spans pair in the local ledger before
+  usage upload, so a response counts once while the duplicate span remains
+  available as raw evidence. The stopped-service pairing index upgrade can be
+  repeated after a 0.7.41 rollback to refresh the historical cursor and target
+  (`eco-6hoxj.163.95`).
+- HTTP deadline proofs cover file-backed status probes, and maintenance FIFO
+  proofs bound deadline-to-reap and absolute hook latency. The runtime keeps
+  the bounded HTTP request behavior (`eco-6hoxj.163.83`).
+
+The replaced dashboard and session-summary triggers remain safe for a 0.7.41
+downgrade (F14).
 
 ## 0.7.5 — 2026-09-08
 
