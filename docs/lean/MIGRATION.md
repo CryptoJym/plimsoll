@@ -1,4 +1,4 @@
-# Migration: existing ledgers, cloud history, parity, reclaim, rollback (round 8 = B0 round 2 corrections on round 7)
+# Migration: existing ledgers, cloud history, parity, reclaim, rollback (round 10 = B0 round 4 corrections on round 7)
 
 **Bead:** eco-6hoxj.164.2 · **Round:** 6 · **As of:** 2026-09-25 MDT · Planning only. Citation style as in DECISION-METRICS.md §0; cloud citations at `067a8a4`; every citation re-validated this round (`out/checks/validate-citations.log`).
 
@@ -13,6 +13,13 @@ recorded at join activation (`CONTRACTS.md` C4). S4's sighting reads the install
 facts, audit rows and installs are kept until tenant erasure, which deletes the facts first (`CONTRACTS.md` C1). S1b (d) and S3
 read `C_conv` from the converter's measured page allocation, and the re-census copy before S3 is made only when the runway leaves
 room for it (`CONTRACTS.md` C2).
+
+**What changed in round 10 (B0 round 4).** S4's sighting takes the install row's lock first and reads `binding_version`, the audit
+rows and the facts under it; the `stamp_not_issued` fact is keyed by the uploader's ledger (the chain of installs of one Mac, linked at
+join with proof of possession of the previous install's key), so the old and the new install of a re-joined Mac read one fact; a pair
+is judged against the install it names whatever its lifecycle; an erasure-only trigger guards every `device_installs` row and erasure
+deletes the facts before the installs in `TENANT_COLUMN_MODELS` order (`CONTRACTS.md` C1). The join request carries the previous
+install's proof and the handshake's version is recorded only when its response names the grant's install (`CONTRACTS.md` C4).
 
 ## 1. Invariants that hold on every host at every step
 
