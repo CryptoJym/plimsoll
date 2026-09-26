@@ -19,6 +19,7 @@ import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import {
   CODEX_USAGE_DUPLICATE_REASON,
+  buildCodexUsagePairingIndexes,
   ensureCodexUsagePairingSchema,
   pairCodexUsageEvent,
 } from "./codex-usage-pairing";
@@ -762,6 +763,9 @@ export class LocalEventBuffer {
     ensureCodexReconciliationSchema(this.db);
     markOpenStep("ledger.codex_reconciliation_schema");
     ensureCodexUsagePairingSchema(this.db);
+    // An empty ledger has no history to scan; existing ledgers get these
+    // indexes only in the explicit stopped-service upgrade step.
+    if (newLedger) buildCodexUsagePairingIndexes(this.db);
     this.learningFacts = new LearningFactStore(
       this.db,
       options.learningFacts?.limits,

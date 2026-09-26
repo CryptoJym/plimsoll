@@ -16,10 +16,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { runCodexReconciliationMaintenance } from "../packages/collector-cli/src/codex-reconciliation";
-import { codexUsagePairingProgress } from "../packages/collector-cli/src/codex-usage-pairing";
+import {
+  buildCodexUsagePairingIndexes,
+  codexUsagePairingProgress,
+  codexUsagePairingStatus,
+} from "../packages/collector-cli/src/codex-usage-pairing";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { terminalPrivacyEligibilitySql } from "../packages/collector-cli/src/privacy-disposition";
 import { collectSessionSnapshots } from "../packages/collector-cli/src/session-sync";
@@ -201,6 +206,36 @@ const once = (o: ReturnType<Harness["observe"]>, count = 1) =>
   o.dashboard.tokenEvents === count && o.dashboard.input === 24_261 * count;
 
 async function main() {
+  {
+    const h = new Harness("indexes-explicit-upgrade");
+    try {
+      h.buffer.close();
+      const db = new Database(h.file);
+      db.exec(`drop index idx_codex_usage_span_backfill;
+        drop index idx_codex_usage_span_match;
+        drop index idx_codex_usage_log_match`);
+      db.close();
+      h.buffer = h.open();
+      const missing = codexUsagePairingStatus(h.buffer.database);
+      check("ordinary_open_does_not_build_pairing_indexes",
+        !missing.enabled && missing.missingIndexes.length === 3, missing);
+      h.append(logEvent(R())); h.append(spanEvent(R()));
+      check("missing_indexes_leave_both_shapes_eligible",
+        h.observe().local.usageRows === 2 && h.observe().local.markedDuplicates === 0);
+      h.buffer.close();
+      const upgrade = new Database(h.file);
+      const timings = buildCodexUsagePairingIndexes(upgrade);
+      check("explicit_upgrade_builds_all_pairing_indexes",
+        timings.length === 3 && codexUsagePairingStatus(upgrade).enabled, timings);
+      upgrade.close();
+      h.buffer = h.open();
+      const later = R({ input: 28_000, output: 200, cache: 12_000, at: T0 + 120_000 });
+      h.append(logEvent(later)); h.append(spanEvent(later));
+      check("pairing_resumes_after_explicit_upgrade",
+        h.observe().local.usageRows === 3 && h.observe().local.markedDuplicates === 1);
+    } finally { h.close(); }
+  }
+
   for (const order of ["log-first", "span-first"] as const) {
     const h = new Harness(order);
     try {

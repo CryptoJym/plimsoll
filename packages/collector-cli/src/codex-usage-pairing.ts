@@ -21,6 +21,34 @@ const LOG_MATCH_PREDICATE = `case when source = 'codex'
     case when json_valid(payload_json)
       then json_extract(payload_json, '$.metadata.otelEventName') end
   end = 'codex.sse_event'`;
+const PAIRING_INDEXES = [
+  "idx_codex_usage_span_backfill",
+  "idx_codex_usage_span_match",
+  "idx_codex_usage_log_match",
+] as const;
+const pairingReady = new WeakMap<Database.Database, boolean>();
+
+/** A catalog lookup only: ordinary opens never scan buffered_events. */
+export function codexUsagePairingStatus(db: Database.Database) {
+  const present = new Set((db.prepare(`select name from sqlite_master
+    where type = 'index' and name in (?, ?, ?)`).all(...PAIRING_INDEXES) as
+    Array<{ name: string }>).map((row) => row.name));
+  const missingIndexes = PAIRING_INDEXES.filter((name) => !present.has(name));
+  return {
+    enabled: missingIndexes.length === 0,
+    reason: missingIndexes.length === 0 ? "ready" : "pairing_indexes_missing_run_lifecycle_pairing_indexes",
+    missingIndexes,
+  };
+}
+
+function indexesReady(db: Database.Database) {
+  let ready = pairingReady.get(db);
+  if (ready === undefined) {
+    ready = codexUsagePairingStatus(db).enabled;
+    pairingReady.set(db, ready);
+  }
+  return ready;
+}
 
 type UsageRow = {
   rowid: number;
@@ -212,6 +240,7 @@ export function pairCodexUsageEvent(
   db: Database.Database,
   eventId: string,
 ): (CodexUsagePair & { pairCount: number }) | null {
+  if (!indexesReady(db)) return null;
   const row = db.prepare(`select ${ROW_COLUMNS} from buffered_events where id = ?`)
     .get(eventId) as UsageRow | undefined;
   if (!row || !isUsageRow(row)) return null;
@@ -249,8 +278,16 @@ export function pairCodexUsageEvent(
   return own ? { ...own, pairCount: pairs.length } : null;
 }
 
-/** Open work is O(1); history follows the null-account time index. */
+/** Ordinary open only creates the O(1) control row, never a history index. */
 export function ensureCodexUsagePairingSchema(db: Database.Database) {
+  const eventColumns = new Set((db.pragma("table_info(buffered_events)") as
+    Array<{ name: string }>).map((column) => column.name));
+  if (!eventColumns.has("usage_duplicate_reason")) {
+    db.exec("alter table buffered_events add column usage_duplicate_reason text");
+  }
+  if (!eventColumns.has("usage_paired_event_id")) {
+    db.exec("alter table buffered_events add column usage_paired_event_id text");
+  }
   db.exec(`create table if not exists codex_usage_pairing_control (
     singleton integer primary key check (singleton = 1),
     cursor_observed_at text not null default '',
@@ -272,24 +309,49 @@ export function ensureCodexUsagePairingSchema(db: Database.Database) {
       update codex_usage_pairing_control
       set cursor_rowid = 0, complete = 0;`);
   }
+}
+
+/** Run only on a new empty ledger or during the stopped-service upgrade window. */
+export function buildCodexUsagePairingIndexes(db: Database.Database) {
+  ensureCodexUsagePairingSchema(db);
+  if (!codexUsagePairingStatus(db).enabled) {
+    // A status/open may have seeded this target before the old collector's
+    // last writes. Reset only when an upgrade still has indexes to create.
+    db.exec(`update codex_usage_pairing_control
+      set cursor_observed_at = '', cursor_rowid = 0,
+          target_rowid = (select coalesce(max(rowid), 0) from buffered_events),
+          complete = case when (select max(rowid) from buffered_events) is null then 1 else 0 end
+      where singleton = 1`);
+  }
+  const timings: Array<{ name: string; elapsedMs: number; created: boolean }> = [];
   // An accountless SSE log can be genuine usage; only the span side needs
   // historical discovery. The ordinary account index includes many unrelated
   // null-account rows and cannot make the upgrade bounded on a large ledger.
-  db.exec(`create index if not exists idx_codex_usage_span_backfill
-    on buffered_events (observed_at)
-    where ${BACKFILL_SPAN_PREDICATE};`);
+  const statements = [
+    `create index if not exists idx_codex_usage_span_backfill
+      on buffered_events (observed_at) where ${BACKFILL_SPAN_PREDICATE}`,
   // Keep the long-span lookback cheap at ingest while the time-first index
   // above preserves an ordered, resumable historical scan.
-  db.exec(`create index if not exists idx_codex_usage_span_match
-    on buffered_events (input_tokens, output_tokens, observed_at)
-    where ${BACKFILL_SPAN_PREDICATE};`);
-  db.exec(`create index if not exists idx_codex_usage_log_match
-    on buffered_events (input_tokens, output_tokens, observed_at)
-    where ${LOG_MATCH_PREDICATE};`);
+    `create index if not exists idx_codex_usage_span_match
+      on buffered_events (input_tokens, output_tokens, observed_at)
+      where ${BACKFILL_SPAN_PREDICATE}`,
+    `create index if not exists idx_codex_usage_log_match
+      on buffered_events (input_tokens, output_tokens, observed_at)
+      where ${LOG_MATCH_PREDICATE}`,
+  ];
+  for (const [index, name] of PAIRING_INDEXES.entries()) {
+    const existed = Boolean(db.prepare(`select 1 from sqlite_master where type = 'index' and name = ?`).get(name));
+    const started = performance.now();
+    db.exec(statements[index]!);
+    timings.push({ name, elapsedMs: performance.now() - started, created: !existed });
+  }
+  pairingReady.set(db, true);
+  return timings;
 }
 
 /** O(1) progress for the daemon's existing bounded repair-followup cadence. */
 export function codexUsagePairingProgress(db: Database.Database) {
+  if (!indexesReady(db)) return { pending: false, units: 0 };
   const row = db.prepare(`select complete, visited from codex_usage_pairing_control
     where singleton = 1`).get() as { complete: number; visited: number } | undefined;
   return { pending: row?.complete === 0, units: row?.visited ?? 0 };
@@ -300,6 +362,7 @@ export function runCodexUsagePairingBackfill(
   limit = 128,
   deadline: () => boolean = () => false,
 ) {
+  if (!indexesReady(db)) return { visited: 0, paired: 0, complete: false };
   const control = db.prepare(
     `select cursor_observed_at as cursorAt, cursor_rowid as cursorRowid,
        target_rowid as target, complete
