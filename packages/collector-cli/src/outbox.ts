@@ -1112,11 +1112,10 @@ export class DeliveryOutbox {
     let nextAttemptAt = now;
     try {
       const event = (JSON.parse(row.payloadJson) as { source?: string; eventType?: string;
-        metadata?: { serviceName?: string; otelEventName?: string } });
+        metadata?: { otelEventName?: string } });
       if (event.source === "codex" && event.eventType === "assistant_response" &&
-          event.metadata?.serviceName === "codex-app-server" &&
-          (event.metadata.otelEventName === "codex.sse_event" ||
-           event.metadata.otelEventName === "handle_responses")) {
+          (event.metadata?.otelEventName === "codex.sse_event" ||
+           event.metadata?.otelEventName === "handle_responses")) {
         nextAttemptAt = new Date(nowDate.getTime() + 60_000).toISOString();
       }
     } catch {
@@ -1954,6 +1953,18 @@ export class DeliveryOutbox {
          and workspace_id is @workspaceId and device_id is @deviceId
          and ${privacyEligible}`,
     );
+    // A response span may pair while its already-leased envelope is in
+    // flight. A successful remote acknowledgment is still an accepted send;
+    // preserve that receipt while keeping the raw row marked as a duplicate.
+    const markAcceptedPairedSpan = this.db.prepare(
+      `update buffered_events set uploaded_at = @terminalAt
+       where rowid = @rawRowid and id = @rawId and created_at = @rawCreatedAt
+         and privacy_generation = @rawGeneration and uploaded_at is null
+         and workspace_id is @workspaceId and device_id is @deviceId
+         and usage_duplicate_reason = 'codex_sse_event_span'
+         and privacy_disposition is null and data_mode = 'metadata'
+         and not exists (select 1 from upload_receipts where delivery_id = @deliveryId)`,
+    );
     const remove = this.db.prepare(`delete from upload_outbox where delivery_id = ? and lease_id = ?`);
     const run = this.db.transaction(() => {
       let acknowledged = 0;
@@ -1966,21 +1977,25 @@ export class DeliveryOutbox {
           | undefined;
         if (!row) continue;
         const authoritativeReason = this.authoritativePrivacyReason(row);
-        if (authoritativeReason) {
+        if (authoritativeReason && authoritativeReason !== "local_usage_duplicate") {
           locallyDead += this.deadActive(id, authoritativeReason, terminalAt);
           continue;
         }
-        const marked = markRaw.run({
+        const markParams = {
           terminalAt,
+          deliveryId: id,
           rawRowid: row.rawRowid,
           rawId: row.rawId,
           rawCreatedAt: row.rawCreatedAt,
           rawGeneration: row.rawGeneration,
           workspaceId: this.workspaceId,
           deviceId: this.deviceId,
-        }).changes;
+        };
+        const marked = authoritativeReason === "local_usage_duplicate"
+          ? markAcceptedPairedSpan.run(markParams).changes
+          : markRaw.run(markParams).changes;
         if (marked !== 1 && !this.rawRetentionExpired(row)) {
-          locallyDead += this.deadActive(id, "local_privacy_violation", terminalAt);
+          locallyDead += this.deadActive(id, authoritativeReason ?? "local_privacy_violation", terminalAt);
           continue;
         }
         const written = this.writeReceipt({

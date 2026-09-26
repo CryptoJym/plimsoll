@@ -120,6 +120,7 @@ import {
   type MaintenanceAttemptOutcome,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import { codexUsagePairingProgress } from "./codex-usage-pairing";
 import { sessionContextIndexStatus } from "./session-context-index";
 import {
   historyCoverageStatus,
@@ -3113,13 +3114,14 @@ async function main() {
           // The one-time session context backfill keeps the repair cadence
           // while each maintenance job's bounded slice still advances it.
           const sessionIndex = sessionContextIndexStatus(buffer.database);
+          const pairing = codexUsagePairingProgress(buffer.database);
           return {
             pending: Object.values(projection.backlog).some(n => n > 0) ||
               !projection.backfill.complete || !projection.backfill.parityComplete || !projection.backfill.metricComplete ||
-              sessionIndex.state === "backfilling",
+              sessionIndex.state === "backfilling" || pairing.pending,
             units: Object.values(repairs.stages).reduce((sum, stage) => sum + stage.rowsVisited, 0) +
               projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited +
-              sessionIndex.backfill.rowsVisited,
+              sessionIndex.backfill.rowsVisited + pairing.units,
           };
         },
         retryNotBefore: () => {

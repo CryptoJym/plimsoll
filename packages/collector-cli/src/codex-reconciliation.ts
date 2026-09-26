@@ -880,9 +880,8 @@ export function runCodexReconciliationMaintenance(
       }
 
       const rowsVisited = legacyRowsVisited + contextRowsVisited + candidateRowsVisited;
-      // Preserve the established 50 ms reconciliation cadence. Pairing's
-      // historical scan has its own small real-time budget and never consumes
-      // the injected clock used to size the #397 reconciliation gate.
+      // Keep direct reconciliation runs useful while the automatic repair
+      // cadence provides a larger dedicated historical slice.
       const pairingDeadline = performance.now() + 5;
       runCodexUsagePairingBackfill(database, 128, () => performance.now() >= pairingDeadline);
       const sliceDurationMs = clock() - sliceStarted;
