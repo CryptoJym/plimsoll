@@ -2,12 +2,15 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import type { AddressInfo } from "node:net";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { bindDispatch } from "../packages/collector-cli/src/dispatch-command";
+import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { terminalPrivacyEligibilitySql } from "../packages/collector-cli/src/privacy-disposition";
+import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { createProofCompletion } from "./lib/proof-completion";
 
 const proof = createProofCompletion("dispatch-pairing-integration");
@@ -73,9 +76,8 @@ async function main() {
     assert.equal(bound.roots, 1);
     proof.check("session_bound_to_codex_capture_root");
 
-    const resource = { attributes: [attr("service.name", "codex-app-server")] };
-    const exploded = explodeOtlpPayload({
-      resourceLogs: [{ resource, scopeLogs: [{ logRecords: [{
+    const resource = { attributes: [attr("service.name", "Codex_Desktop")] };
+    const logPayload = { resourceLogs: [{ resource, scopeLogs: [{ logRecords: [{
         timeUnixNano: nano(observedMs), traceId,
         attributes: [
           attr("event.name", "codex.sse_event"), attr("event.kind", "response.completed"),
@@ -83,8 +85,8 @@ async function main() {
           attr("input_token_count", "24261"), attr("output_token_count", "1902"),
           attr("cached_token_count", 1190), attr("event.timestamp", observedAt),
         ],
-      }] }] }],
-      resourceSpans: [{ resource, scopeSpans: [{ spans: [{
+      }] }] }] };
+    const spanPayload = { resourceSpans: [{ resource, scopeSpans: [{ spans: [{
         name: "handle_responses", traceId, spanId: "0000000000000001",
         startTimeUnixNano: nano(observedMs - 1_500),
         endTimeUnixNano: nano(observedMs + 20),
@@ -93,13 +95,16 @@ async function main() {
           attr("gen_ai.usage.output_tokens", 1902),
           attr("gen_ai.usage.cache_read.input_tokens", 1190),
         ],
-      }] }] }],
-    }, { source: "codex" });
+      }] }] }] };
+    const exploded = explodeOtlpPayload({ ...logPayload, ...spanPayload }, { source: "codex" });
     assert.equal(exploded.parseFailures, 0);
     assert.equal(exploded.events.length, 2);
     const [log, span] = exploded.events;
     assert.ok(log && span);
     assert.equal(log.event.metadata.traceId, traceId);
+    assert.equal(log.event.source, "codex");
+    assert.equal(span.event.source, "codex");
+    assert.equal(log.event.metadata.serviceName, "Codex_Desktop");
     assert.equal(log.event.cacheReadTokens, 1190);
     for (const [field, expected] of Object.entries(dispatchFields))
       assert.equal(log.event.metadata[field], expected, field);
@@ -107,8 +112,38 @@ async function main() {
       assert.equal(span.event.metadata[field], undefined, field);
     proof.check("codex_log_has_pairing_trace_cache_and_dispatch_fields_span_has_none");
 
-    assert.equal(buffer.append(log.event, log.suppressedFields), true);
-    assert.equal(buffer.append(span.event, span.suppressedFields), true);
+    const auth = loadOrCreateLocalIngestAuth(plimsoll);
+    const server = createCollectorServer(configured, buffer, { localAuth: auth });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const port = (server.address() as AddressInfo).port;
+      const post = async (route: string, payload: unknown, source: string, token: string) => {
+        const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", connection: "close",
+            "x-plimsoll-source": source, "x-plimsoll-token": token },
+          body: JSON.stringify(payload),
+        });
+        return { status: response.status, body: await response.json() as Record<string, unknown> };
+      };
+      const rejected = await post("/v1/logs", logPayload, "claude_code", auth.claudeCodeProducer);
+      assert.equal(rejected.status, 401);
+      assert.equal(rejected.body.reason, "source_mismatch");
+      const before = buffer.database.prepare("select count(*) as count from buffered_events").get() as { count: number };
+      assert.equal(before.count, 0);
+      proof.check("claude_credentialed_codex_desktop_is_rejected_before_storage");
+
+      const admittedLog = await post("/v1/logs", logPayload, "codex", auth.codexProducer);
+      const admittedSpan = await post("/v1/traces", spanPayload, "codex", auth.codexProducer);
+      assert.equal(admittedLog.status, 202);
+      assert.equal(admittedSpan.status, 202);
+      proof.check("codex_credential_admits_codex_desktop_log_and_span");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
     const rows = buffer.database.prepare(`select id, event_type as eventType,
       input_tokens as inputTokens, cache_read_tokens as cacheReadTokens,
       usage_duplicate_reason as duplicateReason, payload_json as payloadJson
