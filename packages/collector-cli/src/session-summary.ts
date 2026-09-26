@@ -149,6 +149,32 @@ function columnNames(db: Database.Database, table: string): Set<string> {
   );
 }
 
+/** True only when the durable accumulator has not read this version of a row.
+ * The historical cursor is in (observed_at, rowid) order, while appended rows
+ * are read from the rowid queue. A missing or malformed state fails closed.
+ */
+function unscannedRowSql(sessionId: string, rowid: string, observedAt: string): string {
+  return `exists (select 1 from session_sync_summary_state s
+    where s.session_id = ${sessionId} and json_valid(s.accumulator_json)
+      and (
+        ((s.complete = 1 or s.mode = 'incremental') and ${rowid} > s.high_water)
+        or (s.complete = 0 and s.mode != 'incremental' and
+          ((${rowid} > json_extract(s.accumulator_json, '$.scanBoundary') and ${rowid} > s.high_water)
+           or (${rowid} <= json_extract(s.accumulator_json, '$.scanBoundary') and
+             (json_extract(s.accumulator_json, '$.cursorObservedAt') is null
+              or ${observedAt} > json_extract(s.accumulator_json, '$.cursorObservedAt')
+              or (${observedAt} = json_extract(s.accumulator_json, '$.cursorObservedAt') and
+                  ${rowid} > json_extract(s.accumulator_json, '$.cursorRowid')))))
+      )))`;
+}
+
+function outboxLineageMismatchSql(outbox: string, event: string): string {
+  return `(${outbox}.raw_id is null or ${outbox}.raw_created_at is null or
+    ${outbox}.raw_generation is null or ${outbox}.raw_id is not ${event}.id or
+    ${outbox}.raw_created_at is not ${event}.created_at or
+    ${outbox}.raw_generation is not ${event}.privacy_generation)`;
+}
+
 /**
  * Install the small durable summary index. This is additive and deliberately
  * does not backfill or scan buffered_events. The raw mutation triggers make a
@@ -164,8 +190,40 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     and name in ('trg_session_sync_upload_lease_insert',
       'trg_session_sync_upload_lease_dirty_insert',
       'trg_session_sync_upload_lease_dirty_update')`).all() as Array<{ name: string; sql: string }>;
-  // SQLite's CREATE TRIGGER IF NOT EXISTS keeps the old trigger body. Replace
-  // it atomically when upgrading a v1/v2 ledger to the frozen scan boundary.
+  const oldUnscanned = unscannedRowSql("old.session_id", "old.rowid", "old.observed_at");
+  const newUnscanned = unscannedRowSql("new.session_id", "new.rowid", "new.observed_at");
+  const rawSummaryChanged = [
+    "id", "source", "data_mode", "observed_at", "created_at", "session_id",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+    "cost_usd", "repo_hash", "branch_hash", "account_hash",
+    "privacy_generation", "privacy_disposition",
+  ].map((column) => `old.${column} is not new.${column}`).join(" or ");
+  const oldOutboxMismatch = outboxLineageMismatchSql("old", "e");
+  const newOutboxMismatch = outboxLineageMismatchSql("new", "e");
+  const oldOutboxChange = `${oldOutboxMismatch} and
+    (new.raw_rowid is not old.raw_rowid or not ${newOutboxMismatch})`;
+  const newOutboxChange = `${newOutboxMismatch} and
+    (new.raw_rowid is not old.raw_rowid or not ${oldOutboxMismatch})`;
+  const linkedUnscanned = unscannedRowSql("e.session_id", "e.rowid", "e.observed_at");
+  const oldOutboxAffects = `exists (select 1 from buffered_events e
+    join session_sync_summary_state s on s.session_id = e.session_id
+    where e.rowid = old.raw_rowid and ${oldOutboxChange})`;
+  const newOutboxAffects = `exists (select 1 from buffered_events e
+    join session_sync_summary_state s on s.session_id = e.session_id
+    where e.rowid = new.raw_rowid and ${newOutboxChange})`;
+  const terminalOld = "old.reason in ('local_evidence_quarantined','local_privacy_violation')";
+  const terminalNew = "new.reason in ('local_evidence_quarantined','local_privacy_violation')";
+  const oldReceiptChange = `${terminalOld} and (new.delivery_id is not old.delivery_id or not ${terminalNew})`;
+  const newReceiptChange = `${terminalNew} and (new.delivery_id is not old.delivery_id or not ${terminalOld})`;
+  const oldReceiptAffects = `exists (select 1 from buffered_events e
+    join session_sync_summary_state s on s.session_id = e.session_id
+    where e.id = old.delivery_id and ${oldReceiptChange})`;
+  const newReceiptAffects = `exists (select 1 from buffered_events e
+    join session_sync_summary_state s on s.session_id = e.session_id
+    where e.id = new.delivery_id and ${newReceiptChange})`;
+  // Keep the 0.7.41 trigger names free. Its installer uses IF NOT EXISTS and
+  // must restore its own revision marks on downgrade. Remove those old-name
+  // triggers on re-upgrade; the scanned-aware triggers have distinct names.
   db.transaction(() => {
     // Existing 0.7.40 ledgers have this trigger. An append is outside the
     // leased snapshot; only edits and erasures of existing rows need a fence.
@@ -178,6 +236,13 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     if (rawInsertTrigger && !rawInsertTrigger.sql.includes("scanBoundary")) {
       db.exec("drop trigger trg_session_summary_raw_insert");
     }
+    const legacySummaryTriggers = db.prepare(`select name from sqlite_master where type='trigger'
+      and name in ('trg_session_summary_raw_update', 'trg_session_summary_raw_delete',
+        'trg_session_summary_outbox_insert', 'trg_session_summary_outbox_update',
+        'trg_session_summary_outbox_delete', 'trg_session_summary_receipt_insert',
+        'trg_session_summary_receipt_update', 'trg_session_summary_receipt_delete')`)
+      .all() as Array<{ name: string }>;
+    for (const trigger of legacySummaryTriggers) db.exec(`drop trigger ${trigger.name}`);
     db.exec(`
     create table if not exists session_sync_summary_control (
       singleton integer primary key check (singleton = 1),
@@ -207,6 +272,13 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     create table if not exists session_sync_summary_revision (
       session_id text primary key,
       mutation_revision integer not null check (mutation_revision >= 0)
+    );
+    -- This counter fences a worker read without invalidating an unscanned
+    -- edit. If it moves during the read, the slice is retried from its last
+    -- committed cursor rather than committing a stale worker snapshot.
+    create table if not exists session_sync_summary_activity (
+      session_id text primary key,
+      activity_revision integer not null check (activity_revision >= 0)
     );
     -- A session-sync upload owns a short, per-session lease rather than the
     -- database-wide write reservation. Appends remain in the summary queue;
@@ -314,38 +386,62 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           reason = excluded.reason, updated_at = excluded.updated_at;
     end;
 
-    create trigger if not exists trg_session_summary_raw_update
-    after update of id, source, event_type, data_mode, observed_at, created_at,
+    create trigger if not exists trg_session_summary_raw_update_v42
+    after update of id, source, data_mode, observed_at, created_at,
       session_id, input_tokens, output_tokens, cache_read_tokens,
       cache_creation_tokens, cost_usd, repo_hash, branch_hash, account_hash,
       privacy_generation, privacy_disposition on buffered_events
+    when ${rawSummaryChanged}
     begin
+      -- summary_scanned_aware_v1: unscanned changes retry an in-flight read.
       update session_sync_summary_control
         set mutation_revision = mutation_revision + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where singleton = 1;
+      insert into session_sync_summary_activity (session_id, activity_revision)
+        select old.session_id, 1 where old.session_id is not null
+        on conflict(session_id) do update set activity_revision = activity_revision + 1;
+      insert into session_sync_summary_activity (session_id, activity_revision)
+        select new.session_id, 1 where new.session_id is not null and new.session_id is not old.session_id
+        on conflict(session_id) do update set activity_revision = activity_revision + 1;
+      delete from session_sync_summary_rows
+        where raw_rowid = old.rowid and session_id is not new.session_id;
+      insert into session_sync_summary_rows (raw_rowid, session_id, created_at)
+        select new.rowid, new.session_id, new.created_at
+        where new.session_id is not null and exists (
+          select 1 from session_sync_summary_state s where s.session_id = new.session_id
+            and new.rowid > s.high_water
+            and (s.complete = 1 or s.mode = 'incremental' or
+                 (json_valid(s.accumulator_json) and
+                  new.rowid > json_extract(s.accumulator_json, '$.scanBoundary')))
+        )
+        on conflict(raw_rowid) do update set
+          session_id = excluded.session_id, created_at = excluded.created_at;
       insert into session_sync_summary_dirty (session_id, reason, updated_at)
         select old.session_id, 'raw_update', strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        where old.session_id is not null
+        where old.session_id is not null and not ${oldUnscanned}
         on conflict(session_id) do update set
           reason = excluded.reason, updated_at = excluded.updated_at;
       insert into session_sync_summary_dirty (session_id, reason, updated_at)
         select new.session_id, 'raw_update', strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        where new.session_id is not null
+        where new.session_id is not null and not ${newUnscanned}
         on conflict(session_id) do update set
           reason = excluded.reason, updated_at = excluded.updated_at;
     end;
 
-    create trigger if not exists trg_session_summary_raw_delete
+    create trigger if not exists trg_session_summary_raw_delete_v42
     after delete on buffered_events
     begin
       update session_sync_summary_control
         set mutation_revision = mutation_revision + 1,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where singleton = 1;
+      insert into session_sync_summary_activity (session_id, activity_revision)
+        select old.session_id, 1 where old.session_id is not null
+        on conflict(session_id) do update set activity_revision = activity_revision + 1;
       insert into session_sync_summary_dirty (session_id, reason, updated_at)
         select old.session_id, 'raw_delete', strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        where old.session_id is not null
+        where old.session_id is not null and not ${oldUnscanned}
         on conflict(session_id) do update set
           reason = excluded.reason, updated_at = excluded.updated_at;
       delete from session_sync_summary_rows where raw_rowid = old.rowid;
@@ -359,84 +455,82 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   if (revisionTableMissing) {
     db.exec(`insert or ignore into session_sync_summary_revision (session_id, mutation_revision)
       select session_id, mutation_revision from session_sync_summary_state`);
-    // Round 1 only invalidated privacy changes behind a committed HWM. A
-    // privacy change during the first read must invalidate that read too.
-    db.exec(`
-      drop trigger if exists trg_session_summary_outbox_insert;
-      drop trigger if exists trg_session_summary_outbox_update;
-      drop trigger if exists trg_session_summary_outbox_delete;
-      drop trigger if exists trg_session_summary_receipt_insert;
-      drop trigger if exists trg_session_summary_receipt_update;
-      drop trigger if exists trg_session_summary_receipt_delete;
-    `);
   }
 
   // These tables are created by DeliveryOutbox, but a small proof ledger or a
   // pre-delivery install may not have them. Raw edits/deletes remain covered.
   if (tableExists(db, "upload_outbox")) {
     db.exec(`
-      create trigger if not exists trg_session_summary_outbox_insert
+      create trigger if not exists trg_session_summary_outbox_insert_v42
       after insert on upload_outbox
       when new.raw_rowid is not null and exists (
         select 1 from buffered_events e
         join session_sync_summary_state s on s.session_id = e.session_id
-        where e.rowid = new.raw_rowid
-          and (new.raw_id is null or new.raw_created_at is null or new.raw_generation is null
-            or new.raw_id is not e.id or new.raw_created_at is not e.created_at
-            or new.raw_generation is not e.privacy_generation)
+        where e.rowid = new.raw_rowid and ${newOutboxMismatch}
       )
       begin
         update session_sync_summary_control
           set mutation_revision = mutation_revision + 1,
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           where singleton = 1;
+        insert into session_sync_summary_activity (session_id, activity_revision)
+          select e.session_id, 1 from buffered_events e where e.rowid = new.raw_rowid
+          on conflict(session_id) do update set activity_revision = activity_revision + 1;
         insert into session_sync_summary_dirty (session_id, reason, updated_at)
           select e.session_id, 'privacy_outbox', strftime('%Y-%m-%dT%H:%M:%fZ','now')
           from buffered_events e where e.rowid = new.raw_rowid and e.session_id is not null
+            and not ${linkedUnscanned}
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
-      create trigger if not exists trg_session_summary_outbox_update
+      create trigger if not exists trg_session_summary_outbox_update_v42
       after update of raw_rowid, raw_id, raw_created_at, raw_generation on upload_outbox
-      when new.raw_rowid is not null and exists (
-        select 1 from buffered_events e
-        join session_sync_summary_state s on s.session_id = e.session_id
-        where e.rowid = new.raw_rowid
-          and (
-            old.raw_id is null or old.raw_created_at is null or old.raw_generation is null
-            or old.raw_id is not e.id or old.raw_created_at is not e.created_at
-            or old.raw_generation is not e.privacy_generation
-            or new.raw_id is null or new.raw_created_at is null or new.raw_generation is null
-            or new.raw_id is not e.id or new.raw_created_at is not e.created_at
-            or new.raw_generation is not e.privacy_generation
-          )
-      )
+      when ${oldOutboxAffects} or ${newOutboxAffects}
       begin
         update session_sync_summary_control
           set mutation_revision = mutation_revision + 1,
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           where singleton = 1;
+        insert into session_sync_summary_activity (session_id, activity_revision)
+          select e.session_id, 1 from buffered_events e
+          where e.rowid = old.raw_rowid and ${oldOutboxChange}
+          on conflict(session_id) do update set activity_revision = activity_revision + 1;
+        insert into session_sync_summary_activity (session_id, activity_revision)
+          select e.session_id, 1 from buffered_events e
+          where e.rowid = new.raw_rowid and ${newOutboxChange}
+          on conflict(session_id) do update set activity_revision = activity_revision + 1;
+        insert into session_sync_summary_dirty (session_id, reason, updated_at)
+          select e.session_id, 'privacy_outbox', strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          from buffered_events e where e.rowid = old.raw_rowid and e.session_id is not null
+            and ${oldOutboxChange} and not ${linkedUnscanned}
+          on conflict(session_id) do update set
+            reason = excluded.reason, updated_at = excluded.updated_at;
         insert into session_sync_summary_dirty (session_id, reason, updated_at)
           select e.session_id, 'privacy_outbox', strftime('%Y-%m-%dT%H:%M:%fZ','now')
           from buffered_events e where e.rowid = new.raw_rowid and e.session_id is not null
+            and ${newOutboxChange} and not ${linkedUnscanned}
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
-      create trigger if not exists trg_session_summary_outbox_delete
+      create trigger if not exists trg_session_summary_outbox_delete_v42
       after delete on upload_outbox
       when old.raw_rowid is not null and exists (
         select 1 from buffered_events e
         join session_sync_summary_state s on s.session_id = e.session_id
-        where e.rowid = old.raw_rowid
+        where e.rowid = old.raw_rowid and ${oldOutboxMismatch}
       )
       begin
         update session_sync_summary_control
           set mutation_revision = mutation_revision + 1,
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
           where singleton = 1;
+        insert into session_sync_summary_activity (session_id, activity_revision)
+          select e.session_id, 1 from buffered_events e where e.rowid = old.raw_rowid
+          on conflict(session_id) do update set activity_revision = activity_revision + 1;
         insert into session_sync_summary_dirty (session_id, reason, updated_at)
           select e.session_id, 'privacy_outbox', strftime('%Y-%m-%dT%H:%M:%fZ','now')
           from buffered_events e where e.rowid = old.raw_rowid and e.session_id is not null
+            and not ${linkedUnscanned}
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
@@ -447,7 +541,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     const receiptColumns = columnNames(db, "upload_receipts");
     if (receiptColumns.has("reason") && receiptColumns.has("delivery_id")) {
       db.exec(`
-        create trigger if not exists trg_session_summary_receipt_insert
+        create trigger if not exists trg_session_summary_receipt_insert_v42
         after insert on upload_receipts
         when new.reason in ('local_evidence_quarantined','local_privacy_violation')
           and exists (
@@ -460,32 +554,46 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
             set mutation_revision = mutation_revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             where singleton = 1;
+          insert into session_sync_summary_activity (session_id, activity_revision)
+            select e.session_id, 1 from buffered_events e where e.id = new.delivery_id
+            on conflict(session_id) do update set activity_revision = activity_revision + 1;
           insert into session_sync_summary_dirty (session_id, reason, updated_at)
             select e.session_id, 'privacy_receipt', strftime('%Y-%m-%dT%H:%M:%fZ','now')
             from buffered_events e where e.id = new.delivery_id and e.session_id is not null
+              and not ${linkedUnscanned}
             on conflict(session_id) do update set
               reason = excluded.reason, updated_at = excluded.updated_at;
         end;
-        create trigger if not exists trg_session_summary_receipt_update
+        create trigger if not exists trg_session_summary_receipt_update_v42
         after update of delivery_id, reason on upload_receipts
-        when (
-          old.reason in ('local_evidence_quarantined','local_privacy_violation') or
-          new.reason in ('local_evidence_quarantined','local_privacy_violation')
-        )
+        when ${oldReceiptAffects} or ${newReceiptAffects}
         begin
           update session_sync_summary_control
             set mutation_revision = mutation_revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             where singleton = 1;
+          insert into session_sync_summary_activity (session_id, activity_revision)
+            select e.session_id, 1 from buffered_events e
+            where e.id = old.delivery_id and ${oldReceiptChange}
+            on conflict(session_id) do update set activity_revision = activity_revision + 1;
+          insert into session_sync_summary_activity (session_id, activity_revision)
+            select e.session_id, 1 from buffered_events e
+            where e.id = new.delivery_id and ${newReceiptChange}
+            on conflict(session_id) do update set activity_revision = activity_revision + 1;
           insert into session_sync_summary_dirty (session_id, reason, updated_at)
             select e.session_id, 'privacy_receipt', strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            from buffered_events e
-            join session_sync_summary_state s on s.session_id = e.session_id
-            where e.id = new.delivery_id and e.session_id is not null
+            from buffered_events e where e.id = old.delivery_id and e.session_id is not null
+              and ${oldReceiptChange} and not ${linkedUnscanned}
+            on conflict(session_id) do update set
+              reason = excluded.reason, updated_at = excluded.updated_at;
+          insert into session_sync_summary_dirty (session_id, reason, updated_at)
+            select e.session_id, 'privacy_receipt', strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            from buffered_events e where e.id = new.delivery_id and e.session_id is not null
+              and ${newReceiptChange} and not ${linkedUnscanned}
             on conflict(session_id) do update set
               reason = excluded.reason, updated_at = excluded.updated_at;
         end;
-        create trigger if not exists trg_session_summary_receipt_delete
+        create trigger if not exists trg_session_summary_receipt_delete_v42
         after delete on upload_receipts
         when old.reason in ('local_evidence_quarantined','local_privacy_violation')
           and exists (
@@ -498,11 +606,27 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
             set mutation_revision = mutation_revision + 1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             where singleton = 1;
+          insert into session_sync_summary_activity (session_id, activity_revision)
+            select e.session_id, 1 from buffered_events e where e.id = old.delivery_id
+            on conflict(session_id) do update set activity_revision = activity_revision + 1;
           insert into session_sync_summary_dirty (session_id, reason, updated_at)
             select e.session_id, 'privacy_receipt', strftime('%Y-%m-%dT%H:%M:%fZ','now')
             from buffered_events e where e.id = old.delivery_id and e.session_id is not null
+              and not ${linkedUnscanned}
             on conflict(session_id) do update set
               reason = excluded.reason, updated_at = excluded.updated_at;
+        end;
+        -- The 0.7.41 update trigger marks only the new delivery_id. Keep
+        -- its revision fence for the old side when a terminal id is retargeted.
+        create trigger if not exists trg_session_summary_receipt_retarget_revision_v42
+        after update of delivery_id, reason on upload_receipts
+        when ${oldReceiptAffects}
+        begin
+          insert into session_sync_summary_revision (session_id, mutation_revision)
+            select e.session_id, 1 from buffered_events e
+            join session_sync_summary_state s on s.session_id = e.session_id
+            where e.id = old.delivery_id and ${oldReceiptChange}
+            on conflict(session_id) do update set mutation_revision = mutation_revision + 1;
         end;
       `);
     }
@@ -524,6 +648,14 @@ function sessionRevision(db: Database.Database, sessionId: string): number {
      from session_sync_summary_revision where session_id = ?`,
   ).get(sessionId) as { mutationRevision: number } | undefined;
   return row?.mutationRevision ?? 0;
+}
+
+function sessionActivityRevision(db: Database.Database, sessionId: string): number {
+  const row = db.prepare(
+    `select activity_revision as activityRevision
+     from session_sync_summary_activity where session_id = ?`,
+  ).get(sessionId) as { activityRevision: number } | undefined;
+  return row?.activityRevision ?? 0;
 }
 
 export function sessionSummaryCounters(db: Database.Database): SessionSummaryCounters {
@@ -937,6 +1069,7 @@ export async function updateSessionSummary(
     Number.isFinite(requestedMs) ? requestedMs : SESSION_SUMMARY_DEFAULT_MAX_MS,
     SESSION_SUMMARY_DEFAULT_MAX_MS,
   ));
+  const activityAtStart = sessionActivityRevision(db, sessionId);
   const currentRevision = sessionRevision(db, sessionId);
   const stored = storedState(db, sessionId);
   const parsed = stored ? parseAccumulator(sessionId, stored.accumulatorJson) : null;
@@ -1036,7 +1169,7 @@ export async function updateSessionSummary(
         mutationRevision: state.mutationRevision,
       };
     }
-    if (newer.length > 0 ||
+    if (newer.length > 0 || sessionActivityRevision(db, sessionId) !== activityAtStart ||
         !sessionSummaryCurrent(db, sessionId, until, state.mutationRevision, state.highWater)) {
       mode = "incremental";
       state.complete = false;
@@ -1144,7 +1277,12 @@ export async function updateSessionSummary(
   // (and remains in the queue for the upload fence).
   const stability = await writeRetry.run(() => db.transaction(() => {
     const revisionStable = sessionRevision(db, sessionId) === state.mutationRevision;
+    const activityStable = sessionActivityRevision(db, sessionId) === activityAtStart;
     const noQueuedRows = !queuedRowsAfter(db, sessionId, state.highWater, until);
+    // The read worker may have seen an older snapshot of a row that was still
+    // beyond the durable cursor. Retry that slice; the prior cursor remains
+    // valid and the next worker read sees the edit.
+    if (!activityStable) return { revisionStable, activityStable, noQueuedRows };
     const finalComplete = complete && revisionStable && noQueuedRows;
     state.complete = finalComplete;
     state.mode = complete ? "incremental" : needsFallback ? "fallback" : state.mode;
@@ -1159,9 +1297,9 @@ export async function updateSessionSummary(
       db.prepare(`delete from session_sync_summary_rows where session_id = ? and raw_rowid <= ?`)
         .run(sessionId, state.highWater);
     }
-    return { revisionStable, noQueuedRows };
+    return { revisionStable, activityStable, noQueuedRows };
   }).immediate());
-  const stable = stability.revisionStable && stability.noQueuedRows;
+  const stable = stability.revisionStable && stability.activityStable && stability.noQueuedRows;
 
   const finalMode: SessionSummaryUpdateResult["mode"] = fullRecompute
     ? "fallback"
@@ -1177,6 +1315,7 @@ export async function updateSessionSummary(
     fullRecompute,
     fallbackReason: fullRecompute ? reason
       : !stability.revisionStable ? "ledger_mutation_during_slice"
+      : !stability.activityStable ? "ledger_edit_during_slice"
       : !complete && state.mode === "fallback" ? "fallback_in_progress"
       : !stability.noQueuedRows ? "append_queue" : null,
     mutationRevision: state.mutationRevision,

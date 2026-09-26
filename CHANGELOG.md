@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Active Codex sessions keep their summary rebuild cursor when reconciliation
+  edits a row the summary has not read yet. Ordinary delivery acknowledgements
+  no longer dirty a session through an outbox delete; privacy-changing lineage
+  and terminal receipt changes still do. A worker slice is retried if an edit
+  lands while it is being read, and scanned edits or erasures still rebuild
+  only their affected session (`.163.87`).
+- The scanned-aware summary triggers now use distinct names so a 0.7.41
+  downgrade installs its own revision-marking triggers before sync. A CI
+  rehearsal rejects a terminal privacy receipt raced with the old worker;
+  0.7.39 still reads the full ledger on rollback (`.163.87` round 2).
+- A terminal receipt retarget now also advances the old delivery's session
+  revision. A 0.7.41 worker rejects a stale read after this edit, and the
+  re-upgraded collector rebuilds before sending (`.163.87` round 3).
+
 ## 0.7.5 — 2026-09-08
 
 - Stable and finitely growing oversized Codex and Claude JSONL records can

@@ -108,6 +108,8 @@
     "proof:session-sync-liveness": "tsx scripts/session-sync-liveness-proof.ts",
     "proof:session-summary-incremental": "tsx scripts/session-summary-incremental-proof.ts",
     "proof:session-summary-cycle-resume": "tsx scripts/run-proof.ts scripts/session-summary-cycle-resume-proof.ts",
+    "proof:session-summary-live-churn": "tsx scripts/run-proof.ts scripts/session-summary-live-churn-proof.ts",
+    "proof:session-summary-downgrade": "tsx scripts/run-proof.ts scripts/session-summary-downgrade-proof.ts",
     "proof:studio0-writer-contention": "tsx scripts/studio0-writer-contention-proof.ts",
     "proof:studio0-main-thread-turns": "tsx scripts/studio0-main-thread-turns-proof.ts",
     "proof:wal-checkpoint-bound": "tsx scripts/wal-checkpoint-bound-proof.ts",
