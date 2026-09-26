@@ -13,6 +13,7 @@ import { rootCursorKey, type CaptureRoot } from "../packages/collector-cli/src/c
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { DEFAULT_JSONL_TAILER_IO, jsonlScanStateKey } from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { CollectorMaintenance } from "../packages/collector-cli/src/maintenance";
+import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { runSessionSync } from "../packages/collector-cli/src/session-sync";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
@@ -49,13 +50,52 @@ const rollout = new RolloutTailer(buffer, undefined, () => [], io, roots.slice(0
 const transcript = new TranscriptTailer(buffer, undefined, io, roots.slice(1));
 const maintenance = new CollectorMaintenance(buffer, rollout, transcript, undefined, undefined,
   { captureCoverageIntervalMs: 0, captureCoverageTurnMs: 250 });
-const sampler = new BudgetSampler(buffer.database, ledger, 60_000);
+const sampler = new BudgetSampler(buffer.database, ledger, 60_000,
+  () => buffer.budgetAttemptedTotal());
 const checks: string[] = [];
 function check(name: string, condition: unknown) {
   assert.ok(condition, name);
   checks.push(name);
 }
 const key = (file: string) => jsonlScanStateKey(rootCursorKey(roots, file));
+
+function appendPairedCodexUsage() {
+  const at = Date.now() - 30_000;
+  const nano = (ms: number) => String(BigInt(ms) * 1_000_000n);
+  const attr = (key: string, value: string | number) => ({ key,
+    value: typeof value === "number" ? { intValue: String(value) } : { stringValue: value } });
+  const resource = { attributes: [attr("service.name", "codex-app-server")] };
+  const fixtures = [
+    { resourceLogs: [{ resource, scopeLogs: [{ logRecords: [{ timeUnixNano: nano(at),
+      attributes: [attr("event.name", "codex.sse_event"), attr("event.kind", "response.completed"),
+        attr("input_token_count", "40"), attr("output_token_count", "5"),
+        attr("cached_token_count", 9), attr("event.timestamp", new Date(at).toISOString()),
+        attr("conversation.id", sid), attr("model", "gpt-5.1-codex-max"),
+        attr("user.account_id", "integration-synthetic-account")],
+    }] }] }] },
+    { resourceSpans: [{ resource, scopeSpans: [{ spans: [{
+      traceId: "1".padStart(32, "0"), spanId: "1".padStart(16, "0"), name: "handle_responses",
+      kind: 1, startTimeUnixNano: nano(at - 1_500), endTimeUnixNano: nano(at + 20),
+      attributes: [attr("gen_ai.usage.input_tokens", 40),
+        attr("gen_ai.usage.output_tokens", 5),
+        attr("gen_ai.usage.cache_read.input_tokens", 9)],
+    }] }] }] },
+  ];
+  for (const fixture of fixtures) {
+    const parsed = explodeOtlpPayload(fixture, { source: "codex" });
+    check("codex_pair_fixture_parsed", parsed.events.length === 1 && parsed.parseFailures === 0);
+    const row = parsed.events[0]!;
+    check("codex_pair_fixture_appended", buffer.append(row.event, row.suppressedFields));
+  }
+  const rows = buffer.database.prepare(`select count(*) as total,
+    sum(case when input_tokens is not null then 1 else 0 end) as eligible,
+    sum(case when usage_duplicate_reason = 'codex_sse_event_span' then 1 else 0 end) as marked
+    from buffered_events where source = 'codex' and
+      json_extract(payload_json, '$.metadata.otelEventName') in ('codex.sse_event','handle_responses')`)
+    .get() as { total: number; eligible: number; marked: number };
+  check("codex_pair_on_shared_ledger_counts_once", rows.total === 2 && rows.eligible === 1 && rows.marked === 1);
+  check("budget_counts_both_successful_raw_inserts", buffer.budgetAttemptedTotal() === 2);
+}
 
 async function walkSource(source: "codex" | "claude_code") {
   const directory = source === "codex"
@@ -148,6 +188,8 @@ try {
     .run("00000000-0000-4000-8000-000000000743", "codex", "assistant_response",
       at, at, sid, tenant, "integration-042");
   await sync();
+  appendPairedCodexUsage();
+  await sync();
   const observations = [];
   for (const source of ["codex", "claude_code"] as const) observations.push(await walkSource(source));
   await sampler.sample();
@@ -164,6 +206,10 @@ try {
   check("budget_samples_persist_on_coverage_ledger",
     (buffer.database.prepare("select count(*) as n from budget_samples").get() as { n: number }).n >= 2 &&
     sampler.status().latest !== null);
+  check("budget_sample_includes_paired_raw_inserts",
+    (sampler.status().latest?.attemptedRowsDelta ?? 0) >= 2 ||
+    (buffer.database.prepare(`select coalesce(sum(json_extract(sample_json,'$.attemptedRowsDelta')),0) as n
+      from budget_samples`).get() as { n: number }).n >= 2);
   const before = (buffer.database.prepare(`select activity_revision as n from session_sync_summary_activity
     where session_id=?`).get(sid) as { n: number } | undefined)?.n ?? 0;
   buffer.database.prepare("update buffered_events set input_tokens=3 where session_id=?").run(sid);
