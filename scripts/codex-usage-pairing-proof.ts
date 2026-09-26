@@ -24,6 +24,7 @@ import {
   buildCodexUsagePairingIndexes,
   codexUsagePairingProgress,
   codexUsagePairingStatus,
+  runCodexUsagePairingWriterSlice,
 } from "../packages/collector-cli/src/codex-usage-pairing";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { terminalPrivacyEligibilitySql } from "../packages/collector-cli/src/privacy-disposition";
@@ -476,6 +477,26 @@ async function main() {
         progress.visited <= 1, { duplicate, progress });
       check("pairing_progress_can_drive_fast_repair_cadence",
         cadence.units === progress.visited && cadence.pending === false, cadence);
+    } finally { h.close(); }
+  }
+
+  {
+    const h = new Harness("one-candidate-writer-transactions");
+    try {
+      const db = h.buffer.database;
+      for (let i = 0; i < 3; i += 1) {
+        h.append(spanEvent(R({ input: 30_000 + i, output: 200 + i, at: T0 + i * 60_000 })));
+      }
+      db.exec(`update codex_usage_pairing_control set cursor_observed_at = '', cursor_rowid = 0,
+        target_rowid = (select max(rowid) from buffered_events), complete = 0`);
+      const first = runCodexUsagePairingWriterSlice(db, { maxMs: 100, maxCandidates: 2, clock: () => 0 });
+      const secondWriter = new Database(h.file, { timeout: 0 });
+      try { secondWriter.exec("begin immediate; commit"); } finally { secondWriter.close(); }
+      check("historical_writer_releases_lock_after_each_candidate",
+        first.visited === 2 && first.transactions === 2 && !db.inTransaction, first);
+      const second = runCodexUsagePairingWriterSlice(db, { maxMs: 100, maxCandidates: 2, clock: () => 0 });
+      check("historical_writer_resumes_and_completes",
+        second.visited === 1 && second.transactions === 1 && second.complete, second);
     } finally { h.close(); }
   }
 

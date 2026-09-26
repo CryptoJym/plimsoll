@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 
 import { estimateCostUsd } from "../../shared/src/index";
 import { refreshUnsentRawDelivery, retirePairedSpanDelivery } from "./outbox";
+import { isSqliteContentionError } from "./sqlite-contention";
 
 export const CODEX_USAGE_DUPLICATE_REASON = "codex_sse_event_span";
 const PAIR_WINDOW_MS = 30_000;
@@ -383,24 +384,84 @@ export function runCodexUsagePairingBackfill(
     cursorAt: control.cursorAt,
     cursorRowid: control.cursorRowid,
     target: control.target,
-    limit: rowLimit,
+    limit: rowLimit + 1,
   }) as Array<{ rowid: number; id: string; observedAt: string }>;
   let cursorAt = control.cursorAt;
   let cursorRowid = control.cursorRowid;
   let visited = 0;
   let paired = 0;
-  for (const row of rows) {
+  for (const row of rows.slice(0, rowLimit)) {
     if (deadline()) break;
     paired += pairCodexUsageEvent(db, row.id)?.pairCount ?? 0;
     cursorAt = row.observedAt;
     cursorRowid = row.rowid;
     visited += 1;
   }
-  const complete = rows.length === 0 || (visited === rows.length && rows.length < rowLimit);
+  const complete = rows.length === 0 ||
+    (visited === Math.min(rows.length, rowLimit) && rows.length <= rowLimit);
   db.prepare(
     `update codex_usage_pairing_control set cursor_observed_at = ?, cursor_rowid = ?,
        complete = ?, visited = visited + ?, paired = paired + ?
      where singleton = 1`,
   ).run(cursorAt, cursorRowid, complete ? 1 : 0, visited, paired);
   return { visited, paired, complete };
+}
+
+/** A cadence may visit several candidates, but releases the writer after each one. */
+export function runCodexUsagePairingWriterSlice(
+  db: Database.Database,
+  options: { maxMs?: number; maxCandidates?: number; canStart?: () => boolean;
+    clock?: () => number } = {},
+) {
+  if (db.inTransaction) throw new Error("codex_pairing_writer_slice_requires_outer_commit");
+  const clock = options.clock ?? (() => performance.now());
+  const started = clock();
+  const deadline = started + Math.max(1, Math.min(options.maxMs ?? 15, 100));
+  const maxCandidates = Math.max(1, Math.min(options.maxCandidates ?? 32, 128));
+  let visited = 0;
+  let paired = 0;
+  let transactions = 0;
+  let maxTransactionMs = 0;
+  let maxWriterHoldMs = 0;
+  let maxLockWaitMs = 0;
+  let complete = false;
+  let deferredForWriter = false;
+  const priorBusyTimeout = db.pragma("busy_timeout", { simple: true }) as number;
+  const priorAutoCheckpoint = db.pragma("wal_autocheckpoint", { simple: true }) as number;
+  db.pragma("busy_timeout = 0");
+  // A checkpoint can turn one tiny candidate commit into a large writer hold.
+  // The collector's separate WAL checkpoint stage owns that work.
+  db.pragma("wal_autocheckpoint = 0");
+  try {
+    while (visited < maxCandidates && clock() < deadline && (options.canStart?.() ?? true)) {
+      const transactionStarted = clock();
+      let lockAcquired = transactionStarted;
+      let result: ReturnType<typeof runCodexUsagePairingBackfill>;
+      try {
+        result = db.transaction(() => {
+          lockAcquired = clock();
+          return runCodexUsagePairingBackfill(db, 1, () => clock() >= deadline);
+        }).immediate();
+      } catch (error) {
+        if (!isSqliteContentionError(error)) throw error;
+        deferredForWriter = true;
+        break;
+      }
+      const transactionEnded = clock();
+      maxTransactionMs = Math.max(maxTransactionMs, transactionEnded - transactionStarted);
+      maxLockWaitMs = Math.max(maxLockWaitMs, lockAcquired - transactionStarted);
+      maxWriterHoldMs = Math.max(maxWriterHoldMs, transactionEnded - lockAcquired);
+      transactions += 1;
+      visited += result.visited;
+      paired += result.paired;
+      complete = result.complete;
+      if (result.visited === 0 || complete) break;
+    }
+  } finally {
+    db.pragma(`wal_autocheckpoint = ${priorAutoCheckpoint}`);
+    db.pragma(`busy_timeout = ${priorBusyTimeout}`);
+  }
+  return { visited, paired, complete, transactions,
+    elapsedMs: clock() - started, maxTransactionMs, maxWriterHoldMs, maxLockWaitMs,
+    deferredForWriter };
 }

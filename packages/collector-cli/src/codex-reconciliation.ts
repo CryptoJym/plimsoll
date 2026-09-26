@@ -883,7 +883,10 @@ export function runCodexReconciliationMaintenance(
       // Keep direct reconciliation runs useful while the automatic repair
       // cadence provides a larger dedicated historical slice.
       const pairingDeadline = performance.now() + 5;
-      runCodexUsagePairingBackfill(database, 128, () => performance.now() >= pairingDeadline);
+      // This runs inside reconciliation's own transaction. Keep the pairing
+      // contribution to one candidate; automatic maintenance uses separate
+      // one-candidate writer transactions for the larger historical walk.
+      runCodexUsagePairingBackfill(database, 1, () => performance.now() >= pairingDeadline);
       const sliceDurationMs = clock() - sliceStarted;
       const timeBudgetExhausted = clock() >= deadline;
       database
