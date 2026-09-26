@@ -613,7 +613,7 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 - `src/lib/actor-binding-stamp.ts`: `actorForStamp({ stamp, path, binding, ledgerInstallId })` → `{ actorId, basis, stampInvalid? }`,
   `ledgerInstallId` being the uploader's ledger (round 11: the call **throws** `StampFromOtherLedgerError`, message
   `stamp_from_other_ledger`, when `binding.ledgerInstallId` differs, before any judgment, so both paths refuse at the one ownership
-  function), where `binding = { installId, ledgerInstallId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued:
+  function; round 13: the error carries `ledgerInstallId`, the reading ledger the refusal was judged against), where `binding = { installId, ledgerInstallId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued:
   number[], lifecycle }` is the state of the install the stamp's pair names as `loadSightingView` returned it under the lock, `notIssued` being the facts of the
   reading ledger's view; `lifecycle` is carried, never judged (round 10); `sightStamp(binding, stamp)` → the binding with `notIssued`
   extended when the stamp is above `currentVersion` (pure; persisting the fact is B6's); `firstEchoHeardAt(requests)` over every
@@ -626,7 +626,9 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   for the installs the batch's pairs name** (round 10; the function stays pure, the route may not hand it a view loaded earlier); a pair
   naming an install outside `bindings` fails closed and records nothing; a pair naming an install whose `ledgerInstallId` is not the
   option's `ledgerInstallId` makes the whole call throw `StampFromOtherLedgerError { status: 400, reason: "stamp_from_other_ledger",
-  pairs }` before any row is bound, and the route answers that 400 with the pairs, judging nothing and recording nothing (round 11);
+  pairs, ledgerInstallId }` before any row is bound (round 13: `ledgerInstallId` is the option's, the uploader's ledger the request was
+  authorized with, which the refusal was judged against), and the route answers that 400 with the pairs and that ledger, `{ error:
+  "stamp_from_other_ledger", pairs, ledgerInstallId }`, judging nothing and recording nothing (round 11);
   sets `metadata.actorStampInvalid`; appends every new
   not-issued fact `{ ledgerInstallId, recordedByInstallId, deviceInstallId, version, source }` to `sightings`, which the route persists
   in the same transaction (round 9). The summary path (`actorPartsForSegment`) takes its `install` view from the same call in the
@@ -637,7 +639,7 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   not have is absent; a revoked or suspended one is present; one of another ledger is present with its own `ledgerInstallId`, so the
   predicate refuses it); `sightPairInTransaction(tx, { tenantId, ledgerInstallId, recordedByInstallId, deviceInstallId, version,
   source, at })` takes the row `FOR SHARE`, then reads the install's ledger and rejects `StampFromOtherLedgerError` when it is not
-  `ledgerInstallId` (round 11), else reads and judges, inserts the fact `ON CONFLICT DO NOTHING` when the version is above
+  `ledgerInstallId` (round 11; the error carries `ledgerInstallId`, round 13), else reads and judges, inserts the fact `ON CONFLICT DO NOTHING` when the version is above
   `binding_version` and re-reads → `{ issued, actorId, recorded, bindingVersionThen }`; `linkLedgerByAdmin(tx, { tenantId,
   sourceLedgerInstallId, ledgerInstallId, changedBy })` → `{ linked: true, ledgerInstallId, movedInstalls, rekeyedFacts, linkId }`
   (round 12, C1 "The link is the release": the whole-ledger merge in one transaction: both roots `FOR UPDATE` in ascending id order
@@ -653,13 +655,22 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   newInstallId, previousInstallId, token, proof })` is the join route's lineage step → `{ linked, ledgerInstallId }` (linked only when
   `proof = HMAC-SHA256(previous install's install_key, token)` verifies; round 12: it takes the previous install's row `FOR SHARE`,
   reads its `ledger_install_id` under that lock and writes it on the new install in the same transaction, so it serializes against an
-  admin's merge of that ledger; the join route reads `previousInstall` from the request and answers `lineage`). Proved on the repository's disposable Postgres cluster by `actor-binding-stamp-postgres.contract.test.ts`
+  admin's merge of that ledger; the join route reads `previousInstall` from the request and answers `lineage`);
+  `retryOnTransactionRollback(client, { operation ∈ sighting | rebind | join | ledger_link, attempts = 3, onRetry? }, run)` (round 13,
+  C1 "Serialization"): runs `run(tx)` in a fresh `$transaction` and, when PostgreSQL aborts it with SQLSTATE `40P01` or `40001`
+  (Prisma `P2034`, or the code on the driver error), rolls it back and runs it again from its first statement, at most `attempts` in
+  all with no wait of its own, calling `onRetry({ attempt, sqlstate })` before each retry; nothing of an aborted attempt survives or
+  is acknowledged; when the last attempt is aborted too it rejects `TransactionRetryExhaustedError { status: 503, reason:
+  "transaction_retry_exhausted", operation, attempts, sqlstate }`, and the ingest, summary and admin-link routes, which run every C1
+  transaction through it, answer that 503 with `Retry-After` (`collectorIngestErrorResponse` already answers Prisma `P2034` 503 with
+  `Retry-After`; the surface bounds the attempts before that fallback and names them). Proved on the repository's disposable Postgres cluster by `actor-binding-stamp-postgres.contract.test.ts`
   (needs `PLIMSOLL_PROOF_PG_BIN` as `ci.yml`'s usage-projection step has; the harness applies `0_init` first, connects as the cluster's
   superuser through the socket with the port in the authority, inserts `work_tenants.updated_at`, and runs the erasure in a child
   process bound to the cluster, `tests/contracts/lean/fixtures/erase-tenant-child.ts`; `checks/postgres-harness-repaired-probe.log`;
   round 11: `cluster()` stops the cluster on any set-up failure, the join route is driven in a child the same way,
   `tests/contracts/lean/fixtures/join-route-child.ts`, proved runnable against today's route by `checks/join-route-child-probe.log`,
-  and on macOS PostgreSQL 17 needs a valid `LC_ALL` to start, `checks/round11-sql-orderings.log`). (B6, C1)
+  and on macOS PostgreSQL 17 needs a valid `LC_ALL` to start, `checks/round11-sql-orderings.log`; round 13: the deadlock cases shorten
+  `deadlock_timeout` per transaction, `SET LOCAL`, so the detector fires in a fraction of a second). (B6, C1)
 - `src/lib/delivery-ack-response.ts`: `acknowledgedResponse` emits `actorBindingVersion`, (round 11) `lineage` and (round 12)
   `ledgerInstallId` for a registered install (`CollectorUploadAuthorization` gains `actorBindingVersion: number`, `lineage: "linked" |
   "unlinked"` and `ledgerInstallId: string`), so a collector whose rows are parked learns when its ledger was linked, and a member of
@@ -710,8 +721,11 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   ok | joined_install_unknown | join_incomplete, joinedInstall, configInstall }` for `/status`; `lean/summary-upload.ts`:
   `partitionFloodRefusal(items, { pairs })` → `{ resubmit, parked }` (the segments whose parts name a refused pair parked, everything
   else resubmitted; it takes a `stamp_from_other_ledger` refusal the same way, round 11); `lean/upload-park.ts` (round 11):
-  `partitionRefusedRows(events, { reason, pairs })` → `{ resubmit, parked }` for a delivery refused as `stamp_from_other_ledger`;
-  `buffer.ts` gains `parkOutboxRows(ids, reason, ledgerInstallId)` (the ledger the refusing response named, round 12), `parkedRows()`
+  `partitionRefusedRows(events, refusal)`, `refusal` being the parsed 400 body `{ reason, pairs, ledgerInstallId }` → `{ resubmit,
+  parked, ledgerInstallId }` for a delivery refused as `stamp_from_other_ledger` (round 13: it hands the ledger the 400 named on to
+  the park and throws on a body that names none, so nothing is ever parked under a guessed ledger); `buffer.ts` gains
+  `parkOutboxRows(ids, reason, ledgerInstallId)` (the ledger the 400 named, as `partitionRefusedRows` handed it on, never a value the
+  collector supplied or learned itself; rounds 12-13), `parkedRows()`
   and `releaseParkedRows({ reason: "lineage_linked", ledgerInstallId } | { reason: "admin_release", receipt })` (a parked row is never
   leased while parked; `lineage_linked` returns to the outbox the rows parked under a ledger other than the one the latest response
   named, and leaves the others parked, so a member of a merged chain retries and a response for the same ledger changes nothing,
@@ -769,7 +783,12 @@ waiting for a sighting) in round 11 on PostgreSQL 17.11 (`checks/round11-sql-ord
 green under round 11), and the round-12 rule (the admin link as a whole-ledger merge into a canonical destination, the reader's chain
 and non-root-destination counterexamples red as written in round 11 and green under round 12, the merge waiting for a join in
 progress and moving the joined install, a join during a merge landing in the merged ledger, the merge waiting for a sighting that
-holds a member) in round 12 on PostgreSQL 17.11 (`checks/round12-sql-orderings.log`), not through B6's code; the join route was driven through `fixtures/join-route-child.ts` against today's
+holds a member) in round 12 on PostgreSQL 17.11 (`checks/round12-sql-orderings.log`), and the round-13 rules (a two-pair sighting
+deadlocking with the merge in both interleavings, the transaction that waited first aborted with its SQLSTATE observed and, as round
+12 wrote it, the link not taking effect or the batch left unanswered, then under round 13 the aborted operation run again from its
+start and committed, the merge with the sighting's facts re-keyed or the sighting refusing against its view; the refusal naming the
+ledger it judged and released by the next response naming the merged ledger) in round 13 on PostgreSQL 17.10
+(`checks/round13-sql-orderings.log`), not through B6's code; the join route was driven through `fixtures/join-route-child.ts` against today's
 route on the disposable cluster (`checks/join-route-child-probe.log`: 201 for a fresh token, 409 `used` for a reuse with no second
 install; `previousInstall` and `lineage` are absent today, which is where the pending case fails). What
 no test can bind is where a future route *calls* `loadSightingView`: the pending proof shows the call itself locks first and returns
