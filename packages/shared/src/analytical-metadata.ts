@@ -2,6 +2,7 @@ import {
   isForbiddenRawContentFieldName,
   type EventCostKind,
 } from "./schemas";
+import { linkageHash } from "./linkage";
 
 const SESSION_ID_KEYS = [
   "sessionId",
@@ -389,6 +390,14 @@ const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["planType", "classification"],
   ["stitched", "classification"],
   ["usageSource", "classification"],
+  ["role", "classification"],
+  ["workClass", "classification"],
+  ["complexityBand", "classification"],
+  ["techniqueId", "identifier"],
+  ["techniqueVersion", "version"],
+  ["assignmentId", "identifier"],
+  ["arm", "classification"],
+  ["launchedBy", "identifier"],
   ["projectBasis", "classification"],
   ["cliVersion", "version"],
   ["serviceVersion", "version"],
@@ -544,6 +553,8 @@ export function isSensitiveMetadataSemanticKey(key: string) {
 }
 
 const SAFE_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,159}$/;
+const GITHUB_WORK_ITEM = /^github:(.+)\/pull\/([1-9][0-9]*)$/;
+const GITHUB_REPOSITORY_NAME = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?$/;
 const SAFE_COMPONENT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,199}$/;
 const SAFE_CLASSIFICATION = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,95}$/;
 const SAFE_VERSION = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,63}$/;
@@ -622,10 +633,27 @@ function safeStringByPattern(
   return pattern.test(normalized) ? normalized : null;
 }
 
+/** A named GitHub repository stays local; outbound work keys use its repo linkage hash. */
+function safeWorkItemId(value: unknown) {
+  if (typeof value !== "string") return null;
+  const candidate = value.trim();
+  if (!candidate.startsWith("github:")) return safeStringByPattern(value, SAFE_IDENTIFIER, 160);
+  if (candidate.length > 256) return null;
+  const match = candidate.match(GITHUB_WORK_ITEM);
+  if (!match) return null;
+  const repository = match[1]!;
+  if (/^[1-9][0-9]*$/.test(repository) || /^sha256:[a-f0-9]{64}$/.test(repository))
+    return candidate;
+  if (!GITHUB_REPOSITORY_NAME.test(repository) ||
+      repository.split("/").some(segment => segment === "." || segment === "..")) return null;
+  return `github:${linkageHash(`github.com/${repository.toLowerCase()}`)}/pull/${match[2]}`;
+}
+
 /** Exact-key string validation shared by OTLP capture and outbound sealing. */
 export function safeMetadataStringAttribute(key: string, value: unknown) {
   const disposition = metadataKeyDisposition(key);
   if (!disposition || disposition.valueKind !== "string") return null;
+  if (key === "workItemId") return safeWorkItemId(value);
   const kind = disposition.stringKind;
   if (kind === "signal") {
     const lowCardinality = safeStringByPattern(value, SAFE_COMPONENT_NAME, 160, {

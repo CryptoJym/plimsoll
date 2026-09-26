@@ -403,6 +403,23 @@ async function main() {
   }
 
   {
+    const h = new Harness("trace-linked-session-conflict");
+    try {
+      const linkedSpan = spanEvent(R());
+      linkedSpan.event.sessionId = SESSION_B;
+      linkedSpan.event.metadata.sessionLinkBasis = "otel_trace";
+      h.at(200); h.append(linkedSpan);
+      h.at(1_200); h.append(logEvent(R()));
+      const rows = h.buffer.database.prepare(`select count(*) as usageRows,
+        sum(case when usage_duplicate_reason is not null then 1 else 0 end) as duplicates
+        from buffered_events where source = 'codex' and input_tokens is not null`).get() as
+        { usageRows: number; duplicates: number | null };
+      check("trace_linked_session_rejects_foreign_usage_log",
+        rows.usageRows === 2 && !rows.duplicates, rows);
+    } finally { h.close(); }
+  }
+
+  {
     const h = new Harness("trace-beats-guessed-session");
     try {
       h.at(100); h.append(contextEvent(SESSION_B, T0 - 1_490));

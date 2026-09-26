@@ -364,6 +364,22 @@ export function writeCollectorConfigTransactionally(
   );
 }
 
+/** Read the latest config while holding the same lock as other config writers. */
+export function mutateCollectorConfigTransactionally(
+  mutate: (current: CollectorConfig) => CollectorConfig,
+  configPath = collectorConfigPath(),
+) {
+  return withCollectorConfigMutationLock(configPath, () => {
+    const stored = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    const current = collectorConfigSchema.parse(stored);
+    const next = collectorConfigSchema.parse(mutate(current));
+    assertCollectorPrivacyMode(next, "config write");
+    const published = { ...stored, ...next } as CollectorConfig;
+    writeCollectorConfigTransactionallyUnlocked(published, configPath);
+    return next;
+  });
+}
+
 /**
  * Learn the hosted DeviceInstall UUID only from a validated ingest
  * acknowledgement. The active config file is authoritative: equal echoes are

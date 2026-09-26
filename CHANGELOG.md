@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.43 — 2026-09-26
+
+- `plimsoll dispatch bind` assigns a bounded work item, role, and optional
+  technique to a session before capture. Codex OTLP logs and Codex and Claude
+  tailer rows carry the binding; a late bind needs an explicit restamp of
+  unsent local rows. GitHub repository names are hashed in outbound work IDs
+  (`eco-6hoxj.165.3`).
+- A bound Codex SSE usage log keeps its dispatch fields when it pairs with a
+  response span; the neutralised span carries none (`eco-6hoxj.163.99`).
+- A loaded LaunchAgent with zero runs gets one kickstart and a fresh status
+  check. Capture-root discovery identifies homes already covered by a local
+  producer and warns before adding a second file path (`eco-6hoxj.163.91`,
+  `eco-6hoxj.163.93`).
+- A plain lifecycle update builds the existing Codex pairing indexes after
+  readiness and records the result in its durable completion receipt. A busy
+  ledger yields a bounded, nonfatal skip (`eco-6hoxj.163.100`).
+- Codex OTLP service names are classified as Codex, and a response span keeps
+  its conversation link (`eco-6hoxj.163.98`). A Codex service that sends with
+  a Claude credential now gets `401 source_mismatch` and must use the Codex
+  source and token.
+- Claude capture health stays amber while session counts reconcile after a
+  collector restart; a real local token transcript missing from the ledger
+  still reads red (`eco-6hoxj.163.101`).
+
 ## 0.7.42 — 2026-09-26
 
 - Busy-session summaries preserve rebuild progress while unread rows change.

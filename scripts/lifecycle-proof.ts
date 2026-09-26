@@ -268,6 +268,45 @@ async function main() {
     metadata.cleanup();
   }
 
+  const pairing = fixture("pairing-update");
+  try {
+    let attempts = 0;
+    const result = await runLifecycleCommand({
+      argv: ["update", "--operation-id", "pairing-update", "--artifact", "fixture"],
+      adapter: pairing.adapter,
+      resolveArtifact: async () => pairing.artifact("0.7.42"),
+      pairingIndexes: async () => {
+        attempts += 1;
+        return { status: "applied" as const, reason: null, attempts: 1, elapsedMs: 12 };
+      },
+    } as Parameters<typeof runLifecycleCommand>[0] & { pairingIndexes: () => Promise<unknown> });
+    const receipt = result.receipt as typeof result.receipt & {
+      pairingIndexes?: { status: string; reason: string | null; attempts: number; elapsedMs: number };
+    };
+    const persisted = JSON.parse(fs.readFileSync(path.join(
+      pairing.paths.lifecycleRoot, "receipts", "pairing-update-update.json",
+    ), "utf8")) as typeof receipt;
+    check("update_runs_pairing_before_durable_completion_receipt",
+      attempts === 1 && receipt.status === "completed" && receipt.pairingIndexes?.status === "applied" &&
+      persisted.pairingIndexes?.status === "applied",
+      { attempts, receipt, persisted });
+    const rollback = await runLifecycleCommand({
+      argv: ["rollback", "--operation-id", "pairing-rollback", "--artifact", "fixture"],
+      adapter: pairing.adapter,
+      resolveArtifact: async () => pairing.artifact("0.7.41"),
+      pairingIndexes: async () => {
+        attempts += 1;
+        return { status: "applied", reason: null, attempts: 1, elapsedMs: 1 };
+      },
+    });
+    check("rollback_does_not_run_update_pairing_step",
+      attempts === 1 && rollback.receipt.status === "completed" &&
+      !("pairingIndexes" in rollback.receipt),
+      { attempts, receipt: rollback.receipt });
+  } finally {
+    pairing.cleanup();
+  }
+
   const happy = fixture("happy");
   try {
     const manager = new LifecycleManager(happy.adapter);

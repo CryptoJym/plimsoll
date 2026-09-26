@@ -3853,7 +3853,7 @@ export class DashboardProjectionStore {
       totalCostUsd:usd(row.totalCostNanos),totalCostNanos:undefined};
   }
 
-  private buildHealth(_days:number,now:Date) {
+  private buildHealth(_days:number,now:Date,sessionCountsReconciled=true) {
     const today=now.toISOString().slice(0,10);
     const activityRows=this.db.prepare(
       `select source,last_activity_at as lastActivityAt,files_today as filesToday,
@@ -3891,10 +3891,18 @@ export class DashboardProjectionStore {
         sessions.tokenSessionsToday,Date.parse(dayStart),now.getTime(),"token-session");
       const ledgerCount=sessionCountFreshness(latest.lastEventAt,sessions.latestSessionAt,
         sessions.ledgerSessionsToday,Date.parse(dayStart),now.getTime(),"ledger-session");
-      const countState=tokenCount.state==="unavailable"||ledgerCount.state==="unavailable"
+      // A retained snapshot remains readable during a restart backfill, but
+      // its live source/session rows can be only partly rebuilt. For Claude,
+      // a projected zero in that interval is not evidence that a local
+      // transcript missed capture. Keep the independent activity-to-ledger
+      // lag red below; it still detects a real broken capture path.
+      const countState=source==="claude_code"&&!sessionCountsReconciled
+        ?"unavailable":tokenCount.state==="unavailable"||ledgerCount.state==="unavailable"
         ?"unavailable":tokenCount.state==="lagging"||ledgerCount.state==="lagging"?"lagging":"projected";
       const countsAvailable=countState==="projected";
       const details=[tokenCount.detail,ledgerCount.detail].filter((v):v is string=>v!==null);
+      if(source==="claude_code"&&!sessionCountsReconciled)
+        details.push("Claude session counts await projection reconciliation");
       // The linkage-versus-lag disclosure answers a projection that is behind and
       // may still catch up. An invalid, future, or projection-ahead pair raises
       // no linkage question and will not resolve by waiting, so it is reported
@@ -4083,7 +4091,12 @@ export class DashboardProjectionStore {
     snapshot.status.projection = { ...current, ...validity,
       generation: row.generation, currentGeneration: control.generation };
     this.decoratePresentation(snapshot,subscriptions);
-    snapshot.status.health = this.buildHealth(days, new Date(Date.now()));
+    snapshot.status.health = this.buildHealth(days, new Date(Date.now()),
+      // A scan receipt can dirty the snapshot without changing completed
+      // session counts; it must not defer a genuine zero-token red.
+      Boolean(control.parityReady&&!control.degradedReason&&
+        control.backfillComplete&&control.parityComplete&&control.metricBackfillComplete&&
+        Object.values(current.backlog).every((pending)=>pending===0)));
     const settings=(this.db.prepare(`select settings_version as version from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
     return {kind:"ready",snapshot,etagSeed:`${row.generation}-${settings}-${snapshot.window.since}-${validity.degradedReason ?? "current"}`};
   }

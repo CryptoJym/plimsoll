@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-operator", 80);
+const completion = createProofCompletion("lifecycle-operator", 82);
 /**
  * Issue #103/#158 packaged lifecycle operator proof.
  *
@@ -51,6 +51,7 @@ import {
   readLaunchAgentProgramArguments,
 } from "../packages/collector-cli/src/launch-agent";
 import { PLIMSOLL_VERSION } from "../packages/collector-cli/src/version";
+import { readUtcProcessStartFingerprint, UTC_PROCESS_START_ALGORITHM } from "../packages/collector-cli/src/runtime-ownership";
 
 type Check = { name: string; passed: boolean; detail?: unknown };
 const checks: Check[] = [];
@@ -692,6 +693,54 @@ syncBuiltinESMExports();
 
   // --- Final: the whole exercise never invoked the service manager -------------
   check("zero_launchctl_invocations_end_to_end", launchctlInvocationCount() === 1, launchctlInvocationCount());
+
+  // An update only switches the owned manifest. Its explicit follow-up
+  // load-launch-agent uses the same one-kickstart recovery as any other load.
+  const updatedLoadBin = path.join(fixtureHome, "updated-load-bin");
+  fs.mkdirSync(updatedLoadBin, { mode: 0o700 });
+  const updatedLoadState = path.join(fixtureHome, "updated-load.state");
+  const updatedLoadCalls = path.join(fixtureHome, "updated-load.calls");
+  const updatedLoadPids = path.join(fixtureHome, "updated-load.pids");
+  const updatedLoadServer = path.join(fixtureHome, "updated-load-server.cjs");
+  fs.writeFileSync(updatedLoadServer,
+    `const http = require('node:http');\nhttp.createServer((_req,res) => {res.writeHead(200, {'content-type':'application/json'}); res.end(process.env.FAKE_BODY);}).listen(Number(process.env.FAKE_PORT), '127.0.0.1');\n`,
+    { mode: 0o600 });
+  fs.writeFileSync(path.join(updatedLoadBin, "launchctl"), [
+    "#!/bin/sh", "set -eu", 'case "$1" in',
+    'print) if [ -f "$FAKE_STATE" ]; then echo "state = not running"; echo "runs = 0"; else echo "Could not find service \\"com.plimsoll.collector\\" in domain for user gui: $(/usr/bin/id -u)" >&2; exit 113; fi ;;',
+    'bootstrap) : > "$FAKE_STATE"; echo bootstrap >> "$FAKE_CALLS" ;;',
+    'kickstart) echo kickstart >> "$FAKE_CALLS"; "$FAKE_NODE" "$FAKE_SERVER" >/dev/null 2>&1 & echo $! >> "$FAKE_PIDS" ;;',
+    '*) exit 64 ;;', "esac", "exit 0", "",
+  ].join("\n"), { mode: 0o700 });
+  fs.mkdirSync(path.dirname(collectorConfigPath(fixtureHome)), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(collectorConfigPath(fixtureHome), JSON.stringify({ port }) + "\n", { mode: 0o600 });
+  const startFingerprint = readUtcProcessStartFingerprint(process.pid);
+  check("post_update_fixture_has_live_identity", startFingerprint !== null);
+  const fakeBody = JSON.stringify({ ok: true, runtimeIdentity: {
+    instanceId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", pid: process.pid,
+    processStartFingerprint: startFingerprint,
+    processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
+  } });
+  try {
+    const loaded = spawnSync(process.execPath, [BUNDLE_PATH, "load-launch-agent"], {
+      cwd: fixtureHome, encoding: "utf8", timeout: 30_000,
+      env: { ...childEnv, PATH: `${updatedLoadBin}:${childEnv.PATH}`,
+        FAKE_STATE: updatedLoadState, FAKE_CALLS: updatedLoadCalls, FAKE_PIDS: updatedLoadPids,
+        FAKE_NODE: process.execPath, FAKE_SERVER: updatedLoadServer,
+        FAKE_BODY: fakeBody, FAKE_PORT: String(port) },
+    });
+    const receipt = JSON.parse(loaded.stdout || "{}") as Record<string, any>;
+    const calls = readFileIfExists(updatedLoadCalls)?.split("\n").filter(Boolean) ?? [];
+    check("post_update_explicit_load_kickstarts_once_and_reaches_status",
+      loaded.status === 0 && receipt.loaded === true && receipt.readiness?.verified === true &&
+      receipt.kickstart?.attempted === true && calls.filter((call) => call === "kickstart").length === 1,
+      { code: loaded.status, receipt, calls, stderr: loaded.stderr });
+  } finally {
+    for (const pid of (readFileIfExists(updatedLoadPids) ?? "").split("\n").filter(Boolean)) {
+      try { process.kill(Number(pid), "SIGTERM"); } catch { /* already gone */ }
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
 
   console.log(`lifecycle-operator proof: ${checks.length} checks, all passed`);
 } finally {

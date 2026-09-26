@@ -152,12 +152,7 @@ const spanMatrix = {
   ],
 };
 
-/**
- * Transport authentication is authoritative for `source` (a producer-set
- * `service.name` can never relabel an authenticated batch), so the
- * "same name, other source" case must arrive on its own authenticated post.
- * The measured deny set is Codex-specific; the same name elsewhere fails open.
- */
+/** A Claude-named service is still admitted by a Claude producer. */
 const foreignSourceSpanMatrix = {
   resourceSpans: [
     {
@@ -611,10 +606,9 @@ async function main() {
       "claude_code",
     );
     check(
-      "app_server_rule_is_source_scoped",
-      appServerForeign.status === 202 &&
-        appServerForeign.body.events === 1 &&
-        appServerForeign.body.droppedEvents === 0,
+      "codex_service_with_claude_credential_is_refused",
+      appServerForeign.status === 401 &&
+        appServerForeign.body.reason === "source_mismatch",
       appServerForeign,
     );
 
@@ -625,8 +619,7 @@ async function main() {
           event.source === source &&
           (event.metadata as Record<string, unknown>).otelEventName === name,
       );
-    // Two flood names are deliberately reused by the retained-dimension spans
-    // (and one by the other-service fail-open probe), so the expectation is a
+    // Flood names reused by retained-dimension spans need a per-name count,
     // per-name count, not "absent": the rule drops the shape, not the string.
     const APP_SERVER_EXPECTED_PERSISTED: Record<string, number> = {
       [APP_SERVER_UNKNOWN_ELSEWHERE_SPAN]: 2,
@@ -679,7 +672,7 @@ async function main() {
       appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "codex").some(
         (event) => (event.metadata as Record<string, unknown>).serviceName === "codex_exec",
       ) &&
-        appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "claude_code").length === 1,
+        appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "claude_code").length === 0,
       {
         codexOtherService: appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "codex").map(
           (event) => (event.metadata as Record<string, unknown>).serviceName,
@@ -934,6 +927,102 @@ async function main() {
         body: bodyOnlyLog?.suppressedFields ?? [],
       },
     );
+
+    for (const [index, serviceName] of [
+      "Codex_Desktop", "codex-app-server", "codex_exec", "codex_cli_rs", "codex-app-server-sdk",
+      "codex_desktop", "codex_mcp_server", "codex-tui", "codex_vscode", "codex-cli",
+      "codex_sdk_ts", "codex_work_desktop",
+    ].entries()) {
+      const probe = { resourceSpans: [{
+        resource: { attributes: [attr("service.name", serviceName)] },
+        scopeSpans: [{ spans: [span("handle_responses", 280 + index, [
+          attr("gen_ai.usage.input_tokens", 1000 + index),
+          attr("gen_ai.usage.output_tokens", 17),
+        ])] }],
+      }] };
+      const wrong = await post(port, "/v1/traces", probe, "claude_code");
+      const right = await post(port, "/v1/traces", probe, "codex");
+      const named = buffer.list(500).map((row) => row.payload).filter((event) =>
+        (event.metadata as Record<string, unknown>).serviceName === serviceName &&
+        event.inputTokens === 1000 + index);
+      check(`codex_service_${serviceName}_source_guard`,
+        wrong.status === 401 && wrong.body.reason === "source_mismatch" &&
+        right.status === 202 && named.length === 1 && named[0]?.source === "codex",
+        { wrong, right, sources: named.map((event) => event.source) });
+    }
+
+    const unknownService = { resourceSpans: [{
+      resource: { attributes: [attr("service.name", "mystery_otel")] },
+      scopeSpans: [{ spans: [span("vendor.response", 190, [
+        attr("gen_ai.usage.input_tokens", 1900), attr("gen_ai.usage.output_tokens", 19),
+      ])] }],
+    }] };
+    const unknownResult = await post(port, "/v1/traces", unknownService, "claude_code");
+    const unknownRow = buffer.list(500).map((row) => row.payload).find((event) =>
+      (event.metadata as Record<string, unknown>).serviceName === "mystery_otel");
+    check("unknown_service_is_not_silently_claude",
+      unknownResult.status === 202 && unknownRow?.source === "unknown",
+      { result: unknownResult, source: unknownRow?.source });
+
+    const linkedTrace = "a".repeat(32);
+    const loneSpan = { ...span("handle_responses", 191, [
+      attr("gen_ai.usage.input_tokens", 3191),
+      attr("gen_ai.usage.cache_read.input_tokens", 3000),
+      attr("gen_ai.usage.output_tokens", 91),
+    ]), traceId: linkedTrace };
+    const contextSpan = { ...span("response.context", 192, [
+      attr("conversation.id", LINKED_SESSION),
+    ]), traceId: linkedTrace };
+    const linkedResult = await post(port, "/v1/traces", { resourceSpans: [{
+      resource: { attributes: [attr("service.name", "codex-app-server")] },
+      scopeSpans: [{ spans: [loneSpan, contextSpan] }],
+    }] }, "codex");
+    const linkedRow = buffer.list(500).map((row) => row.payload).find((event) =>
+      event.inputTokens === 3191);
+    check("lone_usage_span_inherits_unique_trace_session_without_invented_model",
+      linkedResult.status === 202 && linkedRow?.sessionId === LINKED_SESSION &&
+        linkedRow?.model === undefined && linkedRow?.actorId === undefined &&
+        linkedRow?.cacheReadTokens === 3000 &&
+        (linkedRow?.metadata as Record<string, unknown> | undefined)?.traceId === linkedTrace &&
+        (linkedRow?.metadata as Record<string, unknown> | undefined)?.sessionLinkBasis === "otel_trace",
+      { linkedResult, session: linkedRow?.sessionId, model: linkedRow?.model });
+
+    const ambiguousTrace = "b".repeat(32);
+    const ambiguousResult = await post(port, "/v1/traces", { resourceSpans: [{
+      resource: { attributes: [attr("service.name", "codex-app-server")] },
+      scopeSpans: [{ spans: [
+        { ...span("handle_responses", 193, [
+          attr("gen_ai.usage.input_tokens", 3192), attr("gen_ai.usage.output_tokens", 92),
+        ]), traceId: ambiguousTrace },
+        { ...span("response.context", 194, [attr("conversation.id", LINKED_SESSION)]),
+          traceId: ambiguousTrace },
+        { ...span("response.context", 195, [
+          attr("conversation.id", "22222222-2222-4333-8444-555555555555"),
+        ]), traceId: ambiguousTrace },
+      ] }],
+    }] }, "codex");
+    const ambiguousRow = buffer.list(500).map((row) => row.payload).find((event) =>
+      event.inputTokens === 3192);
+    check("ambiguous_trace_does_not_guess_session_or_model",
+      ambiguousResult.status === 202 && ambiguousRow?.sessionId === undefined &&
+        ambiguousRow?.model === undefined &&
+        (ambiguousRow?.metadata as Record<string, unknown> | undefined)?.sessionLinkBasis === undefined,
+      { status: ambiguousResult.status, session: ambiguousRow?.sessionId });
+
+    const directResult = await post(port, "/v1/traces", { resourceSpans: [{
+      resource: { attributes: [attr("service.name", "codex-app-server")] },
+      scopeSpans: [{ spans: [span("handle_responses", 196, [
+        attr("conversation.id", LINKED_SESSION),
+        attr("gen_ai.usage.input_tokens", 3193), attr("gen_ai.usage.output_tokens", 93),
+      ])] }],
+    }] }, "codex");
+    const directRow = buffer.list(500).map((row) => row.payload).find((event) =>
+      event.inputTokens === 3193);
+    check("direct_span_session_attribute_survives_without_invented_model",
+      directResult.status === 202 && directRow?.sessionId === LINKED_SESSION &&
+        directRow?.model === undefined &&
+        (directRow?.metadata as Record<string, unknown> | undefined)?.sessionLinkBasis === "span_attribute",
+      { status: directResult.status, session: directRow?.sessionId });
 
     refreshStatus?.();
     const statusResponse = await fetch(`http://127.0.0.1:${port}/status`);

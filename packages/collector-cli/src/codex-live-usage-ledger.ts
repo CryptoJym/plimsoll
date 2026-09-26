@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import type { LocalEventBuffer } from "./buffer";
 import type { LiveAuthenticatedBinding, LiveSourceContext } from "./codex-live-usage-auth";
 import { isAuthenticatedLiveBinding } from "./codex-live-usage-auth";
-import type { CaptureRoot } from "./capture-root-inventory";
+import { currentDispatchRoot,dispatchBindingMetadata,type CaptureRoot } from "./capture-root-inventory";
 import type { MetricSample } from "./otlp";
 import { HttpBoundaryRejection } from "./http-boundary";
 import { readLiveUsageObservation, type AiInteractionEvent } from "../../shared/src/index";
@@ -153,7 +153,7 @@ function snapshot(auth: LiveAuthenticatedBinding, p: LiveUsagePacket): Snapshot 
   ).values()];
   const matchingAccounts = accountCandidates.filter(candidate => contains(p.capturedAt, candidate));
   const account = matchingAccounts.length === 1 ? { ...matchingAccounts[0] } : null;
-  const matches = (auth.root.dispatch ?? []).filter(w => w.sessionId === p.threadId && contains(p.capturedAt, w));
+  const matches = (currentDispatchRoot(auth.root).dispatch ?? []).filter(w => w.sessionId === p.threadId && contains(p.capturedAt, w));
   const work = matches.length === 1 ? { ...matches[0] } : null;
   return { at: p.capturedAt, contextDigest: auth.contextDigest, account, work,
     accountDigest: account ? liveSha256(canonicalJson(account)) : null,
@@ -172,11 +172,11 @@ function intervalEvent(auth: LiveAuthenticatedBinding, p: LiveUsagePacket, diges
   if (prior.snapshot.contextDigest !== current.contextDigest) { account = null; work = null; }
   // Also reject a binding that overlaps any part of the interval even if the
   // chosen binding happens to be unique at both endpoint instants.
-  if (work && (auth.root.dispatch ?? []).filter(w => w.sessionId === p.threadId &&
+  if (work && (currentDispatchRoot(auth.root).dispatch ?? []).filter(w => w.sessionId === p.threadId &&
       Date.parse(w.validFrom) <= Date.parse(p.capturedAt) &&
       (!w.validUntil || Date.parse(w.validUntil) > Date.parse(prior.capturedAt))).length !== 1) work = null;
   const id = liveEventId(p);
-  const metadata: Record<string, string | number> = {
+  const metadata: Record<string, unknown> = {
     sourceVersion: LIVE_SCHEMA, sourceEventId: id, logicalSourceEventId: id, sourcePayloadDigest: digest,
     sourceIdentityEvidenceRef: "native_runtime_observed_interval_v1",
     captureRootId: auth.context.captureRootId, captureProfileId: auth.context.profileId,
@@ -185,10 +185,7 @@ function intervalEvent(auth: LiveAuthenticatedBinding, p: LiveUsagePacket, diges
     liveAttributionState: account && work ? "qualified" : "unresolved", liveFinanceEligibility: "unqualified_observer",
     liveTotalTokens: delta.totalTokens, liveReasoningOutputTokens: delta.reasoningOutputTokens,
     ...(account ? { captureAccountHash: account.actorHash, accountEvidenceRef: account.evidenceRef } : {}),
-    ...(work ? { workItemId: work.workItemId, dispatchProjectKey: work.projectKey, workEvidenceRef: work.evidenceRef,
-      attemptId: work.attemptId, ...(work.parentAttemptId ? { parentAttemptId: work.parentAttemptId } : {}),
-      ...(work.companyRef ? { companyRef: work.companyRef } : {}),
-      ...(work.acceptedOutcomeId ? { acceptedOutcomeId: work.acceptedOutcomeId } : {}) } : {}),
+    ...(work ? dispatchBindingMetadata(work) : {}),
   };
   if (!readLiveUsageObservation(metadata, p.capturedAt)) throw new Error("live_interval_invalid");
   return { id, source: "codex", dataMode: "metadata", eventType: "usage_live", sessionId: p.threadId,

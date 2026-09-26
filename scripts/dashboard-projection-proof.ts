@@ -3976,6 +3976,150 @@ async function main() {
     } finally {
       await closeServer(healthServer);
     }
+
+    // A retained snapshot can be served while a restart rebuilds its live
+    // source/session counts. The source has been idle for 25 minutes and the
+    // raw ledger already contains its token event. Stage the non-token part of
+    // the projection first, then publish the token part after the minute-10
+    // read. Every observation comes through the restarted server's /status.
+    const restartDbPath = path.join(root, "capture-health-idle-restart.sqlite");
+    const idleAt = new Date(NOW.getTime() - 25 * 60_000);
+    const idleFile = path.join(root, "capture-health-idle-home", ".claude", "projects",
+      "fixture", `${uuid(950_001)}.jsonl`);
+    fs.mkdirSync(path.dirname(idleFile), { recursive: true });
+    fs.writeFileSync(idleFile, `${JSON.stringify({ type: "assistant", timestamp: idleAt.toISOString(),
+      message: { id: "idle-token-message", model: "claude-opus-5",
+        usage: { input_tokens: 1200, output_tokens: 340 } } })}\n`);
+    fs.utimesSync(idleFile, idleAt, idleAt);
+    const beforeRestart = new LocalEventBuffer(restartDbPath);
+    beforeRestart.append(event({source: "claude_code", sessionId: uuid(950_001),
+      observedAt: idleAt.toISOString(), inputTokens: 1200, outputTokens: 340}));
+    beforeRestart.append(event({source: "claude_code", sessionId: uuid(950_001),
+      observedAt: idleAt.toISOString(), eventType: "tool_use"}));
+    settle(beforeRestart, NOW, 30);
+    beforeRestart.projection.recordCaptureActivity({source: "claude_code",
+      lastActivityAt: fs.statSync(idleFile).mtime.toISOString(), filesToday: 1,
+      discoveryEntries: 1, lastScanAt: NOW.toISOString(), truncated: false});
+    for (let pass = 0; pass < 20; pass += 1) {
+      const state = beforeRestart.projection.status();
+      if (state.parityReady && !state.dirty && !state.degraded &&
+          state.backfill.complete && state.backfill.parityComplete &&
+          state.backfill.metricComplete && Object.values(state.backlog).every(value => value === 0)) break;
+      beforeRestart.projection.runMaintenance(NOW);
+    }
+    const priorClaude = (readySnapshot(beforeRestart, 30).status.health as {
+      sources: Array<{source: string; status: string; tokenSessionsToday: number}>;
+    }).sources.find(row => row.source === "claude_code")!;
+    const priorTokenAt = (beforeRestart.database.prepare(
+      `select last_token_event_at as tokenAt from dashboard_source_lifetime where source='claude_code'`,
+    ).get() as {tokenAt: string}).tokenAt;
+    check("idle_claude_was_captured_before_collector_restart",
+      priorClaude.status === "green" && priorClaude.tokenSessionsToday === 1 &&
+      priorTokenAt === idleAt.toISOString(),
+      {priorClaude, priorTokenAt, projection: beforeRestart.projection.status()});
+    beforeRestart.close();
+
+    const staged = new Database(restartDbPath);
+    staged.prepare(`update dashboard_source_lifetime set last_token_event_at=null
+      where source='claude_code'`).run();
+    staged.prepare(`update dashboard_session_source_window set token_events=0,
+      last_token_event_at=null where source='claude_code' and days=7`).run();
+    staged.prepare(`update dashboard_projection_control set backfill_complete=0,
+      parity_complete=0,parity_ready=0,dirty=1,degraded_reason='projection_backfilling'
+      where singleton=1`).run();
+    staged.close();
+
+    const afterRestart = new LocalEventBuffer(restartDbPath);
+    let refreshRestartStatus: (() => boolean) | undefined;
+    const restartServer = createCollectorServer(collectorConfigSchema.parse({ subscriptions }),
+      afterRestart, {registerStatusRefresher: refresh => {refreshRestartStatus = refresh;}});
+    const restartPort = await listen(restartServer);
+    const restartClock = Date.now;
+    const restartReads: Array<{minute: number; status: string; reason: string;
+      count: number | null; projection: string}> = [];
+    try {
+      for (let minute = 0; minute <= 15; minute += 1) {
+        Date.now = () => NOW.getTime() + minute * 60_000;
+        if (minute === 8) {
+          // The last backfill rows may be visited before the collector can
+          // attest parity and publish trustworthy session counts.
+          afterRestart.database.prepare(`update dashboard_projection_control set
+            backfill_complete=1,parity_complete=1,metric_backfill_complete=1,
+            parity_ready=0,dirty=1,degraded_reason='projection_repair_backlog'
+            where singleton=1`).run();
+        }
+        if (minute === 11) {
+          afterRestart.database.prepare(`update dashboard_source_lifetime
+            set last_token_event_at=? where source='claude_code'`).run(priorTokenAt);
+          afterRestart.database.prepare(`update dashboard_session_source_window
+            set token_events=1,last_token_event_at=? where source='claude_code' and days=7`).run(priorTokenAt);
+          afterRestart.database.prepare(`update dashboard_projection_control set
+            backfill_complete=1,parity_complete=1,parity_ready=1,dirty=0,
+            degraded_reason=null,last_success_at=? where singleton=1`)
+            .run(new Date(Date.now()).toISOString());
+        }
+        assert.equal(refreshRestartStatus?.(), true);
+        const status = await (await fetch(`http://127.0.0.1:${restartPort}/status`)).json() as {
+          captureHealth: {sources: Array<{source: string; status: string; reason: string;
+            tokenSessionsToday: number | null; sessionCountProjection: {state: string}}>} };
+        const claude = status.captureHealth.sources.find(row => row.source === "claude_code")!;
+        restartReads.push({minute, status: claude.status, reason: claude.reason,
+          count: claude.tokenSessionsToday, projection: claude.sessionCountProjection.state});
+      }
+      check("idle_claude_never_reads_red_during_15_minute_restart_rebuild",
+        restartReads.length === 16 && restartReads.every(row => row.status !== "red") &&
+        restartReads.slice(0, 11).every(row => row.status === "amber" && row.count === null) &&
+        restartReads.slice(11).every(row => row.status === "green" && row.count === 1),
+        {restartReads});
+    } finally {
+      Date.now = restartClock;
+      await closeServer(restartServer);
+      afterRestart.close();
+    }
+
+    // A real local transcript with token activity and no ledger event remains
+    // red, even when the projection has only a retained, coherent snapshot.
+    const missedAt = new Date(NOW.getTime() - 90 * 60_000);
+    const missedFile = path.join(root, "capture-health-missed-home", ".claude", "projects",
+      "fixture", `${uuid(950_002)}.jsonl`);
+    fs.mkdirSync(path.dirname(missedFile), {recursive: true});
+    fs.writeFileSync(missedFile, `${JSON.stringify({type: "assistant", timestamp: missedAt.toISOString(),
+      message: {id: "missed-token-message", model: "claude-opus-5",
+        usage: {input_tokens: 900, output_tokens: 90}}})}\n`);
+    fs.utimesSync(missedFile, missedAt, missedAt);
+    const missed = new LocalEventBuffer(path.join(root, "capture-health-missed.sqlite"));
+    settle(missed, NOW, 30);
+    missed.projection.recordCaptureActivity({source: "claude_code",
+      lastActivityAt: fs.statSync(missedFile).mtime.toISOString(), filesToday: 1,
+      discoveryEntries: 1, lastScanAt: NOW.toISOString(), truncated: false});
+    for (let pass = 0; pass < 20 && !missed.projection.status().parityReady; pass += 1)
+      missed.projection.runMaintenance(NOW);
+    const missedServer = createCollectorServer(collectorConfigSchema.parse({subscriptions}), missed);
+    const missedPort = await listen(missedServer);
+    let missedClaudeEvidence: {status: string; reason: string; ledgerEvents: number;
+      localInputTokens: number} | null = null;
+    try {
+      const status = await (await fetch(`http://127.0.0.1:${missedPort}/status`)).json() as {
+        captureHealth: {sources: Array<{source: string; status: string; reason: string}>} };
+      const claude = status.captureHealth.sources.find(row => row.source === "claude_code")!;
+      const localUsage = JSON.parse(fs.readFileSync(missedFile, "utf8")) as {
+        message: {usage: {input_tokens: number}}};
+      const ledgerEvents = (missed.database.prepare(
+        `select count(*) as n from buffered_events where source='claude_code'`,
+      ).get() as {n: number}).n;
+      missedClaudeEvidence = {status: claude.status, reason: claude.reason,
+        ledgerEvents, localInputTokens: localUsage.message.usage.input_tokens};
+      check("uncaptured_claude_token_transcript_still_reads_red",
+        localUsage.message.usage.input_tokens > 0 && ledgerEvents === 0 &&
+        missed.projection.status().parityReady && missed.projection.status().dirty &&
+        claude.status === "red" &&
+        claude.reason.includes("0 sessions captured with tokens"),
+        {ledgerEvents, claude, projection: missed.projection.status()});
+    } finally {
+      await closeServer(missedServer);
+      missed.close();
+    }
+
     live.fixture.close();
     staleEvents.fixture.close();
     empty.close();
@@ -3991,6 +4135,8 @@ async function main() {
       checks: checks.length,
       names: checks.map((entry) => entry.name),
       evidence:{
+        idleRestartReads:restartReads,
+        missedClaude:missedClaudeEvidence,
         compactStorage:checks.find((entry)=>entry.name==="generic_zero_value_spans_use_bounded_compressed_projection_storage")?.detail,
         activeBatch:checks.find((entry)=>entry.name==="active_5k_compactable_rows_use_repair_day_bounded_segments")?.detail,
         compactGc:checks.find((entry)=>entry.name==="compact_gc_physically_removes_20k_deleted_history_in_bounded_restart_safe_slices")?.detail,
