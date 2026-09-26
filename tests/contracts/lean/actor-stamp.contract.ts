@@ -21,7 +21,14 @@
  * `parkOutboxRows` parks under it, never under a value the collector supplied or learned itself (test 12, changed); the race in which
  * the chain was merged between the request's authorization and the sighting's lock is refused naming the stale view U, parked under
  * U from the wire, released by the next response naming X and retried, where parking under X would have kept the row parked on
- * every later X response (test 13). Pending until B2a lands.
+ * every later X response (test 13). Round 8 of B0 (round 14; the read of C1 after round 13, blocking 1-2 and should-fix 1): the wire
+ * itself is bound: the collector's parsed refusal is the cloud's 400 body, keyed `error` on both sides (round 13 wrote `reason` here
+ * with no mapping), and test 14 drives the exact serialized body the cloud route sends (the same literal the cloud's route test
+ * asserts) through the collector's own upload path: parsed there, parked under the body's ledgerInstallId, released by the next
+ * response naming X, delivered again and acknowledged once; a 400 naming no ledger parks nothing and keeps the ordinary 400 handling
+ * (test 15); a well-formed but unknown ledger id is an opaque value, parked under, kept by a response naming it, released by a
+ * different ledger, no row lost (test 16); the exhausted retry's exact 503 body with Retry-After acknowledges nothing, parks nothing
+ * and is retried at Retry-After (test 17; the sync-backoff proof is the model). Pending until B2a lands.
  */
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
@@ -389,5 +396,153 @@ test("B2a C1 (round 13, read c1 r12 blocking 2): the wire-to-parking race: V's d
     assert.equal(stamped.parkOutboxRows([row.id], "stamp_from_other_ledger", INSTALL_X), 1);
     assert.deepEqual(stamped.releaseParkedRows({ reason: "lineage_linked", ledgerInstallId: INSTALL_X }), { retried: 0, acknowledged: 0 }, "parked under X, a response naming X leaves it parked: the row would wait for a ledger change that never comes");
     assert.deepEqual(stamped.releaseParkedRows({ reason: "admin_release", receipt: "admin-release-lean-contract-13" }), { retried: 0, acknowledged: 1 });
+  } finally { close(); }
+});
+
+// ---- round 14 (B0 round 8): the wire itself. The two literals below are byte-identical to the cloud's tests/contracts/lean/ingest-route-wire.contract.test.ts
+// (checks/wire-body-pin.log): what the cloud route sends is what the collector parses, and no test authors a refusal of its own.
+/** the exact 400 body the cloud route sends for V's pair (V, 0) refused against U: { error, pairs, ledgerInstallId }, one field name on both sides */
+const WIRE_400_BODY = '{"error":"stamp_from_other_ledger","pairs":[{"install":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa0a5","version":0}],"ledgerInstallId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa0a3"}';
+/** the exact 503 body of an exhausted retry (the route adds Retry-After) */
+const WIRE_503_BODY = '{"error":"transaction_retry_exhausted","operation":"sighting","attempts":3,"sqlstate":"40P01"}';
+const INSTALL_U14 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa0a3", INSTALL_V14 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa0a5";
+type Delivered = { uploadedEvents: number; delivery: { retryAfterMs: number } };
+type CloudCall = { events: string[]; status: number; ledger: string | null };
+type CloudAnswer = { status: number; body: string; headers?: Record<string, string> } | { ledger: string };
+/**
+ * The collector's real upload path, uploadBufferedEvents through a fetchImpl, against a fake cloud that answers each delivery from
+ * `answers` in order (a 400 or 503 with an exact serialized body, or a 200 acknowledging every item and naming a ledger, round 12) and
+ * logs every call with the event ids it carried and the ledger it named. The clock is injected (a minute ahead of the real one, as the
+ * sync-backoff proof does, so the outbox's timestamps stay ordered).
+ */
+async function wirePath() {
+  const [{ collectorConfigSchema }, upload] = await Promise.all([wire(), loadSurface("../../../packages/collector-cli/src/upload.ts")]);
+  const uploadBufferedEvents = fn(upload, "uploadBufferedEvents") as (config: unknown, buffer: unknown, options: Record<string, unknown>) => Promise<Delivered>;
+  const DeliveryUploadError = upload.DeliveryUploadError as new (...args: never[]) => Error;
+  const config = collectorConfigSchema.parse({ uploadUrl: "http://127.0.0.1:1/ingest", tenantId: "tenant-lean-contract", installKey: "lean-contract-install", deviceId: "lean-device" });
+  const calls: CloudCall[] = [];
+  const answers: CloudAnswer[] = [];
+  const cloud = acknowledgingFetch((async (_input, init) => {
+    const payload = JSON.parse(String(init?.body ?? "{}")) as { events?: Array<{ event: { id: string } }> };
+    const events = (payload.events ?? []).map((row) => row.event.id);
+    const answer = answers.shift() ?? { ledger: INSTALL_X };
+    if ("ledger" in answer) {
+      calls.push({ events, status: 200, ledger: answer.ledger });
+      return json({ ok: true, accepted: events.length, actorBindingVersion: 0, lineage: "linked", ledgerInstallId: answer.ledger }, 200);
+    }
+    calls.push({ events, status: answer.status, ledger: null });
+    return new Response(answer.body, { status: answer.status, headers: { "content-type": "application/json", ...(answer.headers ?? {}) } });
+  }) as typeof fetch);
+  let now = Math.ceil(Date.now() / 1_000) * 1_000 + 60_000;
+  const deliver = (buffer: unknown) => uploadBufferedEvents(config, buffer, { fetchImpl: cloud, now: () => new Date(now), includeLegacyRemainingUnuploaded: false });
+  return { deliver, answers, calls, DeliveryUploadError, clock: { get: () => now, advance: (ms: number) => { now += ms; } } };
+}
+const outboxRow = (buffer: ReturnType<typeof openTempBuffer>["buffer"], id: string) =>
+  buffer.database.prepare("select state, last_failure_class as failure, next_attempt_at as nextAttemptAt from upload_outbox where delivery_id = ?").get(id) as { state: string; failure: string; nextAttemptAt: string } | undefined;
+const receipts = (buffer: ReturnType<typeof openTempBuffer>["buffer"], at: number) => {
+  const status = buffer.delivery.status(new Date(at));
+  return { acknowledged: status.receipts.acknowledged, dead: status.receipts.dead, remaining: status.remainingDelivery };
+};
+
+test("B2a C1 (round 14, read c1 r13 blocking 1): the collector parses the 400 body the cloud route sends, never a refusal a test authored: delivered through uploadBufferedEvents, V's row stamped (V, 0) is refused by the cloud with the exact serialized body, parked under the body's ledgerInstallId (U) by the collector's own upload path, released when the next acknowledged response names X, delivered again and acknowledged once by X's response, its pair unchanged", pending("B2a"), async () => {
+  fn(await loadSurface("../../../packages/collector-cli/src/lean/upload-park.ts"), "partitionRefusedRows");   // B2a's parser, which the upload path hands the parsed 400 body
+  const { deliver, answers, calls, clock } = await wirePath();
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", deviceId: "lean-device", delivery: { enabled: true }, lean: { write: true } });
+  try {
+    const stamped = buffer as unknown as Stamped & Parking;
+    stamped.recordJoinedInstall(INSTALL_V14, 0);                                          // the ledger is joined with V, the proof-linked child of the unlinked root U
+    const row = event(); buffer.append(row);                                              // captured under (V, 0)
+    // 700: the delivery is authorized with V's ledger read as U; 701: the admin merges U into X; 702: the sighting refuses against U and the route answers the exact body
+    answers.push({ status: 400, body: WIRE_400_BODY });
+    assert.equal((await deliver(buffer)).uploadedEvents, 0, "a parked row is neither delivered nor a failure: the call resolves (no backoff, no circuit) with nothing uploaded");
+    assert.deepEqual(calls.map((c) => [c.status, c.events]), [[400, [row.id]]]);
+    assert.deepEqual(stamped.parkedRows(), [{ id: row.id, reason: "stamp_from_other_ledger", ledgerInstallId: INSTALL_U14 }], "parked under the ledger the serialized 400 named, parsed by the upload path itself: U never passed through this test");
+    assert.deepEqual(receipts(buffer, clock.get()), { acknowledged: 0, dead: 0, remaining: 0 }, "nothing acknowledged, nothing dead; a parked row is not counted as pending delivery");
+    assert.equal((await deliver(buffer)).uploadedEvents, 0);
+    assert.equal(calls.length, 1, "a parked row is never leased while parked: nothing was sent");
+    // 720: a later row's delivery is acknowledged by a response naming V's ledger, X (round 12: every acknowledged response names the ledger): U differs from X, so the parked row is released
+    const later = event(); buffer.append(later);
+    answers.push({ ledger: INSTALL_X });
+    assert.ok((await deliver(buffer)).uploadedEvents >= 1, "the later row is delivered");
+    assert.deepEqual(stamped.parkedRows(), [], "released by the first response naming a ledger other than the one the 400 named");
+    // the released row travels again and is acknowledged by X's response, once
+    answers.push({ ledger: INSTALL_X });
+    await deliver(buffer);
+    const again = calls.filter((c) => c.status === 200 && c.events.includes(row.id));
+    assert.equal(again.length, 1, "delivered again exactly once after the refusal");
+    assert.equal(again[0]?.ledger, INSTALL_X, "and judged in X: the acknowledging response names X");
+    assert.deepEqual(receipts(buffer, clock.get()), { acknowledged: 2, dead: 0, remaining: 0 }, "both rows acknowledged once each, none dead, none left");
+    assert.deepEqual(stampOf(buffer, row.id), { version: 0, install: INSTALL_V14 }, "the row travels again with its pair unchanged");
+  } finally { close(); }
+});
+
+test("B2a C1 (round 14, read c1 r13 should-fix 1, first edge case): a 400 stamp_from_other_ledger that names no ledger parks nothing: the row is not parked under a guessed value, nothing is acknowledged, and the row keeps the ordinary 400 handling in the outbox (today's remote_validation deferral)", pending("B2a"), async () => {
+  fn(await loadSurface("../../../packages/collector-cli/src/lean/upload-park.ts"), "partitionRefusedRows");
+  const { deliver, answers, calls, clock, DeliveryUploadError } = await wirePath();
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", deviceId: "lean-device", delivery: { enabled: true }, lean: { write: true } });
+  try {
+    const stamped = buffer as unknown as Stamped & Parking;
+    stamped.recordJoinedInstall(INSTALL_V14, 0);
+    const row = event(); buffer.append(row);
+    answers.push({ status: 400, body: JSON.stringify({ error: "stamp_from_other_ledger", pairs: [{ install: INSTALL_V14, version: 0 }] }) });   // a malformed refusal: no ledgerInstallId
+    await assert.rejects(deliver(buffer), (error: Error & { failureClass?: string }) => error instanceof DeliveryUploadError && error.failureClass === "remote_validation", "a refusal the collector cannot park on is the ordinary 400: the same deferral the caller sees for any 400 today");
+    assert.deepEqual(calls.map((c) => [c.status, c.events]), [[400, [row.id]]]);
+    assert.deepEqual(stamped.parkedRows(), [], "nothing parked under a guessed ledger");
+    assert.deepEqual([outboxRow(buffer, row.id)?.state, outboxRow(buffer, row.id)?.failure], ["retry", "remote_validation"], "the row is back in the outbox under the ordinary 400 rules, never acknowledged");
+    assert.deepEqual(receipts(buffer, clock.get()), { acknowledged: 0, dead: 0, remaining: 1 });
+    assert.deepEqual(stampOf(buffer, row.id), { version: 0, install: INSTALL_V14 });
+  } finally { close(); }
+});
+
+test("B2a C1 (round 14, read c1 r13 should-fix 1, second edge case): a well-formed but unknown ledger id on the 400 is an opaque value: the row parks under it, a response naming that same value keeps it parked, the next authenticated response naming a different ledger releases it, and it is delivered once; no row is lost", pending("B2a"), async () => {
+  fn(await loadSurface("../../../packages/collector-cli/src/lean/upload-park.ts"), "partitionRefusedRows");
+  const { deliver, answers, calls, clock } = await wirePath();
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", deviceId: "lean-device", delivery: { enabled: true }, lean: { write: true } });
+  try {
+    const stamped = buffer as unknown as Stamped & Parking;
+    stamped.recordJoinedInstall(INSTALL_V14, 0);
+    const UNKNOWN = "ffffffff-ffff-4fff-8fff-ffffffffffff";                                // well-formed, nobody's: the collector cannot tell (only the cloud knows its ledgers)
+    const row = event(); buffer.append(row);
+    answers.push({ status: 400, body: WIRE_400_BODY.replace(INSTALL_U14, UNKNOWN) });
+    assert.equal((await deliver(buffer)).uploadedEvents, 0);
+    assert.deepEqual(stamped.parkedRows(), [{ id: row.id, reason: "stamp_from_other_ledger", ledgerInstallId: UNKNOWN }], "parked under the opaque value: the collector validates nothing it has no source for");
+    const same = event(); buffer.append(same);
+    answers.push({ ledger: UNKNOWN });                                                     // a response naming that same value
+    assert.ok((await deliver(buffer)).uploadedEvents >= 1);
+    assert.deepEqual(stamped.parkedRows().map((r) => r.id), [row.id], "a response naming the same value keeps it parked (the release compares two server-supplied values)");
+    const other = event(); buffer.append(other);
+    answers.push({ ledger: INSTALL_X });                                                   // the next response naming a different ledger
+    assert.ok((await deliver(buffer)).uploadedEvents >= 1);
+    assert.deepEqual(stamped.parkedRows(), [], "released");
+    answers.push({ ledger: INSTALL_X });
+    await deliver(buffer);
+    assert.equal(calls.filter((c) => c.status === 200 && c.events.includes(row.id)).length, 1, "delivered once after the refusal");
+    assert.deepEqual(receipts(buffer, clock.get()), { acknowledged: 3, dead: 0, remaining: 0 }, "no row lost: the three rows acknowledged once each, none dead, none left");
+  } finally { close(); }
+});
+
+test("B2a C1 (round 14, read c1 r13 blocking 2): the exhausted retry on the wire: the cloud answers 503 { error: transaction_retry_exhausted, operation, attempts, sqlstate } with Retry-After, and the collector acknowledges nothing, parks nothing, returns the batch to the outbox with its next attempt at Retry-After and delivers it then (the ordinary transient path, as scripts/sync-backoff-proof.ts proves it for any 503)", pending("B2a"), async () => {
+  const { deliver, answers, calls, clock, DeliveryUploadError } = await wirePath();
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", deviceId: "lean-device", delivery: { enabled: true }, lean: { write: true } });
+  try {
+    const stamped = buffer as unknown as Stamped & Parking;
+    stamped.recordJoinedInstall(INSTALL_V14, 0);
+    const row = event(); buffer.append(row);
+    answers.push({ status: 503, body: WIRE_503_BODY, headers: { "retry-after": "5" } });
+    const at = clock.get();
+    await assert.rejects(deliver(buffer), (error: Error & { failureClass?: string; retryAfterMs?: number }) => error instanceof DeliveryUploadError && error.failureClass === "remote_transient" && error.retryAfterMs === 5_000, "a 503 is the transient failure, deferred with the server's floor");
+    assert.deepEqual(calls.map((c) => [c.status, c.events]), [[503, [row.id]]]);
+    assert.deepEqual(stamped.parkedRows(), [], "a 503 parks nothing");
+    assert.deepEqual(receipts(buffer, at), { acknowledged: 0, dead: 0, remaining: 1 }, "and acknowledges nothing: the row is still to be delivered");
+    assert.deepEqual(outboxRow(buffer, row.id), { state: "retry", failure: "remote_transient", nextAttemptAt: new Date(at + 5_000).toISOString() }, "the row is back in the outbox with its next attempt at Retry-After");
+    clock.advance(1_000);
+    assert.equal((await deliver(buffer)).uploadedEvents, 0, "before the floor nothing is sent");
+    assert.equal(calls.length, 1);
+    clock.advance(4_000);
+    answers.push({ ledger: INSTALL_X });
+    assert.equal((await deliver(buffer)).uploadedEvents, 1, "at the floor the batch is delivered again");
+    assert.deepEqual(calls.map((c) => [c.status, c.events]), [[503, [row.id]], [200, [row.id]]], "the same row, once more");
+    assert.deepEqual(receipts(buffer, clock.get()), { acknowledged: 1, dead: 0, remaining: 0 }, "acknowledged once, by the committed attempt's answer");
+    assert.deepEqual(stampOf(buffer, row.id), { version: 0, install: INSTALL_V14 });
   } finally { close(); }
 });
