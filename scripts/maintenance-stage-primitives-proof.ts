@@ -333,4 +333,68 @@ const recent = "2099-01-01T00:00:00.000Z";
   database.close();
 }
 
-console.log(JSON.stringify({ proof: "maintenance_stage_primitives", checks: 7, passed: 7 }));
+// A PASSIVE checkpoint reports busy=0 even while a reader pins older WAL
+// frames. Following it with a waiting TRUNCATE monopolizes the SQLite writer
+// for the connection's busy timeout, beyond intake's 750 ms retry budget.
+{
+  const directory = mkdtempSync(join(tmpdir(), "plimsoll-checkpoint-reader-"));
+  const file = join(directory, "ledger.sqlite");
+  const database = fixture(file);
+  database.pragma("wal_autocheckpoint = 0");
+  database.pragma("busy_timeout = 1100");
+  const reader = new Database(file, { timeout: 0 });
+  try {
+    database.exec("create table checkpoint_probe (id integer primary key)");
+    database.prepare("insert into checkpoint_probe values (?)").run(1);
+    reader.exec("BEGIN");
+    reader.prepare("select count(*) from checkpoint_probe").get();
+    database.prepare("insert into checkpoint_probe values (?)").run(2);
+    const started = performance.now();
+    const held = runWalCheckpointStage(database, { remainingMs: 2000, batchSize: 1 });
+    const heldMs = performance.now() - started;
+    console.log(JSON.stringify({ case: "reader_pins_uncopied_frames", wallMs: heldMs, ...held }));
+    assert.ok(heldMs < 750, "a pinned reader must not spend intake's busy-retry budget in maintenance checkpoint");
+    assert.equal(held.passive?.busy, 0);
+    assert.ok(held.passive!.log > held.passive!.checkpointed);
+    assert.equal(held.truncate, null, "incomplete PASSIVE must not escalate to TRUNCATE");
+    assert.equal(database.pragma("busy_timeout", { simple: true }), 1100);
+    database.prepare("insert into checkpoint_probe values (?)").run(3);
+    reader.exec("ROLLBACK");
+
+    // Even a reader on the newest WAL snapshot can prevent TRUNCATE after
+    // PASSIVE copied every frame. A zero wait handles that case and the race
+    // where a reader arrives between the two pragmas.
+    reader.exec("BEGIN");
+    reader.prepare("select count(*) from checkpoint_probe").get();
+    const restartAt = performance.now();
+    const restart = runWalCheckpointStage(database, { remainingMs: 2000, batchSize: 1 });
+    const restartMs = performance.now() - restartAt;
+    console.log(JSON.stringify({ case: "reader_pins_copied_frames", wallMs: restartMs, ...restart }));
+    assert.ok(restartMs < 750, "TRUNCATE must not wait for a reader even after all frames were copied");
+    assert.equal(restart.passive!.log, restart.passive!.checkpointed);
+    assert.equal(restart.truncate?.busy, 1);
+    assert.equal(database.pragma("busy_timeout", { simple: true }), 1100);
+    database.prepare("insert into checkpoint_probe values (?)").run(4);
+    reader.exec("ROLLBACK");
+    const released = runWalCheckpointStage(database, { remainingMs: 2000, batchSize: 1 });
+    assert.equal(released.truncate?.busy, 0);
+    assert.equal(released.truncate?.log, 0, "uncontended maintenance still truncates the WAL");
+
+    // Restore the connection policy even if the checkpoint itself throws.
+    const originalPragma = database.pragma.bind(database);
+    (database as any).pragma = (sql: string, ...args: unknown[]) => {
+      if (sql === "wal_checkpoint(TRUNCATE)") throw new Error("checkpoint_fixture_failure");
+      return (originalPragma as any)(sql, ...args);
+    };
+    try {
+      assert.throws(() => runWalCheckpointStage(database, { remainingMs: 2000, batchSize: 1 }),
+        /checkpoint_fixture_failure/);
+      assert.equal(originalPragma("busy_timeout", { simple: true }), 1100);
+    } finally { database.pragma = originalPragma; }
+  } finally {
+    if (reader.inTransaction) reader.exec("ROLLBACK");
+    reader.close(); database.close(); rmSync(directory, { recursive: true });
+  }
+}
+
+console.log(JSON.stringify({ proof: "maintenance_stage_primitives", checks: 10, passed: 10 }));
