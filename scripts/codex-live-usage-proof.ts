@@ -146,6 +146,21 @@ for (let i = 0; i < goldens.length; i++) {
   });
 }
 
+await test("dispatch_role_and_technique_survive_live_usage_interval", async f => {
+  Object.assign(f.config.captureRoots![0].dispatch![0], {
+    role: "reviewer", workClass: "review", complexityBand: "high",
+    techniqueId: "tech-live", techniqueVersion: "1", assignmentId: "assign-live",
+    arm: "treatment", parentAttemptId: "lead-session",
+  });
+  await f.send(baseline);
+  await f.send(positive);
+  const metadata = f.events()[0].metadata;
+  assert.deepEqual([metadata.workItemId, metadata.dispatchProjectKey, metadata.attemptId,
+    metadata.role, metadata.parentAttemptId, metadata.techniqueId, metadata.techniqueVersion,
+    metadata.assignmentId, metadata.arm],
+    ["work-1", "sha256:" + "b".repeat(64), "attempt-1", "reviewer", "lead-session",
+      "tech-live", "1", "assign-live", "treatment"]);
+});
 await test("raw_header_audience_cardinality_target_and_browser_controls", async f => {
   const b=canonicalJson(baseline), h=f.headers();
   for (const route of ["/hooks/codex?x=1","/hooks/claude_code","/v1/logs","/status","/healthz","/hooks/codex/"]) assert.ok((await request(f.port,b,h,route)).status>=400,route);

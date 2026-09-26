@@ -19,6 +19,8 @@ import {
 
 import { resolveGitContext } from "./git-context";
 import { attachRepoContextSidecar } from "./repo-context";
+import { currentDispatchCaptureRoots, dispatchBindingForSession, dispatchBindingMetadata,
+  type CaptureRoot } from "./capture-root-inventory";
 import {
   asRecord,
   classifyEventType,
@@ -265,6 +267,7 @@ function buildLogEvent(
     containerSuppressedFields?: string[];
     resolveGit?: boolean;
     onRepoLabel?: (repoHash: string, label: string) => void;
+    dispatchRoots?: readonly CaptureRoot[];
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const repoContextCwd = workdirFromRawRecord(record);
@@ -336,6 +339,9 @@ function buildLogEvent(
   const traceId = validatedTraceId.accepted && typeof validatedTraceId.value === "string"
     ? validatedTraceId.value
     : undefined;
+  const dispatchBinding = context.source === "codex" && sessionId
+    ? dispatchBindingForSession("codex", sessionId, observedAt, context.dispatchRoots)
+    : null;
 
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
@@ -367,6 +373,7 @@ function buildLogEvent(
     ...(costUsd !== undefined && costUsd >= 0 ? { costUsd, costKind } : {}),
     metadata: {
       ...metadataAttrs.attrs,
+      ...(dispatchBinding ? dispatchBindingMetadata(dispatchBinding) : {}),
       ...(otelEventName ? { otelEventName } : {}),
       ...(toolName ? { toolName } : {}),
       ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
@@ -641,6 +648,7 @@ export function explodeOtlpPayload(
 ): ExplodedOtlp {
   const policy = options.policy ?? DEFAULT_POLICY;
   const source = options.source ?? "unknown";
+  const dispatchRoots = source === "codex" ? currentDispatchCaptureRoots() : [];
   const root = asRecord(payload);
   const result: ExplodedOtlp = {
     events: [],
@@ -678,6 +686,7 @@ export function explodeOtlpPayload(
               // attribution is an explicit offline-only compatibility path.
               resolveGit: options.resolveGit ?? false,
               onRepoLabel: options.onRepoLabel,
+              dispatchRoots,
             }),
           );
         } catch {

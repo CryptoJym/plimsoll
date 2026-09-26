@@ -1169,6 +1169,32 @@ export class DeliveryOutbox {
     return row ? this.enqueueRaw(row) : { enqueued: 0, dead: 0 };
   }
 
+  /** Explicit local correction before the first delivery attempt. */
+  restampUnsentRaw(rawId: string, payloadJson: string) {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`select rowid as rawRowid,id as rawId,created_at as createdAt,
+        data_mode as dataMode,uploaded_at as uploadedAt,payload_json as payloadJson,
+        suppressed_fields_json as suppressedFieldsJson,repo_hash as repoHash,branch_hash as branchHash,
+        workspace_id as workspaceId,device_id as deviceId,privacy_generation as privacyGeneration,
+        privacy_disposition as privacyDisposition from buffered_events where id=?`).get(rawId) as RawDeliveryRow|undefined;
+      if (!row || row.uploadedAt || row.privacyDisposition) return false;
+      const outbox = this.db.prepare(`select delivery_id as deliveryId,state,attempt_count as attemptCount,
+        sealed_envelope_json as sealedEnvelopeJson from upload_outbox where raw_rowid=?`).get(row.rawRowid) as
+        { deliveryId: string;state: string;attemptCount: number;sealedEnvelopeJson: string|null }|undefined;
+      if (outbox && (outbox.attemptCount !== 0 || outbox.sealedEnvelopeJson !== null || outbox.state !== "pending"))
+        return false;
+      if (this.db.prepare("select 1 from upload_receipts where delivery_id=?").get(ensureUuidEventId(rawId).id))
+        return false;
+      const prepared = prepareDelivery({ ...row,payloadJson },this.limits.maxItemBytes);
+      if (!prepared.ok || (outbox && outbox.deliveryId !== prepared.deliveryId))
+        throw new Error("dispatch_restamp_envelope_invalid");
+      this.db.prepare("update buffered_events set payload_json=? where rowid=?").run(payloadJson,row.rawRowid);
+      if (outbox) this.db.prepare(`update upload_outbox set base_envelope_json=?,base_bytes=?,updated_at=?
+        where raw_rowid=?`).run(prepared.baseEnvelopeJson,prepared.baseBytes,this.clock().toISOString(),row.rawRowid);
+      return true;
+    }).immediate();
+  }
+
   /** Replay dead letters written for a remote terminal reason (bead .46).
    *
    * The cloud rejecting an envelope is a statement about the *remote* contract,

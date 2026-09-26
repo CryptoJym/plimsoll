@@ -4,7 +4,13 @@ import path from "node:path";
 import { z } from "zod";
 import { accountAssertionContains, accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
 import type { CaptureBaselineFileObservation } from "./capture-baseline";
+import { resolveCollectorHome } from "./collector-home";
+import { workClassSchema, workComplexityBandSchema } from "../../shared/src/schemas";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+export const namespacedWorkItemIdSchema=z.string().max(256).regex(
+  /^(?:beads:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|github:(?:sha256:[a-f0-9]{64}|[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?)\/pull\/[1-9][0-9]*|jira:[A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/,
+).refine(value => !value.startsWith("github:") ||
+  !value.slice(7,value.lastIndexOf("/pull/")).split("/").some(segment => segment === "." || segment === ".."));
 const legacyAccountSchema=z.object({
   actorHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id
@@ -15,15 +21,20 @@ const accountAssertionEpochSchema=z.object({
   evidenceRef: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   installationEpochId: z.string().uuid(),
 }).strict();
+export const dispatchBindingSchema=z.object({
+  sessionId: id,workItemId: z.union([id,namespacedWorkItemIdSchema]),projectKey: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  companyRef: id.nullable(),attemptId: id,parentAttemptId: id.nullable(),acceptedOutcomeId: id.nullable(),
+  validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id,
+  role: z.enum(["author","reviewer","lead"]).optional(),
+  workClass: workClassSchema.optional(),complexityBand: workComplexityBandSchema.optional(),
+  techniqueId: id.optional(),techniqueVersion: id.optional(),assignmentId: id.optional(),
+  arm: z.enum(["control","treatment"]).optional(),launchedBy: id.optional(),
+}).strict();
 export const captureRootSchema=z.object({
   rootId: id,profileId: id,installationEpochId: id,
   source: z.enum(["codex","claude_code"]),directory: z.string().min(1),
   /** Explicit enrollment attestation; no search of neighboring auth stores. */
-  dispatch: z.array(z.object({
-    sessionId: id,workItemId: id,projectKey: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-    companyRef: id.nullable(),attemptId: id,parentAttemptId: id.nullable(),acceptedOutcomeId: id.nullable(),
-    validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id,
-  }).strict()).max(1000).optional(),
+  dispatch: z.array(dispatchBindingSchema).max(1000).optional(),
   /** Legacy account rows remain accepted; new enrollments use the additive V1 contract. */
   account: z.union([legacyAccountSchema,accountAssertionV1Schema]).optional(),
   /** Immutable historical account windows hydrated from the maintenance key. */
@@ -32,6 +43,7 @@ export const captureRootSchema=z.object({
   accountAssertionEpochs: z.array(accountAssertionEpochSchema).max(1024).optional(),
 }).strict();
 export type CaptureRoot=z.infer<typeof captureRootSchema>;
+export type DispatchBinding=NonNullable<CaptureRoot["dispatch"]>[number];
 export type CaptureRootAccount=NonNullable<CaptureRoot["account"]>;
 export { accountAssertionV1Schema };
 export type { AccountAssertionV1 };
@@ -127,10 +139,65 @@ export function rootCursorKey(roots: readonly CaptureRoot[],file: string): strin
   const root=rootForFile(roots,file);
   return root? `${file}\u0000${captureRootDigest(root)}`:file;
 }
+/** The CLI publishes config atomically; the daemon observes its new inode without a restart. */
+let dispatchConfigCache: { file: string; stamp: string; roots: CaptureRoot[] } | null = null;
+export function currentDispatchCaptureRoots(): CaptureRoot[] {
+  const file=path.join(resolveCollectorHome().home,"collector.config.json");
+  try {
+    const stat=fs.statSync(file);
+    const stamp=`${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    if(dispatchConfigCache?.file===file&&dispatchConfigCache.stamp===stamp)
+      return dispatchConfigCache.roots;
+    const parsed=JSON.parse(fs.readFileSync(file,"utf8")) as { captureRoots?: unknown };
+    const roots=validateCaptureRoots(parsed.captureRoots??[]);
+    dispatchConfigCache={file,stamp,roots};
+    return roots;
+  } catch {
+    dispatchConfigCache=null;
+    return [];
+  }
+}
+export function currentDispatchRoot(root: CaptureRoot): CaptureRoot {
+  const roots=currentDispatchCaptureRoots();
+  const configured=roots.find(candidate => candidate.rootId===root.rootId&&captureRootDigest(candidate)===captureRootDigest(root));
+  return configured ? { ...root,dispatch: configured.dispatch??[] }:root;
+}
+function bindingAt(bindings: readonly DispatchBinding[],sessionId: string,observedAt: string) {
+  const at=Date.parse(observedAt);
+  const matches=bindings.filter(binding => binding.sessionId===sessionId&&at>=Date.parse(binding.validFrom)&&
+    (!binding.validUntil||at<Date.parse(binding.validUntil)));
+  return { binding: matches.length===1 ? matches[0]:null, conflict: matches.length>1 };
+}
+export function dispatchBindingForSession(source: CaptureRoot["source"],sessionId: string,observedAt: string,
+  roots: readonly CaptureRoot[]=currentDispatchCaptureRoots()): DispatchBinding|null {
+  const matches=roots.filter(root => root.source===source)
+    .map(root => bindingAt(root.dispatch??[],sessionId,observedAt)).filter(result => result.binding||result.conflict);
+  if(matches.some(result => result.conflict)) return null;
+  const bindings=[...new Map(matches.map(result => [JSON.stringify(result.binding),result.binding])).values()];
+  return bindings.length===1 ? bindings[0] : null;
+}
+export function dispatchBindingMetadata(binding: DispatchBinding): Record<string,unknown> {
+  return {
+    workItemId: binding.workItemId,dispatchProjectKey: binding.projectKey,
+    workEvidenceRef: binding.evidenceRef,attemptId: binding.attemptId,
+    ...(binding.parentAttemptId? { parentAttemptId: binding.parentAttemptId }:{}),
+    ...(binding.companyRef? { companyRef: binding.companyRef }:{}),
+    ...(binding.acceptedOutcomeId? { acceptedOutcomeId: binding.acceptedOutcomeId }:{}),
+    ...(binding.role? { role: binding.role }:{}),
+    ...(binding.workClass? { workClass: binding.workClass }:{}),
+    ...(binding.complexityBand? { complexityBand: binding.complexityBand }:{}),
+    ...(binding.techniqueId? { techniqueId: binding.techniqueId }:{}),
+    ...(binding.techniqueVersion? { techniqueVersion: binding.techniqueVersion }:{}),
+    ...(binding.assignmentId? { assignmentId: binding.assignmentId }:{}),
+    ...(binding.arm? { arm: binding.arm }:{}),
+    ...(binding.launchedBy? { launchedBy: binding.launchedBy }:{}),
+  };
+}
 export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: string,observedAt: string,sessionId?: string,
   accountAttributionEnabled=true): Record<string, unknown> {
   if(!root)
     return {};
+  root=currentDispatchRoot(root);
   const at=Date.parse(observedAt);
   const accountCandidates = accountAttributionEnabled ? [...new Map(
     [ ...(root.accountAssertions ?? []), ...(root.account ? [root.account] : []) ]
@@ -141,16 +208,9 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
   const accountEpochs = account ? (root.accountAssertionEpochs ?? []).filter(epoch =>
     epoch.actorHash===account.actorHash&&epoch.validFrom===account.validFrom&&epoch.evidenceRef===account.evidenceRef) : [];
   const installationEpochId = accountEpochs.length===1 ? accountEpochs[0].installationEpochId : root.installationEpochId;
-  const bindings=(root.dispatch??[]).filter(binding => binding.sessionId===sessionId&&at>=Date.parse(binding.validFrom)&&(!binding.validUntil||at<Date.parse(binding.validUntil)));
-  const binding=bindings.length===1? bindings[0]:null;
+  const { binding,conflict }=bindingAt(root.dispatch??[],sessionId??"",observedAt);
   return {
-    ...(binding? {
-      workItemId: binding.workItemId,dispatchProjectKey: binding.projectKey,
-      workEvidenceRef: binding.evidenceRef,attemptId: binding.attemptId,
-      ...(binding.parentAttemptId? { parentAttemptId: binding.parentAttemptId }:{}),
-      ...(binding.companyRef? { companyRef: binding.companyRef }:{}),
-      ...(binding.acceptedOutcomeId? { acceptedOutcomeId: binding.acceptedOutcomeId }:{}),
-    }:{}),...(bindings.length>1? { workAttributionState: "conflict" }:{}),
+    ...(binding? dispatchBindingMetadata(binding):{}),...(conflict? { workAttributionState: "conflict" }:{}),
     captureRootId: root.rootId,captureProfileId: root.profileId,installationEpochId,
     logicalSourceEventId: sourceEventId,sourceIdentityEvidenceRef: "native_runtime_event_v1",
     ...(account ? { captureAccountHash: account.actorHash,accountEvidenceRef: account.evidenceRef } : {}),

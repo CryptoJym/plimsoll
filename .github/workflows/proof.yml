@@ -189,6 +189,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-roots-add
 
+      - name: Prove dispatch binding and stamped capture paths (eco-6hoxj.165.3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:dispatch-binding
+
       - name: Prove producer-token rotation covers the Codex seat profiles (eco-6hoxj.54)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-rotation-profiles
