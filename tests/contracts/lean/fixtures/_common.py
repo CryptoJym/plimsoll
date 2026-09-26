@@ -1,6 +1,6 @@
-"""Shared helpers for the round-5 to round-11 (B0, eco-6hoxj.164.4, rounds 1-5) fixtures.
+"""Shared helpers for the round-5 to round-12 (B0, eco-6hoxj.164.4, rounds 1-6) fixtures.
 
-Every fixture is a standalone script: `python3 <fixture>.py --rule r4|r5|r6|r7|r8|r9|r10|r11`.
+Every fixture is a standalone script: `python3 <fixture>.py --rule r4|r5|r6|r7|r8|r9|r10|r11|r12`.
 It builds the minimal in-memory SQLite (or plain Python) state for the reviewer's counterexample, applies the rule of the
 named round, and asserts the outcome the plan promises. Round-5 fixtures are red under `--rule r4` and green under
 `--rule r5`; round-6 fixtures are red under `--rule r5` and green under `--rule r6`; the round-7 (B0 round 1) fixtures were
@@ -8,7 +8,8 @@ red under `--rule r6` and green under `--rule r7`; the round-8 (B0 round 2) vers
 `--rule r6` and `--rule r7` and green under `--rule r8`; the round-9 (B0 round 3) versions of the same two fixtures are red under
 `--rule r6`, `r7` and `r8` and green under `--rule r9`; the round-10 (B0 round 4) version of `b4_offline_rebind.py` is red under
 `--rule r6`, `r7`, `r8` and `r9` and green under `--rule r10`; the round-11 (B0 round 5) version of `b4_offline_rebind.py` is red under
-`--rule r6`, `r7`, `r8`, `r9` and `r10` and green under `--rule r11` (exit 1 = RED, exit 0 = GREEN).
+`--rule r6`, `r7`, `r8`, `r9` and `r10` and green under `--rule r11`; the round-12 (B0 round 6) version of `b4_offline_rebind.py` is red
+under `--rule r6`, `r7`, `r8`, `r9`, `r10` and `r11` and green under `--rule r12` (exit 1 = RED, exit 0 = GREEN).
 No collector, ledger, network or hosted service is touched.
 """
 from __future__ import annotations
@@ -31,7 +32,7 @@ def digest16(payload: str) -> bytes:
 
 def rule_arg() -> str:
     p = argparse.ArgumentParser()
-    p.add_argument("--rule", choices=("r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"), required=True, help="which round's rule to apply")
+    p.add_argument("--rule", choices=("r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"), required=True, help="which round's rule to apply")
     return p.parse_args().rule
 
 class Checks:

@@ -77,11 +77,23 @@ Round 11 rule (B0 round 5, the independent read of C1 after round 10, blockers 1
       in that ledger, where they read the same facts and audit rows as the old install's summary did: one answer. The
       first-sighting guarantee is per ledger, and the ledger separation holds while the previous install's key stays secret (a
       copied key passes the possession proof from another Mac).
+Round 12 rule (B0 round 6, the independent read of C1 after round 11, its one blocking item; CONTRACTS.md r12 C1):
+  (m) THE LINK MOVES A LEDGER, NEVER AN INSTALL. Round 11's admin link moved ONE install (allowed while it was still its own
+      ledger) but re-keyed EVERY fact of its old ledger, so an unlinked root U that already had a proof-linked child V could be
+      linked alone: V stayed in ledger U while V's not-issued fact went to X, and V's poisoned (V, 1) flipped to the actor of a
+      later rebind (the read's CHAIN_COUNTEREXAMPLE on PostgreSQL 17.10); and the link checked nothing about its destination, so
+      a non-root destination made a chain with two ledger ids. Round 12: linkLedgerByAdmin takes a source LEDGER (an install that
+      is its own ledger) and a destination that is the ROOT of its own ledger in the same tenant, and moves every install whose
+      ledger is the source, with the source ledger's facts, in one transaction under one set of locks, recording one audit row
+      (who, when, source, destination, installs moved, facts re-keyed) and stamping every moved install; a non-root or foreign
+      destination is refused (naming the root); a source that is not a root is refused (a chain is linked whole, once per link);
+      links compose (the merged root may be linked on, and the whole chain moves again).
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
 ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (round-3 C1/C4 as written: the lock on the
 read of binding_version only, the fact keyed by the uploader, no lifecycle rule), r10 (round-4 C1/C4 as written: the ledger key,
-a pair judged against the install it names whichever ledger uploads it), r11 (this rule). Red under r6, r7, r8, r9 and r10, green
-under r11.
+a pair judged against the install it names whichever ledger uploads it), r11 (round-5 C1 as written: the admin link moves one
+install and re-keys its old ledger's facts, with no destination check), r12 (this rule). Red under r6, r7, r8, r9, r10 and r11,
+green under r12.
 """
 import itertools
 import json
@@ -89,10 +101,11 @@ from _common import Checks, rule_arg
 
 rule = rule_arg()
 c = Checks("b4_offline_rebind", rule)
-R8 = rule in ("r8", "r9", "r10", "r11")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9-11
-R9 = rule in ("r9", "r10", "r11")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by rounds 10-11
-R10 = rule in ("r10", "r11")      # the round-10 machinery (lock then read, the ledger key, lifecycle) is kept by round 11
-R11 = rule == "r11"
+R8 = rule in ("r8", "r9", "r10", "r11", "r12")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9-12
+R9 = rule in ("r9", "r10", "r11", "r12")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by rounds 10-12
+R10 = rule in ("r10", "r11", "r12")      # the round-10 machinery (lock then read, the ledger key, lifecycle) is kept by rounds 11-12
+R11 = rule in ("r11", "r12")             # the round-11 machinery (the refusal across ledgers, the hold, the admin link with its re-key) is kept by round 12
+R12 = rule == "r12"
 # Round 10: the ledger each install uploads for (the first install of its chain on one Mac). Z re-joined X's Mac with a verified
 # link to X; Zu re-joined a Mac whose previous install could not be proved (no link: its own ledger, disclosed); P and Q are other Macs.
 LEDGER = {"X": "X", "Y": "Y", "W": "W", "R": "R", "Z": "X", "Zf": "X", "Zu": "Zu", "P": "P", "Q": "Q", "Xr": "Xr"}
@@ -472,7 +485,7 @@ def run_variant(order, uploaders):
             splits += 1
             if example is None: example = {"schedule": list(trace), "answers": answers}
     return {"order": order, "uploaders": list(uploaders), "schedules": len(results), "deadlocks": deadlocks, "splits": splits, "example": example}
-PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"], "r11": ["lock_then_read"]}.get(rule, ["no_lock"])
+PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"], "r11": ["lock_then_read"], "r12": ["lock_then_read"]}.get(rule, ["no_lock"])
 same_uploader = {order: run_variant(order, ("X", "X")) for order in ("no_lock", "lock_then_read", "facts_then_lock")}
 print("    R5b (two paths, one uploader, statement-level): " + json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "example"} for k, v in same_uploader.items()}))
 print("    R5b facts-first example: " + json.dumps(same_uploader["facts_then_lock"]["example"]))
@@ -546,9 +559,14 @@ c.expect(revoked_d == ("C", "binding_at_capture") and revoked_u == ("C", "bindin
 # collector parks the rows until the ledger is linked or an admin releases them (undelivered, never judged).
 class Ledgers:
     """The cloud with explicit ledgers. `sight` is actor_for_stamp for a pair uploaded by `uploader`; `link` is the admin's audited
-    link of an unlinked install into another ledger (round 11), re-keying the facts of its old ledger in the same transaction."""
-    def __init__(self, audit, ledger):
+    link (round 11: of an unlinked install into another ledger, re-keying the facts of its old ledger in the same transaction; round
+    12: of a whole LEDGER into a root of the same tenant, moving every install of the source ledger with its facts, one audit row).
+    `tenant` maps an install to its tenant (one tenant unless given); `linked_by` records how and when each install came to be in a
+    ledger other than its own."""
+    def __init__(self, audit, ledger, tenant=None):
         self.audit, self.ledger, self.facts, self.refused, self.links = {k: dict(v) for k, v in audit.items()}, dict(ledger), {}, [], []
+        self.tenant = {k: (tenant or {}).get(k, "t1") for k in self.audit}
+        self.linked_by = {k: {"by": "join_proof", "at": None} for k in self.audit if self.ledger[k] != k}
     def bv(self, install, at): return max(v for v, (_, t) in self.audit[install].items() if t <= at)
     def key(self, uploader, install, v):
         if R10: return (self.ledger[uploader], install, v)          # rounds 10-11: the uploader's ledger
@@ -563,12 +581,25 @@ class Ledgers:
         if v <= self.bv(install, at): return (self.audit[install][v][0], "binding_at_capture")
         self.facts[key] = {"first_seen_at": at, "binding_version_then": self.bv(install, at), "recorded_by": uploader}
         return (None, "stamp_invalid:stamp_not_issued")
+    def members(self, ledger): return sorted(i for i in self.ledger if self.ledger[i] == ledger)
     def link(self, install, ledger, at, by="admin", rekey=True):
-        """Round 11: an UNLINKED install (its own ledger) is linked into `ledger`; its old ledger's facts are re-keyed with it."""
-        if not R11 or self.ledger[install] != install: return False
-        old = self.ledger[install]; self.ledger[install] = ledger; self.links.append({"install": install, "ledger": ledger, "at": at, "by": by})
+        """Round 11: an UNLINKED install (its own ledger) is linked into `ledger`; its old ledger's facts are re-keyed with it. Round 12:
+        `install` names a source LEDGER (it must be its own ledger) and `ledger` a destination that is the ROOT of its own ledger in the
+        same tenant; every install of the source ledger moves with the source ledger's facts, one audit row records the link and every
+        moved install is stamped. Returns True, or the refusal reason (round 12; False under round 11)."""
+        if not R11 or self.ledger[install] != install: return "source_not_root" if R12 else False
+        if R12:
+            if ledger not in self.ledger or self.tenant[ledger] != self.tenant[install]: return "target_not_found"
+            if self.ledger[ledger] != ledger: return f"target_not_root:{self.ledger[ledger]}"      # the refusal names the destination's root
+            if ledger == install: return "source_is_target"
+        old = install
+        moved = self.members(old) if R12 else [install]                                            # round 11 moved the one install only
+        for i in moved:
+            self.ledger[i] = ledger; self.linked_by[i] = {"by": by, "at": at}
+        rekeyed = 0
         if rekey:
-            for k in [k for k in self.facts if k[0] == old]: self.facts[(ledger, k[1], k[2])] = self.facts.pop(k)
+            for k in [k for k in self.facts if k[0] == old]: self.facts[(ledger, k[1], k[2])] = self.facts.pop(k); rekeyed += 1
+        self.links.append({"source": old, "ledger": ledger, "at": at, "by": by, "installs_moved": len(moved), "facts_rekeyed": rekeyed})
         return True
     def actors_of_ledger(self, ledger):
         return {actor for inst, hist in self.audit.items() if self.ledger[inst] == ledger for actor, _ in hist.values()}
@@ -634,4 +665,61 @@ cloud14b.audit["X"][2] = ("C", 600); zl_deliver = cloud14b.sight("X", 2, 700, up
 c.expect(zl_member[0] is None and zl_deliver == zl_member, "S9/linked: the same history through a re-join WITH proof (Zl in X's ledger) is judged at once and agrees, as in round 10: the hold applies only to an unlinked ledger", f"member={zl_member} deliver={zl_deliver}")
 copied_key = join_ledger("U2", "X", True)                                        # a copied previous-install key passes the possession proof from any Mac
 c.expect(copied_key == {"ledger": "X", "lineage": "linked"} or not R10, "S9/should-fix 4: the ledger separation is per KEY, not per hardware: a join that proves possession of X's key joins X's ledger wherever it runs, so 'another Mac never enters the ledger' holds while the previous install's key stays secret; the first-sighting guarantee is per ledger", f"{copied_key}")
+
+# ---- 15. blocking (read c1 r11): the admin link must move a whole ledger, into a canonical destination -------------------------------
+# The read's CHAIN_COUNTEREXAMPLE. X is a Mac's first install (v1 = B at 200). At 500 the Mac re-joins WITHOUT proof of X's key: U is its
+# own ledger (lineage: unlinked). At 520 the Mac re-joins again, this time WITH proof of U's key: V joins U's ledger (a proof-linked
+# child of the unlinked root). At 550 V sights its own future pair (V, 1) (V at v0): a fact in ledger U, nobody's. At 800 an admin
+# links U into X's ledger. Round 11 moved the ONE install U and re-keyed EVERY fact of ledger U, so V stayed in ledger U while V's fact
+# went to X: at 900 V is rebound to E as version 1, and at 950 V's own judgment of (V, 1) reads ledger U (no fact): issued, E's: the
+# flip fixed-first-sighting ownership forbids; and U's later upload of V's pair was refused as another ledger's. Round 12 moves the
+# whole ledger: U and V are both in X, V's fact is X's, (V, 1) stays nobody's, and nothing is stranded.
+INST15 = {"X": {0: ("A", 0), 1: ("B", 200)}, "U": {0: ("D", 500)}, "V": {0: ("D", 520)}, "Zl": {0: ("D", 300)},  # Zl: X's proof-linked child (in X)
+          "F": {0: ("D", 0)}, "F2": {0: ("D", 0)}, "Y": {0: ("A", 0)}}                                            # F: a fresh root; F2: another TENANT's root; Y: another root
+LEDGER15 = {"X": "X", "U": "U", "V": "U", "Zl": "X", "F": "F", "F2": "F2", "Y": "Y"}
+cloud15 = Ledgers(INST15, LEDGER15, tenant={"F2": "t2"})
+v_own_550 = cloud15.sight("V", 1, 550, uploader="V")                              # V's own future pair at V's v0: a fact in ledger U
+direct_child_link = cloud15.link("V", "X", 700)                                    # a member cannot be linked alone (both rounds refuse: V is not its own ledger)
+link_800 = cloud15.link("U", "X", 800)
+cloud15.audit["V"][1] = ("E", 900)                                                 # V is rebound to E as version 1 after the link
+v_own_950 = cloud15.sight("V", 1, 950, uploader="V")                              # V judges its own (V, 1) in its ledger
+u_uploads_v_960 = cloud15.sight("V", 1, 960, uploader="U")                        # U delivers a row of the chain stamped (V, 1)
+print("    CHAIN (U unlinked root, V its proof-linked child; the admin links U -> X at 800; V rebound to E as 1 at 900): " + json.dumps({"V_own_550": v_own_550, "direct_child_link": direct_child_link, "link_800": link_800, "ledgers_after": {k: cloud15.ledger[k] for k in ("U", "V", "X", "Zl")}, "V_own_950": v_own_950, "U_uploads_V1_960": u_uploads_v_960, "facts": {"|".join(map(str, k)): v["recorded_by"] for k, v in cloud15.facts.items()}, "links": cloud15.links, "linked_by": {k: cloud15.linked_by.get(k) for k in ("U", "V")}}))
+c.expect(v_own_550[0] is None and v_own_950[0] is None and direct_child_link in (False, "source_not_root"),
+         "CHAIN: V's own pair (V, 1), poisoned in ledger U before the link, is still nobody's after the admin links U into X and V is rebound up to 1 (round 11 moved U alone and re-keyed V's fact away from V's ledger: E's, a flip; the direct link of the child V is refused in both rounds, so round 11 had no way to keep the chain together)",
+         f"sighted_550={v_own_550} judged_950={v_own_950} direct_child_link={direct_child_link}")
+c.expect(link_800 is True and cloud15.members("U") == [] and {cloud15.ledger[i] for i in ("U", "V")} == {"X"} and not [k for k in cloud15.facts if k[0] == "U"],
+         "CHAIN: the link moves the whole ledger: after it no install and no fact is left in ledger U, U and V are both in X (round 11 left V in the emptied ledger U: a stranded member whose facts had moved without it)",
+         f"link={link_800} members_of_U={cloud15.members('U')} ledgers={ {k: cloud15.ledger[k] for k in ('U', 'V')} } facts={list(cloud15.facts)}")
+c.expect(u_uploads_v_960 == v_own_950 == (None, "stamp_invalid:stamp_not_issued"),
+         "CHAIN: after the link U's upload of a chain row stamped (V, 1) is judged in X's ledger, not held, and agrees with V's own judgment: nobody's (round 11: U in X and V in U, so U's upload named an install outside U's ledger and was held for ever)",
+         f"U_uploads={u_uploads_v_960} V_own={v_own_950}")
+c.expect(len(cloud15.links) == 1 and cloud15.links[0] == {"source": "U", "ledger": "X", "at": 800, "by": "admin", "installs_moved": 2, "facts_rekeyed": 1} and all(cloud15.linked_by.get(i) == {"by": "admin", "at": 800} for i in ("U", "V")),
+         "CHAIN/audit: one audit row per link (who, when, the source ledger, the destination, 2 installs moved, 1 fact re-keyed) and every moved install stamped with who and when (round 11 stamped and moved one install)",
+         f"links={cloud15.links} linked_by={ {k: cloud15.linked_by.get(k) for k in ('U', 'V')} }")
+second_u, second_v = cloud15.link("U", "Y", 970), cloud15.link("V", "Y", 971)
+c.expect(second_u in (False, "source_not_root") and second_v in (False, "source_not_root") and {cloud15.ledger[i] for i in ("U", "V")} == {"X"},
+         "CHAIN/linked once: after the link neither U nor V is its own ledger, so a second link of either is refused and the chain stays whole in X (both rounds)", f"U={second_u} V={second_v}")
+# the destination must be the ROOT of its own ledger, in the same tenant. Round 11 checked only the source: linking a fresh root F
+# into Zl (a member of X's ledger) made F's ledger id Zl while Zl's is X: one chain, two ledger ids (the read's NONROOT_TARGET
+# counterexample), so F's rows naming X's pairs and X's naming F's were refused as another ledger's for ever.
+nonroot = cloud15.link("F", "Zl", 980); f_after_nonroot = cloud15.ledger["F"]
+f_names_x = cloud15.sight("X", 1, 985, uploader="F")
+foreign = cloud15.link("F", "F2", 986); f_after_foreign = cloud15.ledger["F"]
+canonical = cloud15.link("F", "X", 990)
+f_names_x_after = cloud15.sight("X", 1, 995, uploader="F")
+print("    NON-ROOT DESTINATION (F -> Zl, a member of X's ledger; F -> F2, another tenant's root; F -> X, the root): " + json.dumps({"F_into_Zl": nonroot, "F_ledger_after_it": f_after_nonroot, "Zl_ledger": cloud15.ledger["Zl"], "F_names_X1": f_names_x, "F_into_F2": foreign, "F_ledger_after_it": f_after_foreign, "F_into_X": canonical, "F_ledger_after": cloud15.ledger["F"], "F_names_X1_after": f_names_x_after}))
+c.expect(nonroot == "target_not_root:X" and f_after_nonroot == "F",
+         "NON-ROOT DESTINATION: a link into an install that is not the root of its own ledger is refused, naming the root the admin should use, and nothing moves (round 11 accepted it: F's ledger id became Zl while Zl's ledger is X, one chain with two ledger ids)",
+         f"result={nonroot} F_ledger={f_after_nonroot} Zl_ledger={cloud15.ledger['Zl']}")
+c.expect(foreign == "target_not_found" and f_after_foreign == "F",
+         "NON-ROOT DESTINATION/tenant: a destination of another tenant is refused as not found and nothing moves (round 11 checked nothing about the destination)", f"result={foreign} F_ledger={f_after_foreign}")
+c.expect(canonical is True and cloud15.ledger["F"] == "X" and f_names_x_after == ("B", "binding_at_capture"),
+         "NON-ROOT DESTINATION/repair: the same link into the root X succeeds, and F's rows naming X's pairs are judged in X's ledger (under round 11's non-root link they were held for ever: F's ledger id was Zl, not X)",
+         f"result={canonical} F_ledger={cloud15.ledger['F']} F_names_X1_after={f_names_x_after}")
+# links compose: the merged root X may itself be linked into another root Y later, and the whole chain (X, Zl, U, V, F) moves again
+compose = cloud15.link("X", "Y", 1000)
+c.expect(compose is True and all(cloud15.ledger[i] == "Y" for i in ("X", "Zl", "U", "V", "F")) and not [k for k in cloud15.facts if k[0] != "Y"] and (cloud15.links[-1]["installs_moved"] if cloud15.links else None) == 5,
+         "COMPOSE: linking the merged root X into Y moves every install of X's ledger (X, Zl, U, V, F) with every fact, so a chain never has two ledger ids (round 11 moved X alone: four members stranded in the emptied ledger X)",
+         f"result={compose} ledgers={ {i: cloud15.ledger[i] for i in ('X', 'Zl', 'U', 'V', 'F')} } facts={list(cloud15.facts)} moved={(cloud15.links[-1].get('installs_moved') if cloud15.links else None)}")
 c.finish()
