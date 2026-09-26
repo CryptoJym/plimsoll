@@ -63,10 +63,25 @@ Round 10 rule (B0 round 4, the independent read of C1/C4 after round 9, blockers
       (read c1c4 blocker 2).
   (j) A pair is judged against the install it names WHATEVER that install's lifecycle (active, suspended, revoked): lifecycle
       gates authentication, never the audit rows, so revoking the old identity after a re-join turns no pair into null.
+Round 11 rule (B0 round 5, the independent read of C1 after round 10, blockers 1-2 and should-fix 4; CONTRACTS.md r11 C1):
+  (k) OWNERSHIP NEVER CROSSES A LEDGER. A pair naming an install OUTSIDE the uploader's ledger (another Mac of the tenant, or the
+      previous chain of a re-join that could not prove the previous install's key) is never judged: the batch is refused (400
+      stamp_from_other_ledger, the pairs listed), nothing is judged and nothing is recorded, and the collector parks the rows (or
+      the summary segments) until the ledger is linked, or an admin releases them undelivered, never judged. Round 10 read the
+      uploader's ledger's facts (none) and judged the pair against the named install: an ISSUED pair of another Mac gave the
+      uploader's row to that Mac's actor (read c1 r10 blocking 1, S8), and an unlinked re-join's delivery of an old faulty row was
+      someone's while the old install's summary said nobody (blocking 2, S9).
+  (l) THE LINK IS THE RELEASE. The join's verified proof links a ledger at join; an admin may link an unlinked install into a
+      ledger later (audited: ledger_linked_at, ledger_linked_by), which re-keys the facts of its old ledger in the same
+      transaction, so a pair poisoned before the link stays poisoned after it; the parked rows are then resubmitted and judged
+      in that ledger, where they read the same facts and audit rows as the old install's summary did: one answer. The
+      first-sighting guarantee is per ledger, and the ledger separation holds while the previous install's key stays secret (a
+      copied key passes the possession proof from another Mac).
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
 ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (round-3 C1/C4 as written: the lock on the
-read of binding_version only, the fact keyed by the uploader, no lifecycle rule), r10 (this rule). Red under r6, r7, r8 and r9,
-green under r10.
+read of binding_version only, the fact keyed by the uploader, no lifecycle rule), r10 (round-4 C1/C4 as written: the ledger key,
+a pair judged against the install it names whichever ledger uploads it), r11 (this rule). Red under r6, r7, r8, r9 and r10, green
+under r11.
 """
 import itertools
 import json
@@ -74,9 +89,10 @@ from _common import Checks, rule_arg
 
 rule = rule_arg()
 c = Checks("b4_offline_rebind", rule)
-R8 = rule in ("r8", "r9", "r10")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9 and 10
-R9 = rule in ("r9", "r10")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by round 10
-R10 = rule == "r10"
+R8 = rule in ("r8", "r9", "r10", "r11")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9-11
+R9 = rule in ("r9", "r10", "r11")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by rounds 10-11
+R10 = rule in ("r10", "r11")      # the round-10 machinery (lock then read, the ledger key, lifecycle) is kept by round 11
+R11 = rule == "r11"
 # Round 10: the ledger each install uploads for (the first install of its chain on one Mac). Z re-joined X's Mac with a verified
 # link to X; Zu re-joined a Mac whose previous install could not be proved (no link: its own ledger, disclosed); P and Q are other Macs.
 LEDGER = {"X": "X", "Y": "Y", "W": "W", "R": "R", "Z": "X", "Zf": "X", "Zu": "Zu", "P": "P", "Q": "Q", "Xr": "Xr"}
@@ -456,7 +472,7 @@ def run_variant(order, uploaders):
             splits += 1
             if example is None: example = {"schedule": list(trace), "answers": answers}
     return {"order": order, "uploaders": list(uploaders), "schedules": len(results), "deadlocks": deadlocks, "splits": splits, "example": example}
-PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"]}.get(rule, ["no_lock"])
+PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"], "r11": ["lock_then_read"]}.get(rule, ["no_lock"])
 same_uploader = {order: run_variant(order, ("X", "X")) for order in ("no_lock", "lock_then_read", "facts_then_lock")}
 print("    R5b (two paths, one uploader, statement-level): " + json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "example"} for k, v in same_uploader.items()}))
 print("    R5b facts-first example: " + json.dumps(same_uploader["facts_then_lock"]["example"]))
@@ -521,4 +537,101 @@ print("    lifecycle (Xr revoked at 900; (Xr, 2) delivered at 950): " + json.dum
 c.expect(revoked_d == ("C", "binding_at_capture") and revoked_u == ("C", "binding_at_capture"),
          "lifecycle: a row stamped (Xr, 2), issued at 600, is C's on both paths after Xr's identity is revoked at 900 (round 9's text let an implementation build its view from active installs and turn the pair into null)",
          f"delivered={revoked_d} undelivered={revoked_u}")
+
+# ---- 13. blocking 1 (read c1 r10, S8): a pair naming an install of ANOTHER ledger is never judged ---------------------------------
+# P (its own ledger, server-bound actor B) uploads a row stamped (X, 2) after another Mac's install X was rebound to C as version 2.
+# Round 10 read the facts of P's ledger (none) and judged the pair against X: issued, so C's: an actor attribution across Macs (the
+# reviewer's S8 on PostgreSQL). Round 11: actor_for_stamp refuses a pair whose install is outside the uploader's ledger before any
+# judgment: the batch is refused (400 stamp_from_other_ledger, the pairs listed), nothing is judged and nothing is recorded; the
+# collector parks the rows until the ledger is linked or an admin releases them (undelivered, never judged).
+class Ledgers:
+    """The cloud with explicit ledgers. `sight` is actor_for_stamp for a pair uploaded by `uploader`; `link` is the admin's audited
+    link of an unlinked install into another ledger (round 11), re-keying the facts of its old ledger in the same transaction."""
+    def __init__(self, audit, ledger):
+        self.audit, self.ledger, self.facts, self.refused, self.links = {k: dict(v) for k, v in audit.items()}, dict(ledger), {}, [], []
+    def bv(self, install, at): return max(v for v, (_, t) in self.audit[install].items() if t <= at)
+    def key(self, uploader, install, v):
+        if R10: return (self.ledger[uploader], install, v)          # rounds 10-11: the uploader's ledger
+        if R9: return (uploader, install, v)                        # round 9: the uploader
+        return (install, v)                                         # round 8: the named install
+    def sight(self, install, v, at, uploader):
+        if install not in self.audit: return (None, "stamp_invalid:unknown_install")            # another tenant: judged closed, no fact
+        if R11 and self.ledger[install] != self.ledger[uploader]:                                # round 11: outside the uploader's ledger
+            self.refused.append((uploader, install, v, at)); return ("held", "refused:stamp_from_other_ledger")
+        key = self.key(uploader, install, v)
+        if key in self.facts: return (None, "stamp_invalid:stamp_not_issued")
+        if v <= self.bv(install, at): return (self.audit[install][v][0], "binding_at_capture")
+        self.facts[key] = {"first_seen_at": at, "binding_version_then": self.bv(install, at), "recorded_by": uploader}
+        return (None, "stamp_invalid:stamp_not_issued")
+    def link(self, install, ledger, at, by="admin", rekey=True):
+        """Round 11: an UNLINKED install (its own ledger) is linked into `ledger`; its old ledger's facts are re-keyed with it."""
+        if not R11 or self.ledger[install] != install: return False
+        old = self.ledger[install]; self.ledger[install] = ledger; self.links.append({"install": install, "ledger": ledger, "at": at, "by": by})
+        if rekey:
+            for k in [k for k in self.facts if k[0] == old]: self.facts[(ledger, k[1], k[2])] = self.facts.pop(k)
+        return True
+    def actors_of_ledger(self, ledger):
+        return {actor for inst, hist in self.audit.items() if self.ledger[inst] == ledger for actor, _ in hist.values()}
+INST11 = {"X": {0: ("A", 0), 1: ("B", 200), 2: ("C", 600)},    # one Mac's first install, rebound to B (v1) and C (v2)
+          "P": {0: ("B", 0)},                                    # ANOTHER Mac, server-bound to B (the same person X had at v1)
+          "U": {0: ("D", 500)},                                  # X's Mac re-joined at 500 WITHOUT proof of X's key: its own ledger (lineage: unlinked)
+          "Zl": {0: ("D", 500)}}                                 # the same re-join WITH proof: X's ledger (lineage: linked)
+LEDGER11 = {"X": "X", "P": "P", "U": "U", "Zl": "X"}
+cloud13 = Ledgers(INST11, LEDGER11)
+s8 = cloud13.sight("X", 2, 700, uploader="P")                                  # P's row stamped (X, 2), delivered at 700, after X issued 2 (C) at 600
+p_own = cloud13.sight("P", 0, 710, uploader="P")                               # P's honest row stamped with its own pair
+print("    S8 (another Mac's issued pair, uploaded by P bound to B): " + json.dumps({"P_row_X2": s8, "P_own_row": p_own, "facts": {"|".join(map(str, k)): v for k, v in cloud13.facts.items()}, "refused": cloud13.refused}))
+c.expect(s8[0] != "C" and s8[0] == "held",
+         "S8: a row P uploads stamped (X, 2), another Mac's ISSUED pair, is never C's: the pair names an install outside P's ledger, so the batch is refused (stamp_from_other_ledger) and the row is held, not judged (round 10 read P's empty ledger view, judged the pair against X and gave P's row to C, the person bound to another Mac; P's server-bound actor is B)",
+         f"P_row={s8}")
+c.expect(not cloud13.facts and p_own == ("B", "binding_at_capture"), "S8: nothing is recorded for the refused pair (no fact in any ledger) and P's own rows are unaffected", f"facts={cloud13.facts} own={p_own}")
+def crossings(cloud):
+    """Guarantee 5 (round 11): a row uploaded by ledger L is owned by an actor of L's binding history or by nobody, whoever is named and whenever it is judged."""
+    out = []
+    for uploader in cloud.ledger:
+        allowed = cloud.actors_of_ledger(cloud.ledger[uploader]) | {None, "held"}
+        for install in cloud.audit:
+            for v in cloud.audit[install]:
+                for at in range(min(t for _, t in cloud.audit[install].values()), 1001, 50):     # from the install's registration on
+                    a = Ledgers(INST11, LEDGER11).sight(install, v, at, uploader)[0]
+                    if a not in allowed: out.append({"uploader": uploader, "pair": [install, v], "at": at, "answer": a})
+    return out
+crossed = crossings(cloud13)
+print("    S8 ownership crossings (uploader, pair, instant -> an actor outside the uploader's ledger): " + json.dumps(crossed[:6]) + (" ..." if len(crossed) > 6 else ""))
+c.expect(not crossed, "S8/guarantee 5: for every uploader, every pair of the tenant and every instant, the answer is an actor of the uploader's own ledger or nobody: ownership never crosses a ledger (round 10 crossed for every issued pair named across Macs)", f"{len(crossed)} crossings, e.g. {crossed[:2]}")
+
+# ---- 14. blocking 2 (read c1 r10, S9): a re-join without proof of the previous key; the old path and the new path ---------------
+# X's summary at 300 judges the faulty (X, 2) (X at v1): not issued, a fact in X's ledger, nobody. At 500 the Mac re-joins WITHOUT
+# proof of X's key (the config was lost, or the key had been rotated): U is its own ledger, lineage: unlinked. At 600 an admin
+# rebinds the old install X to C as version 2. At 700 U delivers the pre-re-join outbox row stamped (X, 2). Round 10 judged it in
+# U's ledger's view (no fact) against X: issued, C's, while the member was nobody's. Round 11 holds it: the pair names an install
+# outside U's ledger. At 800 an admin links U into X's ledger (audited); the parked row is resubmitted at 850 and judged in X's
+# ledger, where it reads the fact X's summary recorded: nobody, like the member. One row, one answer; the hold is not a judgment.
+cloud14 = Ledgers(INST11, LEDGER11)
+member_300 = cloud14.sight("X", 2, 300, uploader="X")
+honest_member_300 = cloud14.sight("X", 1, 300, uploader="X")                    # an honest pre-re-join row stamped (X, 1): issued, B's
+deliver_700 = cloud14.sight("X", 2, 700, uploader="U")
+honest_deliver_700 = cloud14.sight("X", 1, 700, uploader="U")
+u_own_550 = cloud14.sight("U", 1, 550, uploader="U")                            # U's own faulty pair (U, 1) at U's v0: a fact in U's ledger
+linked = cloud14.link("U", "X", 800)
+deliver_850 = cloud14.sight("X", 2, 850, uploader="U")
+honest_deliver_850 = cloud14.sight("X", 1, 850, uploader="U")
+cloud14.audit["U"][1] = ("E", 900)                                               # U is rebound to E as version 1 after the link
+u_own_950 = cloud14.sight("U", 1, 950, uploader="U")
+print("    S9 (unlinked re-join; the old path, the new path, the link): " + json.dumps({"member_300": member_300, "deliver_700_unlinked": deliver_700, "linked_at_800": linked, "deliver_850_linked": deliver_850,
+      "honest": {"member_300": honest_member_300, "deliver_700": honest_deliver_700, "deliver_850": honest_deliver_850}, "U_own_pair": {"sighted_550": u_own_550, "judged_950_after_link_and_rebind": u_own_950},
+      "facts": {"|".join(map(str, k)): v["recorded_by"] for k, v in cloud14.facts.items()}, "links": cloud14.links}))
+judgments = {a[0] for a in (member_300, deliver_700, deliver_850) if a[0] != "held"}
+c.expect(judgments == {None}, "S9: the old faulty row gets ONE answer: nobody in X's summary (the old path), and nobody when the unlinked new install's delivery is finally judged (the new path, after the link); no judgment ever says C (round 10 judged the delivery in the unlinked ledger's empty view and gave the row to C)", f"member={member_300} deliver_700={deliver_700} deliver_850={deliver_850}")
+c.expect(deliver_700[0] == "held" and honest_deliver_700[0] == "held", "S9: through an UNLINKED ledger a pre-re-join row is held, not judged (the pair names an install outside that ledger), whether its pair is faulty or honest: the batch is refused as stamp_from_other_ledger and the collector parks the rows (round 10 judged both)", f"faulty={deliver_700} honest={honest_deliver_700}")
+c.expect(linked and deliver_850 == member_300 and honest_deliver_850 == honest_member_300 == ("B", "binding_at_capture"), "S9: after the admin links the install into X's ledger, the parked rows are judged in that ledger and agree with X's summary: the faulty pair nobody's, the honest pair B's (the link is the only release into a judgment)", f"linked={linked} faulty={deliver_850} honest={honest_deliver_850}")
+c.expect(u_own_950[0] is None and ("X", "U", 1) in cloud14.facts, "S9/link: the link re-keys the facts of the linked ledger, so U's own pair (U, 1), poisoned before the link, stays nobody's after it and after U is rebound up to 1 (without the re-key it would be E's: a flip)", f"judged={u_own_950} facts={list(cloud14.facts)}")
+no_rekey = Ledgers(INST11, LEDGER11); no_rekey.sight("U", 1, 550, uploader="U"); no_rekey.link("U", "X", 800, rekey=False); no_rekey.audit["U"][1] = ("E", 900)
+print("    S9 counterexample, a link WITHOUT the re-key: (U, 1) judged at 950 -> " + json.dumps(no_rekey.sight("U", 1, 950, uploader="U")) + " (E's under r11 without the re-key: the flip the re-key prevents)")
+cloud14b = Ledgers(INST11, LEDGER11)
+zl_member, zl_deliver = cloud14b.sight("X", 2, 300, uploader="X"), None
+cloud14b.audit["X"][2] = ("C", 600); zl_deliver = cloud14b.sight("X", 2, 700, uploader="Zl")
+c.expect(zl_member[0] is None and zl_deliver == zl_member, "S9/linked: the same history through a re-join WITH proof (Zl in X's ledger) is judged at once and agrees, as in round 10: the hold applies only to an unlinked ledger", f"member={zl_member} deliver={zl_deliver}")
+copied_key = join_ledger("U2", "X", True)                                        # a copied previous-install key passes the possession proof from any Mac
+c.expect(copied_key == {"ledger": "X", "lineage": "linked"} or not R10, "S9/should-fix 4: the ledger separation is per KEY, not per hardware: a join that proves possession of X's key joins X's ledger wherever it runs, so 'another Mac never enters the ledger' holds while the previous install's key stays secret; the first-sighting guarantee is per ledger", f"{copied_key}")
 c.finish()
