@@ -1,4 +1,4 @@
-# Lean Plimsoll contract register (round 11 = B0 round 5, eco-6hoxj.164.4)
+# Lean Plimsoll contract register (round 12 = B0 round 6, eco-6hoxj.164.4)
 
 **As of:** 2026-09-25 MDT · **Owner:** B0 (contract owner; documents and failing tests only). This file is normative for the
 items the round-6 review left to B0 (two blockers, four `b0Carries`; `input/review-r6/VERDICT.json`) and for the repairs the
@@ -8,16 +8,17 @@ answer replacing the stamp, the first sighting racing the rebind, two pending te
 and the independent read of C1/C4 after round 9 required (`input/read-c1c4/VERDICT.json`: a sighting must take the lock before it
 reads the facts, and one ledger uploaded by two installs must read one fact; and its should-fixes) and the independent read of C1
 after round 10 required (`input/read-c1-r10/VERDICT.json`: a pair naming an install of another ledger must never own the uploader's
-row, and a re-join that cannot prove the previous key must not split an old row; and its should-fixes). Where it and another
-document disagree, this file wins and the other carries a "round 7", "round 8", "round 9", "round 10" or "round 11" note pointing
-here. Every rule below has (a) a runnable fixture in `fixtures/` (the round-11 fixture `b4_offline_rebind.py` is red under `--rule
-r6`, `r7`, `r8`, `r9` and `r10` and green under `--rule r11`; `s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green
-under `r9`;
+row, and a re-join that cannot prove the previous key must not split an old row; and its should-fixes) and the independent read of
+C1 after round 11 required (`input/read-c1-r11/VERDICT.json`: the admin link must move a whole ledger into a canonical destination,
+or refuse; and its should-fix). Where it and another document disagree, this file wins and the other carries a "round 7", "round
+8", "round 9", "round 10", "round 11" or "round 12" note pointing here. Every rule below has (a) a runnable fixture in `fixtures/`
+(the round-12 fixture `b4_offline_rebind.py` is red under `--rule r6`, `r7`, `r8`, `r9`, `r10` and `r11` and green under `--rule
+r12`; `s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green under `r9`;
 `checks/fixtures-summary.json`) and (b) a **pending test** in the repository that owns the rule (§C6), which fails today and names
 the bead that turns it green. Nothing here is implemented;
 nothing here is frozen until the lead signs the freeze list (`FREEZE.md`).
 
-## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5, read-c1-r10 blockers 1-2 and should-fixes 1-4; B6 cloud, B2a collector)
+## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5, read-c1-r10 blockers 1-2 and should-fixes 1-4, read-c1-r11 blocking and should-fix; B6 cloud, B2a collector)
 
 **The defect (review r6).** Round 6 wrote two validators. A delivered stamp had to satisfy `V exists, V ≤ actorBindingVersionHeard
 ≤ current`; an undelivered stamp only `V exists, V ≤ current`. For a version the cloud had issued but the collector had not yet
@@ -68,6 +69,17 @@ own ledger, which cannot see the old install's not-issued fact: X's summary judg
 ledger**: a pair naming an install outside the uploader's ledger is refused before any judgment and records nothing, the collector
 parks such rows, and the only release into a judgment is the ledger's link (the join's proof, or an admin's audited link), after
 which the rows are judged in that ledger, where they read the same facts and audit rows the old install's summary did.
+
+**The defect (the read of C1 after round 11).** Round 11's admin link moved the **one** install the admin named (allowed while that
+install was still its own ledger) but re-keyed **every** fact of its old ledger (`input/read-c1-r11/VERDICT.json`,
+`checks/pg-probe.log` `CHAIN_COUNTEREXAMPLE`). An unlinked root U that already had a proof-linked child V (the Mac re-joined again,
+this time with proof of U's key) still satisfied the link's only precondition, so linking U into X left V in the emptied ledger U
+while V's not-issued fact went to X: after V was rebound to E as version 1, V's own judgment of `(V, 1)`, null before the link, was
+E's, against guarantee 1. The link also checked nothing about its destination, so a link into an install that was itself a member of
+another ledger made one chain with two ledger ids (`NONROOT_TARGET_COUNTEREXAMPLE`). Round 12 closes both below: **the link moves a
+ledger, never an install** (every install of the source ledger, with the source ledger's facts, in one transaction under one set of
+locks, with one audit row), into a destination that is **the root of its own ledger in the same tenant**, and the join's lineage
+step holds the previous install's row so a join and a merge of one chain serialize.
 
 **The rule.** A stamp is the **pair** `(install, V)`: the `DeviceInstall` id of the response that supplied `V` and the version. The
 collector persists the pair, stamps it on the identity row (`summary_members.actor_binding_version`, `.actor_binding_install`) and
@@ -176,14 +188,39 @@ construction: no install can sight another ledger's pairs at all; the poisoning 
 pairs) nor take another Mac's actor, and the server-bound actor today's ingest protects (`src/lib/ingest.ts:397-427`) is never
 overridden across Macs (`b4_offline_rebind.py` S8, red under r10; `checks/round11-sql-orderings.log` S8). **The link is the release
 (round 11, blocking 2).** A parked row is judged only once its uploader's ledger **is** the named install's ledger: at join, by the
-verified proof (`lineage: linked`, `ledger_linked_by = join_proof`); later, by an **admin's audited link** (`linkLedgerByAdmin`:
-allowed only for an install that is still its own ledger, so a chain is linked once; it takes the install row `FOR UPDATE` like a
-rebind, sets `ledger_install_id` with `ledger_linked_at` and `ledger_linked_by`, and **re-keys the facts of the install's old
-ledger** to the new one in the same transaction, so a pair poisoned in the unlinked ledger stays poisoned after the link,
-`checks/round11-sql-orderings.log` S10, and a sighting never reads a half-linked ledger, S11). The next authenticated response then
-reports `lineage: linked` and the collector resubmits the parked rows, which are judged in that ledger, where they read the facts
-and audit rows the old install's summary read: the same answer (`b4_offline_rebind.py` S9, red under r10;
-`checks/round11-sql-orderings.log` S9, S9h). A row an admin releases without a link is acknowledged `undeliverable_unlinked_ledger`
+verified proof (`lineage: linked`, `ledger_linked_by = join_proof`); later, by an **admin's audited link** (`linkLedgerByAdmin`;
+**round 12: the link moves a ledger, never an install**). The source of the link is a **ledger**: an install that is still its own
+ledger (`ledger_install_id = id`, the root of its chain); the destination is the **root of its own ledger in the same tenant**
+(`ledger_install_id = id`, the source's `tenant_id`). In **one transaction**: (1) both roots' rows `FOR UPDATE`, in ascending id
+order, and the preconditions checked under those locks (a source that is not a root is refused `source_not_root`, so a chain is
+always moved whole and a member is never moved alone; a destination that is not a root is refused `target_not_root`, the refusal
+naming the destination's root for the admin to use instead; a destination of another tenant, or none, `target_not_found`; the source
+itself `source_is_target`; a refusal moves nothing); (2) **every install whose `ledger_install_id` is the source** locked `FOR
+UPDATE` in ascending id order by a statement issued after those locks (its snapshot follows them), re-enumerated in a further
+statement until no unlocked member remains (a join into the chain that is in progress holds its previous install's row `FOR SHARE`,
+below, so it commits before this lock is granted and the fresh statement sees the install it joined); (3) every member, the source
+root included, set to the destination's `ledger_install_id` and stamped `ledger_linked_at` and `ledger_linked_by` with the admin
+(who and when, per moved install); (4) **the facts of the source ledger re-keyed** to the destination, so a pair poisoned in the
+source ledger stays poisoned after the link (`checks/round11-sql-orderings.log` S10) and a member's fact never leaves its member's
+ledger; (5) **one audit row**, `device_install_ledger_links (id, tenant_id, source_ledger_install_id, ledger_install_id,
+installs_moved, facts_rekeyed, linked_by, linked_at)`, whose id the admin's receipt carries. After the link the source ledger has no
+install and no fact; the destination root may itself be linked on later and the whole merged chain moves again (links compose); a
+second link of the source or of any member is refused (`source_not_root`). **The join's lineage step keeps the same lock
+discipline** (round 12): `linkLedgerAtJoin` takes the previous install's row `FOR SHARE`, reads its `ledger_install_id` under that
+lock and writes it on the new install in the same transaction, so a merge of that ledger, which takes every member `FOR UPDATE`,
+either waits for the join and then moves the joined install too, or holds its locks while the join waits and then joins the merged
+ledger; a sighting that holds a member `FOR SHARE` is waited for the same way, so a sighting never reads a half-linked ledger
+(`checks/round11-sql-orderings.log` S11 for the root; `checks/round12-sql-orderings.log` S14 for a member and for both orders of
+the join). Round 11 moved the one install the admin named and re-keyed every fact of its old ledger, so an unlinked root U that
+already had a proof-linked child V was linked alone: V stayed in the emptied ledger U while V's not-issued fact went to X, and after
+V was rebound to E as version 1 the same `(V, 1)`, null before the link, was E's (the read's `CHAIN_COUNTEREXAMPLE` on PostgreSQL
+17.10; U's later upload of V's pair was refused as another ledger's); and it checked nothing about the destination, so a link into a
+member made one chain with two ledger ids whose installs refused one another's pairs (`NONROOT_TARGET_COUNTEREXAMPLE`). Both are
+red under round 11 and green under round 12 (`b4_offline_rebind.py` section 15; `checks/round12-sql-orderings.log` S12, S13). The
+next authenticated response then reports `lineage: linked` **and the ledger, `ledgerInstallId`** (round 12: a member of a merged
+chain sees its ledger change while its lineage was already `linked`), and the collector resubmits the rows it parked under a
+different ledger, which are judged in that ledger, where they read the facts and audit rows the old install's summary read: the
+same answer (`b4_offline_rebind.py` S9, red under r10; `checks/round11-sql-orderings.log` S9, S9h). A row an admin releases without a link is acknowledged `undeliverable_unlinked_ledger`
 under the admin's receipt: never delivered, never judged, listed on the certify, so the old install's summary answer stands alone.
 An honest B2a collector links at join whenever it still holds the previous install's key, so the hold is reached only when that key
 is gone (a lost config, a rotated key) or by a faulty or hostile collector, and it costs an honest collector a delay, never an
