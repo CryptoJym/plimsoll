@@ -54,6 +54,13 @@ jobs:
         id: typecheck
         run: pnpm exec tsc --noEmit
 
+      # eco-6hoxj.164.4 (lean Plimsoll B0): contract tests that FAIL today by design.
+      # Each is declared pending("<bead>") (node:test todo), so the step prints every
+      # failure and exits 0 until the named bead removes the marker; from then on the
+      # test blocks. Not a proof: tests/contracts/lean/README.md.
+      - name: Lean contract tests (pending until their beads land)
+        run: pnpm contracts:lean
+
       - name: Reject incomplete proofs and require WAL, authentication and retention receipts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
