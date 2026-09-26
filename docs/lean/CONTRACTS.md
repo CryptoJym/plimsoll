@@ -1,17 +1,20 @@
-# Lean Plimsoll contract register (round 9 = B0 round 3, eco-6hoxj.164.4)
+# Lean Plimsoll contract register (round 10 = B0 round 4, eco-6hoxj.164.4)
 
 **As of:** 2026-09-25 MDT · **Owner:** B0 (contract owner; documents and failing tests only). This file is normative for the
 items the round-6 review left to B0 (two blockers, four `b0Carries`; `input/review-r6/VERDICT.json`) and for the repairs the
 round-1 review of B0 required (`input/review-r1/VERDICT.json`: C1/C4 judged at judgment time, C2 rule 3 overstating the runway,
 the test helper; and its should-fixes) and the round-2 review required (`input/review-r2/VERDICT.json`: the old install's late
-answer replacing the stamp, the first sighting racing the rebind, two pending tests that could not pass; and its nine should-fixes).
-Where it and another document disagree, this file wins and the other carries a "round 7", "round 8" or "round 9" note pointing
-here. Every rule below has (a) a runnable fixture in `fixtures/` (the two round-9 fixtures are red under `--rule r6`, `r7` and `r8`
-and green under `--rule r9`; `checks/fixtures-summary.json`) and (b) a **pending test** in the repository that owns the rule (§C6),
-which fails today and names the bead that turns it green. Nothing here is implemented;
+answer replacing the stamp, the first sighting racing the rebind, two pending tests that could not pass; and its nine should-fixes)
+and the independent read of C1/C4 after round 9 required (`input/read-c1c4/VERDICT.json`: a sighting must take the lock before it
+reads the facts, and one ledger uploaded by two installs must read one fact; and its should-fixes). Where it and another document
+disagree, this file wins and the other carries a "round 7", "round 8", "round 9" or "round 10" note pointing here. Every rule below
+has (a) a runnable fixture in `fixtures/` (the round-10 fixture `b4_offline_rebind.py` is red under `--rule r6`, `r7`, `r8` and `r9`
+and green under `--rule r10`; `s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green under `r9`;
+`checks/fixtures-summary.json`) and (b) a **pending test** in the repository that owns the rule (§C6), which fails today and names
+the bead that turns it green. Nothing here is implemented;
 nothing here is frozen until the lead signs the freeze list (`FREEZE.md`).
 
-## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4; B6 cloud, B2a collector)
+## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5; B6 cloud, B2a collector)
 
 **The defect (review r6).** Round 6 wrote two validators. A delivered stamp had to satisfy `V exists, V ≤ actorBindingVersionHeard
 ≤ current`; an undelivered stamp only `V exists, V ≤ current`. For a version the cloud had issued but the collector had not yet
@@ -39,6 +42,18 @@ reads 1, the rebind commits 2, T3 judges the pair issued and exports C, T1 recor
 next version by naming it (R7). Round 9 closes all three below: the collector accepts a version only from the install its ledger is
 **joined** with (C4), the sighting is **serialized** against the rebind, and the fact is keyed by the **uploader**.
 
+**The defect (the read of C1/C4 after round 9).** Round 9 left two gaps, both reached only by a faulty stamp (a pair naming a
+version the cloud had not issued when it first saw it) and both breaking the promise that a row gets one answer whenever and on
+whichever path it is judged (`input/read-c1c4/VERDICT.json`, `checks/c1-sql-orderings.log`). (1) The text locked the read of
+`binding_version` but did not say when the facts and the audit rows are read, and C6's ingest surface judged from a preloaded view;
+with the facts read before the lock, two first sightings of one pair on the ingest and summary paths at the same instant, around the
+rebind that issues the version, split in 8 of 566 schedules (the summary read "no fact", the ingest recorded the fact and committed,
+the rebind committed, the summary locked, read the issued version and exported C; every later judgment was null). (2) Keyed by the
+uploader, one row judged by two installs of the same ledger got two answers: after a re-join the old install X judges the row's
+summary member (a fact under X) and the new install Z delivers the row itself, and if X was rebound up to the version in between the
+row was unallocated in X's part and someone's when Z delivered it. Round 10 closes both below: a sighting takes the lock **first** and
+reads everything under it, and the fact is keyed by the **ledger** (the chain of installs of one Mac), not the uploader.
+
 **The rule.** A stamp is the **pair** `(install, V)`: the `DeviceInstall` id of the response that supplied `V` and the version. The
 collector persists the pair, stamps it on the identity row (`summary_members.actor_binding_version`, `.actor_binding_install`) and
 sends it on the wire (`metadata.actorBindingVersion`, `metadata.actorBindingInstall`); the summary item's per-segment parts are
@@ -56,9 +71,10 @@ install the pair names, never against the uploading install:
    cloud sees the pair and is never revisited: `actor_for_stamp` reads only the audit table and the `stamp_not_issued` facts, an
    audit row created after the fact does not revive it, and no fact can be created once the audit row exists **because the sighting
    is serialized against the rebind** (below, round 9): a rebind cannot commit between a sighting's read of `binding_version` and
-   its fact. Every judgment is a
+   its fact, and (round 10) every input of the judgment, `binding_version`, the audit rows and the facts, is read **after** the
+   sighting took the lock, never from a view loaded before it. Every judgment is a
    sighting, so every judgment of a row stamped `(install, V)` (ingest, a dead delivery's replay, any summary revision, either
-   path) returns the same actor or the same null. The fixture probes every sighted pair at every instant from its first sighting
+   path, whichever install of the ledger uploads it, round 10) returns the same actor or the same null. The fixture probes every sighted pair at every instant from its first sighting
    to the end of the timeline and finds one answer each (round 7 flipped for `(W, 2)` and `(Zf, 2)`).
 2. **Honest collectors are exact.** An honest collector is one that stamps only versions it persisted from responses of the
    install its ledger is **joined** with (C4: the joined install is recorded at join activation; a response from any other install
@@ -81,19 +97,30 @@ install the pair names, never against the uploading install:
 first_seen_at, binding_version_then, source ∈ {echo, row, member})`, unique per `(uploader_install_id, device_install_id, version)`,
 `device_install_id` a foreign key to `device_installs` without cascade, written in the transaction of the request receipt, the ingest
 or the summary judgment that first saw the pair above the install's `binding_version`; never deleted except by a tenant erasure
-(below). A refused batch (schema violation, 400) judges nothing and records nothing. **Serialization (round 9, review r2 R5).** A
-sighting that may record a fact reads `device_installs.binding_version` **with the install row locked `FOR SHARE`** in the
-transaction that records the fact. The rebind (`bindDeviceInstalls`, `reverseDeviceInstallBinding`) updates that row
-(`binding_version + 1`, the actor) and inserts the audit row in one transaction; its `UPDATE` takes the row's `FOR NO KEY UPDATE`
-lock, which conflicts with `FOR SHARE`, so either the rebind waits until the sighting commits (the fact then precedes the audit row
-and the pair is not issued for ever) or the sighting reads after the rebind committed and sees the issued version (no fact). An
-implementation may instead run both at `SERIALIZABLE` with retry. The fact is inserted `ON CONFLICT (uploader_install_id,
-device_install_id, version) DO NOTHING` and re-read, so two first sightings of the same pair on two paths at once (R6) leave one fact
-and both judge null; neither batch is refused. Of the 12 interleavings of a faulty sighting with the rebind that issues its version,
-0 flip under this rule and the rebind waits in 4 (`b4_offline_rebind.py` R5; round 8 flipped in 1); the same schedules were
-reproduced in a real PostgreSQL cluster in round 9 (`checks/r5-postgres-reproduction.log`: without the lock T3 exported C and T1
-then recorded the fact; with `FOR SHARE` `pg_blocking_pids` shows the rebind waiting). The durable proof is pending in the cloud:
-`actor-binding-stamp-postgres.contract.test.ts` (B6). **Scope (round 9, review r2 R7).** `actor_for_stamp` for a row or member
+(below). A refused batch (schema violation, 400) judges nothing and records nothing. **Serialization (round 9, review r2 R5; round
+10, read c1c4 blocking 1).** A sighting **first takes the named install's row `FOR SHARE`** in the transaction that records the fact,
+and **only then reads `binding_version`, the audit rows and the facts**, all under that lock; a view of any of them loaded before the
+lock (at request start, or by a caller that hands `eventRowsForStorage` a preloaded view, C6) is not a judgment input and is re-read
+under the lock. The rebind (`bindDeviceInstalls`, `reverseDeviceInstallActorBindings`, `plimsoll-cloud@4954995
+src/lib/device-install-actor-binding.ts:128-134,151,258`) first locks the install rows `FOR UPDATE` (`lockInstalls`), then updates
+the row (`binding_version + 1`, the actor) and inserts the audit row, in one transaction; `FOR UPDATE` conflicts with `FOR SHARE`, so
+either the rebind waits until every sighting that holds the row commits (the fact then precedes the audit row and the pair is not
+issued for ever) or the sighting waits for a rebind that holds the row and reads the issued version with its audit row (no fact).
+PostgreSQL grants a `FOR SHARE` at once while a `FOR UPDATE` is merely waiting (compatible row locks do not queue), so a sighting
+never waits for a waiting rebind, only for one that holds the row (`checks/round10-sql-orderings.log` S5c). A sighting or a view
+that names several installs locks them in **ascending id order**, and B6 gives `lockInstalls` the same `ORDER BY`, so two lockers of
+the same installs cannot deadlock (round 10, low). An implementation may instead run both at `SERIALIZABLE` with retry. The fact is
+inserted `ON CONFLICT (ledger_install_id, device_install_id, version) DO NOTHING` and re-read, so two first sightings of the same pair
+on two paths at once (R6) leave one fact and both judge null; neither batch is refused. Of the 12 interleavings of a faulty sighting
+with the rebind that issues its version, 0 flip under this rule and the rebind waits in 4 (`b4_offline_rebind.py` R5; round 8 flipped
+in 1); of the statement-level schedules of two first sightings of one pair on the ingest and summary paths around the rebind, 0 of 102
+split with the lock taken first, while a view of the facts loaded before the lock, which round 9's text did not exclude, splits in 8
+of 566 (`b4_offline_rebind.py` R5b, red under r9; reproduced on the real migrations in `checks/c1-sql-orderings.log` S2 and
+`checks/round10-sql-orderings.log` S2, S5a-b). The durable proof is pending in the cloud: `actor-binding-stamp-postgres.contract.test.ts`
+(B6): the R5 wait with the rebind observed waiting, the concurrent mirror order (the rebind holds its lock first; the sighting waits,
+reads the issued version, answers the actor and records nothing: without `FOR SHARE` it reads the old version, records a fact after the
+rebind commits and a judgment in between says the actor), and `loadSightingView` waiting for a held `FOR UPDATE` and returning the
+committed version with its audit row and every committed fact. **Scope (round 9, review r2 R7).** `actor_for_stamp` for a row or member
 uploaded by install U reads the facts with `uploader_install_id = U`; a fact another install recorded by naming `(install, V)` never
 enters `install`'s own view, so one install's faulty or hostile traffic cannot poison another install's next version (the
 poisoning of guarantee 3 is confined to the uploader's own pairs). A pair naming an install of another tenant fails closed and
@@ -142,8 +169,8 @@ is round 8 as written: the late answer replaces the pair, no lock, the fact keye
 
 **Judgment state.** Validity is decided at the first sighting of `(install, V)` and recorded; a version that did not exist then is
 invalid on both paths for ever. Parts are computed per received revision and frozen at the seal; a raw row's actor is bound once at
-ingest; because the fact precedes both, and the rebind cannot slip between a sighting's read and its fact, neither can differ from
-the other.
+ingest; because the fact precedes both, the rebind cannot slip between a sighting's read and its fact, every input is read after the
+lock, and every install of the ledger reads the same fact (round 10), neither can differ from the other.
 
 **Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 11 cases): the reviewer's issued-but-unheard row,
 the honest orderings and the A→B→A reversal, the never-issued stamp, the first-sighting rule with the replay and the repair, the
