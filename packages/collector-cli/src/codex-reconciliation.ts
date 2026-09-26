@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 
 import { estimateCostUsd } from "../../shared/src/index";
+import { pairCodexUsageEvent, runCodexUsagePairingBackfill } from "./codex-usage-pairing";
 
 const WINDOW_SECONDS = 10 * 60;
 const CONTROL_ROW = 1;
@@ -663,6 +664,7 @@ export function runCodexReconciliationMaintenance(
             });
             rowsChanged += apply.run({ id: row.id, sessionId, model, costUsd, costKind, payloadJson })
               .changes;
+            if (sessionChanged) pairCodexUsageEvent(database, row.id);
             if (sessionChanged) stitched += 1;
             if (costChanged) priced += 1;
           }
@@ -878,6 +880,13 @@ export function runCodexReconciliationMaintenance(
       }
 
       const rowsVisited = legacyRowsVisited + contextRowsVisited + candidateRowsVisited;
+      // Keep direct reconciliation runs useful while the automatic repair
+      // cadence provides a larger dedicated historical slice.
+      const pairingDeadline = performance.now() + 5;
+      // This runs inside reconciliation's own transaction. Keep the pairing
+      // contribution to one candidate; automatic maintenance uses separate
+      // one-candidate writer transactions for the larger historical walk.
+      runCodexUsagePairingBackfill(database, 1, () => performance.now() >= pairingDeadline);
       const sliceDurationMs = clock() - sliceStarted;
       const timeBudgetExhausted = clock() >= deadline;
       database

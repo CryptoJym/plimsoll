@@ -121,6 +121,11 @@ import {
   type MaintenanceAttemptOutcome,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import {
+  buildCodexUsagePairingIndexes,
+  codexUsagePairingProgress,
+  codexUsagePairingStatus,
+} from "./codex-usage-pairing";
 import { sessionContextIndexStatus } from "./session-context-index";
 import {
   historyCoverageStatus,
@@ -190,6 +195,7 @@ import {
 } from "./lifecycle-command";
 import {
   composeLifecycleAdapter,
+  otherProcessesWithFilesOpen,
   resolveArtifactFromBundle,
   resolveSelfArtifact,
 } from "./lifecycle-adapters";
@@ -522,6 +528,10 @@ Config tools:
       twice the ledger size (snapshot plus a rollback's copy) plus
       max(2 GiB, 5%). Clone-capable volumes need no copy space. The update
       itself refuses while any other process has the ledger open.
+  lifecycle pairing-indexes [--apply]
+      Preview index readiness, or build the three Codex usage pairing indexes
+      while the collector is stopped and producers spool. Refuses an open or
+      unprovably quiescent ledger; run before lifecycle update and restart.
   lifecycle snapshots list [--keep N] [--json]
       Every update snapshot and runtime version: created, size, method, the
       operation's state, and whether retention keeps it. Read-only.
@@ -2585,6 +2595,11 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    const pairingStatus = codexUsagePairingStatus(buffer.database);
+    if (!pairingStatus.enabled) {
+      console.warn(JSON.stringify({ warning: "codex_usage_pairing_disabled", reason: pairingStatus.reason,
+        missingIndexes: pairingStatus.missingIndexes }));
+    }
     // A worker thread copies its WAL back and keeps it bounded; the
     // connection's own automatic checkpoint stays only as a backstop
     // (wal-checkpoint-worker.ts).
@@ -3126,13 +3141,14 @@ async function main() {
           // The one-time session context backfill keeps the repair cadence
           // while each maintenance job's bounded slice still advances it.
           const sessionIndex = sessionContextIndexStatus(buffer.database);
+          const pairing = codexUsagePairingProgress(buffer.database);
           return {
             pending: Object.values(projection.backlog).some(n => n > 0) ||
               !projection.backfill.complete || !projection.backfill.parityComplete || !projection.backfill.metricComplete ||
-              sessionIndex.state === "backfilling",
+              sessionIndex.state === "backfilling" || pairing.pending,
             units: Object.values(repairs.stages).reduce((sum, stage) => sum + stage.rowsVisited, 0) +
               projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited +
-              sessionIndex.backfill.rowsVisited,
+              sessionIndex.backfill.rowsVisited + pairing.units,
           };
         },
         retryNotBefore: () => {
@@ -3629,6 +3645,7 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
+          codexUsagePairing: codexUsagePairingStatus(buffer.database),
           sessionAttribution: sessionContextIndexStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
@@ -6265,8 +6282,48 @@ async function main() {
 
   if (command === "lifecycle") {
     const action = process.argv[3] ?? "";
-    if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots"].includes(action)) {
-      throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots");
+    if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots", "pairing-indexes"].includes(action)) {
+      throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots|pairing-indexes");
+    }
+    if (action === "pairing-indexes") {
+      if (process.argv.slice(4).some((arg) => arg !== "--apply") ||
+          process.argv.slice(4).filter((arg) => arg === "--apply").length > 1) {
+        throw new Error("lifecycle pairing-indexes takes only an optional --apply");
+      }
+      const apply = flag("--apply");
+      const ledgerPath = collectorBufferPath();
+      if (!fs.existsSync(ledgerPath) || !fs.lstatSync(ledgerPath).isFile()) {
+        throw new Error("pairing index upgrade requires an existing regular ledger");
+      }
+      const openFiles = [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`];
+      const others = otherProcessesWithFilesOpen(openFiles);
+      if (apply && (others === null || others.length > 0)) {
+        throw new Error(others === null ? "pairing index upgrade cannot prove ledger quiescence" :
+          "pairing index upgrade requires every other ledger connection to be stopped");
+      }
+      const database = new Database(ledgerPath, { readonly: !apply, fileMustExist: true, timeout: 0 });
+      try {
+        const before = codexUsagePairingStatus(database);
+        if (!apply) {
+          console.log(JSON.stringify({ operation: "pairing_indexes", applied: false, ...before }, null, 2));
+          return;
+        }
+        // WAL EXCLUSIVE mode retains the ledger lock between the three atomic
+        // CREATE INDEX statements. An idle second connection is caught by lsof.
+        database.pragma("locking_mode = EXCLUSIVE");
+        database.exec("BEGIN EXCLUSIVE; COMMIT");
+        const stillOpen = otherProcessesWithFilesOpen(openFiles);
+        if (stillOpen === null || stillOpen.length > 0) {
+          throw new Error("pairing index upgrade lost exclusive ledger ownership");
+        }
+        const timings = buildCodexUsagePairingIndexes(database);
+        const after = codexUsagePairingStatus(database);
+        if (!after.enabled) throw new Error("pairing index upgrade did not build every index");
+        console.log(JSON.stringify({ operation: "pairing_indexes", applied: true, before, after, timings }, null, 2));
+      } finally {
+        database.close();
+      }
+      return;
     }
     // Checked before any action runs, so a misplaced or mistyped --retention never falls back to pruning.
     const keepAll = lifecycleRetentionKeepAll([action, ...process.argv.slice(4)]);

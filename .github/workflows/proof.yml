@@ -240,6 +240,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-reconciliation
 
+      - name: Prove real Codex usage pairing and ledger upgrade
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-usage-pairing
+
       - name: Prove fair capture progress across concurrent generations
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-fairness

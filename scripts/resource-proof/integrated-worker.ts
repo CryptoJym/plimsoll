@@ -418,7 +418,12 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
     checks.reopenedSnapshotExactlyOne =
       reopenedSnapshot.status === 200 && reopenedSnapshotBody.summary?.totals?.events === 1;
 
+    const firstLease = buffer.delivery.lease({ now: new Date() });
+    checks.codexUsageHeldBeforeGrace = firstLease.items.length === 0 &&
+      durableState(buffer).outbox === 1;
+    const afterGrace = new Date(Date.now() + 61_000);
     const upload = await uploadBufferedEvents(config, buffer, {
+      now: () => afterGrace,
       fetchImpl: async (input, init) => {
         fakeUploadCalls += 1;
         const target =

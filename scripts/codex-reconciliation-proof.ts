@@ -298,6 +298,61 @@ function usageEvent(id: string, observedAt: string) {
   });
 }
 
+function proveAppServerResponsePair(root: string) {
+  const observedAt = "2026-07-15T12:00:00.000Z";
+  for (const order of ["log-first", "span-first", "long-span"] as const) {
+    const buffer = new LocalEventBuffer(path.join(root, `app-server-pair-${order}.sqlite`), {
+      delivery: { enabled: true },
+    });
+    try {
+      const traceId = "0123456789abcdef0123456789abcdef";
+      const log = aiInteractionEventSchema.parse({
+        ...usageEvent(`pair-log-${order}`,
+          order === "long-span" ? "2026-07-15T12:01:30.000Z" : observedAt),
+        sessionId: "019e9100-0000-7000-8000-000000000001",
+        actorId: "synthetic-account",
+        cacheReadTokens: undefined,
+        metadata: { otelEventName: "codex.sse_event",
+          serviceName: "codex-app-server" },
+      });
+      const span = aiInteractionEventSchema.parse({
+        ...usageEvent(`pair-span-${order}`,
+          order === "long-span" ? observedAt : "2026-07-15T12:00:06.000Z"),
+        sessionId: undefined,
+        metadata: { otelEventName: "handle_responses", traceId,
+          ...(order === "long-span" ? { otelSpanEndAt: "2026-07-15T12:01:30.000Z" } : {}),
+          serviceName: "codex-app-server" },
+      });
+      for (const event of order === "log-first" ? [log, span] : [span, log]) {
+        assert.equal(buffer.append(event), true);
+      }
+      const total = buffer.database.prepare(
+        `select count(*) as rawRows,
+           sum(case when usage_duplicate_reason = 'codex_sse_event_span' then 1 else 0 end) as duplicates,
+           sum(input_tokens) as inputTokens, sum(output_tokens) as outputTokens,
+           sum(cache_read_tokens) as cacheReadTokens
+         from buffered_events where source = 'codex'`,
+      ).get() as { rawRows: number; duplicates: number; inputTokens: number;
+        outputTokens: number; cacheReadTokens: number };
+      const queued = buffer.database.prepare(
+        `select count(*) as n from upload_outbox`,
+      ).get() as { n: number };
+      check(`app_server_response_pair_${order}_stores_one_usage_row`,
+        total.rawRows === 2 && total.duplicates === 1 &&
+        total.inputTokens === 2_400 && total.outputTokens === 510 &&
+        total.cacheReadTokens === 1_800 && queued.n === 1,
+        { total, queued });
+      const savedSpan = buffer.database.prepare(
+        `select session_id as sessionId from buffered_events where id = ?`,
+      ).get(span.id) as { sessionId: string | null };
+      check(`app_server_response_pair_${order}_avoids_stitch`,
+        savedSpan.sessionId === null, { savedSpan });
+    } finally {
+      buffer.close();
+    }
+  }
+}
+
 function contextEvent(id: string, observedAt: string) {
   return aiInteractionEventSchema.parse({
     id,
@@ -1312,6 +1367,7 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-codex-reconciliation-proof-"));
   try {
+    proveAppServerResponsePair(root);
     await proveRequestPathIsBounded(root);
     proveDeterministicNearestContextTies(root);
     provePriorDraftCandidatePriorityMigration(root);

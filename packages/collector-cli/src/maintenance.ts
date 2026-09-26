@@ -8,6 +8,7 @@ import {
   runCodexReconciliationMaintenance,
   type CodexReconciliationResult,
 } from "./codex-reconciliation";
+import { codexUsagePairingProgress, runCodexUsagePairingWriterSlice } from "./codex-usage-pairing";
 import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
 import type { GrokUsageScanResult, GrokUsageTailer } from "./grok-usage-tailer";
@@ -975,6 +976,17 @@ export class CollectorMaintenance {
     let drained = null as Awaited<ReturnType<typeof drainProjectionMigration>> | null;
     const runRepairs = async () => {
       const repairStarted = performance.now();
+      // Historical Codex pairs must advance on every admitted repair turn;
+      // reconciliation itself rotates with four other repair stages.
+      if (!this.signal?.aborted && budget.canStart(15) &&
+          codexUsagePairingProgress(this.buffer.database).pending) {
+        runCodexUsagePairingWriterSlice(this.buffer.database, {
+          maxMs: 15, maxCandidates: 32,
+          canStart: () => !this.signal?.aborted && budget.canStart(2),
+        });
+        // CaptureWorkBudget started before repairs and checks its actual wall
+        // time before every next transaction and capture turn.
+      }
       for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
         const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
         if (this.signal?.aborted || !budget.canStart(5) ||

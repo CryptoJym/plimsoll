@@ -39,6 +39,7 @@ const CACHE_READ_TOKEN_KEYS = [
   "gen_ai.usage.cache_read_tokens",
   "gen_ai.usage.cache_read.input_tokens",
   "gen_ai.usage.cached_tokens",
+  "cached_token_count",
   "cached_content_token_count",
 ] as const;
 
