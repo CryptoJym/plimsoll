@@ -88,12 +88,32 @@ Round 12 rule (B0 round 6, the independent read of C1 after round 11, its one bl
       (who, when, source, destination, installs moved, facts re-keyed) and stamping every moved install; a non-root or foreign
       destination is refused (naming the root); a source that is not a root is refused (a chain is linked whole, once per link);
       links compose (the merged root may be linked on, and the whole chain moves again).
+Round 13 rule (B0 round 7, the independent read of C1 after round 12, its two blocking items; CONTRACTS.md r13 C1):
+  (n) A DEADLOCKED C1 TRANSACTION IS RETRIED FROM ITS START, AT MOST THREE ATTEMPTS. A sighting that names several installs locks
+      them FOR SHARE in ascending id order; the merge locks the two roots FOR UPDATE first and only then the source ledger's
+      members: two orders, so a batch naming a member that sorts before its root and the root itself can hold the member and wait
+      for the root while the merge holds the root and waits for the member. PostgreSQL detects the cycle and aborts one transaction
+      (SQLSTATE 40P01; 40001 where an implementation runs at SERIALIZABLE). Round 12 said nothing about the aborted one: the reader's
+      probe saw the merge aborted and the parked rows never released. Round 13: the aborted operation (a sighting on either path,
+      the rebind, the join's lineage step, the admin's merge) is rolled back and run again as a fresh transaction from its first
+      statement, fresh locks and every input re-read under them, at most 3 attempts in all; nothing is acknowledged, recorded or
+      receipted before the transaction that did the work commits; when the third attempt is aborted too the caller sees 503
+      transaction_retry_exhausted with Retry-After (a sighting: the collector's ordinary transient retry re-delivers the batch, no
+      row parked or acknowledged; the admin's link: nothing moved, no audit row, the rows still parked, the admin re-issues it). A
+      retried link that commits releases the parked rows exactly as a first-attempt link does.
+  (o) THE 400 NAMES THE LEDGER IT JUDGED. The stamp_from_other_ledger refusal carries ledgerInstallId, the uploader's ledger the
+      request was authorized with (read before the sighting's lock), which is the ledger the sighting compared the named install's
+      ledger against; the collector parks the refused rows under that wire value, never one it supplied or learned itself, and
+      releases them when a response names a different ledger. Round 12 released rows parked "under the ledger the refusing response
+      named" but put no such field on the 400, so an implementation could only park under a ledger it learned later, the current
+      one, under which a row refused against a stale view (the merge committed between the request's authorization and its lock)
+      stays parked on every later response.
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
 ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (round-3 C1/C4 as written: the lock on the
 read of binding_version only, the fact keyed by the uploader, no lifecycle rule), r10 (round-4 C1/C4 as written: the ledger key,
 a pair judged against the install it names whichever ledger uploads it), r11 (round-5 C1 as written: the admin link moves one
-install and re-keys its old ledger's facts, with no destination check), r12 (this rule). Red under r6, r7, r8, r9, r10 and r11,
-green under r12.
+install and re-keys its old ledger's facts, with no destination check), r12 (round-6 C1 as written: no rule for a deadlocked
+transaction, and a 400 that names no ledger), r13 (this rule). Red under r6, r7, r8, r9, r10, r11 and r12, green under r13.
 """
 import itertools
 import json
@@ -101,11 +121,12 @@ from _common import Checks, rule_arg
 
 rule = rule_arg()
 c = Checks("b4_offline_rebind", rule)
-R8 = rule in ("r8", "r9", "r10", "r11", "r12")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9-12
-R9 = rule in ("r9", "r10", "r11", "r12")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by rounds 10-12
-R10 = rule in ("r10", "r11", "r12")      # the round-10 machinery (lock then read, the ledger key, lifecycle) is kept by rounds 11-12
-R11 = rule in ("r11", "r12")             # the round-11 machinery (the refusal across ledgers, the hold, the admin link with its re-key) is kept by round 12
-R12 = rule == "r12"
+R8 = rule in ("r8", "r9", "r10", "r11", "r12", "r13")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9-13
+R9 = rule in ("r9", "r10", "r11", "r12", "r13")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by rounds 10-13
+R10 = rule in ("r10", "r11", "r12", "r13")      # the round-10 machinery (lock then read, the ledger key, lifecycle) is kept by rounds 11-13
+R11 = rule in ("r11", "r12", "r13")             # the round-11 machinery (the refusal across ledgers, the hold, the admin link with its re-key) is kept by rounds 12-13
+R12 = rule in ("r12", "r13")                    # the round-12 machinery (the whole-ledger merge into a canonical destination) is kept by round 13
+R13 = rule == "r13"
 # Round 10: the ledger each install uploads for (the first install of its chain on one Mac). Z re-joined X's Mac with a verified
 # link to X; Zu re-joined a Mac whose previous install could not be proved (no link: its own ledger, disclosed); P and Q are other Macs.
 LEDGER = {"X": "X", "Y": "Y", "W": "W", "R": "R", "Z": "X", "Zf": "X", "Zu": "Zu", "P": "P", "Q": "Q", "Xr": "Xr"}
@@ -485,7 +506,7 @@ def run_variant(order, uploaders):
             splits += 1
             if example is None: example = {"schedule": list(trace), "answers": answers}
     return {"order": order, "uploaders": list(uploaders), "schedules": len(results), "deadlocks": deadlocks, "splits": splits, "example": example}
-PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"], "r11": ["lock_then_read"], "r12": ["lock_then_read"]}.get(rule, ["no_lock"])
+PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"], "r11": ["lock_then_read"], "r12": ["lock_then_read"], "r13": ["lock_then_read"]}.get(rule, ["no_lock"])
 same_uploader = {order: run_variant(order, ("X", "X")) for order in ("no_lock", "lock_then_read", "facts_then_lock")}
 print("    R5b (two paths, one uploader, statement-level): " + json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "example"} for k, v in same_uploader.items()}))
 print("    R5b facts-first example: " + json.dumps(same_uploader["facts_then_lock"]["example"]))
@@ -565,18 +586,24 @@ class Ledgers:
     ledger other than its own."""
     def __init__(self, audit, ledger, tenant=None):
         self.audit, self.ledger, self.facts, self.refused, self.links = {k: dict(v) for k, v in audit.items()}, dict(ledger), {}, [], []
+        self.wire = {}                                                   # the body of the last 400 refusal (round 13: it names the ledger it judged)
         self.tenant = {k: (tenant or {}).get(k, "t1") for k in self.audit}
         self.linked_by = {k: {"by": "join_proof", "at": None} for k in self.audit if self.ledger[k] != k}
     def bv(self, install, at): return max(v for v, (_, t) in self.audit[install].items() if t <= at)
-    def key(self, uploader, install, v):
-        if R10: return (self.ledger[uploader], install, v)          # rounds 10-11: the uploader's ledger
+    def key(self, uploader, install, v, view=None):
+        if R10: return (view or self.ledger[uploader], install, v)  # rounds 10-13: the uploader's ledger (the one the request was authorized with)
         if R9: return (uploader, install, v)                        # round 9: the uploader
         return (install, v)                                         # round 8: the named install
-    def sight(self, install, v, at, uploader):
+    def sight(self, install, v, at, uploader, view=None):
+        """`view` is the uploader's ledger as the request was authorized with it, read before the sighting's lock (by default the current one;
+        round 13, section 17: a merge that commits between that read and the lock leaves it stale, and the refusal is judged against it)."""
+        view = view or self.ledger[uploader]
         if install not in self.audit: return (None, "stamp_invalid:unknown_install")            # another tenant: judged closed, no fact
-        if R11 and self.ledger[install] != self.ledger[uploader]:                                # round 11: outside the uploader's ledger
-            self.refused.append((uploader, install, v, at)); return ("held", "refused:stamp_from_other_ledger")
-        key = self.key(uploader, install, v)
+        if R11 and self.ledger[install] != view:                                                 # round 11: outside the uploader's ledger
+            self.refused.append((uploader, install, v, at))
+            self.wire = {"reason": "stamp_from_other_ledger", "pairs": [[install, v]], **({"ledgerInstallId": view} if R13 else {})}
+            return ("held", "refused:stamp_from_other_ledger")
+        key = self.key(uploader, install, v, view)
         if key in self.facts: return (None, "stamp_invalid:stamp_not_issued")
         if v <= self.bv(install, at): return (self.audit[install][v][0], "binding_at_capture")
         self.facts[key] = {"first_seen_at": at, "binding_version_then": self.bv(install, at), "recorded_by": uploader}
@@ -722,4 +749,180 @@ compose = cloud15.link("X", "Y", 1000)
 c.expect(compose is True and all(cloud15.ledger[i] == "Y" for i in ("X", "Zl", "U", "V", "F")) and not [k for k in cloud15.facts if k[0] != "Y"] and (cloud15.links[-1]["installs_moved"] if cloud15.links else None) == 5,
          "COMPOSE: linking the merged root X into Y moves every install of X's ledger (X, Zl, U, V, F) with every fact, so a chain never has two ledger ids (round 11 moved X alone: four members stranded in the emptied ledger X)",
          f"result={compose} ledgers={ {i: cloud15.ledger[i] for i in ('X', 'Zl', 'U', 'V', 'F')} } facts={list(cloud15.facts)} moved={(cloud15.links[-1].get('installs_moved') if cloud15.links else None)}")
+
+# ---- 16. blocking 1 (read c1 r12): a two-pair sighting and the merge take their locks in two orders and can deadlock ----------------------
+# The sighting locks the installs its pairs name FOR SHARE in ascending id order (C6 loadSightingView); the merge locks the two roots FOR
+# UPDATE first and only then the source ledger's members (C1 "The link is the release"): when a member V sorts before its root U, a batch
+# naming V and U can hold V and wait for U while the merge U -> X holds U (and X) and waits for V. PostgreSQL detects the cycle and aborts
+# one transaction (40P01). Round 12 said nothing about the aborted one (the reader's pg-lock-order.log: the merge aborted, the parked rows
+# never released); round 13 retries the aborted transaction from its start, at most 3 attempts, and acknowledges nothing before commit.
+# Every statement-level interleaving of the two transactions is enumerated, with EITHER transaction as PostgreSQL's victim at a deadlock.
+ORDER16 = {"V": 1, "U": 2, "X": 3}                                  # ascending id: the member V sorts before its root U; X is the destination root
+RETRY_CAP = 3 if R13 else None                                       # round 13: at most 3 attempts; rounds 6-12 as written: no rule, the victim stays aborted
+def state16():
+    return {"ledger": {"V": "U", "U": "U", "X": "X"}, "facts": set(), "audit": [], "share": {r: set() for r in ORDER16}, "update": {r: None for r in ORDER16}}
+def lock_share(s, t, row):                                          # SELECT ... FOR SHARE: waits while another transaction holds the row FOR UPDATE
+    if s["update"][row] not in (None, t): return False
+    s["share"][row].add(t); return True
+def lock_update(s, t, row):                                         # SELECT ... FOR UPDATE: waits while any other transaction holds the row
+    if (s["share"][row] - {t}) or s["update"][row] not in (None, t): return False
+    s["update"][row] = t; return True
+def release16(s, t):                                                # commit or rollback: every lock of t released
+    for row in ORDER16:
+        s["share"][row].discard(t)
+        if s["update"][row] == t: s["update"][row] = None
+def sighting16(view="U"):
+    """V delivers a batch stamped (V, 1) and (U, 1), both at version 0 (not issued); the request was authorized with V's ledger read as `view`."""
+    named = sorted(("V", "U"), key=ORDER16.get)
+    def lock_first(s, t): return lock_share(s, "S", named[0])
+    def lock_second(s, t): return lock_share(s, "S", named[1])
+    def read(s, t):                                                 # under both locks: the named installs' ledgers, then the judgment
+        if any(s["ledger"][r] != view for r in named): t["answer"] = ("held", view)      # 400 stamp_from_other_ledger, judged against `view`
+        else: t["answer"] = ("judged", view); t["facts"] = {(view, r, 1) for r in named}
+        return True
+    def commit(s, t): s["facts"] |= t.get("facts", set()); release16(s, "S"); t["committed"] = True; return True
+    return [("S.lock_" + named[0], lock_first), ("S.lock_" + named[1], lock_second), ("S.read", read), ("S.commit", commit)]
+def merge16(source="U", target="X"):
+    roots = sorted((source, target), key=ORDER16.get)
+    def lock_root_a(s, t): return lock_update(s, "M", roots[0])
+    def lock_root_b(s, t): return lock_update(s, "M", roots[1])
+    def lock_members(s, t):                                         # a later statement: every install whose ledger is the source, FOR UPDATE, ascending
+        for r in sorted((r for r in ORDER16 if s["ledger"][r] == source and r != source), key=ORDER16.get):
+            if not lock_update(s, "M", r): return False
+        return True
+    def commit(s, t):                                               # the moves, the re-key and the audit row are visible at commit only
+        moved = [r for r in ORDER16 if s["ledger"][r] == source]
+        for r in moved: s["ledger"][r] = target
+        s["facts"] = {(target if k[0] == source else k[0], k[1], k[2]) for k in s["facts"]}
+        s["audit"].append({"source": source, "target": target, "installs_moved": len(moved)})
+        release16(s, "M"); t["committed"] = True; t["moved"] = len(moved); return True
+    return [("M.lock_" + roots[0], lock_root_a), ("M.lock_" + roots[1], lock_root_b), ("M.lock_members", lock_members), ("M.commit", commit)]
+def enumerate16(retry_cap, handoff=True):
+    """`handoff`: a lock the victim releases is granted to the transaction already waiting for it before anyone else runs (PostgreSQL's lock
+    manager wakes the waiter at the release and it re-checks the row at once); without it an adversarial scheduler lets the victim's retry
+    re-take its first lock before the waiter is granted, which is how the retry cap can be reached at all with two lockers."""
+    import copy
+    txs = {"S": sighting16(), "M": merge16()}
+    runs, deadlocks = [], []
+    def dfs(state, pcs, locals_, attempts, trace):
+        active = [n for n in txs if pcs[n] < len(txs[n]) and "status" not in locals_[n]]
+        if not active:
+            runs.append({"trace": trace, "state": state, "locals": locals_, "attempts": attempts}); return
+        progressed = False
+        for n in active:
+            label, step = txs[n][pcs[n]]
+            s2, l2 = copy.deepcopy(state), copy.deepcopy(locals_)
+            if step(s2, l2[n]):
+                progressed = True
+                p2 = dict(pcs); p2[n] += 1
+                dfs(s2, p2, l2, dict(attempts), trace + [label])
+        if progressed: return
+        # every active transaction waits on another: a deadlock; PostgreSQL aborts one (40P01), and the model takes each in turn as the victim
+        deadlocks.append({"trace": trace, "holds": {n: [r for r in ORDER16 if n in state["share"][r] or state["update"][r] == n] for n in active}})
+        for victim in active:
+            s2, l2, p2, a2 = copy.deepcopy(state), copy.deepcopy(locals_), dict(pcs), dict(attempts)
+            release16(s2, victim); l2[victim] = {}; p2[victim] = 0                        # rolled back: no lock, no fact, no move, no answer survives
+            if retry_cap is None: l2[victim] = {"status": "aborted"}                       # rounds 6-12 as written: no rule for the aborted transaction
+            elif a2[victim] >= retry_cap: l2[victim] = {"status": "exhausted"}            # the cap: 503 transaction_retry_exhausted
+            else: a2[victim] += 1                                                          # round 13: run again from its first statement
+            trace2 = trace + [f"DEADLOCK: {victim} aborted (40P01)" + (", retried from its start" if "status" not in l2[victim] else "")]
+            if handoff:
+                for n in active:                                                            # the waiter is granted the released row at the abort
+                    if n != victim and step_of(txs, n, p2)(s2, l2[n]): trace2 = trace2 + [txs[n][p2[n]][0] + " (granted at the abort)"]; p2[n] += 1
+            dfs(s2, p2, l2, a2, trace2)
+    dfs(state16(), {n: 0 for n in txs}, {n: {} for n in txs}, {n: 1 for n in txs}, [])
+    return runs, deadlocks
+def step_of(txs, n, pcs): return txs[n][pcs[n]][1]
+runs16, deadlocks16 = enumerate16(RETRY_CAP)
+runs16_adversarial, _ = enumerate16(RETRY_CAP, handoff=False)
+def outcome16(run):
+    s, l = run["state"], run["locals"]
+    answer = l["S"].get("answer")
+    merge_ok = bool(l["M"].get("committed")) and s["ledger"]["V"] == "X" and s["ledger"]["U"] == "X" and len(s["audit"]) == 1 and s["audit"][0]["installs_moved"] == 2
+    sight_ok = bool(l["S"].get("committed")) and answer in (("judged", "U"), ("held", "U"))
+    keyed = "X" if l["M"].get("committed") else "U"                                   # a committed merge re-keyed the source ledger's facts
+    facts_ok = s["facts"] == ({(keyed, "V", 1), (keyed, "U", 1)} if answer == ("judged", "U") and l["S"].get("committed") else set())
+    return {"merge": "committed" if l["M"].get("committed") else l["M"].get("status", "incomplete"), "sighting": l["S"].get("status") or (answer[0] if answer else "incomplete"),
+            "merge_ok": merge_ok, "sight_ok": sight_ok, "facts_ok": facts_ok, "attempts": run["attempts"], "trace": run["trace"]}
+outcomes16 = [outcome16(r) for r in runs16]
+adversarial16 = [outcome16(r) for r in runs16_adversarial]
+victims16 = {}
+for r in runs16:
+    for step in r["trace"]:
+        if step.startswith("DEADLOCK"): victims16[step] = victims16.get(step, 0) + 1
+merge_failed = [o for o in outcomes16 if not o["merge_ok"]]
+sight_failed = [o for o in outcomes16 if not (o["sight_ok"] and o["facts_ok"])]
+max_attempts = max(max(o["attempts"].values()) for o in outcomes16)
+# the two named interleavings: who waits first decides whose deadlock_timeout fires first, i.e. the victim PostgreSQL picks (the SQL log's S15a, S15b)
+reader_order = [d for d in deadlocks16 if d["trace"][:1] == ["S.lock_V"]]        # the sighting holds V; the merge holds U and X and waits for V; the sighting asks for U
+mirror_order = [d for d in deadlocks16 if d["trace"][:2] == ["M.lock_U", "M.lock_X"]]   # the merge holds the roots; the sighting holds V and waits for U; the merge asks for V
+print("    S15 (a two-pair sighting vs the merge, statement-level, either transaction the victim): " + json.dumps({"schedules": len(runs16), "deadlocks": len(deadlocks16), "victims": victims16,
+      "merge_not_committed": len(merge_failed), "sighting_not_answered": len(sight_failed), "max_attempts": max_attempts, "reader_order_deadlocks": len(reader_order), "mirror_order_deadlocks": len(mirror_order),
+      "example": deadlocks16[0] if deadlocks16 else None, "outcomes": sorted({(o["merge"], o["sighting"]) for o in outcomes16})}))
+c.expect(reader_order and mirror_order and all(d["holds"] == {"S": ["V"], "M": ["U", "X"]} for d in deadlocks16) and any("M aborted" in k for k in victims16) and any("S aborted" in k for k in victims16),
+         "S15: the defect is real in both interleavings: the sighting (V then U, FOR SHARE) and the merge (the roots U and X FOR UPDATE, then the member V) deadlock with the sighting holding V and the merge holding U and X, whether the sighting or the merge locked first (the reader's pg-lock-order.log), and PostgreSQL may abort either",
+         json.dumps({"reader_order": len(reader_order), "mirror_order": len(mirror_order), "holds": deadlocks16[0]["holds"] if deadlocks16 else None, "victims": victims16}))
+c.expect(not merge_failed and max_attempts <= 3,
+         "S15: in every interleaving, whichever transaction PostgreSQL aborts, the admin's merge commits within the retry cap (at most 3 attempts; 2 are ever needed with two lockers): U and V are in X with one audit row, so the link releases the parked rows (round 12 as written: the aborted merge stays aborted, nothing moves, and the rows it was to release stay parked, as the reader observed)",
+         json.dumps({"merge_not_committed": len(merge_failed), "example": (merge_failed[0]["trace"] if merge_failed else None), "max_attempts": max_attempts}))
+c.expect(not sight_failed,
+         "S15: in every interleaving the sighting is answered by one committed transaction within the cap: judged in U before the merge (its facts then re-keyed to X by the merge) or refused naming U, the ledger the request was authorized with (a stale view: section 17 releases it on the next response naming X); nothing is acknowledged or recorded by an aborted attempt (round 12 as written: the aborted sighting's batch has no rule and no answer)",
+         json.dumps({"sighting_not_answered": len(sight_failed), "example": (sight_failed[0]["trace"] if sight_failed else None)}))
+# the cap: without PostgreSQL's hand-off (an adversarial scheduler that lets the victim's retry re-take its first lock before the waiter is granted,
+# or a third concurrent locker) a transaction can be aborted again; the third abort is the caller's 503, never a silent abort and never a half-result
+def ended16(o, tx): return o["merge" if tx == "M" else "sighting"]
+exhausted16 = [o for o in adversarial16 if "exhausted" in (o["merge"], o["sighting"])]
+unruled16 = [o for o in adversarial16 if "aborted" in (o["merge"], o["sighting"]) or "incomplete" in (o["merge"], o["sighting"])]
+half16 = [o for o in adversarial16 if (o["merge"] == "committed") != o["merge_ok"] or (o["sighting"] in ("judged", "held")) != (o["sight_ok"] and o["facts_ok"])]
+over16 = [o for o in adversarial16 if any(n > 3 for n in o["attempts"].values()) or ("exhausted" in (o["merge"], o["sighting"]) and 3 not in o["attempts"].values())]
+print("    S15 adversarial (no hand-off): " + json.dumps({"schedules": len(adversarial16), "reach_the_cap": len(exhausted16), "no_rule": len(unruled16), "half_results": len(half16), "over_the_cap": len(over16), "outcomes": sorted({(o["merge"], o["sighting"]) for o in adversarial16})}))
+c.expect(exhausted16 and not unruled16 and not half16 and not over16,
+         "S15/cap: at most 3 attempts: in the adversarial schedules a transaction aborted three times ends as transaction_retry_exhausted (the caller's 503, after exactly 3 attempts) with nothing recorded, moved or acknowledged, and a committed transaction's result is whole; no transaction is ever left aborted without a rule (round 12 as written: every victim is)",
+         json.dumps({"reach_the_cap": len(exhausted16), "no_rule": len(unruled16), "half_results": len(half16), "over_the_cap": len(over16), "example": (unruled16 or half16 or over16 or [{"trace": None}])[0]["trace"]}))
+
+# ---- 17. blocking 2 (read c1 r12): the 400 refusal names the ledger it judged, and the collector parks under that wire value ---------------
+# The uploader's ledger is read for the request's authorization, before the sighting's lock; a merge U -> X can commit in between, so the
+# sighting reads the named install's ledger as X, compares it with U and refuses (the reader's MERGE_THEN_SIGHTING). Round 12 released a
+# parked row when a later response named a ledger OTHER than the one the row was parked under, but its 400 carried reason and pairs only:
+# no wire field named the ledger the refusal was judged against, so the only ledger a collector could park under was one it learned later,
+# the current ledger X, under which the row stays parked on every later X response. Round 13: the 400 carries ledgerInstallId, the
+# uploader's ledger the refusal was judged against (U); the collector parks under that wire value and the next response naming X
+# releases the row, which is resubmitted, judged in X, and agrees with every other judgment of its pair.
+class ParkedRows:
+    """The collector's park (C6 parkOutboxRows / releaseParkedRows). Round 13: a row is parked under the ledger the 400 named. Rounds 11-12 as
+    written: the 400 names no ledger, so the model fills the missing value from the next authenticated response, the current ledger: a
+    reading the round-12 text permits, since it names no source for the value."""
+    def __init__(self): self.rows = []
+    def park(self, row_id, body): self.rows.append([row_id, body.get("ledgerInstallId")])
+    def on_response(self, ledger):                                      # every acknowledged response names the install's ledger (round 12)
+        for row in self.rows:
+            if row[1] is None: row[1] = ledger
+        released = [row[0] for row in self.rows if row[1] != ledger]    # released: parked under a ledger other than the one the response names
+        self.rows = [row for row in self.rows if row[1] == ledger]
+        return released
+INST17 = {"X": {0: ("A", 0), 1: ("B", 200)}, "U": {0: ("D", 500)}, "V": {0: ("D", 520)}, "P": {0: ("B", 0)}}   # U: unlinked root; V: its proof-linked child; P: another Mac
+LEDGER17 = {"X": "X", "U": "U", "V": "U", "P": "P"}
+cloud17 = Ledgers(INST17, LEDGER17)
+view_700 = cloud17.ledger["V"]                                          # 700: V's delivery is authorized; the uploader's ledger is read as U
+link_701 = cloud17.link("U", "X", 701)                                  # 701: the admin merges U into X before the sighting locks V
+refused_702 = cloud17.sight("V", 1, 702, uploader="V", view=view_700)   # 702: the sighting locks V, reads its ledger (X now), compares with U: refused
+body_702 = dict(cloud17.wire)                                           # the 400 body on the wire
+park17 = ParkedRows(); park17.park("row-v1", body_702)
+released_720 = park17.on_response(cloud17.ledger["V"])                  # 720: the next acknowledged response names V's ledger, X
+retry_730 = cloud17.sight("V", 1, 730, uploader="V") if released_720 else None   # the resubmission is authorized with V's current ledger, X
+released_800 = park17.on_response(cloud17.ledger["V"])                  # 800: another response naming X
+print("    S16 (the refusal's ledger; the merge committed between authorization and the lock): " + json.dumps({"view_at_authorization": view_700, "link_701": link_701, "refused_702": refused_702, "wire_body": body_702,
+      "parked_under": [r[1] for r in park17.rows] or "released", "released_by_the_720_response": released_720, "retry_730": retry_730, "released_by_the_800_response": released_800, "still_parked": park17.rows, "facts": sorted("|".join(map(str, k)) for k in cloud17.facts)}))
+c.expect(refused_702[0] == "held" and body_702.get("ledgerInstallId") == "U",
+         "S16: the 400 stamp_from_other_ledger carries ledgerInstallId, the uploader's ledger the refusal was judged against (U, the request's authorization view, not X, the current ledger): the collector parks from the wire value (round 12: the body carried reason and pairs only, and the test supplied the ledger by hand)",
+         f"refused={refused_702} body={body_702}")
+c.expect(released_720 == ["row-v1"] and retry_730 == (None, "stamp_invalid:stamp_not_issued") and ("X", "V", 1) in cloud17.facts and not park17.rows and released_800 == [],
+         "S16: parked under the refusal's ledger U, the row is released by the first response naming X and judged in X (nobody's: its pair was not issued; one answer with every later judgment); parked under the current ledger X, the only value round 12's text let a collector find, it stays parked on the 720 response and on every later X response",
+         f"released_720={released_720} retry_730={retry_730} still_parked={park17.rows} released_800={released_800}")
+p_refused = cloud17.sight("X", 1, 810, uploader="P"); p_body = dict(cloud17.wire); park_p = ParkedRows(); park_p.park("row-p", p_body)
+p_same = park_p.on_response(cloud17.ledger["P"]); p_same_again = park_p.on_response(cloud17.ledger["P"])
+p_link = cloud17.link("P", "X", 900); p_released = park_p.on_response(cloud17.ledger["P"]); p_retry = cloud17.sight("X", 1, 910, uploader="P") if p_released else None
+c.expect(p_refused[0] == "held" and p_same == [] and p_same_again == [] and p_released == ["row-p"] and p_retry == ("B", "binding_at_capture"),
+         "S16: the release compares two server-supplied values: a response naming the ledger the refusal named (P's, unchanged) releases nothing, and the response after the admin links P into X names X and releases the row, which is then judged in X (B's, like X's own judgment of (X, 1))",
+         f"refused={p_refused} same={p_same},{p_same_again} link={p_link} released={p_released} retry={p_retry}")
 c.finish()
