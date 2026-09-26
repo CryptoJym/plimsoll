@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import { PLIMSOLL_VERSION } from "./version";
+import { recordToolStatsDimension } from "./weekly-tool-stats";
 import { recordRuntimeFactDrop, type RuntimeFactDropReason } from "./runtime-fact-drops";
 import { dispatchBindingForSession } from "./capture-root-inventory";
 
@@ -196,6 +198,13 @@ export function promoteRuntimeLearningFacts(
       const recorded = store.recordToolSignal(start);
       if (recorded.dropped) {
         return { attempted: true, attemptInserted: false, resultApplied: false };
+      }
+      if (recorded.inserted) {
+        recordToolStatsDimension(target.database, {
+          operationId: start.operationId, eventId: event.id,
+          runtimeVersion: topLevelMetadataString(event, "serviceVersion"),
+          collectorVersion: PLIMSOLL_VERSION,
+        });
       }
       // A completion-bearing signal on the same observation (OTLP tool spans
       // export start, end, and status together) closes the attempt in this

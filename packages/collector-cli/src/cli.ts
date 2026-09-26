@@ -77,6 +77,7 @@ import { appendForwardedHook } from "./forwarder";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
+import { uploadCompletedToolStatsWeek } from "./weekly-tool-stats-upload";
 import {
   DEFAULT_PRODUCER_ROTATION_GRACE_MS,
   MAX_PRODUCER_ROTATION_GRACE_MS,
@@ -3290,6 +3291,23 @@ async function main() {
     if (config.uploadUrl) {
       syncBackoff.arm();
       timers.push(setInterval(() => { syncBackoff.tick(); void runSync(); }, config.syncIntervalSeconds * 1000));
+      let toolStatsInFlight = false;
+      const runWeeklyToolStats = async () => {
+        if (toolStatsInFlight || shuttingDown) return;
+        toolStatsInFlight = true;
+        try {
+          const status = await uploadCompletedToolStatsWeek(config, buffer.database);
+          if (status === "accepted" || status === "conflict") {
+            console.log(JSON.stringify({ status: `weekly_tool_stats_${status}` }));
+          }
+        } catch {
+          console.warn(JSON.stringify({ warning: "weekly_tool_stats_retry_pending" }));
+        } finally {
+          toolStatsInFlight = false;
+        }
+      };
+      timers.push(setInterval(() => void runWeeklyToolStats(), config.syncIntervalSeconds * 1000));
+      setTimeout(() => void runWeeklyToolStats(), 1_000).unref();
     }
     // Self-healing managed-config reconcile (bead eco-6hoxj.50). The fleet's
     // seat and conductor tooling rewrites ~/.claude-seats/<slug>/settings.json

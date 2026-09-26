@@ -30,6 +30,7 @@ import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
 import { promoteRuntimeLearningFacts } from "./runtime-facts";
+import { ensureWeeklyToolStatsSchema } from "./weekly-tool-stats";
 import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFinancePublicationDirty,
   advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -771,6 +772,7 @@ export class LocalEventBuffer {
       this.db,
       options.learningFacts?.limits,
     );
+    ensureWeeklyToolStatsSchema(this.db);
     markOpenStep("ledger.learning_schema");
     this.projection = new DashboardProjectionStore(this.db, {
       newLedger,

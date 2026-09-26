@@ -60,6 +60,7 @@ function factTableText(db: Database.Database) {
     "technique_exposure_facts",
     "technique_identity_registry",
     "runtime_fact_drops",
+    "tool_stat_attempt_dimensions",
   ];
   const existing = new Set(
     (db.prepare(`select name from sqlite_master where type='table'`).all() as Array<{ name: string }>)
@@ -125,11 +126,13 @@ async function main() {
   const config = collectorConfigSchema.parse({
     uploadUrl: "http://127.0.0.1/fake-runtime-facts-ingest",
     installKey: "runtime-facts-proof-install",
+    deviceId: "runtime-facts-device",
   });
   try {
     proofStage = "buffer_open";
     buffer = new LocalEventBuffer(ledger, {
       workspaceId: config.tenantId,
+      deviceId: config.deviceId,
       delivery: { enabled: true },
     });
     const store = buffer.learningFacts;
@@ -164,6 +167,16 @@ async function main() {
       { attempts: store.attempts().length },
     );
     const hookAttempt = store.attempts()[0];
+    const dimensions = buffer.database.prepare(`select workspace_id as workspaceId, device_id as deviceId,
+      runtime_version as runtimeVersion, collector_version as collectorVersion
+      from tool_stat_attempt_dimensions where operation_id = ?`).get(hookAttempt.operationId) as
+      { workspaceId: string; deviceId: string; runtimeVersion: string; collectorVersion: string } | undefined;
+    check("joined_tool_attempt_records_only_bounded_upload_dimensions",
+      dimensions?.workspaceId === config.tenantId && dimensions.deviceId === config.deviceId &&
+      dimensions.runtimeVersion === "unknown" && dimensions.collectorVersion === "0.7.43" &&
+      !factTableText(buffer.database).includes(HOSTILE.command) &&
+      !factTableText(buffer.database).includes(HOSTILE.secret),
+      { dimensionRecorded: Boolean(dimensions) });
     check(
       "hook_attempt_binds_implicit_content_free_episode",
       store.episodes().length === 1 &&
