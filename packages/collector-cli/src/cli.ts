@@ -141,6 +141,7 @@ import {
 import {
   captureRootBaselineFiles,
   captureRootBaselineObservations,
+  captureRootLiveCoverage,
   captureRootsDeriveFrom,
   configuredCaptureRootDirectory,
   deriveCaptureRootIdentity,
@@ -5207,7 +5208,8 @@ async function main() {
     };
 
     if (action === "discover") {
-      const entries = discoverCaptureRoots(home, configuredRoots);
+      const entries = discoverCaptureRoots(home, configuredRoots, config.port);
+      const liveCovered = entries.filter((entry) => entry.state === "live_covered");
       console.log(
         JSON.stringify(
           {
@@ -5217,9 +5219,11 @@ async function main() {
             counts: {
               registered: entries.filter((entry) => entry.state === "registered").length,
               candidate: entries.filter((entry) => entry.state === "candidate").length,
+              liveCovered: liveCovered.length,
               missing: entries.filter((entry) => entry.state === "missing").length,
             },
-            roots: entries,
+            roots: entries.filter((entry) => entry.state !== "live_covered"),
+            liveCovered,
           },
           null,
           2,
@@ -5264,6 +5268,7 @@ async function main() {
       relative: string;
       observations: ReturnType<typeof captureRootBaselineObservations>["observations"];
       ambiguous: Array<{ path: string; reason: string }>;
+      liveEvidence: string[];
     }> = [];
     const seen = new Set(configuredRoots.map((root) => configuredCaptureRootDirectory(root)));
     const seenIds = new Set(configuredRoots.map((root) => root.rootId));
@@ -5358,7 +5363,8 @@ async function main() {
       seen.add(directory);
       seenIds.add(identity.rootId);
       added.push({ ...identity, installationEpochId, source, directory });
-      preexisting.push({ source, directory, relative, observations: observed.observations, ambiguous });
+      preexisting.push({ source, directory, relative, observations: observed.observations, ambiguous,
+        liveEvidence: captureRootLiveCoverage(resolvedHome, source, directory, config.port) });
     }
 
     const beforeBytes = fs.readFileSync(configPath);
@@ -5438,6 +5444,8 @@ async function main() {
       scanAmbiguities: preexisting
         .filter((entry) => entry.ambiguous.length > 0)
         .map((entry) => ({ directory: entry.relative, entries: entry.ambiguous })),
+      warnings: preexisting.filter((entry) => entry.liveEvidence.length > 0).map((entry) =>
+        `${entry.relative} already reports live to Plimsoll. Adding this root adds the file path beside the live path; 0.7.42 reconciliation merges paired responses.`),
       machine,
       installationEpochId,
       rootCountBefore: configuredRoots.length,
