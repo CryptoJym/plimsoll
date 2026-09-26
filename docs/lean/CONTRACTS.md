@@ -416,20 +416,27 @@ hand-off a transaction aborted three times ends as `transaction_retry_exhausted`
 and section 17 (the uploader's ledger read as U for the request's authorization, U merged into X before the lock, the refusal judged
 against U: the 400 names U, the row parked under that wire value is released by the first response naming X and judged in X, while
 a row parked under X, the current ledger, stays parked on every later X response; a response naming the ledger the refusal named
-releases nothing): 76 checks, r6 24/76, r7 32/76, r8 47/76, r9 49/76, r10 57/76, r11 62/76, **r12 71/76**, r13 76/76 (`--rule
+releases nothing); **round 14** adds to section 16 the exhausted retry's exact answer (503 `{ error, operation, attempts: 3,
+sqlstate }` with `Retry-After` for the sighting and for the merge, the collector acknowledging and parking nothing and retrying at
+`Retry-After`) and the fixed request context (a retried sighting that reads the installs after the merge committed refuses against
+U), and to section 17 the wire's one field name (the collector parses the body the cloud sends), a 400 naming no ledger parking
+nothing, and an unknown ledger id opaque, kept by a response naming it and released by a different ledger: 81 checks, r6 24/81, r7
+32/81, r8 47/81, r9 49/81, r10 57/81, r11 62/81, r12 72/81, **r13 76/81**, r14 81/81 (`--rule
 r8` is round 8 as written: the late answer replaces the pair, no lock, the fact keyed by the named install; `--rule r9` is round 9 as
 written: the lock on the read of `binding_version` only, the fact keyed by the uploader, no lifecycle rule; `--rule r10` is round 10
 as written: a pair judged against the install it names in the uploader's ledger's view, whichever ledger uploads it; `--rule r11` is
 round 11 as written: the admin link moves one install and re-keys its old ledger's facts, with no destination check; `--rule r12` is
 round 12 as written: no rule for a transaction PostgreSQL aborts in a deadlock, and a 400 that names no ledger, so a collector can
-only park under the ledger it learns next).
+only park under the ledger it learns next; `--rule r13` is round 13 as written: the cloud's 400 keyed `error`, the collector's parsed
+refusal keyed `reason` and no mapping, so the collector recognises no refusal and parks nothing).
 
 **Judgment state.** Validity is decided at the first sighting of `(install, V)` and recorded; a version that did not exist then is
 invalid on both paths for ever. Parts are computed per received revision and frozen at the seal; a raw row's actor is bound once at
 ingest; because the fact precedes both, the rebind cannot slip between a sighting's read and its fact, every input is read after the
 lock, every install of the ledger reads the same fact (round 10), a pair naming an install outside the ledger is never judged
 until the ledger is linked (round 11), a link moves a ledger whole with its facts (round 12), and a transaction PostgreSQL aborts
-leaves nothing behind and is run again whole (round 13), neither can differ from the other.
+leaves nothing behind and is run again whole (round 13; keeping the request's authorization ledger and re-reading everything else,
+round 14), neither can differ from the other.
 
 **Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 16 cases): the reviewer's issued-but-unheard row,
 the honest orderings and the A→B→A reversal, the never-issued stamp, the first-sighting rule with the replay and the repair, the
@@ -441,7 +448,13 @@ the ledger-keyed fact across a re-join (X's fact binds Z and Z's binds X, before
 judgment with no fact anywhere (R7, test 11), S8 on both paths and through `eventRowsForStorage` (test 14), S9 held and then judged
 after the link with the null-stamp exception untouched (test 15), and (round 13) every refusal naming the ledger it judged (tests 11,
 14 and 15) with the race in which the chain was merged between a request's authorization and its lock: refused naming the stale view
-U, released by the next response naming X and judged in X (test 17); `actor-binding-stamp-postgres.contract.test.ts` (B6, 9 cases on the
+U, released by the next response naming X and judged in X (test 17), and (round 14) every refusal's `code` asserted, the wire body's
+`error`, one field name on both sides; `ingest-route-wire.contract.test.ts` (B6, 3 cases, round 14): the shipped ingest route driven
+with its transaction mocked to throw the typed errors, as `tests/ingest-error-boundary.test.ts` drives it: the 400 with exactly
+`{ error: "stamp_from_other_ledger", pairs, ledgerInstallId }` and no `Retry-After`, the 503 with exactly `{ error:
+"transaction_retry_exhausted", operation, attempts, sqlstate }` and `Retry-After`, nothing acknowledged and no post-commit refresh
+in either, and `collectorIngestErrorResponse` mapping both typed errors before its generic branches (the two body literals are
+byte-identical to the collector's tests 14 and 17); `actor-binding-stamp-postgres.contract.test.ts` (B6, 9 cases on the
 repository's disposable Postgres cluster, set up as `checks/postgres-harness-repaired-probe.log` proves): the fact in the sighting's own
 transaction, replay after the version is issued and a revoked install's issued pair, the R5 row lock with the rebind observed waiting
 and the concurrent mirror order, R6 and R7 by the ledger, `loadSightingView` lock-first with the reviewer's ordering replayed through
@@ -455,12 +468,14 @@ round 13: the refusal naming the ledger it judged after the chain was merged bet
 two-pair sighting deadlocking with the merge in both interleavings, the transaction that waited first aborted by PostgreSQL and run
 again from its start through `retryOnTransactionRollback`, the merge committing on its second attempt with the sighting's fact
 re-keyed, the sighting refusing against its view and naming it, and an exhausted retry as the caller's 503 with nothing moved and no
-audit row), and the join route driven through `fixtures/join-route-child.ts` (case 9: a reused token refused with no install created, a proof
+audit row; round 14: the default cap bound, c3: three deadlocks forced in a row on the real detector, the third abort the caller's 503
+`transaction_retry_exhausted` with `attempts: 3`, `onRetry` before the second and the third attempt only, never a fourth attempt and no
+fact from any aborted attempt), and the join route driven through `fixtures/join-route-child.ts` (case 9: a reused token refused with no install created, a proof
 replayed under a fresh token and a previous install of another tenant joining unlinked, the linked grant with `lineage`);
 `schema-additions.contract.test.ts` (5 cases: the columns with the link's audit columns (round 11) and the one-row ledger-link audit
 table (round 12), the fact with its tenant, ledger, recording install and install reference, the plan's erasure order (the link audit
 rows included, round 12) and the residue check, the guard migration, the other additions). Collector
-`tests/contracts/lean/actor-stamp.contract.ts` (B2a, 13 cases): null before the first response, the pair on the identity row and never
+`tests/contracts/lean/actor-stamp.contract.ts` (B2a, 17 cases): null before the first response, the pair on the identity row and never
 lowered within one install, the echo with its install and the pair on the wire, both keys allowlisted through the seal, the scope
 cleared by a re-join and a transition with the new install's 0 accepted, join activation recording the new install with the
 handshake's version while a pre-re-join row keeps its pair, the old install's late answer ignored and counted, join activation driven
@@ -472,7 +487,13 @@ the one they were parked under (round 12: the response names the ledger beside i
 too, and a response for the same ledger changes nothing; round 13: the ledger a row is parked under is the one the 400 carried,
 handed on by `partitionRefusedRows`, and a 400 that names no ledger parks nothing) or released by an admin as undeliverable (test
 12), and (round 13) the wire-to-parking race: refused against the stale view U, parked under U from the wire, released by the next
-response naming X and retried, where parking under X would have kept the row parked (test 13); `helper.contract.ts` gains a green guard proving that `join.ts` activation completes on today's
+response naming X and retried, where parking under X would have kept the row parked (test 13), and (round 14) the wire itself: the
+exact serialized 400 body the cloud route sends (the literal the cloud's route test asserts), delivered through `uploadBufferedEvents`
+against a fake cloud and parsed by the collector's own upload path, parked under the body's `ledgerInstallId`, released by the next
+acknowledged response naming X, delivered again and acknowledged once, its pair unchanged (test 14); a 400 naming no ledger parking
+nothing and keeping the ordinary 400 handling (test 15); an unknown ledger id opaque, kept by a response naming it, released by a
+different ledger, no row lost (test 16); and the exhausted retry's exact 503 body with `Retry-After` acknowledging nothing, parking
+nothing and retried at `Retry-After` (test 17); `helper.contract.ts` gains a green guard proving that `join.ts` activation completes on today's
 code with a fake cloud.
 
 ## C2. S1b runway: G per host, one G, G owed (review-r6 blocker 2 and should-fix 5; review-r1 blocker 2 and should-fix 5; review-r2 should-fixes 5-6; B1, B10a and B2a collector)
