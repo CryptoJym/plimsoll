@@ -154,9 +154,9 @@ install is its own ledger. At a re-join the collector still holds the previous i
 only when it stages the grant), so the join request carries `previousInstall = { deviceId, proof }` with `proof =
 HMAC-SHA256(previous install's installKey, join token)`; the cloud's join route links the new install to the previous install's
 ledger **only when the proof verifies** against that install in the token's tenant, whatever that install's lifecycle, and otherwise
-gives the new install its own ledger and answers `lineage: unlinked` (disclosed on the join receipt, in `/status` and on the certify,
-where the pre-re-join rows such a ledger delivers are counted as `stamp_from_other_ledger`; an honest B2a collector links whenever it
-has a previous install). `actor_for_stamp` for a row or member uploaded by install U requires, first, that the install the pair
+gives the new install its own ledger and answers `lineage: unlinked` (disclosed on the join receipt, in `/status` and on the certify;
+the pre-re-join rows such a ledger delivers are **refused and parked**, `stamp_from_other_ledger`, until the ledger is linked, round
+11 below; an honest B2a collector links whenever it has a previous install). `actor_for_stamp` for a row or member uploaded by install U requires, first, that the install the pair
 names is in U's ledger, `ledger(install) = ledger(U)`, and refuses the pair otherwise (round 11, below); it then reads the facts with
 `ledger_install_id = ledger(U)`: the old install X judging a summary member and the new install Z delivering the same row after a re-join read one fact
 (whichever recorded it first), so a faulty pair judged null in X's summary stays null when Z delivers it after X is rebound up to the
@@ -174,9 +174,21 @@ that Mac's actor (S8), and an unlinked re-join's delivery of an old faulty row w
 nobody (S9). So one Mac's faulty or hostile traffic can neither poison another Mac's next version (R7 stays closed, now by
 construction: no install can sight another ledger's pairs at all; the poisoning of guarantee 3 is confined to the ledger's own
 pairs) nor take another Mac's actor, and the server-bound actor today's ingest protects (`src/lib/ingest.ts:397-427`) is never
-overridden across Macs (`b4_offline_rebind.py` S8, red under r10; `checks/round11-sql-orderings.log` S8). A pair naming an install
-of another tenant still fails closed and records nothing (the cloud test asserts the absence of the fact, not only the null). **Cap
-(round 9, low).** A request may create at
+overridden across Macs (`b4_offline_rebind.py` S8, red under r10; `checks/round11-sql-orderings.log` S8). **The link is the release
+(round 11, blocking 2).** A parked row is judged only once its uploader's ledger **is** the named install's ledger: at join, by the
+verified proof (`lineage: linked`, `ledger_linked_by = join_proof`); later, by an **admin's audited link** (`linkLedgerByAdmin`:
+allowed only for an install that is still its own ledger, so a chain is linked once; it takes the install row `FOR UPDATE` like a
+rebind, sets `ledger_install_id` with `ledger_linked_at` and `ledger_linked_by`, and **re-keys the facts of the install's old
+ledger** to the new one in the same transaction, so a pair poisoned in the unlinked ledger stays poisoned after the link,
+`checks/round11-sql-orderings.log` S10, and a sighting never reads a half-linked ledger, S11). The next authenticated response then
+reports `lineage: linked` and the collector resubmits the parked rows, which are judged in that ledger, where they read the facts
+and audit rows the old install's summary read: the same answer (`b4_offline_rebind.py` S9, red under r10;
+`checks/round11-sql-orderings.log` S9, S9h). A row an admin releases without a link is acknowledged `undeliverable_unlinked_ledger`
+under the admin's receipt: never delivered, never judged, listed on the certify, so the old install's summary answer stands alone.
+An honest B2a collector links at join whenever it still holds the previous install's key, so the hold is reached only when that key
+is gone (a lost config, a rotated key) or by a faulty or hostile collector, and it costs an honest collector a delay, never an
+answer. A pair naming an install of another tenant still fails closed and records nothing (the cloud test asserts the absence of
+the fact, not only the null). **Cap (round 9, low).** A request may create at
 most 8 new facts; a request that would create more is refused whole (400, `stamp_not_issued_flood`, its body listing the refused
 pairs), judges nothing and records nothing, so an authenticated collector cannot write one fact per distinct version per batch. Every
 new fact a request creates is listed on its receipt. **On a summary batch (round 10, read c1c4 low)** the collector splits the item:
