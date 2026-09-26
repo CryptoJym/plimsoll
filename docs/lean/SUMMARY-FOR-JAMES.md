@@ -1,43 +1,41 @@
-# Lean, decision-grade Plimsoll: what changed in B0's third round (round 9)
+# Lean, decision-grade Plimsoll: what changed in B0's fourth round (round 10)
 
-**2026-09-25.** Still a plan, not a change; nothing was deployed, pushed or written anywhere, and no live ledger was read. The
-independent review of B0's second round said: the first wave can continue and most contracts can be signed, but the ownership rule
-has three gaps and two promised tests still could not pass. This round closes those and the review's nine smaller items.
+**2026-09-25.** Still a plan, not a change; nothing was deployed, pushed or written anywhere, and no live ledger was read. You signed
+eight contracts and then the joined-install rule (C4). An independent reader then checked the ownership rule (C1) and found two gaps.
+Both are closed in this round, with the reader's smaller items.
 
-## What the review found, and what changed
+## What the reader found, and what changed
 
-- **A Mac's old identity could still speak for it after a re-join.** A reply from the *old* install can arrive after a re-join (an
-  answer already in flight, or a collector process that read its settings before the re-join); last round's rule let it overwrite
-  the new stamp, so the new person's rows were exported as the old person's. Now the ledger records at join time which install it
-  belongs to; only that install's replies count, and any other reply is ignored and counted.
-- **A rare race could flip a verdict.** The cloud decides each stamp the first time it sees it; if an admin re-bound the Mac at
-  that instant, one path could say "issued" while the record said "not issued". The rule now locks the install's row while it
-  decides, so the re-bind waits: 12 interleavings, none flips (last round's rule flipped in 1), reproduced in a real PostgreSQL
-  database on Studio4, with a database proof pending in the cloud repository.
-- **One install could poison another's future.** Any install of a workspace could name another install's next version before it
-  existed and make that version worthless. The "not issued" record is now kept per uploading install.
-- **Two promised tests could never pass.** Both were set-up defects (a timestamp rewritten after the fact; a row inserted by hand
-  with no delivery record). Both are repaired, with two green guards proving their set-up. Last round's summary said all eight
-  tests landed; that was true for seven.
+- **The rule said which lock to take but not what to read under it.** Deciding a stamp needs three facts: the Mac's current binding
+  version, its binding history, and the record of stamps already refused. Last round locked only the first. If a server read the
+  refusals *before* taking the lock, one row could be "nobody" on one path and a person on the other (8 of 566 possible schedules, and
+  reproduced in a real database). Now the lock comes first, then all three reads, and the cloud's ingest surface must use the view
+  loaded that way, never one loaded earlier.
+- **A refusal recorded by a Mac's old identity did not bind its new identity.** After a Mac re-joins, its old identity still judges
+  activity summaries while the new one delivers the rows. The refusal record was kept per uploading identity, so the same row could be
+  "nobody" in the summary and someone's when delivered, if an admin re-bound the old identity in between. Now the record is kept per
+  **ledger**: the chain of identities of one Mac. When a Mac re-joins, it proves it held the previous identity's key, and the cloud links
+  the two. Another Mac still cannot poison this one's future (last round's protection stays), and a re-join that cannot prove the link
+  is shown as such.
 
-Also done: "not issued" records, binding history and old installs are kept until a workspace is erased, and erasure removes them
-in order; the runway rule says how the converter measures its own bytes (the pages it allocates, not estimated row sizes) and refuses
-a census copy that would itself trip an alarm; the usage-record hash no longer ignores the case of a quoted value; the claim that the
-runway rule "self-corrects" to real row sizes is withdrawn (exact at the 25% allowance, safe only up to it).
+Also done, all from the reader's list: the database proof that was promised last round could not have run (five set-up faults) and
+would have passed without the lock; both are fixed, and the set-up was run step by step against today's schema. The erasure-order
+check now looks where erasure actually orders its steps. The claim that a database key "refuses" deleting a Mac's identity was
+overstated; a real guard now allows such deletes only during workspace erasure. A stamp is judged against the identity it names even
+after an admin revokes that identity. The join test now drives the real join code with a fake cloud, and the two half-joined states are
+named in `/status`. The echo every request carries now names the identity it is for.
 
 ## Ready to freeze, and not
 
-Ready for your signature (`FREEZE.md`): the runway formula and census obligation, the reject table, the open-gap rule, the
-usage-record pin, the day acknowledgement, the day keys, the token-volume gate, the abort size check. **Ready after one more
-independent read:** the ownership rule, because this round changes which install's replies count and how the "not issued" record is
-keyed. **Not yet:** the runway numbers and any hold on any Mac, the deletion proof as a whole, the future claim and fault rules, the
-fleet half of dispatch tagging.
+Signed: the eight round-9 contracts and C4. **Ready after one more independent read:** the ownership rule (C1), because the lock order
+and the ledger key are new text no reviewer has read, and the reader asked for exactly that. **Not yet:** the runway numbers and any
+hold on any Mac, the deletion proof as a whole, the future claim and fault rules, the fleet half of dispatch tagging.
 
 ## Test state
 
-Collector 51 tests (15 green guards, 36 pending); cloud 31 (3 green, 28 pending); both exit 0, every pending test failing at the
-surface its bead will build. Typecheck, lint and the coverage gate pass locally, not in GitHub Actions. One commit per item; no
-product code.
+Collector 56 tests (16 green guards, 40 pending); cloud 36 (3 green, 33 pending); both exit 0, every pending test failing at the
+surface its bead will build. Typecheck, lint and the coverage gate pass locally, not in GitHub Actions. The rule model has 51 checks:
+green under this round's rule, red under every earlier one. One commit per item; no product code.
 
 ## The one decision for you (unchanged)
 
