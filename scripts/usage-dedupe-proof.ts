@@ -463,6 +463,37 @@ function issue193ReworkFixtures() {
     check("i193r_stale_sibling_actually_suppresses_window_total",
       Math.abs(projected30 - 4) < 1e-6, { projected30, expected: 4 });
 
+    // Snapshot publication holds BEGIN IMMEDIATE. Its usage-authority count
+    // must not fetch payload-heavy raw table pages once for every window.
+    // Inspect the actual production query's VM, without pinning index names
+    // or depending on machine-specific elapsed-time thresholds.
+    const prepare = buffer.database.prepare.bind(buffer.database);
+    const authorityQueries: string[] = [];
+    buffer.database.prepare = ((sql: string) => {
+      if (/intersect/i.test(sql) && /from buffered_events/.test(sql)) authorityQueries.push(sql);
+      return prepare(sql);
+    }) as typeof buffer.database.prepare;
+    try {
+      prepare("update dashboard_projection_control set dirty=1 where singleton=1").run();
+      buffer.projection.runMaintenance(NOW);
+    } finally { buffer.database.prepare = prepare; }
+    check("authority_count_exercised_in_snapshot_publication", authorityQueries.length === 5,
+      { queries: authorityQueries.length });
+    const rootpage = (prepare("select rootpage from sqlite_master where type='table' and name='buffered_events'")
+      .get() as { rootpage: number }).rootpage;
+    const query = authorityQueries[0]!;
+    const cutoff = new Date(NOW.getTime() - 30 * DAY_MS).toISOString();
+    const program = prepare(`explain ${query}`).all(cutoff) as
+      Array<{ opcode: string; p1: number; p2: number; p3: number }>;
+    const rawCursors = new Set(program.filter(op => op.opcode === "OpenRead" &&
+      op.p2 === rootpage && op.p3 === 0).map(op => op.p1));
+    const rawColumnReads = program.filter(op => op.opcode === "Column" && rawCursors.has(op.p1));
+    const plan = prepare(`explain query plan ${query}`).all(cutoff);
+    check("authority_count_never_reads_payload_table_columns", rawColumnReads.length === 0,
+      { rawColumnReads, plan });
+    check("indexed_authority_count_keeps_unbounded_live_sibling_semantics",
+      (prepare(query).get(cutoff) as { n: number }).n === 2);
+
     console.log(`rework fixtures: ${checks.length - 20} checks green`);
   } finally {
     buffer.close();
