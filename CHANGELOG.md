@@ -1,20 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.7.42 — Draft (first integration pass)
 
-- Active Codex sessions keep their summary rebuild cursor when reconciliation
-  edits a row the summary has not read yet. Ordinary delivery acknowledgements
-  no longer dirty a session through an outbox delete; privacy-changing lineage
-  and terminal receipt changes still do. A worker slice is retried if an edit
-  lands while it is being read, and scanned edits or erasures still rebuild
-  only their affected session (`.163.87`).
-- The scanned-aware summary triggers now use distinct names so a 0.7.41
-  downgrade installs its own revision-marking triggers before sync. A CI
-  rehearsal rejects a terminal privacy receipt raced with the old worker;
-  0.7.39 still reads the full ledger on rollback (`.163.87` round 2).
-- A terminal receipt retarget now also advances the old delivery's session
-  revision. A 0.7.41 worker rejects a stale read after this edit, and the
-  re-upgraded collector rebuilds before sending (`.163.87` round 3).
+- Busy-session summaries preserve rebuild progress while unread rows change.
+  A terminal receipt retarget advances the old session revision so a 0.7.41
+  worker rejects stale data during a downgrade (`eco-6hoxj.163.87`).
+- Codex and Claude tailers keep skipped usage visible as a possible loss when
+  a JSON discriminator probe saturates. A revisit queue resumes partial files
+  without losing the capture claim gap (`eco-6hoxj.163.81`).
+- Coverage walks page saved partial cursors and record a gap when a known
+  partial file vanishes before its directory entry is reached. A file created
+  and removed entirely between walks remains outside this claim
+  (`eco-6hoxj.163.82`).
+- Observe-only budget sampling records ledger size, process memory and CPU,
+  outbox age, and summary lag. Status and CSV show advisory targets and local
+  history; no capture budget is enforced. A stopped collector purge also
+  removes ledger WAL and SHM files (`eco-6hoxj.164.3`).
 
 ## 0.7.5 — 2026-09-08
 

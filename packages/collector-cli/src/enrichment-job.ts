@@ -94,6 +94,8 @@ export class EnrichmentProcessBoundary {
 
   constructor(private readonly options: EnrichmentBoundaryOptions) {}
 
+  budgetChildPid(): number | null { return this.child?.pid ?? null; }
+
   status(): EnrichmentBoundaryStatus {
     return {
       inFlight: this.running,

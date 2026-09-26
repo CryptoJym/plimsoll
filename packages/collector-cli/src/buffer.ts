@@ -213,6 +213,7 @@ export class LocalEventBuffer {
   readonly projection: DashboardProjectionStore;
   readonly learningFacts: LearningFactStore;
   private insertEventStatement?: Database.Statement;
+  private budgetAttemptedRows = 0;
 
   constructor(
     path: string,
@@ -2393,6 +2394,7 @@ export class LocalEventBuffer {
         privacyGeneration,
       });
     if (result.changes > 0) {
+      this.budgetAttemptedRows += 1;
       if (repoContextId) {
         this.db.prepare(
           `insert into repo_context_event_links
@@ -3248,6 +3250,11 @@ export class LocalEventBuffer {
   /** Read access for dashboard queries; do not write through this. */
   get database() {
     return this.db;
+  }
+
+  /** Cheap intake counter read by the advisory footprint sampler once a minute. */
+  budgetAttemptedTotal() {
+    return this.budgetAttemptedRows;
   }
 
   close() {
