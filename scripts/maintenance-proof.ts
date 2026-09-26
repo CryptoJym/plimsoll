@@ -568,6 +568,33 @@ async function proveAdaptiveBaselineCadence() {
   );
 }
 
+async function proveAdvancingRepairCadence() {
+  const clock = fakeCadenceTimer();
+  let visited = 0;
+  const scheduler = new CoalescingMaintenanceScheduler(async () => {
+    visited += 1;
+    return fakeRun();
+  });
+  const cadence = new AutomaticMaintenanceCadence(
+    scheduler,
+    () => fakeBaselineStatus("complete"),
+    { timer: clock.timer, repairProgress: () => ({ pending: visited < 3, units: visited }) },
+  );
+  cadence.start();
+  await clock.advance(5_000);
+  const first = cadence.status();
+  await clock.advance(5_000);
+  const second = cadence.status();
+  await clock.advance(5_000);
+  const final = cadence.status();
+  cadence.stop();
+  check("advancing_repair_uses_fast_followups_then_returns_to_normal",
+    first.retryClass === "repair" && second.retryClass === "repair" &&
+      final.retryClass === "normal" && final.triggerCount === 3 &&
+      scheduler.status().maxConcurrentJobs === 1,
+    { first, second, final, scheduler: scheduler.status() });
+}
+
 /**
  * REVIEW-78 N1: `activity.discoveryEntries` is the classifyRetry signal, not
  * an operator-only receipt. A mixed turn — Claude still baselining,
@@ -1698,6 +1725,7 @@ async function main() {
   await proveCoalescing();
   await proveStoppingCancelsPendingFollowup();
   await proveAdaptiveBaselineCadence();
+  await proveAdvancingRepairCadence();
   await proveLeaseRepairStageDefers();
   await proveLeaseCadenceRetry();
   await proveLeaseDoesNotMaskRealFailure();

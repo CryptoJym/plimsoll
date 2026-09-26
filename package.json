@@ -83,6 +83,7 @@
     "proof:session-attribution-bounded": "tsx scripts/session-attribution-bounded-proof.ts",
     "proof:session-context-index": "tsx scripts/session-context-index-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
+    "proof:codex-usage-pairing": "tsx scripts/codex-usage-pairing-proof.ts",
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
     "proof:resource": "tsx scripts/resource-proof/index.ts",
     "proof:resource-finalization": "tsx scripts/resource-proof/finalization-proof.ts",
