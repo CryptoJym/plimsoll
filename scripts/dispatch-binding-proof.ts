@@ -301,22 +301,32 @@ proof.check("close_shortens_a_scheduled_validity_window");
 
 const atCap = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
 const rootAtCap = atCap.captureRoots![0];
-const fillerCount = 1000 - (rootAtCap.dispatch?.length ?? 0);
-for (let index = 0; index < fillerCount; index++) rootAtCap.dispatch!.push({
+rootAtCap.dispatch = [];
+for (let index = 0; index < 1000; index++) rootAtCap.dispatch.push({
   sessionId: `cap-session-${index}`,workItemId: `beads:cap-${index}`,projectKey: key,
   attemptId: `cap-attempt-${index}`,parentAttemptId: null,companyRef: null,acceptedOutcomeId: null,
   evidenceRef: `cap-evidence-${index}`,validFrom: new Date(Date.parse("2026-09-20T00:00:00.000Z") + index * 1000).toISOString(),
   validUntil: null,role: "author",
 });
 fs.writeFileSync(configPath, `${JSON.stringify(atCap, null, 2)}\n`);
-const capBound = cli(["dispatch", "bind", "--session-id", "cap-new-session", "--work-item-id", "beads:cap-new",
-  "--project-key", key, "--attempt-id", "cap-new-lane", "--valid-from", "2026-09-25T23:00:00.000Z"]);
-assert.equal(capBound.code, 0, capBound.stderr);
+const beforeCapBind = fs.readFileSync(configPath);
+const capBound = cli(["dispatch", "bind", "--session-id", "cap-late-session", "--work-item-id", "beads:cap-late",
+  "--project-key", key, "--attempt-id", "cap-late-lane", "--valid-from", "2026-09-19T00:00:00.000Z"]);
+assert.notEqual(capBound.code, 0, capBound.stdout);
+assert.match(capBound.stderr, /dispatch_binding_capacity_exceeded/);
+assert.deepEqual(fs.readFileSync(configPath), beforeCapBind);
 const kept = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8"))).captureRoots![0].dispatch!;
 assert.equal(kept.length, 1000);
-assert.ok(kept.some(binding => binding.attemptId === "cap-new-lane"));
-assert.ok(!kept.some(binding => binding.attemptId === "cap-attempt-0"));
-proof.check("capacity_prune_keeps_newest_bindings");
+assert.ok(kept.some(binding => binding.attemptId === "cap-attempt-0"));
+assert.ok(!kept.some(binding => binding.attemptId === "cap-late-lane"));
+proof.check("capacity_refuses_late_bind_without_dropping_live_bindings");
+const staleBound = cli(["dispatch", "bind", "--session-id", "cap-stale-session", "--work-item-id", "beads:cap-stale",
+  "--project-key", key, "--attempt-id", "cap-stale-lane", "--valid-from", "2026-09-01T00:00:00.000Z",
+  "--valid-until", "2026-09-02T00:00:00.000Z"]);
+assert.notEqual(staleBound.code, 0, staleBound.stdout);
+assert.match(staleBound.stderr, /dispatch_binding_outside_retention/);
+assert.deepEqual(fs.readFileSync(configPath), beforeCapBind);
+proof.check("bind_refuses_a_window_already_outside_retention");
 proof.complete();
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

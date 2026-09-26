@@ -40,7 +40,8 @@ function newestBindings(bindings: DispatchBinding[], now: Date) {
   const retained = bindings.filter(binding => !binding.validUntil || Date.parse(binding.validUntil) >= cutoff)
     .sort((a, b) => Date.parse(b.validFrom) - Date.parse(a.validFrom) ||
       b.attemptId.localeCompare(a.attemptId) || b.sessionId.localeCompare(a.sessionId));
-  return { bindings: retained.slice(0, 1000), pruned: bindings.length - Math.min(retained.length, 1000) };
+  if (retained.length > 1000) throw new Error("dispatch_binding_capacity_exceeded");
+  return { bindings: retained, pruned: bindings.length - retained.length };
 }
 
 export function bindDispatch(args: string[], now = new Date()) {
@@ -76,6 +77,7 @@ export function bindDispatch(args: string[], now = new Date()) {
         Date.parse(binding.validFrom) < (candidate.validUntil ? Date.parse(candidate.validUntil) : Infinity));
       if (overlaps) throw new Error("dispatch_session_window_conflict");
       const result = newestBindings([...prior,binding],now);
+      if (!result.bindings.includes(binding)) throw new Error("dispatch_binding_outside_retention");
       pruned += result.pruned;
       return { ...root,dispatch: result.bindings };
     }) };
