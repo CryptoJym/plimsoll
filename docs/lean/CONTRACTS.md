@@ -1,4 +1,4 @@
-# Lean Plimsoll contract register (round 13 = B0 round 7, eco-6hoxj.164.4)
+# Lean Plimsoll contract register (round 14 = B0 round 8, eco-6hoxj.164.4)
 
 **As of:** 2026-09-25 MDT · **Owner:** B0 (contract owner; documents and failing tests only). This file is normative for the
 items the round-6 review left to B0 (two blockers, four `b0Carries`; `input/review-r6/VERDICT.json`) and for the repairs the
@@ -11,16 +11,18 @@ after round 10 required (`input/read-c1-r10/VERDICT.json`: a pair naming an inst
 row, and a re-join that cannot prove the previous key must not split an old row; and its should-fixes) and the independent read of
 C1 after round 11 required (`input/read-c1-r11/VERDICT.json`: the admin link must move a whole ledger into a canonical destination,
 or refuse; and its should-fix) and the independent read of C1 after round 12 required (`input/read-c1-r12/VERDICT.json`: a C1
-transaction PostgreSQL aborts in a deadlock must be retried under a stated rule, and the 400 refusal must name the ledger it judged).
-Where it and another document disagree, this file wins and the other carries a "round 7", "round 8", "round 9", "round 10", "round
-11", "round 12" or "round 13" note pointing here. Every rule below has (a) a runnable fixture in `fixtures/` (the round-13 fixture
-`b4_offline_rebind.py` is red under `--rule r6`, `r7`, `r8`, `r9`, `r10`, `r11` and `r12` and green under `--rule r13`;
+transaction PostgreSQL aborts in a deadlock must be retried under a stated rule, and the 400 refusal must name the ledger it judged)
+and the independent read of C1 after round 13 required (`input/read-c1-r13/VERDICT.json`: the 400's wire shape and the exhausted 503
+must be bound at the route by exact tests, with one field name on both sides; and its should-fixes). Where it and another document
+disagree, this file wins and the other carries a "round 7", "round 8", "round 9", "round 10", "round 11", "round 12", "round 13" or
+"round 14" note pointing here. Every rule below has (a) a runnable fixture in `fixtures/` (the round-14 fixture `b4_offline_rebind.py`
+is red under `--rule r6`, `r7`, `r8`, `r9`, `r10`, `r11`, `r12` and `r13` and green under `--rule r14`;
 `s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green under `r9`;
 `checks/fixtures-summary.json`) and (b) a **pending test** in the repository that owns the rule (§C6), which fails today and names
 the bead that turns it green. Nothing here is implemented;
 nothing here is frozen until the lead signs the freeze list (`FREEZE.md`).
 
-## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5, read-c1-r10 blockers 1-2 and should-fixes 1-4, read-c1-r11 blocking and should-fix, read-c1-r12 blocking 1-2; B6 cloud, B2a collector)
+## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5, read-c1-r10 blockers 1-2 and should-fixes 1-4, read-c1-r11 blocking and should-fix, read-c1-r12 blocking 1-2, read-c1-r13 blocking 1-2 and should-fixes 1-2; B6 cloud, B2a collector)
 
 **The defect (review r6).** Round 6 wrote two validators. A delivered stamp had to satisfy `V exists, V ≤ actorBindingVersionHeard
 ≤ current`; an undelivered stamp only `V exists, V ≤ current`. For a version the cloud had issued but the collector had not yet
@@ -97,6 +99,24 @@ current ledger, would keep the row parked on every later response naming X, whil
 Round 13 closes both below: **a C1 transaction PostgreSQL aborts is retried from its start, at most three attempts, and nothing is
 acknowledged before its commit** ("Serialization"), and **the 400 names the ledger it judged**, `ledgerInstallId`, the value the
 collector parks under ("Outside the ledger", "The link is the release").
+
+**The defect (the read of C1 after round 13).** Round 13 stated both rules but bound neither at the wire (`input/read-c1-r13/VERDICT.json`,
+`checks/wire-shape-probe.json`, `checks/cloud-route-error-probe.log`, `checks/refusal-boundaries.log`). (1) C6 had the cloud route
+answer `{ error: "stamp_from_other_ledger", pairs, ledgerInstallId }` while the collector's parsed refusal was `{ reason, pairs,
+ledgerInstallId }`, and no mapping was defined: a collector built to the letter would not have recognised the refusal it received; the
+cloud tests asserted an error object and then parked under a literal, and the collector test authored its own 400, so no test carried
+the route's body into the collector's parser. The round-13 fixture also still parked a 400 that named no ledger under `None` and filled
+it from the next response, against the text, and nothing said what an unknown but well-formed ledger id means. (2) The default cap of
+three attempts was checked only through a one-attempt override, and the exhausted 503 was asserted as an error object: at the route,
+today's generic handler would have sent `{ error: "ingest_unavailable" }`, losing the operation, the attempts and the SQLSTATE, and no
+test bound the collector's answer to that 503. Round 14 closes both below with exact tests on both sides of the wire: **one field name,
+`error`, on the cloud's 400 body and in the collector's parsed refusal**, a pending route test that asserts the status and the exact
+body, and a pending collector test that parses that serialized body through the collector's own upload path, parks under its
+`ledgerInstallId`, is released by the next response naming X and delivers once; a 400 that names no ledger parks nothing and an
+unknown ledger id is opaque ("Outside the ledger"); **the default cap bound by three forced aborts and never a fourth attempt, the
+exact 503 route answer through `collectorIngestErrorResponse`, and the collector's no-acknowledgement, no-parking retry at
+`Retry-After`** ("Serialization"); and, the read's second should-fix, the request context fixed at authorization while everything
+else is re-read on a retry.
 
 **The rule.** A stamp is the **pair** `(install, V)`: the `DeviceInstall` id of the response that supplied `V` and the version. The
 collector persists the pair, stamps it on the identity row (`summary_members.actor_binding_version`, `.actor_binding_install`) and
@@ -225,13 +245,23 @@ install of the tenant that is **not in the uploader's ledger** is **refused befo
 install's `ledger_install_id` under its lock, and when it differs from the uploader's ledger the batch is refused (400
 `stamp_from_other_ledger`, its body listing the refused pairs and, **round 13, naming `ledgerInstallId`: the uploader's ledger the
 refusal was judged against**, that is the ledger the request was authorized with, read before the lock; a merge that commits
-between that read and the lock makes the refusal conservative, never wrong, and the release below corrects it), nothing is judged
-and **nothing is recorded** in any ledger; on a
+between that read and the lock makes the refusal conservative, never wrong, and the release below corrects it; **round 14: the body
+is `{ error: "stamp_from_other_ledger", pairs, ledgerInstallId }`, keyed `error` like every other answer of the collector routes,
+and the collector's parsed refusal is that body, keyed `error` on both sides**: round 13 wrote `reason` on the collector side and
+defined no mapping, so a collector built to the letter would not have recognised the refusal it received; the cloud's route test
+asserts the status and the exact body, the collector's test 14 parses that same serialized body through its own upload path), nothing
+is judged and **nothing is recorded** in any ledger; on a
 summary batch the collector parks the segments whose parts name a refused pair and resubmits the rest exactly as for the flood
 refusal (C4's `partitionFloodRefusal` takes either reason); on a delivery it parks the refused rows in the outbox
 (`outbox_row_parked`, `partitionRefusedRows`: undelivered, retained under the ordinary rules, never leased while parked, parked
 **under the ledger the 400 named** (round 13; never a value the collector supplied or learned itself, and a 400 that names no
-ledger parks nothing), listed in `/status` as `parkedRows` beside the `lineage` and on the certify) and resubmits the rest at once. Round 10 judged such a pair
+ledger parks nothing: **round 14**, such a body is a malformed refusal the collector cannot act on, so the rows keep the ordinary
+handling of any 400, returned to the outbox as `remote_validation`, never acknowledged and never parked under a guessed value; and a
+**well-formed but unknown ledger id is an opaque value**: the collector has no source for a ledger's existence but the cloud's own
+responses, so it validates nothing, parks the rows under the value as received and releases them on the next authenticated response
+naming a different ledger, with no row lost, while a response naming that same value keeps them parked; refusing to park what the
+collector cannot verify would instead lose the hold for exactly the rows the cloud refused), listed in `/status` as `parkedRows`
+beside the `lineage` and on the certify) and resubmits the rest at once. Round 10 judged such a pair
 against the install it named and read only the uploader's ledger's facts, so another Mac's issued pair assigned the uploader's row to
 that Mac's actor (S8), and an unlinked re-join's delivery of an old faulty row was someone's while the old install's summary said
 nobody (S9). So one Mac's faulty or hostile traffic can neither poison another Mac's next version (R7 stays closed, now by
