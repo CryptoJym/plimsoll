@@ -483,9 +483,11 @@ globs and, in the collector, outside `tsconfig` `include`, so they never break `
 and linted, so a missing surface is loaded at run time through `loadSurface()` and fails as a test, not as a type error.
 
 **Surfaces the cloud tests bind (plimsoll-cloud, `tests/contracts/lean/`).**
-- `src/lib/actor-binding-stamp.ts`: `actorForStamp({ stamp, path, binding })` → `{ actorId, basis, stampInvalid? }` where `binding =
-  { installId, ledgerInstallId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued: number[], lifecycle }` is the
-  state of the install the stamp's pair names as `loadSightingView` returned it under the lock, `notIssued` being the facts of the
+- `src/lib/actor-binding-stamp.ts`: `actorForStamp({ stamp, path, binding, ledgerInstallId })` → `{ actorId, basis, stampInvalid? }`,
+  `ledgerInstallId` being the uploader's ledger (round 11: the call **throws** `StampFromOtherLedgerError`, message
+  `stamp_from_other_ledger`, when `binding.ledgerInstallId` differs, before any judgment, so both paths refuse at the one ownership
+  function), where `binding = { installId, ledgerInstallId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued:
+  number[], lifecycle }` is the state of the install the stamp's pair names as `loadSightingView` returned it under the lock, `notIssued` being the facts of the
   reading ledger's view; `lifecycle` is carried, never judged (round 10); `sightStamp(binding, stamp)` → the binding with `notIssued`
   extended when the stamp is above `currentVersion` (pure; persisting the fact is B6's); `firstEchoHeardAt(requests)` over every
   request kind, a request `{ at, echoed, install?, echoedInstall? }` counted only when `echoedInstall` is absent or equal to `install`
@@ -495,16 +497,25 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   sightings })` binds the pair `metadata.actorBindingVersion` + `metadata.actorBindingInstall` through `actorForStamp` against
   `bindings[actorBindingInstall]`; `bindings` **is the record `loadSightingView` returned in the ingest transaction, after the lock,
   for the installs the batch's pairs name** (round 10; the function stays pure, the route may not hand it a view loaded earlier); a pair
-  naming an install outside `bindings` fails closed and records nothing; sets `metadata.actorStampInvalid`; appends every new
+  naming an install outside `bindings` fails closed and records nothing; a pair naming an install whose `ledgerInstallId` is not the
+  option's `ledgerInstallId` makes the whole call throw `StampFromOtherLedgerError { status: 400, reason: "stamp_from_other_ledger",
+  pairs }` before any row is bound, and the route answers that 400 with the pairs, judging nothing and recording nothing (round 11);
+  sets `metadata.actorStampInvalid`; appends every new
   not-issued fact `{ ledgerInstallId, recordedByInstallId, deviceInstallId, version, source }` to `sightings`, which the route persists
   in the same transaction (round 9). The summary path (`actorPartsForSegment`) takes its `install` view from the same call in the
   judgment's transaction. (B6, C1)
-- `src/lib/actor-binding-stamp-store.ts` (rounds 9-10): `loadSightingView(tx, { tenantId, ledgerInstallId, installIds })` locks the
-  named installs' rows `FOR SHARE` in ascending id order **first**, then reads `binding_version`, the audit rows and the ledger's
-  facts under the lock → `Record<installId, binding>` (an install the tenant does not have is absent; a revoked or suspended one is
-  present); `sightPairInTransaction(tx, { tenantId, ledgerInstallId, recordedByInstallId, deviceInstallId, version, source, at })`
-  takes the row `FOR SHARE`, then reads and judges, inserts the fact `ON CONFLICT DO NOTHING` when the version is above
-  `binding_version` and re-reads → `{ issued, actorId, recorded, bindingVersionThen }`; `issueBindingVersionInTransaction(tx,
+- `src/lib/actor-binding-stamp-store.ts` (rounds 9-11): `loadSightingView(tx, { tenantId, ledgerInstallId, installIds })` locks the
+  named installs' rows `FOR SHARE` in ascending id order **first**, then reads each install's `ledger_install_id` (round 11),
+  `binding_version`, the audit rows and the ledger's facts under the lock → `Record<installId, binding>` (an install the tenant does
+  not have is absent; a revoked or suspended one is present; one of another ledger is present with its own `ledgerInstallId`, so the
+  predicate refuses it); `sightPairInTransaction(tx, { tenantId, ledgerInstallId, recordedByInstallId, deviceInstallId, version,
+  source, at })` takes the row `FOR SHARE`, then reads the install's ledger and rejects `StampFromOtherLedgerError` when it is not
+  `ledgerInstallId` (round 11), else reads and judges, inserts the fact `ON CONFLICT DO NOTHING` when the version is above
+  `binding_version` and re-reads → `{ issued, actorId, recorded, bindingVersionThen }`; `linkLedgerByAdmin(tx, { tenantId, installId,
+  ledgerInstallId, changedBy })` → `{ linked, ledgerInstallId, rekeyedFacts }` (round 11: the install row `FOR UPDATE`, allowed only
+  for an install still its own ledger, `ledger_install_id` with `ledger_linked_at` and `ledger_linked_by`, and the re-key of the
+  install's old ledger's facts, in one transaction; the join route sets `ledger_linked_by = join_proof` on a verified proof and the
+  grant carries `lineage`); `issueBindingVersionInTransaction(tx,
   { tenantId, deviceInstallId, actorId, changedBy })` is the rebind's write (`binding_version + 1` on the install row, the audit row
   carrying it) that `bindDeviceInstalls` and `reverseDeviceInstallActorBindings` call after `lockInstalls` (which gains `ORDER BY id`);
   `stampFactsFor(tx, { ledgerInstallId, deviceInstallId })` lists the recorded versions; `linkLedgerAtJoin(tx, { tenantId,
@@ -513,10 +524,13 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   answers `lineage`). Proved on the repository's disposable Postgres cluster by `actor-binding-stamp-postgres.contract.test.ts`
   (needs `PLIMSOLL_PROOF_PG_BIN` as `ci.yml`'s usage-projection step has; the harness applies `0_init` first, connects as the cluster's
   superuser through the socket with the port in the authority, inserts `work_tenants.updated_at`, and runs the erasure in a child
-  process bound to the cluster, `tests/contracts/lean/fixtures/erase-tenant-child.ts`; `checks/postgres-harness-repaired-probe.log`).
-  (B6, C1)
-- `src/lib/delivery-ack-response.ts`: `acknowledgedResponse` emits `actorBindingVersion` for a registered install
-  (`CollectorUploadAuthorization` gains `actorBindingVersion: number`). (B6)
+  process bound to the cluster, `tests/contracts/lean/fixtures/erase-tenant-child.ts`; `checks/postgres-harness-repaired-probe.log`;
+  round 11: `cluster()` stops the cluster on any set-up failure, the join route is driven in a child the same way,
+  `tests/contracts/lean/fixtures/join-route-child.ts`, proved runnable against today's route by `checks/join-route-child-probe.log`,
+  and on macOS PostgreSQL 17 needs a valid `LC_ALL` to start, `checks/round11-sql-orderings.log`). (B6, C1)
+- `src/lib/delivery-ack-response.ts`: `acknowledgedResponse` emits `actorBindingVersion` and (round 11) `lineage` for a registered
+  install (`CollectorUploadAuthorization` gains `actorBindingVersion: number` and `lineage: "linked" | "unlinked"`), so a collector
+  whose rows are parked learns when its ledger was linked. (B6)
 - `src/lib/activity-summary/contract.ts`: `ACTIVITY_SUMMARY_PAYLOAD_KIND`, `isActivitySummaryPayload`, `activitySummaryBatchSchema`,
   `SUMMARY_ITEM_KINDS` (with `day_summary`); `src/lib/activity-summary/judge.ts`: `judgeSummaryItems(items, stored)`;
   `src/lib/activity-summary/actor-parts.ts`: `actorPartsForSegment({ members, install })`. (B6)
@@ -529,7 +543,9 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 - `prisma/migrations/<B6>/migration.sql`: the erasure-only delete trigger on `device_installs` (`BEFORE DELETE`, allowed only while
   `current_setting('plimsoll.erasing_tenant', true)` is the row's tenant, else `RAISE EXCEPTION … erasure`), the `ledger_install_id`
   column backfilled with the row's own id, `lockInstalls`' `ORDER BY`. (B6, C1)
-- `prisma/schema.prisma`: `DeviceInstall.bindingVersion`, `DeviceInstall.ledgerInstallId`, `DeviceInstall.activityLaneClosedAt`,
+- `prisma/schema.prisma`: `DeviceInstall.bindingVersion`, `DeviceInstall.ledgerInstallId`, `DeviceInstall.ledgerLinkedAt` and
+  `.ledgerLinkedBy` (round 11: how and when the install was linked into a ledger other than its own, `join_proof` or the admin),
+  `DeviceInstall.activityLaneClosedAt`,
   `DeviceInstallActorBindingAudit.bindingVersion` and `.heardAt`, models `AiSummaryActorPart`, `CaptureGap` and
   `DeviceInstallStampNotIssued` (`tenantId`, `ledgerInstallId`, `recordedByInstallId`, `deviceInstallId`, `version`, `firstSeenAt`,
   `bindingVersionThen`, `source`, unique per `(ledgerInstallId, deviceInstallId, version)`, a relation to `DeviceInstall` without
@@ -558,7 +574,12 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   token) }` when the existing config has both; `lean/actor-binding-status.ts`: `actorBindingStatus({ binding, config })` → `{ state ∈
   ok | joined_install_unknown | join_incomplete, joinedInstall, configInstall }` for `/status`; `lean/summary-upload.ts`:
   `partitionFloodRefusal(items, { pairs })` → `{ resubmit, parked }` (the segments whose parts name a refused pair parked, everything
-  else resubmitted). (B2a; C1, C4)
+  else resubmitted; it takes a `stamp_from_other_ledger` refusal the same way, round 11); `lean/upload-park.ts` (round 11):
+  `partitionRefusedRows(events, { reason, pairs })` → `{ resubmit, parked }` for a delivery refused as `stamp_from_other_ledger`;
+  `buffer.ts` gains `parkOutboxRows(ids, reason)`, `parkedRows()` and `releaseParkedRows({ reason: "lineage_linked" } | { reason:
+  "admin_release", receipt })` (a parked row is never leased while parked; `lineage_linked` returns it to the outbox; `admin_release`
+  acknowledges it `undeliverable_unlinked_ledger` under the receipt, never delivered, never judged); `actorBindingStatus` gains
+  `lineage` and `parkedRows`. (B2a; C1, C4)
 - `packages/collector-cli/src/upload.ts`: `buildIngestBatch(...).batch.actorBindingVersionHeard` (the current install's version;
   earlier installs' stamps do not raise it) and `.actorBindingInstallHeard` (the ledger's joined install the echo is for, round 10),
   and the pair on every event's metadata; `packages/shared/src/schemas.ts`: `aiWorkIngestBatchSchema` accepts both;
@@ -605,7 +626,12 @@ its missing surface before any cluster starts; once B6 removes its marker it nee
 only B6's own columns are missing), so the five set-up faults the read found are gone. The R5 interleaving was reproduced in round 9
 in a local PostgreSQL 16 cluster at the SQL level (`checks/r5-postgres-reproduction.log`), and the round-10 rules (the facts read before
 the lock, the two installs of one ledger, the mirror order, the view under a held lock, PostgreSQL's grant of a `FOR SHARE` while a
-`FOR UPDATE` waits, lifecycle, the erasure-only guard) in round 10 (`checks/round10-sql-orderings.log`), not through B6's code. What
+`FOR UPDATE` waits, lifecycle, the erasure-only guard) in round 10 (`checks/round10-sql-orderings.log`), and the round-11 rules (a
+pair outside the ledger refused with nothing recorded, the hold across an unlinked re-join, the admin link with its re-key, the link
+waiting for a sighting) in round 11 on PostgreSQL 17.11 (`checks/round11-sql-orderings.log`: S8 and S9 red as written in round 10,
+green under round 11), not through B6's code; the join route was driven through `fixtures/join-route-child.ts` against today's
+route on the disposable cluster (`checks/join-route-child-probe.log`: 201 for a fresh token, 409 `used` for a reuse with no second
+install; `previousInstall` and `lineage` are absent today, which is where the pending case fails). What
 no test can bind is where a future route *calls* `loadSightingView`: the pending proof shows the call itself locks first and returns
 a consistent view, and C6 requires the call in the judging transaction; a route that loaded the view earlier would pass the proof
 and break C1, so B6's review must read the route. Row widths in C2 remain estimates until S2 measures them on a copy; the Studio4 census
