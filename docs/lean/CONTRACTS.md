@@ -204,10 +204,18 @@ already waiting for it); a second abort needs a third concurrent locker, so thre
 did the work commits**: an aborted attempt sends no response, leaves no fact (its insert is rolled back with it), moves no install and
 writes no audit row, so a retry never sees its own earlier attempt, and the answer the caller receives is one committed transaction's,
 which is why the first-sighting guarantee is untouched by the retry. When the last attempt is aborted too, the request fails **503
-`transaction_retry_exhausted`** with `Retry-After` and the body `{ error, operation, attempts, sqlstate }`: for a sighting that is the
-ingest or summary route's ordinary retryable answer (the collector's transient-failure path returns the batch's rows to the outbox
-for a later delivery; a 503 parks, acknowledges and judges nothing); for the admin's merge the same 503 is the receipt (nothing moved,
-no audit row, the rows it would have released still parked) and the admin re-issues the link. A merge that commits on its second or
+`transaction_retry_exhausted`** with `Retry-After` and the body `{ error: "transaction_retry_exhausted", operation, attempts,
+sqlstate }` (**round 14**: the route answers it through `collectorIngestErrorResponse`, which maps `TransactionRetryExhaustedError` to
+exactly that status, body and header before its generic branches, C6; without that branch today's handler would send `{ error:
+"ingest_unavailable" }` and the operation, the attempts and the SQLSTATE would be lost at the wire): for a sighting that is the
+ingest or summary route's ordinary retryable answer, and the collector treats it as any 503, its transient failure: it **acknowledges
+nothing and parks nothing**, returns the batch's rows to the outbox with their next attempt at `Retry-After` and delivers them then
+(its `remote_transient` path, `scripts/sync-backoff-proof.ts`; a 503 judges nothing); for the admin's merge the same 503 is the
+receipt (nothing moved, no audit row, the rows it would have released still parked) and the admin re-issues the link. **The default
+cap is bound** (round 14): three aborts in a row give the 503 with `attempts: 3`, and there is never a fourth attempt (cloud
+`actor-binding-stamp-postgres.contract.test.ts` case 8 c3, three deadlocks forced on the real detector); the exact route answer and
+the handler mapping are the cloud's `ingest-route-wire.contract.test.ts`, and the collector's path is `actor-stamp.contract.ts` test
+17 (`b4_offline_rebind.py` section 16, S15/503). A merge that commits on its second or
 third attempt releases the parked rows exactly as a first-attempt merge does: the next authenticated response names the new ledger.
 A common global lock order was not chosen: the merge cannot know its member set before it holds the source root, and a join that
 commits while the merge waits can add a member whose id sorts below the ones already held, so "everything in ascending id order"
