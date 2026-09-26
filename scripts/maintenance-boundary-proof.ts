@@ -576,6 +576,91 @@ async function fifoAvailabilityProof() {
   }
 }
 
+async function absoluteHookLatencyProof() {
+  // The FIFO fixture's file-backed ledger needs a same-run comparison under
+  // disk load. It cannot set its own absolute hook limit: a regression shared
+  // by the idle and active waves would raise that limit. Run both hook waves
+  // against memory SQLite and time each request inside the server instead.
+  const buffer = new LocalEventBuffer(":memory:");
+  const { boundary } = fakeBoundary(() => new FakeChild(0));
+  let inFlight = false;
+  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer, {
+    maintenanceStatus: () => ({ ...boundary.status(), inFlight }),
+  });
+  const hookTimingsMs: number[] = [];
+  server.prependListener("request", (incoming, response) => {
+    if (incoming.url !== "/hooks/codex") return;
+    const started = process.hrtime.bigint();
+    response.once("finish", () => hookTimingsMs.push(
+      Number(process.hrtime.bigint() - started) / 1_000_000,
+    ));
+  });
+  const waveConcurrency = FIFO_AVAILABILITY_BUDGETS.waveConcurrency;
+  const agent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
+  // Under 32-worker CPU load, healthy waves spent up to 4,092 ms inside the
+  // server; the 20 ms-per-hook mutation spent 21,778 ms without added task
+  // load. The absolute aggregate cap clears measured scheduling noise while
+  // rejecting uniform slowdown on the memory ledger. A separate per-hook cap
+  // catches a single blocked request; loaded pilot max was 527 ms.
+  const hookTotalCeilingMs = 10_000;
+  const hookSingleCeilingMs = 1_200;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (server.address() as AddressInfo).port;
+    const waves: Array<{ inFlight: boolean; serverTotalMs: number; serverMaxMs: number }> = [];
+    for (const active of [false, true]) {
+      inFlight = active;
+      const timingStart = hookTimingsMs.length;
+      const responses = await Promise.all(Array.from({ length: waveConcurrency }, (_, index) =>
+        request(agent, port, "POST", "/hooks/codex", JSON.stringify({
+          hook_event_name: "PostToolUse",
+          session_id: `${active ? "30000000" : "20000000"}-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          tool_name: "proof_tool",
+        }), { "x-plimsoll-source": "codex" }),
+      ));
+      assert.ok(responses.every((row) => row.status === 202), "memory-ledger hooks must return 202");
+      const timings = hookTimingsMs.slice(timingStart);
+      assert.equal(timings.length, waveConcurrency, "time every hook inside the server");
+      const serverTotalMs = timings.reduce((sum, value) => sum + value, 0);
+      const serverMaxMs = Math.max(...timings);
+      assert.ok(
+        serverTotalMs <= hookTotalCeilingMs,
+        `memory-ledger ${active ? "active" : "idle"} hooks spent ${serverTotalMs.toFixed(1)}ms ` +
+          `inside the server (max ${serverMaxMs.toFixed(1)}ms), exceeded ${hookTotalCeilingMs}ms total`,
+      );
+      assert.ok(
+        serverMaxMs <= hookSingleCeilingMs,
+        `memory-ledger ${active ? "active" : "idle"} hook spent ${serverMaxMs.toFixed(1)}ms ` +
+          `inside the server, exceeded ${hookSingleCeilingMs}ms per hook`,
+      );
+      waves.push({
+        inFlight: active,
+        serverTotalMs: Number(serverTotalMs.toFixed(3)),
+        serverMaxMs: Number(serverMaxMs.toFixed(3)),
+      });
+    }
+    const stored = Number((buffer.database.prepare(
+      "select count(*) as n from buffered_events",
+    ).get() as { n: number }).n);
+    assert.equal(stored, waveConcurrency * 2, "memory-ledger hooks must be durable exactly once");
+    pass("memory_ledger_hooks_have_absolute_in_server_latency", {
+      waveConcurrency,
+      hookTotalCeilingMs,
+      hookSingleCeilingMs,
+      waves,
+      stored,
+    });
+  } finally {
+    agent.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await boundary.shutdown();
+    buffer.close();
+  }
+}
+
 async function blockedShutdownProof() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `${PRIVATE_PATH_SENTINEL}-shutdown-`));
   const fifoPath = path.join(root, "maintenance-boundary-block.fifo");
@@ -2002,6 +2087,7 @@ async function main() {
     return;
   }
   await fifoAvailabilityProof();
+  await absoluteHookLatencyProof();
   await blockedShutdownProof();
   await circuitAndRecoveryProof();
   await spawnFailureAndConcurrentStartupProof();
@@ -2039,7 +2125,8 @@ async function main() {
     // budgets.statusP95Ms rather than assume it is there.
     // 3 adds idle hook-wave measurements and matched dynamic latency bounds;
     // deadlineToReapMs now starts at the worker's armed work timer.
-    schemaVersion: 3,
+    // 4 adds an absolute in-server hook guard and fire-to-reap bound.
+    schemaVersion: 4,
     proof: "maintenance_boundary",
     node: process.versions.node,
     checks,
