@@ -321,6 +321,34 @@ async function main() {
   }
 
   {
+    const h = new Harness("different-cache-no-trace");
+    try {
+      h.append(logEvent(R()));
+      h.append(spanEvent(R({ cache: R().cache + 1 })));
+      const rows = h.buffer.database.prepare(`select count(*) as usageRows,
+        sum(case when usage_duplicate_reason is not null then 1 else 0 end) as duplicates
+        from buffered_events where source = 'codex'`).get() as { usageRows: number; duplicates: number };
+      check("different_cache_no_trace_stays_two_eligible_rows",
+        rows.usageRows === 2 && rows.duplicates === 0 && h.observe().local.usageRows === 2, rows);
+    } finally { h.close(); }
+  }
+
+  {
+    const h = new Harness("different-workspace-no-trace");
+    try {
+      const logId = h.append(logEvent(R()));
+      h.buffer.database.prepare(`update buffered_events set workspace_id = ? where id = ?`)
+        .run("b3b3b3b3-3333-4333-8333-333333333333", logId);
+      h.append(spanEvent(R()));
+      const rows = h.buffer.database.prepare(`select count(*) as usageRows,
+        sum(case when usage_duplicate_reason is not null then 1 else 0 end) as duplicates
+        from buffered_events where source = 'codex'`).get() as { usageRows: number; duplicates: number };
+      check("different_nonnull_workspace_no_trace_stays_two_eligible_rows",
+        rows.usageRows === 2 && rows.duplicates === 0 && h.observe().local.usageRows === 2, rows);
+    } finally { h.close(); }
+  }
+
+  {
     const h = new Harness("concurrent-sessions");
     try {
       h.at(100); h.append(contextEvent(SESSION_B, T0 - 1_490));
