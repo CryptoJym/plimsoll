@@ -1,4 +1,4 @@
-# Lean Plimsoll contract register (round 10 = B0 round 4, eco-6hoxj.164.4)
+# Lean Plimsoll contract register (round 11 = B0 round 5, eco-6hoxj.164.4)
 
 **As of:** 2026-09-25 MDT · **Owner:** B0 (contract owner; documents and failing tests only). This file is normative for the
 items the round-6 review left to B0 (two blockers, four `b0Carries`; `input/review-r6/VERDICT.json`) and for the repairs the
@@ -6,15 +6,18 @@ round-1 review of B0 required (`input/review-r1/VERDICT.json`: C1/C4 judged at j
 the test helper; and its should-fixes) and the round-2 review required (`input/review-r2/VERDICT.json`: the old install's late
 answer replacing the stamp, the first sighting racing the rebind, two pending tests that could not pass; and its nine should-fixes)
 and the independent read of C1/C4 after round 9 required (`input/read-c1c4/VERDICT.json`: a sighting must take the lock before it
-reads the facts, and one ledger uploaded by two installs must read one fact; and its should-fixes). Where it and another document
-disagree, this file wins and the other carries a "round 7", "round 8", "round 9" or "round 10" note pointing here. Every rule below
-has (a) a runnable fixture in `fixtures/` (the round-10 fixture `b4_offline_rebind.py` is red under `--rule r6`, `r7`, `r8` and `r9`
-and green under `--rule r10`; `s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green under `r9`;
+reads the facts, and one ledger uploaded by two installs must read one fact; and its should-fixes) and the independent read of C1
+after round 10 required (`input/read-c1-r10/VERDICT.json`: a pair naming an install of another ledger must never own the uploader's
+row, and a re-join that cannot prove the previous key must not split an old row; and its should-fixes). Where it and another
+document disagree, this file wins and the other carries a "round 7", "round 8", "round 9", "round 10" or "round 11" note pointing
+here. Every rule below has (a) a runnable fixture in `fixtures/` (the round-11 fixture `b4_offline_rebind.py` is red under `--rule
+r6`, `r7`, `r8`, `r9` and `r10` and green under `--rule r11`; `s1b_runway_host_bound.py` is red under `r6`, `r7` and `r8` and green
+under `r9`;
 `checks/fixtures-summary.json`) and (b) a **pending test** in the repository that owns the rule (§C6), which fails today and names
 the bead that turns it green. Nothing here is implemented;
 nothing here is frozen until the lead signs the freeze list (`FREEZE.md`).
 
-## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5; B6 cloud, B2a collector)
+## C1. One actor-ownership predicate, fixed at the first sighting (review-r6 blocker 1, review-r1 blocker 1, review-r2 blockers 1-2 and should-fixes 1-4, read-c1c4 blockers 1-2 and should-fixes 1-5, read-c1-r10 blockers 1-2 and should-fixes 1-4; B6 cloud, B2a collector)
 
 **The defect (review r6).** Round 6 wrote two validators. A delivered stamp had to satisfy `V exists, V ≤ actorBindingVersionHeard
 ≤ current`; an undelivered stamp only `V exists, V ≤ current`. For a version the cloud had issued but the collector had not yet
@@ -54,6 +57,18 @@ summary member (a fact under X) and the new install Z delivers the row itself, a
 row was unallocated in X's part and someone's when Z delivered it. Round 10 closes both below: a sighting takes the lock **first** and
 reads everything under it, and the fact is keyed by the **ledger** (the chain of installs of one Mac), not the uploader.
 
+**The defect (the read of C1 after round 10).** Round 10 left two gaps, both about a row whose pair names an install of **another
+ledger**, and both breaking the promise that a row gets one answer whichever path judges it (`input/read-c1-r10/VERDICT.json`,
+`checks/round10-sql-orderings-unlinked.log` S8, S9). (1) The predicate judged a pair against the install it names and read only the
+uploader's ledger's facts, so a same-tenant install P (server-bound to B) that uploaded a row stamped `(X, 2)` after another Mac's
+install X had been rebound to C as version 2 got its row assigned to C: an actor attribution across Macs, which today's ingest (the
+server-bound actor, `src/lib/ingest.ts:397-427`) never allows. (2) A re-join that cannot prove the previous install's key starts its
+own ledger, which cannot see the old install's not-issued fact: X's summary judged the faulty `(X, 2)` nobody's, X was rebound up to
+2, and the new unlinked install's delivery of the same row was C's. Round 11 closes both below: **ownership never crosses a
+ledger**: a pair naming an install outside the uploader's ledger is refused before any judgment and records nothing, the collector
+parks such rows, and the only release into a judgment is the ledger's link (the join's proof, or an admin's audited link), after
+which the rows are judged in that ledger, where they read the same facts and audit rows the old install's summary did.
+
 **The rule.** A stamp is the **pair** `(install, V)`: the `DeviceInstall` id of the response that supplied `V` and the version. The
 collector persists the pair, stamps it on the identity row (`summary_members.actor_binding_version`, `.actor_binding_install`) and
 sends it on the wire (`metadata.actorBindingVersion`, `metadata.actorBindingInstall`); the summary item's per-segment parts are
@@ -64,6 +79,7 @@ install the pair names, never against the uploading install:
 |---|---|---|
 | `(install, V)` **issued at its first sighting**: `V = 0`, or the audit row for `V` existed when the cloud first saw `(install, V)` in any request echo, delivered row or summary member | `actor_id = actor_of(install, V)`; basis `raw_ingest` (identical to `binding_at_capture` by construction) | `actor_id = actor_of(install, V)`, basis `binding_at_capture` |
 | `(install, V)` **not issued at its first sighting** (`V > binding_version` then), recorded once as the durable fact `stamp_not_issued(ledger, install, V)` in the same transaction, keyed by the uploader's **ledger** (round 10: the first install of the uploader's chain of installs on one Mac, so the old install judging a summary member and the new install delivering the row after a re-join read one fact; round 9 keyed it by the uploader); or a pair naming an install the tenant does not have (judged closed, **nothing recorded**) | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify; **stays null after the cloud issues `V`**, at ingest, on replay and in every summary revision | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
+| `(install, V)` naming an install **outside the uploader's ledger** (round 11: another Mac of the tenant, or the previous chain of a re-join that could not prove the previous install's key) | **not judged**: the batch is refused (400 `stamp_from_other_ledger`, its body listing the refused pairs), **nothing recorded** in any ledger; the collector parks the rows (`outbox_row_parked`: undelivered, retained, never leased while parked) until the ledger is linked, or an admin releases them undelivered and never judged | **not judged**: the segment is parked (`summary_segment_parked`, exactly as for the flood refusal) and the rest of the batch is resubmitted |
 | `null` (a collector older than B2a, or a B2a collector before the first versioned response of its **current** install, C4) | today's ingest binding (the uploading install's actor at ingest); basis `ingest_current` | `single_binding` (the install has no audit row and a non-null actor) else `unallocated_no_stamp` |
 
 **The guarantee (what `fixtures/b4_offline_rebind.py` and the tests prove).**
@@ -92,6 +108,15 @@ install the pair names, never against the uploading install:
    is sealed**, whichever collector version wrote it (C4): its undelivered answer is `single_binding` while the install has no audit
    row and `unallocated_no_stamp` once it has one, so a part sealed before the install's first rebind and a part sealed after it
    differ, and that is disclosed (review r2 R9).
+5. **Ownership never crosses a ledger (round 11).** A row uploaded by an install of ledger L is owned by an actor of L's binding
+   history or by nobody: `actor_for_stamp` refuses, before any judgment, a pair naming an install outside L (the fixture's S8 probes
+   every uploader, pair and instant and finds no crossing; round 10 crossed for every issued pair named across Macs), and a refused
+   row is never judged until L is the named install's ledger. The first-sighting guarantee is therefore **per ledger**: for every
+   ledger L, install in L and V, the answer for `(install, V)` in L is decided at L's first sighting of the pair and never revisited,
+   and no other ledger ever judges that pair. What the hold costs an honest collector is a delay, never an answer: a pre-re-join row
+   delivered through an unlinked ledger waits (S9) and, once the ledger is linked, is judged in that ledger, where it reads the facts
+   and audit rows the old install's summary read, so it agrees with the member (null for a faulty pair, the version's actor for an
+   honest one); a row an admin releases instead is acknowledged undelivered and never judged, so the summary's answer stands alone.
 
 **Sightings and the durable fact.** `device_install_stamp_not_issued (tenant_id, ledger_install_id, recorded_by_install_id,
 device_install_id, version, first_seen_at, binding_version_then, source ∈ {echo, row, member})`, unique per `(ledger_install_id,
@@ -99,8 +124,10 @@ device_install_id, version)` (round 10; `recorded_by_install_id` is the install 
 `device_install_id` a foreign key to `device_installs` without cascade, written in the transaction of the request receipt, the ingest
 or the summary judgment that first saw the pair above the install's `binding_version`; never deleted except by a tenant erasure
 (below). A refused batch (schema violation, 400) judges nothing and records nothing. **Serialization (round 9, review r2 R5; round
-10, read c1c4 blocking 1).** A sighting **first takes the named install's row `FOR SHARE`** in the transaction that records the fact,
-and **only then reads `binding_version`, the audit rows and the facts**, all under that lock; a view of any of them loaded before the
+10, read c1c4 blocking 1; round 11).** A sighting **first takes the named install's row `FOR SHARE`** in the transaction that records
+the fact, and **only then reads the install's `ledger_install_id` (round 11), `binding_version`, the audit rows and the facts**, all
+under that lock; a pair whose install's ledger is not the uploader's ledger is refused right there, before any further read (round
+11, "Scope"); a view of any of them loaded before the
 lock (at request start, or by a caller that hands `eventRowsForStorage` a preloaded view, C6) is not a judgment input and is re-read
 under the lock. The rebind (`bindDeviceInstalls`, `reverseDeviceInstallActorBindings`, `plimsoll-cloud@4954995
 src/lib/device-install-actor-binding.ts:128-134,151,258`) first locks the install rows `FOR UPDATE` (`lockInstalls`), then updates
@@ -129,15 +156,27 @@ HMAC-SHA256(previous install's installKey, join token)`; the cloud's join route 
 ledger **only when the proof verifies** against that install in the token's tenant, whatever that install's lifecycle, and otherwise
 gives the new install its own ledger and answers `lineage: unlinked` (disclosed on the join receipt, in `/status` and on the certify,
 where the pre-re-join rows such a ledger delivers are counted as `stamp_from_other_ledger`; an honest B2a collector links whenever it
-has a previous install). `actor_for_stamp` for a row or member uploaded by install U reads the facts with `ledger_install_id =
-ledger(U)`: the old install X judging a summary member and the new install Z delivering the same row after a re-join read one fact
+has a previous install). `actor_for_stamp` for a row or member uploaded by install U requires, first, that the install the pair
+names is in U's ledger, `ledger(install) = ledger(U)`, and refuses the pair otherwise (round 11, below); it then reads the facts with
+`ledger_install_id = ledger(U)`: the old install X judging a summary member and the new install Z delivering the same row after a re-join read one fact
 (whichever recorded it first), so a faulty pair judged null in X's summary stays null when Z delivers it after X is rebound up to the
 version (round 9 keyed the fact by the uploader and gave that row to the person bound to X then; `b4_offline_rebind.py` R10, red
-under r9; `checks/round10-sql-orderings.log` S3, S3b). A fact another Mac's install (another ledger) recorded by naming `(install,
-V)` never enters `install`'s own ledger's view, so one Mac's faulty or hostile traffic cannot poison another Mac's next version (R7
-stays closed; the poisoning of guarantee 3 is confined to the ledger's own pairs), and lineage cannot be claimed without the
-previous install's key. A pair naming an install of another tenant fails closed and records nothing (the cloud test asserts the
-absence of the fact, not only the null). **Cap (round 9, low).** A request may create at
+under r9; `checks/round10-sql-orderings.log` S3, S3b). **Outside the ledger (round 11, read c1 r10 blockers 1-2).** A pair naming an
+install of the tenant that is **not in the uploader's ledger** is **refused before any judgment**: the sighting reads the named
+install's `ledger_install_id` under its lock, and when it differs from the uploader's ledger the batch is refused (400
+`stamp_from_other_ledger`, its body listing the refused pairs), nothing is judged and **nothing is recorded** in any ledger; on a
+summary batch the collector parks the segments whose parts name a refused pair and resubmits the rest exactly as for the flood
+refusal (C4's `partitionFloodRefusal` takes either reason); on a delivery it parks the refused rows in the outbox
+(`outbox_row_parked`, `partitionRefusedRows`: undelivered, retained under the ordinary rules, never leased while parked, listed in
+`/status` as `parkedRows` beside the `lineage` and on the certify) and resubmits the rest at once. Round 10 judged such a pair
+against the install it named and read only the uploader's ledger's facts, so another Mac's issued pair assigned the uploader's row to
+that Mac's actor (S8), and an unlinked re-join's delivery of an old faulty row was someone's while the old install's summary said
+nobody (S9). So one Mac's faulty or hostile traffic can neither poison another Mac's next version (R7 stays closed, now by
+construction: no install can sight another ledger's pairs at all; the poisoning of guarantee 3 is confined to the ledger's own
+pairs) nor take another Mac's actor, and the server-bound actor today's ingest protects (`src/lib/ingest.ts:397-427`) is never
+overridden across Macs (`b4_offline_rebind.py` S8, red under r10; `checks/round11-sql-orderings.log` S8). A pair naming an install
+of another tenant still fails closed and records nothing (the cloud test asserts the absence of the fact, not only the null). **Cap
+(round 9, low).** A request may create at
 most 8 new facts; a request that would create more is refused whole (400, `stamp_not_issued_flood`, its body listing the refused
 pairs), judges nothing and records nothing, so an authenticated collector cannot write one fact per distinct version per batch. Every
 new fact a request creates is listed on its receipt. **On a summary batch (round 10, read c1c4 low)** the collector splits the item:
@@ -210,7 +249,8 @@ lifecycle rule).
 **Judgment state.** Validity is decided at the first sighting of `(install, V)` and recorded; a version that did not exist then is
 invalid on both paths for ever. Parts are computed per received revision and frozen at the seal; a raw row's actor is bound once at
 ingest; because the fact precedes both, the rebind cannot slip between a sighting's read and its fact, every input is read after the
-lock, and every install of the ledger reads the same fact (round 10), neither can differ from the other.
+lock, every install of the ledger reads the same fact (round 10), and a pair naming an install outside the ledger is never judged
+until the ledger is linked (round 11), neither can differ from the other.
 
 **Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 13 cases): the reviewer's issued-but-unheard row,
 the honest orderings and the A→B→A reversal, the never-issued stamp, the first-sighting rule with the replay and the repair, the
