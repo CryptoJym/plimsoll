@@ -63,7 +63,7 @@ install the pair names, never against the uploading install:
 | Stamp | Delivered raw row (ingest) | Undelivered member (part) |
 |---|---|---|
 | `(install, V)` **issued at its first sighting**: `V = 0`, or the audit row for `V` existed when the cloud first saw `(install, V)` in any request echo, delivered row or summary member | `actor_id = actor_of(install, V)`; basis `raw_ingest` (identical to `binding_at_capture` by construction) | `actor_id = actor_of(install, V)`, basis `binding_at_capture` |
-| `(install, V)` **not issued at its first sighting** (`V > binding_version` then), recorded once as the durable fact `stamp_not_issued(uploader, install, V)` in the same transaction, keyed by the **uploading install** as well (round 9); or a pair naming an install the tenant does not have (judged closed, **nothing recorded**) | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify; **stays null after the cloud issues `V`**, at ingest, on replay and in every summary revision | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
+| `(install, V)` **not issued at its first sighting** (`V > binding_version` then), recorded once as the durable fact `stamp_not_issued(ledger, install, V)` in the same transaction, keyed by the uploader's **ledger** (round 10: the first install of the uploader's chain of installs on one Mac, so the old install judging a summary member and the new install delivering the row after a re-join read one fact; round 9 keyed it by the uploader); or a pair naming an install the tenant does not have (judged closed, **nothing recorded**) | `actor_id = null`, `metadata.actorStampInvalid = true`, listed in the S4 certify; **stays null after the cloud issues `V`**, at ingest, on replay and in every summary revision | `actor_id = null`, basis `unallocated_stamp_invalid`, candidates = every actor in the install's history plus its current actor |
 | `null` (a collector older than B2a, or a B2a collector before the first versioned response of its **current** install, C4) | today's ingest binding (the uploading install's actor at ingest); basis `ingest_current` | `single_binding` (the install has no audit row and a non-null actor) else `unallocated_no_stamp` |
 
 **The guarantee (what `fixtures/b4_offline_rebind.py` and the tests prove).**
@@ -83,8 +83,8 @@ install the pair names, never against the uploading install:
    for every ordering of capture, rebind, contact, delivery, re-join and late answer, including a row still in the outbox at a
    re-join (it keeps the old install's pair and is judged against the old install, whoever delivers it). The echo, `heard_at`, the
    delivery instant and the summary instant are not inputs.
-3. **A not-issued pair fails closed, permanently and visibly.** Rows carrying it are unallocated on both paths (never anyone's),
-   and so are rows the same install later stamps legitimately with that version: `(install, V)` is poisoned, listed on the
+3. **A not-issued pair fails closed, permanently and visibly.** Rows carrying it are unallocated on both paths and under whichever
+   install of the ledger judges them (never anyone's), and so are rows the same install later stamps legitimately with that version: `(install, V)` is poisoned, listed on the
    certify (`stamp_not_issued` with the first sighting, the binding version then and the affected row count) and on the impact
    report as unallocated with candidates; the repair is an admin rebind, which issues a fresh version. The cloud cannot tell a
    faulty stamp from a stamp issued later except by the order of sightings, which is why the fact is recorded durably at the first one.
@@ -93,8 +93,9 @@ install the pair names, never against the uploading install:
    row and `unallocated_no_stamp` once it has one, so a part sealed before the install's first rebind and a part sealed after it
    differ, and that is disclosed (review r2 R9).
 
-**Sightings and the durable fact.** `device_install_stamp_not_issued (tenant_id, uploader_install_id, device_install_id, version,
-first_seen_at, binding_version_then, source ∈ {echo, row, member})`, unique per `(uploader_install_id, device_install_id, version)`,
+**Sightings and the durable fact.** `device_install_stamp_not_issued (tenant_id, ledger_install_id, recorded_by_install_id,
+device_install_id, version, first_seen_at, binding_version_then, source ∈ {echo, row, member})`, unique per `(ledger_install_id,
+device_install_id, version)` (round 10; `recorded_by_install_id` is the install whose request first saw the pair, for the certify),
 `device_install_id` a foreign key to `device_installs` without cascade, written in the transaction of the request receipt, the ingest
 or the summary judgment that first saw the pair above the install's `binding_version`; never deleted except by a tenant erasure
 (below). A refused batch (schema violation, 400) judges nothing and records nothing. **Serialization (round 9, review r2 R5; round
@@ -120,11 +121,23 @@ of 566 (`b4_offline_rebind.py` R5b, red under r9; reproduced on the real migrati
 (B6): the R5 wait with the rebind observed waiting, the concurrent mirror order (the rebind holds its lock first; the sighting waits,
 reads the issued version, answers the actor and records nothing: without `FOR SHARE` it reads the old version, records a fact after the
 rebind commits and a judgment in between says the actor), and `loadSightingView` waiting for a held `FOR UPDATE` and returning the
-committed version with its audit row and every committed fact. **Scope (round 9, review r2 R7).** `actor_for_stamp` for a row or member
-uploaded by install U reads the facts with `uploader_install_id = U`; a fact another install recorded by naming `(install, V)` never
-enters `install`'s own view, so one install's faulty or hostile traffic cannot poison another install's next version (the
-poisoning of guarantee 3 is confined to the uploader's own pairs). A pair naming an install of another tenant fails closed and
-records nothing (the cloud test asserts the absence of the fact, not only the null). **Cap (round 9, low).** A request may create at
+committed version with its audit row and every committed fact. **Scope (round 9, review r2 R7; round 10, read c1c4 blocking 2).** Every
+install belongs to a **ledger**: `device_installs.ledger_install_id`, the first install of the chain of installs on one Mac. A fresh
+install is its own ledger. At a re-join the collector still holds the previous install's credentials (`join.ts:201-238` drops them
+only when it stages the grant), so the join request carries `previousInstall = { deviceId, proof }` with `proof =
+HMAC-SHA256(previous install's installKey, join token)`; the cloud's join route links the new install to the previous install's
+ledger **only when the proof verifies** against that install in the token's tenant, whatever that install's lifecycle, and otherwise
+gives the new install its own ledger and answers `lineage: unlinked` (disclosed on the join receipt, in `/status` and on the certify,
+where the pre-re-join rows such a ledger delivers are counted as `stamp_from_other_ledger`; an honest B2a collector links whenever it
+has a previous install). `actor_for_stamp` for a row or member uploaded by install U reads the facts with `ledger_install_id =
+ledger(U)`: the old install X judging a summary member and the new install Z delivering the same row after a re-join read one fact
+(whichever recorded it first), so a faulty pair judged null in X's summary stays null when Z delivers it after X is rebound up to the
+version (round 9 keyed the fact by the uploader and gave that row to the person bound to X then; `b4_offline_rebind.py` R10, red
+under r9; `checks/round10-sql-orderings.log` S3, S3b). A fact another Mac's install (another ledger) recorded by naming `(install,
+V)` never enters `install`'s own ledger's view, so one Mac's faulty or hostile traffic cannot poison another Mac's next version (R7
+stays closed; the poisoning of guarantee 3 is confined to the ledger's own pairs), and lineage cannot be claimed without the
+previous install's key. A pair naming an install of another tenant fails closed and records nothing (the cloud test asserts the
+absence of the fact, not only the null). **Cap (round 9, low).** A request may create at
 most 8 new facts; a request that would create more is refused whole (400, `stamp_not_issued_flood`), judges nothing and records
 nothing, so an authenticated collector cannot write one fact per distinct version per batch. Every new fact a request creates is
 listed on its receipt.
