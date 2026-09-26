@@ -41,6 +41,16 @@ receipted before the transaction that did the work commits; an exhausted retry i
 400 `stamp_from_other_ledger` names the ledger it judged, the uploader's ledger the request was authorized with, and the collector
 parks the refused rows under that wire value only (`CONTRACTS.md` C1 "Serialization", "Outside the ledger", C6).
 
+**What changed in round 14 (B0 round 8).** The two promises are now exact on the wire and bound by tests on both sides. The 400 body
+is `{ error: "stamp_from_other_ledger", pairs, ledgerInstallId }`, keyed `error` on the cloud and in the collector's parsed refusal
+(round 13 wrote `reason` on the collector side with no mapping); a 400 that names no ledger parks nothing and keeps the ordinary 400
+handling; a well-formed but unknown ledger id is an opaque value, parked under and released by the next response naming a different
+ledger. The exhausted retry is exactly 503 `{ error: "transaction_retry_exhausted", operation, attempts, sqlstate }` with `Retry-After`,
+answered through `collectorIngestErrorResponse` (today's generic handler would send `ingest_unavailable`); the default cap is bound
+(three aborts, never a fourth attempt) and the collector acknowledges nothing, parks nothing and retries at `Retry-After`. A retry
+keeps the uploader's ledger read at the request's authorization and re-reads everything else, so a retry after a merge refuses
+conservatively against that ledger (`CONTRACTS.md` C1 "Serialization", "Outside the ledger", C6).
+
 ## 1. Invariants that hold on every host at every step
 
 1. **No raw row is deleted by any job between the hold and S9, except under the disclosed hold-release ladder.** From S1b the prune is held (ARCHITECTURE.md §2.4); today's prune would otherwise delete a pending-upload row at age (`collector-cli/src/buffer.ts:3008-3013,3041-3052`). The ladder's rung at fewer than 5 days of runway deletes only rows whose delivery is acknowledged (`uploaded_at` set and an `acknowledged` receipt for the row's own id, `collector-cli/src/outbox.ts:662-671,701-709`), never a member of an open target, and writes a receipt and a tombstone; the S3 certify converts the affected sessions as `cloud_superset` (§3, §6). A rollback through S8 therefore replays or rebuilds from every raw row that is not in the cloud already; **after a rung-2 release** the old reader path is reconstructable only from the rows still present, and the difference is exactly the receipted release set (§8; `out/fixtures/sf1_ladder_rollback_parity.py`).
