@@ -108,12 +108,29 @@ Round 13 rule (B0 round 7, the independent read of C1 after round 12, its two bl
       named" but put no such field on the 400, so an implementation could only park under a ledger it learned later, the current
       one, under which a row refused against a stale view (the merge committed between the request's authorization and its lock)
       stays parked on every later response.
+Round 14 rule (B0 round 8, the independent read of C1 after round 13, its two blocking items and two should-fixes; CONTRACTS.md r14 C1):
+  (p) ONE FIELD NAME ON THE WIRE. The cloud's 400 body is { error: "stamp_from_other_ledger", pairs, ledgerInstallId } and the
+      collector's parsed refusal is that body, keyed by `error` on both sides. Round 13 as written had the cloud send `error` while the
+      collector's parsed refusal required `reason`, with no mapping: a collector built to the letter did not recognise the refusal it
+      received and parked nothing, so the row was never released. A 400 that names no ledger parks nothing (the round-13 text said so;
+      the round-13 fixture still parked under None and filled it from the next response): the rows keep the ordinary 400 handling,
+      never acknowledged, never parked under a guessed value. A well-formed but unknown ledger id is an opaque value: the collector
+      cannot verify a ledger exists and never compares it with anything but the ledger later responses name, so rows park under it and
+      release on the next authenticated response naming a different ledger, with no row lost.
+  (q) THE EXHAUSTED RETRY'S EXACT ANSWER, AND THE FIXED REQUEST CONTEXT. The third abort is 503 { error: "transaction_retry_exhausted",
+      operation, attempts: 3, sqlstate } with Retry-After, routed through the collector ingest error handler so the named body survives
+      (round 13 as written left the generic handler, which sends { error: "ingest_unavailable" }); the collector treats it as its ordinary
+      transient failure: nothing acknowledged, nothing parked, the rows retried after Retry-After. A retry re-reads the named install's
+      ledger, the binding, the audit rows and the facts under fresh locks, but the uploader's ledger U is fixed at the request's
+      authorization and is not re-read, so a retry that runs after a merge committed refuses conservatively against U (the next response
+      naming X releases the rows); round 13 said "every judgment input re-read" without that exception.
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
 ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (round-3 C1/C4 as written: the lock on the
 read of binding_version only, the fact keyed by the uploader, no lifecycle rule), r10 (round-4 C1/C4 as written: the ledger key,
 a pair judged against the install it names whichever ledger uploads it), r11 (round-5 C1 as written: the admin link moves one
 install and re-keys its old ledger's facts, with no destination check), r12 (round-6 C1 as written: no rule for a deadlocked
-transaction, and a 400 that names no ledger), r13 (this rule). Red under r6, r7, r8, r9, r10, r11 and r12, green under r13.
+transaction, and a 400 that names no ledger), r13 (round-7 C1 as written: the cloud's 400 keyed `error`, the collector's parsed refusal
+keyed `reason`, no mapping), r14 (this rule). Red under r6, r7, r8, r9, r10, r11, r12 and r13, green under r14.
 """
 import itertools
 import json
@@ -121,12 +138,13 @@ from _common import Checks, rule_arg
 
 rule = rule_arg()
 c = Checks("b4_offline_rebind", rule)
-R8 = rule in ("r8", "r9", "r10", "r11", "r12", "r13")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9-13
-R9 = rule in ("r9", "r10", "r11", "r12", "r13")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by rounds 10-13
-R10 = rule in ("r10", "r11", "r12", "r13")      # the round-10 machinery (lock then read, the ledger key, lifecycle) is kept by rounds 11-13
-R11 = rule in ("r11", "r12", "r13")             # the round-11 machinery (the refusal across ledgers, the hold, the admin link with its re-key) is kept by rounds 12-13
-R12 = rule in ("r12", "r13")                    # the round-12 machinery (the whole-ledger merge into a canonical destination) is kept by round 13
-R13 = rule == "r13"
+R8 = rule in ("r8", "r9", "r10", "r11", "r12", "r13", "r14")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9-14
+R9 = rule in ("r9", "r10", "r11", "r12", "r13", "r14")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by rounds 10-14
+R10 = rule in ("r10", "r11", "r12", "r13", "r14")      # the round-10 machinery (lock then read, the ledger key, lifecycle) is kept by rounds 11-14
+R11 = rule in ("r11", "r12", "r13", "r14")             # the round-11 machinery (the refusal across ledgers, the hold, the admin link with its re-key) is kept by rounds 12-14
+R12 = rule in ("r12", "r13", "r14")                    # the round-12 machinery (the whole-ledger merge into a canonical destination) is kept by rounds 13-14
+R13 = rule in ("r13", "r14")                           # the round-13 machinery (the retry from the start, the 400 naming the ledger it judged) is kept by round 14
+R14 = rule == "r14"
 # Round 10: the ledger each install uploads for (the first install of its chain on one Mac). Z re-joined X's Mac with a verified
 # link to X; Zu re-joined a Mac whose previous install could not be proved (no link: its own ledger, disclosed); P and Q are other Macs.
 LEDGER = {"X": "X", "Y": "Y", "W": "W", "R": "R", "Z": "X", "Zf": "X", "Zu": "Zu", "P": "P", "Q": "Q", "Xr": "Xr"}
@@ -506,7 +524,7 @@ def run_variant(order, uploaders):
             splits += 1
             if example is None: example = {"schedule": list(trace), "answers": answers}
     return {"order": order, "uploaders": list(uploaders), "schedules": len(results), "deadlocks": deadlocks, "splits": splits, "example": example}
-PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"], "r11": ["lock_then_read"], "r12": ["lock_then_read"], "r13": ["lock_then_read"]}.get(rule, ["no_lock"])
+PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"], "r11": ["lock_then_read"], "r12": ["lock_then_read"], "r13": ["lock_then_read"], "r14": ["lock_then_read"]}.get(rule, ["no_lock"])
 same_uploader = {order: run_variant(order, ("X", "X")) for order in ("no_lock", "lock_then_read", "facts_then_lock")}
 print("    R5b (two paths, one uploader, statement-level): " + json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "example"} for k, v in same_uploader.items()}))
 print("    R5b facts-first example: " + json.dumps(same_uploader["facts_then_lock"]["example"]))
@@ -601,7 +619,7 @@ class Ledgers:
         if install not in self.audit: return (None, "stamp_invalid:unknown_install")            # another tenant: judged closed, no fact
         if R11 and self.ledger[install] != view:                                                 # round 11: outside the uploader's ledger
             self.refused.append((uploader, install, v, at))
-            self.wire = {"reason": "stamp_from_other_ledger", "pairs": [[install, v]], **({"ledgerInstallId": view} if R13 else {})}
+            self.wire = {("error" if R13 else "reason"): "stamp_from_other_ledger", "pairs": [[install, v]], **({"ledgerInstallId": view} if R13 else {})}   # round 13 C6: the route's body is keyed `error` (round 14: on both sides)
             return ("held", "refused:stamp_from_other_ledger")
         key = self.key(uploader, install, v, view)
         if key in self.facts: return (None, "stamp_invalid:stamp_not_issued")
@@ -823,7 +841,8 @@ def enumerate16(retry_cap, handoff=True):
             s2, l2, p2, a2 = copy.deepcopy(state), copy.deepcopy(locals_), dict(pcs), dict(attempts)
             release16(s2, victim); l2[victim] = {}; p2[victim] = 0                        # rolled back: no lock, no fact, no move, no answer survives
             if retry_cap is None: l2[victim] = {"status": "aborted"}                       # rounds 6-12 as written: no rule for the aborted transaction
-            elif a2[victim] >= retry_cap: l2[victim] = {"status": "exhausted"}            # the cap: 503 transaction_retry_exhausted
+            elif a2[victim] >= retry_cap:                                                  # the cap: 503 transaction_retry_exhausted, the exact route answer (round 14)
+                l2[victim] = {"status": "exhausted", "response": {"status": 503, "retry_after": 5, "body": {"error": "transaction_retry_exhausted", "operation": "ledger_link" if victim == "M" else "sighting", "attempts": a2[victim], "sqlstate": "40P01"}}}
             else: a2[victim] += 1                                                          # round 13: run again from its first statement
             trace2 = trace + [f"DEADLOCK: {victim} aborted (40P01)" + (", retried from its start" if "status" not in l2[victim] else "")]
             if handoff:
@@ -879,6 +898,25 @@ print("    S15 adversarial (no hand-off): " + json.dumps({"schedules": len(adver
 c.expect(exhausted16 and not unruled16 and not half16 and not over16,
          "S15/cap: at most 3 attempts: in the adversarial schedules a transaction aborted three times ends as transaction_retry_exhausted (the caller's 503, after exactly 3 attempts) with nothing recorded, moved or acknowledged, and a committed transaction's result is whole; no transaction is ever left aborted without a rule (round 12 as written: every victim is)",
          json.dumps({"reach_the_cap": len(exhausted16), "no_rule": len(unruled16), "half_results": len(half16), "over_the_cap": len(over16), "example": (unruled16 or half16 or over16 or [{"trace": None}])[0]["trace"]}))
+# round 14: the exhausted sighting's exact route answer, and what the collector does with it (nothing acknowledged, nothing parked, retried after Retry-After)
+exhausted_responses16 = [r["locals"][n]["response"] for r in runs16_adversarial for n in ("S", "M") if r["locals"][n].get("status") == "exhausted"]
+bad_shape16 = [x for x in exhausted_responses16 if x["status"] != 503 or set(x["body"]) != {"error", "operation", "attempts", "sqlstate"} or x["body"]["error"] != "transaction_retry_exhausted" or x["body"]["attempts"] != 3 or x["body"]["sqlstate"] != "40P01" or not x.get("retry_after")]
+class Outbox503:
+    """The collector's outbox on a 503 (C1 "Serialization", round 14): the batch is returned to the outbox unacknowledged with next_attempt_at at Retry-After; no row is parked."""
+    def __init__(self, rows): self.rows, self.acknowledged, self.parked, self.next_attempt_at = list(rows), [], [], None
+    def on_503(self, response, now): self.next_attempt_at = now + response["retry_after"]; return {"acknowledged": list(self.acknowledged), "parked": list(self.parked), "outbox": list(self.rows), "retry_at": self.next_attempt_at}
+sighting503 = next((x for x in exhausted_responses16 if x["body"]["operation"] == "sighting"), None)
+after503 = Outbox503(["row-v1", "row-u1"]).on_503(sighting503, 700) if sighting503 else None
+c.expect(bool(exhausted_responses16) and not bad_shape16 and after503 == {"acknowledged": [], "parked": [], "outbox": ["row-v1", "row-u1"], "retry_at": 705},
+         "S15/503 (round 14): the exhausted retry's answer is exactly 503 { error: transaction_retry_exhausted, operation, attempts: 3, sqlstate } with Retry-After, for the sighting and for the merge; on it the collector acknowledges nothing, parks nothing and retries the batch after Retry-After (round 12 as written: no cap and no answer; the round-13 text named this body but left the route's generic handler, which sends ingest_unavailable, unbound)",
+         json.dumps({"exhausted": len(exhausted_responses16), "bad_shape": bad_shape16[:1], "sighting_503": sighting503, "collector_after_503": after503}))
+# round 14 (read c1 r13 should-fix 2): the request context is fixed. The uploader's ledger U was read for the request's authorization; a retried sighting
+# re-reads the named installs' ledgers, the binding, the audit rows and the facts under fresh locks but keeps U, so a retry that runs after the merge
+# committed sees X under its locks, compares it with U and refuses naming U: conservative, never a judgment in a ledger the request was not authorized for.
+retried_after_merge16 = [o for o in outcomes16 if o["attempts"]["S"] >= 2 and o["merge"] == "committed" and any(step.startswith("DEADLOCK: S aborted") for step in o["trace"]) and o["trace"].index([s for s in o["trace"] if s.startswith("DEADLOCK: S aborted")][-1]) < o["trace"].index("M.commit") < o["trace"].index("S.read")]
+c.expect(bool(retried_after_merge16) and all(o["sighting"] == "held" for o in retried_after_merge16),
+         "S15/fixed U (round 14): a retried sighting that reads the named installs after the merge committed refuses against U, the ledger its request was authorized with (kept across the retry, not re-read as X), and names U; nothing is judged in X on a request authorized for U (round 12 as written: no retry; the round-13 text said every judgment input is re-read, without excepting the request's fixed context)",
+         json.dumps({"schedules": len(retried_after_merge16), "outcomes": sorted({o["sighting"] for o in retried_after_merge16}), "example": (retried_after_merge16[0]["trace"] if retried_after_merge16 else None)}))
 
 # ---- 17. blocking 2 (read c1 r12): the 400 refusal names the ledger it judged, and the collector parks under that wire value ---------------
 # The uploader's ledger is read for the request's authorization, before the sighting's lock; a merge U -> X can commit in between, so the
@@ -889,11 +927,20 @@ c.expect(exhausted16 and not unruled16 and not half16 and not over16,
 # uploader's ledger the refusal was judged against (U); the collector parks under that wire value and the next response naming X
 # releases the row, which is resubmitted, judged in X, and agrees with every other judgment of its pair.
 class ParkedRows:
-    """The collector's park (C6 parkOutboxRows / releaseParkedRows). Round 13: a row is parked under the ledger the 400 named. Rounds 11-12 as
-    written: the 400 names no ledger, so the model fills the missing value from the next authenticated response, the current ledger: a
-    reading the round-12 text permits, since it names no source for the value."""
-    def __init__(self): self.rows = []
-    def park(self, row_id, body): self.rows.append([row_id, body.get("ledgerInstallId")])
+    """The collector's park (C6 partitionRefusedRows / parkOutboxRows / releaseParkedRows). Round 14: the parsed refusal is the cloud's 400 body,
+    keyed `error` on both sides; a body that names no ledger parks nothing (the rows keep the ordinary 400 handling: never acknowledged, never
+    parked under a guessed value); a well-formed but unknown ledger id is opaque: parked under, released by a different ledger. Round 13 as
+    written: the collector's parsed refusal was keyed `reason` while the cloud sent `error`, with no mapping, so the refusal is not recognised
+    and nothing is parked. Rounds 11-12 as written: the 400 names no ledger, so the model fills the missing value from the next authenticated
+    response, the current ledger: a reading the round-12 text permits, since it names no source for the value."""
+    def __init__(self): self.rows, self.unparked = [], []
+    KEY = "error" if R14 else "reason"                                 # the field the collector's parser reads (round 14: the cloud's, `error`)
+    def park(self, row_id, body):
+        if body.get(self.KEY) != "stamp_from_other_ledger": self.unparked.append(row_id); return "not_recognised"   # round 13 as written: `error` is not `reason`
+        if "ledgerInstallId" not in body:
+            if R13: self.unparked.append(row_id); return "no_ledger"   # rounds 13-14: parks nothing (the row keeps the ordinary 400 handling)
+            self.rows.append([row_id, None]); return "parked_under_none"
+        self.rows.append([row_id, body["ledgerInstallId"]]); return "parked"
     def on_response(self, ledger):                                      # every acknowledged response names the install's ledger (round 12)
         for row in self.rows:
             if row[1] is None: row[1] = ledger
@@ -907,22 +954,37 @@ view_700 = cloud17.ledger["V"]                                          # 700: V
 link_701 = cloud17.link("U", "X", 701)                                  # 701: the admin merges U into X before the sighting locks V
 refused_702 = cloud17.sight("V", 1, 702, uploader="V", view=view_700)   # 702: the sighting locks V, reads its ledger (X now), compares with U: refused
 body_702 = dict(cloud17.wire)                                           # the 400 body on the wire
-park17 = ParkedRows(); park17.park("row-v1", body_702)
+park17 = ParkedRows(); park_702 = park17.park("row-v1", body_702)                        # the collector parses the body it received
 released_720 = park17.on_response(cloud17.ledger["V"])                  # 720: the next acknowledged response names V's ledger, X
 retry_730 = cloud17.sight("V", 1, 730, uploader="V") if released_720 else None   # the resubmission is authorized with V's current ledger, X
 released_800 = park17.on_response(cloud17.ledger["V"])                  # 800: another response naming X
 print("    S16 (the refusal's ledger; the merge committed between authorization and the lock): " + json.dumps({"view_at_authorization": view_700, "link_701": link_701, "refused_702": refused_702, "wire_body": body_702,
-      "parked_under": [r[1] for r in park17.rows] or "released", "released_by_the_720_response": released_720, "retry_730": retry_730, "released_by_the_800_response": released_800, "still_parked": park17.rows, "facts": sorted("|".join(map(str, k)) for k in cloud17.facts)}))
+      "park_702": park_702, "parked_under": [r[1] for r in park17.rows] or "released", "released_by_the_720_response": released_720, "retry_730": retry_730, "released_by_the_800_response": released_800, "still_parked": park17.rows, "facts": sorted("|".join(map(str, k)) for k in cloud17.facts)}))
 c.expect(refused_702[0] == "held" and body_702.get("ledgerInstallId") == "U",
          "S16: the 400 stamp_from_other_ledger carries ledgerInstallId, the uploader's ledger the refusal was judged against (U, the request's authorization view, not X, the current ledger): the collector parks from the wire value (round 12: the body carried reason and pairs only, and the test supplied the ledger by hand)",
          f"refused={refused_702} body={body_702}")
 c.expect(released_720 == ["row-v1"] and retry_730 == (None, "stamp_invalid:stamp_not_issued") and ("X", "V", 1) in cloud17.facts and not park17.rows and released_800 == [],
          "S16: parked under the refusal's ledger U, the row is released by the first response naming X and judged in X (nobody's: its pair was not issued; one answer with every later judgment); parked under the current ledger X, the only value round 12's text let a collector find, it stays parked on the 720 response and on every later X response",
          f"released_720={released_720} retry_730={retry_730} still_parked={park17.rows} released_800={released_800}")
+c.expect(park_702 == "parked" and body_702.get("error") == "stamp_from_other_ledger" and ParkedRows.KEY == "error",
+         "S16/wire (round 14): the cloud's 400 body and the collector's parsed refusal use one field name, `error`, so the collector recognises the refusal it received and parks from it (round 13 as written: the cloud sent `error`, the collector's parsed refusal required `reason`, no mapping was defined, and a collector built to the letter parked nothing)",
+         f"park={park_702} body={body_702} collector_key={ParkedRows.KEY}")
 p_refused = cloud17.sight("X", 1, 810, uploader="P"); p_body = dict(cloud17.wire); park_p = ParkedRows(); park_p.park("row-p", p_body)
 p_same = park_p.on_response(cloud17.ledger["P"]); p_same_again = park_p.on_response(cloud17.ledger["P"])
 p_link = cloud17.link("P", "X", 900); p_released = park_p.on_response(cloud17.ledger["P"]); p_retry = cloud17.sight("X", 1, 910, uploader="P") if p_released else None
 c.expect(p_refused[0] == "held" and p_same == [] and p_same_again == [] and p_released == ["row-p"] and p_retry == ("B", "binding_at_capture"),
          "S16: the release compares two server-supplied values: a response naming the ledger the refusal named (P's, unchanged) releases nothing, and the response after the admin links P into X names X and releases the row, which is then judged in X (B's, like X's own judgment of (X, 1))",
          f"refused={p_refused} same={p_same},{p_same_again} link={p_link} released={p_released} retry={p_retry}")
+# round 14, the two edge cases of the wire value (read c1 r13 should-fix 1)
+body_no_ledger = {k: v for k, v in body_702.items() if k != "ledgerInstallId"}         # a 400 that names no ledger
+park_nl = ParkedRows(); nl_result = park_nl.park("row-nl", body_no_ledger); nl_720 = park_nl.on_response("X"); nl_800 = park_nl.on_response("U")
+c.expect(nl_result == "no_ledger" and park_nl.rows == [] and nl_720 == [] and nl_800 == [] and park_nl.unparked == ["row-nl"],
+         "S16/no ledger (round 14): a 400 that names no ledger parks nothing: the row is not parked under a guessed value, no later response releases anything, and it keeps the ordinary 400 handling in the outbox (never acknowledged); the round-13 fixture parked it under None and filled that from the next response, the current ledger, under which the row stayed parked for ever",
+         f"result={nl_result} rows={park_nl.rows} on_X={nl_720} on_U={nl_800} unparked={park_nl.unparked}")
+UNKNOWN = "ffffffff-ffff-4fff-8fff-ffffffffffff"                                        # well-formed, nobody's ledger: the collector cannot tell
+body_unknown = {**body_702, "ledgerInstallId": UNKNOWN}
+park_unk = ParkedRows(); unk_result = park_unk.park("row-unk", body_unknown); unk_same = park_unk.on_response(UNKNOWN); unk_x = park_unk.on_response("X"); unk_again = park_unk.on_response("X")
+c.expect(unk_result == "parked" and unk_same == [] and unk_x == ["row-unk"] and unk_again == [] and park_unk.rows == [] and park_unk.unparked == [],
+         "S16/unknown ledger (round 14): a well-formed but unknown ledger id is an opaque value: the row parks under it, a response naming that same value keeps it parked, the next authenticated response naming a different ledger (X) releases it exactly once, and no row is lost (the collector validates nothing it has no source for; the cloud alone knows its ledgers)",
+         f"result={unk_result} same={unk_same} on_X={unk_x} again={unk_again} rows={park_unk.rows} unparked={park_unk.unparked}")
 c.finish()
