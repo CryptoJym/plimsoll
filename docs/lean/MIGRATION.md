@@ -26,6 +26,14 @@ install outside the uploader's ledger before any judgment (400 `stamp_from_other
 rows and segments until the ledger is linked, by the join's proof or by an admin's audited link, which re-keys the linked ledger's
 facts in the same transaction, or until an admin releases them undelivered and never judged (`CONTRACTS.md` C1 "Scope").
 
+**What changed in round 12 (B0 round 6).** The admin's link moves a whole ledger, never one install: every install whose ledger is
+the source moves, with the source ledger's facts, in one transaction under one set of locks, into a destination that is the root of
+its own ledger in the same tenant, with one audit row (`device_install_ledger_links`, in the erasure list) and every moved install
+stamped; a member, a non-root destination and another tenant's install are refused with nothing moved. The join's lineage step holds
+the previous install's row `FOR SHARE`, so a join and a merge of one chain serialize. The acknowledged response names the install's
+ledger beside its lineage, and the collector resubmits parked rows when that ledger changes (`CONTRACTS.md` C1 "The link is the
+release", C6).
+
 ## 1. Invariants that hold on every host at every step
 
 1. **No raw row is deleted by any job between the hold and S9, except under the disclosed hold-release ladder.** From S1b the prune is held (ARCHITECTURE.md §2.4); today's prune would otherwise delete a pending-upload row at age (`collector-cli/src/buffer.ts:3008-3013,3041-3052`). The ladder's rung at fewer than 5 days of runway deletes only rows whose delivery is acknowledged (`uploaded_at` set and an `acknowledged` receipt for the row's own id, `collector-cli/src/outbox.ts:662-671,701-709`), never a member of an open target, and writes a receipt and a tombstone; the S3 certify converts the affected sessions as `cloud_superset` (§3, §6). A rollback through S8 therefore replays or rebuilds from every raw row that is not in the cloud already; **after a rung-2 release** the old reader path is reconstructable only from the rows still present, and the difference is exactly the receipted release set (§8; `out/fixtures/sf1_ladder_rollback_parity.py`).

@@ -1,6 +1,6 @@
 # Lean Plimsoll pending contract tests (eco-6hoxj.164.4, B0)
 
-These tests bind the lean-Plimsoll contracts (`docs/lean/CONTRACTS.md`, round 11 = B0 round 5, with the ARCHITECTURE, BUDGETS,
+These tests bind the lean-Plimsoll contracts (`docs/lean/CONTRACTS.md`, round 12 = B0 round 6, with the ARCHITECTURE, BUDGETS,
 MIGRATION, PROOF and BEADS documents beside it) to this repository's surfaces. **Every pending test fails today by design** and is declared
 `pending("<bead>")`, which node:test reports under `# todo`: the suite prints each failure and still exits 0, so it never
 blocks a build. The bead named in a test's title implements the surface and removes the marker in the same change; from then
@@ -11,7 +11,7 @@ missing surface must fail as a test, never as a typecheck error; product modules
 `loadSurface` as well, so a rename stays a pending failure. Files: `schema` (B2a/B10a/B10b/B22: DDL v3, C3), `retention-hold`
 (B10a), `actor-stamp` (B2a: the (install, version) pair, the joined install and its scope, join activation driven through `join.ts`
 with a fake cloud, the pre-B2a seed, the partial join, the echo's install, the flood split, and (round 11) a delivery refused as
-`stamp_from_other_ledger` parking only the refused rows until the ledger is linked or an admin releases them, C1/C4), `membership` (B2a), `runway`
+`stamp_from_other_ledger` parking only the refused rows until a response names another ledger (the ledger was linked, or the chain it was in was merged, round 12) or an admin releases them, C1/C4), `membership` (B2a), `runway`
 (B1/B10a/B2a: G owed, the census gate and the measured C_conv, C2), `day-key` (B5/B9a), `converter` (B2a: C3), `conversion-rejects`
 (B2a/B10b: retention and the live pointer, C3), `capture-gaps` (B22: C5), `receipts-and-ladder` (B2a/B10b/B13), `usage-record-pin`
 (three green guards and one B2a test, C8). Guards (green today): `b22-documents`, the foreign-keys pragma in `schema`, `helper`
