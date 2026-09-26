@@ -7,11 +7,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { ensureSessionSummarySchema, updateSessionSummary } from "../packages/collector-cli/src/session-summary";
-import { collectSessionSnapshots } from "../packages/collector-cli/src/session-sync";
+import { collectSessionSnapshots, runSessionSync } from "../packages/collector-cli/src/session-sync";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const completion = createProofCompletion("session-summary-downgrade", 7);
+const completion = createProofCompletion("session-summary-downgrade", 9);
 const root = process.env.PLIMSOLL_PROOF_ROOT!;
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const until = "2026-09-30T00:00:00.000Z";
@@ -251,6 +251,148 @@ async function main(): Promise<void> {
       assert.ok(triggerSql(headAfter39.database, "trg_session_summary_raw_update_v42"));
       completion.check("head_reupgrade_after_0739_keeps_scanned_aware_sql");
     } finally { headAfter39.close(); }
+
+    // A permitted receipt retarget releases a row that 0.7.41's own
+    // receipt-update trigger misses on the old delivery id. The head's
+    // eligibility revision must fence that old worker even when the row is
+    // ahead of the head cursor and its scanned-aware dirty marker stays clear.
+    const retargetFile = path.join(root, "reupgrade-receipt-retarget.sqlite");
+    const retargetSession = session(888);
+    const retargetHead = new LocalEventBuffer(retargetFile, { workspaceId: workspace });
+    ensureSessionSummarySchema(retargetHead.database);
+    // Simulate a round-2 ledger: keep its scanned-aware SQL, remove only the
+    // new revision trigger, then prove current startup installs it additively.
+    const scannedSql = triggerSql(retargetHead.database, "trg_session_summary_receipt_update_v42");
+    retargetHead.database.exec("drop trigger trg_session_summary_receipt_retarget_revision_v42");
+    ensureSessionSummarySchema(retargetHead.database);
+    assert.ok(triggerSql(retargetHead.database, "trg_session_summary_receipt_retarget_revision_v42"));
+    assert.equal(triggerSql(retargetHead.database, "trg_session_summary_receipt_update_v42"), scannedSql);
+    put(retargetHead, retargetSession, 888);
+    put(retargetHead, retargetSession, 889);
+    terminalReceipt(retargetHead, 889);
+    retargetHead.close();
+    const retargetOld = new buffer41.LocalEventBuffer(retargetFile, { workspaceId: workspace });
+    try {
+      summary41.ensureSessionSummarySchema(retargetOld.database);
+      const revision = () => (retargetOld.database.prepare(`select mutation_revision as value
+        from session_sync_summary_revision where session_id = ?`).get(retargetSession) as
+        { value: number } | undefined)?.value ?? 0;
+      let injected = false;
+      let revisionDelta = 0;
+      const raced = await summary41.updateSessionSummary(retargetOld.database, retargetSession, until, {
+        read: async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>) => {
+          const rows = await read(retargetOld.database)<T>(queries);
+          if (!injected && rows.some((row) => typeof (row as { outputTokens?: unknown }).outputTokens === "number")) {
+            injected = true;
+            const before = revision();
+            retargetOld.database.prepare("update upload_receipts set delivery_id = ? where delivery_id = ?")
+              .run(event(890), event(889));
+            revisionDelta = revision() - before;
+          }
+          return rows;
+        },
+      });
+      assert.equal(injected, true);
+      assert.ok(revisionDelta > 0, "eligibility retarget must advance the 0.7.41 revision fence");
+      assert.equal(raced.complete, false, "0.7.41 must reject the stale read");
+      assert.equal(collectSessionSnapshots(retargetOld.database,
+        { until, sessionIds: [retargetSession] })[0]?.events, 2);
+    } finally { retargetOld.close(); }
+
+    const retargetAgain = new LocalEventBuffer(retargetFile, { workspaceId: workspace });
+    try {
+      ensureSessionSummarySchema(retargetAgain.database);
+      const wireEvents: number[] = [];
+      for (const horizon of [until, "2026-09-30T00:00:01.000Z", "2026-09-30T00:00:02.000Z"]) {
+        const bodies: string[] = [];
+        const sent = await runSessionSync(config, { ledgerDb: retargetAgain.database, incremental: true,
+          sessionIds: [retargetSession], until: horizon, delayMs: 0, maxAttemptsPerBatch: 1,
+          log: () => undefined, fetchImpl: (async (_input, init) => {
+            const body = String(init?.body ?? "");
+            bodies.push(body);
+            return new Response(JSON.stringify(acceptedFixtureDelivery(body, config.installKey!)),
+              { status: 200, headers: { "content-type": "application/json" } });
+          }) as typeof fetch });
+        assert.equal(sent.sentSessions, 1);
+        assert.equal(bodies.length, 1);
+        const actual = JSON.parse(bodies[0]!).sessions[0].totals.events as number;
+        const scratch = collectSessionSnapshots(retargetAgain.database,
+          { until: horizon, sessionIds: [retargetSession] })[0]?.events;
+        assert.equal(actual, scratch);
+        wireEvents.push(actual);
+      }
+      assert.deepEqual(wireEvents, [2, 2, 2]);
+      console.log(JSON.stringify({ case: "0741-receipt-retarget-reupgrade", wireEvents }));
+      completion.check("0741_receipt_retarget_reupgrade_sends_full_count_on_three_horizons");
+    } finally { retargetAgain.close(); }
+
+    // Once 0.7.41 installs its old trigger set, its permitted eligibility
+    // marks advance the revision that its worker reads. The new receipt
+    // trigger covers the old delivery id that its update trigger omits.
+    const marks = new LocalEventBuffer(path.join(root, "eligibility-marks.sqlite"),
+      { workspaceId: workspace });
+    try {
+      ensureSessionSummarySchema(marks.database);
+      const sid = session(901);
+      put(marks, sid, 901);
+      put(marks, sid, 902);
+      put(marks, sid, 906);
+      const partial = await updateSessionSummary(marks.database, sid, until,
+        { read: read(marks.database), maxRows: 1, maxMs: 1_000 });
+      assert.equal(partial.complete, false);
+      summary41.ensureSessionSummarySchema(marks.database);
+      const revision = () => (marks.database.prepare(`select mutation_revision as value
+        from session_sync_summary_revision where session_id = ?`).get(sid) as
+        { value: number } | undefined)?.value ?? 0;
+      const mark = (name: string, change: () => void) => {
+        const before = revision();
+        change();
+        assert.ok(revision() > before, `${name} did not advance the old revision fence`);
+      };
+      mark("terminal receipt insert", () => terminalReceipt(marks, 902));
+      mark("receipt retarget release", () => {
+        marks.database.prepare("update upload_receipts set delivery_id = ? where delivery_id = ?")
+          .run(event(903), event(902));
+      });
+      mark("receipt retarget exclusion", () => {
+        marks.database.prepare("update upload_receipts set delivery_id = ? where delivery_id = ?")
+          .run(event(902), event(903));
+      });
+      mark("terminal receipt delete", () => {
+        marks.database.prepare("delete from upload_receipts where delivery_id = ?").run(event(902));
+      });
+      const rowid = (marks.database.prepare("select rowid as value from buffered_events where id = ?")
+        .get(event(902)) as { value: number }).value;
+      mark("outbox lineage mismatch insert", () => {
+        marks.database.prepare(`insert into upload_outbox
+          (delivery_id, raw_rowid, raw_id, raw_created_at, raw_generation,
+           base_envelope_json, base_bytes, state, next_attempt_at, created_at, updated_at)
+          values (?, ?, ?, ?, ?, '{}', 2, 'pending', ?, ?, ?)`).run(
+          event(904), rowid, event(903), created, "generation-902", created, created, created);
+      });
+      const beforeRejectedLineage = revision();
+      assert.throws(() => marks.database.prepare(
+        "update upload_outbox set raw_rowid = ? where delivery_id = ?",
+      ).run(rowid + 100, event(904)), /upload_outbox_lineage_is_immutable/);
+      assert.equal(revision(), beforeRejectedLineage);
+      mark("outbox lineage delete", () => {
+        marks.database.prepare("delete from upload_outbox where delivery_id = ?").run(event(904));
+      });
+      mark("raw lineage change", () => {
+        marks.database.prepare("update buffered_events set id = ? where id = ?")
+          .run(event(905), event(902));
+      });
+      mark("raw erasure", () => {
+        marks.database.prepare("delete from buffered_events where id = ?").run(event(905));
+      });
+      mark("raw privacy disposition", () => {
+        marks.database.prepare("update buffered_events set privacy_disposition = ? where id = ?")
+          .run("local_privacy_violation", event(906));
+      });
+      console.log(JSON.stringify({ case: "downgraded-eligibility-revision", marks: 9,
+        outboxRetargetRejected: true }));
+      completion.check("downgraded_eligibility_marks_advance_old_revision_fence");
+    } finally { marks.close(); }
     completion.complete();
   } finally {
     for (const dir of installed.reverse()) {

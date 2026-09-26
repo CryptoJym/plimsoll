@@ -616,6 +616,18 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
             on conflict(session_id) do update set
               reason = excluded.reason, updated_at = excluded.updated_at;
         end;
+        -- The 0.7.41 update trigger marks only the new delivery_id. Keep
+        -- its revision fence for the old side when a terminal id is retargeted.
+        create trigger if not exists trg_session_summary_receipt_retarget_revision_v42
+        after update of delivery_id, reason on upload_receipts
+        when ${oldReceiptAffects}
+        begin
+          insert into session_sync_summary_revision (session_id, mutation_revision)
+            select e.session_id, 1 from buffered_events e
+            join session_sync_summary_state s on s.session_id = e.session_id
+            where e.id = old.delivery_id and ${oldReceiptChange}
+            on conflict(session_id) do update set mutation_revision = mutation_revision + 1;
+        end;
       `);
     }
   }

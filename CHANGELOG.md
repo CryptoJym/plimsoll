@@ -12,6 +12,9 @@
   downgrade installs its own revision-marking triggers before sync. A CI
   rehearsal rejects a terminal privacy receipt raced with the old worker;
   0.7.39 still reads the full ledger on rollback (`.163.87` round 2).
+- A terminal receipt retarget now also advances the old delivery's session
+  revision. A 0.7.41 worker rejects a stale read after this edit, and the
+  re-upgraded collector rebuilds before sending (`.163.87` round 3).
 
 ## 0.7.5 — 2026-09-08
 
