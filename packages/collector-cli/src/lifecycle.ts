@@ -417,6 +417,15 @@ export type LifecycleReceipt = {
   restoreRefusal?: LifecycleRestoreRefusalRecord;
   /** snapshots_reconcile: what was found and repaired. */
   reconcile?: LifecycleReconcileRecord;
+  /** Completed update: best-effort stopped-service Codex pairing index upgrade. */
+  pairingIndexes?: LifecyclePairingIndexesRecord;
+};
+
+export type LifecyclePairingIndexesRecord = {
+  status: "applied" | "skipped";
+  reason: "ledger_missing" | "ledger_in_use" | "quiescence_unproven" | "timeout" | "upgrade_failed" | null;
+  attempts: number;
+  elapsedMs: number;
 };
 
 export type LifecycleSupportSnapshot = {
@@ -948,6 +957,16 @@ function validCompletedHealth(value: unknown, toVersion: string) {
     record.configCompatible === true && record.databaseCompatible === true && record.reason === "ready";
 }
 
+function validPairingIndexesRecord(value: unknown) {
+  const record = ownPlainRecord(value);
+  return record !== null && exactKeys(record, ["status", "reason", "attempts", "elapsedMs"]) &&
+    (record.status === "applied" || record.status === "skipped") &&
+    (record.status === "applied" ? record.reason === null :
+      ["ledger_missing", "ledger_in_use", "quiescence_unproven", "timeout", "upgrade_failed"].includes(record.reason as string)) &&
+    nonnegativeInteger(record.attempts) && record.attempts <= 2 &&
+    nonnegativeInteger(record.elapsedMs) && record.elapsedMs <= 180_000;
+}
+
 /**
  * Reads a completion marker as the full immutable receipt its operation
  * wrote. Only a receipt that is complete, has no unknown field, is internally
@@ -961,7 +980,7 @@ export function parseCompletionReceipt(
   options: { sequenceOptional?: boolean } = {},
 ): LifecycleCompletedOperation | null {
   const record = ownPlainRecord(value);
-  if (!record || !exactKeys(record, RECEIPT_KEYS, ["snapshot", "retention", "restore", "completionSequence"])) return null;
+  if (!record || !exactKeys(record, RECEIPT_KEYS, ["snapshot", "retention", "restore", "completionSequence", "pairingIndexes"])) return null;
   const { operation, status, fromVersion, toVersion } = record;
   if (record.schemaVersion !== LIFECYCLE_SCHEMA_VERSION || record.operationId !== operationId) return null;
   if (typeof record.toolVersion !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(record.toolVersion)) return null;
@@ -971,6 +990,8 @@ export function parseCompletionReceipt(
         sameList(record.retainedTargets, lists.retained) && sameList(record.purgeOnlyTargets, lists.purgeOnly)) ||
       !sameList(record.preserved, PRESERVED)) return null;
   if ("snapshot" in record && !validSnapshotRecord(record.snapshot)) return null;
+  if ("pairingIndexes" in record &&
+      (operation !== "update" || status !== "completed" || !validPairingIndexesRecord(record.pairingIndexes))) return null;
   // Receipts that record a snapshot, retention or restore were written after
   // sequencing began, so each must carry its durable completion sequence.
   const sequence = record.completionSequence;
@@ -1002,16 +1023,18 @@ function assertReadiness(readiness: LifecycleReadiness, version: string) {
  */
 export class LifecycleManager {
   private readonly readinessTimeoutMs: number;
+  private readonly pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord>;
 
   constructor(
     private readonly adapter: LifecycleAdapter,
-    options: { readinessTimeoutMs?: number } = {},
+    options: { readinessTimeoutMs?: number; pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord> } = {},
   ) {
     const requested = options.readinessTimeoutMs ?? 10_000;
     if (!Number.isSafeInteger(requested) || requested < 10 || requested > 60_000) {
       throw new Error("readiness timeout must be between 10 and 60000 milliseconds");
     }
     this.readinessTimeoutMs = requested;
+    this.pairingIndexes = options.pairingIndexes;
   }
 
   private async assertFreshOperation(operationId: string) {
@@ -1246,6 +1269,15 @@ export class LifecycleManager {
       journal.phase = "verified";
       await this.adapter.writeJournal(journal);
 
+      let pairingIndexes: LifecyclePairingIndexesRecord | undefined;
+      if (kind === "update" && this.pairingIndexes) {
+        try {
+          pairingIndexes = await this.pairingIndexes();
+        } catch {
+          pairingIndexes = { status: "skipped", reason: "upgrade_failed", attempts: 0, elapsedMs: 0 };
+        }
+      }
+
       const receipt: LifecycleReceipt = {
         schemaVersion: LIFECYCLE_SCHEMA_VERSION,
         toolVersion: PLIMSOLL_VERSION,
@@ -1260,6 +1292,7 @@ export class LifecycleManager {
         retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
         purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
         preserved: ["ledger", "history", "credentials", "workspace_membership"],
+        ...(pairingIndexes ? { pairingIndexes } : {}),
         ...await this.snapshotRecord(journal.snapshotId),
         ...await this.completionSequence(operationId),
       };

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
 import { accountAssertionContains, accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
 import type { CaptureBaselineFileObservation } from "./capture-baseline";
@@ -349,13 +350,105 @@ export type CaptureRootCandidate = {
 
 export type CaptureRootDiscoveryEntry = {
   source: CaptureRoot["source"];
-  state: "registered" | "candidate" | "missing";
+  state: "registered" | "candidate" | "missing" | "live_covered";
   /** Relative to the operator home, or null for a configured root outside it. */
   directory: string | null;
   outsideHome: boolean;
   shape: string | null;
   rootId: string | null;
+  /** Names of config sections and keys that establish a live path; no values. */
+  evidence?: string[];
 };
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+}
+
+/** Read a native-home config only when its physical file stays inside home. */
+function nativeConfig(home: string, directory: string, file: string): string | null {
+  const target = path.join(path.dirname(directory), file);
+  const relative = path.relative(home, target);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return null;
+  try {
+    const stat = fs.lstatSync(target);
+    if (!stat.isFile() || stat.size > 1_048_576) return null;
+    return fs.readFileSync(target, "utf8");
+  } catch { return null; }
+}
+
+function loopbackEndpoint(value: unknown, port: number, suffix: string) {
+  return value === `http://127.0.0.1:${port}${suffix}`;
+}
+
+/** A read-only diagnostic; only names of matched sections/keys leave here. */
+export function captureRootLiveCoverage(
+  home: string,
+  source: CaptureRoot["source"],
+  directory: string,
+  port: number,
+): string[] {
+  const resolvedHome = resolveDiscoveryHome(home);
+  if (source === "codex" && path.basename(directory) === "sessions") {
+    const sourceText = nativeConfig(resolvedHome, directory, "config.toml");
+    if (sourceText === null) return [];
+    try {
+      const otel = record(record(parseToml(sourceText))?.otel);
+      for (const [section, suffix] of [["trace_exporter", "/v1/traces"], ["exporter", "/v1/logs"]] as const) {
+        const exporter = record(record(otel?.[section])?.["otlp-http"]);
+        const headers = record(exporter?.headers);
+        const sourceHeader = headers && Object.entries(headers).find(([name]) => name.toLowerCase() === "x-plimsoll-source");
+        if (loopbackEndpoint(exporter?.endpoint, port, suffix) && sourceHeader?.[1] === "codex") {
+          return [`otel.${section}.otlp-http.endpoint`,
+            `otel.${section}.otlp-http.headers.x-plimsoll-source`];
+        }
+      }
+    } catch { return []; }
+    return [];
+  }
+  if (source !== "claude_code" || path.basename(directory) !== "projects") return [];
+  const sourceText = nativeConfig(resolvedHome, directory, "settings.json");
+  if (sourceText === null) return [];
+  try {
+    const settings = record(JSON.parse(sourceText));
+    if (!settings) return [];
+    const evidence: string[] = [];
+    const hooks = record(settings.hooks);
+    if (hooks) {
+      for (const [event, groups] of Object.entries(hooks)) {
+        if (!Array.isArray(groups)) continue;
+        const live = groups.some((group) => {
+          const handlers = record(group)?.hooks;
+          return Array.isArray(handlers) && handlers.some((handler) => {
+            const entry = record(handler);
+            return entry?.type === "http" &&
+              loopbackEndpoint(entry.url, port, "/hooks/claude-code");
+          });
+        });
+        if (live) evidence.push(`hooks.${event}.hooks.type`, `hooks.${event}.hooks.url`);
+      }
+    }
+    const env = record(settings.env);
+    const headers = typeof env?.OTEL_EXPORTER_OTLP_HEADERS === "string"
+      ? env.OTEL_EXPORTER_OTLP_HEADERS.split(",").some((header) =>
+        header.trim().toLowerCase() === "x-plimsoll-source=claude_code") : false;
+    if (env?.CLAUDE_CODE_ENABLE_TELEMETRY === "1" && headers) {
+      const signals = [["OTEL_LOGS_EXPORTER", "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "/v1/logs"],
+        ["OTEL_METRICS_EXPORTER", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "/v1/metrics"]] as const;
+      for (const [exporter, endpoint, suffix] of signals) {
+        const specific = loopbackEndpoint(env[endpoint], port, suffix);
+        const common = loopbackEndpoint(env.OTEL_EXPORTER_OTLP_ENDPOINT, port, "");
+        if (env[exporter] === "otlp" && (specific || common)) {
+          evidence.push("env.CLAUDE_CODE_ENABLE_TELEMETRY", `env.${exporter}`,
+            `env.${specific ? endpoint : "OTEL_EXPORTER_OTLP_ENDPOINT"}`,
+            "env.OTEL_EXPORTER_OTLP_HEADERS");
+          break;
+        }
+      }
+    }
+    return [...new Set(evidence)];
+  } catch { return []; }
+}
 
 /**
  * Python `json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -472,6 +565,7 @@ export function discoverCaptureRootCandidates(home: string): CaptureRootCandidat
 export function discoverCaptureRoots(
   home: string,
   roots: readonly CaptureRoot[],
+  port: number,
 ): CaptureRootDiscoveryEntry[] {
   const resolvedHome = resolveDiscoveryHome(home);
   const candidates = discoverCaptureRootCandidates(resolvedHome);
@@ -494,13 +588,15 @@ export function discoverCaptureRoots(
   });
   for (const candidate of candidates) {
     if (configured.has(candidate.directory)) continue;
+    const evidence = captureRootLiveCoverage(resolvedHome, candidate.source, candidate.directory, port);
     entries.push({
       source: candidate.source,
-      state: "candidate",
+      state: evidence.length ? "live_covered" : "candidate",
       directory: candidate.relativeDirectory,
       outsideHome: false,
       shape: candidate.shape,
       rootId: null,
+      ...(evidence.length ? { evidence } : {}),
     });
   }
   return entries;

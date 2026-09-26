@@ -144,6 +144,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-readiness
 
+      - name: Prove one kickstart for a loaded LaunchAgent with zero runs (eco-6hoxj.163.91)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:launch-agent-kickstart
+
       - name: Prove hosted-runner flake classes stay fixed (#187)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:flake-regression
@@ -196,6 +200,10 @@ jobs:
       - name: Prove bound Codex dispatch survives response pairing (eco-6hoxj.163.99)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-pairing-integration
+
+      - name: Prove live-covered homes are separate from capture gaps (eco-6hoxj.163.93)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-roots-live
 
       - name: Prove producer-token rotation covers the Codex seat profiles (eco-6hoxj.54)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

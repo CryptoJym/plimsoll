@@ -736,7 +736,7 @@ that gap without touching enrollment:
 
 ```bash
 # what native roots exist under $HOME, and which are already registered
-plimsoll capture-roots discover --json     # state: registered | candidate | missing
+plimsoll capture-roots discover --json     # roots: registered | candidate | missing; liveCovered separately
 
 # preview, then append one (repeat --directory to add several at once)
 plimsoll capture-roots add --source claude_code --directory ~/.claude/projects \
@@ -753,6 +753,12 @@ cannot be enumerated unambiguously (`capture_root_scan_ambiguous`), a config
 that would lose a top-level field this schema does not know
 (`append_only_violation`), or a config whose existing roots do not reproduce
 their own ids under the label given (`identity_derivation_mismatch`).
+
+`discover` puts unregistered homes that already report through a local Codex
+OTEL exporter or Claude hook/OTEL configuration in `liveCovered`, separate
+from file-capture candidates. Its evidence lists config section and key names,
+never their values. `add` permits those homes and warns that the new file path
+will sit beside the live path; 0.7.42 reconciles paired responses.
 
 `capture_root_scan_ambiguous` names the entries it could not resolve — a
 symlinked or non-regular `.jsonl`, an unreadable subdirectory — because the
