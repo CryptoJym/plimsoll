@@ -96,6 +96,7 @@ import {
   launchAgentPlistPath,
   launchctlBootoutCommand,
   launchctlBootstrapCommand,
+  launchctlKickstartCommand,
   launchctlPrintCommand,
   uninstallLaunchAgent,
 } from "./launch-agent";
@@ -708,6 +709,8 @@ function runLaunchctl(args: string[], setExitCode = true) {
 function launchctlJobState(): LaunchAgentLabelObservation & {
   exitCode: number | null;
   errorCode: string | null;
+  jobState: string | null;
+  runs: number | null;
 } {
   const args = launchctlPrintCommand();
   const result = spawnSync(args[0] ?? "launchctl", args.slice(1), {
@@ -716,7 +719,7 @@ function launchctlJobState(): LaunchAgentLabelObservation & {
     stdio: ["ignore", "pipe", "pipe"],
   });
   const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code ?? null;
-  const details = { exitCode: result.status, errorCode };
+  const details = { exitCode: result.status, errorCode, jobState: null, runs: null };
   if (result.error) return { kind: "query_failed", ...details };
   if (result.status !== 0) {
     const uid = typeof process.getuid === "function" ? process.getuid() : null;
@@ -734,6 +737,8 @@ function launchctlJobState(): LaunchAgentLabelObservation & {
   }
   const pidMatch = result.stdout.match(/^\s*pid\s*=\s*(\d+)\s*$/m);
   const pid = pidMatch ? Number(pidMatch[1]) : null;
+  const stateMatch = result.stdout.match(/^\s*state\s*=\s*(.*?)\s*$/m);
+  const runsMatch = result.stdout.match(/^\s*runs\s*=\s*(\d+)\s*$/m);
   // The label observation is compared against persisted identities, so it
   // must use the same UTC algorithm and carry the explicit tag.
   const processStartFingerprint = pid ? readUtcProcessStartFingerprint(pid) : null;
@@ -747,7 +752,14 @@ function launchctlJobState(): LaunchAgentLabelObservation & {
         }
       : null,
     ...details,
+    jobState: stateMatch?.[1] ?? null,
+    runs: runsMatch ? Number(runsMatch[1]) : null,
   };
+}
+
+function loadedButUnspawned(job: ReturnType<typeof launchctlJobState>) {
+  return job.kind === "reported" && job.processIdentity === null &&
+    job.jobState === "not running" && job.runs === 0;
 }
 
 // Issue #158: one canonical mutation authority for every LaunchAgent
@@ -894,6 +906,34 @@ async function loadVisibleLaunchAgent(
     };
   }
   try {
+    const finishLoaded = async (
+      status: "already_loaded" | "bootstrap_succeeded",
+      firstReadiness: LaunchAgentLoadReadiness,
+    ) => {
+      const base = {
+        loaded: true,
+        status,
+        manifestDigest: visible.manifestDigest,
+        manifestIdentityDigest: visible.manifestIdentityDigest,
+      };
+      if (firstReadiness.verified || !loadedButUnspawned(launchctlJobState())) {
+        return { ...base, readiness: firstReadiness };
+      }
+      assertLaunchAgentFence(fence);
+      // A loaded job with zero runs is launchd's accepted-but-not-spawned
+      // state. One plain kickstart is the only recovery attempt.
+      const kicked = runLaunchctl(launchctlKickstartCommand(), false);
+      const readiness = kicked ? await verifyPostBootstrapReadiness(port) : firstReadiness;
+      return {
+        ...base,
+        status: kicked
+          ? readiness.verified ? status : "kickstart_readiness_failed" as const
+          : "kickstart_failed" as const,
+        initialReadiness: firstReadiness,
+        readiness,
+        kickstart: { attempted: true, succeeded: kicked, reason: "loaded_not_running_runs_zero" as const },
+      };
+    };
     const pidPath = collectorLogPath("collector.pid");
     const observeLabel = () => launchctlJobState();
     const observeListener = () => observeCollectorListener(port);
@@ -922,6 +962,9 @@ async function loadVisibleLaunchAgent(
           manifestDigest: visible.manifestDigest,
           manifestIdentityDigest: visible.manifestIdentityDigest,
         };
+      }
+      if (loadedButUnspawned(launchctlJobState())) {
+        return finishLoaded("already_loaded", await verifyPostBootstrapReadiness(port));
       }
       return {
         loaded: true,
@@ -1007,19 +1050,17 @@ async function loadVisibleLaunchAgent(
         },
       };
     }
-    return {
-      loaded: true,
-      status: "bootstrap_succeeded" as const,
-      manifestDigest: visible.manifestDigest,
-      manifestIdentityDigest: visible.manifestIdentityDigest,
-      // Issue #148: bootstrap truth and collector readiness are separate
-      // facts. `loaded` stays literal; `readiness` records whether a live
-      // collector actually answered /status within the bounded window.
-      readiness: await verifyPostBootstrapReadiness(port),
-    };
+    // Bootstrap truth and serving truth remain distinct. The fallback runs
+    // only after the ordinary readiness window and a zero-run label reading.
+    return finishLoaded("bootstrap_succeeded", await verifyPostBootstrapReadiness(port));
   } finally {
     releaseLaunchAgentFence(fence);
   }
+}
+
+function launchAgentLoadFailed(load: { loaded: boolean; status: string }) {
+  return !load.loaded || load.status === "kickstart_failed" ||
+    load.status === "kickstart_readiness_failed";
 }
 
 function unloadPriorReceipt(prior: LaunchAgentUnloadPriorState) {
@@ -5658,7 +5699,7 @@ async function main() {
       };
       // A collector that did not come back is a failure of this command, not
       // a note in a receipt an operator may never read.
-      const failedStep = !load.loaded
+      const failedStep = launchAgentLoadFailed(load)
         ? "load"
         : !(daemon.reachable && daemon.processLive && daemon.runtimeIdentityMatches)
           ? "daemon_verification"
@@ -6426,7 +6467,7 @@ async function main() {
         2,
       ),
     );
-    if (flag("--load") && !load.loaded && process.exitCode === undefined) process.exitCode = 1;
+    if (flag("--load") && launchAgentLoadFailed(load) && process.exitCode === undefined) process.exitCode = 1;
     return;
   }
 
@@ -6451,7 +6492,7 @@ async function main() {
     }
     const load = await loadVisibleLaunchAgent(plistPath, config.port, false, launchAgentMutationAuthority());
     console.log(JSON.stringify({ ...load, plistPath, label: LAUNCH_AGENT_LABEL }, null, 2));
-    if (!load.loaded && process.exitCode === undefined) process.exitCode = 1;
+    if (launchAgentLoadFailed(load) && process.exitCode === undefined) process.exitCode = 1;
     return;
   }
 

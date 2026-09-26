@@ -144,6 +144,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-readiness
 
+      - name: Prove one kickstart for a loaded LaunchAgent with zero runs (eco-6hoxj.163.91)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:launch-agent-kickstart
+
       - name: Prove hosted-runner flake classes stay fixed (#187)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:flake-regression

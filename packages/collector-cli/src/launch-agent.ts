@@ -1287,3 +1287,8 @@ export function launchctlPrintCommand(label = LAUNCH_AGENT_LABEL, uid = process.
   if (label !== LAUNCH_AGENT_LABEL) fail("LABEL_NOT_ALLOWLISTED");
   return ["launchctl", "print", `gui/${uid ?? ""}/${label}`].filter(Boolean);
 }
+
+export function launchctlKickstartCommand(label = LAUNCH_AGENT_LABEL, uid = process.getuid?.()) {
+  if (label !== LAUNCH_AGENT_LABEL) fail("LABEL_NOT_ALLOWLISTED");
+  return ["launchctl", "kickstart", `gui/${uid ?? ""}/${label}`].filter(Boolean);
+}
