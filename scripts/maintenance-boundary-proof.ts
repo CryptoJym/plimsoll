@@ -104,6 +104,11 @@ const FIFO_AVAILABILITY_BUDGETS = {
   statusMaxMs: 500,
   hookP95Ms: 750,
   hookMaxMs: 1_200,
+  // The deadline fires before failActive sends TERM, waits its 100 ms grace,
+  // sends KILL, and waits up to 800 ms for close. Review measurements of
+  // healthy fire-to-rejection time were 115-179 ms under quiet, CPU, and disk
+  // load; 1,000 ms allows the configured grace plus 100 ms for bookkeeping.
+  deadlineFireToReapMs: 1_000,
   rejectionWaitMs: 10_000,
   requestTimeoutMs: REQUEST_TIMEOUT_MS,
 } as const;
@@ -402,6 +407,7 @@ async function fifoAvailabilityProof() {
   // one. statusP95Ms is therefore not comparable across that change.
   const idleAgent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
   let runPromise: Promise<MaintenanceRunOutcome> | null = null;
+  let rejectedAtMs = Number.NaN;
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -458,7 +464,7 @@ async function fifoAvailabilityProof() {
 
     const runStartedAt = performance.now();
     runPromise = boundary.run();
-    void runPromise.catch(() => undefined);
+    void runPromise.catch(() => { rejectedAtMs = Date.now(); });
     await waitFor(() => fs.existsSync(markerPath), "fifo_child_block_marker");
 
     const statuses = await statusWave(agent);
@@ -500,9 +506,11 @@ async function fifoAvailabilityProof() {
     const runToReapMs = performance.now() - runStartedAt;
     const status = boundary.status();
     // run() first starts a child and waits for ready (allowed 5 s above).
-    // lastStartedAt is set when the work timer is armed, so this interval
-    // measures the promised work deadline plus TERM/KILL/reap grace only.
+    // The arm-to-reap interval includes any delay in firing the timer while
+    // this proof serves hook waves. Bound the interval after the deadline
+    // actually fires so loaded hosts do not hide a slow TERM/KILL/reap path.
     const deadlineToReapMs = Date.now() - Date.parse(status.lastStartedAt ?? "");
+    const fireToReapMs = rejectedAtMs - Date.parse(status.lastCompletedAt ?? "");
     const rowsAfter = Number((buffer.database.prepare(
       "select count(*) as n from buffered_events",
     ).get() as { n: number }).n);
@@ -517,6 +525,12 @@ async function fifoAvailabilityProof() {
     assert.equal(status.reap.orphanRisk, false, "reaped child must leave no orphan risk");
     assert.equal(status.childPresent, false, "reaped child must not remain attached");
     assert.ok(Number.isFinite(deadlineToReapMs), "work-timer start must be recorded");
+    assert.ok(
+      Number.isFinite(fireToReapMs) && fireToReapMs >= 0 &&
+        fireToReapMs <= FIFO_AVAILABILITY_BUDGETS.deadlineFireToReapMs,
+      `deadline fire to child rejection/reap took ${fireToReapMs}ms, exceeded ` +
+        `${FIFO_AVAILABILITY_BUDGETS.deadlineFireToReapMs}ms`,
+    );
 
     const serialized = JSON.stringify({ statuses: statuses.map((row) => row.body), status });
     assert.equal(serialized.includes(PRIVATE_PATH_SENTINEL), false, "receipts must remain path-free");
@@ -544,6 +558,7 @@ async function fifoAvailabilityProof() {
       hookP95Ms: Number(hookP95.toFixed(3)),
       hookMaxMs: Number(hookMax.toFixed(3)),
       deadlineToReapMs,
+      fireToReapMs,
       runToReapMs: Number(runToReapMs.toFixed(3)),
       termSignals: status.reap.termSignals,
       killSignals: status.reap.killSignals,
