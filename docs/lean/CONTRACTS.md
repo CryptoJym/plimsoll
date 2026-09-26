@@ -187,8 +187,13 @@ and audit rows the old install's summary read: the same answer (`b4_offline_rebi
 under the admin's receipt: never delivered, never judged, listed on the certify, so the old install's summary answer stands alone.
 An honest B2a collector links at join whenever it still holds the previous install's key, so the hold is reached only when that key
 is gone (a lost config, a rotated key) or by a faulty or hostile collector, and it costs an honest collector a delay, never an
-answer. A pair naming an install of another tenant still fails closed and records nothing (the cloud test asserts the absence of
-the fact, not only the null). **Cap (round 9, low).** A request may create at
+answer. **What "another Mac never enters the ledger" means (round 11, read c1 r10 should-fix 4).** The ledger is the chain of
+installs that proved possession of one another's keys; the possession proof cannot tell a copied key on another physical Mac from
+the same Mac, so the separation between Macs holds **while the previous install's key stays secret** (the ordinary uncompromised-key
+assumption of the install key itself), and lineage cannot be claimed without that key. Within that assumption the first-sighting
+guarantee is per ledger (guarantee 5), and the intentional R7 separation is exactly the ledger boundary: nothing an install of
+another ledger sends is ever judged in, or recorded for, this ledger. A pair naming an install of another tenant still fails closed
+and records nothing (the cloud test asserts the absence of the fact, not only the null). **Cap (round 9, low).** A request may create at
 most 8 new facts; a request that would create more is refused whole (400, `stamp_not_issued_flood`, its body listing the refused
 pairs), judges nothing and records nothing, so an authenticated collector cannot write one fact per distinct version per batch. Every
 new fact a request creates is listed on its receipt. **On a summary batch (round 10, read c1c4 low)** the collector splits the item:
@@ -227,8 +232,9 @@ names, ignoring and counting one whose named install is not the authenticated in
 and no fact can arise in X's ledger from Z's echo. It is a diagnostic and a sighting,
 never ownership: `stamp_ahead_of_echo` (a request carries a stamp above its own echo), `echo_ahead_of_binding` (an echo above the
 install's `binding_version`; it records the not-issued fact), `stamp_sequence_regressed` (a segment's versions are not
-non-decreasing in rowid order) and `stamp_from_earlier_install` (a pair naming an install other than the uploader: expected after a
-re-join, counted; a not-issued one records a fact for the uploader, never for the named install, round 9) are recorded on the request receipt and the segment, shown in `/status`, the S4 certify and the impact report,
+non-decreasing in rowid order) and `stamp_from_earlier_install` (a pair naming an install other than the uploader **but in its
+ledger**: expected after a linked re-join, counted; a not-issued one records a fact for the uploader's ledger, round 10; a pair
+naming an install **outside** the ledger is `stamp_from_other_ledger` and refuses the batch, round 11) are recorded on the request receipt and the segment, shown in `/status`, the S4 certify and the impact report,
 and change no actor. `heard_at` on the audit row is the instant of the **first request that echoes** the version, a disclosure
 fact for the export's `changed_at → heard_at` window; a response that supplies a version sets nothing, and the registration
 response is not an echo. `heard_at` exists only for an **issued** version, because it lives on the audit row: the instant of an
@@ -253,10 +259,16 @@ permitted, the facts read before the lock included, must agree; 8 of 566 split u
 ledger sight the same pair around the rebind: 2 of 142 schedules split under r9's uploader key, 0 under the ledger key; the sequential
 re-join case, X's summary at 300, the re-join at 500, X rebound to G as version 5 at 600, Z's replay at 700: null throughout under r10,
 G's under r9; the key separates Macs and joins installs of one Mac; a join whose proof fails starts its own ledger and is disclosed)
-and the lifecycle case (an install revoked at 900 still names its version's actor at 950): 51 checks, r6 17/51, r7 25/51, r8 40/51,
-**r9 45/51**, r10 51/51 (`--rule r8` is round 8 as written: the late answer replaces the pair, no lock, the fact keyed by the named
-install; `--rule r9` is round 9 as written: the lock on the read of `binding_version` only, the fact keyed by the uploader, no
-lifecycle rule).
+and the lifecycle case (an install revoked at 900 still names its version's actor at 950); **round 11** adds S8 (another Mac's
+install P, bound to B, uploads X's issued pair `(X, 2)`: held, never C's, nothing recorded; and for every uploader, pair and instant
+the answer is an actor of the uploader's own ledger or nobody) and S9 (the unlinked re-join: X's summary judges the faulty `(X, 2)`
+nobody's at 300, U re-joins without proof at 500, X is rebound to C as 2 at 600, U's delivery at 700 is held, the admin links U at
+800 and the delivery at 850 is nobody's like the member; the honest `(X, 1)` is B's on both paths; the link's re-key keeps U's own
+poisoned `(U, 1)` nobody's after U is rebound to 1; a linked re-join is judged at once as in round 10; a copied key passes the
+possession proof): 60 checks, r6 21/60, r7 29/60, r8 44/60, r9 47/60, **r10 54/60**, r11 60/60 (`--rule r8` is round 8 as written:
+the late answer replaces the pair, no lock, the fact keyed by the named install; `--rule r9` is round 9 as written: the lock on the
+read of `binding_version` only, the fact keyed by the uploader, no lifecycle rule; `--rule r10` is round 10 as written: a pair judged
+against the install it names in the uploader's ledger's view, whichever ledger uploads it).
 
 **Judgment state.** Validity is decided at the first sighting of `(install, V)` and recorded; a version that did not exist then is
 invalid on both paths for ever. Parts are computed per received revision and frozen at the seal; a raw row's actor is bound once at
@@ -264,27 +276,34 @@ ingest; because the fact precedes both, the rebind cannot slip between a sightin
 lock, every install of the ledger reads the same fact (round 10), and a pair naming an install outside the ledger is never judged
 until the ledger is linked (round 11), neither can differ from the other.
 
-**Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 13 cases): the reviewer's issued-but-unheard row,
+**Tests.** Cloud `tests/contracts/lean/actor-binding-stamp.contract.test.ts` (B6, 15 cases): the reviewer's issued-but-unheard row,
 the honest orderings and the A→B→A reversal, the never-issued stamp, the first-sighting rule with the replay and the repair, the
 re-join (honest, pre-re-join outbox row, faulty, null after the join), C4, `firstEchoHeardAt` with deliveries as requests, an echo
 attributed only to the install it names, and the diagnostics, `eventRowsForStorage` binding by the pair against the view loaded under
 the lock (a not-issued pair yields one new fact for the uploader's ledger, an unknown install fails closed and records **no** fact),
-the ledger-keyed fact across Macs (R7) and across a re-join (X's fact binds Z and Z's binds X, before and after X is rebound up to the
-version), lifecycle, `acknowledgedResponse`, the per-actor parts; `actor-binding-stamp-postgres.contract.test.ts` (B6, 7 cases on the
+the ledger-keyed fact across a re-join (X's fact binds Z and Z's binds X, before and after X is rebound up to the version), lifecycle,
+`acknowledgedResponse` (with `lineage`, round 11), the per-actor parts, and (round 11) another Mac's install refused before any
+judgment with no fact anywhere (R7, test 11), S8 on both paths and through `eventRowsForStorage` (test 14), S9 held and then judged
+after the link with the null-stamp exception untouched (test 15); `actor-binding-stamp-postgres.contract.test.ts` (B6, 9 cases on the
 repository's disposable Postgres cluster, set up as `checks/postgres-harness-repaired-probe.log` proves): the fact in the sighting's own
 transaction, replay after the version is issued and a revoked install's issued pair, the R5 row lock with the rebind observed waiting
 and the concurrent mirror order, R6 and R7 by the ledger, `loadSightingView` lock-first with the reviewer's ordering replayed through
-it, one ledger under two installs with the join's lineage proof, retention with the erasure-only guard and erasure with zero residue;
-`schema-additions.contract.test.ts` (5 cases: the columns, the fact with its tenant, ledger, recording install and install reference,
+it, one ledger under two installs with the join's lineage proof, retention with the erasure-only guard and erasure with zero residue,
+and (round 11) `cluster()` stopping the cluster on any set-up failure, R7 refusing (case 4), S8, S9 with the admin link, its re-key
+and the linked-once rule (case 8), and the join route driven through `fixtures/join-route-child.ts` (case 9: a reused token refused
+with no install created, a proof replayed under a fresh token and a previous install of another tenant joining unlinked, the linked
+grant with `lineage`); `schema-additions.contract.test.ts` (5 cases: the columns with the link's audit columns (round 11), the fact with its tenant, ledger, recording install and install reference,
 the plan's erasure order and the residue check, the guard migration, the other additions). Collector
-`tests/contracts/lean/actor-stamp.contract.ts` (B2a, 11 cases): null before the first response, the pair on the identity row and never
+`tests/contracts/lean/actor-stamp.contract.ts` (B2a, 12 cases): null before the first response, the pair on the identity row and never
 lowered within one install, the echo with its install and the pair on the wire, both keys allowlisted through the seal, the scope
 cleared by a re-join and a transition with the new install's 0 accepted, join activation recording the new install with the
 handshake's version while a pre-re-join row keeps its pair, the old install's late answer ignored and counted, join activation driven
 through `join.ts` with a fake cloud (the handshake's version recorded only when its `deviceId` is the grant's install; the join request's
 `previousInstall` proof), the pre-B2a seed and `joined_install_unknown`, the partial join reported as `join_incomplete` with the echo
-naming the ledger's install, and the flood refusal splitting a summary batch; `helper.contract.ts` gains a green guard proving that
-`join.ts` activation completes on today's code with a fake cloud.
+naming the ledger's install, the flood refusal splitting a summary batch, and (round 11) a delivery refused as
+`stamp_from_other_ledger` split the same way, its rows parked and never judged, retried on `lineage: linked` or released by an
+admin as undeliverable (test 12); `helper.contract.ts` gains a green guard proving that `join.ts` activation completes on today's
+code with a fake cloud.
 
 ## C2. S1b runway: G per host, one G, G owed (review-r6 blocker 2 and should-fix 5; review-r1 blocker 2 and should-fix 5; review-r2 should-fixes 5-6; B1, B10a and B2a collector)
 
@@ -426,17 +445,19 @@ the new one. Until the first versioned response of the **joined** install the co
 collector: a fresh install's rows before its first contact, an upgraded install's rows before its first post-upgrade response, and a
 re-joined ledger's rows between the join and the new install's first versioned response carry `actor_binding_version = null`; the
 join records the new install's version 0 where the handshake response carried it, so that window is normally empty. Rows already
-in the outbox at a re-join keep the pair they were stamped with and are judged against that install (C1). The cloud treats every
+in the outbox at a re-join keep the pair they were stamped with and are judged against that install (C1; through a ledger the join
+could not link they are held until the ledger is linked, C1 "Scope", round 11: the collector's promise here, keep the pair, is
+unchanged). The cloud treats every
 null stamp by the C1 exception, so the exception is stated as "stamp = null on an install rebound before the seal", not as "older
 collectors". The collector's `/status` shows `actorBinding = {state ∈ ok | joined_install_unknown | join_incomplete,
 joinedInstall, install, version, heardAt, stampedRows, nullStampedRows, earlierInstallRows, ignoredResponses, lineage ∈ linked |
-unlinked, parkedSegments}` so the size of the exception, of the re-join tail, of the ignored late answers and of the degraded states
+unlinked, parkedSegments, parkedRows (round 11)}` so the size of the exception, of the re-join tail, of the ignored late answers and of the degraded states
 is visible per host, and B2a's acceptance counts the null-stamped rows admitted before the first response on the Studio5 copy. Test:
-collector `actor-stamp.contract.ts` (11 cases: null until the first response; stamped after; the joined install recorded and cleared by
+collector `actor-stamp.contract.ts` (12 cases: null until the first response; stamped after; the joined install recorded and cleared by
 a re-join and a transition; the pre-re-join row keeps its pair; the old install's late answer ignored and counted, the echo the joined
 install's; round 10: join activation driven through `join.ts` with a fake cloud, the handshake's version recorded only when its
 `deviceId` is the grant's install, the join request's lineage proof; the pre-B2a seed and `joined_install_unknown`; the partial join
-as `join_incomplete` with the echo naming the ledger's install; the flood split) with `helper.contract.ts` proving the `join.ts` premise;
+as `join_incomplete` with the echo naming the ledger's install; the flood split; round 11: the parked rows) with `helper.contract.ts` proving the `join.ts` premise;
 cloud `actor-binding-stamp.contract.test.ts` (C4 case, the re-join cases). Fixture: `b4_offline_rebind.py` case L (red under r8) and
 the join-lineage check of section 11 (red under r9).
 
