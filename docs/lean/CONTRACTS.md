@@ -142,16 +142,27 @@ most 8 new facts; a request that would create more is refused whole (400, `stamp
 nothing, so an authenticated collector cannot write one fact per distinct version per batch. Every new fact a request creates is
 listed on its receipt.
 
-**Retention and erasure (round 9, review r2 should-fix 2).** The answer for every pair is read from the audit rows and from every
-install a pair can name, the **old** install after a re-join included. They are therefore kept **until tenant erasure**: audit rows,
-superseded installs and the `stamp_not_issued` facts are outside every retention job and every future device-removal path (a path
-that deleted an install would turn its pairs from an actor into null); the fact's foreign key to `device_installs` (no cascade)
-refuses such a delete by construction. At `plimsoll-cloud@4954995` only tenant erasure deletes installs or audit rows
-(`src/lib/work-intelligence/subject-rights.ts:500,506`). Tenant erasure deletes `device_install_stamp_not_issued` (tenant-scoped)
-**before** `device_installs`, in the same transaction, and the residue check counts it (ARCHITECTURE.md §7); the `tenant_id`
-column exists for exactly that. Tests: cloud `schema-additions.contract.test.ts` (the model with `tenant_id`, `uploader_install_id`,
-the install relation without cascade; the erasure list and residue check), `actor-binding-stamp-postgres.contract.test.ts` (the
-refused install delete; erasure with zero residue).
+**Retention and erasure (round 9, review r2 should-fix 2; round 10, read c1c4 should-fixes 3-5).** The answer for every pair is
+read from the audit rows and from every install a pair can name, the **old** install after a re-join included, **whatever that
+install's lifecycle**: `device_installs.lifecycle` (`active`, `suspended`, `revoked`; `src/lib/fleet-registry/contracts.ts:38-64`)
+gates the authentication of requests, never the audit rows, so revoking the old identity after a re-join (the natural clean-up) turns
+no pair into null, and the view a sighting reads is built from every install of the tenant, never from the active ones only
+(`b4_offline_rebind.py` section 12, red under r9; `checks/round10-sql-orderings.log` S6). They are therefore kept **until tenant
+erasure**: audit rows, superseded installs and the `stamp_not_issued` facts are outside every retention job and every future
+device-removal path (a path that deleted an install would turn its pairs from an actor into null). The fact's foreign key to
+`device_installs` (no cascade) refuses the delete of an install some fact names, that is of faulty-stamp installs only; every other
+install, the old install after an honest re-join included, is guarded by an **erasure-only delete trigger** on `device_installs` like
+the audit table's (`prisma/migrations/20260923170000_…:24-41`): a delete is allowed only while `plimsoll.erasing_tenant` names the
+row's tenant, so `capture_watermarks`' cascade (`20260923180000_…:45`) can fire under erasure alone. At `plimsoll-cloud@4954995` only
+tenant erasure deletes installs or audit rows (`src/lib/work-intelligence/subject-rights.ts:500,506`). Tenant erasure deletes
+`device_install_stamp_not_issued` (tenant-scoped) **before** `device_installs`, in the same transaction, and the residue check counts
+it (ARCHITECTURE.md §7); the order that matters is the one erasure runs, `TENANT_COLUMN_MODELS` in
+`src/lib/work-intelligence/tenant-erasure-plan.ts:15-49` (`subject-rights.ts:549` iterates it; the deleter object literal's key order
+decides nothing), so the fact model is listed there before `DeviceInstall`; the `tenant_id` column exists for exactly that. Tests:
+cloud `schema-additions.contract.test.ts` (the model with `tenant_id`, `ledger_install_id`, `recorded_by_install_id`, the install
+relation without cascade; the plan's order and the residue check; the guard migration), `actor-binding-stamp-postgres.contract.test.ts`
+(the refused delete of an install a fact names and of one no fact names; erasure through the erasure-only path with zero residue; a
+revoked install's issued pair still the version's actor); cloud `actor-binding-stamp.contract.test.ts` test 13 (lifecycle).
 
 **What the echo is for.** `actorBindingVersionHeard` on every request, **upload deliveries included**, is the collector's
 `max(persisted version of the current install, highest stamp carried for the current install)`. It is a diagnostic and a sighting,
