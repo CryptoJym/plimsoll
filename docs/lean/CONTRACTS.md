@@ -677,7 +677,10 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
 - `src/lib/actor-binding-stamp.ts`: `actorForStamp({ stamp, path, binding, ledgerInstallId })` → `{ actorId, basis, stampInvalid? }`,
   `ledgerInstallId` being the uploader's ledger (round 11: the call **throws** `StampFromOtherLedgerError`, message
   `stamp_from_other_ledger`, when `binding.ledgerInstallId` differs, before any judgment, so both paths refuse at the one ownership
-  function; round 13: the error carries `ledgerInstallId`, the reading ledger the refusal was judged against), where `binding = { installId, ledgerInstallId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued:
+  function; round 13: the error carries `ledgerInstallId`, the reading ledger the refusal was judged against; round 14: the error is
+  `StampFromOtherLedgerError { status: 400, code: "stamp_from_other_ledger", pairs, ledgerInstallId }`, constructed `new
+  StampFromOtherLedgerError({ pairs, ledgerInstallId })`, `code` like the routes' other typed errors (`InstallTenantMismatchError.code`)
+  and the name the wire carries as `error`; its message is the code), where `binding = { installId, ledgerInstallId, currentVersion, currentActorId, actorByVersion, hasAuditRows, notIssued:
   number[], lifecycle }` is the state of the install the stamp's pair names as `loadSightingView` returned it under the lock, `notIssued` being the facts of the
   reading ledger's view; `lifecycle` is carried, never judged (round 10); `sightStamp(binding, stamp)` → the binding with `notIssued`
   extended when the stamp is above `currentVersion` (pure; persisting the fact is B6's); `firstEchoHeardAt(requests)` over every
@@ -689,10 +692,11 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `bindings[actorBindingInstall]`; `bindings` **is the record `loadSightingView` returned in the ingest transaction, after the lock,
   for the installs the batch's pairs name** (round 10; the function stays pure, the route may not hand it a view loaded earlier); a pair
   naming an install outside `bindings` fails closed and records nothing; a pair naming an install whose `ledgerInstallId` is not the
-  option's `ledgerInstallId` makes the whole call throw `StampFromOtherLedgerError { status: 400, reason: "stamp_from_other_ledger",
+  option's `ledgerInstallId` makes the whole call throw `StampFromOtherLedgerError { status: 400, code: "stamp_from_other_ledger",
   pairs, ledgerInstallId }` before any row is bound (round 13: `ledgerInstallId` is the option's, the uploader's ledger the request was
   authorized with, which the refusal was judged against), and the route answers that 400 with the pairs and that ledger, `{ error:
-  "stamp_from_other_ledger", pairs, ledgerInstallId }`, judging nothing and recording nothing (round 11);
+  "stamp_from_other_ledger", pairs, ledgerInstallId }`, judging nothing and recording nothing (round 11; round 14: through
+  `collectorIngestErrorResponse`, below, and the collector's parsed refusal is that body, keyed `error` on both sides);
   sets `metadata.actorStampInvalid`; appends every new
   not-issued fact `{ ledgerInstallId, recordedByInstallId, deviceInstallId, version, source }` to `sightings`, which the route persists
   in the same transaction (round 9). The summary path (`actorPartsForSegment`) takes its `install` view from the same call in the
@@ -724,10 +728,15 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   C1 "Serialization"): runs `run(tx)` in a fresh `$transaction` and, when PostgreSQL aborts it with SQLSTATE `40P01` or `40001`
   (Prisma `P2034`, or the code on the driver error), rolls it back and runs it again from its first statement, at most `attempts` in
   all with no wait of its own, calling `onRetry({ attempt, sqlstate })` before each retry; nothing of an aborted attempt survives or
-  is acknowledged; when the last attempt is aborted too it rejects `TransactionRetryExhaustedError { status: 503, reason:
-  "transaction_retry_exhausted", operation, attempts, sqlstate }`, and the ingest, summary and admin-link routes, which run every C1
-  transaction through it, answer that 503 with `Retry-After` (`collectorIngestErrorResponse` already answers Prisma `P2034` 503 with
-  `Retry-After`; the surface bounds the attempts before that fallback and names them). Proved on the repository's disposable Postgres cluster by `actor-binding-stamp-postgres.contract.test.ts`
+  is acknowledged; a retry re-reads everything `run` reads and keeps what the caller closed over, the request's authorization
+  context (the uploader's ledger, round 14); when the last attempt is aborted too it rejects `TransactionRetryExhaustedError { status:
+  503, code: "transaction_retry_exhausted", operation, attempts, sqlstate }` (round 14: `code`, constructed `new
+  TransactionRetryExhaustedError({ operation, attempts, sqlstate })`, its message the code), and the ingest, summary and admin-link
+  routes, which run every C1 transaction through it, answer that 503 through `collectorIngestErrorResponse` (round 14, below) with
+  exactly `{ error: "transaction_retry_exhausted", operation, attempts, sqlstate }` and `Retry-After` (the handler already answers
+  Prisma `P2034` 503 with `Retry-After`; the surface bounds the attempts before that fallback and names them). The default cap is
+  proved by three deadlocks forced in a row (case 8 c3): the third abort is the 503 with `attempts: 3`, `onRetry` ran before the
+  second and the third attempt only, and there was no fourth attempt. Proved on the repository's disposable Postgres cluster by `actor-binding-stamp-postgres.contract.test.ts`
   (needs `PLIMSOLL_PROOF_PG_BIN` as `ci.yml`'s usage-projection step has; the harness applies `0_init` first, connects as the cluster's
   superuser through the socket with the port in the authority, inserts `work_tenants.updated_at`, and runs the erasure in a child
   process bound to the cluster, `tests/contracts/lean/fixtures/erase-tenant-child.ts`; `checks/postgres-harness-repaired-probe.log`;
@@ -735,6 +744,14 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   `tests/contracts/lean/fixtures/join-route-child.ts`, proved runnable against today's route by `checks/join-route-child-probe.log`,
   and on macOS PostgreSQL 17 needs a valid `LC_ALL` to start, `checks/round11-sql-orderings.log`; round 13: the deadlock cases shorten
   `deadlock_timeout` per transaction, `SET LOCAL`, so the detector fires in a fraction of a second). (B6, C1)
+- `src/lib/ingest-error-response.ts` (round 14): `collectorIngestErrorResponse(error, serverErrorCode)` gains two branches **before**
+  its Prisma and generic ones, in the shape of its existing typed-error branches: `StampFromOtherLedgerError` → 400 `{ error:
+  error.code, pairs, ledgerInstallId }` with no `Retry-After` (a refusal is not a transient failure: the collector parks, it does not
+  back off); `TransactionRetryExhaustedError` → 503 `{ error: error.code, operation, attempts, sqlstate }` with `Retry-After` (the
+  handler's existing delay); an untyped error still maps to `{ error: serverErrorCode }` 503 and never carries a private message.
+  Proved at the route boundary by `ingest-route-wire.contract.test.ts`, which drives the shipped `POST` of
+  `src/app/api/work-intelligence/ingest/route.ts` with the ingest transaction mocked to throw each typed error (the composition of the
+  transaction with `retryOnTransactionRollback` is B6's and is read, not tested, C7). (B6, C1)
 - `src/lib/delivery-ack-response.ts`: `acknowledgedResponse` emits `actorBindingVersion`, (round 11) `lineage` and (round 12)
   `ledgerInstallId` for a registered install (`CollectorUploadAuthorization` gains `actorBindingVersion: number`, `lineage: "linked" |
   "unlinked"` and `ledgerInstallId: string`), so a collector whose rows are parked learns when its ledger was linked, and a member of
@@ -785,9 +802,11 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   ok | joined_install_unknown | join_incomplete, joinedInstall, configInstall }` for `/status`; `lean/summary-upload.ts`:
   `partitionFloodRefusal(items, { pairs })` → `{ resubmit, parked }` (the segments whose parts name a refused pair parked, everything
   else resubmitted; it takes a `stamp_from_other_ledger` refusal the same way, round 11); `lean/upload-park.ts` (round 11):
-  `partitionRefusedRows(events, refusal)`, `refusal` being the parsed 400 body `{ reason, pairs, ledgerInstallId }` → `{ resubmit,
-  parked, ledgerInstallId }` for a delivery refused as `stamp_from_other_ledger` (round 13: it hands the ledger the 400 named on to
-  the park and throws on a body that names none, so nothing is ever parked under a guessed ledger); `buffer.ts` gains
+  `partitionRefusedRows(events, refusal)`, `refusal` being the parsed 400 body `{ error: "stamp_from_other_ledger", pairs,
+  ledgerInstallId }` (round 14: keyed `error`, the body exactly as the cloud route sends it, one field name on both sides) → `{
+  resubmit, parked, ledgerInstallId }` for a delivery refused as `stamp_from_other_ledger` (round 13: it hands the ledger the 400
+  named on to the park and throws on a body that names none, so nothing is ever parked under a guessed ledger; round 14: the upload
+  path catches that throw and gives the rows the ordinary 400 handling); `buffer.ts` gains
   `parkOutboxRows(ids, reason, ledgerInstallId)` (the ledger the 400 named, as `partitionRefusedRows` handed it on, never a value the
   collector supplied or learned itself; rounds 12-13), `parkedRows()`
   and `releaseParkedRows({ reason: "lineage_linked", ledgerInstallId } | { reason: "admin_release", receipt })` (a parked row is never
@@ -799,7 +818,15 @@ and linted, so a missing surface is loaded at run time through `loadSurface()` a
   earlier installs' stamps do not raise it) and `.actorBindingInstallHeard` (the ledger's joined install the echo is for, round 10),
   and the pair on every event's metadata; `packages/shared/src/schemas.ts`: `aiWorkIngestBatchSchema` accepts both;
   `analytical-metadata.ts`: `metadataKeyDisposition("actorBindingVersion")` and `("actorBindingInstall")` are identifiers;
-  `outbound-envelope.ts`: `sealOutboundEnvelope` keeps both. (B2a)
+  `outbound-envelope.ts`: `sealOutboundEnvelope` keeps both. Round 14, the wire path of `uploadBufferedEvents` (C1 "Outside the
+  ledger", "Serialization"): a 400 whose parsed body is `{ error: "stamp_from_other_ledger", pairs, ledgerInstallId }` goes through
+  `partitionRefusedRows`; the refused rows are parked through `parkOutboxRows` under the body's `ledgerInstallId` (an unknown id is
+  parked under as received), the rest is resubmitted in the same cycle, and the call resolves with nothing uploaded and no failure
+  (no backoff, no circuit: a parked row is neither); a body naming no ledger keeps the ordinary 400 handling (`remote_validation`,
+  the rows back in the outbox, nothing parked, nothing acknowledged); every acknowledged response's `ledgerInstallId` is handed to
+  `releaseParkedRows({ reason: "lineage_linked", ledgerInstallId })`, so the rows parked under a different ledger travel again; and
+  a 503 keeps today's `remote_transient` path (nothing acknowledged, nothing parked, the batch retried at `Retry-After`). Bound by
+  `actor-stamp.contract.ts` tests 14-17 against a fake cloud that answers with the exact serialized bodies. (B2a)
 - `packages/collector-cli/src/lean/runway.ts`: `LEAN_ROW_WIDTHS`; `estimateHostG(census)` (with the optional `segmentProxy`;
   `null` for an unmeasured census); `holdRunway({ freeBytes, reserveBytes, rebuildHeadroomBytes, gGateBytes, rawBytesAtCensus,
   converterWrittenBytes, rawUnfoldedBytesSinceCensus, conversionComplete, leanTableBytesNow?, grossGrowthP95PerDay, rawBytes,
@@ -852,7 +879,15 @@ deadlocking with the merge in both interleavings, the transaction that waited fi
 12 wrote it, the link not taking effect or the batch left unanswered, then under round 13 the aborted operation run again from its
 start and committed, the merge with the sighting's facts re-keyed or the sighting refusing against its view; the refusal naming the
 ledger it judged and released by the next response naming the merged ledger) in round 13 on PostgreSQL 17.10
-(`checks/round13-sql-orderings.log`), not through B6's code; the join route was driven through `fixtures/join-route-child.ts` against today's
+(`checks/round13-sql-orderings.log`), not through B6's code; the round-14 wire shapes (the exact 400 and 503 bodies) are bound by
+route tests whose ingest transaction is mocked to throw the typed errors, so they prove the route boundary and the handler mapping,
+not the transaction: where B6 wraps the transaction in `retryOnTransactionRollback` and how the thrown error reaches the handler is
+B6's to compose and its review to read; the two body literals are pinned byte-identical in both repositories
+(`checks/wire-body-pin.log`), the collector's 503 and malformed-400 expectations were checked against today's upload path before the
+pending tests were written (`checks/collector-wire-path-probe.log`) and the route harness against today's route
+(`checks/cloud-route-wire-harness-probe.log`); no PostgreSQL cluster was run in round 14 (the default cap is bound by the pending
+case 8 c3, whose partner transactions force three deadlocks on the real detector; the round-11 to round-13 SQL logs are carried
+unchanged); the join route was driven through `fixtures/join-route-child.ts` against today's
 route on the disposable cluster (`checks/join-route-child-probe.log`: 201 for a fresh token, 409 `used` for a reuse with no second
 install; `previousInstall` and `lineage` are absent today, which is where the pending case fails). What
 no test can bind is where a future route *calls* `loadSightingView`: the pending proof shows the call itself locks first and returns
