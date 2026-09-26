@@ -808,10 +808,11 @@ export class CollectorMaintenance {
    * eco-6hoxj.163.18 (review r2 B1, r3 N4): the capture frontier the upload
    * claim attests moves only from a stat-only check of every tailed file
    * (capture-frontier.ts), never from a pass. Capture phase only. A check
-   * starts at most once per interval (the first at once), walks each source
-   * for at most CAPTURE_COVERAGE_TURN_MS per cadence and resumes where it
-   * stopped; a source's frontier moves when its walk completes. Each source's
-   * start time is taken before its walk. A check that fails leaves the
+   * starts at most once per interval (the first at once), aims to walk each
+   * source for CAPTURE_COVERAGE_TURN_MS per cadence and resumes where it
+   * stopped. Synchronous work can exceed that target. A source's frontier
+   * moves when its walk completes. Its start time is taken before the walk.
+   * A check that fails leaves the
    * frontier unchanged. Without a Grok tailer this loop captures no Grok usage,
    * so there is none to cover.
    */
@@ -855,7 +856,8 @@ export class CollectorMaintenance {
         advance((first + offset) % walks.length, performance.now() + shareMs);
       }
       // Every source gets its first share before an active source reuses idle
-      // time. The common deadline prevents the bonus from extending the turn.
+      // time. The common deadline stops bonus work; a synchronous step may
+      // still run past it.
       for (let offset = 0; offset < walks.length && !this.signal?.aborted; offset += 1) {
         if (performance.now() >= turnDeadline) break;
         advance((first + offset) % walks.length, turnDeadline);

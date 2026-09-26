@@ -47,7 +47,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -426,13 +426,16 @@ export class RolloutTailer {
       return new CaptureCoverageWalk(null);
     }
     const verdict = jsonlCoverageCheck(this.buffer.database);
+    const known = new KnownPartialJsonlFiles(this.buffer.database, PARSER_KIND);
+    const firstCheck = !hasCompleteCaptureCoverage(this.buffer.database, "codex");
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.sessionsDir],
       maxEntries,
       failOnMissing: true,
       missingFromRestart: true,
-      changedDirectory: hasCompleteCaptureCoverage(this.buffer.database, "codex")
-        ? undefined : (directory) => changedDirectoryCoverageFile("codex", directory),
+      prepareKnown: (maxRows) => known.prepare(maxRows),
+      unlistedFiles: () => known.unlistedFiles(),
+      changedDirectory: firstCheck ? (directory) => changedDirectoryCoverageFile("codex", directory) : undefined,
       open: (directory, depth) => openCaptureCoverageDirectory(directory, (entry) => {
         const full = path.join(directory, entry.name);
         if (depth < 3) {
@@ -446,7 +449,9 @@ export class RolloutTailer {
       }, this.coverageDirectoryCache, depth),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
-        return verdict(this.cursorKey(file), stat);
+        const checked = verdict(this.cursorKey(file), stat);
+        if (checked) known.checked(checked.key);
+        return checked;
       },
       checkLink: (link) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), link);

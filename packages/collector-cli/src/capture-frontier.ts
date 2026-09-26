@@ -16,9 +16,10 @@ import { jsonlScanStateKey } from "./jsonl-byte-tailer";
  * enrollment, and Grok's sweep reaches a session only every few cadences, so a
  * pass can finish clean while a file it has not read keeps growing.
  *
- * The check is stat-only and walks each source in turns of at most
- * CAPTURE_COVERAGE_TURN_MS (review r3, N4), resuming where it stopped. For
- * each file it asks the tailer's own state whether the file has been read to
+ * The check is stat-only and aims for CAPTURE_COVERAGE_TURN_MS per turn
+ * (review r3, N4), resuming where it stopped. A synchronous read, stat or
+ * database write can exceed that soft deadline. For each file it asks the
+ * tailer's own state whether the file has been read to
  * its current end.
  * - Read to its end, or untouched since the epoch began: covered.
  * - Otherwise the file is uncovered since the last check that saw it covered,
@@ -33,7 +34,8 @@ import { jsonlScanStateKey } from "./jsonl-byte-tailer";
  * - If a directory changes during a source's first walk, a file removed
  *   before its open cursor reached the name cannot be identified. That walk
  *   records a conservative uncertainty gap from the epoch start. Later
- *   walks retain uncovered rows for files they previously saw disappear.
+ *   walks reconcile saved partial tailer cursors with their listed files;
+ *   an unlisted partial file stays a gap instead of silently disappearing.
  * - A symlink where a tailer would read a file or descend into a directory is
  *   never covered (review r4, S1). The tailers do not follow links, and
  *   neither does this check: nothing behind one is read, listed or stat'ed.
@@ -61,7 +63,7 @@ export const CAPTURE_WRITE_LAG_MS = 60 * 60 * 1000;
 export const CAPTURE_HOLD_LIMIT_MS = 60 * 60 * 1000;
 /** How often the maintenance worker starts a (stat-only) coverage check. */
 export const CAPTURE_COVERAGE_INTERVAL_MS = 15 * 60 * 1000;
-/** Wall time one maintenance cadence spends on a coverage check; the walk resumes on the next. */
+/** Soft wall-time target for a coverage turn; synchronous work may exceed it. */
 export const CAPTURE_COVERAGE_TURN_MS = 250;
 /** Classified entries one check may visit per source; beyond it the check is incomplete. */
 export const CAPTURE_COVERAGE_MAX_ENTRIES = 200_000;
@@ -273,6 +275,10 @@ export type CaptureCoverageWalkSpec = {
   changedDirectory?(directory: string): CaptureCoverageFile | null;
   /** A previously listed file absent from a verifying restart may be checked as a loss. */
   missingFromRestart?: boolean;
+  /** Page saved cursor rows before checking files, charging each row to this source's turn. */
+  prepareKnown?(maxRows: number): { work: number; done: boolean };
+  /** Verdicts for saved partial files that this walk never checked. */
+  unlistedFiles?(): Iterable<CaptureCoverageFile>;
   maxEntries?: number;
 };
 
@@ -311,6 +317,9 @@ export class CaptureCoverageWalk {
   private activeRestarts = 0;
   private activeReads = 0;
   private closed: CaptureCoverageDirectory | null = null;
+  private knownPrepared: boolean;
+  private unlisted: Iterator<CaptureCoverageFile> | null = null;
+  private unlistedStarted = false;
   private entries = 0;
   done = false;
   complete = true;
@@ -318,6 +327,7 @@ export class CaptureCoverageWalk {
   constructor(private readonly spec: CaptureCoverageWalkSpec | null) {
     // A null spec is a walk that cannot be taken (for example an unready root).
     this.directories = spec ? spec.roots.map((directory) => ({ directory, depth: 0 })).reverse() : [];
+    this.knownPrepared = !spec?.prepareKnown;
     if (!spec) this.fail();
   }
 
@@ -424,6 +434,15 @@ export class CaptureCoverageWalk {
         } catch { this.fail(); }
         continue;
       }
+      if (!this.knownPrepared && (this.files.length > 0 || (!this.active && this.directories.length === 0))) {
+        try {
+          const progress = this.spec!.prepareKnown!(Math.min(256, limit - work));
+          if (progress.work < 1 || progress.work > limit - work) throw new Error("invalid_coverage_cursor_work");
+          work += progress.work;
+          this.knownPrepared = progress.done;
+        } catch { this.fail(); }
+        continue;
+      }
       const file = this.files.pop();
       if (file !== undefined) {
         if (this.active) this.activeChecked = true;
@@ -445,7 +464,23 @@ export class CaptureCoverageWalk {
         continue;
       }
       const next = this.directories.pop();
-      if (!next) { this.done = true; break; }
+      if (!next) {
+        try {
+          if (!this.unlistedStarted) {
+            this.unlistedStarted = true;
+            this.unlisted = this.spec!.unlistedFiles?.()[Symbol.iterator]() ?? null;
+          }
+          if (!this.unlisted) { this.done = true; break; }
+          work += 1;
+          const pending = this.unlisted.next();
+          if (pending.done) { this.unlisted = null; this.done = true; }
+          else {
+            batch.push(pending.value);
+            if (batch.length >= CAPTURE_COVERAGE_BATCH) flush();
+          }
+        } catch { this.fail(); }
+        continue;
+      }
       work += 1;
       try {
         this.active = this.spec!.open(next.directory, next.depth);
@@ -507,8 +542,10 @@ export class CaptureCoverageWalk {
     this.complete = false;
     this.done = true;
     try { this.active?.close(); } catch { /* already failing closed */ }
+    try { this.unlisted?.return?.(); } catch { /* already failing closed */ }
     this.active = null;
     this.closed = null;
+    this.unlisted = null;
     this.activeSeen.clear();
     this.activeExpected.clear();
     this.activePending.clear();
@@ -524,11 +561,34 @@ export class CaptureCoverageWalk {
  * the key cannot drift from theirs. A symlink is a `link` verdict under a key
  * of its own (a path holds no NUL, so none collides with a file's).
  */
+type JsonlCoverageCursorRow = {
+  size: number;
+  committedOffset: number | null;
+  deferredBytes: number | null;
+  workRemaining: number | null;
+  unresolvedKind: string | null;
+};
+
+const JSONL_COVERAGE_CURSOR_COLUMNS = `size, committed_offset as committedOffset,
+  deferred_bytes as deferredBytes, work_remaining as workRemaining,
+  unresolved_kind as unresolvedKind`;
+
+function jsonlCursorComplete(row: JsonlCoverageCursorRow, extent: number) {
+  return (row.committedOffset ?? row.size) >= extent &&
+    !row.workRemaining && !row.unresolvedKind && (row.deferredBytes ?? 0) === 0;
+}
+
+function missingJsonlCoverageFile(key: string, row: JsonlCoverageCursorRow | undefined): CaptureCoverageFile {
+  return {
+    key, mtimeMs: Date.now(), birthtimeMs: 0, extent: Math.max(1, row?.size ?? 1),
+    progress: row ? row.committedOffset ?? row.size : -1,
+    fullyRead: row !== undefined && jsonlCursorComplete(row, row.size),
+  };
+}
+
 export function jsonlCoverageCheck(database: Database.Database) {
   const cursor = database.prepare(
-    `select size, committed_offset as committedOffset, deferred_bytes as deferredBytes,
-       work_remaining as workRemaining, unresolved_kind as unresolvedKind
-     from rollout_scan_state where file = ?`,
+    `select ${JSONL_COVERAGE_CURSOR_COLUMNS} from rollout_scan_state where file = ?`,
   );
   return (cursorKey: string, stat: fs.Stats | null): CaptureCoverageFile | null => {
     // The tailers never read a symlinked JSONL file or descend through a
@@ -536,21 +596,14 @@ export function jsonlCoverageCheck(database: Database.Database) {
     if (stat?.isSymbolicLink()) return linkCoverageFile(jsonlScanStateKey(`${cursorKey}\0symlink`), stat.birthtimeMs);
     if (stat && !stat.isFile()) return null;
     const key = jsonlScanStateKey(cursorKey);
-    const row = cursor.get(key) as
-      | { size: number; committedOffset: number | null; deferredBytes: number | null; workRemaining: number | null; unresolvedKind: string | null }
-      | undefined;
+    const row = cursor.get(key) as JsonlCoverageCursorRow | undefined;
     // A legacy row (no committed offset) recorded the size it had read.
     const committed = row ? row.committedOffset ?? row.size : -1;
     if (!stat) {
       // The file was listed, so it existed during this walk. Its last saved
       // cursor says whether capture finished; an unknown or unfinished file
       // becomes a durable loss rather than invalidating every busy check.
-      return {
-        key, mtimeMs: Date.now(), birthtimeMs: 0, extent: Math.max(1, row?.size ?? 1),
-        progress: committed,
-        fullyRead: row !== undefined && committed >= row.size &&
-          !row.workRemaining && !row.unresolvedKind && (row.deferredBytes ?? 0) === 0,
-      };
+      return missingJsonlCoverageFile(key, row);
     }
     return {
       key,
@@ -558,10 +611,67 @@ export function jsonlCoverageCheck(database: Database.Database) {
       birthtimeMs: stat.birthtimeMs,
       extent: stat.size,
       progress: committed,
-      fullyRead: row !== undefined && committed >= stat.size &&
-        !row.workRemaining && !row.unresolvedKind && (row.deferredBytes ?? 0) === 0,
+      fullyRead: row !== undefined && jsonlCursorComplete(row, stat.size),
     };
   };
+}
+
+/**
+ * Only partially captured cursor keys stay in memory. Page the scan-state
+ * table by its primary key and charge every row before checking source files,
+ * so even a large ledger cannot make one coverage turn unbounded. Parser kind
+ * scopes current rows; old untyped partial rows conservatively belong to both
+ * JSONL sources because their hashed keys cannot reveal the source path.
+ */
+export class KnownPartialJsonlFiles {
+  private after = "";
+  private ready = false;
+  private readonly pending = new Set<string>();
+  private readonly parserFamily: string;
+  private readonly page;
+  private readonly current;
+
+  constructor(database: Database.Database, parserKind: string) {
+    this.parserFamily = parserKind.replace(/\d+$/, "");
+    this.page = database.prepare(
+      `select file, parser_kind as parserKind, ${JSONL_COVERAGE_CURSOR_COLUMNS}
+       from rollout_scan_state where file > ? order by file limit ?`,
+    );
+    this.current = database.prepare(
+      `select ${JSONL_COVERAGE_CURSOR_COLUMNS} from rollout_scan_state where file = ?`,
+    );
+  }
+
+  prepare(maxRows: number) {
+    const limit = Math.max(1, Math.min(256, Math.floor(maxRows)));
+    const rows = this.page.all(this.after, limit) as Array<JsonlCoverageCursorRow & {
+      file: string; parserKind: string | null;
+    }>;
+    for (const row of rows) {
+      this.after = row.file;
+      const scoped = row.parserKind?.startsWith(this.parserFamily) ?? false;
+      if ((scoped || row.parserKind === null) &&
+          !jsonlCursorComplete(row, row.size)) {
+        this.pending.add(row.file);
+        if (this.pending.size > CAPTURE_COVERAGE_MAX_ENTRIES) throw new Error("capture_partial_cursor_ceiling");
+      }
+    }
+    this.ready = rows.length < limit;
+    return { work: Math.max(1, rows.length), done: this.ready };
+  }
+
+  checked(key: string) { this.pending.delete(key); }
+
+  *unlistedFiles(): Iterable<CaptureCoverageFile> {
+    if (!this.ready) throw new Error("capture_partial_cursor_scan_incomplete");
+    try {
+      for (const key of this.pending) {
+        const row = this.current.get(key) as JsonlCoverageCursorRow | undefined;
+        if (!row) throw new Error("capture_partial_cursor_disappeared");
+        yield missingJsonlCoverageFile(key, row);
+      }
+    } finally { this.pending.clear(); }
+  }
 }
 
 /** lstat that reports a vanished file as null, the way every walk treats one. */

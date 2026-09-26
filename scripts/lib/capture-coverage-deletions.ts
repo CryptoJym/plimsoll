@@ -146,6 +146,70 @@ async function unlistedStartFile(check: Check) {
   } finally { w.close(); }
 }
 
+/** Reviewer r4: a saved partial cursor must survive a later walk's unseen deletion. */
+async function knownPartialAfterPriorCheck(check: Check, remove: boolean) {
+  const w = world(remove ? "known-partial-deleted" : "known-partial-present");
+  try {
+    w.turn();
+    const first = w.state() ?? null;
+    const files = seed(w.day, 10_000, 900_000);
+    // More than one capped turn of partial keys guarantees an unseen victim
+    // even when the filesystem returns names in a different order.
+    const partial = files.slice(0, 5_000);
+    const partialPaths = new Set(partial);
+    const insert = w.buffer.database.prepare(
+      `insert into rollout_scan_state
+         (file, size, scanned_at, committed_offset, deferred_bytes, work_remaining, parser_kind)
+       values (?, 3, ?, ?, 0, 0, 'codex-rollout-v2')`,
+    );
+    w.buffer.database.transaction(() => {
+      for (const file of files) {
+        insert.run(w.fileKey(file), new Date().toISOString(), partialPaths.has(file) ? 0 : 3);
+      }
+    })();
+    await pause();
+    w.turn();
+    const listedAtMutation = w.listed.size;
+    const stateAtMutation = w.state() ?? null;
+    const victim = partial.find((file) => !w.listed.has(file));
+    if (!victim) throw new Error("no unseen partial cursor after the first capped turn");
+    const finishedVictim = files.slice(5_000).find((file) => !w.listed.has(file));
+    if (!finishedVictim) throw new Error("no unseen finished cursor after the first capped turn");
+    const finish = w.buffer.database.prepare(
+      `update rollout_scan_state set committed_offset = 3 where file = ?`,
+    );
+    w.buffer.database.transaction(() => {
+      for (const file of partial) if (file !== victim) finish.run(w.fileKey(file));
+    })();
+    const victimListed = w.listed.has(victim);
+    fs.unlinkSync(finishedVictim);
+    if (remove) fs.unlinkSync(victim);
+    let turns = 0;
+    while (w.state()?.checkedAt === first?.checkedAt && turns < 30) {
+      await pause();
+      w.turn();
+      turns += 1;
+    }
+    const after = w.state() ?? null;
+    const victimGap = w.hasLoss(w.fileKey(victim));
+    const finishedGap = w.hasLoss(w.fileKey(finishedVictim));
+    const claudeGaps = (w.buffer.database.prepare(
+      `select count(*) as total from capture_uncovered_files where source = 'claude_code'`,
+    ).get() as { total: number }).total;
+    check(remove
+      ? "tailer_known_partial_deleted_before_listing_on_later_walk_is_a_gap"
+      : "tailer_known_partial_present_on_later_walk_is_a_gap",
+    first !== null && first.completeThrough !== null && stateAtMutation?.checkedAt === first.checkedAt &&
+      !victimListed && after !== null && after.checkedAt !== first.checkedAt && victimGap &&
+      !finishedGap && w.losses() === 1 && claudeGaps === 0 &&
+      w.checked.has(victim) === !remove,
+    { first, after, stateAtMutation, victimListed, listedAtMutation, victimGap,
+      victimChecked: w.checked.has(victim), finishedListed: w.listed.has(finishedVictim),
+      finishedChecked: w.checked.has(finishedVictim), finishedGap,
+      codexGaps: w.losses(), claudeGaps, turns });
+  } finally { w.close(); }
+}
+
 /** Reviewer r3's sustained listed deletions, with one new session per turn. */
 async function sustainedDeletion(check: Check) {
   const w = world("deletion-growth");
@@ -193,5 +257,7 @@ async function sustainedDeletion(check: Check) {
 export async function deletionCoverageChecks(check: Check) {
   await finishedCaptureRemoved(check);
   await unlistedStartFile(check);
+  await knownPartialAfterPriorCheck(check, true);
+  await knownPartialAfterPriorCheck(check, false);
   await sustainedDeletion(check);
 }

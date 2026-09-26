@@ -103,14 +103,18 @@ does not transfer its sessions to a tailer.
   coverage uses its saved capture progress to mark it finished or record a
   gap; repeated file removals no longer hold the source frontier indefinitely.
   On a source's first coverage walk, a changed folder records an uncertainty
-  gap for any file removed before its open cursor could list it. Small changed
-  folders get one verifying restart. Small unchanged folders reuse a bounded
+  gap for any file removed before its open cursor could list it. Later walks
+  compare saved partial capture cursors with the files checked, so a known
+  partial file deleted before listing becomes a gap. Small changed folders get
+  one verifying restart. Small unchanged folders reuse a bounded
   list of names on later checks; every file is still checked for changes.
+  Files created and removed between walks without ever being listed cannot be
+  detected without a filesystem journal; coverage does not attest those files.
   Ignored names use work but do not count toward the 200,000 relevant-entry
-  ceiling. Codex,
-  Claude Code, and Grok each get a share of every turn, with the first source
-  rotating and unused time returning to active sources. Legacy symlinked
-  Codex or Claude roots now make coverage incomplete, like configured roots.
+  ceiling. Codex, Claude Code, and Grok each get a share of every turn, with
+  the first source rotating and unused time returning to active sources.
+  Legacy symlinked Codex or Claude roots now make coverage incomplete, like
+  configured roots.
   The 250 ms coverage turn is a target: a synchronous directory read, file
   stat, or database write can run past it.
 - When the OTLP intake spool cannot hold a refused request (full, or the disk
