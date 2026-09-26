@@ -61,6 +61,11 @@ const HEAVY_FIXTURE_CLIENT_TIMEOUT_MS = 30_000;
 // while still rejecting hundreds of ms of extra cardinality work; zero
 // ledger writes is asserted separately below.
 const CARDINALITY_REJECT_CPU_CEILING_MS = 200;
+// The concurrent /status probe on the file-backed max-128 path must expose
+// a synchronous disk-only stall that the memory-ledger latency fixture cannot.
+// Review calibration found at most 193.3 ms across 15 dual-disk and 5 all-core
+// full runs; 900 ms leaves more than 4x that noise yet catches a 1.2 s stall.
+const FILE_BACKED_STATUS_CEILING_MS = 900;
 const CODEX_RECORD_BASE_NANOS = 1_760_000_000_000_000_000n;
 
 function expectedCodexObservedAt(records: number) {
@@ -1633,7 +1638,8 @@ async function main() {
         Atomics.load(appendSignalView, 0) === 1 &&
         statusDuringMax.startedAtMs <= maxSettledAtMs &&
         statusDuringMax.settledAtMs <= maxSettledAtMs &&
-        statusDuringMax.status === 200,
+        statusDuringMax.status === 200 &&
+        statusDuringMax.elapsedMs <= FILE_BACKED_STATUS_CEILING_MS,
       {
         acceptedStatus: maxAccepted.status,
         acceptedElapsedMs: Math.round(maxAccepted.elapsedMs * 100) / 100,
@@ -1652,6 +1658,7 @@ async function main() {
           statusDuringMax.settledAtMs <= maxSettledAtMs,
         statusCode: statusDuringMax.status,
         statusElapsedMs: Math.round(statusDuringMax.elapsedMs * 100) / 100,
+        statusCeilingMs: FILE_BACKED_STATUS_CEILING_MS,
       },
     );
 
@@ -1667,6 +1674,7 @@ async function main() {
         run.acceptedRecordCount === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
         run.acceptedCpuMs <= 500 &&
         run.statusCode === 200 &&
+        run.statusMs <= FILE_BACKED_STATUS_CEILING_MS &&
         run.facts.events === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
         run.facts.inputTokens === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
         run.facts.outputTokens === DEFERRED_CONTEXT_OWNERSHIP_RECORDS * 2 &&
