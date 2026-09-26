@@ -34,6 +34,13 @@ the previous install's row `FOR SHARE`, so a join and a merge of one chain seria
 ledger beside its lineage, and the collector resubmits parked rows when that ledger changes (`CONTRACTS.md` C1 "The link is the
 release", C6).
 
+**What changed in round 13 (B0 round 7).** A C1 transaction that PostgreSQL aborts in a deadlock (SQLSTATE `40P01`, or `40001` at
+`SERIALIZABLE`) is rolled back and run again from its start, at most three attempts, and nothing is acknowledged, recorded or
+receipted before the transaction that did the work commits; an exhausted retry is a 503 `transaction_retry_exhausted` with
+`Retry-After` (a sighting: the collector's ordinary transient retry; the admin's link: nothing moved, the admin re-issues it). The
+400 `stamp_from_other_ledger` names the ledger it judged, the uploader's ledger the request was authorized with, and the collector
+parks the refused rows under that wire value only (`CONTRACTS.md` C1 "Serialization", "Outside the ledger", C6).
+
 ## 1. Invariants that hold on every host at every step
 
 1. **No raw row is deleted by any job between the hold and S9, except under the disclosed hold-release ladder.** From S1b the prune is held (ARCHITECTURE.md §2.4); today's prune would otherwise delete a pending-upload row at age (`collector-cli/src/buffer.ts:3008-3013,3041-3052`). The ladder's rung at fewer than 5 days of runway deletes only rows whose delivery is acknowledged (`uploaded_at` set and an `acknowledged` receipt for the row's own id, `collector-cli/src/outbox.ts:662-671,701-709`), never a member of an open target, and writes a receipt and a tombstone; the S3 certify converts the affected sessions as `cloud_superset` (§3, §6). A rollback through S8 therefore replays or rebuilds from every raw row that is not in the cloud already; **after a rung-2 release** the old reader path is reconstructable only from the rows still present, and the difference is exactly the receipted release set (§8; `out/fixtures/sf1_ladder_rollback_parity.py`).
