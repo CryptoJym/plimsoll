@@ -113,7 +113,7 @@ function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
   // completion. Include bounded long-running responses, then check the exact
   // span end and mutual uniqueness below.
   const spanEnd = rowShape.spanEndAt ? Date.parse(rowShape.spanEndAt) : NaN;
-  const index = wanted === "span" ? "idx_codex_usage_span_backfill"
+  const index = wanted === "span" ? "idx_codex_usage_span_match"
     : "idx_codex_usage_log_match";
   const predicate = wanted === "span" ? BACKFILL_SPAN_PREDICATE : LOG_MATCH_PREDICATE;
   const windows = wanted === "span"
@@ -277,6 +277,11 @@ export function ensureCodexUsagePairingSchema(db: Database.Database) {
   // null-account rows and cannot make the upgrade bounded on a large ledger.
   db.exec(`create index if not exists idx_codex_usage_span_backfill
     on buffered_events (observed_at)
+    where ${BACKFILL_SPAN_PREDICATE};`);
+  // Keep the long-span lookback cheap at ingest while the time-first index
+  // above preserves an ordered, resumable historical scan.
+  db.exec(`create index if not exists idx_codex_usage_span_match
+    on buffered_events (input_tokens, output_tokens, observed_at)
     where ${BACKFILL_SPAN_PREDICATE};`);
   db.exec(`create index if not exists idx_codex_usage_log_match
     on buffered_events (input_tokens, output_tokens, observed_at)
