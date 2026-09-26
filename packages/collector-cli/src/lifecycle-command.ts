@@ -6,6 +6,7 @@ import {
   LifecycleManager,
   lifecycleBoundaryStatement,
   type LifecycleAdapter,
+  type LifecyclePairingIndexesRecord,
   type LifecycleSnapshotInventory,
   type RuntimeArtifact,
 } from "./lifecycle";
@@ -68,11 +69,13 @@ export async function runLifecycleCommand(input: {
   adapter: LifecycleAdapter;
   resolveArtifact: LifecycleArtifactResolver;
   readinessTimeoutMs?: number;
+  pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord>;
 }) {
   const [action] = input.argv;
   const operationId = option(input.argv, "--operation-id") ?? "";
   const manager = new LifecycleManager(input.adapter, {
     ...(input.readinessTimeoutMs !== undefined ? { readinessTimeoutMs: input.readinessTimeoutMs } : {}),
+    ...(action === "update" && input.pairingIndexes ? { pairingIndexes: input.pairingIndexes } : {}),
   });
   if (action === "update" || action === "rollback") {
     const reference = option(input.argv, "--artifact");

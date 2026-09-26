@@ -195,6 +195,7 @@ import {
   runLifecycleCommand,
   runLifecycleSnapshotCommand,
 } from "./lifecycle-command";
+import { buildPairingIndexesAfterUpdate } from "./lifecycle-pairing-indexes";
 import {
   composeLifecycleAdapter,
   otherProcessesWithFilesOpen,
@@ -6409,6 +6410,7 @@ async function main() {
       argv: [action, ...process.argv.slice(4)],
       adapter: composeLifecycleAdapter({ keepAll }),
       resolveArtifact,
+      ...(action === "update" ? { pairingIndexes: buildPairingIndexesAfterUpdate } : {}),
       ...(optionValue("--readiness-timeout-ms") !== undefined && Number.isFinite(readinessTimeoutOption)
         ? { readinessTimeoutMs: readinessTimeoutOption }
         : {}),
