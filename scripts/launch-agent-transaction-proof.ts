@@ -922,7 +922,11 @@ esac
         secondLoadReceipt.loaded === true &&
         secondLoadReceipt.status === "already_loaded" &&
         launchctlCalls.filter((entry) => entry === "bootstrap").length === 1 &&
-        launchctlCalls.filter((entry) => entry === "print").length === 4,
+        // Each load reads the job state once more to rule out launchd's
+        // loaded-but-unspawned state (runs = 0), and a running job is never
+        // kickstarted (eco-6hoxj.163.91): 4 reads before that change, now 6.
+        launchctlCalls.filter((entry) => entry === "print").length === 6 &&
+        launchctlCalls.filter((entry) => entry === "kickstart").length === 0,
       {
         firstStatus: firstLoadReceipt.status,
         secondStatus: secondLoadReceipt.status,
