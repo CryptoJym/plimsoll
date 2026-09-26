@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("authenticated-ingestion", 11);
+const completion = createProofCompletion("authenticated-ingestion", 12);
 /**
  * Focused proof for the authenticated portion of issue #108 / 0059.
  *
@@ -222,9 +222,18 @@ async function main() {
     const acceptedHook = await request(port, "/hooks/claude-code", "POST", hookBody, {
       "x-plimsoll-token": rotated.claudeCodeProducer,
     });
-    const acceptedOtlp = await request(port, "/v1/logs", "POST", JSON.stringify({
+    const mismatchedOtlp = await request(port, "/v1/logs", "POST", JSON.stringify({
       resourceLogs: [{
         resource: { attributes: [{ key: "service.name", value: { stringValue: "claude_code" } }] },
+        scopeLogs: [{ logRecords: [{ attributes: [{ key: "gen_ai.usage.input_tokens", value: { intValue: "3" } }] }] }],
+      }],
+    }), {
+      "x-plimsoll-source": "codex",
+      "x-plimsoll-token": rotated.codexProducer,
+    });
+    const acceptedOtlp = await request(port, "/v1/logs", "POST", JSON.stringify({
+      resourceLogs: [{
+        resource: { attributes: [{ key: "service.name", value: { stringValue: "codex_exec" } }] },
         scopeLogs: [{ logRecords: [{ attributes: [{ key: "gen_ai.usage.input_tokens", value: { intValue: "3" } }] }] }],
       }],
     }), {
@@ -235,12 +244,41 @@ async function main() {
       "select source from buffered_events order by rowid desc limit 1",
     ).get() as { source?: string } | undefined;
     check(
-      "valid_source_bound_credentials_write_and_transport_identity_wins_over_service_name",
+      "valid_source_bound_credentials_write_and_conflicting_service_is_refused",
       acceptedHook.status === 202 &&
+        mismatchedOtlp.status === 401 && mismatchedOtlp.body.reason === "source_mismatch" &&
         acceptedOtlp.status === 202 &&
         sourceFact?.source === "codex",
-      { acceptedHook, acceptedOtlp, sourceFact },
+      { acceptedHook, mismatchedOtlp, acceptedOtlp, sourceFact },
     );
+
+    // Codex config has independent log and trace exporters. A missing log
+    // credential can therefore leave only the response span in the ledger.
+    const missingLogToken = await request(port, "/v1/logs", "POST", JSON.stringify({
+      resourceLogs: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "codex-app-server" } }] },
+        scopeLogs: [{ logRecords: [{ attributes: [
+          { key: "event.name", value: { stringValue: "codex.sse_event" } },
+          { key: "input_token_count", value: { intValue: "5555" } },
+          { key: "output_token_count", value: { intValue: "55" } },
+        ] }] }] }],
+    }), { "x-plimsoll-source": "codex" });
+    const timestamp = String(BigInt(Date.now()) * 1_000_000n);
+    const admittedTrace = await request(port, "/v1/traces", "POST", JSON.stringify({
+      resourceSpans: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "codex-app-server" } }] },
+        scopeSpans: [{ spans: [{ name: "handle_responses", traceId: "a".repeat(32), spanId: "b".repeat(16),
+          startTimeUnixNano: timestamp, endTimeUnixNano: timestamp, attributes: [
+            { key: "gen_ai.usage.input_tokens", value: { intValue: "5555" } },
+            { key: "gen_ai.usage.output_tokens", value: { intValue: "55" } },
+          ] }] }] }],
+    }), { "x-plimsoll-source": "codex", "x-plimsoll-token": rotated.codexProducer });
+    const loneSpan = buffer.database.prepare(
+      "select source, session_id as sessionId, model from buffered_events where input_tokens = 5555 limit 1",
+    ).get() as { source?: string; sessionId?: string | null; model?: string | null } | undefined;
+    check("missing_log_token_leaves_a_valid_codex_response_span_unpaired",
+      missingLogToken.status === 401 && missingLogToken.body.reason === "producer_token_required" &&
+        admittedTrace.status === 202 && loneSpan?.source === "codex" &&
+        loneSpan.sessionId === null && loneSpan.model === null,
+      { missingLogToken, admittedTrace, loneSpan });
 
     const sameId = await request(port, "/hooks/claude-code", "POST", hookBody, {
       "x-plimsoll-token": rotated.claudeCodeProducer,

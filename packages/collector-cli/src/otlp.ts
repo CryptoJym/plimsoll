@@ -95,6 +95,7 @@ function resourceSummary(resource: unknown, dataMode: PolicyConfig["dataMode"]) 
   const admitted = metadataSafeOtlpAttributes(attrs, dataMode, "resource");
   return {
     serviceName: admitted.attrs["service.name"] as string | undefined,
+    serviceSource: sourceForOtlpService(attrs["service.name"]),
     serviceVersion: admitted.attrs["service.version"] as string | undefined,
     suppressedFields: admitted.suppressedFields,
   };
@@ -128,17 +129,38 @@ function intTokens(value: number | undefined) {
   return Math.round(value);
 }
 
-function eventSourceFor(attrs: Record<string, unknown>, fallback: ToolSource | undefined, serviceName: string | undefined): ToolSource {
-  // Transport authentication is authoritative. A producer-controlled
-  // service.name must never turn an authenticated Codex batch into Claude
-  // events (or vice versa); only legacy/unknown callers may infer a source.
-  if (fallback === "claude_code" || fallback === "codex" || fallback === "gemini_cli" || fallback === "grok") return fallback;
-  const service = (serviceName ?? "").toLowerCase();
-  if (service.includes("claude")) return "claude_code";
-  if (service.includes("codex")) return "codex";
-  if (service.includes("gemini")) return "gemini_cli";
-  if (service.includes("grok")) return "grok";
-  return fallback ?? "unknown";
+function sourceForOtlpService(value: unknown): ToolSource | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") return "unknown";
+  const service = value.trim().toLowerCase();
+  if (/^codex(?:$|[-_.])/.test(service)) return "codex";
+  if (/^claude(?:$|[-_.])/.test(service)) return "claude_code";
+  if (/^gemini(?:$|[-_.])/.test(service)) return "gemini_cli";
+  if (/^grok(?:$|[-_.])/.test(service)) return "grok";
+  return "unknown";
+}
+
+/** Called only after the producer token has been checked. A service cannot
+ * change its authenticated source by choosing a different resource name. */
+export function conflictingOtlpServiceSource(payload: unknown, claimed: ToolSource): boolean {
+  const root = asRecord(payload);
+  for (const section of ["resourceLogs", "resourceSpans", "resourceMetrics"] as const) {
+    const resources = root[section];
+    if (!Array.isArray(resources)) continue;
+    for (const entry of resources) {
+      const attrs = flattenOtelAttributes(asRecord(asRecord(entry).resource).attributes);
+      const named = sourceForOtlpService(attrs["service.name"]);
+      if (named !== undefined && named !== "unknown" && named !== claimed) return true;
+    }
+  }
+  return false;
+}
+
+function eventSourceFor(fallback: ToolSource, serviceSource: ToolSource | undefined): ToolSource {
+  // The HTTP receiver rejects a known name that conflicts with its authenticated
+  // source before calling this parser. Direct/offline callers still get the
+  // named source; an unrecognized name is explicitly UNKNOWN.
+  return serviceSource ?? fallback;
 }
 
 function workdirFromRawRecord(record: Record<string, unknown>): string | undefined {
@@ -261,6 +283,7 @@ function buildLogEvent(
   context: {
     policy: PolicyConfig;
     source: ToolSource;
+    serviceSource?: ToolSource;
     transportPath?: string;
     serviceName?: string;
     serviceVersion?: string;
@@ -357,7 +380,7 @@ function buildLogEvent(
     ]),
     sessionId,
     tenantId: context.policy.tenantId,
-    source: eventSourceFor(attrs, context.source, context.serviceName),
+    source: eventSourceFor(context.source, context.serviceSource),
     dataMode: context.policy.dataMode,
     eventType,
     observedAt,
@@ -410,6 +433,7 @@ function buildSpanEvent(
   context: {
     policy: PolicyConfig;
     source: ToolSource;
+    serviceSource?: ToolSource;
     transportPath?: string;
     serviceName?: string;
     serviceVersion?: string;
@@ -521,7 +545,7 @@ function buildSpanEvent(
     ]),
     sessionId,
     tenantId: context.policy.tenantId,
-    source: eventSourceFor(attrs, context.source, context.serviceName),
+    source: eventSourceFor(context.source, context.serviceSource),
     dataMode: context.policy.dataMode,
     eventType,
     observedAt,
@@ -551,6 +575,8 @@ function buildSpanEvent(
       ...(spanEndedAt ? { otelSpanEndAt: spanEndedAt } : {}),
       ...(traceId ? { traceId } : {}),
       ...(spanId ? { spanId } : {}),
+      ...(sessionId && spanName === "handle_responses"
+        ? { sessionLinkBasis: "span_attribute" } : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
     },
@@ -576,6 +602,7 @@ function buildMetricSamples(
   context: {
     policy: PolicyConfig;
     source: ToolSource;
+    serviceSource?: ToolSource;
     serviceName?: string;
     containerSuppressedFields?: string[];
   },
@@ -621,7 +648,7 @@ function buildMetricSamples(
           String(dataPoint.timeUnixNano ?? ""),
           JSON.stringify(attrs),
         ]),
-        source: eventSourceFor(attrs, context.source, context.serviceName),
+        source: eventSourceFor(context.source, context.serviceSource),
         metricName,
         observedAt,
         sessionId,
@@ -675,6 +702,7 @@ export function explodeOtlpPayload(
             buildLogEvent(asRecord(record), {
               policy,
               source,
+              serviceSource: resource.serviceSource,
               transportPath: options.transportPath,
               serviceName: resource.serviceName,
               serviceVersion: resource.serviceVersion,
@@ -710,6 +738,7 @@ export function explodeOtlpPayload(
           const entry = buildSpanEvent(asRecord(span), {
               policy,
               source,
+              serviceSource: resource.serviceSource,
               transportPath: options.transportPath,
               serviceName: resource.serviceName,
               serviceVersion: resource.serviceVersion,
@@ -744,6 +773,7 @@ export function explodeOtlpPayload(
         const samples = buildMetricSamples(asRecord(metric), {
           policy,
           source,
+          serviceSource: resource.serviceSource,
           serviceName: resource.serviceName,
           containerSuppressedFields: [...resource.suppressedFields, ...scopeReceipts],
         });
@@ -753,5 +783,27 @@ export function explodeOtlpPayload(
     }
   }
 
+  // A response span can carry a session only when a sanitized peer in this
+  // same OTLP trace has exactly one session. The span's token counts and model
+  // remain its own facts; trace proximity never supplies a model or account.
+  const sessionsByTrace = new Map<string, Set<string>>();
+  for (const { event } of result.events) {
+    const traceId = event.metadata.traceId;
+    if (event.source !== "codex" || typeof traceId !== "string" || !event.sessionId) continue;
+    const sessions = sessionsByTrace.get(traceId) ?? new Set<string>();
+    sessions.add(event.sessionId);
+    sessionsByTrace.set(traceId, sessions);
+  }
+  for (const { event } of result.events) {
+    const traceId = event.metadata.traceId;
+    if (event.source !== "codex" || event.eventType !== "assistant_response" ||
+        event.metadata.otelEventName !== "handle_responses" || event.sessionId ||
+        typeof traceId !== "string") continue;
+    const sessions = sessionsByTrace.get(traceId);
+    if (sessions?.size === 1) {
+      event.sessionId = sessions.values().next().value;
+      event.metadata.sessionLinkBasis = "otel_trace";
+    }
+  }
   return result;
 }
