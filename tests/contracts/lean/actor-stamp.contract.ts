@@ -16,7 +16,12 @@
  * re-join that could not prove the previous install's key) is split the same way, the refused rows parked in the outbox, undelivered
  * and never judged, until a response reports a ledger other than the one they were parked under (round 12: the response names the
  * ledger beside its lineage, so a member of a chain an admin merged, whose lineage was already linked, retries too) or an admin
- * releases them (test 12). Pending until B2a lands.
+ * releases them (test 12). Round 7 of B0 (round 13; the read of C1 after round 12, blocking 2): the 400 names the ledger it judged
+ * (`ledgerInstallId`, the uploader's ledger the request was authorized with), `partitionRefusedRows` hands that wire value on, and
+ * `parkOutboxRows` parks under it, never under a value the collector supplied or learned itself (test 12, changed); the race in which
+ * the chain was merged between the request's authorization and the sighting's lock is refused naming the stale view U, parked under
+ * U from the wire, released by the next response naming X and retried, where parking under X would have kept the row parked on
+ * every later X response (test 13). Pending until B2a lands.
  */
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
@@ -313,30 +318,41 @@ test("B2a C1 (round 4, low): a summary batch refused as stamp_not_issued_flood (
   assert.deepEqual((resubmit[0] as { segments: Array<{ seq: number }> }).segments.map((s) => s.seq), [1], "... the faulty item without its parked segment; the claim and the receipts of the other segments are unaffected");
 });
 
-test("B2a C1 (round 11, read c1 r10 blockers 1-2; round 12): a batch refused as stamp_from_other_ledger (400, the pairs listed) is split: the rows whose pair names an install outside the ledger are parked in the outbox (undelivered, retained, never judged) and the rest is resubmitted at once; /status lists them with the lineage; a parked row is retried when a response names a ledger other than the one it was parked under (the ledger was linked, or the chain it was in was merged), not on a response for the same ledger, and an admin's release acknowledges it as undeliverable without a judgment", pending("B2a"), async () => {
+/** the 400 body as the cloud sends it (round 13: it names the ledger the refusal was judged against, the uploader's ledger the request was authorized with) */
+type StampRefusal = { reason: "stamp_from_other_ledger"; pairs: Array<{ install: string; version: number }>; ledgerInstallId: string };
+type PartitionRefusedRows = (events: Array<{ event: { id: string; metadata: Record<string, unknown> } }>, refusal: StampRefusal) => { resubmit: string[]; parked: Array<{ id: string; pair: string }>; ledgerInstallId: string };
+type Parking = {
+  /** the outbox rows the cloud refused: kept undelivered, never leased for upload while parked, under the ledger the 400 named (round 13: the value partitionRefusedRows handed on from the wire, never one the collector supplied or learned itself); returns the number parked */
+  parkOutboxRows(ids: string[], reason: "stamp_from_other_ledger", ledgerInstallId: string): number;
+  parkedRows(): Array<{ id: string; reason: string; ledgerInstallId: string }>;
+  /** lineage_linked: the rows parked under a ledger other than `ledgerInstallId` (the one the latest response named) go back to the outbox and are resubmitted, the others stay parked (round 12: a response for the same ledger changes nothing); admin_release: acknowledged as undeliverable_unlinked_ledger under the admin's receipt, never delivered, never judged, listed on the certify */
+  releaseParkedRows(input: { reason: "lineage_linked"; ledgerInstallId: string } | { reason: "admin_release"; receipt: string }): { retried: number; acknowledged: number };
+};
+const refusal = (pairs: Array<{ install: string; version: number }>, ledgerInstallId: string): StampRefusal => ({ reason: "stamp_from_other_ledger", pairs, ledgerInstallId });
+
+test("B2a C1 (round 11, read c1 r10 blockers 1-2; rounds 12-13): a batch refused as stamp_from_other_ledger (400, the pairs listed and the ledger the refusal was judged against named) is split: the rows whose pair names an install outside the ledger are parked in the outbox (undelivered, retained, never judged) under the ledger the 400 named, and the rest is resubmitted at once; /status lists them with the lineage; a parked row is retried when a response names a ledger other than the one it was parked under (the ledger was linked, or the chain it was in was merged), not on a response for the same ledger, and an admin's release acknowledges it as undeliverable without a judgment", pending("B2a"), async () => {
   const park = await loadSurface("../../../packages/collector-cli/src/lean/upload-park.ts");
-  const partitionRefusedRows = fn(park, "partitionRefusedRows") as (events: Array<{ event: { id: string; metadata: Record<string, unknown> } }>, refusal: { reason: string; pairs: Array<{ install: string; version: number }> }) => { resubmit: string[]; parked: Array<{ id: string; pair: string }> };
+  const partitionRefusedRows = fn(park, "partitionRefusedRows") as PartitionRefusedRows;
   const ev = (id: string, install: string | null, version: number | null) => ({ event: { id, metadata: install === null ? {} : { actorBindingInstall: install, actorBindingVersion: version } } });
-  // after an UNLINKED re-join (the config was lost, or the key rotated): r1 and r4 are pre-re-join outbox rows stamped with X's pair, r2 is the new install's, r3 is null-stamped
-  const { resubmit, parked } = partitionRefusedRows([ev("r1", INSTALL_X, 2), ev("r2", INSTALL_Z, 0), ev("r3", null, null), ev("r4", INSTALL_X, 1)], { reason: "stamp_from_other_ledger", pairs: [{ install: INSTALL_X, version: 2 }, { install: INSTALL_X, version: 1 }] });
+  // after an UNLINKED re-join (the config was lost, or the key rotated): r1 and r4 are pre-re-join outbox rows stamped with X's pair, r2 is the new install's, r3 is null-stamped;
+  // the refusing response was judged against Z's own (unlinked) ledger and says so
+  const wire = refusal([{ install: INSTALL_X, version: 2 }, { install: INSTALL_X, version: 1 }], INSTALL_Z);
+  const { resubmit, parked, ledgerInstallId } = partitionRefusedRows([ev("r1", INSTALL_X, 2), ev("r2", INSTALL_Z, 0), ev("r3", null, null), ev("r4", INSTALL_X, 1)], wire);
   assert.deepEqual(parked, [{ id: "r1", pair: `${INSTALL_X}:2` }, { id: "r4", pair: `${INSTALL_X}:1` }], "only the rows whose pair the cloud refused are parked");
   assert.deepEqual(resubmit, ["r2", "r3"], "the new install's rows and the null-stamped rows travel again at once");
+  assert.equal(ledgerInstallId, wire.ledgerInstallId, "the ledger to park under is the one the 400 named (round 13): it comes out of the partition, from the wire");
+  assert.throws(() => partitionRefusedRows([ev("r1", INSTALL_X, 2)], { reason: "stamp_from_other_ledger", pairs: [{ install: INSTALL_X, version: 2 }] } as unknown as StampRefusal), /ledgerInstallId/, "a 400 that names no ledger is not a refusal the collector can park on: nothing is parked under a guessed ledger");
   const status = fn(await loadSurface("../../../packages/collector-cli/src/lean/actor-binding-status.ts"), "actorBindingStatus") as (i: { binding: Binding; config: { cloudDeviceId?: string }; lineage?: "linked" | "unlinked"; parkedRows?: number }) => { state: string; lineage: "linked" | "unlinked" | null; parkedRows: number };
   const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", deviceId: "lean-device", lean: { write: true } });
   try {
-    const stamped = buffer as unknown as Stamped & {
-      /** the outbox rows the cloud refused: kept undelivered, never leased for upload while parked, with the ledger the refusing response named (round 12); returns the number parked */
-      parkOutboxRows(ids: string[], reason: "stamp_from_other_ledger", ledgerInstallId: string): number;
-      parkedRows(): Array<{ id: string; reason: string; ledgerInstallId: string }>;
-      /** lineage_linked: the rows parked under a ledger other than `ledgerInstallId` (the one the latest response named) go back to the outbox and are resubmitted, the others stay parked (round 12: a response for the same ledger changes nothing); admin_release: acknowledged as undeliverable_unlinked_ledger under the admin's receipt, never delivered, never judged, listed on the certify */
-      releaseParkedRows(input: { reason: "lineage_linked"; ledgerInstallId: string } | { reason: "admin_release"; receipt: string }): { retried: number; acknowledged: number };
-    };
+    const stamped = buffer as unknown as Stamped & Parking;
     stamped.recordJoinedInstall(INSTALL_X, 2);
     const old = event(); buffer.append(old);                                            // captured under (X, 2) before the re-join
     stamped.recordJoinedInstall(INSTALL_Z, 0);                                          // the re-join (unlinked): the pair cleared, Z's 0 recorded
     const fresh = event(); buffer.append(fresh);
     assert.deepEqual([stampOf(buffer, old.id), stampOf(buffer, fresh.id)], [{ version: 2, install: INSTALL_X }, { version: 0, install: INSTALL_Z }]);
-    assert.equal(stamped.parkOutboxRows([old.id], "stamp_from_other_ledger", INSTALL_Z), 1);   // the refusing response named Z's own (unlinked) ledger
+    const refused = partitionRefusedRows([ev(old.id, INSTALL_X, 2), ev(fresh.id, INSTALL_Z, 0)], refusal([{ install: INSTALL_X, version: 2 }], INSTALL_Z));   // the refusing response was judged against Z's own (unlinked) ledger
+    assert.equal(stamped.parkOutboxRows(refused.parked.map((row) => row.id), "stamp_from_other_ledger", refused.ledgerInstallId), 1, "parked under the ledger the 400 named, as the partition handed it on from the wire");
     assert.deepEqual(stamped.parkedRows(), [{ id: old.id, reason: "stamp_from_other_ledger", ledgerInstallId: INSTALL_Z }]);
     assert.deepEqual(status({ binding: buffer.workspaceBinding() as Binding, config: { cloudDeviceId: INSTALL_Z }, lineage: "unlinked", parkedRows: stamped.parkedRows().length }), { state: "ok", lineage: "unlinked", parkedRows: 1 }, "/status shows the unlinked lineage and the parked count per host");
     assert.deepEqual(stamped.releaseParkedRows({ reason: "lineage_linked", ledgerInstallId: INSTALL_Z }), { retried: 0, acknowledged: 0 }, "a response naming the same ledger changes nothing: the row stays parked");
@@ -345,5 +361,33 @@ test("B2a C1 (round 11, read c1 r10 blockers 1-2; round 12): a batch refused as 
     assert.equal(stamped.parkOutboxRows([old.id], "stamp_from_other_ledger", INSTALL_Z), 1);   // refused again (still unlinked in this variant)
     assert.deepEqual(stamped.releaseParkedRows({ reason: "admin_release", receipt: "admin-release-lean-contract" }), { retried: 0, acknowledged: 1 }, "an admin's release acknowledges the row as undeliverable_unlinked_ledger: never delivered, never judged, listed on the certify; the old install's summary answer stands alone");
     assert.deepEqual([stamped.parkedRows(), stampOf(buffer, old.id)], [[], { version: 2, install: INSTALL_X }], "the identity row keeps its pair for the certify");
+  } finally { close(); }
+});
+
+test("B2a C1 (round 13, read c1 r12 blocking 2): the wire-to-parking race: V's delivery was authorized with V's ledger U, the admin merged U's chain into X before the named install was locked, and the cloud refused against U, naming U on the 400; the collector parks the row under that wire value, the next response names X and releases it, and the row is retried and delivered again; parked under the current ledger X it would have stayed parked on every later X response", pending("B2a"), async () => {
+  const partitionRefusedRows = fn(await loadSurface("../../../packages/collector-cli/src/lean/upload-park.ts"), "partitionRefusedRows") as PartitionRefusedRows;
+  const INSTALL_U = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa0a3", INSTALL_V = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa0a5";
+  const ev = (id: string, install: string, version: number) => ({ event: { id, metadata: { actorBindingInstall: install, actorBindingVersion: version } } });
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract", deviceId: "lean-device", lean: { write: true } });
+  try {
+    const stamped = buffer as unknown as Stamped & Parking;
+    stamped.recordJoinedInstall(INSTALL_V, 0);                                          // the ledger is joined with V (the proof-linked child of the unlinked root U)
+    const row = event(); buffer.append(row);                                            // captured under (V, 0)
+    assert.deepEqual(stampOf(buffer, row.id), { version: 0, install: INSTALL_V });
+    // 700: the delivery is authorized with V's ledger read as U; 701: the admin merges U into X; 702: the sighting locks V, reads X, compares it with U and refuses, naming U
+    const wire = refusal([{ install: INSTALL_V, version: 0 }], INSTALL_U);
+    const refused = partitionRefusedRows([ev(row.id, INSTALL_V, 0)], wire);
+    assert.deepEqual([refused.parked, refused.resubmit, refused.ledgerInstallId], [[{ id: row.id, pair: `${INSTALL_V}:0` }], [], INSTALL_U]);
+    assert.equal(stamped.parkOutboxRows(refused.parked.map((r) => r.id), "stamp_from_other_ledger", refused.ledgerInstallId), 1);
+    assert.deepEqual(stamped.parkedRows(), [{ id: row.id, reason: "stamp_from_other_ledger", ledgerInstallId: INSTALL_U }], "parked under the ledger the 400 named (U), not under the ledger current when it was parked (X)");
+    assert.deepEqual(stamped.releaseParkedRows({ reason: "lineage_linked", ledgerInstallId: INSTALL_U }), { retried: 0, acknowledged: 0 }, "a response naming the ledger the refusal named changes nothing");
+    // 720: the next acknowledged response names V's ledger, X (round 12: every response names the ledger): released, because U differs from X
+    assert.deepEqual(stamped.releaseParkedRows({ reason: "lineage_linked", ledgerInstallId: INSTALL_X }), { retried: 1, acknowledged: 0 }, "released by the first response after the merge; resubmitted for X it is judged there (the cloud's side of the race is actor-binding-stamp test 17 and the Postgres proof)");
+    assert.deepEqual(stamped.parkedRows(), []);
+    assert.deepEqual(stampOf(buffer, row.id), { version: 0, install: INSTALL_V }, "the row travels again with its pair unchanged");
+    // the contrast: parked under the current ledger X (the only value round 12's text let a collector find), the same row is not released by any X response
+    assert.equal(stamped.parkOutboxRows([row.id], "stamp_from_other_ledger", INSTALL_X), 1);
+    assert.deepEqual(stamped.releaseParkedRows({ reason: "lineage_linked", ledgerInstallId: INSTALL_X }), { retried: 0, acknowledged: 0 }, "parked under X, a response naming X leaves it parked: the row would wait for a ledger change that never comes");
+    assert.deepEqual(stamped.releaseParkedRows({ reason: "admin_release", receipt: "admin-release-lean-contract-13" }), { retried: 0, acknowledged: 1 });
   } finally { close(); }
 });
