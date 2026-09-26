@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.7.42 — Draft (first integration pass)
+## 0.7.42 — Draft (second integration pass)
+
+- Codex SSE logs and matching response spans pair in the local ledger before
+  usage upload, so a response counts once while the duplicate span remains
+  available as raw evidence. The stopped-service pairing index upgrade can be
+  repeated after a 0.7.41 rollback to refresh the historical cursor and target
+  (`eco-6hoxj.163.95`).
+- HTTP deadline proofs cover file-backed status probes, and maintenance FIFO
+  proofs bound deadline-to-reap and absolute hook latency. The runtime keeps
+  the bounded HTTP request behavior (`eco-6hoxj.163.83`).
 
 - Busy-session summaries preserve rebuild progress while unread rows change.
   A terminal receipt retarget advances the old session revision so a 0.7.41
