@@ -258,7 +258,7 @@ function verifyMeasurements(
   ], "idle measurements");
   assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 2);
   assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
-  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_610);
+  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_608);
   assert.equal(integer(idle.filesOpened, "history files opened"), 2_614);
   assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
   assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
@@ -337,6 +337,9 @@ function verifyMeasurements(
     );
   }
   const firstBoot = idleArtifact;
+  assert.equal(firstBoot.stableRuns, "<volatile-number>");
+  assert.equal(firstBoot.stableRunsUnchanged, true);
+  assert.equal(firstBoot.stableSweepCompleted, true);
   assert.equal(firstBoot.firstBootRecentOnly, true);
   assert.equal(integer(firstBoot.oldContentReadsAtBoot, "old boot reads"), 0);
   assert.equal(firstBoot.restartZeroWork, true);

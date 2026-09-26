@@ -1,6 +1,6 @@
 {
   "schema": "plimsoll.system-e2e-support-contract.v1",
-  "normalizationVersion": 10,
+  "normalizationVersion": 11,
   "phases": [
     {
       "name": "install_doctor",
@@ -25,7 +25,7 @@
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:b3652398c04150a51dfb88b25f142c9f6ed34ed77ec048e6956bab8df00166b2"
+      "expectedArtifactDigest": "sha256:b7b729181b305a853ee61ec24d46ce1d372b4c9ff32e222fe787f7060ae2f3c2"
     },
     {
       "name": "launch_agent_unload_terminal_truth",

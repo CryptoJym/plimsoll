@@ -2,12 +2,13 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 import type Database from "better-sqlite3";
+import type { CaptureSkippedRecord } from "./capture-record-loss";
 
 const PROBE_BYTES = 512;
 const DEFAULT_MAX_READ_BYTES = 1024 * 1024;
 const DEFAULT_MAX_RECORDS = 1_000;
 const MIN_MAX_READ_BYTES = PROBE_BYTES * 2 + 1;
-const ABSOLUTE_MAX_READ_BYTES = 16 * 1024 * 1024;
+export const ABSOLUTE_MAX_READ_BYTES = 16 * 1024 * 1024;
 const ABSOLUTE_MAX_RECORDS = 10_000;
 const STATE_TABLE = "rollout_scan_state";
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -47,10 +48,13 @@ export type JsonlTailReadLimits = {
   maxBytes?: number;
   /** Maximum number of complete JSONL records returned in one slice. */
   maxRecords?: number;
+  /** First byte admitted from an enrollment-excluded generation. */
+  initialOffset?: number;
 };
 
 export type JsonlTailRead = {
   continuation?: import("./jsonl-continuation").ContinuationProposal;
+  skippedRecord?: CaptureSkippedRecord;
   lines: string[];
   observedSize: number;
   committedOffset: number;
@@ -492,7 +496,11 @@ export function readJsonlTail(
   let checkpointRebuild = false;
   let reset = false;
   let rewriteAmbiguous = false;
-  let start = cursor?.committedOffset ?? 0;
+  const initialOffset = limits.initialOffset ?? 0;
+  if (!nonnegativeInteger(initialOffset) || initialOffset > observedSize) {
+    throw new RangeError("initialOffset must be inside the observed file");
+  }
+  let start = cursor?.committedOffset ?? initialOffset;
   if (cursor) {
     legacyRebuild = cursor.checkpointStatus === "legacy";
     checkpointRebuild = cursor.checkpointStatus === "invalid";
@@ -552,6 +560,10 @@ export function readJsonlTail(
       bytesRead += bytes.length;
       return bytes;
     };
+
+    if (!cursor && start > 0 && readBudgeted(1, start - 1)[0] !== 0x0a) {
+      throw new Error("enrollment_boundary_ambiguous");
+    }
 
     // The head probe catches ordinary replacement. The independent continuity
     // probe immediately before committedOffset catches same-inode
@@ -615,7 +627,9 @@ export function readJsonlTail(
     }
 
     const available = Math.max(0, observedSize - start);
-    const contentBudget = Math.max(0, maxBytes - bytesRead);
+    // A new post-enrollment cursor still needs bounded head and continuity
+    // integrity probes, even if this slice contains no complete record.
+    const contentBudget = Math.max(0, maxBytes - bytesRead - (!cursor && start > 0 ? PROBE_BYTES * 2 : 0));
     const bytes = readAt(fd, Math.min(available, contentBudget), start, beforeSourceRead, limits.onBytesRead);
     bytesRead += bytes.length;
 

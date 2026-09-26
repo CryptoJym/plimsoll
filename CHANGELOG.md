@@ -155,6 +155,23 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Codex rollout and Claude transcript capture now revisits files left unread in
+  older folders, after partial reads, and after post-enrollment growth. Records
+  beyond the reader ceiling are passed in bounded chunks; skipped kinds and
+  bytes are counted, and any possible usage loss remains a capture gap after
+  the file reaches its end. Same-session rewrites with unchanged prior usage
+  events replay through stable identities so tokens are not counted again.
+  Skipped-record kinds use JSON nesting. The bounded reader also checks the
+  whole skipped record for duplicate or escaped discriminator keys before it
+  calls a skip known non-usage. An uncertain skip stays a possible usage loss
+  in the cloud claim, even after its file reaches EOF. Each key counter keeps
+  scanning independently; a saturated or incomplete counter cannot certify
+  non-usage even across a saved continuation. An older saved skip is
+  reclassified on resume. Receipt identity includes a hash of the first 2 KiB:
+  same-offset, same-size rewrites sharing that prefix still share one receipt.
+  Earlier pre-enrollment bytes remain excluded. Once post-enrollment growth
+  advances the shared cursor to EOF, those earlier bytes cannot be imported
+  through that cursor; a separate historical cursor and identity policy is needed.
 - OTLP exports the ledger cannot commit in time are kept, not lost
   (`eco-6hoxj.163.17`). An authenticated, validated request that meets a busy
   ledger or runs out of its 1.5 s deadline — including one whose body arrived

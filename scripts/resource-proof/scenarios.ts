@@ -2036,8 +2036,11 @@ export async function runNoChangeConstantWorkContract(
       restartMutations.updated === 0 &&
       restartMutations.deleted === 0;
 
-    // Growth of the exact pre-install generations remains excluded. This is
-    // the token-safe boundary for Codex cumulative totals.
+    // The baseline excludes old bytes, but a later append must be captured
+    // from that exact byte boundary. Its first Codex cumulative total has no
+    // prior total to subtract, so it stays unvalidated.
+    const rolloutBeforeGrowth = fs.statSync(fixture.recentRollout).size;
+    const transcriptBeforeGrowth = fs.statSync(fixture.recentTranscript).size;
     fs.appendFileSync(
       fixture.recentRollout,
       `${JSON.stringify({
@@ -2081,7 +2084,8 @@ export async function runNoChangeConstantWorkContract(
       const run = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
       if (!run) throw new Error("ExcludedAppendMaintenanceResultMissing");
       excludedAppendRuns.push(run);
-      if (run.rollout.excludedGenerations >= 1 && run.transcript.excludedGenerations >= 1) {
+      if (excludedAppendRuns.some((item) => item.rollout.filesRead > 0) &&
+        excludedAppendRuns.some((item) => item.transcript.filesRead > 0)) {
         break;
       }
     }
@@ -2089,17 +2093,19 @@ export async function runNoChangeConstantWorkContract(
       excludedAppendBefore,
       eventMutationCounts(buffer),
     );
-    const preinstallGrowthStayedExcluded =
+    const preinstallGrowthRecovered =
       excludedAppendRuns.length > 0 &&
-      excludedAppendRuns.every(
-        (run) =>
-          run.rawEventWrites === 0 &&
-          run.rollout.filesRead === 0 &&
-          run.transcript.filesRead === 0,
-      ) &&
-      excludedAppendRuns.some((run) => run.rollout.excludedGenerations >= 1) &&
-      excludedAppendRuns.some((run) => run.transcript.excludedGenerations >= 1) &&
-      excludedAppendMutations.inserted === 0;
+      excludedAppendRuns.reduce((sum, run) => sum + run.rollout.filesRead, 0) === 1 &&
+      excludedAppendRuns.reduce((sum, run) => sum + run.transcript.filesRead, 0) === 1 &&
+      excludedAppendRuns.reduce((sum, run) => sum + run.rollout.bytesRead, 0) <=
+        fs.statSync(fixture.recentRollout).size - rolloutBeforeGrowth + 1024 &&
+      excludedAppendRuns.reduce((sum, run) => sum + run.transcript.bytesRead, 0) <=
+        fs.statSync(fixture.recentTranscript).size - transcriptBeforeGrowth + 1024 &&
+      excludedAppendRuns.reduce((sum, run) => sum + (run.rollout.unvalidatedFirstRows ?? 0), 0) === 1 &&
+      excludedAppendRuns.reduce((sum, run) => sum + run.rollout.eventsAppended, 0) === 1 &&
+      excludedAppendRuns.reduce((sum, run) => sum + run.transcript.eventsAppended, 0) === 1 &&
+      excludedAppendRuns.reduce((sum, run) => sum + run.rawEventWrites, 0) === 2 &&
+      excludedAppendMutations.inserted === 2;
 
     // New path/generation fixtures begin at byte zero and capture exactly
     // once. They are deliberately created only after both baseline receipts.
@@ -2624,6 +2630,7 @@ export async function runNoChangeConstantWorkContract(
       firstRun.transcript.filesRead +
       restartRun.rollout.filesRead +
       restartRun.transcript.filesRead +
+      excludedAppendRuns.reduce((total, run) => total + run.rollout.filesRead + run.transcript.filesRead, 0) +
       appendedRuns.reduce((total, run) => total + run.rollout.filesRead + run.transcript.filesRead, 0) +
       afterAppendRun.rollout.filesRead +
       afterAppendRun.transcript.filesRead +
@@ -2632,6 +2639,7 @@ export async function runNoChangeConstantWorkContract(
     counters.fileBytesRead =
       firstRun.rollout.bytesRead +
       firstRun.transcript.bytesRead +
+      excludedAppendRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
       appendedRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
       replayRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
       transcriptPartial.bytesRead +
@@ -2689,7 +2697,7 @@ export async function runNoChangeConstantWorkContract(
       setupFilesystemEnumerationCalls === fixture.expectedSetupFilesystemEnumerationCalls &&
       recentDidNotPromote &&
       restartZeroWork &&
-      preinstallGrowthStayedExcluded &&
+      preinstallGrowthRecovered &&
       appendedExactlyOnce &&
       durableReceiptCounters &&
       recentPromotionRejected &&
@@ -2711,8 +2719,8 @@ export async function runNoChangeConstantWorkContract(
       required: true,
       status: passed ? "pass" : "fail",
       detail: passed
-        ? "Metadata-only first boot excluded pre-install generations, coalesced without overlap, kept their growth excluded, captured only new generations exactly once, and left history import explicit and resumable."
-        : `Recent-first boot, durable receipt, restart, status, or explicit history coverage assertions failed: ${JSON.stringify({ appendedWrites: appendedRuns.map((run) => ({ raw: run.rawEventWrites, rollout: run.rollout.eventsAppended, transcript: run.transcript.eventsAppended })), appendMutations, afterAppendRun })}`,
+        ? "Metadata-only first boot excluded pre-install bytes, recovered later appends from their boundary, captured new generations exactly once, and left history import explicit and resumable."
+        : `Recent-first boot, durable receipt, restart, status, or explicit history coverage assertions failed: ${JSON.stringify({ growthRuns: excludedAppendRuns.map((run) => ({ raw: run.rawEventWrites, rolloutRead: run.rollout.filesRead, rolloutBytes: run.rollout.bytesRead, rolloutUnvalidated: run.rollout.unvalidatedFirstRows, claudeRead: run.transcript.filesRead, claudeBytes: run.transcript.bytesRead, claudeEvents: run.transcript.eventsAppended })), growthMutations: excludedAppendMutations, appendedWrites: appendedRuns.map((run) => ({ raw: run.rawEventWrites, rollout: run.rollout.eventsAppended, transcript: run.transcript.eventsAppended })), appendMutations, afterAppendRun })}`,
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
       measurements: {
@@ -2754,7 +2762,7 @@ export async function runNoChangeConstantWorkContract(
         stableRolloutSweepComplete: stableRolloutSweep?.sweepComplete ?? false,
         stableTranscriptSweepComplete: stableTranscriptSweep?.sweepComplete ?? false,
         restartZeroWork,
-        preinstallGrowthStayedExcluded,
+        preinstallGrowthRecovered,
         appendedExactlyOnce,
         durableReceiptCounters,
         replayRolloutFilesRead: replayRuns.reduce(

@@ -17,6 +17,7 @@ import {
   ensureJsonlScanState,
   loadJsonlScanCursor,
   rememberJsonlScanCursor,
+  jsonlScanStateKey,
   type JsonlScanCursor,
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
@@ -32,6 +33,8 @@ import {
   type CaptureScanProgress,
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
+  captureBaselineExcludedSize,
+  captureBaselinePostEnrollmentOffset,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -48,6 +51,8 @@ import {
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent } from "./capture-frontier";
+import { CaptureRevisitQueue } from "./capture-revisit-queue";
+import { recordCaptureRecordLoss } from "./capture-record-loss";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -117,6 +122,9 @@ export type TranscriptScanResult = {
   parseErrors: number;
   unresolvedRecords: number;
   recordsParsed: number;
+  skippedRecords?: number;
+  skippedBytes?: number;
+  skippedKinds?: Record<string, { records: number; bytes: number }>;
   /** Complete records included in successful cursor transactions. */
   recordsCommitted?: number;
   continuationBytesAdvanced?: number;
@@ -342,6 +350,7 @@ function restoreResultMutationSnapshot(
 }
 
 export class TranscriptTailer {
+  private readonly revisit = new CaptureRevisitQueue();
   private activeCaptureRoot: CaptureRoot | undefined;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
@@ -367,6 +376,7 @@ export class TranscriptTailer {
       return new CaptureCoverageWalk(null);
     }
     const verdict = jsonlCoverageCheck(this.buffer.database);
+    const baselineComplete = captureBaselineStatus(this.buffer.database).status === "complete";
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.projectsDir],
       maxEntries,
@@ -385,7 +395,14 @@ export class TranscriptTailer {
       },
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
-        return stat ? verdict(this.cursorKey(file), stat) : null;
+        const checked = stat ? verdict(this.cursorKey(file), stat) : null;
+        if (checked && stat?.isFile() && !checked.fullyRead) {
+          const baselineSize = baselineComplete
+            ? captureBaselineExcludedSize(this.buffer.database, "claude_code", baselineObservation(file, stat)) : null;
+          if (baselineSize === null || stat.size > baselineSize) this.revisit.offer(file);
+          else this.revisit.remove(file);
+        } else this.revisit.remove(file);
+        return checked;
       },
       checkLink: (link) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), link);
@@ -617,6 +634,7 @@ export class TranscriptTailer {
       this.captureAttempt?.discovery.close();
       this.baselineAttempt = null;
       this.captureAttempt = null;
+      this.revisit.clear();
       rememberCaptureSweepResume(this.buffer.database, "claude_code", null);
     }
     if (options.deferredBeforeIo) {
@@ -839,9 +857,14 @@ export class TranscriptTailer {
     const discoveredFiles: Array<{ file: string; stat?: fs.Stats; precise?: fs.BigIntStats; servicedCadences?: number }> = automaticDiscovery
       ? automaticDiscovery.files
       : explicitDiscovery!.files.map((file) => ({ file }));
+    const revisitFiles = automatic?.phase === "capture" ? new Set(this.revisit.next()) : new Set<string>();
+    if (revisitFiles.size > 0) {
+      const known = new Set(discoveredFiles.map((entry) => entry.file));
+      for (const file of revisitFiles) if (!known.has(file)) discoveredFiles.push({ file });
+    }
     result.activity.truncated = discovery.truncated;
     result.discoveryErrors = discovery.errors + rootErrors;
-    result.filesSeen = discovery.files.length;
+    result.filesSeen = discoveredFiles.length;
     // Directory entries visited this cadence, never the files they matched:
     // this number is published as `entriesThisTick` beside `entriesThisSweep`,
     // which counts entries too. `discovery.files` on the automatic path is the
@@ -853,6 +876,7 @@ export class TranscriptTailer {
       file: string;
       stat: fs.Stats;
       cursor: JsonlScanCursor<TranscriptParserState> | undefined;
+      initialOffset?: number;
     }> = [];
     const automaticFilesConsumed = new Set<string>();
     const automaticFilesPartial = new Set<string>();
@@ -902,12 +926,13 @@ export class TranscriptTailer {
         result.activity.lastActivityAt = mtime;
       }
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
-      if (options.scope === "recent" && stat.mtime.getTime() < recentCutoff) {
+      if (options.scope === "recent" && !revisitFiles.has(file) && stat.mtime.getTime() < recentCutoff) {
         result.filesSkippedOutsideRecentWindow += 1;
         consumeAutomaticFile(file);
         continue;
       }
       const observation = baselineObservation(file, stat, discovered.precise);
+      let growthStart: number | null = null;
       if (automatic?.phase === "capture") {
         const decision = classifyCaptureBaselineFile(
           this.buffer.database,
@@ -916,10 +941,13 @@ export class TranscriptTailer {
           { mode: "automatic", observedAt: scanNow.toISOString() },
         );
         if (decision.decision === "exclude") {
-          result.excludedGenerations += 1;
-          result.excludedBytes += stat.size;
-          consumeAutomaticFile(file);
-          continue;
+          if (stat.size <= decision.baselineSize) {
+            result.excludedGenerations += 1;
+            result.excludedBytes += stat.size;
+            consumeAutomaticFile(file);
+            continue;
+          }
+          growthStart = decision.baselineSize;
         }
         if (decision.decision === "block") {
           result.statErrors += 1;
@@ -941,13 +969,19 @@ export class TranscriptTailer {
         }
       }
       const cursor = loadJsonlScanCursor<TranscriptParserState>(
-        this.buffer.database,
-        this.cursorKey(file),
-        PARSER_KIND,
-        CHECKPOINT_VERSION,
-        validateTranscriptParserState,
+        this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateTranscriptParserState,
       );
-      candidates.push({ file, stat, cursor });
+      let initialOffset: number | undefined;
+      if (growthStart !== null) {
+        if (cursor && (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart)) {
+          result.excludedGenerations += 1;
+          result.excludedBytes += stat.size;
+          consumeAutomaticFile(file);
+          continue;
+        }
+        if (!cursor) initialOffset = growthStart;
+      }
+      candidates.push({ file, stat, cursor, initialOffset });
     }
 
     const preferNewest = automatic ? this.nextCandidatePreference() === "newest" : false;
@@ -1025,15 +1059,18 @@ export class TranscriptTailer {
             const root = rootForFile(this.captureRoots, candidate.file);
             const next = readJsonlContinuation(candidate.file, candidate.stat, cursor, limits, this.io, {
               database: this.buffer.database, provider: "claude", cursorKey: this.cursorKey(candidate.file), root: root ?? undefined,
-              directory: root?.directory ?? this.projectsDir,
+              directory: root?.directory ?? this.projectsDir, initialOffset: candidate.initialOffset,
               deadline: automatic ? automatic.budget.unitDeadline() : performance.now() + 200,
               eligible: () => {
                 if (options.signal?.aborted) return false;
                 if (this.inventoryConfigured && !root) return false;
                 if (automatic?.phase !== "capture") return true;
                 const fresh = this.regularFileStat(candidate.file);
-                return classifyCaptureBaselineFile(this.buffer.database, "claude_code", baselineObservation(candidate.file, fresh),
-                  {mode:"automatic", observedAt:scanNow.toISOString()}).decision === "capture";
+                const observation = baselineObservation(candidate.file, fresh);
+                const decision = classifyCaptureBaselineFile(this.buffer.database, "claude_code", observation,
+                  {mode:"automatic", observedAt:scanNow.toISOString()});
+                return decision.decision === "capture" || decision.decision === "exclude" &&
+                  captureBaselinePostEnrollmentOffset(this.buffer.database, "claude_code", observation) !== null;
               },
             });
             if (!next) {
@@ -1112,6 +1149,9 @@ export class TranscriptTailer {
                 return;
               }
               const parseErrorsBefore = result.parseErrors;
+              if (read.skippedRecord) recordCaptureRecordLoss(this.buffer.database, {
+                source: "claude_code", fileKey: jsonlScanStateKey(this.cursorKey(candidate.file)), record: read.skippedRecord,
+              });
               const parserState = this.ingestLines(
                 read.lines,
                 result,
@@ -1133,6 +1173,14 @@ export class TranscriptTailer {
               );
             });
             committed = true;
+            if (read.skippedRecord) {
+              result.skippedRecords = (result.skippedRecords ?? 0) + 1;
+              result.skippedBytes = (result.skippedBytes ?? 0) + read.skippedRecord.bytes;
+              result.skippedKinds ??= {};
+              const kind = read.skippedRecord.kind;
+              const count = result.skippedKinds[kind] ?? { records: 0, bytes: 0 };
+              result.skippedKinds[kind] = { records: count.records + 1, bytes: count.bytes + read.skippedRecord.bytes };
+            }
             if (read.lines.length || read.continuation?.scanBytesAdvanced) this.continuationAdmission.progressed(candidateHash);
             result.continuationBytesAdvanced = (result.continuationBytesAdvanced ?? 0) + (read.continuation?.scanBytesAdvanced ?? 0);
             if (read.continuation?.reason) {
@@ -1319,6 +1367,7 @@ export class TranscriptTailer {
 
   private consumeAutomaticCaptureFiles(files: ReadonlySet<string>, partial: ReadonlySet<string>) {
     const attempt = this.captureAttempt;
+    for (const file of files) if (!partial.has(file)) this.revisit.remove(file);
     if (!attempt) return;
     attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
