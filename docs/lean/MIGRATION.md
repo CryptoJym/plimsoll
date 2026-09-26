@@ -21,6 +21,11 @@ is judged against the install it names whatever its lifecycle; an erasure-only t
 deletes the facts before the installs in `TENANT_COLUMN_MODELS` order (`CONTRACTS.md` C1). The join request carries the previous
 install's proof and the handshake's version is recorded only when its response names the grant's install (`CONTRACTS.md` C4).
 
+**What changed in round 11 (B0 round 5).** S4's sighting reads the named install's ledger under its lock and refuses a pair naming an
+install outside the uploader's ledger before any judgment (400 `stamp_from_other_ledger`, nothing recorded); the collector parks such
+rows and segments until the ledger is linked, by the join's proof or by an admin's audited link, which re-keys the linked ledger's
+facts in the same transaction, or until an admin releases them undelivered and never judged (`CONTRACTS.md` C1 "Scope").
+
 ## 1. Invariants that hold on every host at every step
 
 1. **No raw row is deleted by any job between the hold and S9, except under the disclosed hold-release ladder.** From S1b the prune is held (ARCHITECTURE.md §2.4); today's prune would otherwise delete a pending-upload row at age (`collector-cli/src/buffer.ts:3008-3013,3041-3052`). The ladder's rung at fewer than 5 days of runway deletes only rows whose delivery is acknowledged (`uploaded_at` set and an `acknowledged` receipt for the row's own id, `collector-cli/src/outbox.ts:662-671,701-709`), never a member of an open target, and writes a receipt and a tombstone; the S3 certify converts the affected sessions as `cloud_superset` (§3, §6). A rollback through S8 therefore replays or rebuilds from every raw row that is not in the cloud already; **after a rung-2 release** the old reader path is reconstructable only from the rows still present, and the difference is exactly the receipted release set (§8; `out/fixtures/sf1_ladder_rollback_parity.py`).
