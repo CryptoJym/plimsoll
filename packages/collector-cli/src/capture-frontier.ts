@@ -1,4 +1,4 @@
-import type fs from "node:fs";
+import fs from "node:fs";
 
 import type Database from "better-sqlite3";
 
@@ -17,9 +17,10 @@ import { captureRecordLossGaps } from "./capture-record-loss";
  * enrollment, and Grok's sweep reaches a session only every few cadences, so a
  * pass can finish clean while a file it has not read keeps growing.
  *
- * The check is stat-only and walks each source in turns of at most
- * CAPTURE_COVERAGE_TURN_MS (review r3, N4), resuming where it stopped. For
- * each file it asks the tailer's own state whether the file has been read to
+ * The check is stat-only and aims for CAPTURE_COVERAGE_TURN_MS per turn
+ * (review r3, N4), resuming where it stopped. A synchronous read, stat or
+ * database write can exceed that soft deadline. For each file it asks the
+ * tailer's own state whether the file has been read to
  * its current end.
  * - Read to its end, or untouched since the epoch began: covered.
  * - Otherwise the file is uncovered since the last check that saw it covered,
@@ -31,6 +32,11 @@ import { captureRecordLossGaps } from "./capture-record-loss";
  * - A file the tailer keeps up with is uncovered only since the walk before:
  *   when the tailer has read everything the file held at that walk, what is
  *   unread now came after it (review r3, S5).
+ * - If a directory changes during a source's first walk, a file removed
+ *   before its open cursor reached the name cannot be identified. That walk
+ *   records a conservative uncertainty gap from the epoch start. Later
+ *   walks reconcile saved partial tailer cursors with their listed files;
+ *   an unlisted partial file stays a gap instead of silently disappearing.
  * - A symlink where a tailer would read a file or descend into a directory is
  *   never covered (review r4, S1). The tailers do not follow links, and
  *   neither does this check: nothing behind one is read, listed or stat'ed.
@@ -58,11 +64,11 @@ export const CAPTURE_WRITE_LAG_MS = 60 * 60 * 1000;
 export const CAPTURE_HOLD_LIMIT_MS = 60 * 60 * 1000;
 /** How often the maintenance worker starts a (stat-only) coverage check. */
 export const CAPTURE_COVERAGE_INTERVAL_MS = 15 * 60 * 1000;
-/** Wall time one maintenance cadence spends on a coverage check; the walk resumes on the next. */
+/** Soft wall-time target for a coverage turn; synchronous work may exceed it. */
 export const CAPTURE_COVERAGE_TURN_MS = 250;
-/** Directory entries one check may visit per source; beyond it the check is incomplete. */
+/** Classified entries one check may visit per source; beyond it the check is incomplete. */
 export const CAPTURE_COVERAGE_MAX_ENTRIES = 200_000;
-/** Deterministic units one coverage turn may process before yielding to the next cadence. */
+/** Directory opens, physical entry reads and file checks allowed per source and turn. */
 export const CAPTURE_COVERAGE_MAX_WORK_PER_TURN = 4_096;
 /** Gaps one claim carries. Closer gaps merge first, which only widens them. */
 export const CAPTURE_CLAIM_MAX_GAPS = 8;
@@ -107,30 +113,187 @@ export type CaptureCoverageFile = {
 /** `complete` is false when a walk hit its entry budget, a directory error or an unready root. */
 export type CaptureCoverageSnapshot = { complete: boolean; files: CaptureCoverageFile[] };
 
+export type CaptureCoverageEntry = { path: string; kind: "directory" | "file" | "link" };
+
+/** One directory cursor; `undefined` is an ignored entry and `null` is EOF. */
+export type CaptureCoverageDirectory = {
+  read(): CaptureCoverageEntry | undefined | null;
+  /** Reusing a verified in-memory listing does not issue a directory read. */
+  readWork?: 0;
+  unchanged(): boolean;
+  /** Still the same directory after its stream closed; additions may follow in the next check. */
+  sameIdentity?(): boolean;
+  close(): void;
+};
+
+/** Keep only small, unchanged listings between checks; file stats still run every check. */
+export class CaptureCoverageDirectoryCache {
+  private readonly listings = new Map<string, { stat: fs.BigIntStats; entries: CaptureCoverageEntry[] }>();
+  private entries = 0;
+
+  get(directory: string, depth: number, stat: fs.BigIntStats) {
+    const key = `${depth}\0${directory}`;
+    const saved = this.listings.get(key);
+    if (!saved) return null;
+    if (saved.stat.dev !== stat.dev || saved.stat.ino !== stat.ino ||
+        saved.stat.mtimeNs !== stat.mtimeNs || saved.stat.ctimeNs !== stat.ctimeNs) {
+      this.drop(key);
+      return null;
+    }
+    this.listings.delete(key);
+    this.listings.set(key, saved);
+    return saved.entries;
+  }
+
+  put(directory: string, depth: number, stat: fs.BigIntStats, entries: CaptureCoverageEntry[]) {
+    if (entries.length > 256) return;
+    const key = `${depth}\0${directory}`;
+    this.drop(key);
+    while (this.entries + entries.length > CAPTURE_COVERAGE_MAX_WORK_PER_TURN || this.listings.size >= 256) {
+      this.drop(this.listings.keys().next().value!);
+    }
+    this.listings.set(key, { stat, entries });
+    this.entries += entries.length;
+  }
+
+  clear() { this.listings.clear(); this.entries = 0; }
+
+  private drop(key: string) {
+    const saved = this.listings.get(key);
+    if (saved) this.entries -= saved.entries.length;
+    this.listings.delete(key);
+  }
+}
+
 /**
- * What one directory holds for a walk: directories to descend into, files to
- * check, and symlinks where the tailer would descend if they were directories.
+ * Open without materializing a listing. Node may prefetch at most one 32-entry
+ * batch; each physical read is charged before the walk reads the next one.
+ * A verified small listing may be served from memory on later checks.
+ * Directory identity and change times are checked across turns and at EOF.
  */
-export type CaptureCoverageListing = { directories: string[]; files: string[]; links?: string[] };
+export function openCaptureCoverageDirectory(
+  directory: string,
+  classify: (entry: fs.Dirent) => CaptureCoverageEntry | null,
+  cache?: CaptureCoverageDirectoryCache,
+  depth = 0,
+): CaptureCoverageDirectory {
+  const identity = () => fs.lstatSync(directory, { bigint: true });
+  const before = identity();
+  if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("capture_coverage_not_directory");
+  const unchanged = () => {
+    try {
+      const after = identity();
+      return after.isDirectory() && after.dev === before.dev && after.ino === before.ino &&
+        after.mtimeNs === before.mtimeNs && after.ctimeNs === before.ctimeNs;
+    } catch {
+      return false;
+    }
+  };
+  const sameIdentity = () => {
+    try {
+      const after = identity();
+      return after.isDirectory() && after.dev === before.dev && after.ino === before.ino;
+    } catch {
+      return false;
+    }
+  };
+  const cached = cache?.get(directory, depth, before);
+  if (cached) {
+    if (!unchanged()) throw new Error("capture_coverage_directory_changed");
+    let next = 0;
+    return { read: () => cached[next++] ?? null, readWork: 0, unchanged, sameIdentity, close: () => undefined };
+  }
+  const handle = fs.opendirSync(directory, { bufferSize: 32 });
+  let closed = false;
+  const close = () => {
+    if (!closed) {
+      closed = true;
+      handle.closeSync();
+    }
+  };
+  if (!unchanged()) {
+    close();
+    throw new Error("capture_coverage_directory_changed");
+  }
+  let staged: CaptureCoverageEntry[] | null = cache ? [] : null;
+  return {
+    read: () => {
+      const entry = handle.readSync();
+      if (!entry) {
+        if (staged && unchanged()) cache!.put(directory, depth, before, staged);
+        return null;
+      }
+      const classified = classify(entry) ?? undefined;
+      if (classified && staged) {
+        if (staged.length < 256) staged.push(classified);
+        else staged = null;
+      }
+      return classified;
+    },
+    unchanged,
+    sameIdentity,
+    close,
+  };
+}
+
+/** A one-entry cursor for a root that is itself a symlink. */
+export function linkCaptureCoverageDirectory(link: string): CaptureCoverageDirectory {
+  const before = fs.lstatSync(link, { bigint: true });
+  if (!before.isSymbolicLink()) throw new Error("capture_coverage_link_changed");
+  let read = false;
+  return {
+    read: () => {
+      if (read) return null;
+      read = true;
+      return { path: link, kind: "link" };
+    },
+    unchanged: () => {
+      try {
+        const after = fs.lstatSync(link, { bigint: true });
+        return after.isSymbolicLink() && after.dev === before.dev && after.ino === before.ino &&
+          after.mtimeNs === before.mtimeNs && after.ctimeNs === before.ctimeNs;
+      } catch { return false; }
+    },
+    close: () => undefined,
+  };
+}
 
 export type CaptureCoverageWalkSpec = {
   roots: readonly string[];
-  /** List one directory; depth 0 is a root. Throws when it cannot be listed. */
-  list(directory: string, depth: number): CaptureCoverageListing;
+  /** Open one directory incrementally; depth 0 is a root. Throws on errors. */
+  open(directory: string, depth: number): CaptureCoverageDirectory;
   /**
    * Stat one file (lstat, never through a link) and read the tailer's state; a
-   * symlinked file is a `link` verdict. Null when it is gone or not a regular
-   * file or link. Throws otherwise.
+   * symlinked file is a `link` verdict. A source may return a loss verdict
+   * when the path is gone. Null means this walk cannot account for the file.
    */
   check(file: string): CaptureCoverageFile | null;
   /** The `link` verdict for a listed symlink (lstat only); null once it is gone or no longer a link. */
   checkLink(link: string): CaptureCoverageFile | null;
+  /** A listed file going missing invalidates a check for sources that require it. */
+  failOnMissing?: boolean;
+  /** Account for a changed directory when there is no earlier complete check to compare against. */
+  changedDirectory?(directory: string): CaptureCoverageFile | null;
+  /** A previously listed file absent from a verifying restart may be checked as a loss. */
+  missingFromRestart?: boolean;
+  /** Page saved cursor rows before checking files, charging each row to this source's turn. */
+  prepareKnown?(maxRows: number): { work: number; done: boolean };
+  /** Verdicts for saved partial files that this walk never checked. */
+  unlistedFiles?(): Iterable<CaptureCoverageFile>;
   maxEntries?: number;
 };
 
 /** The verdict for a symlink the tailer does not follow, seen by a walk now. */
 export function linkCoverageFile(key: string, birthtimeMs: number): CaptureCoverageFile {
   return { key, mtimeMs: Date.now(), birthtimeMs, extent: -1, progress: -1, fullyRead: false, link: true };
+}
+
+/** A first check cannot identify a file removed before its open cursor reached it. */
+export function changedDirectoryCoverageFile(source: CaptureFrontierSource, directory: string): CaptureCoverageFile {
+  return {
+    key: jsonlScanStateKey(`${source}\0${directory}\0coverage-uncertain`),
+    mtimeMs: Date.now(), birthtimeMs: 0, extent: 1, progress: -1, fullyRead: false,
+  };
 }
 
 const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | null)?.code;
@@ -145,6 +308,19 @@ const errorCode = (error: unknown) => (error as NodeJS.ErrnoException | null)?.c
 export class CaptureCoverageWalk {
   private readonly directories: Array<{ directory: string; depth: number }>;
   private readonly files: Array<{ path: string; link: boolean }> = [];
+  private active: CaptureCoverageDirectory | null = null;
+  private activeDirectory = "";
+  private readonly activeSeen = new Map<string, CaptureCoverageEntry["kind"]>();
+  private activeExpected = new Set<string>();
+  private readonly activePending = new Set<string>();
+  private readonly activeCheckedPaths = new Set<string>();
+  private activeChecked = false;
+  private activeRestarts = 0;
+  private activeReads = 0;
+  private closed: CaptureCoverageDirectory | null = null;
+  private knownPrepared: boolean;
+  private unlisted: Iterator<CaptureCoverageFile> | null = null;
+  private unlistedStarted = false;
   private entries = 0;
   done = false;
   complete = true;
@@ -152,6 +328,7 @@ export class CaptureCoverageWalk {
   constructor(private readonly spec: CaptureCoverageWalkSpec | null) {
     // A null spec is a walk that cannot be taken (for example an unready root).
     this.directories = spec ? spec.roots.map((directory) => ({ directory, depth: 0 })).reverse() : [];
+    this.knownPrepared = !spec?.prepareKnown;
     if (!spec) this.fail();
   }
 
@@ -159,7 +336,7 @@ export class CaptureCoverageWalk {
   static empty() {
     return new CaptureCoverageWalk({
       roots: [],
-      list: () => ({ directories: [], files: [] }),
+      open: () => { throw new Error("empty_walk_has_no_directory"); },
       check: () => null,
       checkLink: () => null,
     });
@@ -173,57 +350,207 @@ export class CaptureCoverageWalk {
   ) {
     let batch: CaptureCoverageFile[] = [];
     let work = 0;
+    const limit = Math.max(0, Math.min(CAPTURE_COVERAGE_MAX_WORK_PER_TURN, Math.floor(maxWork)));
     const flush = () => {
       if (batch.length > 0) onBatch(batch);
       batch = [];
     };
-    while (!this.done && work < maxWork && now() < deadline) {
+    let restart = !!this.active && !this.active.unchanged() && !this.allowsActiveGrowth();
+    if (this.active && !this.active.unchanged() && !this.active.sameIdentity?.()) this.fail();
+    if (this.closed && !this.closedIdentity()) this.fail();
+    while (!this.done && work < limit && now() < deadline) {
+      if (restart) {
+        // A live day folder can gain a session while its cursor is suspended.
+        // Reopen only this folder. Each raw read, including a duplicate on the
+        // new cursor, still costs a unit; queued paths are never queued twice.
+        work += 1;
+        try { this.restartActive(); } catch { this.fail(); }
+        restart = false;
+        continue;
+      }
+      // A bounded queue alternates reads and checks in a large folder. Keep
+      // its cursor across turns even after checks begin, so new sessions do
+      // not force a large active folder to fail on every cadence.
+      if (this.active && this.files.length < CAPTURE_COVERAGE_MAX_WORK_PER_TURN) {
+        work += this.active.readWork ?? 1;
+        try {
+          const entry = this.active.read();
+          this.activeReads += this.active.readWork ?? 1;
+          if (this.activeRestarts === 0 && this.allowsActiveGrowth()) {
+            // Only a small folder can restart. Do not retain duplicate name
+            // sets for a large folder throughout a 200,000-entry walk.
+            this.activePending.clear();
+            this.activeCheckedPaths.clear();
+          }
+          if (entry === null) {
+            if (!this.active.sameIdentity?.() && !this.active.unchanged()) {
+              this.fail();
+            } else if (!this.active.unchanged() && !this.allowsActiveGrowth()) {
+              restart = true;
+            } else {
+              if (this.activeExpected.size > 0) {
+                if (!this.spec!.missingFromRestart || [...this.activeExpected].some((path) =>
+                  this.activeSeen.get(path) === "directory")) {
+                  this.fail();
+                  continue;
+                }
+                // A restarted cursor may omit a previously listed file. It
+                // still gets one charged check, which reports capture or loss.
+                for (const path of this.activeExpected) {
+                  if (this.activePending.has(path) || this.activeCheckedPaths.has(path)) continue;
+                  this.files.push({ path, link: this.activeSeen.get(path) === "link" });
+                  this.activePending.add(path);
+                }
+                this.activeExpected.clear();
+              }
+              if (this.spec!.changedDirectory &&
+                  (!this.active.unchanged() || this.activeRestarts > 0)) {
+                const uncertain = this.spec!.changedDirectory(this.activeDirectory);
+                if (uncertain) {
+                  batch.push(uncertain);
+                  if (batch.length >= CAPTURE_COVERAGE_BATCH) flush();
+                }
+              }
+              this.active.close();
+              this.closed = this.active;
+              this.active = null;
+              this.activeSeen.clear();
+            }
+          } else if (entry !== undefined) {
+            const prior = this.activeSeen.get(entry.path);
+            if (prior && prior !== entry.kind) this.fail();
+            else if (prior) this.activeExpected.delete(entry.path);
+            else {
+              this.activeSeen.set(entry.path, entry.kind);
+              this.entries += 1;
+              if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) this.fail();
+              else if (entry.kind === "directory") {
+                this.directories.push({ directory: entry.path, depth: this.activeDepth + 1 });
+              } else {
+                this.files.push({ path: entry.path, link: entry.kind === "link" });
+                if (!this.allowsActiveGrowth()) this.activePending.add(entry.path);
+              }
+            }
+          }
+        } catch { this.fail(); }
+        continue;
+      }
+      if (!this.knownPrepared && (this.files.length > 0 || (!this.active && this.directories.length === 0))) {
+        try {
+          const progress = this.spec!.prepareKnown!(Math.min(256, limit - work));
+          if (progress.work < 1 || progress.work > limit - work) throw new Error("invalid_coverage_cursor_work");
+          work += progress.work;
+          this.knownPrepared = progress.done;
+        } catch { this.fail(); }
+        continue;
+      }
       const file = this.files.pop();
       if (file !== undefined) {
+        if (this.active) this.activeChecked = true;
+        if (this.activePending.delete(file.path)) this.activeCheckedPaths.add(file.path);
         work += 1;
         try {
           const checked = file.link ? this.spec!.checkLink(file.path) : this.spec!.check(file.path);
           if (checked) batch.push(checked);
+          else if (this.spec!.failOnMissing) this.fail();
         } catch {
           this.fail();
         }
         if (batch.length >= CAPTURE_COVERAGE_BATCH) flush();
         continue;
       }
+      if (this.closed) {
+        if (!this.closedIdentity()) this.fail();
+        this.closed = null;
+        continue;
+      }
       const next = this.directories.pop();
       if (!next) {
-        this.done = true;
-        break;
+        try {
+          if (!this.unlistedStarted) {
+            this.unlistedStarted = true;
+            this.unlisted = this.spec!.unlistedFiles?.()[Symbol.iterator]() ?? null;
+          }
+          if (!this.unlisted) { this.done = true; break; }
+          work += 1;
+          const pending = this.unlisted.next();
+          if (pending.done) { this.unlisted = null; this.done = true; }
+          else {
+            batch.push(pending.value);
+            if (batch.length >= CAPTURE_COVERAGE_BATCH) flush();
+          }
+        } catch { this.fail(); }
+        continue;
       }
-      let listing: CaptureCoverageListing;
+      work += 1;
       try {
-        listing = this.spec!.list(next.directory, next.depth);
+        this.active = this.spec!.open(next.directory, next.depth);
+        this.activeDirectory = next.directory;
+        this.activeDepth = next.depth;
+        this.activeSeen.clear();
+        this.activeExpected.clear();
+        this.activePending.clear();
+        this.activeCheckedPaths.clear();
+        this.activeChecked = false;
+        this.activeRestarts = 0;
+        this.activeReads = 0;
       } catch (error) {
         // A missing root holds no files, as it does for the tailers' scans.
         if (!(next.depth === 0 && errorCode(error) === "ENOENT")) this.fail();
-        continue;
-      }
-      const links = listing.links ?? [];
-      work += 1 + listing.directories.length + listing.files.length + links.length;
-      this.entries += listing.directories.length + listing.files.length + links.length;
-      if (this.entries > (this.spec!.maxEntries ?? CAPTURE_COVERAGE_MAX_ENTRIES)) {
-        this.fail();
-        continue;
-      }
-      for (let index = listing.directories.length - 1; index >= 0; index -= 1) {
-        this.directories.push({ directory: listing.directories[index]!, depth: next.depth + 1 });
-      }
-      for (let index = links.length - 1; index >= 0; index -= 1) this.files.push({ path: links[index]!, link: true });
-      for (let index = listing.files.length - 1; index >= 0; index -= 1) {
-        this.files.push({ path: listing.files[index]!, link: false });
       }
     }
+    if (this.active && !this.active.unchanged() && !this.active.sameIdentity?.()) this.fail();
+    if (this.closed && !this.closedIdentity()) this.fail();
     flush();
+    return work;
   }
+
+  private activeDepth = 0;
+
+  private allowsActiveGrowth() {
+    // One changed small folder gets a verifying restart. A large folder must
+    // keep its open cursor: restarting it every cadence cannot reach EOF.
+    return this.activeChecked || this.activeRestarts > 0 ||
+      this.activeReads >= CAPTURE_COVERAGE_MAX_WORK_PER_TURN / 4;
+  }
+
+  private canRestartActive() {
+    return !this.allowsActiveGrowth() && (this.active?.sameIdentity?.() ?? false);
+  }
+
+  private restartActive() {
+    if (!this.canRestartActive()) throw new Error("capture_coverage_directory_replaced");
+    const previous = this.active!;
+    previous.close();
+    const opened = this.spec!.open(this.activeDirectory, this.activeDepth);
+    if (!previous.sameIdentity?.()) {
+      opened.close();
+      throw new Error("capture_coverage_directory_replaced");
+    }
+    this.active = opened;
+    this.activeRestarts += 1;
+    this.activeExpected = new Set(this.activeSeen.keys());
+  }
+
+  private closedIdentity() {
+    return this.closed?.sameIdentity?.() ?? this.closed?.unchanged() ?? true;
+  }
+
+  /** Close a suspended directory when maintenance stops or discards a walk. */
+  close() { if (!this.done) this.fail(); }
 
   private fail() {
     this.complete = false;
     this.done = true;
+    try { this.active?.close(); } catch { /* already failing closed */ }
+    try { this.unlisted?.return?.(); } catch { /* already failing closed */ }
+    this.active = null;
+    this.closed = null;
+    this.unlisted = null;
+    this.activeSeen.clear();
+    this.activeExpected.clear();
+    this.activePending.clear();
+    this.activeCheckedPaths.clear();
     this.directories.length = 0;
     this.files.length = 0;
   }
@@ -235,33 +562,117 @@ export class CaptureCoverageWalk {
  * the key cannot drift from theirs. A symlink is a `link` verdict under a key
  * of its own (a path holds no NUL, so none collides with a file's).
  */
+type JsonlCoverageCursorRow = {
+  size: number;
+  committedOffset: number | null;
+  deferredBytes: number | null;
+  workRemaining: number | null;
+  unresolvedKind: string | null;
+};
+
+const JSONL_COVERAGE_CURSOR_COLUMNS = `size, committed_offset as committedOffset,
+  deferred_bytes as deferredBytes, work_remaining as workRemaining,
+  unresolved_kind as unresolvedKind`;
+
+function jsonlCursorComplete(row: JsonlCoverageCursorRow, extent: number) {
+  return (row.committedOffset ?? row.size) >= extent &&
+    !row.workRemaining && !row.unresolvedKind && (row.deferredBytes ?? 0) === 0;
+}
+
+function missingJsonlCoverageFile(key: string, row: JsonlCoverageCursorRow | undefined): CaptureCoverageFile {
+  return {
+    key, mtimeMs: Date.now(), birthtimeMs: 0, extent: Math.max(1, row?.size ?? 1),
+    progress: row ? row.committedOffset ?? row.size : -1,
+    fullyRead: row !== undefined && jsonlCursorComplete(row, row.size),
+  };
+}
+
 export function jsonlCoverageCheck(database: Database.Database) {
   const cursor = database.prepare(
-    `select size, committed_offset as committedOffset, deferred_bytes as deferredBytes,
-       work_remaining as workRemaining, unresolved_kind as unresolvedKind
-     from rollout_scan_state where file = ?`,
+    `select ${JSONL_COVERAGE_CURSOR_COLUMNS} from rollout_scan_state where file = ?`,
   );
-  return (cursorKey: string, stat: fs.Stats): CaptureCoverageFile | null => {
+  return (cursorKey: string, stat: fs.Stats | null): CaptureCoverageFile | null => {
     // The tailers never read a symlinked JSONL file or descend through a
     // symlinked directory (review r4, S1).
-    if (stat.isSymbolicLink()) return linkCoverageFile(jsonlScanStateKey(`${cursorKey}\0symlink`), stat.birthtimeMs);
-    if (!stat.isFile()) return null;
+    if (stat?.isSymbolicLink()) return linkCoverageFile(jsonlScanStateKey(`${cursorKey}\0symlink`), stat.birthtimeMs);
+    if (stat && !stat.isFile()) return null;
     const key = jsonlScanStateKey(cursorKey);
-    const row = cursor.get(key) as
-      | { size: number; committedOffset: number | null; deferredBytes: number | null; workRemaining: number | null; unresolvedKind: string | null }
-      | undefined;
+    const row = cursor.get(key) as JsonlCoverageCursorRow | undefined;
     // A legacy row (no committed offset) recorded the size it had read.
     const committed = row ? row.committedOffset ?? row.size : -1;
+    if (!stat) {
+      // The file was listed, so it existed during this walk. Its last saved
+      // cursor says whether capture finished; an unknown or unfinished file
+      // becomes a durable loss rather than invalidating every busy check.
+      return missingJsonlCoverageFile(key, row);
+    }
     return {
       key,
       mtimeMs: stat.mtimeMs,
       birthtimeMs: stat.birthtimeMs,
       extent: stat.size,
       progress: committed,
-      fullyRead: row !== undefined && committed >= stat.size &&
-        !row.workRemaining && !row.unresolvedKind && (row.deferredBytes ?? 0) === 0,
+      fullyRead: row !== undefined && jsonlCursorComplete(row, stat.size),
     };
   };
+}
+
+/**
+ * Only partially captured cursor keys stay in memory. Page the scan-state
+ * table by its primary key and charge every row before checking source files,
+ * so even a large ledger cannot make one coverage turn unbounded. Parser kind
+ * scopes current rows; old untyped partial rows conservatively belong to both
+ * JSONL sources because their hashed keys cannot reveal the source path.
+ */
+export class KnownPartialJsonlFiles {
+  private after = "";
+  private ready = false;
+  private readonly pending = new Set<string>();
+  private readonly parserFamily: string;
+  private readonly page;
+  private readonly current;
+
+  constructor(database: Database.Database, parserKind: string) {
+    this.parserFamily = parserKind.replace(/\d+$/, "");
+    this.page = database.prepare(
+      `select file, parser_kind as parserKind, ${JSONL_COVERAGE_CURSOR_COLUMNS}
+       from rollout_scan_state where file > ? order by file limit ?`,
+    );
+    this.current = database.prepare(
+      `select ${JSONL_COVERAGE_CURSOR_COLUMNS} from rollout_scan_state where file = ?`,
+    );
+  }
+
+  prepare(maxRows: number) {
+    const limit = Math.max(1, Math.min(256, Math.floor(maxRows)));
+    const rows = this.page.all(this.after, limit) as Array<JsonlCoverageCursorRow & {
+      file: string; parserKind: string | null;
+    }>;
+    for (const row of rows) {
+      this.after = row.file;
+      const scoped = row.parserKind?.startsWith(this.parserFamily) ?? false;
+      if ((scoped || row.parserKind === null) &&
+          !jsonlCursorComplete(row, row.size)) {
+        this.pending.add(row.file);
+        if (this.pending.size > CAPTURE_COVERAGE_MAX_ENTRIES) throw new Error("capture_partial_cursor_ceiling");
+      }
+    }
+    this.ready = rows.length < limit;
+    return { work: Math.max(1, rows.length), done: this.ready };
+  }
+
+  checked(key: string) { this.pending.delete(key); }
+
+  *unlistedFiles(): Iterable<CaptureCoverageFile> {
+    if (!this.ready) throw new Error("capture_partial_cursor_scan_incomplete");
+    try {
+      for (const key of this.pending) {
+        const row = this.current.get(key) as JsonlCoverageCursorRow | undefined;
+        if (!row) throw new Error("capture_partial_cursor_disappeared");
+        yield missingJsonlCoverageFile(key, row);
+      }
+    } finally { this.pending.clear(); }
+  }
 }
 
 /** lstat that reports a vanished file as null, the way every walk treats one. */
@@ -358,6 +769,13 @@ function frontierState(database: Database.Database, check: Pick<CaptureCoverageC
     .get(check.workspaceId, check.installationEpochId, check.source) as
     | { checkedAt: string; completeThrough: string | null }
     | undefined;
+}
+
+/** The first walk has no prior file inventory to resolve an unseen removal. */
+export function hasCompleteCaptureCoverage(database: Database.Database, source: CaptureFrontierSource) {
+  const epoch = currentEpoch(database);
+  return epoch !== null && tableExists(database, "capture_coverage_state") &&
+    frontierState(database, { ...epoch, source }) !== undefined;
 }
 
 /**

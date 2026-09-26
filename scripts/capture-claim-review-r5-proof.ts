@@ -32,6 +32,8 @@ import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { grokUsageDocument } from "./lib/grok-usage-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
+import { fairnessCoverageChecks } from "./lib/capture-coverage-fairness";
+import { shutdownCoverageCheck } from "./lib/capture-coverage-shutdown";
 
 // maintenance.ts checkCaptureCoverage steps one coverage walk per source in a
 // turn: codex, claude_code and grok.
@@ -42,7 +44,7 @@ const COVERAGE_SOURCES = 3;
  * this proof until the new ceiling is reviewed and written here. */
 const RELEASE_MAX_WORK_PER_TURN = 4_096;
 
-const completion = createProofCompletion("capture-claim-review-r5", 7);
+const completion = createProofCompletion("capture-claim-review-r5", 11);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
 const check = (name: string, passed: boolean, detail: Record<string, unknown>) => {
   completion.check(name, passed);
@@ -253,28 +255,36 @@ function coverageTurnBudget() {
   const links = Array.from({ length: RELEASE_MAX_WORK_PER_TURN * 2 + 17 },
     (_, index) => `link-${index}`);
   let checked = 0;
+  let next = 0;
   const walk = new CaptureCoverageWalk({
     roots: ["root"],
-    list: () => ({ directories: [], files: [], links }),
+    open: () => ({
+      read: () => next < links.length ? { path: links[next++]!, kind: "link" as const } : null,
+      unchanged: () => true,
+      close: () => undefined,
+    }),
     check: () => null,
     checkLink: () => {
       checked += 1;
       return null;
     },
   });
-  walk.step(1_000, () => undefined, () => 0);
-  walk.step(1_000, () => undefined, () => 0);
+  const firstWork = walk.step(1_000, () => undefined, () => 0);
+  const secondWork = walk.step(1_000, () => undefined, () => 0);
   const afterBudgetTurn = checked;
   let virtualNow = 0;
-  walk.step(8, () => undefined, () => virtualNow++);
+  const deadlineWork = walk.step(8, () => undefined, () => virtualNow++);
   const afterDeadlineTurn = checked - afterBudgetTurn;
   check("R4_S1_coverage_walk_enforces_the_deterministic_turn_work_budget_and_deadline",
     CAPTURE_COVERAGE_MAX_WORK_PER_TURN === RELEASE_MAX_WORK_PER_TURN &&
-      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN &&
-      afterDeadlineTurn === 8 &&
+      firstWork === RELEASE_MAX_WORK_PER_TURN && secondWork === RELEASE_MAX_WORK_PER_TURN &&
+      afterBudgetTurn === RELEASE_MAX_WORK_PER_TURN / 2 &&
+      next === RELEASE_MAX_WORK_PER_TURN + RELEASE_MAX_WORK_PER_TURN / 2 + 3 &&
+      deadlineWork === 8 && afterDeadlineTurn === 4 &&
       !walk.done,
     { maxWorkPerTurn: CAPTURE_COVERAGE_MAX_WORK_PER_TURN, releaseMaxWorkPerTurn: RELEASE_MAX_WORK_PER_TURN,
-      afterBudgetTurn, afterDeadlineTurn, done: walk.done });
+      firstWork, secondWork, deadlineWork, afterBudgetTurn, afterDeadlineTurn, listed: next, done: walk.done });
+  walk.close();
 }
 
 async function manyLinks() {
@@ -358,7 +368,8 @@ async function claudeMemoryNotes() {
 }
 
 async function main() {
-  for (const step of [grokSessionsDirectory, claudeProjectDirectory, claudeTranscriptFile, codexDayFolder, coverageTurnBudget, manyLinks,
+  for (const step of [grokSessionsDirectory, claudeProjectDirectory, claudeTranscriptFile, codexDayFolder, coverageTurnBudget,
+    () => fairnessCoverageChecks(check), () => shutdownCoverageCheck(check), manyLinks,
     claudeMemoryNotes]) {
     try {
       await step();

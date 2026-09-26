@@ -14,9 +14,9 @@ import {
 import {
   DEFAULT_JSONL_TAILER_IO,
   ensureJsonlScanState,
+  jsonlScanStateKey,
   loadJsonlScanCursor,
   rememberJsonlScanCursor,
-  jsonlScanStateKey,
   type JsonlScanCursor,
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
@@ -49,7 +49,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import { CaptureRevisitQueue } from "./capture-revisit-queue";
 import { recordCaptureRecordLoss } from "./capture-record-loss";
 import {
@@ -414,6 +414,7 @@ function restoreResultMutationSnapshot(
 
 export class RolloutTailer {
   private readonly revisit = new CaptureRevisitQueue();
+  private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
@@ -438,39 +439,43 @@ export class RolloutTailer {
     }
     const verdict = jsonlCoverageCheck(this.buffer.database);
     const baselineComplete = captureBaselineStatus(this.buffer.database).status === "complete";
+    const known = new KnownPartialJsonlFiles(this.buffer.database, PARSER_KIND);
+    const firstCheck = !hasCompleteCaptureCoverage(this.buffer.database, "codex");
     return new CaptureCoverageWalk({
       roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.sessionsDir],
       maxEntries,
-      list: (directory, depth) => {
+      failOnMissing: true,
+      missingFromRestart: true,
+      prepareKnown: (maxRows) => known.prepare(maxRows),
+      unlistedFiles: () => known.unlistedFiles(),
+      changedDirectory: firstCheck ? (directory) => changedDirectoryCoverageFile("codex", directory) : undefined,
+      open: (directory, depth) => openCaptureCoverageDirectory(directory, (entry) => {
+        const full = path.join(directory, entry.name);
         if (depth < 3) {
-          const listing = { directories: [] as string[], files: [], links: [] as string[] };
-          for (const entry of this.io.readDirents(directory)) {
-            if (entry.isDirectory()) listing.directories.push(path.join(directory, entry.name));
-            else if (entry.isSymbolicLink()) listing.links.push(path.join(directory, entry.name));
-          }
-          return listing;
+          if (entry.isDirectory()) return { path: full, kind: "directory" };
+          if (entry.isSymbolicLink()) return { path: full, kind: "link" };
+        } else if (entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
+          // The check below classifies symlinked rollouts as uncovered links.
+          return { path: full, kind: "file" };
         }
-        // A symlinked rollout is listed here and checked as a link.
-        return {
-          directories: [],
-          files: this.io.readNames(directory).filter((name) => name.startsWith("rollout-") && name.endsWith(".jsonl"))
-            .map((name) => path.join(directory, name)),
-        };
-      },
+        return null;
+      }, this.coverageDirectoryCache, depth),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
-        const checked = stat ? verdict(this.cursorKey(file), stat) : null;
+        const checked = verdict(this.cursorKey(file), stat);
         if (checked && stat?.isFile() && !checked.fullyRead) {
           const baselineSize = baselineComplete
             ? captureBaselineExcludedSize(this.buffer.database, "codex", baselineObservation(file, stat)) : null;
           if (baselineSize === null || stat.size > baselineSize) this.revisit.offer(file);
           else this.revisit.remove(file);
         } else this.revisit.remove(file);
+        if (checked) known.checked(checked.key);
         return checked;
       },
       checkLink: (link) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), link);
-        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat) : null;
+        return stat?.isSymbolicLink() ? verdict(this.cursorKey(link), stat)
+          : stat === null ? linkCoverageFile(jsonlScanStateKey(`${this.cursorKey(link)}\0symlink`), 0) : null;
       },
     });
   }
@@ -509,6 +514,7 @@ export class RolloutTailer {
   }
 
   close() {
+    this.coverageDirectoryCache.clear();
     this.baselineAttempt?.discovery.close();
     this.captureAttempt?.discovery.close();
     this.baselineAttempt = null;
