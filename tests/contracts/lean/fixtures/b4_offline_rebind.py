@@ -47,9 +47,26 @@ Round 9 rule (B0 round 3, review-r2 blockers 1-2 and should-fixes 1, 4; CONTRACT
       another install's traffic naming it (review-r2 R7); a pair naming an install of another tenant records nothing.
   (g) `heard_at` exists only for an issued version (it lives on the audit row); a never-issued echo's instant is the fact's
       `first_seen_at`.
+Round 10 rule (B0 round 4, the independent read of C1/C4 after round 9, blockers 1-2 and should-fixes; CONTRACTS.md r10 C1, C4):
+  (h) LOCK, THEN READ. A sighting takes the named install's row FOR SHARE FIRST and only then reads binding_version, the audit
+      rows and the facts, inside the transaction that records the fact; a view of the facts loaded before the lock is never a
+      judgment input. Round 9 locked the read of binding_version but did not say when the facts are read, so a judgment from a
+      view of the facts loaded BEFORE the lock (C6's preloaded eventRowsForStorage view) was a permitted order: two first
+      sightings of one pair on the ingest and summary paths around the rebind split in 8 of 566 schedules (read c1c4 blocker 1).
+  (i) THE FACT IS KEYED BY THE LEDGER: stamp_not_issued(ledger, install, V), where `ledger` is the first install of the
+      uploader's chain of installs on one Mac (the cloud records at join, with proof of possession of the previous install's
+      key, which install a new install replaced). One ledger uploaded by two installs across a re-join (the old install X judging
+      a summary member, the new install Z delivering the row) reads ONE fact; another Mac's install (its own ledger) still never
+      enters this ledger's view (round 9's R7 stays closed); a foreign tenant's install still records nothing; a re-join whose
+      link could not be verified starts a new ledger and is DISCLOSED. Round 9 keyed the fact by the uploader, so X's fact did
+      not bind Z: if X was rebound up to V in between, the row was null in X's summary and someone's when Z delivered it
+      (read c1c4 blocker 2).
+  (j) A pair is judged against the install it names WHATEVER that install's lifecycle (active, suspended, revoked): lifecycle
+      gates authentication, never the audit rows, so revoking the old identity after a re-join turns no pair into null.
 Modes: --rule r6 (round 6 as written), r7 (round-1 C1 as written, with the round-1 fixture's modelling: deliveries are non-echoing
-ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (this rule). Red under r6, r7 and r8,
-green under r9.
+ingest instants and heard_at(0) is the registration), r8 (round-2 C1/C4 as written), r9 (round-3 C1/C4 as written: the lock on the
+read of binding_version only, the fact keyed by the uploader, no lifecycle rule), r10 (this rule). Red under r6, r7, r8 and r9,
+green under r10.
 """
 import itertools
 import json
@@ -57,8 +74,17 @@ from _common import Checks, rule_arg
 
 rule = rule_arg()
 c = Checks("b4_offline_rebind", rule)
-R8 = rule in ("r8", "r9")          # the round-8 machinery (the pair, the first-sighting fact) is kept by round 9
-R9 = rule == "r9"
+R8 = rule in ("r8", "r9", "r10")   # the round-8 machinery (the pair, the first-sighting fact) is kept by rounds 9 and 10
+R9 = rule in ("r9", "r10")         # the round-9 machinery (the joined install, the row lock, the fact scoped to an uploader) is kept by round 10
+R10 = rule == "r10"
+# Round 10: the ledger each install uploads for (the first install of its chain on one Mac). Z re-joined X's Mac with a verified
+# link to X; Zu re-joined a Mac whose previous install could not be proved (no link: its own ledger, disclosed); P and Q are other Macs.
+LEDGER = {"X": "X", "Y": "Y", "W": "W", "R": "R", "Z": "X", "Zf": "X", "Zu": "Zu", "P": "P", "Q": "Q", "Xr": "Xr"}
+def fact_key(uploader, install, v):
+    """The key of the durable fact: round 8 the named install; round 9 the uploader as well; round 10 the uploader's LEDGER."""
+    if R10: return (LEDGER[uploader], install, v)
+    if R9: return (uploader, install, v)
+    return (install, v)
 
 # ---- installs: version -> (actor bound, changed_at on the cloud clock); version 0 = the registration or join binding ---------
 INSTALLS = {
@@ -343,9 +369,9 @@ c.expect(serialized == 4, "R5: the FOR SHARE read makes the rebind wait in exact
 class Cloud:
     def __init__(self, audit): self.audit, self.facts = {k: dict(v) for k, v in audit.items()}, {}
     def bv(self, install, at): return max(v for v, (_, t) in self.audit[install].items() if t <= at)
-    def sight(self, install, v, at, uploader, tenant_installs=("P", "Q")):
+    def sight(self, install, v, at, uploader, tenant_installs=("P", "Q", "X", "Z", "Zu")):
         if install not in tenant_installs: return (None, "stamp_invalid:unknown_install")   # another tenant's install: judged closed, NO fact
-        key = (uploader, install, v) if R9 else (install, v)
+        key = fact_key(uploader, install, v)
         if key in self.facts: return (None, "stamp_invalid:stamp_not_issued")
         if v <= self.bv(install, at): return (self.audit[install][v][0], "binding_at_capture")
         self.facts[key] = {"first_seen_at": at, "binding_version_then": self.bv(install, at)}
@@ -357,4 +383,142 @@ foreign = cloud.sight("F", 1, 300, uploader="P")                             # a
 print("    R7 (fact scope): " + json.dumps({"P_row": p_row, "Q_rows": q_rows, "foreign": foreign, "facts": {"|".join(map(str, k)): v for k, v in cloud.facts.items()}}))
 c.expect(p_row[0] is None and all(r == ("B2", "binding_at_capture") for r in q_rows), "R7: another install's traffic naming (Q, 1) before Q issues 1 records a fact for THAT uploader only; Q's own rows stamped (Q, 1) after the rebind are B2's (round 8 keyed the fact by the named install and poisoned Q)", f"P={p_row} Q={q_rows}")
 c.expect(foreign == (None, "stamp_invalid:unknown_install") and not any(k[-2] == "F" for k in cloud.facts), "R7: a pair naming an install of another tenant fails closed and records no fact", json.dumps({"|".join(map(str, k)): v for k, v in cloud.facts.items()}))
+
+# ---- 10. blocking 1 (read c1c4): a sighting takes the lock FIRST, then reads binding_version, the audit rows and the facts ----------
+# Two FIRST sightings of the faulty pair (X, 2) on the two paths at the same instant (Ti: the delivered row at ingest; Ts: its
+# member in a summary) around the rebind R that issues 2, as statement-level schedules under READ COMMITTED with PostgreSQL's
+# waits: FOR SHARE waits for the rebind's FOR UPDATE (lockInstalls) and the rebind waits for every share lock; an insert of the
+# fact waits on another transaction's uncommitted insert of the same key. A step that must wait cannot run until the transaction
+# it waits on has committed, so the enumeration visits exactly the schedules the database can produce (the reviewer's model,
+# checks/review_c1c4_r9.py section B, re-implemented here from the round-10 text). The rule decides which statement orders a
+# sighting MAY use: r6-r8 no lock at all; r9 the lock on the read of binding_version, the facts read before OR after it (the text
+# did not say); r10 the lock first, then binding_version and the facts under it.
+V2, ACTOR_OF_V2 = 2, "C"
+def sighting_steps(name, uploader, order):
+    key = fact_key(uploader, "X", V2)
+    def lock(s, t):                                   # SELECT ... FOR SHARE: waits while the rebind holds FOR UPDATE; the locked read sees the latest committed version
+        if s["U"] not in (None, name): return False
+        s["S"].add(name); t["bv"] = s["bv"]; return True
+    def read_unlocked(s, t):                          # rounds 6-8: no lock; binding_version and the facts read as committed at that instant
+        t["bv"] = s["bv"]; t["fact"] = key in s["facts"]; return True
+    def facts(s, t):                                  # the facts as committed when this statement runs
+        t["fact"] = key in s["facts"]; return True
+    def judge(s, t):
+        if t["fact"]: t["answer"] = None; return True
+        if V2 <= t["bv"]: t["answer"] = ACTOR_OF_V2; return True
+        owner = s["pending"].get(key)
+        if owner not in (None, name): return False    # the unique key: wait for the other transaction's uncommitted insert
+        if key in s["facts"]: t["answer"] = None; return True    # ON CONFLICT DO NOTHING, re-read: the fact exists
+        s["pending"][key] = name; t["answer"] = None; return True
+    def commit(s, t):
+        s["S"].discard(name)
+        for k, owner in list(s["pending"].items()):
+            if owner == name: s["facts"].add(k); del s["pending"][k]
+        return True
+    steps = {"no_lock": [read_unlocked, judge, commit], "lock_then_read": [lock, facts, judge, commit], "facts_then_lock": [facts, lock, judge, commit]}[order]
+    return [(f"{name}.{f.__name__}", f) for f in steps]
+def rebind_steps(name="R"):
+    def lock_for_update(s, t):
+        if (s["S"] - {name}) or s["U"] not in (None, name): return False
+        s["U"] = name; return True
+    def update(s, t): t["new_bv"] = s["bv"] + 1; return True
+    def commit(s, t): s["bv"] = t["new_bv"]; s["U"] = None; return True
+    return [(f"{name}.{f.__name__}", f) for f in (lock_for_update, update, commit)]
+def later_answer(s, uploader):
+    if fact_key(uploader, "X", V2) in s["facts"]: return None
+    return ACTOR_OF_V2 if V2 <= s["bv"] else None
+def enumerate_schedules(txs):
+    import copy
+    results, deadlocks, names = [], [0], list(txs)
+    def dfs(state, pcs, locals_, trace):
+        if all(pcs[n] == len(txs[n]) for n in names):
+            results.append((tuple(trace), state, locals_)); return
+        progressed = False
+        for n in names:
+            if pcs[n] == len(txs[n]): continue
+            label, step = txs[n][pcs[n]]
+            s2, l2 = copy.deepcopy(state), copy.deepcopy(locals_)
+            if step(s2, l2[n]):
+                progressed = True
+                p2 = dict(pcs); p2[n] += 1
+                dfs(s2, p2, l2, trace + [label])
+        if not progressed: deadlocks[0] += 1
+    dfs({"bv": 1, "facts": set(), "pending": {}, "S": set(), "U": None}, {n: 0 for n in names}, {n: {} for n in names}, [])
+    return results, deadlocks[0]
+def run_variant(order, uploaders):
+    txs = {"Ti": sighting_steps("Ti", uploaders[0], order), "Ts": sighting_steps("Ts", uploaders[1], order), "R": rebind_steps()}
+    results, deadlocks = enumerate_schedules(txs)
+    splits, example = 0, None
+    for trace, state, loc in results:
+        answers = {f"ingest({uploaders[0]})": loc["Ti"]["answer"], f"summary({uploaders[1]})": loc["Ts"]["answer"],
+                   f"later({uploaders[0]})": later_answer(state, uploaders[0]), f"later({uploaders[1]})": later_answer(state, uploaders[1])}
+        if len(set(answers.values())) > 1:
+            splits += 1
+            if example is None: example = {"schedule": list(trace), "answers": answers}
+    return {"order": order, "uploaders": list(uploaders), "schedules": len(results), "deadlocks": deadlocks, "splits": splits, "example": example}
+PERMITTED_ORDERS = {"r9": ["lock_then_read", "facts_then_lock"], "r10": ["lock_then_read"]}.get(rule, ["no_lock"])
+same_uploader = {order: run_variant(order, ("X", "X")) for order in ("no_lock", "lock_then_read", "facts_then_lock")}
+print("    R5b (two paths, one uploader, statement-level): " + json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "example"} for k, v in same_uploader.items()}))
+print("    R5b facts-first example: " + json.dumps(same_uploader["facts_then_lock"]["example"]))
+c.expect(same_uploader["facts_then_lock"]["splits"] > 0 and same_uploader["lock_then_read"]["splits"] == 0,
+         "R5b: the defect is real: a summary sighting that reads the facts BEFORE taking the lock splits from the ingest sighting of the same pair (the summary reads 'no fact', the ingest records the fact and commits, the rebind commits, the summary locks, reads the issued version and exports C; every later judgment is null), while lock-then-read never splits",
+         json.dumps({k: (v["splits"], v["schedules"]) for k, v in same_uploader.items()}))
+c.expect(all(same_uploader[o]["splits"] == 0 for o in PERMITTED_ORDERS),
+         f"R5b: every statement order the rule permits agrees in every schedule (permitted under {rule}: {PERMITTED_ORDERS}); round 9's text locked only the read of binding_version and so permitted a view of the facts loaded before the lock; round 10 takes the lock first and reads binding_version, the audit rows and the facts under it",
+         json.dumps({o: (same_uploader[o]["splits"], same_uploader[o]["schedules"]) for o in PERMITTED_ORDERS}))
+
+# ---- 11. blocking 2 (read c1c4): one ledger uploaded by two installs must read ONE fact -------------------------------------------
+# After a re-join the old install X still judges the row's summary member (X's summary) while the new install Z delivers the row
+# itself (C1: a pre-re-join outbox row is judged against the old install, whoever delivers it; today's collector batches a
+# pre-re-join row with a post-re-join row). The fact must bind both.
+two_uploaders = run_variant("lock_then_read", ("Z", "X"))
+print("    R10 (two uploaders of one ledger, lock then read): " + json.dumps({k: v for k, v in two_uploaders.items() if k != "example"}) + " example=" + json.dumps(two_uploaders["example"]))
+c.expect(two_uploaders["splits"] == 0,
+         "R10: two first sightings of the faulty (X, 2) by the two installs of one ledger (Z delivers the row, X judges its member) around the rebind agree in every schedule (round 9 keyed the fact by the uploader: 2 of 142 schedules split, Z null and X C; round 10 keys it by the ledger, so both read one fact)",
+         json.dumps({"splits": two_uploaders["splits"], "schedules": two_uploaders["schedules"], "example": two_uploaders["example"]}))
+# the same history with no concurrency at all (the reviewer's section C): X's summary judges the faulty (X, 5) at 300 (X at v4);
+# the Mac re-joins as Z at 500; an admin rebinds the OLD install X (still valid) to G as version 5 at 600; Z replays the row's
+# dead delivery at 700.
+cloud_c = Cloud({"X": {0: ("A", 0), 1: ("B", 100), 2: ("C", 150), 3: ("C", 200), 4: ("B", 250)}, "Z": {0: ("D", 500)}})
+member_300 = cloud_c.sight("X", 5, 300, uploader="X")
+cloud_c.audit["X"][5] = ("G", 600)
+replay_700 = cloud_c.sight("X", 5, 700, uploader="Z")
+print("    R10 sequential (X summary at 300, re-join at 500, X rebound to G as v5 at 600, Z replays at 700): " + json.dumps({"member": member_300, "replay": replay_700, "facts": {"|".join(map(str, k)): v for k, v in cloud_c.facts.items()}}))
+c.expect(member_300[0] is None and replay_700[0] is None and member_300[0] == replay_700[0],
+         "R10: the faulty (X, 5) judged null in X's summary at 300 is still null when Z delivers the same row at 700 after the old install was rebound up to 5 (round 9: G's, a person who may never have used the Mac; the fact keyed by the ledger binds every install of the ledger)",
+         f"member={member_300} replay={replay_700}")
+# the ledger view stays per Mac: P's fact naming (Q, 1) (section 9) is in P's ledger only, and a foreign tenant records nothing (unchanged)
+c.expect(fact_key("P", "Q", 1) != fact_key("Q", "Q", 1) and fact_key("Z", "X", 5) == fact_key("X", "X", 5),
+         "R10: the key separates Macs and joins installs of one Mac: P's view of (Q, 1) is not Q's (R7 stays closed), Z's view of (X, 5) is X's (one answer across the re-join)",
+         f"P={fact_key('P', 'Q', 1)} Q={fact_key('Q', 'Q', 1)} Z={fact_key('Z', 'X', 5)} X={fact_key('X', 'X', 5)}")
+# a re-join whose link to the previous install could not be verified starts its own ledger and is disclosed
+def join_ledger(new_install, previous, proof_verified):
+    """The cloud's join route (round 10): the new install inherits the previous install's ledger only when the join request proves possession of that install's key."""
+    if not R10: return None
+    linked = previous is not None and proof_verified
+    return {"ledger": LEDGER[previous] if linked else new_install, "lineage": "linked" if linked else "unlinked"}
+linked, unlinked = join_ledger("Z", "X", True), join_ledger("Zu", "X", False)
+print("    R10 join lineage: " + json.dumps({"Z": linked, "Zu": unlinked}))
+c.expect(linked == {"ledger": "X", "lineage": "linked"} and unlinked == {"ledger": "Zu", "lineage": "unlinked"},
+         "R10: a re-join that proves possession of the previous install's key joins its ledger; one that cannot starts a new ledger and the join receipt says lineage_unlinked (disclosed; its pre-re-join rows are counted as stamp_from_other_ledger on the certify)",
+         f"linked={linked} unlinked={unlinked}")
+
+# ---- 12. should-fix (read c1c4): a pair is judged against the install it names whatever that install's lifecycle --------------------
+# Xr is X's twin whose identity an admin REVOKES at 900 (the natural clean-up after the re-join at 800). A pre-re-join row stamped
+# (Xr, 2) (issued at 600, C) is delivered by Z at 950. Round 10 says lifecycle gates authentication only; round 9's text did not
+# say, so a B6 that builds its install view from ACTIVE installs (a natural implementation) turns the pair into 'nobody'.
+INSTALLS["Xr"] = dict(INSTALLS["X"])
+LIFECYCLE = {"Xr": ("revoked", 900)}
+def lifecycle_at(install, at):
+    change = LIFECYCLE.get(install)
+    return change[0] if change and at >= change[1] else "active"
+def actor_for_stamp_lifecycle(stamp, at, path, install):
+    if not R10 and lifecycle_at(install, at) != "active":      # rounds <= 9 as permitted: the view holds active installs only
+        return (None, "actor_stamp_invalid:unknown_install" if path == "delivered" else "unallocated_stamp_invalid:unknown_install")
+    return actor_for_stamp(stamp, at, path, install)
+revoked_d, revoked_u = actor_for_stamp_lifecycle(2, 950, "delivered", "Xr"), actor_for_stamp_lifecycle(2, SUMMARY_AT, "undelivered", "Xr")
+print("    lifecycle (Xr revoked at 900; (Xr, 2) delivered at 950): " + json.dumps({"delivered": revoked_d, "undelivered": revoked_u}))
+c.expect(revoked_d == ("C", "binding_at_capture") and revoked_u == ("C", "binding_at_capture"),
+         "lifecycle: a row stamped (Xr, 2), issued at 600, is C's on both paths after Xr's identity is revoked at 900 (round 9's text let an implementation build its view from active installs and turn the pair into null)",
+         f"delivered={revoked_d} undelivered={revoked_u}")
 c.finish()
