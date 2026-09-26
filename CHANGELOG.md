@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.43 — Draft
+
+- `plimsoll dispatch bind` assigns a bounded work item, role, and optional
+  technique to a session before capture. Codex OTLP logs and Codex and Claude
+  tailer rows carry the binding; a late bind needs an explicit restamp of
+  unsent local rows. GitHub repository names are hashed in outbound work IDs
+  (`eco-6hoxj.165.3`).
+- A bound Codex SSE usage log keeps its dispatch fields when it pairs with a
+  response span; the neutralised span carries none (`eco-6hoxj.163.99`).
+
 ## 0.7.42 — 2026-09-26
 
 - Busy-session summaries preserve rebuild progress while unread rows change.

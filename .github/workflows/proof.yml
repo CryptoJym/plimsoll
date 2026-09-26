@@ -193,6 +193,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding
 
+      - name: Prove bound Codex dispatch survives response pairing (eco-6hoxj.163.99)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:dispatch-pairing-integration
+
       - name: Prove producer-token rotation covers the Codex seat profiles (eco-6hoxj.54)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-rotation-profiles
