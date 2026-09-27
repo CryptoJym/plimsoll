@@ -7,6 +7,8 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
+import { currentDispatchCaptureRoots } from "./capture-root-inventory";
+import { countUnlinkableDispatchBindings } from "./dispatch-command";
 import { readJevAnalysis, type JevAnalysisSnapshot } from "./jev-analysis";
 import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
 import { automaticRepairServiceStatus } from "./maintenance";
@@ -122,7 +124,7 @@ import {
   openStaleProducerWindows,
   scanProducerProcesses,
 } from "./producer-processes";
-import { healthzProof, isHealthzChallenge } from "./status-summary";
+import { healthzProof, isHealthzChallenge, summaryPendingStatus } from "./status-summary";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -1190,6 +1192,8 @@ export function createCollectorServer(
     const read = snapshotResponse(30, true);
     if (read.kind === "ready") {
       const body = read.snapshot.status as Record<string, unknown>;
+      body.summaryPending = summaryPendingStatus(buffer.database);
+      body.unlinkableBindCount = countUnlinkableDispatchBindings(currentDispatchCaptureRoots());
       lastCoherentStatus = {
         body,
         generation: read.snapshot.generation,
@@ -1229,6 +1233,8 @@ export function createCollectorServer(
       reconciliation: codexReconciliationStatus(buffer.database),
       codexUsagePairing: codexUsagePairingStatus(buffer.database),
       sessionAttribution: sessionContextIndexStatus(buffer.database),
+      summaryPending: summaryPendingStatus(buffer.database),
+      unlinkableBindCount: countUnlinkableDispatchBindings(currentDispatchCaptureRoots()),
       maintenance: options.maintenanceStatus?.() ?? null,
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
@@ -1402,6 +1408,9 @@ export function createCollectorServer(
             reconciliation: null,
             codexUsagePairing: null,
             sessionAttribution: null,
+            summaryPending: { pendingCount: null, reasonCounts: {}, freshness: {
+              observedAt: null, oldestPendingAt: null, latestUpdateAt: null } },
+            unlinkableBindCount: null,
             maintenance: options.maintenanceStatus?.() ?? null,
             historyCoverage: null,
             captureBaseline: null,
