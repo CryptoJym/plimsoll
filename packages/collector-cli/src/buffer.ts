@@ -3048,7 +3048,7 @@ export class LocalEventBuffer {
     return run(ids);
   }
 
-  /** The same acknowledged-only release test used by B10a's held path. */
+  /** Keep active and unacknowledged deliveries; old uploaded_at-only rows may expire. */
   private rawRetentionUploadHoldSql() {
     const activeOutbox = `(exists (
       select 1 from upload_outbox o
@@ -3071,9 +3071,10 @@ export class LocalEventBuffer {
             'local_item_oversize', 'local_usage_duplicate'
           )
       )
-      and not (e.uploaded_at is not null and exists (
-        select 1 from upload_receipts ack
-        where ack.delivery_id = retention_delivery_id(e.id) and ack.terminal_state = 'acknowledged'
+      and (e.uploaded_at is null or exists (
+        select 1 from upload_receipts unacknowledged
+        where unacknowledged.delivery_id = retention_delivery_id(e.id)
+          and unacknowledged.terminal_state <> 'acknowledged'
       ))
     ))`;
   }

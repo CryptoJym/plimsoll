@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 9);
+const completion = createProofCompletion("retention", 10);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -185,6 +185,147 @@ try {
       "a legacy raw ID uses its acknowledged outbox delivery ID for retention");
     buffer.close();
     completion.check("legacy_raw_id_acknowledgement_expires");
+  }
+
+  {
+    // Open a pre-outbox ledger: historical uploaded_at is its only durable
+    // successful-send marker. The current outbox schema must not be present.
+    const file = path.join(root, "pre-outbox-upgrade.sqlite");
+    const oldDb = new Database(file);
+    oldDb.exec(`create table buffered_events (
+      id text primary key, source text not null, event_type text not null,
+      data_mode text not null, observed_at text not null,
+      payload_json text not null, suppressed_fields_json text not null default '[]',
+      created_at text not null, uploaded_at text
+    )`);
+    const legacyUploadedAt = "2020-01-01T00:00:00.000Z";
+    const legacyUploadedRows = 515;
+    const legacyNeverUploaded = event();
+    const insertOld = oldDb.prepare(`insert into buffered_events
+      (id,source,event_type,data_mode,observed_at,payload_json,created_at,uploaded_at)
+      values (?, 'codex', 'assistant_response', 'metadata', ?, ?, ?, ?)`);
+    oldDb.transaction(() => {
+      for (let n = 0; n < legacyUploadedRows; n++) {
+        const row = event();
+        insertOld.run(row.id, oldCreatedAt, JSON.stringify(row), oldCreatedAt, legacyUploadedAt);
+      }
+      insertOld.run(legacyNeverUploaded.id, oldCreatedAt,
+        JSON.stringify(legacyNeverUploaded), oldCreatedAt, null);
+    })();
+    assert.equal(oldDb.prepare("select 1 from sqlite_master where name='upload_outbox'").get(), undefined);
+    oldDb.close();
+
+    const buffer = new LocalEventBuffer(file, {
+      delivery: { enabled: true }, enrollmentNow: () => new Date(oldCreatedAt),
+    });
+    const db = buffer.database;
+    const now = new Date();
+    let migrationVisited = 0;
+    let skippedUploaded = 0;
+    let migrationEnqueued = 0;
+    let migrationComplete = false;
+    for (let pass = 0; pass < 20; pass++) {
+      const slice = buffer.delivery.migrateLegacy({ maxRows: 64, now });
+      assert.ok(slice.visited <= 64, "legacy migration must keep each writer slice bounded");
+      migrationVisited += slice.visited;
+      skippedUploaded += slice.skippedUploaded;
+      migrationEnqueued += slice.enqueued;
+      if (slice.complete) { migrationComplete = true; break; }
+    }
+    assert.equal(migrationComplete, true);
+    assert.equal(migrationVisited, legacyUploadedRows + 1);
+    assert.equal(skippedUploaded, legacyUploadedRows);
+    assert.equal(migrationEnqueued, 1);
+    assert.equal((db.prepare("select count(*) as n from upload_receipts").get() as { n: number }).n, 0,
+      "legacy uploaded rows have no synthesized acknowledgement receipts");
+    assert.equal((db.prepare("select count(*) as n from upload_outbox").get() as { n: number }).n, 1,
+      "only the never-uploaded legacy row is enqueued");
+
+    const [pending, retry, inFlight, acknowledged, remoteDead, localDead] =
+      [event(), event(), event(), event(), event(), event()];
+    buffer.delivery.configure({ enabled: false });
+    for (const row of [pending, retry, inFlight, acknowledged, remoteDead, localDead]) {
+      assert.equal(buffer.append(row), true);
+      db.prepare("update buffered_events set created_at=? where id=?").run(oldCreatedAt, row.id);
+    }
+    buffer.delivery.configure({ enabled: true });
+    for (const row of [pending, retry, inFlight, acknowledged, remoteDead, localDead]) {
+      assert.equal(buffer.delivery.repairRawById(row.id).enqueued, 1);
+    }
+    const at = now.toISOString();
+    db.transaction(() => {
+      db.prepare("update upload_outbox set state='retry', attempt_count=1 where raw_id=?")
+        .run(retry.id);
+      db.prepare(`update upload_outbox set state='in_flight', attempt_count=1,
+        lease_id='upgrade-proof', lease_expires_at=? where raw_id=?`)
+        .run(new Date(now.getTime() + 120_000).toISOString(), inFlight.id);
+      const remove = db.prepare("delete from upload_outbox where raw_id=?");
+      const markUploaded = db.prepare("update buffered_events set uploaded_at=? where id=?");
+      const receipt = db.prepare(`insert into upload_receipts
+        (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+        values (?,?,?,?,1,?,?)`);
+      remove.run(acknowledged.id);
+      markUploaded.run(at, acknowledged.id);
+      receipt.run(acknowledged.id, "acknowledged", "remote_acknowledged", "success", at, at);
+      remove.run(remoteDead.id);
+      markUploaded.run(at, remoteDead.id);
+      receipt.run(remoteDead.id, "dead", "remote_validation_rejected", "remote", at, at);
+      remove.run(localDead.id);
+      receipt.run(localDead.id, "dead", "local_schema_invalid", "local", at, at);
+    })();
+    const activeStates = db.prepare("select state,count(*) as n from upload_outbox group by state")
+      .all() as Array<{ state: string; n: number }>;
+    assert.deepEqual(Object.fromEntries(activeStates.map(({ state, n }) => [state, n])),
+      { pending: 2, retry: 1, in_flight: 1 });
+    for (let pass = 0; pass < 10 && !buffer.projection.status().ready; pass++) {
+      buffer.projection.runMaintenance(now);
+    }
+    assert.equal(buffer.projection.status().ready, true,
+      "upgraded projection must publish before /status serves the retention count");
+
+    const synchronousHeld = buffer.retentionStatus(90, now).states.heldForUpload;
+    assert.equal(synchronousHeld, 5);
+    const first = buffer.retentionProgressStatus(90, now);
+    assert.equal(first.lastPass.heldForUploadExact, false);
+    const workerHeld = await buffer.refreshRetentionHoldCount(90, now);
+    assert.equal(workerHeld, synchronousHeld);
+    const afterWorker = buffer.retentionProgressStatus(90, now);
+    assert.equal(afterWorker.states.heldForUpload, synchronousHeld);
+    assert.equal(afterWorker.lastPass.heldForUploadExact, true);
+    assert.equal(afterWorker.lastPass.heldForUploadAsOfCutoff, first.policy.cutoffAt);
+    const server = createCollectorServer(collectorConfigSchema.parse({ retentionDays: 90 }), buffer);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/status`);
+      const body = await response.json() as { retention?: {
+        states?: { heldForUpload?: number };
+        lastPass?: { heldForUploadExact?: boolean; heldForUploadAsOfCutoff?: string | null };
+      } };
+      assert.equal(response.status, 200);
+      assert.equal(body.retention?.states?.heldForUpload, synchronousHeld);
+      assert.equal(body.retention?.lastPass?.heldForUploadExact, true);
+      assert.equal(body.retention?.lastPass?.heldForUploadAsOfCutoff, first.policy.cutoffAt);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    const result = buffer.prune(90, { maxRows: 1_000, now });
+    assert.equal(result.events, legacyUploadedRows + 2,
+      "legacy uploaded, new acknowledged, and local-dead rows expire");
+    const remaining = (db.prepare("select id from buffered_events order by id")
+      .all() as Array<{ id: string }>).map((row) => row.id);
+    assert.deepEqual(remaining, [legacyNeverUploaded, pending, retry, inFlight, remoteDead]
+      .map((row) => row.id).sort(), "never-uploaded and active or remote-dead deliveries remain");
+    assert.equal(buffer.retentionStatus(90, now).states.heldForUpload, 5);
+    assert.equal(buffer.retentionProgressStatus(90, now).states.heldForUpload, 5);
+    console.log(JSON.stringify({ fixture: "pre_outbox_upgrade", migrationVisited,
+      skippedUploaded, migrationEnqueued, synchronousHeld, workerHeld,
+      expired: result.events, remaining: remaining.length }));
+    buffer.close();
+    completion.check("pre_outbox_uploaded_rows_expire_and_unuploaded_rows_hold");
   }
 
   {
