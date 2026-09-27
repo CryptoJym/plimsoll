@@ -33,6 +33,9 @@ export type SessionSnapshot = {
 export const SESSION_SUMMARY_SCHEMA_VERSION = 3 as const;
 export const SESSION_SUMMARY_DEFAULT_MAX_ROWS = 5_000;
 export const SESSION_SUMMARY_DEFAULT_MAX_MS = 250;
+export const SESSION_SUMMARY_ZERO_PROGRESS_STUCK_AFTER = 3;
+const ZERO_PROGRESS_RETRY_BASE_MS = 100;
+const ZERO_PROGRESS_RETRY_MAX_MS = 5_000;
 
 type SummaryAccumulator = {
   sessionId: string;
@@ -115,6 +118,8 @@ export type SessionSummaryUpdateOptions = {
   read: SessionSummaryRead;
   /** Share one bounded wait budget across schema setup and summary writes in a daemon pass. */
   writeRetry?: SyncStorageRetryController;
+  /** Proof-injectable clock for the durable zero-progress retry deadline. */
+  now?: () => Date;
 };
 
 export type SessionSummaryUpdateResult = {
@@ -262,6 +267,15 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       mutation_revision integer not null check (mutation_revision >= 0),
       mode text not null check (mode in ('initial', 'incremental', 'fallback')),
       accumulator_json text not null,
+      updated_at text not null
+    );
+    create table if not exists session_sync_summary_pending (
+      session_id text primary key,
+      reason text not null,
+      mutation_revision integer not null,
+      queued_high_water integer not null,
+      consecutive_zero_progress integer not null check (consecutive_zero_progress >= 0),
+      next_retry_at text,
       updated_at text not null
     );
     create table if not exists session_sync_summary_dirty (
@@ -816,6 +830,27 @@ function storedState(db: Database.Database, sessionId: string): StoredSummarySta
   return { ...row, complete: Boolean(row.complete), mode: row.mode } as StoredSummaryState;
 }
 
+type PendingSummaryRow = {
+  reason: string;
+  mutationRevision: number;
+  queuedHighWater: number;
+  consecutiveZeroProgress: number;
+  nextRetryAt: string | null;
+};
+
+function pendingSummaryRow(db: Database.Database, sessionId: string): PendingSummaryRow | null {
+  return db.prepare(`select reason, mutation_revision as mutationRevision,
+      queued_high_water as queuedHighWater, consecutive_zero_progress as consecutiveZeroProgress,
+      next_retry_at as nextRetryAt from session_sync_summary_pending where session_id = ?`)
+    .get(sessionId) as PendingSummaryRow | undefined ?? null;
+}
+
+function queuedSummaryHighWater(db: Database.Database, sessionId: string): number {
+  const row = db.prepare(`select max(raw_rowid) as highWater
+    from session_sync_summary_rows where session_id = ?`).get(sessionId) as { highWater: number | null };
+  return row.highWater ?? 0;
+}
+
 function validStoredState(state: StoredSummaryState, sessionId: string, until: string): boolean {
   return state.sessionId === sessionId &&
     state.schemaVersion === SESSION_SUMMARY_SCHEMA_VERSION &&
@@ -1072,6 +1107,50 @@ export async function updateSessionSummary(
   const activityAtStart = sessionActivityRevision(db, sessionId);
   const currentRevision = sessionRevision(db, sessionId);
   const stored = storedState(db, sessionId);
+  const pending = pendingSummaryRow(db, sessionId);
+  const queuedHighWaterAtStart = queuedSummaryHighWater(db, sessionId);
+  const now = options.now ?? (() => new Date());
+  const samePendingInput = () => pending?.mutationRevision === currentRevision &&
+    pending.queuedHighWater === queuedHighWaterAtStart;
+  const finish = async (result: SessionSummaryUpdateResult, zeroProgressRead = false) => {
+    if (result.complete) {
+      if (pending) await writeRetry.run(() => db.prepare(
+        "delete from session_sync_summary_pending where session_id = ?",
+      ).run(sessionId));
+      return result;
+    }
+    const consecutive = zeroProgressRead && samePendingInput()
+      ? pending!.consecutiveZeroProgress : 0;
+    const nextConsecutive = zeroProgressRead ? consecutive + 1 : 0;
+    const reason = zeroProgressRead && nextConsecutive >= SESSION_SUMMARY_ZERO_PROGRESS_STUCK_AFTER
+      ? "rows_read_stuck" : result.fallbackReason ?? `${result.mode}_in_progress`;
+    const delayMs = zeroProgressRead
+      ? Math.min(ZERO_PROGRESS_RETRY_MAX_MS, ZERO_PROGRESS_RETRY_BASE_MS * 2 ** Math.min(nextConsecutive - 1, 10))
+      : null;
+    const observedAt = now();
+    await writeRetry.run(() => db.prepare(`insert into session_sync_summary_pending
+        (session_id, reason, mutation_revision, queued_high_water,
+          consecutive_zero_progress, next_retry_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        on conflict(session_id) do update set reason = excluded.reason,
+          mutation_revision = excluded.mutation_revision,
+          queued_high_water = excluded.queued_high_water,
+          consecutive_zero_progress = excluded.consecutive_zero_progress,
+          next_retry_at = excluded.next_retry_at, updated_at = excluded.updated_at`)
+      .run(sessionId, reason, currentRevision, queuedHighWaterAtStart, nextConsecutive,
+        delayMs === null ? null : new Date(observedAt.getTime() + delayMs).toISOString(),
+        observedAt.toISOString()));
+    return { ...result, fallbackReason: reason };
+  };
+  if (pending?.nextRetryAt && samePendingInput() &&
+      Date.parse(pending.nextRetryAt) > now().getTime()) {
+    return {
+      snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
+      durationMs: Math.round(performance.now() - started), highWater: stored?.highWater ?? 0,
+      mode: stored?.mode ?? "initial", fullRecompute: false, fallbackReason: pending.reason,
+      mutationRevision: stored?.mutationRevision ?? currentRevision,
+    };
+  }
   const parsed = stored ? parseAccumulator(sessionId, stored.accumulatorJson) : null;
   const dirty = Boolean(db.prepare(
     `select 1 from session_sync_summary_dirty where session_id = ? limit 1`,
@@ -1084,12 +1163,12 @@ export async function updateSessionSummary(
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
       // A worker deadline says nothing about checkpoint integrity. Preserve
       // the stored cursor and retry the bounded read on the next slice.
-      return {
+      return finish({
         snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
         durationMs: Math.round(performance.now() - started), highWater: stored.highWater,
         mode: stored.mode, fullRecompute: false, fallbackReason: "checkpoint_timeout",
         mutationRevision: stored.mutationRevision,
-      };
+      });
     }
   }
   const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk, dirty);
@@ -1162,19 +1241,19 @@ export async function updateSessionSummary(
       newerReadOk = false;
     }
     if (!newerReadOk) {
-      return {
+      return finish({
         snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
         durationMs: Math.round(performance.now() - started), highWater: state.highWater,
         mode: "cached", fullRecompute: false, fallbackReason: "newer_read_timeout",
         mutationRevision: state.mutationRevision,
-      };
+      });
     }
     if (newer.length > 0 || sessionActivityRevision(db, sessionId) !== activityAtStart ||
         !sessionSummaryCurrent(db, sessionId, until, state.mutationRevision, state.highWater)) {
       mode = "incremental";
       state.complete = false;
     } else {
-    return {
+    return finish({
       snapshot: snapshot(state.accumulator),
       complete: true,
       rowsRead: 0,
@@ -1185,7 +1264,7 @@ export async function updateSessionSummary(
       fullRecompute: false,
       fallbackReason: null,
       mutationRevision: state.mutationRevision,
-    };
+    });
     }
   }
 
@@ -1264,12 +1343,12 @@ export async function updateSessionSummary(
   }
 
   if (readInterrupted && rowsRead === 0) {
-    return {
+    return finish({
       snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
       durationMs: Math.round(performance.now() - started), highWater: state.highWater,
       mode, fullRecompute, fallbackReason: "rows_read_timeout",
       mutationRevision: state.mutationRevision,
-    };
+    }, true);
   }
 
   // Revision, queued-row check, and state write share one write transaction.
@@ -1304,7 +1383,7 @@ export async function updateSessionSummary(
   const finalMode: SessionSummaryUpdateResult["mode"] = fullRecompute
     ? "fallback"
     : mode === "initial" ? "initial" : "incremental";
-  return {
+  return finish({
     snapshot: complete && stable ? snapshot(state.accumulator) : null,
     complete: complete && stable,
     rowsRead,
@@ -1319,5 +1398,5 @@ export async function updateSessionSummary(
       : !complete && state.mode === "fallback" ? "fallback_in_progress"
       : !stability.noQueuedRows ? "append_queue" : null,
     mutationRevision: state.mutationRevision,
-  };
+  });
 }
