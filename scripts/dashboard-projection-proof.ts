@@ -2755,7 +2755,7 @@ async function main() {
         `${secondTick.rootsStarted}/22 eligible of 25 configured capture root(s) enumerated`) &&
       baselineClaude.reason.includes(`${secondTick.entriesThisSweep} entr(ies) this sweep`) &&
       baselineClaude.reason.includes("lifetime limit 100000") &&
-      !baselineClaude.reason.includes("0 entr(ies) this sweep") &&
+      !/(?<![0-9])0 entr\(ies\) this sweep/.test(baselineClaude.reason) &&
       !baselineClaude.reason.includes("lifetime limit 0") &&
       baselineClaude.activityState.scanState === "in_progress" &&
       baselineClaude.activityState.scan?.sweepComplete === false,
@@ -2855,7 +2855,7 @@ async function main() {
         `${codexSecond.rootsStarted}/22 eligible of 25 configured capture root(s) enumerated`) &&
       codexHealth.reason.includes(`${codexSecond.entriesThisSweep} entr(ies) this sweep`) &&
       codexHealth.reason.includes("lifetime limit 100000") &&
-      !codexHealth.reason.includes("0 entr(ies) this sweep") &&
+      !/(?<![0-9])0 entr\(ies\) this sweep/.test(codexHealth.reason) &&
       !codexHealth.reason.includes("/44 eligible") &&
       codexHealth.activityState.scanState === "in_progress" &&
       codexHealth.activityState.scan?.sweepComplete === false,
