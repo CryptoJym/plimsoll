@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 import gzip
 import hashlib
 import io
@@ -241,6 +242,49 @@ def group_compare(label: str, expected: dict, actual: dict, out: list[dict]) -> 
                     "status": "PASS" if equal else "FAIL"})
 
 
+def fixed_four(value: float) -> float:
+    """Match Number(value.toFixed(4)) for the snapshot's repository tail."""
+    return float(Decimal.from_float(value).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+
+def displayed_repos(repo_rows: list[sqlite3.Row], published: dict) -> dict:
+    def key(row: sqlite3.Row) -> str:
+        return row["repo_hash"] or "__unlinked__"
+
+    def value(row: sqlite3.Row) -> dict:
+        return {"repoHash": row["repo_hash"], "label": None, "sessions": row["sessions"],
+                "branchRefs": row["branch_refs"], "inputTokens": row["input_tokens"],
+                "outputTokens": row["output_tokens"], "costUsd": row["cost_nanos"] / 1e9}
+
+    if len(repo_rows) <= 12:
+        return {key(row): value(row) for row in repo_rows}
+
+    # The producer orders only by costNanos. At the 11th-place boundary it
+    # declares no secondary tie-break. Use its published head identities only
+    # when they form a valid top-11 set; every compared value remains oracle-
+    # derived. An invalid head falls back to the independent query order and
+    # produces ordinary value differences.
+    cutoff = repo_rows[10]["cost_nanos"]
+    mandatory = {key(row) for row in repo_rows if row["cost_nanos"] > cutoff}
+    eligible = {key(row) for row in repo_rows if row["cost_nanos"] >= cutoff}
+    published_head = set(published) - {"__tail__"}
+    if ("__tail__" in published and len(published_head) == 11
+            and mandatory <= published_head <= eligible):
+        head_keys = published_head
+    else:
+        head_keys = {key(row) for row in repo_rows[:11]}
+    head = {key(row): value(row) for row in repo_rows if key(row) in head_keys}
+    tail = [value(row) for row in repo_rows if key(row) not in head_keys]
+    head["__tail__"] = {
+        "repoHash": "__tail__", "label": f"({len(tail)} more repositories)",
+        "sessions": sum(row["sessions"] for row in tail), "branchRefs": 0,
+        "inputTokens": sum(row["inputTokens"] for row in tail),
+        "outputTokens": sum(row["outputTokens"] for row in tail),
+        "costUsd": fixed_four(sum(row["costUsd"] for row in tail)),
+    }
+    return head
+
+
 def query_manifest(parity_log: Path | None, fixture_log: Path | None, census_log: Path | None) -> dict:
     queries = json.loads((HERE / "proof-queries.json").read_text())
     by_id = {row["id"]: row for row in queries}
@@ -394,15 +438,8 @@ def comparison(db: sqlite3.Connection, frozen: datetime) -> dict:
             group_compare(f"sessions/{key[0]}/{key[1]}", old_sessions.get(key, {}),
                           oracle_sessions.get(key, {}), rows)
         old_repos = {r["repoHash"] or "__unlinked__": r for r in snap["repos"]}
-        oracle_repos = {}
-        for r in db.execute("select * from oracle_repos where days=? order by cost_nanos desc", (days,)):
-            oracle_repos[r["repo_hash"] or "__unlinked__"] = {
-                "repoHash": r["repo_hash"], "label": None, "sessions": r["sessions"],
-                "branchRefs": r["branch_refs"], "inputTokens": r["input_tokens"],
-                "outputTokens": r["output_tokens"], "costUsd": r["cost_nanos"] / 1e9,
-            }
-        if len(oracle_repos) > 12:
-            raise AssertionError("repo tail folding is required for this host")
+        repo_rows = list(db.execute("select * from oracle_repos where days=? order by cost_nanos desc", (days,)))
+        oracle_repos = displayed_repos(repo_rows, old_repos)
         for key in sorted(set(old_repos) | set(oracle_repos)):
             group_compare(f"repos/{key}", old_repos.get(key, {}), oracle_repos.get(key, {}), rows)
         old_accounts = {r["accountHash"] or "__unlinked__": r for r in snap["accounts"]["accounts"]}
