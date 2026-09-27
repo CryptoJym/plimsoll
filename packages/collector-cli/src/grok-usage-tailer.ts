@@ -607,6 +607,7 @@ export function buildGrokUsageEvent(sessionId: string, turnNumber: number, obser
     metadata: {
       usageSource: emit.stream.labelIncomplete ? "grok_usage_incomplete" : "grok_usage",
       turnIndex: turnNumber,
+      ...(costTicks > 0 ? { costUsdTicks: costTicks } : {}),
       ...(emit.delta.reasoning > 0 ? { reasoningOutputTokens: emit.delta.reasoning } : {}),
     },
   });
