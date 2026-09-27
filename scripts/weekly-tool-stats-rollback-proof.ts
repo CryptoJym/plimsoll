@@ -8,9 +8,9 @@ import { deterministicLearningFactId } from "../packages/collector-cli/src/learn
 import { aggregateToolStatsWeek } from "../packages/collector-cli/src/weekly-tool-stats";
 
 async function main() {
-  const oldRoot = process.argv[2];
+  const oldRoot = process.env.PLIMSOLL_V0743_ROOT;
   if (!oldRoot || !fs.existsSync(path.join(oldRoot, "packages/collector-cli/src/buffer.ts"))) {
-    throw new Error("0.7.43 source tree required");
+    throw new Error("PLIMSOLL_V0743_ROOT must name a 0.7.43 source tree");
   }
   const oldPackage = JSON.parse(fs.readFileSync(path.join(oldRoot, "packages/collector-cli/package.json"), "utf8")) as { version: string };
   assert.equal(oldPackage.version, "0.7.43");
