@@ -24,6 +24,8 @@ async function main() {
         .run(eventId(12)).changes, 1); },
       () => { assert.equal(buffer.database.prepare("delete from buffered_events where id = ?")
         .run(eventId(13)).changes, 1); },
+      () => { assert.equal(buffer.database.prepare("update buffered_events set observed_at = ? where id = ?")
+        .run("2026-09-19T23:59:58.000Z", eventId(size - 1)).changes, 1); },
     ];
     let priorHorizon = "";
     const measurements: Array<{ edit: number; rowsRead: number; passes: number; fullRecomputes: number }> = [];

@@ -104,6 +104,10 @@ export async function daemonCycle(buffer: LocalEventBuffer, until: string,
   const result = await runSessionSync(config, {
     sessionIds: [sessionId],
     until: plan.until, ledgerDb: buffer.database, incremental: true,
+    // The fixture measures summary repair and daemon horizon behavior. Keep
+    // its reads deterministic; the separate live-churn proof exercises the
+    // off-thread reader and records its interruption rate.
+    proofSummaryHooks: { read: directRead(buffer) },
     fetchImpl, sleep: async () => undefined, delayMs: 0, maxAttemptsPerBatch: 1,
     log: () => undefined,
   });
