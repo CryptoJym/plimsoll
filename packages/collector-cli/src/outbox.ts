@@ -228,6 +228,7 @@ export type DeliveryCaptureClaim = {
 
 /** Why a claim attests nothing (review r2 B3): the cloud withdraws what it held. */
 export type CaptureUnattestedReason =
+  | "maintenance_rebuild"
   | "migration_incomplete"
   | "over_row_budget"
   | "spool_unreadable"
@@ -588,7 +589,8 @@ export class DeliveryOutbox {
       const lost = this.deadLetterSummary(epochStartedAt, epochStartMs);
       const spoolLosses = (spool?.losses ?? []).filter((loss) => loss.toMs >= epochStartMs);
       const unattested: CaptureUnattestedReason | null =
-        control.migrationComplete !== 1 ? "migration_incomplete"
+        spool?.maintenanceRebuildPending ? "maintenance_rebuild"
+          : control.migrationComplete !== 1 ? "migration_incomplete"
           : overBudget ? "over_row_budget"
             : spool === null || spool.unreadable ? "spool_unreadable"
               : frontier.capturedThrough === null ? "frontier_unknown"

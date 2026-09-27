@@ -6,6 +6,8 @@ import { performance } from "node:perf_hooks";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
+import { acquireRebuildOpenToken, acquireRebuildWriterLeases,
+  releaseRebuildOpenToken, releaseRebuildWriterLeases } from "./maintenance-rebuild";
 import { advanceCaptureBaselineEnrollment } from "./capture-baseline";
 import { captureRootEventInstallationEpoch } from "./capture-root-inventory";
 
@@ -209,6 +211,8 @@ const installationEpochIdSchema = z.string().uuid();
 
 export class LocalEventBuffer {
   private readonly db: Database.Database;
+  private rebuildWriterLease: string | null = null;
+  private rebuildOpenToken: string | null = null;
   private readonly enrollmentNow: () => Date;
   private workspaceId: string | null = null;
   private deviceId: string | null = null;
@@ -260,7 +264,10 @@ export class LocalEventBuffer {
     };
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
-    this.db = new Database(path, { timeout });
+    this.rebuildOpenToken = acquireRebuildOpenToken(path);
+    let openedDb: Database.Database | null = null;
+    try {
+    this.db = openedDb = new Database(path, { timeout });
     this.db.pragma("journal_mode = WAL");
     this.deviceId = options.deviceId?.trim() || null;
     const newLedger = !this.db
@@ -784,6 +791,13 @@ export class LocalEventBuffer {
         : undefined,
     });
     markOpenStep("ledger.projection_schema");
+    this.rebuildWriterLease = acquireRebuildWriterLeases(this.db, path);
+    } catch (error) {
+      try { openedDb?.close(); } catch { /* the open may already have failed */ }
+      releaseRebuildOpenToken(this.rebuildOpenToken);
+      this.rebuildOpenToken = null;
+      throw error;
+    }
   }
 
   /**
@@ -3279,6 +3293,17 @@ export class LocalEventBuffer {
   }
 
   close() {
-    this.db.close();
+    try {
+      if (this.rebuildWriterLease) {
+        releaseRebuildWriterLeases(this.db, this.rebuildWriterLease);
+        this.rebuildWriterLease = null;
+      }
+    } finally {
+      try { this.db.close(); }
+      finally {
+        releaseRebuildOpenToken(this.rebuildOpenToken);
+        this.rebuildOpenToken = null;
+      }
+    }
   }
 }

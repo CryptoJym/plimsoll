@@ -167,6 +167,9 @@ import {
   type HookSpoolDaemonReading,
 } from "./hook-spool";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
+import { preflightMaintenanceRebuild, rebuildLedger, recoverInterruptedRebuild,
+  renameBackBeforeResume, readMaintenanceRebuildHeadroomStatus,
+  REQUIRED_REBUILD_WRITERS, type RebuildStage, type RebuildHeadroomStatus } from "./maintenance-rebuild";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
 import { WalCheckpointWorker } from "./wal-checkpoint-worker";
 import {
@@ -326,10 +329,10 @@ import {
 
 const command = process.argv[2] ?? "help";
 
-async function startStopWindowChild(port: number) {
+async function startStopWindowChild(port: number, mode: "stop_window" | "maintenance_rebuild" = "stop_window") {
   const nonce = randomUUID();
   const child = spawn(process.execPath, [
-    ...process.execArgv, process.argv[1] ?? "", "__stop_window_listener", nonce,
+    ...process.execArgv, process.argv[1] ?? "", "__stop_window_listener", nonce, mode,
   ], {
     detached: true,
     stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -369,6 +372,11 @@ Commands:
                         (credentialed daemon /status; liveness is GET /healthz)
   maintenance --disable-account-assertion SOURCE --yes
                         Toggle one adapter; writes only account assertion state
+  maintenance rebuild --ledger ABSOLUTE_PATH --stage S10|ABORT --wal-high-water-bytes N
+                        Reclaim a stage-ready ledger under a full writer pause;
+                        --copy-drill --copy-root ABSOLUTE_DIR confines a rehearsal
+                        --recover restores an interrupted pre-resume source;
+                        --rename-back refuses once a writer may have resumed
   --disable-account-assertion SOURCE
                         Disable one account assertion adapter (requires --yes)
   --enable-account-assertion SOURCE
@@ -653,6 +661,7 @@ function accountAssertionSourceFromArg(value: string | undefined): AccountAssert
 }
 
 function accountAssertionMutationFromArgs() {
+  if (process.argv[2] === "maintenance" && process.argv[3] === "rebuild") return null;
   const direct = process.argv[2] === "--disable-account-assertion" || process.argv[2] === "--enable-account-assertion" ||
     process.argv[2]?.startsWith("--disable-account-assertion=") || process.argv[2]?.startsWith("--enable-account-assertion=");
   const maintenance = process.argv[2] === "maintenance";
@@ -2575,7 +2584,8 @@ async function main() {
     "lifecycle",
     "__stop_window_listener",
   ]);
-  const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
+  const rebuildCommand = command === "maintenance" && process.argv[3] === "rebuild";
+  const configRead = noCreateConfigCommands.has(command) || rebuildCommand ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
   if (command === "setup" && configRead?.status === "invalid") {
     // Strict parsing preserves the specific privacy/error reason without the
@@ -2584,18 +2594,119 @@ async function main() {
   }
   const configPath = configRead?.path ?? collectorConfigPath();
   const config = configRead?.config ?? strictSetupConfig ??
-    (noCreateConfigCommands.has(command) ? collectorConfigSchema.parse({}) : loadCollectorConfig());
+    (noCreateConfigCommands.has(command) || rebuildCommand ? collectorConfigSchema.parse({}) : loadCollectorConfig());
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
 
+  if (command === "maintenance" && process.argv[3] === "rebuild") {
+    const allowed = new Set(["--ledger", "--stage", "--wal-high-water-bytes", "--copy-drill", "--copy-root",
+      "--recover", "--rename-back"]);
+    for (const arg of process.argv.slice(4)) {
+      if (arg.startsWith("--") && !allowed.has(arg)) throw new Error(`unknown_rebuild_option:${arg}`);
+    }
+    const ledgerArgument = optionValue("--ledger");
+    if (!ledgerArgument || !path.isAbsolute(ledgerArgument)) throw new Error("rebuild_requires_absolute_ledger");
+    const ledgerPath = fs.realpathSync(ledgerArgument);
+    const copyDrill = flag("--copy-drill");
+    if (copyDrill) {
+      const rootArgument = optionValue("--copy-root");
+      if (!rootArgument || !path.isAbsolute(rootArgument)) throw new Error("copy_drill_requires_root");
+      const copyRoot = fs.realpathSync(rootArgument);
+      const relative = path.relative(copyRoot, ledgerPath);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative) ||
+        ledgerPath === collectorBufferPath() || copyRoot === resolveCollectorHome().home) {
+        throw new Error("copy_drill_ledger_outside_clone");
+      }
+    } else if (ledgerPath !== fs.realpathSync(collectorBufferPath())) {
+      throw new Error("live_rebuild_requires_active_ledger");
+    }
+    if (flag("--recover") || flag("--rename-back")) {
+      const result = flag("--rename-back")
+        ? (renameBackBeforeResume(ledgerPath), { status: "renamed_back" })
+        : recoverInterruptedRebuild(ledgerPath);
+      if (!copyDrill) {
+        await releaseStopWindowListener(config.port, resolveCollectorHome().home);
+        const visible = inspectLaunchAgentManifest();
+        if (!visible.ok) throw new Error("launch_agent_manifest_invalid");
+        const load = await loadVisibleLaunchAgent(visible.plistPath, config.port, false,
+          launchAgentMutationAuthority());
+        if (!load.loaded) throw new Error(`rebuild_resume_failed:${load.status}`);
+      }
+      console.log(JSON.stringify(result));
+      return;
+    }
+    const stage = optionValue("--stage");
+    if (stage !== "S10" && stage !== "ABORT") throw new Error("rebuild_stage_required");
+    const highWater = Number(optionValue("--wal-high-water-bytes"));
+    if (!Number.isSafeInteger(highWater) || highWater < 0 ||
+      optionValue("--wal-high-water-bytes") === undefined) throw new Error("wal_high_water_required");
+    const input = { ledgerPath, stage: stage as RebuildStage, walHighWaterBytes: highWater, copyDrill };
+    preflightMaintenanceRebuild(input);
+    const pauseWindow: { ready: Promise<void> | null } = { ready: null };
+    let pauseWindowStarted = false;
+    const resume = async () => {
+      if (copyDrill) return;
+      if (pauseWindowStarted) {
+        await releaseStopWindowListener(config.port, resolveCollectorHome().home);
+        pauseWindowStarted = false;
+      }
+      const visible = inspectLaunchAgentManifest();
+      if (!visible.ok) throw new Error("launch_agent_manifest_invalid");
+      const load = await loadVisibleLaunchAgent(visible.plistPath, config.port, false,
+        launchAgentMutationAuthority());
+      if (!load.loaded) throw new Error(`rebuild_resume_failed:${load.status}`);
+    };
+    const quiesce = async () => {
+      if (copyDrill) return { modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true };
+      if (configRead?.status !== "valid" || !readLocalIngestAuth(resolveCollectorHome().home)) {
+        throw new Error("rebuild_pause_auth_unavailable");
+      }
+      let daemonUnloaded = false;
+      try {
+        pauseWindow.ready = startStopWindowChild(config.port, "maintenance_rebuild");
+        void pauseWindow.ready.catch(() => undefined);
+        const unloaded = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
+        if (!unloaded.unloaded) throw new Error(`writer_not_quiesced:${unloaded.reason}`);
+        daemonUnloaded = true;
+        await pauseWindow.ready;
+        pauseWindowStarted = true;
+        return { modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true };
+      } catch (error) {
+        if (daemonUnloaded) {
+          await pauseWindow.ready?.catch(() => undefined);
+          await releaseStopWindowListener(config.port, resolveCollectorHome().home).catch(() => undefined);
+          const visible = inspectLaunchAgentManifest();
+          if (!visible.ok) throw new Error("rebuild_quiesce_resume_manifest_invalid", { cause: error });
+          const load = await loadVisibleLaunchAgent(visible.plistPath, config.port, false,
+            launchAgentMutationAuthority());
+          if (!load.loaded) throw new Error(`rebuild_quiesce_resume_failed:${load.status}`, { cause: error });
+        }
+        throw error;
+      }
+    };
+    try {
+      const result = await rebuildLedger({ ...input, quiesce, resume });
+      console.log(JSON.stringify(result));
+    } finally {
+      if (!copyDrill && pauseWindow.ready) {
+        await pauseWindow.ready.catch(() => undefined);
+        await releaseStopWindowListener(config.port, resolveCollectorHome().home).catch(() => undefined);
+      }
+    }
+    return;
+  }
+
+
   if (command === "__stop_window_listener") {
+    const mode = process.argv[4] === "maintenance_rebuild" ? "maintenance_rebuild" :
+      process.argv[4] === "stop_window" ? "stop_window" : null;
     if (!process.send || process.argv[3] !== process.env.PLIMSOLL_STOP_WINDOW_NONCE ||
-        !/^[a-f0-9-]{36}$/i.test(process.argv[3] ?? "") || configRead?.status !== "valid") {
+        !/^[a-f0-9-]{36}$/i.test(process.argv[3] ?? "") || configRead?.status !== "valid" || !mode) {
       throw new Error("stop_window_listener_requires_lifecycle_update");
     }
     try {
-      await runStopWindowListener(config, resolveCollectorHome().home);
+      await runStopWindowListener(config, resolveCollectorHome().home, { mode });
     } catch (error) {
       process.send?.({ status: "error", reason: (error as Error).message });
       throw error;
@@ -2893,6 +3004,14 @@ async function main() {
     // drain armed below replays it. PLIMSOLL_OTLP_SPOOL=off disables both.
     const otlpSpool = new OtlpIntakeSpool({ home: collectorHome() });
     const syncBackoff = new SyncBackoff(config.syncIntervalSeconds * 1_000);
+    let rebuildHeadroom: RebuildHeadroomStatus | null = null;
+    const refreshRebuildHeadroom = () => {
+      try { rebuildHeadroom = readMaintenanceRebuildHeadroomStatus(collectorBufferPath()); }
+      catch { rebuildHeadroom = null; }
+    };
+    refreshRebuildHeadroom();
+    const rebuildHeadroomTimer = setInterval(refreshRebuildHeadroom, 1_000);
+    rebuildHeadroomTimer.unref();
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
@@ -2914,6 +3033,7 @@ async function main() {
         cadence: maintenanceCadence?.status() ?? null,
         retentionCadence: retentionCadence?.status() ?? null,
         starvation: cachedStarvationReceipt,
+        rebuild: rebuildHeadroom,
       }),
       detectedIdentities: () => detectedIdentities,
       outcomePerformance: (days, asOf) => outcomeTimelineStore.performanceSummary(days, asOf),

@@ -27,19 +27,24 @@ import { conflictingOtlpServiceSource, explodeOtlpPayload } from "./otlp";
 import { OtlpIntakeSpool } from "./otlp-spool";
 import { readProducerEventIdHeader, PRODUCER_EVENT_ID_HEADER } from "./producer-parity";
 import { markStopWindowProbe, STOP_WINDOW_PROBE_HEADER } from "./stop-window-probe";
+import { markMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
 
 export const STOP_WINDOW_RELEASE_PATH = "/api/stop-window/release";
 
-function reply(response: http.ServerResponse, status: number, body: Record<string, unknown>) {
-  response.writeHead(status, { "content-type": "application/json", "connection": "close" });
+function reply(response: http.ServerResponse, status: number, body: Record<string, unknown>, retryAfter = false) {
+  response.writeHead(status, { "content-type": "application/json", "connection": "close",
+    ...(retryAfter ? { "retry-after": "1" } : {}) });
   response.end(JSON.stringify(body));
 }
 
 /** The update child never opens a ledger. A 202 means a private spool file is durable. */
-export async function runStopWindowListener(config: CollectorConfig, home: string) {
+export async function runStopWindowListener(config: CollectorConfig, home: string,
+  options: { mode?: "stop_window" | "maintenance_rebuild" } = {}) {
+  const mode = options.mode ?? "stop_window";
   if (!hookSpoolEnabled() || !new OtlpIntakeSpool({ home }).enabled) {
     throw new Error("stop_window_spool_disabled");
   }
+  if (mode === "maintenance_rebuild") markMaintenanceRebuildPause(home);
   const managementAuth = readLiveProducerAuth(home);
   if (!managementAuth) throw new Error("stop_window_auth_unavailable");
   const limiter = createSourceRateLimiter();
@@ -53,7 +58,13 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
       assertNoBrowserOrigin(request);
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       if (request.method === "GET" && url.pathname === "/healthz") {
-        reply(response, 200, { ok: true, mode: "stop_window" });
+        reply(response, 200, { ok: true, mode });
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/status" && mode === "maintenance_rebuild") {
+        assertManagementCredential(request, managementAuth, url);
+        reply(response, 200, { ok: true, maintenance: { rebuild: "paused" },
+          captureClaim: { unattested: "maintenance_rebuild", through: null } });
         return;
       }
       if (request.method === "POST" && url.pathname === STOP_WINDOW_RELEASE_PATH) {
@@ -97,7 +108,9 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         if (!sanitized) throw new HttpBoundaryRejection("internal_rejection", 400);
         const write = writeHookSpoolEnvelope({ home, source, body: sanitized.text, blanked: sanitized.blanked, probe });
         if (!write.ok) throw new HttpBoundaryRejection("storage_busy_retry", 503);
-        reply(response, 202, { status: "hook_spooled", source });
+        reply(response, mode === "maintenance_rebuild" ? 503 : 202,
+          { status: mode === "maintenance_rebuild" ? "maintenance_rebuild_spooled" : "hook_spooled", source },
+          mode === "maintenance_rebuild");
         return;
       }
       assertBoundedOtlpCardinality(payload, body.decodedBytes);
@@ -118,13 +131,14 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         },
       });
       if (!result.ok) throw new HttpBoundaryRejection("storage_busy_retry", 503);
-      reply(response, 202, {
-        status: "otlp_spooled", source, events: exploded.events.length,
-        metricSamples: exploded.metricSamples.length,
-      });
+      reply(response, mode === "maintenance_rebuild" ? 503 : 202, {
+        status: mode === "maintenance_rebuild" ? "maintenance_rebuild_spooled" : "otlp_spooled",
+        source, events: exploded.events.length, metricSamples: exploded.metricSamples.length,
+      }, mode === "maintenance_rebuild");
     } catch (error) {
       const rejection = asHttpBoundaryRejection(error);
-      reply(response, rejection.status, { error: rejection.reason });
+      reply(response, rejection.status, { error: rejection.reason },
+        mode === "maintenance_rebuild" && rejection.status === 503);
     } finally {
       inFlight -= 1;
       if (releasing && inFlight === 0) server.close();

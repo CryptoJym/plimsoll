@@ -1,6 +1,7 @@
 import { hookSpoolDirectory, listHookSpoolArrivals } from "./hook-spool";
 import { listOtlpSpoolArrivals, otlpSpoolDirectory } from "./otlp-spool";
 import { readSpoolLosses, type SpoolLoss } from "./spool-losses";
+import { maintenanceRebuildPauseSeen } from "./maintenance-rebuild-pause-state";
 
 /**
  * What the hook and OTLP spools hold or lost, for the upload capture claim
@@ -17,6 +18,8 @@ export type CaptureSpoolState = {
   losses: SpoolLoss[];
   /** A spool directory or loss log exists but cannot be read. */
   unreadable: boolean;
+  /** An earlier rebuild pause is still waiting for its admitted pushes. */
+  maintenanceRebuildPending?: boolean;
 };
 
 export function captureSpoolState(home: string): CaptureSpoolState {
@@ -28,5 +31,6 @@ export function captureSpoolState(home: string): CaptureSpoolState {
     oldestPendingMs: arrivals.reduce<number | null>((oldest, at) => (oldest === null || at < oldest ? at : oldest), null),
     losses: logs.flatMap((log) => log ?? []),
     unreadable: [...listings, ...logs].some((value) => value === null),
+    maintenanceRebuildPending: arrivals.length > 0 && maintenanceRebuildPauseSeen(home),
   };
 }
