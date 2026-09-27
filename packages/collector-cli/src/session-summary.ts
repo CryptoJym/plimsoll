@@ -1116,6 +1116,7 @@ async function checkpointValid(
   sessionId: string,
   read: SessionSummaryRead,
   maxMs?: number,
+  cursorSegmentQueued = false,
 ): Promise<boolean> {
   if (state.highWater === 0) return state.checkpointId === null &&
     accumulator.cursorRowid === 0 && accumulator.cursorObservedAt === null && accumulator.cursorId === null;
@@ -1125,7 +1126,14 @@ async function checkpointValid(
   if (accumulator.cursorRowid === 0) return accumulator.cursorObservedAt === null && accumulator.cursorId === null;
   if (accumulator.cursorObservedAt === null || accumulator.cursorId === null) return false;
   if (accumulator.cursorRowid === state.highWater) {
-    return rows[0]?.id === accumulator.cursorId && rows[0]?.observedAt === accumulator.cursorObservedAt;
+    if (rows[0]?.id !== accumulator.cursorId) return false;
+    if (rows[0]?.observedAt === accumulator.cursorObservedAt) return true;
+    if (!cursorSegmentQueued) return false;
+    // A completed historical scan no longer seeks by this timestamp. The
+    // trigger queued its segment, so repair that row and persist the new
+    // checkpoint timestamp instead of discarding the whole prefix.
+    accumulator.cursorObservedAt = rows[0].observedAt;
+    return true;
   }
   const cursorRows = await read<{ id: string; sessionId: string | null; observedAt: string }>([{
     sql: `select id, session_id as sessionId, observed_at as observedAt
@@ -1133,8 +1141,12 @@ async function checkpointValid(
     params: { rowid: accumulator.cursorRowid },
     ...(maxMs === undefined ? {} : { maxMs }),
   }]);
-  return cursorRows.length === 1 && cursorRows[0]?.id === accumulator.cursorId &&
-    cursorRows[0]?.sessionId === sessionId && cursorRows[0]?.observedAt === accumulator.cursorObservedAt;
+  if (cursorRows.length !== 1 || cursorRows[0]?.id !== accumulator.cursorId ||
+      cursorRows[0]?.sessionId !== sessionId) return false;
+  if (cursorRows[0]?.observedAt === accumulator.cursorObservedAt) return true;
+  if (!cursorSegmentQueued) return false;
+  accumulator.cursorObservedAt = cursorRows[0].observedAt;
+  return true;
 }
 
 function summaryRowsQuery(
@@ -1457,10 +1469,19 @@ export async function updateSessionSummary(
     `select reason from session_sync_summary_dirty where session_id = ? limit 1`,
   ).get(sessionId) as { reason: string } | undefined)?.reason ?? null;
   const pendingRepair = repairQueueRow(db, sessionId);
+  const cursorSegmentQueued = Boolean(parsed?.scanComplete && parsed.cursorRowid > 0 &&
+    repairQueueRow(db, sessionId, segmentOf(parsed.cursorRowid)) !== null);
+  // A completed queued repair may leave the dirty marker in place while a
+  // future row in its segment matures. Its next due repair is still bounded
+  // work, provided the durable state already records this ledger revision.
+  const repairAvailable = pendingRepair !== null || Boolean(stored && parsed &&
+    stored.mutationRevision === currentRevision &&
+    (parsed.activeRepair !== null || dueSegment(parsed, until) !== null));
   let checkpointOk = false;
   if (stored && parsed && validStoredState(stored, sessionId, until)) {
     try {
-      checkpointOk = await checkpointValid(stored, parsed, sessionId, options.read, maxMs);
+      checkpointOk = await checkpointValid(stored, parsed, sessionId, options.read, maxMs,
+        cursorSegmentQueued);
     } catch (error) {
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
       // A worker deadline says nothing about checkpoint integrity. Preserve
@@ -1474,7 +1495,7 @@ export async function updateSessionSummary(
     }
   }
   const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk,
-    dirtyReason, pendingRepair !== null);
+    dirtyReason, repairAvailable);
   const resumableFallback = stored?.mode === "fallback" &&
     !stored.complete && (stored.mutationRevision === currentRevision || pendingRepair !== null) &&
     parsed !== null && checkpointOk && (reason === null || reason === "dirty_marker") &&
@@ -1675,16 +1696,19 @@ export async function updateSessionSummary(
           repairRowsQuery(db, sessionId, repair, limit,
             Math.max(1, maxMs - (performance.now() - started))),
         ]);
+        let processedRepairRows = 0;
         for (const row of repairRows) {
           rowsRead += 1;
+          processedRepairRows += 1;
           repair.cursorRowid = row.rowid;
           if (row.createdAt > repair.until) trackFuture(repair.aggregate, row.createdAt);
           else if (row.eligible) {
             fold(repair.aggregate, row);
             rowsApplied += 1;
           }
+          if (rowsRead >= maxRows || performance.now() - started >= maxMs) break;
         }
-        if (repairRows.length < limit ||
+        if ((processedRepairRows === repairRows.length && repairRows.length < limit) ||
             repair.cursorRowid === (nextSegment + 1) * SESSION_SUMMARY_SEGMENT_ROWS) {
           state.accumulator.segments[String(nextSegment)] = repair.aggregate;
           state.accumulator.activeRepair = null;
