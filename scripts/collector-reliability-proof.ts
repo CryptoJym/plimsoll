@@ -406,6 +406,10 @@ async function main() {
     for (const item of items) buffer.append(item);
     buffer.database.prepare("update buffered_events set created_at='2000-01-01T00:00:00.000Z'").run();
     buffer.markUploaded(items.slice(8).map(item => item.id));
+    const acknowledge = buffer.database.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?, 'acknowledged', 'remote_acknowledged', 'success', 1, ?, ?)`);
+    for (const item of items.slice(8)) acknowledge.run(item.id, new Date(now).toISOString(), new Date(now).toISOString());
     buffer.close();
     // Legacy migration preserves the old raw timestamp. Keep this synthetic
     // 2000-dated delivery alive so this proof isolates raw/outbox conservation.
@@ -425,10 +429,10 @@ async function main() {
       // The actual worker stage uses the same bounded expiry/receipt path.
       runRetentionDeletionStage(buffer.database,{remainingMs:3000,batchSize:8,retentionDays:90,parityReady:true,
         prune:maxRows=>buffer.prune(90,{maxRows})});
-      assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as any).n,0);
+      assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as any).n,8);
       assert.equal(buffer.delivery.status().remainingDelivery,8);
-      assert.equal((buffer.database.prepare("select count(*) as n from raw_retention_receipts").get() as any).n,12);
-      return {protected:8,expired:12,outboxPreserved:8,passes:receipts.length};
+      assert.equal((buffer.database.prepare("select count(*) as n from raw_retention_receipts").get() as any).n,4);
+      return {protected:8,expired:4,outboxPreserved:8,passes:receipts.length};
     } finally {buffer.close();}
   });
   await check("retention_followups_converge_and_stop", () => {

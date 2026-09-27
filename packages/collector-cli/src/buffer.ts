@@ -26,6 +26,7 @@ import {
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
+import { ensureUuidEventId } from "./upload-history";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
@@ -89,6 +90,7 @@ export type RawRetentionStatus = {
   states: {
     retained: number;
     pendingDelivery: number;
+    heldForUpload: number;
     quarantined: number;
     expired: number;
     notInspected: 0;
@@ -264,6 +266,8 @@ export class LocalEventBuffer {
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
     this.db = new Database(path, { timeout });
+    this.db.function("retention_delivery_id", { deterministic: true },
+      (rawId: string) => ensureUuidEventId(rawId).id);
     this.db.pragma("journal_mode = WAL");
     this.deviceId = options.deviceId?.trim() || null;
     const newLedger = !this.db
@@ -3036,6 +3040,36 @@ export class LocalEventBuffer {
     return run(ids);
   }
 
+  /** The same acknowledged-only release test used by B10a's held path. */
+  private rawRetentionUploadHoldSql() {
+    const activeOutbox = `(exists (
+      select 1 from upload_outbox o
+      where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
+    ) or exists (
+      select 1 from upload_outbox o where o.delivery_id = retention_delivery_id(e.id)
+    ))`;
+    if (!this.delivery.isEnabled()) return activeOutbox;
+    return `(${activeOutbox} or (
+      e.data_mode = 'metadata'
+      and e.privacy_disposition is null
+      and e.usage_duplicate_reason is null
+      and not exists (
+        select 1 from upload_receipts local_receipt
+        where local_receipt.delivery_id = retention_delivery_id(e.id)
+          and local_receipt.terminal_state = 'dead'
+          and local_receipt.reason in (
+            'local_evidence_quarantined', 'local_payload_unparseable',
+            'local_schema_invalid', 'local_privacy_violation',
+            'local_item_oversize', 'local_usage_duplicate'
+          )
+      )
+      and not (e.uploaded_at is not null and exists (
+        select 1 from upload_receipts ack
+        where ack.delivery_id = retention_delivery_id(e.id) and ack.terminal_state = 'acknowledged'
+      ))
+    ))`;
+  }
+
   prune(
     retentionDays = 90,
     options: { maxRows?: number; now?: Date } = {},
@@ -3047,12 +3081,7 @@ export class LocalEventBuffer {
     // Seek through a bounded raw candidate page BEFORE checking migration.
     // A protected prefix must neither cause a full scan nor hide later rows.
     const scanKey = "raw_retention_scan_v1";
-    const deliveryProtection = this.delivery.isEnabled()
-      ? `case when e.uploaded_at is not null or exists (
-           select 1 from upload_outbox o
-           where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
-         ) then 0 else 1 end`
-      : "0";
+    const deliveryProtection = `case when ${this.rawRetentionUploadHoldSql()} then 1 else 0 end`;
     const run = this.db.transaction(() => {
       const stored = this.db.prepare(`select value from maintenance_state where key=?`).get(scanKey) as {value:string}|undefined;
       const scan = stored ? JSON.parse(stored.value) as {at:string;id:string;metricsFirst:boolean} :
@@ -3146,7 +3175,7 @@ export class LocalEventBuffer {
     };
   }
 
-  /** Constant-size maintenance receipt; never count the retained raw ledger. */
+  /** The HTTP endpoint reads this cached result; refresh counts overdue holds. */
   retentionProgressStatus(retentionDays = 90, now = new Date()) {
     const pass = this.db.prepare(`select last_rows_visited as rowsVisited,
       last_rows_expired as rowsExpired,last_has_more as hasMore,last_run_at as at,
@@ -3154,10 +3183,15 @@ export class LocalEventBuffer {
         rowsVisited:number;rowsExpired:number;hasMore:number;at:string|null;expired:number;
       };
     const scan = this.db.prepare(`select value from maintenance_state where key='raw_retention_scan_v1'`).get() as {value:string}|undefined;
+    const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
+    const heldForUpload = (this.db.prepare(
+      `select count(*) as n from buffered_events e indexed by idx_events_retention
+       where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
+    ).get(cutoffAt) as { n: number }).n;
     return {
       inspection: "bounded" as const,
-      policy: {retentionDays,cutoffAt:new Date(now.getTime()-retentionDays*86_400_000).toISOString()},
-      states: {retained:null,pendingDelivery:null,quarantined:null,expired:pass.expired,notInspected:1},
+      policy: {retentionDays,cutoffAt},
+      states: {retained:null,pendingDelivery:null,heldForUpload,quarantined:null,expired:pass.expired,notInspected:1},
       lastPass: {rowsVisited:pass.rowsVisited,rowsExpired:pass.rowsExpired,
         hasMore:Boolean(pass.hasMore),at:pass.at,
         migrationProtectedRows:scan ? Number(JSON.parse(scan.value).migrationProtectedRows ?? 0) : 0},
@@ -3191,6 +3225,10 @@ export class LocalEventBuffer {
          where state in ('pending','retry','in_flight')`,
       ).get() as { n: number }
     ).n;
+    const heldForUpload = (this.db.prepare(
+      `select count(*) as n from buffered_events e indexed by idx_events_retention
+       where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
+    ).get(cutoffAt) as { n: number }).n;
     const pass = this.db.prepare(
       `select last_rows_visited as rowsVisited,last_rows_expired as rowsExpired,
          last_has_more as hasMore,last_run_at as at,expired_total as expired
@@ -3209,6 +3247,7 @@ export class LocalEventBuffer {
       states: {
         retained,
         pendingDelivery,
+        heldForUpload,
         quarantined,
         expired: pass.expired,
         notInspected: 0,

@@ -1262,6 +1262,7 @@ export function createCollectorServer(
         states: {
           retained: null,
           pendingDelivery: null,
+          heldForUpload: null,
           quarantined: null,
           expired: null,
           notInspected: 1,
@@ -1437,6 +1438,7 @@ export function createCollectorServer(
               states: {
                 retained: null,
                 pendingDelivery: null,
+                heldForUpload: null,
                 quarantined: null,
                 expired: null,
                 notInspected: 1,
