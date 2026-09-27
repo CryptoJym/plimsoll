@@ -4479,6 +4479,84 @@ async function caseCrashAfterHookAdmission(producerEventId?: string) {
   }
 }
 
+/** A future timestamp must keep the same eligibility after a committed drain crashes. */
+async function caseCrashReplayAtFutureSkewBoundary() {
+  const { home } = fixtureHome("crash-future-skew");
+  const ledgerPath = path.join(home, "work-ledger.sqlite");
+  const receivedAtMs = Date.now();
+  const receivedAt = new Date(receivedAtMs).toISOString();
+  const bodyTime = new Date(receivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs + 1).toISOString();
+  const sessionId = crypto.randomUUID();
+  const saved = writeHookSpoolFile({
+    home,
+    source: "claude_code",
+    nowMs: receivedAtMs,
+    body: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: sessionId, timestamp: bodyTime }),
+  });
+  if (!saved) throw new Error("future_skew_fixture_spool_write_failed");
+
+  const withClock = async <T>(nowMs: number, run: () => Promise<T>): Promise<T> => {
+    const originalNow = Date.now;
+    Date.now = () => nowMs;
+    try { return await run(); } finally { Date.now = originalNow; }
+  };
+  const rows = (buffer: LocalEventBuffer) => buffer.database.prepare(
+    "select id, observed_at as observedAt from buffered_events where session_id = ?",
+  ).all(sessionId) as Array<{ id: string; observedAt: string }>;
+
+  let intercepted = 0;
+  const first = new LocalEventBuffer(ledgerPath);
+  let firstRows: ReturnType<typeof rows>;
+  try {
+    const originalUnlink = fs.unlinkSync;
+    try {
+      fs.unlinkSync = ((target: fs.PathLike) => {
+        if (String(target) === saved.path) {
+          intercepted += 1;
+          throw Object.assign(new Error("injected_before_spool_unlink"), { code: "EIO" });
+        }
+        return originalUnlink(target);
+      }) as typeof fs.unlinkSync;
+      await withClock(receivedAtMs, () => createHookSpoolDrain(
+        collectorConfigSchema.parse({}), first, { home },
+      ).tick());
+    } finally {
+      fs.unlinkSync = originalUnlink;
+    }
+    firstRows = rows(first);
+  } finally {
+    first.close();
+  }
+
+  const pendingAfterCrash = listHookSpoolFiles(home).length;
+  const restarted = new LocalEventBuffer(ledgerPath);
+  let replayed: Awaited<ReturnType<HookSpoolDrain["tick"]>>;
+  let replayRows: ReturnType<typeof rows>;
+  let collisions: ReturnType<LocalEventBuffer["eventCollisionSummary"]>;
+  try {
+    // A single millisecond later the body's time reaches the allowed boundary.
+    replayed = await withClock(receivedAtMs + 1, () => createHookSpoolDrain(
+      collectorConfigSchema.parse({}), restarted, { home },
+    ).tick());
+    replayRows = rows(restarted);
+    collisions = restarted.eventCollisionSummary();
+  } finally {
+    restarted.close();
+  }
+
+  check("crash_future_skew_replay_dedupes_without_collision",
+    intercepted === 1 && pendingAfterCrash === 1 &&
+      firstRows.length === 1 && firstRows[0]?.observedAt === receivedAt &&
+      replayed.recovered === 1 && replayRows.length === 1 &&
+      replayRows[0]?.id === firstRows[0]?.id &&
+      collisions.totalConflicts === 0 && listHookSpoolFiles(home).length === 0,
+    { receivedAt, bodyTime, intercepted, pendingAfterCrash,
+      firstRows: firstRows.map(({ id, observedAt }) => ({ id, observedAt })),
+      replayed, replayRows: replayRows.map(({ id, observedAt }) => ({ id, observedAt })),
+      collisions, pendingAfterReplay: listHookSpoolFiles(home).length },
+  );
+}
+
 async function main() {
   // Stage markers on stderr: a hosted-runner hang has to name the case it hung
   // in without waiting for the final report.
@@ -4556,6 +4634,8 @@ async function main() {
     stage("crash_after_hook_admission");
     await caseCrashAfterHookAdmission();
     await caseCrashAfterHookAdmission("11111111-1111-4111-8111-111111111111");
+    stage("crash_future_skew_boundary");
+    await caseCrashReplayAtFutureSkewBoundary();
     stage("report");
   } finally {
     for (const [key, value] of previousEnv) {

@@ -99,8 +99,8 @@ const PROTECTED_METADATA_HASH = /^sha256:[a-f0-9]{16}$/;
  * use the shared validators; protected path/identity fields survive only as
  * hashes already produced by `sanitizeForPolicy`. Every unknown key drops.
  */
-export function admittedHookMetadata(input: Record<string, unknown>) {
-  const validated = admittedMetadataAttributes(input, "record");
+export function admittedHookMetadata(input: Record<string, unknown>, receivedAtMs = Date.now()) {
+  const validated = admittedMetadataAttributes(input, "record", receivedAtMs);
   const attributes: Record<string, unknown> = { ...validated.attributes };
   const rejectedKeys: string[] = [];
   for (const [key, value] of Object.entries(input)) {
