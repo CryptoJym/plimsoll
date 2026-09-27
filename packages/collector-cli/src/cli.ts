@@ -483,7 +483,7 @@ Config tools:
       nothing the JSON carries a hint naming --since; an exact --limit pool and inert
       skips alone never raise it. --dry-run classifies with zero writes.
   push-repo-labels [--dry-run] [--yes] [--url URL]
-  sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
+  sync-outcomes --repository owner/repo [--work-artifacts accepted-links.json] [--no-explicit-work-join] [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
       Same fetch surface as the local efficiency report (pull list, check-runs and
       rework scan for joined PRs only — bounded; GITHUB_TOKEN/GH_TOKEN honored, optional
       for public repos). Naming the repo is the same deliberate disclosure as
@@ -6073,6 +6073,8 @@ async function main() {
     };
     const outcomes = await runOutcomesSync(config, {
       repository,
+      workArtifactsPath: optionValue("--work-artifacts"),
+      explicitJoinEnabled: !flag("--no-explicit-work-join"),
       sinceDays: numberOption("--since-days"),
       reworkWindowDays: numberOption("--rework-window-days"),
       until: optionValue("--until"),

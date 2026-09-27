@@ -193,6 +193,23 @@ function safeTopLevelModel(value: string | undefined) {
 export function sealOutboundEvent(event: AiInteractionEvent) {
   const metadata = sanitizeMetadata(event.metadata);
   if (!metadata.ok) return { ok: false as const, reason: "privacy" as const };
+  // A dispatch bind is the authority for this additive wire ref. Keep the
+  // existing flat metadata for pre-S16 consumers; never infer a work ref from
+  // a session, git branch, or an unverified/legacy work item.
+  const workItemId = metadata.metadata.workItemId;
+  const attemptId = metadata.metadata.attemptId;
+  if (typeof workItemId === "string" &&
+      /^beads:eco-[a-z0-9]+(?:\.[1-9][0-9]*)*$/.test(workItemId) &&
+      workItemId.length - "beads:".length <= 128 &&
+      typeof attemptId === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attemptId) &&
+      typeof metadata.metadata.workEvidenceRef === "string" &&
+      metadata.metadata.workEvidenceRef.length > 0 &&
+      metadata.metadata.workAttributionState !== "conflict") {
+    metadata.metadata.work_ref = {
+      schema: "work-ref/v1", work_id: workItemId.slice("beads:".length), run_id: attemptId,
+    };
+  }
   const id = safeTopLevelIdentifier(event.id);
   const sessionId = safeTopLevelIdentifier(event.sessionId);
   const tenantId = safeTopLevelIdentifier(event.tenantId);
