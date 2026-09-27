@@ -2,7 +2,7 @@
 import { AutomaticRetentionCadence } from "./retention-cadence";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -157,6 +157,7 @@ import {
 import { bindDispatch,closeDispatch,restampDispatch } from "./dispatch-command";
 import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
 import { OtlpIntakeSpool } from "./otlp-spool";
+import { releaseStopWindowListener, runStopWindowListener } from "./stop-window-listener";
 import {
   HOOK_SPOOL_COLLECTOR_TOO_OLD,
   HOOK_SPOOL_COLLECTOR_UNREACHABLE,
@@ -324,6 +325,39 @@ import {
 } from "./runtime-ownership";
 
 const command = process.argv[2] ?? "help";
+
+async function startStopWindowChild(port: number) {
+  const nonce = randomUUID();
+  const child = spawn(process.execPath, [
+    ...process.execArgv, process.argv[1] ?? "", "__stop_window_listener", nonce,
+  ], {
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+    env: { ...process.env, PLIMSOLL_STOP_WINDOW_NONCE: nonce },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("stop_window_listener_ready_timeout")), 95_000);
+      const fail = (error: Error) => { clearTimeout(timer); reject(error); };
+      child.once("error", fail);
+      child.once("exit", (code) => fail(new Error(`stop_window_listener_exit:${code}`)));
+      child.on("message", (message) => {
+        const row = message as { status?: unknown; port?: unknown; reason?: unknown };
+        if (row.status === "ready" && row.port === port) {
+          clearTimeout(timer);
+          resolve();
+        } else if (row.status === "error") {
+          fail(new Error(`stop_window_listener_error:${String(row.reason)}`));
+        }
+      });
+    });
+  } catch (error) {
+    child.kill();
+    throw error;
+  }
+  child.disconnect();
+  child.unref();
+}
 
 function printHelp() {
   console.log(`Plimsoll Collector
@@ -2539,6 +2573,7 @@ async function main() {
     "unload-launch-agent",
     "uninstall-launch-agent",
     "lifecycle",
+    "__stop_window_listener",
   ]);
   const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
@@ -2553,6 +2588,20 @@ async function main() {
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
+
+  if (command === "__stop_window_listener") {
+    if (!process.send || process.argv[3] !== process.env.PLIMSOLL_STOP_WINDOW_NONCE ||
+        !/^[a-f0-9-]{36}$/i.test(process.argv[3] ?? "") || configRead?.status !== "valid") {
+      throw new Error("stop_window_listener_requires_lifecycle_update");
+    }
+    try {
+      await runStopWindowListener(config, resolveCollectorHome().home);
+    } catch (error) {
+      process.send?.({ status: "error", reason: (error as Error).message });
+      throw error;
+    }
+    return;
+  }
 
   if (command === "dispatch") {
     if (configRead?.status !== "valid") throw new Error("dispatch_config_not_valid");
@@ -6533,6 +6582,14 @@ async function main() {
       if (result.kind === "preflight" && !result.preflight.ok) process.exitCode = 1;
       return;
     }
+    if (action === "update") {
+      // Managed/upload-enabled update windows are the fleet path. An
+      // unenrolled offline install has no running authenticated receiver.
+      if (configRead?.status === "valid" && (config.managed || config.uploadUrl)) {
+        if (!readLocalIngestAuth(resolveCollectorHome().home)) throw new Error("stop_window_auth_unavailable");
+        await startStopWindowChild(config.port);
+      }
+    }
     const resolveArtifact = async (reference: string) => {
       if (reference === "self") return resolveSelfArtifact();
       if (!path.isAbsolute(reference) || !fs.existsSync(reference)) {
@@ -6604,7 +6661,8 @@ async function main() {
       throw new Error("LaunchAgent visible manifest postcondition failed after install.");
     }
     const load = flag("--load")
-      ? await loadVisibleLaunchAgent(result.plistPath, config.port, result.receipt.changed, launchAgentMutationAuthority())
+      ? (await releaseStopWindowListener(config.port, resolveCollectorHome().home),
+        await loadVisibleLaunchAgent(result.plistPath, config.port, result.receipt.changed, launchAgentMutationAuthority()))
       : { loaded: false, status: "not_requested" as const, manifestDigest: visible.manifestDigest };
     console.log(
       JSON.stringify(
@@ -6642,6 +6700,7 @@ async function main() {
       process.exitCode = 1;
       return;
     }
+    await releaseStopWindowListener(config.port, resolveCollectorHome().home);
     const load = await loadVisibleLaunchAgent(plistPath, config.port, false, launchAgentMutationAuthority());
     console.log(JSON.stringify({ ...load, plistPath, label: LAUNCH_AGENT_LABEL }, null, 2));
     if (launchAgentLoadFailed(load) && process.exitCode === undefined) process.exitCode = 1;

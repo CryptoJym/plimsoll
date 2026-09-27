@@ -96,7 +96,7 @@ export type OtlpIntakeBatch = {
   admissionDrops: OtlpAdmissionDrop[];
 };
 
-export type OtlpSpoolCause = "storage_busy_retry" | "request_deadline_exceeded";
+export type OtlpSpoolCause = "storage_busy_retry" | "request_deadline_exceeded" | "update_window";
 
 export function otlpChunkCount(batch: OtlpIntakeBatch) {
   return Math.max(
@@ -470,7 +470,7 @@ function validatedBatch(value: unknown): OtlpIntakeBatch | null {
 }
 
 const PRODUCER_SOURCES = new Set<string>(["claude_code", "codex", "gemini_cli", "grok"]);
-const CAUSES = new Set<string>(["storage_busy_retry", "request_deadline_exceeded"]);
+const CAUSES = new Set<string>(["storage_busy_retry", "request_deadline_exceeded", "update_window"]);
 
 type ReadResult =
   | { ok: true; envelope: OtlpSpoolEnvelope }

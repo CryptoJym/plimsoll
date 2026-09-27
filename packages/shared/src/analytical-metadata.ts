@@ -265,6 +265,7 @@ const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
   ["otelHasError", "boolean"],
   ["otelHasException", "boolean"],
   ["repoStitched", "boolean"],
+  ["stopWindowProbe", "boolean"],
 ]);
 // OTLP semantic-convention keys use their documented lowercase spelling.
 // Camel-case entries below are explicit legacy producer aliases, not a

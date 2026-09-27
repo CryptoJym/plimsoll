@@ -22,6 +22,7 @@ import {
   validatedMetadataAttribute,
 } from "../../shared/src/index";
 import { appendForwardedHook, appendNormalizedHook, normalizeForwardedHook } from "./forwarder";
+import { markStopWindowProbe } from "./stop-window-probe";
 import {
   PRODUCER_EVENT_ID_HEADER,
   appendProducerObservation,
@@ -201,20 +202,25 @@ function admitHookBody(
     buffer: LocalEventBuffer;
     budget: RequestBudget;
     producerEventId?: string;
+    probe?: boolean;
   },
 ) {
   const payload = parseBoundedJson(bodyText);
   assertBoundedJsonNodes(payload);
   if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
   context.budget.checkpoint();
-  return retryStorageBusy(context.budget, () =>
-    appendForwardedHook(payload, {
+  return retryStorageBusy(context.budget, () => {
+    const options = {
       config: context.config,
       buffer: context.buffer,
       source,
       producerEventId: context.producerEventId,
-    }),
-  );
+    };
+    if (!context.probe) return appendForwardedHook(payload, options);
+    const canonical = normalizeForwardedHook(payload, options);
+    canonical.event = markStopWindowProbe(canonical.event);
+    return appendNormalizedHook(context.buffer, canonical);
+  });
 }
 
 /**
@@ -493,7 +499,7 @@ export function createHookSpoolDrain(
         await admitHookBody(
           spooledBodyWithHookTime(read.envelope.body, read.envelope.receivedAt),
           read.envelope.source,
-          { config, buffer, budget: createRequestBudget() },
+          { config, buffer, budget: createRequestBudget(), probe: read.envelope.probe },
         );
         try {
           fs.unlinkSync(file.path);

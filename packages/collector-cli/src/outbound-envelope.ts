@@ -191,6 +191,9 @@ function safeTopLevelModel(value: string | undefined) {
 }
 
 export function sealOutboundEvent(event: AiInteractionEvent) {
+  // Rehearsal probes prove local replay but must never enter hosted spend or
+  // activity views, even when a future loader broadens its usage predicate.
+  if (event.metadata.stopWindowProbe === true) return { ok: false as const, reason: "privacy" as const };
   const metadata = sanitizeMetadata(event.metadata);
   if (!metadata.ok) return { ok: false as const, reason: "privacy" as const };
   // A dispatch bind is the authority for this additive wire ref. Keep the
