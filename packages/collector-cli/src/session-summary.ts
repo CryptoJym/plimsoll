@@ -1037,11 +1037,18 @@ function fallbackReason(
 export function listSessionSummaryPendingIds(db: Database.Database, until: string, maxIds = 8_000): string[] {
   if (!tableExists(db, "session_sync_summary_state") || !tableExists(db, "session_sync_summary_dirty")) return [];
   const limit = Math.max(1, Math.min(Math.trunc(maxIds), 8_000));
+  // A ledger upgraded from before the pending table existed keeps its lazy
+  // summary migrations; read the pending reasons only once the table is there.
+  const pendingUnion = tableExists(db, "session_sync_summary_pending")
+    ? `select session_id as sessionId from session_sync_summary_pending
+       where ${BOUNDED_SQL_READ_PREDICATE}
+     union
+     ` : "";
   const rows = boundedSqlRows<{ sessionId: string }>(db,
     `select session_id as sessionId from session_sync_summary_dirty
        where ${BOUNDED_SQL_READ_PREDICATE}
      union
-     select session_id as sessionId from session_sync_summary_state
+     ${pendingUnion}     select session_id as sessionId from session_sync_summary_state
        where complete = 0 and ${BOUNDED_SQL_READ_PREDICATE}
      union
      select r.session_id as sessionId from session_sync_summary_revision r
@@ -1114,7 +1121,7 @@ export async function updateSessionSummary(
     pending.queuedHighWater === queuedHighWaterAtStart;
   const finish = async (result: SessionSummaryUpdateResult, zeroProgressRead = false) => {
     if (result.complete) {
-      if (pending) await writeRetry.run(() => db.prepare(
+      await writeRetry.run(() => db.prepare(
         "delete from session_sync_summary_pending where session_id = ?",
       ).run(sessionId));
       return result;
