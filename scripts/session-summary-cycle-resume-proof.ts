@@ -9,11 +9,13 @@ import { build } from "esbuild";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { readLedgerOffThread, buildSessionSyncRow, collectSessionSnapshots,
+import { buildSessionSyncRow, collectSessionSnapshots,
   commitDaemonSessionSyncFailure, commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState, planDaemonSessionSync, runSessionSync,
   saveDaemonSessionSyncState } from "../packages/collector-cli/src/session-sync";
-import { sessionSummaryCounters, updateSessionSummary } from "../packages/collector-cli/src/session-summary";
+import { SESSION_SUMMARY_DEFAULT_MAX_MS, SESSION_SUMMARY_DEFAULT_MAX_ROWS,
+  sessionSummaryCounters,
+  type SessionSummaryRead, type SessionSummaryUpdateResult } from "../packages/collector-cli/src/session-summary";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
@@ -34,9 +36,37 @@ const ids = {
   upgrade: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeee86",
 };
 let eventNumber = 1;
-let horizonNumber = 0;
 const eventId = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
-const nextUntil = () => new Date(Date.now() + (++horizonNumber) * 1_000).toISOString();
+class ProofClock {
+  constructor(private instant = Date.now()) {}
+  now() { return this.instant; }
+  nextUntil() { this.instant += 1_000; return new Date(this.instant).toISOString(); }
+  advancePast(iso: string) { this.instant = Math.max(this.instant, Date.parse(iso) + 1); }
+}
+const clock = new ProofClock();
+const rowReadDelayMs = Number(process.env.PLIMSOLL_PROOF_ROW_READ_DELAY_MS ?? "0");
+assert.ok(Number.isFinite(rowReadDelayMs) && rowReadDelayMs >= 0 && rowReadDelayMs <= 1);
+
+// The proof controls read speed without changing the production reader. The
+// proxy delays each row when the summarizer consumes it, preserving the SQL
+// result length and cursor semantics while making the 250 ms cap observable.
+function proofRead(buffer: LocalEventBuffer, slow: boolean): SessionSummaryRead {
+  return async <T>(queries: Parameters<SessionSummaryRead>[0]): Promise<T[]> => {
+    assert.equal(queries.length, 1);
+    const query = queries[0]!;
+    const rows = buffer.database.prepare(query.sql).all(query.params) as T[];
+    if (!slow || typeof query.params.limit !== "number") return rows;
+    return new Proxy(rows, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^(0|[1-9]\d*)$/.test(property)) {
+          const readyAt = performance.now() + rowReadDelayMs;
+          while (performance.now() < readyAt) { /* proof-only per-row read latency */ }
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+  };
+}
 
 // LocalEventBuffer.appendMany is the collector's real event insertion path.
 function insertEventRows(buffer: LocalEventBuffer, sessionId: string, count: number,
@@ -60,13 +90,15 @@ function insertEventRows(buffer: LocalEventBuffer, sessionId: string, count: num
 }
 
 type Cycle = Awaited<ReturnType<typeof daemonCycle>>;
-async function daemonCycle(buffer: LocalEventBuffer) {
-  const until = nextUntil();
+async function daemonCycle(buffer: LocalEventBuffer, slow = false, summaryMaxRows?: number) {
+  const until = clock.nextUntil();
+  const updates = new Map<string, SessionSummaryUpdateResult>();
   const prior = loadDaemonSessionSyncState(buffer.database);
   const plan = planDaemonSessionSync({ db: buffer.database, state: prior, uploadedBatches: [], until });
   saveDaemonSessionSyncState(buffer.database, plan.state);
   const sent: Array<{ session: { id: string }; [key: string]: unknown }> = [];
-  if (plan.skip) return { until, plan, result: null, sent, state: loadDaemonSessionSyncState(buffer.database) };
+  if (plan.skip) return { until, plan, result: null, sent, updates,
+    state: loadDaemonSessionSyncState(buffer.database) };
   const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
     const raw = String(init?.body ?? "");
     sent.push(...(JSON.parse(raw).sessions ?? []));
@@ -78,6 +110,11 @@ async function daemonCycle(buffer: LocalEventBuffer) {
   const result = await runSessionSync(config, {
     ...(plan.sessionIds !== undefined ? { sessionIds: plan.sessionIds } : {}),
     until: plan.until, ledgerDb: buffer.database, incremental: true,
+    ...(summaryMaxRows === undefined ? {} : { summaryMaxRows }),
+    proofSummaryHooks: {
+      ...(slow && rowReadDelayMs > 0 ? { read: proofRead(buffer, true) } : {}),
+      onUpdate: (sessionId, update) => { updates.set(sessionId, update); },
+    },
     fetchImpl, sleep: async () => undefined, delayMs: 0, maxAttemptsPerBatch: 1,
     log: () => undefined,
   });
@@ -86,7 +123,7 @@ async function daemonCycle(buffer: LocalEventBuffer) {
     : commitDaemonSessionSyncFailure(plan.state,
       plan.sessionIds === undefined ? undefined : [...plan.sessionIds, ...result.pendingSummarySessionIds]);
   saveDaemonSessionSyncState(buffer.database, next);
-  return { until, plan, result, sent, state: loadDaemonSessionSyncState(buffer.database) };
+  return { until, plan, result, sent, updates, state: loadDaemonSessionSyncState(buffer.database) };
 }
 
 function stateRow(buffer: LocalEventBuffer, sessionId: string) {
@@ -95,6 +132,12 @@ function stateRow(buffer: LocalEventBuffer, sessionId: string) {
     from session_sync_summary_state where session_id = ?`).get(sessionId) as {
       complete: number; mode: string; highWater: number; coveredUntil: string; accumulatorJson: string;
     };
+}
+
+function accumulator(buffer: LocalEventBuffer, sessionId: string) {
+  return JSON.parse(stateRow(buffer, sessionId).accumulatorJson) as {
+    scanBoundary: number; events: number; futureRows: boolean; futureCreatedAt: string | null;
+  };
 }
 
 function expectedWire(buffer: LocalEventBuffer, sessionId: string, until: string) {
@@ -106,11 +149,14 @@ function expectedWire(buffer: LocalEventBuffer, sessionId: string, until: string
 }
 
 async function waitForInitialCatchUp(buffer: LocalEventBuffer, maxPasses: number) {
+  const trace: unknown[] = [];
   for (let pass = 1; pass <= maxPasses; pass += 1) {
     const cycle = await daemonCycle(buffer);
     if (cycle.state.caughtUp && cycle.state.lastSuccessfulUntil === cycle.until) return cycle;
+    trace.push({ pass, pending: cycle.result?.pendingSummarySessionIds,
+      stats: cycle.result?.summaryStats, reasons: cycle.result?.pendingSummaryReasons });
   }
-  throw new Error(`initial_session_sync_did_not_complete_within_${maxPasses}_passes`);
+  throw new Error(`initial_session_sync_did_not_complete_within_${maxPasses}_passes ${JSON.stringify(trace)}`);
 }
 
 async function load0740Summary() {
@@ -138,6 +184,9 @@ async function main() {
       [ids.fiveSlices, insertEventRows(buffer, ids.fiveSlices, 20_001)],
       [ids.control, insertEventRows(buffer, ids.control, 1)],
     ]);
+    // Fixture insertion can take seconds; start the injected wall clock after
+    // its created_at values so ordinary rows are not mistaken for future rows.
+    clock.advancePast(new Date(Date.now() + 1_000).toISOString());
     const initial = await waitForInitialCatchUp(buffer, 12);
     completion.check("initial_daemon_horizon_caught_up", initial.state.caughtUp && initial.state.lastSuccessfulUntil === initial.until);
     for (const [sessionId, eventIds] of rows) {
@@ -148,18 +197,53 @@ async function main() {
     }
     const startingHorizon = initial.state.lastSuccessfulUntil;
     const completedAt = new Map<string, number>();
+    const elapsedBySession = new Map<string, number>();
+    const appliedBySession = new Map<string, number>();
+    const timeBoundUpdates: Array<{ sessionId: string; pass: number; rowsRead: number; durationMs: number }> = [];
+    let frozenBoundary: number | null = null;
+    let appendedRowid: number | null = null;
+    let appendDrainCount = 0;
     let last: Cycle | null = null;
-    for (let pass = 1; pass <= 8; pass += 1) {
-      last = await daemonCycle(buffer);
+    for (let pass = 1; pass <= (rowReadDelayMs > 0 ? 40 : 12); pass += 1) {
+      const previousHighWater = stateRow(buffer, ids.studio4).highWater;
+      last = await daemonCycle(buffer, rowReadDelayMs > 0);
       if (pass === 1) {
+        const firstState = stateRow(buffer, ids.studio4);
+        assert.equal(firstState.mode, "fallback");
+        assert.equal(firstState.complete, 0);
+        frozenBoundary = accumulator(buffer, ids.studio4).scanBoundary;
+        assert.ok(frozenBoundary > 0);
         // A new row has a later rowid but an observation behind the historical cursor.
         const first = buffer.database.prepare("select observed_at as observedAt from buffered_events where id = ?")
           .get(rows.get(ids.studio4)![0]) as { observedAt: string };
-        insertEventRows(buffer, ids.studio4, 1,
+        const appendedId = insertEventRows(buffer, ids.studio4, 1,
           new Date(Date.parse(first.observedAt) - 1).toISOString());
+        appendedRowid = (buffer.database.prepare("select rowid from buffered_events where id = ?")
+          .get(appendedId[0]) as { rowid: number }).rowid;
+        assert.ok(appendedRowid > frozenBoundary);
       }
+      assert.equal(accumulator(buffer, ids.studio4).scanBoundary, frozenBoundary,
+        `scanBoundary changed on daemon pass ${pass}`);
       for (const sessionId of [ids.studio4, ids.studio5, ids.fiveSlices]) {
-        if (!completedAt.has(sessionId) && stateRow(buffer, sessionId).complete === 1) completedAt.set(sessionId, pass);
+        const update = last.updates.get(sessionId);
+        assert.ok(update, `missing summary update for ${sessionId} on pass ${pass}`);
+        if (completedAt.has(sessionId)) continue;
+        assert.ok(update.complete || update.rowsRead >= SESSION_SUMMARY_DEFAULT_MAX_ROWS ||
+          update.durationMs >= SESSION_SUMMARY_DEFAULT_MAX_MS ||
+          update.fallbackReason === "append_queue",
+        JSON.stringify({ sessionId, pass, update, reason: "unaccounted_partial_pass" }));
+        elapsedBySession.set(sessionId, (elapsedBySession.get(sessionId) ?? 0) + update.durationMs);
+        appliedBySession.set(sessionId, (appliedBySession.get(sessionId) ?? 0) + update.rowsApplied);
+        if (!update.complete && update.durationMs >= SESSION_SUMMARY_DEFAULT_MAX_MS &&
+            update.rowsRead > 0 && update.rowsRead < SESSION_SUMMARY_DEFAULT_MAX_ROWS) {
+          timeBoundUpdates.push({ sessionId, pass, rowsRead: update.rowsRead, durationMs: update.durationMs });
+        }
+        if (stateRow(buffer, sessionId).complete === 1) completedAt.set(sessionId, pass);
+      }
+      if (appendedRowid !== null && previousHighWater < appendedRowid &&
+          stateRow(buffer, ids.studio4).highWater >= appendedRowid) {
+        assert.equal(last.updates.get(ids.studio4)?.rowsApplied, 1);
+        appendDrainCount += 1;
       }
       if (last.state.caughtUp && last.state.lastSuccessfulUntil === last.until) break;
     }
@@ -168,14 +252,31 @@ async function main() {
     assert.equal(last.state.lastSuccessfulUntil, last.until);
     assert.notEqual(last.state.lastSuccessfulUntil, startingHorizon);
     completion.check("moving_horizon_advances_after_all_summaries_complete");
+    assert.equal(appendDrainCount, 1);
+    assert.equal(accumulator(buffer, ids.studio4).scanBoundary, frozenBoundary);
+    assert.equal(accumulator(buffer, ids.studio4).events, 5_095);
+    assert.equal(appliedBySession.get(ids.studio4), 5_095);
+    completion.check("backdated_append_keeps_frozen_boundary_and_drains_once");
+    completion.check("partial_passes_charge_rows_time_or_append_drain");
     for (const [sessionId, count] of [[ids.studio4, 5_095], [ids.studio5, 10_119], [ids.fiveSlices, 20_001]] as const) {
-      const bound = Math.ceil(count / 5_000) + 1;
+      // A nonfinal pass is charged to its 5,000-row cap, its 250 ms cap,
+      // or the one pass needed to drain a post-boundary append.
+      const elapsedMs = elapsedBySession.get(sessionId)!;
+      const bound = Math.ceil(count / SESSION_SUMMARY_DEFAULT_MAX_ROWS) +
+        Math.floor(elapsedMs / SESSION_SUMMARY_DEFAULT_MAX_MS) + 1;
       assert.ok((completedAt.get(sessionId) ?? Infinity) <= bound,
-        JSON.stringify({ sessionId, passes: completedAt.get(sessionId), bound }));
+        JSON.stringify({ sessionId, passes: completedAt.get(sessionId), bound, elapsedMs }));
       const sentRow: unknown = last.sent.find((row) => row.session.id === sessionId);
       assert.deepEqual(sentRow, expectedWire(buffer, sessionId, last.until));
-      completion.check(`from_scratch_${count}_rows_within_${bound}_passes`);
+      console.log(JSON.stringify({ drain: count, passes: completedAt.get(sessionId), bound,
+        elapsedMs, applied: appliedBySession.get(sessionId) }));
+      completion.check(`from_scratch_${count}_rows_with_load_aware_bound`);
     }
+    if (rowReadDelayMs > 0) {
+      assert.ok(timeBoundUpdates.length > 0, "injected read delay never reached the 250 ms cap");
+      console.log(JSON.stringify({ rowReadDelayMs, timeBoundUpdates }));
+    }
+    completion.check("read_delay_exercises_time_cap_when_injected");
 
     // A deletion after a partial historical slice changes the revision, so
     // the next pass must rebuild and the erased row cannot reach the wire.
@@ -223,10 +324,10 @@ async function main() {
   try {
     const inserted = insertEventRows(upgraded, ids.upgrade, 5_094);
     old.ensureSessionSummarySchema(upgraded.database);
-    const initialUntil = nextUntil();
+    const initialUntil = clock.nextUntil();
     for (let pass = 0; pass < 4; pass += 1) {
       const result = await old.updateSessionSummary(upgraded.database, ids.upgrade, initialUntil, {
-        read: (queries) => readLedgerOffThread(upgraded.database, queries),
+        read: proofRead(upgraded, false),
       });
       if (result.complete) break;
     }
@@ -235,8 +336,8 @@ async function main() {
       .run(inserted[0]).changes, 1);
     const cursors: number[] = [];
     for (let pass = 0; pass < 3; pass += 1) {
-      const result = await old.updateSessionSummary(upgraded.database, ids.upgrade, nextUntil(), {
-        read: (queries) => readLedgerOffThread(upgraded.database, queries),
+      const result = await old.updateSessionSummary(upgraded.database, ids.upgrade, clock.nextUntil(), {
+        read: proofRead(upgraded, false), maxRows: 2_500,
       });
       assert.equal(result.complete, false);
       cursors.push(JSON.parse(stateRow(upgraded, ids.upgrade).accumulatorJson).events);
@@ -255,37 +356,56 @@ async function main() {
       expectedWire(upgraded, ids.upgrade, recovered.until));
     completion.check("0740_stuck_ledger_recovers_without_manual_step");
 
-    // A preexisting row beyond the current horizon must not restart every
-    // moving-horizon slice. It is rebuilt once when that row becomes eligible.
-    const futureCreatedAt = new Date(Date.now() + 3_600_000).toISOString();
+    // The injected daemon clock crosses this row's creation time while a
+    // historical fallback is partial. No direct update or artificial until
+    // bypasses planDaemonSessionSync/runSessionSync.
+    const futureCreatedAt = new Date(clock.now() + 3_000).toISOString();
     assert.equal(upgraded.database.prepare("update buffered_events set created_at = ? where id = ?")
       .run(futureCreatedAt, inserted[1]).changes, 1);
     const recomputesBeforeFuture = sessionSummaryCounters(upgraded.database).fallbackRecomputes;
-    let beforeMaturity: Cycle | null = null;
-    for (let pass = 0; pass < 3; pass += 1) {
-      beforeMaturity = await daemonCycle(upgraded);
-      if (beforeMaturity.state.lastSuccessfulUntil === beforeMaturity.until) break;
-    }
-    assert.ok(beforeMaturity?.state.caughtUp && beforeMaturity.state.lastSuccessfulUntil === beforeMaturity.until);
+    const beforeMaturity = await daemonCycle(upgraded, false, 2_000);
+    assert.ok(Date.parse(beforeMaturity.until) < Date.parse(futureCreatedAt));
+    assert.equal(stateRow(upgraded, ids.upgrade).complete, 0);
+    assert.ok(beforeMaturity.result?.pendingSummarySessionIds.includes(ids.upgrade));
+    assert.ok(!beforeMaturity.sent.some((row) => row.session.id === ids.upgrade));
+    assert.equal(beforeMaturity.state.lastSuccessfulUntil, recovered.until);
+    assert.equal(accumulator(upgraded, ids.upgrade).futureCreatedAt, futureCreatedAt);
     assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture + 1);
-    assert.deepEqual(beforeMaturity.sent.find((row) => row.session.id === ids.upgrade),
-      expectedWire(upgraded, ids.upgrade, beforeMaturity.until));
-    const matureUntil = new Date(Date.parse(futureCreatedAt) + 1_000).toISOString();
-    let matureRebuilds = 0;
-    let matured: Awaited<ReturnType<typeof updateSessionSummary>> | null = null;
-    for (let pass = 0; pass < 3; pass += 1) {
-      matured = await updateSessionSummary(upgraded.database, ids.upgrade, matureUntil, {
-        read: (queries) => readLedgerOffThread(upgraded.database, queries),
-      });
-      if (matured.fullRecompute) matureRebuilds += 1;
-      if (matured.complete) break;
+    const stillBeforeMaturity = await daemonCycle(upgraded, false, 2_000);
+    assert.ok(Date.parse(stillBeforeMaturity.until) < Date.parse(futureCreatedAt));
+    assert.equal(stateRow(upgraded, ids.upgrade).complete, 0);
+    assert.equal(stillBeforeMaturity.updates.get(ids.upgrade)?.fullRecompute, false);
+    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture + 1);
+    assert.ok(!stillBeforeMaturity.sent.some((row) => row.session.id === ids.upgrade));
+    assert.equal(stillBeforeMaturity.state.lastSuccessfulUntil, recovered.until);
+    completion.check("future_row_stays_unsent_while_pre_maturity_fallback_is_partial");
+
+    clock.advancePast(futureCreatedAt);
+    let maturityRebuilds = 0;
+    let matured: Cycle | null = null;
+    for (let pass = 0; pass < 6; pass += 1) {
+      matured = await daemonCycle(upgraded, false, 2_000);
+      const update = matured.updates.get(ids.upgrade);
+      if (update?.fullRecompute) maturityRebuilds += 1;
+      if (pass === 0) {
+        assert.ok(update?.fullRecompute);
+        assert.equal(update.fallbackReason, "future_horizon");
+        assert.equal(stateRow(upgraded, ids.upgrade).complete, 0);
+      }
+      if (stateRow(upgraded, ids.upgrade).complete === 0) {
+        assert.ok(!matured.sent.some((row) => row.session.id === ids.upgrade));
+        assert.equal(matured.state.lastSuccessfulUntil, recovered.until);
+      }
+      if (matured.state.caughtUp && matured.state.lastSuccessfulUntil === matured.until) break;
     }
-    assert.equal(matureRebuilds, 1);
-    assert.ok(matured?.complete);
-    assert.deepEqual(matured.snapshot, collectSessionSnapshots(upgraded.database, {
-      until: matureUntil, sessionIds: [ids.upgrade],
-    })[0]);
-    completion.check("future_row_waits_without_restarts_then_enters_final_horizon_once");
+    assert.equal(maturityRebuilds, 1);
+    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture + 2);
+    assert.ok(matured?.state.caughtUp && matured.state.lastSuccessfulUntil === matured.until);
+    assert.ok(Date.parse(matured.until) > Date.parse(futureCreatedAt));
+    assert.deepEqual(matured.sent.find((row) => row.session.id === ids.upgrade),
+      expectedWire(upgraded, ids.upgrade, matured.until));
+    assert.equal(accumulator(upgraded, ids.upgrade).events, inserted.length);
+    completion.check("future_row_matures_during_partial_daemon_summary_once");
   } finally { upgraded.close(); }
   completion.complete();
 }

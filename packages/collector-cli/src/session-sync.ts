@@ -31,6 +31,7 @@ import {
   type SessionReadQuery,
   type SessionSnapshot,
   type SessionSummaryRead,
+  type SessionSummaryUpdateResult,
 } from "./session-summary";
 
 export type { SessionSnapshot } from "./session-summary";
@@ -1129,6 +1130,11 @@ export type SessionSyncOptions = {
   /** Test/diagnostic bounds; production keeps the conservative defaults. */
   summaryMaxRows?: number;
   summaryMaxMs?: number;
+  /** Disposable proof only: inject read latency and capture each bounded update. */
+  proofSummaryHooks?: {
+    read?: SessionSummaryRead;
+    onUpdate?: (sessionId: string, update: SessionSummaryUpdateResult) => void;
+  };
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
@@ -1192,6 +1198,9 @@ export async function runSessionSync(
   config: CollectorConfig,
   options: SessionSyncOptions = {},
 ): Promise<SessionSyncResult> {
+  if (options.proofSummaryHooks && !process.env.PLIMSOLL_PROOF_ROOT) {
+    throw new Error("proof_summary_hooks_require_disposable_proof_root");
+  }
   assertCollectorPrivacyMode(config, "session sync", {
     willEnableUpload: Boolean(options.url),
   });
@@ -1278,11 +1287,12 @@ export async function runSessionSync(
       ledgerSessions = sessionIds.length;
       for (const sessionId of sessionIds) {
         const update = await updateSessionSummary(ledger, sessionId, until, {
-          read: summaryReader.read,
+          read: options.proofSummaryHooks?.read ?? summaryReader.read,
           maxRows: options.summaryMaxRows,
           maxMs: options.summaryMaxMs,
           writeRetry: summaryWriteRetry,
         });
+        options.proofSummaryHooks?.onUpdate?.(sessionId, update);
         summaryStats.rowsRead += update.rowsRead;
         summaryStats.rowsApplied += update.rowsApplied;
         summaryStats.durationMs += update.durationMs;
