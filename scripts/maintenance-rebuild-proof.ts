@@ -117,7 +117,7 @@ async function main() {
   const result = await rebuildLedger({ ...base,
     quiesce: () => quiesce(ledger),
     resume: async () => {
-      assert.equal(fs.existsSync(`${ledger}.maintenance-rebuild.lock`), false);
+      assert.equal(fs.existsSync(`${ledger}.maintenance-rebuild.lock`), true);
       resumed += 1;
     },
   });

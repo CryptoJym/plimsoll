@@ -22,7 +22,19 @@ function canonicalGatePath(inputPath: string) {
 }
 
 export function assertRebuildWriterGateOpen(ledgerPath: string) {
-  if (fs.existsSync(rebuildLockPath(canonicalGatePath(ledgerPath)))) throw new Error("maintenance_rebuild_paused");
+  const canonical = canonicalGatePath(ledgerPath);
+  if (!fs.existsSync(rebuildLockPath(canonical))) return;
+  // The resumed launch agent must be able to reopen the verified replacement
+  // while every other opener stays fenced. This exception only starts after
+  // the durable no-rollback boundary and ends when resume completes.
+  if (process.argv[2] === "start") {
+    try {
+      const state = JSON.parse(fs.readFileSync(`${canonical}.maintenance-rebuild.json`, "utf8")) as
+        { phase?: unknown };
+      if (state.phase === "resume_started") return;
+    } catch { /* A missing or unreadable state never grants an opener. */ }
+  }
+  throw new Error("maintenance_rebuild_paused");
 }
 
 /** Create the token before SQLite opens. The rebuild holds its lock before

@@ -516,11 +516,11 @@ export async function rebuildLedger(input: RebuildRunInput) {
     }
     state = advance(ledgerPath, state, "resume_started");
     resumeStarted = true;
-    // From here the old file is forensic evidence. Let the new daemon open
-    // the rebuilt path; the durable phase already forbids rename-back.
-    removeIfExists(lockPath(ledgerPath));
+    // The old file is forensic evidence. Only the resumed daemon's start
+    // command may open the verified replacement while this fence remains.
     await input.resume();
     state = advance(ledgerPath, state, "complete");
+    removeIfExists(lockPath(ledgerPath));
     return { status: "rebuilt" as const, pauseMs: performance.now() - pausedAt,
       backupPath, quiesce: { ...receipt, fencedOwnership }, ...preflight };
   } catch (error) {

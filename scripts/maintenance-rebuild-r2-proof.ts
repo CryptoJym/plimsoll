@@ -59,11 +59,13 @@ async function main() {
     separateStateDatabases: [...separateStores] }));
   const ledger = path.join(home, "work-ledger.sqlite");
   fixture(ledger);
+  const lock = `${ledger}.maintenance-rebuild.lock`;
   const before = observeRebuildConnectionOwnership(ledger);
   assert.equal(connectionOwnershipClosed(before), true);
   const input = { ledgerPath: ledger, stage: "S10" as const, walHighWaterBytes: 0, copyDrill: true };
   let delayedRefused = false;
   let mutantCommitted = false;
+  let fencedResume = false;
   const result = await rebuildLedger({ ...input,
     quiesce: async () => {
       const after = observeRebuildConnectionOwnership(ledger);
@@ -71,6 +73,10 @@ async function main() {
     },
     beforeSwap: () => {
       assert.throws(() => openRebuildFencedDatabase(ledger), /maintenance_rebuild_paused/);
+      const previous = process.argv[2];
+      process.argv[2] = "start";
+      try { assert.throws(() => openRebuildFencedDatabase(ledger), /maintenance_rebuild_paused/); }
+      finally { process.argv[2] = previous; }
       assert.throws(() => {
         const raw = new Database(ledger, { timeout: 0 });
         try { raw.prepare("insert into buffered_events values (?,?)").run("during_swap", "{}"); }
@@ -95,8 +101,16 @@ async function main() {
         mutantCommitted = true;
       } finally { writer.close(); }
     },
-    resume: async () => undefined,
+    resume: async () => {
+      assert.equal(fs.existsSync(lock), true, "the fence remains through daemon resume");
+      assert.throws(() => openRebuildFencedDatabase(ledger), /maintenance_rebuild_paused/);
+      const previous = process.argv[2];
+      process.argv[2] = "start";
+      try { openRebuildFencedDatabase(ledger).close(); fencedResume = true; }
+      finally { process.argv[2] = previous; }
+    },
   });
+  assert.equal(fencedResume, true);
   const active = rows(ledger);
   const backup = rows(result.backupPath);
   assert.deepEqual(active, backup, "a delayed independent writer cannot be lost across the swap");
@@ -107,7 +121,6 @@ async function main() {
   console.log(JSON.stringify({ check: "late_independent_open_fenced", active, backup,
     quiesce: result.quiesce }));
 
-  const lock = `${ledger}.maintenance-rebuild.lock`;
   const alias = path.join(root, "alias.sqlite");
   fs.symlinkSync(ledger, alias);
   fs.writeFileSync(lock, `${process.pid}\n`);
