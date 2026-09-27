@@ -51,7 +51,9 @@ export function claimRebuildResumePermit(ledgerPath: string, startLockPath: stri
     if (!stat.isFile() || stat.isSymbolicLink() ||
       (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
       (stat.mode & 0o077) !== 0) throw new Error("start_lock_untrusted");
-    owner = JSON.parse(fs.readFileSync(startLockPath, "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(startLockPath, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("start_lock_untrusted");
+    owner = parsed;
   } catch { throw new Error("maintenance_rebuild_paused"); }
   if (owner.version !== 3 || owner.label !== "com.plimsoll.collector" ||
     owner.pid !== identity.pid || owner.instanceId !== identity.instanceId ||
@@ -60,9 +62,14 @@ export function claimRebuildResumePermit(ledgerPath: string, startLockPath: stri
   }
   const claim: ResumeClaim = { nonce: state.nonce, pid: identity.pid,
     instanceId: identity.instanceId, processStartFingerprint: identity.processStartFingerprint };
-  const descriptor = fs.openSync(rebuildResumeClaimPath(canonical, state.nonce), "wx", 0o600);
+  const claimPath = rebuildResumeClaimPath(canonical, state.nonce);
+  let descriptor: number;
+  try { descriptor = fs.openSync(claimPath, "wx", 0o600); }
+  catch { throw new Error("maintenance_rebuild_paused"); }
   try { fs.writeFileSync(descriptor, `${JSON.stringify(claim)}\n`); fs.fsyncSync(descriptor); }
   finally { fs.closeSync(descriptor); }
+  const directory = fs.openSync(path.dirname(claimPath), "r");
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
   localResumeClaims.set(canonical, claim);
   return true;
 }
@@ -74,7 +81,8 @@ export function assertRebuildWriterGateOpen(ledgerPath: string) {
   if (claim?.pid === process.pid) {
     try {
       const state = resumeState(canonical);
-      if (state?.phase === "resume_started" && state.nonce === claim.nonce &&
+      if ((state?.phase === "resume_started" || state?.phase === "complete") &&
+        state.nonce === claim.nonce &&
         fs.readFileSync(rebuildResumeClaimPath(canonical, claim.nonce), "utf8") ===
           `${JSON.stringify(claim)}\n`) return;
     } catch { /* A missing or unreadable state never grants an opener. */ }

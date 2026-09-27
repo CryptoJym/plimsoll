@@ -124,6 +124,9 @@ function secondStartRefused() {
   finally { process.argv[2] = prior; }
   const identity = createCollectorRuntimeIdentity();
   const startLock = path.join(root, "collector.pid.start.lock");
+  fs.writeFileSync(startLock, "null", { mode: 0o600 });
+  assert.throws(() => claimRebuildResumePermit(ledger, startLock, identity), /maintenance_rebuild_paused/,
+    "an invalid collector start lock cannot claim a permit");
   fs.writeFileSync(startLock, JSON.stringify({ ...identity, version: 3, label: "com.plimsoll.collector" }),
     { mode: 0o600 });
   assert.equal(claimRebuildResumePermit(ledger, startLock, identity), true);
