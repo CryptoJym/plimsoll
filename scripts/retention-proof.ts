@@ -234,32 +234,50 @@ try {
     });
     const db = buffer.database;
     const now = new Date("2030-01-01T00:00:00.000Z");
-    const overdueHeld = 110_000;
+    const overdueRows = 110_000;
+    const uuidId = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    const acknowledgedId = uuidId(overdueRows - 2);
+    const locallyRejectedId = uuidId(overdueRows - 1);
+    const expectedHeld = overdueRows - 2;
     const insert = db.prepare(`insert into buffered_events
       (id,source,event_type,data_mode,observed_at,payload_json,created_at,privacy_generation)
       values (?, 'codex', 'assistant_response', 'metadata', ?, '{}', ?, 'fixture-generation')`);
     db.transaction(() => {
-      for (let n = 0; n < overdueHeld; n++) {
-        insert.run(`00000000-0000-4000-8000-${String(n).padStart(12, "0")}`, oldCreatedAt, oldCreatedAt);
+      for (let n = 0; n < overdueRows; n++) {
+        insert.run(uuidId(n), oldCreatedAt, oldCreatedAt);
       }
     })();
+    assert.equal(ensureUuidEventId(acknowledgedId).id, acknowledgedId);
+    assert.equal(ensureUuidEventId(locallyRejectedId).id, locallyRejectedId);
+    assert.equal(ensureUuidEventId(uuidId(overdueRows - 3)).id, uuidId(overdueRows - 3));
     const legacyId = "legacy-status-ack";
     insert.run(legacyId, oldCreatedAt, oldCreatedAt);
     const at = now.toISOString();
-    db.prepare("update buffered_events set uploaded_at=? where id=?").run(at, legacyId);
+    db.prepare("update buffered_events set uploaded_at=? where id in (?,?)")
+      .run(at, legacyId, acknowledgedId);
     db.prepare(`insert into upload_receipts
       (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-      values (?, 'acknowledged', 'remote_acknowledged', 'success', 1, ?, ?)`).run(
-        ensureUuidEventId(legacyId).id, at, at);
+      values (?, ?, ?, ?, 1, ?, ?)`).run(
+        ensureUuidEventId(legacyId).id, "acknowledged", "remote_acknowledged", "success", at, at);
+    db.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?, ?, ?, ?, 1, ?, ?)`).run(
+        acknowledgedId, "acknowledged", "remote_acknowledged", "success", at, at);
+    db.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?, ?, ?, ?, 1, ?, ?)`).run(
+        locallyRejectedId, "dead", "local_schema_invalid", "local", at, at);
     const started = performance.now();
     const first = buffer.retentionProgressStatus(90, now);
     const refreshMs = performance.now() - started;
     assert.equal(first.lastPass.heldForUploadExact, false);
     assert.ok(refreshMs < 150, `status refresh scanned the backlog: ${refreshMs} ms`);
-    assert.equal(await buffer.refreshRetentionHoldCount(90, now), overdueHeld);
+    const synchronousHeld = buffer.retentionStatus(90, now).states.heldForUpload;
+    assert.equal(synchronousHeld, expectedHeld);
+    assert.equal(await buffer.refreshRetentionHoldCount(90, now), synchronousHeld);
     assert.equal(buffer.prune(90, { maxRows: 128, now }).events, 0);
     const after = buffer.retentionProgressStatus(90, now);
-    assert.equal(after.states.heldForUpload, overdueHeld);
+    assert.equal(after.states.heldForUpload, expectedHeld);
     assert.equal(after.lastPass.heldForUploadExact, true);
     assert.equal(after.lastPass.heldForUploadAsOfCutoff, first.policy.cutoffAt);
 
@@ -291,19 +309,19 @@ try {
         } }>;
       };
       const httpAfterWorker = await readStatus();
-      assert.equal(httpAfterWorker.retention?.states?.heldForUpload, overdueHeld);
+      assert.equal(httpAfterWorker.retention?.states?.heldForUpload, expectedHeld);
       assert.equal(httpAfterWorker.retention?.lastPass?.heldForUploadExact, true);
       assert.equal(httpAfterWorker.retention?.lastPass?.heldForUploadAsOfCutoff, first.policy.cutoffAt);
       assert.notEqual(httpAfterWorker.retention?.policy?.cutoffAt, first.policy.cutoffAt);
 
       assert.equal(refreshStatus?.(), true);
       const later = await readStatus();
-      assert.equal(later.retention?.states?.heldForUpload, overdueHeld);
+      assert.equal(later.retention?.states?.heldForUpload, expectedHeld);
       assert.equal(later.retention?.lastPass?.heldForUploadExact, true);
       assert.equal(later.retention?.lastPass?.heldForUploadAsOfCutoff, first.policy.cutoffAt);
       assert.notEqual(later.retention?.policy?.cutoffAt, first.policy.cutoffAt);
       assert.equal(laterWorkerRequests, 0, "fresh cached status must not start another worker");
-      console.log(JSON.stringify({ fixture: "offline_status_http", heldForUpload: overdueHeld,
+      console.log(JSON.stringify({ fixture: "offline_status_http", heldForUpload: expectedHeld,
         exact: later.retention?.lastPass?.heldForUploadExact,
         asOfCutoff: later.retention?.lastPass?.heldForUploadAsOfCutoff,
         currentPolicyCutoff: later.retention?.policy?.cutoffAt,
@@ -311,8 +329,8 @@ try {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-    console.log(JSON.stringify({ fixture: "offline_status", overdueHeld, refreshMs,
-      exactAfterPrune: after.states.heldForUpload }));
+    console.log(JSON.stringify({ fixture: "offline_status", overdueRows, synchronousHeld,
+      workerHeld: after.states.heldForUpload, acknowledgedId, locallyRejectedId, refreshMs }));
     buffer.close();
     completion.check("large_offline_status_is_bounded_and_exact_after_prune");
   }

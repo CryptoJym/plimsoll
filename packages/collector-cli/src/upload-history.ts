@@ -56,7 +56,7 @@ import {
  * must accept exactly what Postgres accepts. Re-deriving an id the daemon
  * could upload as-is would split one ledger row into two cloud rows.
  */
-const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Deterministic UUID for ledger ids the cloud's uuid column would reject

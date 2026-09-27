@@ -2,15 +2,16 @@ import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 
 import type Database from "better-sqlite3";
+import { POSTGRES_UUID_RE } from "./upload-history";
 
 // The ledger reader keeps this exact count off the collector's event loop.
-// The UUID normalization mirrors ensureUuidEventId in upload-history.ts.
+// The UUID test is shared with ensureUuidEventId in upload-history.ts.
 const workerSource = `
   const crypto = require('node:crypto');
   const { parentPort, workerData } = require('node:worker_threads');
   const Database = require(workerData.sqliteModule);
   const db = new Database(workerData.ledgerPath, { readonly: true, fileMustExist: true });
-  const postgresUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const postgresUuid = workerData.postgresUuid;
   db.function('retention_delivery_id', { deterministic: true }, (rawId) => {
     if (postgresUuid.test(rawId)) return rawId;
     const digest = crypto.createHash('sha256').update('workspace-backfill|' + rawId).digest('hex');
@@ -42,6 +43,7 @@ export function countRetentionHoldsOffThread(
       sqliteModule: createRequire(import.meta.url).resolve("better-sqlite3"),
       cutoffAt,
       holdSql,
+      postgresUuid: POSTGRES_UUID_RE,
     },
   });
   worker.unref();
