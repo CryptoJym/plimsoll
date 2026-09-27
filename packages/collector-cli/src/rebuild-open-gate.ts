@@ -96,12 +96,22 @@ export function acquireRebuildOpenToken(ledgerPath: string) {
   if (ledgerPath === ":memory:") return null;
   const canonical = canonicalGatePath(ledgerPath);
   const directory = rebuildOpenLeaseDirectory(canonical);
-  try { fs.mkdirSync(directory, { mode: 0o700 }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("writer_lease_directory_invalid");
   const token = path.join(directory, `${process.pid}.${randomUUID()}.lease`);
-  const descriptor = fs.openSync(token, "wx", 0o600);
+  let descriptor: number | null = null;
+  for (let attempt = 0; attempt < 5 && descriptor === null; attempt += 1) {
+    try { fs.mkdirSync(directory, { mode: 0o700 }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    try {
+      const stat = fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("writer_lease_directory_invalid");
+      descriptor = fs.openSync(token, "wx", 0o600);
+    } catch (error) {
+      // The last closer may remove the now-empty directory between mkdir and
+      // token creation. Retry that safe race; every other error fails closed.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  if (descriptor === null) throw new Error("writer_lease_directory_unavailable");
   try { fs.writeFileSync(descriptor, `${process.pid}\n`); fs.fsyncSync(descriptor); }
   finally { fs.closeSync(descriptor); }
   try { assertRebuildWriterGateOpen(canonical); }
@@ -113,6 +123,10 @@ export function releaseRebuildOpenToken(token: string | null) {
   if (!token) return;
   try { fs.unlinkSync(token); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  try { fs.rmdirSync(path.dirname(token)); }
+  catch (error) {
+    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  }
 }
 
 export function assertNoRebuildOpenTokens(ledgerPath: string) {

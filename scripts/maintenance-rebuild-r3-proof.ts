@@ -148,12 +148,25 @@ function secondStartRefused() {
     firstProcessPermitted: true, secondStartRefused: true }));
 }
 
+function leaseDirectoryRetiresAfterClose() {
+  const ledger = path.join(root, "closed-writer.sqlite");
+  const directory = `${ledger}.rebuild-open-leases`;
+  const db = openRebuildFencedDatabase(ledger);
+  try {
+    db.exec("create table proof_row(id integer primary key)");
+    assert.equal(fs.existsSync(directory), true);
+  } finally { db.close(); }
+  assert.equal(fs.existsSync(directory), false, "the last writer must remove its empty lease directory");
+  console.log(JSON.stringify({ check: "default_off_lease_directory_cleanup", removed: true }));
+}
+
 async function main() {
   const requested = process.argv[2] ?? "all";
   try {
     if (requested === "all" || requested === "aliases") await aliasStoreGap();
     if (requested === "all" || requested === "recovery") activeMissingMainRecovery();
     if (requested === "all" || requested === "resume") secondStartRefused();
+    if (requested === "all" || requested === "leases") leaseDirectoryRetiresAfterClose();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });
