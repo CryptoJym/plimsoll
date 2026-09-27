@@ -43,10 +43,11 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   // event loop responsive and ample time to return inside curl's 2 s cap.
   storageBusyRetryBudgetMs: 750,
   storageBusyRetryDelayMs: 25,
-  // Issue 0056 (#104): per-source admission ceiling before any body decode or
-  // ledger work. Generous for real tool cadence (hooks + periodic OTLP
-  // exports), yet bounds a flood so it cannot monopolize the event loop.
-  perSourceRequestsPerWindow: 600,
+  // The 0.7.39 Studio0 ledger records a p99 event cadence of 8,061/minute.
+  // Hook and OTLP requests for one authenticated source share this window;
+  // 600/minute refused calibrated normal intake before body decode. Keep a
+  // finite source ceiling with headroom for that measured distribution.
+  perSourceRequestsPerWindow: 3_000,
   perSourceRateWindowMs: 60_000,
 });
 

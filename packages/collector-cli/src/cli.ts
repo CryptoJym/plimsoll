@@ -270,6 +270,8 @@ import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
 import { runLearningMaterialization } from "./learning-materializer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import {
+  advanceLegacySessionSummaryRebuild,
+  beginLegacySessionSummaryRebuild,
   commitDaemonSessionSyncFailure,
   commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState,
@@ -2889,6 +2891,7 @@ async function main() {
     // is accepted, each cycle catch-up-walks the ledger so a missed first
     // refresh does not wait for `upload-history --sessions`.
     let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
+    let legacySummaryRebuild = beginLegacySessionSummaryRebuild(buffer.database);
     let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
     let lastSessionPassAt = performance.now();
 
@@ -2985,19 +2988,42 @@ async function main() {
         ];
         const sessionUntil = new Date().toISOString();
         try {
-          const sessionPlan = planDaemonSessionSync({
-            db: buffer.database,
-            state: { ...sessionSyncState, pendingSessionIds },
-            uploadedBatches,
+          const legacyActive = legacySummaryRebuild !== null && legacySummaryRebuild.phase !== "done";
+          const newIds = sessionSyncState.caughtUp
+            ? await listLedgerSessionIdsOffThread(buffer.database, {
+                until: sessionUntil,
+                since: sessionSyncState.lastSuccessfulUntil,
+                excludedIds: sessionSyncState.blockedSessionIds,
+              }) : [];
+          // While the legacy cursor scans historical sessions, its incomplete
+          // ids belong to the rebuild, not the foreground sync planner. A
+          // current-id batch runs first and keeps its own durable pending set.
+          const blocked = new Set(sessionSyncState.blockedSessionIds ?? []);
+          const currentIds = [...new Set([...touchedSessionIds, ...newIds])]
+            .filter((id) => !blocked.has(id));
+          const foregroundIds = currentIds.slice(0, 64);
+          const sessionPlan = legacyActive ? {
+            skip: foregroundIds.length === 0,
+            sessionIds: foregroundIds,
             until: sessionUntil,
-            ledgerSessionIds: sessionSyncState.caughtUp
-              ? await listLedgerSessionIdsOffThread(buffer.database, {
-                  until: sessionUntil,
-                  since: sessionSyncState.lastSuccessfulUntil,
-                  excludedIds: sessionSyncState.blockedSessionIds,
-                })
-              : undefined,
-          });
+            reason: "incremental" as const,
+            state: { ...sessionSyncState, pendingSessionIds: currentIds },
+          } : (() => {
+            try {
+              const sessionPlan = planDaemonSessionSync({
+                db: buffer.database,
+                state: { ...sessionSyncState, pendingSessionIds },
+                uploadedBatches,
+                until: sessionUntil,
+                ledgerSessionIds: sessionSyncState.caughtUp ? newIds : undefined,
+              });
+              return sessionPlan;
+            } catch (error) {
+              console.warn(JSON.stringify({ warning: "session_sync_planner_failed",
+                message: error instanceof Error ? error.message : String(error) }));
+              throw error;
+            }
+          })();
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
           if (!await persistSessionCarry()) return;
@@ -3012,7 +3038,30 @@ async function main() {
             });
             const summaryPending = sessionResult.pendingSummarySessionIds;
             summaryCatchUp = summaryPending.length > 0;
-            if (sessionResult.ok && sessionResult.summaryComplete) {
+            if (legacyActive) {
+              // Only the completed historical scan may advance the daemon's
+              // full-catch-up horizon. A current-id batch still uploads real
+              // complete snapshots and retains unfinished ids for next time.
+              const unfinished = new Set(sessionResult.pendingSummarySessionIds);
+              const completed = sessionResult.ok
+                ? new Set(foregroundIds.filter((id) => !unfinished.has(id)))
+                : new Set<string>();
+              const blockedNext = new Set([
+                ...blocked, ...sessionResult.rejectedSessionIds,
+              ]);
+              pendingSessionIds = [...new Set([
+                ...pendingSessionIds.filter((id) => !completed.has(id)), ...unfinished,
+              ])].filter((id) => !blockedNext.has(id));
+              sessionSyncState = { ...sessionSyncState, pendingSessionIds,
+                blockedSessionIds: [...blockedNext] };
+              if (sessionResult.ok && sessionResult.summaryComplete &&
+                  currentIds.length === foregroundIds.length && sessionSyncState.caughtUp) {
+                sessionSyncState = commitDaemonSessionSyncSuccess(
+                  sessionSyncState, sessionPlan.until, sessionResult.rejectedSessionIds,
+                );
+                pendingSessionIds = sessionSyncState.pendingSessionIds;
+              }
+            } else if (sessionResult.ok && sessionResult.summaryComplete) {
               sessionSyncState = commitDaemonSessionSyncSuccess(
                 sessionSyncState,
                 sessionPlan.until,
@@ -3063,6 +3112,49 @@ async function main() {
               console.warn(
                 JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
               );
+            }
+          }
+          if (legacySummaryRebuild && legacySummaryRebuild.phase !== "done") {
+            try {
+              const step = await advanceLegacySessionSummaryRebuild(config, buffer.database);
+              legacySummaryRebuild = step.state;
+              const elapsedSeconds = step.state
+                ? Math.max(1, (Date.now() - Date.parse(step.state.startedAt)) / 1_000) : 0;
+              const projectedSeconds = step.state && step.state.rowsRead > 0
+                ? Math.round(elapsedSeconds * step.state.rawRowsAtStart / step.state.rowsRead)
+                : null;
+              console.log(JSON.stringify({
+                status: "session_summary_rebuild_progress",
+                phase: step.state?.phase ?? "none",
+                scannedSessions: step.state?.scanned ?? 0,
+                rowsRead: step.state?.rowsRead ?? 0,
+                rawRowsAtStart: step.state?.rawRowsAtStart ?? 0,
+                passes: step.state?.passes ?? 0,
+                projectedSeconds,
+                batchSessions: step.ids.length,
+                batchAccepted: step.result?.acceptedSessions ?? 0,
+                batchPending: step.result?.pendingSummarySessionIds.length ?? 0,
+              }));
+              if (step.result?.ok && step.result.acceptedSessions > 0) {
+                console.log(JSON.stringify({
+                  status: "session_sync", source: "legacy_summary_rebuild",
+                  sessions: step.result.sentSessions,
+                  accepted: step.result.acceptedSessions,
+                  summaryComplete: step.result.summaryComplete,
+                  rowsRead: step.result.summaryStats.rowsRead,
+                }));
+              }
+              if (step.state?.phase === "done" && !sessionSyncState.caughtUp) {
+                sessionSyncState = { ...sessionSyncState, caughtUp: true,
+                  lastSuccessfulUntil: step.state.startedAt };
+                await persistSessionCarry();
+              }
+              if (step.state?.phase !== "done") summaryCatchUp = true;
+              if (step.result && !step.result.ok) summaryCatchUp = true;
+            } catch (error) {
+              console.warn(JSON.stringify({ warning: "session_summary_rebuild_failed",
+                message: error instanceof Error ? error.message : String(error) }));
+              summaryCatchUp = true;
             }
           }
         } catch (error) {
