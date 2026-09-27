@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 8);
+const completion = createProofCompletion("retention", 9);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -224,6 +224,47 @@ try {
       .get(invalid.id) as { n: number }).n, 0);
     buffer.close();
     completion.check("ineligible_privacy_and_invalid_kind_expire");
+  }
+
+  {
+    // The cached HTTP status refresh must never walk an offline backlog on
+    // the collector's event loop. A read-only worker can count it exactly.
+    const buffer = new LocalEventBuffer(path.join(root, "offline-status.sqlite"), {
+      workspaceId: "tenant-retention-proof", delivery: { enabled: true },
+    });
+    const db = buffer.database;
+    const now = new Date("2030-01-01T00:00:00.000Z");
+    const overdueHeld = 110_000;
+    const insert = db.prepare(`insert into buffered_events
+      (id,source,event_type,data_mode,observed_at,payload_json,created_at,privacy_generation)
+      values (?, 'codex', 'assistant_response', 'metadata', ?, '{}', ?, 'fixture-generation')`);
+    db.transaction(() => {
+      for (let n = 0; n < overdueHeld; n++) {
+        insert.run(`00000000-0000-4000-8000-${String(n).padStart(12, "0")}`, oldCreatedAt, oldCreatedAt);
+      }
+    })();
+    const legacyId = "legacy-status-ack";
+    insert.run(legacyId, oldCreatedAt, oldCreatedAt);
+    const at = now.toISOString();
+    db.prepare("update buffered_events set uploaded_at=? where id=?").run(at, legacyId);
+    db.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?, 'acknowledged', 'remote_acknowledged', 'success', 1, ?, ?)`).run(
+        ensureUuidEventId(legacyId).id, at, at);
+    const started = performance.now();
+    const first = buffer.retentionProgressStatus(90, now);
+    const refreshMs = performance.now() - started;
+    assert.equal(first.lastPass.heldForUploadExact, false);
+    assert.ok(refreshMs < 150, `status refresh scanned the backlog: ${refreshMs} ms`);
+    assert.equal(await buffer.refreshRetentionHoldCount(90, now), overdueHeld);
+    assert.equal(buffer.prune(90, { maxRows: 128, now }).events, 0);
+    const after = buffer.retentionProgressStatus(90, now);
+    assert.equal(after.states.heldForUpload, overdueHeld);
+    assert.equal(after.lastPass.heldForUploadExact, true);
+    console.log(JSON.stringify({ fixture: "offline_status", overdueHeld, refreshMs,
+      exactAfterPrune: after.states.heldForUpload }));
+    buffer.close();
+    completion.check("large_offline_status_is_bounded_and_exact_after_prune");
   }
 
   {

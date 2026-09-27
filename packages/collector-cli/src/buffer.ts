@@ -3,6 +3,7 @@ import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallati
 import crypto from "node:crypto";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
+import type { Worker } from "node:worker_threads";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
@@ -27,6 +28,7 @@ import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { ensureUuidEventId } from "./upload-history";
+import { countRetentionHoldsOffThread } from "./retention-hold-count";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
@@ -228,6 +230,12 @@ export class LocalEventBuffer {
   readonly learningFacts: LearningFactStore;
   private insertEventStatement?: Database.Statement;
   private budgetAttemptedRows = 0;
+  private retentionHoldCount: { count: number; cutoffAt: string; measuredAt: number } | null = null;
+  private retentionHoldTask: { worker: Worker; result: Promise<number> } | null = null;
+  private retentionHoldCountDirty = false;
+  private retentionHoldCountClosed = false;
+  private retentionHoldGeneration = 0;
+  private retentionHoldCountChanged: (() => void) | null = null;
 
   constructor(
     path: string,
@@ -3164,6 +3172,10 @@ export class LocalEventBuffer {
         hasMore,
       };
     }).immediate();
+    if (run.events > 0) {
+      this.retentionHoldGeneration += 1;
+      this.retentionHoldCountDirty = true;
+    }
     return {
       cutoff,
       events: run.events,
@@ -3175,7 +3187,7 @@ export class LocalEventBuffer {
     };
   }
 
-  /** The HTTP endpoint reads this cached result; refresh counts overdue holds. */
+  /** Bound the synchronous sample; a worker supplies the exact large-ledger count. */
   retentionProgressStatus(retentionDays = 90, now = new Date()) {
     const pass = this.db.prepare(`select last_rows_visited as rowsVisited,
       last_rows_expired as rowsExpired,last_has_more as hasMore,last_run_at as at,
@@ -3184,17 +3196,78 @@ export class LocalEventBuffer {
       };
     const scan = this.db.prepare(`select value from maintenance_state where key='raw_retention_scan_v1'`).get() as {value:string}|undefined;
     const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
-    const heldForUpload = (this.db.prepare(
-      `select count(*) as n from buffered_events e indexed by idx_events_retention
-       where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
-    ).get(cutoffAt) as { n: number }).n;
+    const cached = this.retentionHoldCount;
+    const fresh = cached && !this.retentionHoldCountDirty && Date.now() - cached.measuredAt < 60_000;
+    let heldForUpload: number;
+    let heldForUploadExact: boolean;
+    if (fresh) {
+      heldForUpload = cached.count;
+      heldForUploadExact = cached.cutoffAt === cutoffAt;
+    } else {
+      // Never walk an offline backlog on the collector's event loop. A small
+      // ledger is exact here; the read-only worker counts a larger one.
+      const sample = this.db.prepare(
+        `select case when ${this.rawRetentionUploadHoldSql()} then 1 else 0 end as held
+         from buffered_events e indexed by idx_events_retention
+         where e.created_at < ? order by e.created_at,e.id limit 513`,
+      ).all(cutoffAt) as Array<{ held: number }>;
+      heldForUpload = sample.reduce((count, row) => count + row.held, 0);
+      heldForUploadExact = sample.length < 513;
+      if (heldForUploadExact) {
+        this.retentionHoldCount = { count: heldForUpload, cutoffAt, measuredAt: Date.now() };
+        this.retentionHoldCountDirty = false;
+      } else {
+        if (cached) heldForUpload = cached.count;
+        if (!this.db.memory) {
+          try { void this.refreshRetentionHoldCount(retentionDays, now).catch(() => undefined); }
+          catch { /* retain the bounded observation for this refresh */ }
+        }
+      }
+    }
     return {
       inspection: "bounded" as const,
       policy: {retentionDays,cutoffAt},
       states: {retained:null,pendingDelivery:null,heldForUpload,quarantined:null,expired:pass.expired,notInspected:1},
       lastPass: {rowsVisited:pass.rowsVisited,rowsExpired:pass.rowsExpired,
         hasMore:Boolean(pass.hasMore),at:pass.at,
+        heldForUploadExact,
+        heldForUploadAsOfCutoff: heldForUploadExact ? cutoffAt : cached?.cutoffAt ?? null,
         migrationProtectedRows:scan ? Number(JSON.parse(scan.value).migrationProtectedRows ?? 0) : 0},
+    };
+  }
+
+  /** Exact large-ledger count on a read-only worker; callers never wait on the intake loop. */
+  refreshRetentionHoldCount(retentionDays = 90, now = new Date()): Promise<number> {
+    if (this.retentionHoldCountClosed) return Promise.reject(new Error("retention_hold_count_closed"));
+    if (this.retentionHoldTask) return this.retentionHoldTask.result;
+    const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
+    if (this.db.memory) {
+      const count = (this.db.prepare(
+        `select count(*) as n from buffered_events e indexed by idx_events_retention
+         where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
+      ).get(cutoffAt) as { n: number }).n;
+      this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now() };
+      this.retentionHoldCountDirty = false;
+      return Promise.resolve(count);
+    }
+    const { worker, result } = countRetentionHoldsOffThread(this.db, cutoffAt, this.rawRetentionUploadHoldSql());
+    const generation = this.retentionHoldGeneration;
+    const settled = result.then((count) => {
+      if (!this.retentionHoldCountClosed && generation === this.retentionHoldGeneration) {
+        this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now() };
+        this.retentionHoldCountDirty = false;
+        this.retentionHoldCountChanged?.();
+      }
+      return count;
+    }).finally(() => { this.retentionHoldTask = null; });
+    this.retentionHoldTask = { worker, result: settled };
+    return settled;
+  }
+
+  onRetentionHoldCountChanged(listener: () => void) {
+    this.retentionHoldCountChanged = listener;
+    return () => {
+      if (this.retentionHoldCountChanged === listener) this.retentionHoldCountChanged = null;
     };
   }
 
@@ -3326,6 +3399,9 @@ export class LocalEventBuffer {
   }
 
   close() {
+    this.retentionHoldCountClosed = true;
+    this.retentionHoldCountChanged = null;
+    if (this.retentionHoldTask) void this.retentionHoldTask.worker.terminate();
     this.db.close();
   }
 }
