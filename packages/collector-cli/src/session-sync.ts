@@ -38,6 +38,10 @@ export type { SessionSnapshot } from "./session-summary";
 
 /** Even a sustained event backlog must give the session planner a turn. */
 export const SESSION_SYNC_MAX_DEFERRAL_MS = 60_000;
+/** Cloud accepts at most this much database/collector clock displacement. */
+export const SESSION_SYNC_MAX_CLOCK_SKEW_MS = 60_000;
+/** Extra local scheduling slack after the cloud's latest possible commit. */
+export const SESSION_SYNC_LEASE_SLACK_MS = 5_000;
 
 export function shouldDeferDaemonSessionSync(input: {
   batchCapReached: boolean;
@@ -443,6 +447,9 @@ export type DaemonSessionSyncState = {
   /** Explicit cloud rejections are retained locally and excluded from the
    * next automatic walk. They are not counted as acknowledged progress. */
   blockedSessionIds?: string[];
+  clockSkewRefusalStreak?: number;
+  clockSkewServerTime?: string | null;
+  clockSkewRetryAt?: string | null;
 };
 
 export type DaemonSessionSyncPlan = {
@@ -461,6 +468,9 @@ export function emptyDaemonSessionSyncState(): DaemonSessionSyncState {
     lastSuccessfulUntil: null,
     pendingSessionIds: [],
     blockedSessionIds: [],
+    clockSkewRefusalStreak: 0,
+    clockSkewServerTime: null,
+    clockSkewRetryAt: null,
   };
 }
 
@@ -518,6 +528,9 @@ export function loadDaemonSessionSyncState(db: Database.Database): DaemonSession
       lastSuccessfulUntil?: unknown;
       pendingSessionIds?: unknown;
       blockedSessionIds?: unknown;
+      clockSkewRefusalStreak?: unknown;
+      clockSkewServerTime?: unknown;
+      clockSkewRetryAt?: unknown;
     };
     const pendingSessionIds = sanitizeSessionIds(parsed.pendingSessionIds);
     const blockedSessionIds = parsed.blockedSessionIds === undefined
@@ -544,6 +557,13 @@ export function loadDaemonSessionSyncState(db: Database.Database): DaemonSession
       lastSuccessfulUntil: parsed.lastSuccessfulUntil,
       pendingSessionIds,
       blockedSessionIds,
+      clockSkewRefusalStreak: Number.isSafeInteger(parsed.clockSkewRefusalStreak) &&
+        Number(parsed.clockSkewRefusalStreak) >= 0 ? Math.min(3, Number(parsed.clockSkewRefusalStreak)) : 0,
+      clockSkewServerTime: typeof parsed.clockSkewServerTime === "string" &&
+        parsed.clockSkewServerTime.length <= 40 && !Number.isNaN(Date.parse(parsed.clockSkewServerTime))
+        ? new Date(parsed.clockSkewServerTime).toISOString() : null,
+      clockSkewRetryAt: typeof parsed.clockSkewRetryAt === "string" &&
+        !Number.isNaN(Date.parse(parsed.clockSkewRetryAt)) ? parsed.clockSkewRetryAt : null,
     };
   } catch {
     return empty;
@@ -566,11 +586,38 @@ export function saveDaemonSessionSyncState(
           lastSuccessfulUntil: state.lastSuccessfulUntil,
           pendingSessionIds,
           blockedSessionIds,
+          clockSkewRefusalStreak: Math.max(0, Math.min(3, state.clockSkewRefusalStreak ?? 0)),
+          clockSkewServerTime: state.clockSkewServerTime ?? null,
+          clockSkewRetryAt: state.clockSkewRetryAt ?? null,
         };
   db.prepare(
     `insert into maintenance_state (key, value, updated_at) values (?, ?, ?)
      on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`,
   ).run(DAEMON_SESSION_SYNC_STATE_KEY, JSON.stringify(record), new Date().toISOString());
+}
+
+/** A capped durable streak gives operators a reason after three refusals. */
+export function recordSessionSyncSettlement(
+  state: DaemonSessionSyncState,
+  settlement: SessionSyncResult["settlements"][number],
+  nowMs = Date.now(),
+): DaemonSessionSyncState {
+  if (settlement.status !== "clock_skew") {
+    return { ...state, clockSkewRefusalStreak: 0, clockSkewServerTime: null,
+      clockSkewRetryAt: null };
+  }
+  const streak = Math.min(3, (state.clockSkewRefusalStreak ?? 0) + 1);
+  const retryMs = Math.min(300_000, 1_000 * 2 ** streak);
+  return { ...state, clockSkewRefusalStreak: streak,
+    clockSkewServerTime: settlement.serverTime ?? null,
+    clockSkewRetryAt: new Date(nowMs + retryMs).toISOString() };
+}
+
+export function sessionSyncClockSkewStatus(state: DaemonSessionSyncState) {
+  return state.clockSkewRefusalStreak && state.clockSkewRefusalStreak >= 3
+    ? { reason: "clock_skew" as const, refusalStreak: state.clockSkewRefusalStreak,
+        serverTime: state.clockSkewServerTime ?? null, retryAt: state.clockSkewRetryAt ?? null }
+    : null;
 }
 
 /** Retry only the local durable carry write; never replay a network send. */
@@ -922,6 +969,9 @@ export function commitDaemonSessionSyncSuccess(
     lastSuccessfulUntil: until,
     pendingSessionIds: [],
     blockedSessionIds,
+    clockSkewRefusalStreak: state.clockSkewRefusalStreak ?? 0,
+    clockSkewServerTime: state.clockSkewServerTime ?? null,
+    clockSkewRetryAt: state.clockSkewRetryAt ?? null,
   };
 }
 
@@ -1144,6 +1194,8 @@ export type SessionSyncOptions = {
 export type SessionSyncResult = {
   ok: boolean;
   reason: string | null;
+  /** Completion order of explicitly settled batch outcomes. */
+  settlements: Array<{ status: "accepted" | "expired" | "clock_skew"; serverTime?: string }>;
   until: string;
   ledgerSessions: number;
   eligibleSessions: number;
@@ -1373,6 +1425,7 @@ export async function runSessionSync(
   let skippedStaleSessions: number | null = null;
   let batches = 0;
   let abortReason: string | null = null;
+  const settlements: SessionSyncResult["settlements"] = [];
   let staleReason: string | null = null;
 
   const snapshotFresh = (sessionId: string): boolean => {
@@ -1411,12 +1464,17 @@ export async function runSessionSync(
       return;
     }
     const rows = sealedRows.flatMap((item) => item.ok ? [item.row] : []);
+    const requestTimeoutMs = Math.min(120_000, config.delivery.requestTimeoutSeconds * 1_000);
+    const sentAt = new Date().toISOString();
+    const expiresAt = new Date(Date.parse(sentAt) + requestTimeoutMs).toISOString();
     const body = JSON.stringify(
       aiWorkSessionSyncBatchSchema.parse({
         kind: "session_sync",
         tenantId: config.tenantId,
         installKey: config.installKey,
         appVersion,
+        sentAt,
+        expiresAt,
         sessions: rows,
       }),
     );
@@ -1428,7 +1486,7 @@ export async function runSessionSync(
         return new TransportError("source_changed");
       };
       try {
-        const requestTimeoutMs = Math.min(120_000, config.delivery.requestTimeoutSeconds * 1_000);
+        let refusal: { status: "expired" | "clock_skew"; serverTime: string } | null = null;
         const fencedFetch: typeof fetch = options.incremental ? async (request, init) => {
           const leaseToken = crypto.randomUUID();
           const retry = new SyncStorageRetryController({ budgetMs: 1_000, sleep });
@@ -1449,37 +1507,48 @@ export async function runSessionSync(
             const insert = ledger.prepare(`insert into session_sync_upload_leases
               (session_id, lease_token, lease_expires_at, mutation_revision, high_water)
               values (?, ?, ?, ?, ?)`);
-            const expiresAt = new Date(Date.now() + requestTimeoutMs + 5_000).toISOString();
+            const leaseUntil = new Date(Date.parse(expiresAt) +
+              SESSION_SYNC_MAX_CLOCK_SKEW_MS + SESSION_SYNC_LEASE_SLACK_MS).toISOString();
             for (const row of rows) {
               const version = snapshotVersions.get(row.session.id)!;
-              insert.run(version.rawSessionId, leaseToken, expiresAt, version.mutationRevision, version.highWater);
+              insert.run(version.rawSessionId, leaseToken, leaseUntil, version.mutationRevision, version.highWater);
             }
           }).immediate());
-          let released = false;
           const clear = () => ledger.prepare(
             "delete from session_sync_upload_leases where lease_token = ?",
           ).run(leaseToken);
-          try {
-            // The HTTP deadline may expire while a short transaction retries.
-            // An aborted attempt must never start a delayed POST.
-            if (init?.signal?.aborted) throw new TransportError("deadline_exceeded");
-            const response = await fetchImpl(request, init);
+          // The HTTP deadline may expire while a short transaction retries.
+          // An aborted attempt must never start a delayed POST.
+          if (init?.signal?.aborted) throw new TransportError("deadline_exceeded");
+          const response = await fetchImpl(request, init);
+          if (response.status === 409) {
+            try {
+              const reply = await response.clone().json() as { error?: unknown; serverTime?: unknown };
+              if (typeof reply.serverTime === "string" && reply.serverTime.length <= 40 &&
+                  !Number.isNaN(Date.parse(reply.serverTime)) &&
+                  (reply.error === "session_sync_expired" || reply.error === "session_sync_clock_skew")) {
+                refusal = { status: reply.error === "session_sync_expired" ? "expired" : "clock_skew",
+                  serverTime: new Date(reply.serverTime).toISOString() };
+              }
+            } catch { /* An unrecognized 409 stays an uncertain send. */ }
+          }
+          // Only a completed success or the two explicit no-write refusals
+          // settles the remote outcome. A timeout, abort, lost response or
+          // transient response leaves the durable lease until its bound.
+          if (response.ok || refusal) {
             const fresh = await retry.run(() => ledger.transaction(() => {
               const current = rows.every((row) => snapshotFresh(row.session.id));
               clear();
               return current;
             }).immediate());
-            released = true;
+            if (response.ok) settlements.push({ status: "accepted" });
+            else if (refusal) settlements.push(refusal);
             if (!fresh) {
               void response.body?.cancel().catch(() => undefined);
               throw stale();
             }
-            return response;
-          } finally {
-            // A crashed/timed-out process leaves only an expiring lease. A
-            // live attempt clears only its own token, including failed sends.
-            if (!released) await retry.run(() => ledger.transaction(clear).immediate());
           }
+          return response;
         } : fetchImpl;
         const result = await postHistoryBatch({
           url,
@@ -1537,7 +1606,11 @@ export async function runSessionSync(
           staleReason = error instanceof Error ? error.message : String(error);
           return;
         }
-        abortReason = abortReason ?? (error instanceof Error ? error.message : String(error));
+        const latest = settlements.at(-1);
+        abortReason = abortReason ?? (latest?.status === "clock_skew"
+          ? `session_sync_clock_skew: serverTime=${latest.serverTime}`
+          : latest?.status === "expired" ? "session_sync_expired"
+          : error instanceof Error ? error.message : String(error));
       }
     })();
     const tracked: Promise<void> = task.finally(() => {
@@ -1568,6 +1641,7 @@ export async function runSessionSync(
   const result: SessionSyncResult = {
     ok: abortReason === null,
     reason: abortReason,
+    settlements,
     until,
     ledgerSessions,
     eligibleSessions: eligible.length,

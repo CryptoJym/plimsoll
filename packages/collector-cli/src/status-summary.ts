@@ -69,6 +69,8 @@ export type StatusSummary = {
   port: number;
   updatedAt: string;
   stats: StatusSummaryStats | null;
+  sessionSync?: { reason: "clock_skew"; refusalStreak: number;
+    serverTime: string | null; retryAt: string | null } | null;
 };
 
 /** The four menu counters from the cached lifetime stats; every other field is dropped. */
@@ -200,6 +202,7 @@ export type StatusSummaryWriterOptions = {
   port: number;
   /** The daemon's cached lifetime stats. Must not read the ledger. */
   stats: () => unknown;
+  sessionSyncStatus?: () => StatusSummary["sessionSync"];
   intervalMs?: number;
   now?: () => Date;
 };
@@ -233,6 +236,7 @@ export function startStatusSummaryWriter(options: StatusSummaryWriterOptions): S
         port: options.port,
         updatedAt: (options.now?.() ?? new Date()).toISOString(),
         stats: statusSummaryStats(options.stats()),
+        ...(options.sessionSyncStatus ? { sessionSync: options.sessionSyncStatus() } : {}),
       };
       await writeStatusSummary(await home, summary);
       lastFailure = null;

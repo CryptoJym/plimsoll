@@ -360,6 +360,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
 
+      - name: Prove session sync late remote refusal and crash lease recovery (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-remote-deadline
+
       - name: Prove bounded legacy outbox writer turns and retryable busy refusals (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:studio0-writer-contention

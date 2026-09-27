@@ -46,10 +46,6 @@ async function main() {
     assert.equal(direct.length, 2);
     const rows = direct.map(snapshot => buildSessionSyncRow(snapshot));
     assert.ok(rows.every(row => row.ok));
-    const expectedBody = JSON.stringify(aiWorkSessionSyncBatchSchema.parse({
-      kind: "session_sync", tenantId, installKey: config.installKey,
-      appVersion: "0.1.0", sessions: rows.flatMap(row => row.ok ? [row.row] : []),
-    }));
     let wireBody = "";
     const fetchImpl = (async (_input, init) => {
       wireBody = String(init?.body ?? "");
@@ -63,6 +59,15 @@ async function main() {
     });
     assert.equal(result.ok, true);
     assert.equal(result.acceptedSessions, 2);
+    const sent = aiWorkSessionSyncBatchSchema.parse(JSON.parse(wireBody));
+    assert.ok(sent.sentAt && sent.expiresAt);
+    assert.equal(Date.parse(sent.expiresAt) - Date.parse(sent.sentAt),
+      config.delivery.requestTimeoutSeconds * 1_000);
+    const expectedBody = JSON.stringify(aiWorkSessionSyncBatchSchema.parse({
+      kind: "session_sync", tenantId, installKey: config.installKey,
+      appVersion: "0.1.0", sentAt: sent.sentAt, expiresAt: sent.expiresAt,
+      sessions: rows.flatMap(row => row.ok ? [row.row] : []),
+    }));
     assert.equal(wireBody, expectedBody, "hosted batch bytes changed");
 
     const input = {

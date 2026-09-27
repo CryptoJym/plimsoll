@@ -279,9 +279,11 @@ import {
   planDaemonSessionSync,
   listLedgerSessionIdsOffThread,
   readLedgerOffThread,
+  recordSessionSyncSettlement,
   runSessionSync,
   saveDaemonSessionSyncStateWithRetry,
   sessionIdsFromBatches,
+  sessionSyncClockSkewStatus,
   shouldDeferDaemonSessionSync,
 } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
@@ -2897,7 +2899,8 @@ async function main() {
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
-      syncStatus: () => syncBackoff.status(syncInFlight),
+      syncStatus: () => ({ ...syncBackoff.status(syncInFlight),
+        sessionSync: sessionSyncClockSkewStatus(sessionSyncState) }),
       walCheckpointStatus: () => walCheckpoint.status(),
       budgetStatus: () => budgetSampler?.status() ?? { mode: "advisory", latest: null,
         p50: null, p95: null, hostClass: null, targets: null,
@@ -3077,6 +3080,8 @@ async function main() {
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
           if (!await persistSessionCarry()) return;
+          if (sessionSyncState.clockSkewRetryAt &&
+              Date.now() < Date.parse(sessionSyncState.clockSkewRetryAt)) return;
           if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
               ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
@@ -3133,6 +3138,9 @@ async function main() {
             } else {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
+            }
+            for (const settlement of sessionResult.settlements) {
+              sessionSyncState = recordSessionSyncSettlement(sessionSyncState, settlement);
             }
             if (!await persistSessionCarry()) return;
             if (sessionResult.ok && sessionResult.summaryComplete && sessionResult.sentSessions > 0) {
@@ -3766,6 +3774,7 @@ async function main() {
         collectorVersion: PLIMSOLL_VERSION,
         port: config.port,
         stats: server.plimsollCachedStats,
+        sessionSyncStatus: () => sessionSyncClockSkewStatus(sessionSyncState),
       });
       console.log(
         JSON.stringify({
