@@ -34,13 +34,15 @@ NON_ISO = {
 NAN = {"26/09/2026 00:00:00 +00:00"}          # Date.parse NaN: the schema refuses it; it can reach a ledger only past the schema
 
 def date_parse_ms(s):
-    """Python port of V8 Date.parse for the ISO shapes (fractions truncated to ms; T24:00 = next midnight) plus the measured corpus."""
+    """Python port of Node 22 Date.parse for the ISO shapes plus the measured non-ISO corpus."""
     m = ISO.match(s)
     if not m:
         return NON_ISO.get(s)
     y, mo, d, sep, hh, mi, ss, frac, tz = m.groups()
     hh = int(hh or 0); mi = int(mi or 0); ss = int(ss or 0); ms = int((frac or "0")[:3].ljust(3, "0"))
     if hh == 24 and mi == 0 and ss == 0 and ms == 0:
+        if sep in ("T", "t") and frac and any(digit != "0" for digit in frac):
+            return None
         base = datetime(int(y), int(mo), int(d), tzinfo=timezone.utc) + timedelta(days=1)
     elif hh > 23 or mi > 59 or ss > 59:
         return None
@@ -48,6 +50,8 @@ def date_parse_ms(s):
         base = datetime(int(y), int(mo), int(d), hh, mi, ss, tzinfo=timezone.utc)
     off = 0 if tz == "Z" else (1 if tz[0] == "+" else -1) * (int(tz[1:3]) * 60 + int(tz[4:6]))
     return int(base.timestamp()) * 1000 + ms - off * 60_000
+c.expect(date_parse_ms("2026-09-26T24:00:00.0009Z") is None and date_parse_ms(" 2026-09-26T00:00:00+00:00 ") is None,
+         "Node 22 rejects ISO T24 with a nonzero sub-millisecond fraction and raw whitespace-wrapped timestamps")
 def schema_ok(s): return SCHEMA_SUFFIX.search(s) is not None and date_parse_ms(s) is not None
 def utc_day(ms): return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
 

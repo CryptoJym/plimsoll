@@ -8,8 +8,8 @@ event has zero day shift ...').
 
 Round-5 rule (ARCHITECTURE.md §3.5 'The boundary, exactly'): for a midnight cutoff C the two rules differ
 for a row s iff (s >= C_str) != (observed_at_ms(s) >= C_ms), where observed_at_ms is Date.parse
-(collector-cli/src/dashboard-projection.ts:500-504; V8 truncates fractions beyond 3 digits,
-out/checks/node-date-parse.log). Rows that can differ at SOME midnight cutoff are exactly the union of
+(collector-cli/src/dashboard-projection.ts:500-504; V8 usually truncates fractions beyond 3 digits,
+but rejects nonzero sub-millisecond fractions on ISO T24:00:00). Rows that can differ at SOME midnight cutoff are exactly the union of
 three census classes, each computable per row without knowing the cutoff:
   day_move             substr(s,1,10) <> UTC day of observed_at_ms
   before_own_midnight  s < substr(s,1,10) || 'T00:00:00.000Z'   (explicit-offset forms at 00:00:00, fractions
@@ -25,8 +25,8 @@ from _common import Checks, rule_arg
 rule = rule_arg()
 c = Checks("b5_lexical_boundary", rule)
 
-# --- Date.parse as verified with node v20.20.2 (out/checks/node-date-parse.log) ------------------------------------------
-NODE_VERIFIED = {  # string -> ms (or None when Date.parse gives NaN); the subset of that log this fixture reproduces
+# --- Date.parse verified against Node 22's runtime ---------------------------------------------------------------
+NODE_VERIFIED = {  # string -> ms (or None when Date.parse gives NaN); measured examples this fixture reproduces
     "2026-09-26T00:00:00.000Z": 1790380800000, "2026-09-26T00:00:00Z": 1790380800000, "2026-09-26T00:00:00+00:00": 1790380800000,
     "2026-09-26T00:00:00-00:00": 1790380800000, "2026-09-26T00:00:00.000+00:00": 1790380800000, "2026-09-26T00:00:00.0Z": 1790380800000,
     "2026-09-26T00:00:00.00Z": 1790380800000, "2026-09-26T00:00:00.0000Z": 1790380800000, "2026-09-26T00:00:00.0009Z": 1790380800000,
@@ -37,20 +37,24 @@ NODE_VERIFIED = {  # string -> ms (or None when Date.parse gives NaN); the subse
     "2026-09-26T00:00:00.123456789Z": 1790380800123, "2026-09-26Z": 1790380800000, "2026-09-26T24:00:00Z": 1790467200000,
     "2026-09-26T00:00:00+14:00": 1790330400000, "2026-09-26T00:00:00-12:00": 1790424000000,
     "Sat, 26 Sep 2026 00:00:00 GMT+00:00": 1790380800000, "September 26, 2026 00:00:00 +00:00": 1790380800000,
-    "2026-09-26T24:00:00.000Z": 1790467200000, "2026-09-26T24:00:00.5Z": None, "2026-09-26T24:00:01Z": None, "2026-09-26 24:00:00Z": 1790467200000, "2026-09-26T24:00Z": 1790467200000,
+    "2026-09-26T24:00:00.000Z": 1790467200000, "2026-09-26T24:00:00.0009Z": None, "2026-09-26T24:00:00.5Z": None, "2026-09-26T24:00:01Z": None, "2026-09-26 24:00:00Z": 1790467200000, "2026-09-26T24:00Z": 1790467200000,
+    " 2026-09-26T00:00:00+00:00 ": None,
 }
 SCHEMA_SUFFIX = re.compile(r"(?:Z|[+-]\d{2}:\d{2})$")          # packages/shared/src/schemas.ts:64-73 (plus Date.parse != NaN)
 ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:([Tt ])(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?(Z|[+-]\d{2}:\d{2})$")
 NON_ISO_INSTANT = {"Sat, 26 Sep 2026 00:00:00 GMT+00:00": 1790380800000, "September 26, 2026 00:00:00 +00:00": 1790380800000}
 
 def date_parse_ms(s):
-    """Python port of V8 Date.parse for the shapes enumerated here (fractions truncated to ms; T24:00 = next midnight)."""
+    """Python port of Node 22 Date.parse for the enumerated shapes (T24:00 = next midnight)."""
     m = ISO.match(s)
     if not m:
         return NON_ISO_INSTANT.get(s)
     y, mo, d, sep, hh, mi, ss, frac, tz = m.groups()
     hh = int(hh or 0); mi = int(mi or 0); ss = int(ss or 0); ms = int((frac or "0")[:3].ljust(3, "0"))
     if hh == 24 and mi == 0 and ss == 0 and ms == 0:
+        # ISO T/t forms reject even a sub-millisecond remainder; space forms in this corpus still parse.
+        if sep in ("T", "t") and frac and any(digit != "0" for digit in frac):
+            return None
         base = datetime(int(y), int(mo), int(d), tzinfo=timezone.utc) + timedelta(days=1)
     elif hh > 23 or mi > 59 or ss > 59:
         return None
@@ -63,7 +67,7 @@ def schema_ok(s):
     return SCHEMA_SUFFIX.search(s) is not None and date_parse_ms(s) is not None
 
 mismatch = {s: (date_parse_ms(s), ms) for s, ms in NODE_VERIFIED.items() if date_parse_ms(s) != ms}
-c.expect(not mismatch, f"the fixture's Date.parse port reproduces node v20 on all {len(NODE_VERIFIED)} verified strings", str(mismatch))
+c.expect(not mismatch, f"the fixture's Date.parse port reproduces Node 22 on all {len(NODE_VERIFIED)} verified strings", str(mismatch))
 
 # --- the two window rules and the census classes -------------------------------------------------------------------------
 def cutoff_str(day):   # sinceIso: new Date(ms).toISOString()  -> always 'YYYY-MM-DDT00:00:00.000Z' at a midnight cutoff
@@ -109,6 +113,10 @@ for day in days:
                 for tz in tzs:
                     strings.add(f"{day}{sep}{t}{f}{tz}")
 strings |= set(NON_ISO_INSTANT)
+strict_day_end_fraction = sorted(s for s in strings if re.search(r"[Tt]24:00:00\.0009(?:Z|[+-]\d{2}:\d{2})$", s))
+c.expect(len(strict_day_end_fraction) == 54 and all(date_parse_ms(s) is None for s in strict_day_end_fraction),
+         "Node 22 rejects every T/t 24:00:00.0009 corpus string",
+         f"{len(strict_day_end_fraction)} strings; accepted={sum(date_parse_ms(s) is not None for s in strict_day_end_fraction)}")
 valid = sorted(s for s in strings if schema_ok(s))
 differ = {s: differing_cutoffs(s) for s in valid}
 in_census = {s for s in valid if census_classes(s)}

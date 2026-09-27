@@ -1,9 +1,30 @@
 # Rule models (Python) behind the pending contract tests
 
-The in-memory rule models of the lean-Plimsoll plan (rounds 5-14), copied from the program's contract bundle so an implementer
-can replay a rule before writing code: `python3 <fixture>.py --rule r6|r7|r8|r9|r10|r11|r12|r13|r14` (each is red under the round it corrects and
-green under the round that fixed it; the round-14 fixture `b4_offline_rebind.py` is red under r6, r7, r8, r9, r10, r11, r12 and r13 and green
-under r14, the round-9 fixture `s1b_runway_host_bound.py` red under r6, r7 and r8 and green under r9; `_common.py` is the shared helper). `b22_false_complete.py` reads `docs/lean/` at the repository root
-by default. `host_cardinality_census.py` is B1's read-only census tool (run on a `VACUUM INTO` copy only) and
-`usage_record_predicate.sql` the pinned `<UR>` text. These are not run by CI; the TypeScript tests one directory up are the
-contract tests.
+These in-memory models let an implementer replay a lean-Plimsoll rule before writing code. Run them from the repository root with the passing rule listed here:
+
+| Fixture | Passing `--rule` |
+| --- | --- |
+| `b1_day_target_receipt.py` | `r6` |
+| `b1_membership_edges.py` | `r5` |
+| `b22_false_complete.py` | `r7` |
+| `b2_epoch_day_keys.py` | `r5` |
+| `b3_durable_target_refs.py` | `r5` |
+| `b4_actor_at_capture.py` | `r5` |
+| `b4_offline_rebind.py` | `r14` |
+| `b5_lexical_boundary.py` | `r5` |
+| `b5_non_iso_day_facts.py` | `r6` |
+| `b6_unknown_volume_gates.py` | `r5` |
+| `s1b_runway_geometry.py` | `r6` |
+| `s1b_runway_host_bound.py` | `r9` |
+| `sf1_ladder_rollback_parity.py` | `r5` |
+| `sf5_unresolved_file_open_gap.py` | `r5` |
+| `sf_abort_rebuild_bound.py` | `r6` |
+| `sf_no_cache_columns_guard.py` | `r6` |
+
+For example, B6's corrected unknown-volume gate is the `r5` branch:
+
+```sh
+python3 tests/contracts/lean/fixtures/b6_unknown_volume_gates.py --rule r5
+```
+
+Earlier rules intentionally reproduce red cases. Each fixture has its own rule branches; a later rule is not automatically supported by an earlier fixture. `_common.py` is the shared helper. `b22_false_complete.py` reads `docs/lean/` at the repository root by default. `host_cardinality_census.py` is B1's read-only census tool (run on a `VACUUM INTO` copy only), and `usage_record_predicate.sql` is the pinned `<UR>` text. CI runs the TypeScript contracts one directory up, not these Python models.
