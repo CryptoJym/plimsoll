@@ -21,6 +21,7 @@ import {
   runtimeFactDropCounters,
 } from "../packages/collector-cli/src/runtime-facts";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
+import { PLIMSOLL_VERSION } from "../packages/collector-cli/src/version";
 import {
   aiInteractionEventSchema,
 } from "../packages/shared/src/index";
@@ -173,7 +174,7 @@ async function main() {
       { workspaceId: string; deviceId: string; runtimeVersion: string; collectorVersion: string } | undefined;
     check("joined_tool_attempt_records_only_bounded_upload_dimensions",
       dimensions?.workspaceId === config.tenantId && dimensions.deviceId === config.deviceId &&
-      dimensions.runtimeVersion === "unknown" && dimensions.collectorVersion === "0.7.43" &&
+      dimensions.runtimeVersion === "unknown" && dimensions.collectorVersion === PLIMSOLL_VERSION &&
       !factTableText(buffer.database).includes(HOSTILE.command) &&
       !factTableText(buffer.database).includes(HOSTILE.secret),
       { dimensionRecorded: Boolean(dimensions) });
