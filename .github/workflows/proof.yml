@@ -300,6 +300,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sync-storage-retry
 
+      - name: Prove one storage retry budget across session carry writes (eco-6hoxj.163.119)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-carry-retry-budget
+
       - name: Prove partial-success sync backoff and server cooldowns (eco-6hoxj.67)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sync-backoff

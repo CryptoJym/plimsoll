@@ -2955,7 +2955,7 @@ async function main() {
         try {
           await saveDaemonSessionSyncStateWithRetry(
             buffer.database, sessionSyncState,
-            new SyncStorageRetryController(),
+            storageRetry,
           );
           return true;
         } catch (error) {

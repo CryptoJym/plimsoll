@@ -107,6 +107,7 @@
     "proof:outbox": "tsx scripts/outbox-proof.ts",
     "proof:upload-replay": "tsx scripts/upload-replay-proof.ts",
     "proof:sync-storage-retry": "tsx scripts/sync-storage-retry-proof.ts",
+    "proof:session-carry-retry-budget": "tsx scripts/session-carry-retry-budget-proof.ts",
     "proof:sync-backoff": "tsx scripts/sync-backoff-proof.ts",
     "proof:session-sync-daemon": "tsx scripts/run-proof.ts scripts/session-sync-daemon-proof.ts",
     "proof:session-sync-upgrade": "tsx scripts/session-sync-upgrade-proof.ts",
