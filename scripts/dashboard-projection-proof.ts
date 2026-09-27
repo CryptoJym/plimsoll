@@ -128,6 +128,77 @@ function settle(buffer: LocalEventBuffer, now = NOW, maxSlices = 100) {
   throw new Error(`projection did not settle: ${JSON.stringify(buffer.projection.status())}`);
 }
 
+function proveDuplicateFactRepair(root: string) {
+  const file = path.join(root, "duplicate-fact-repair.sqlite");
+  let buffer = new LocalEventBuffer(file);
+  try {
+    const tokenFree = event({ source: "codex", sessionId: "duplicate-fact-session",
+      model: "gpt-proof" });
+    const withUsage = event({ source: "codex", sessionId: "duplicate-usage-session",
+      model: "gpt-proof", inputTokens: 17, outputTokens: 3, costUsd: 1.25 });
+    buffer.append(tokenFree);
+    buffer.append(withUsage);
+    settle(buffer);
+    let db = buffer.database;
+    const counts = () => ({
+      oracle: (db.prepare(`select count(*) as n from buffered_events
+        where usage_duplicate_reason is null`).get() as { n: number }).n,
+      facts: (db.prepare(`select count(*) as n from dashboard_event_facts`).get() as { n: number }).n,
+      events: (db.prepare(`select events from dashboard_window_totals where days=30`)
+        .get() as { events: number }).events,
+      usage: db.prepare(`select input_tokens as input,output_tokens as output,
+        cost_nanos as cost from dashboard_window_totals where days=30`).get() as
+        { input: number; output: number; cost: number },
+    });
+    check("duplicate_fixture_facts_preexist", counts().facts === 2, counts());
+    const flag = db.prepare(`update buffered_events set usage_duplicate_reason=? where id=?`);
+    flag.run("codex_sse_event_span", tokenFree.id);
+    check("duplicate_flag_only_queues_fact_repair", Boolean(db.prepare(
+      `select 1 from dashboard_projection_repairs where raw_rowid=
+        (select rowid from buffered_events where id=?)`).get(tokenFree.id)));
+    settle(buffer);
+    check("duplicate_token_free_fact_removed_matches_raw_oracle",
+      counts().oracle === 1 && counts().facts === 1 && counts().events === 1, counts());
+    flag.run("codex_sse_event_span", withUsage.id);
+    check("duplicate_usage_flag_queues_fact_repair", Boolean(db.prepare(
+      `select 1 from dashboard_projection_repairs where raw_rowid=
+        (select rowid from buffered_events where id=?)`).get(withUsage.id)));
+    settle(buffer);
+    const excluded = counts();
+    check("duplicate_usage_fact_removed_with_tokens_and_cost",
+      excluded.oracle === 0 && excluded.facts === 0 && excluded.events === 0 &&
+      excluded.usage.input === 0 && excluded.usage.output === 0 && excluded.usage.cost === 0,
+      excluded);
+    flag.run(null, tokenFree.id);
+    flag.run(null, withUsage.id);
+    settle(buffer);
+    const restored = counts();
+    check("unmarked_rows_restore_event_usage_and_cost",
+      restored.oracle === 2 && restored.facts === 2 && restored.events === 2 &&
+      restored.usage.input === 17 && restored.usage.output === 3 &&
+      restored.usage.cost === 1_250_000_000, restored);
+
+    // Simulate an older ledger whose repair receipt was lost after a fact was
+    // written. Reopening installs the trigger; the bounded scan finds the debt.
+    db.exec(`drop trigger trg_dashboard_usage_duplicate_update`);
+    flag.run("codex_sse_event_span", tokenFree.id);
+    check("legacy_duplicate_has_stale_fact_without_receipt",
+      counts().facts === 2 && !db.prepare(`select 1 from dashboard_projection_repairs
+        where raw_rowid=(select rowid from buffered_events where id=?)`).get(tokenFree.id));
+    db.exec(`update codex_duplicate_fact_scan set cursor_raw_rowid=0, complete=0`);
+    buffer.close();
+    buffer = new LocalEventBuffer(file);
+    db = buffer.database;
+    buffer.projection.runMaintenance(NOW);
+    settle(buffer);
+    const repaired = counts();
+    check("legacy_duplicate_scan_repairs_stale_fact",
+      repaired.oracle === 1 && repaired.facts === 1 && repaired.events === 1, repaired);
+  } finally {
+    buffer.close();
+  }
+}
+
 function readySnapshot(
   buffer: LocalEventBuffer,
   days: number,
@@ -338,6 +409,7 @@ async function main() {
   ];
 
   try {
+    proveDuplicateFactRepair(root);
     buffer.recordRepoLabel(repoA, "proof/repo-a");
     buffer.recordRepoLabel(repoB, "proof/repo-b");
     buffer.setPriorityRepo(repoA, URL_SENTINEL);

@@ -95,6 +95,7 @@ const INTERNAL_WINDOWS = [7, ...DASHBOARD_WINDOWS] as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const BACKFILL_ROWS = 1_000;
 const REPAIR_ROWS = 250;
+const DUPLICATE_FACT_SCAN_ROWS = 1_000;
 const COMPACT_GC_ITEMS = 1_000;
 const SESSION_REPAIR_ROWS = 1_000;
 const SESSION_REPAIR_BUDGET_MS = 50;
@@ -1164,6 +1165,17 @@ export class DashboardProjectionStore {
     }
     markOpenStep("projection.control_rows");
 
+    // Existing ledgers may have facts written before a Codex span was marked
+    // duplicate. Scan those facts in bounded maintenance slices once per
+    // ledger; later changes are covered by the trigger below.
+    this.db.exec(`create table if not exists codex_duplicate_fact_scan (
+      singleton integer primary key check (singleton = 1),
+      cursor_raw_rowid integer not null default 0,
+      complete integer not null default 0
+    )`);
+    this.db.prepare(`insert or ignore into codex_duplicate_fact_scan (singleton, complete)
+      values (1, ?)`).run(newLedger ? 1 : 0);
+
     const deletedPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "old");
     const hasRetentionReceipts = Boolean(this.db.prepare(
       `select 1 from sqlite_master where type='table' and name='raw_retention_receipts'`,
@@ -1247,6 +1259,22 @@ export class DashboardProjectionStore {
         on conflict(raw_rowid) do nothing;
         insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
         values (new.rowid, 'raw_update', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(raw_rowid) do update set
+          reason=case
+            when dashboard_projection_repairs.reason in ('raw_insert','projection_apply_failed')
+              then dashboard_projection_repairs.reason
+            else excluded.reason end,
+          queued_at=excluded.queued_at;
+        update dashboard_projection_control set dirty=1,
+          degraded_reason=${DEGRADED_REASON_ON_REPAIR_SQL}
+        where singleton=1;
+      end;
+      create trigger if not exists trg_dashboard_usage_duplicate_update
+      after update of usage_duplicate_reason on buffered_events
+      when old.usage_duplicate_reason is not new.usage_duplicate_reason
+      begin
+        insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
+        values (new.rowid, 'usage_duplicate_update', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         on conflict(raw_rowid) do update set
           reason=case
             when dashboard_projection_repairs.reason in ('raw_insert','projection_apply_failed')
@@ -3075,6 +3103,28 @@ export class DashboardProjectionStore {
         ).run(high.highWater,high.highWater,high.highWater);
       }
       const control = this.control();
+      const duplicateScan = this.db.prepare(`select cursor_raw_rowid as cursor, complete
+        from codex_duplicate_fact_scan where singleton=1`).get() as
+        { cursor: number; complete: number };
+      if (!duplicateScan.complete) {
+        const candidates = this.db.prepare(`select f.raw_rowid as rawRowid,
+            b.usage_duplicate_reason as duplicateReason
+          from dashboard_event_facts f
+          left join buffered_events b on b.rowid=f.raw_rowid
+          where f.raw_rowid > ? order by f.raw_rowid limit ?`
+        ).all(duplicateScan.cursor, DUPLICATE_FACT_SCAN_ROWS) as
+          Array<{ rawRowid: number; duplicateReason: string | null }>;
+        const queue = this.db.prepare(`insert or ignore into dashboard_projection_repairs
+          (raw_rowid, reason, queued_at) values (?, 'legacy_usage_duplicate', ?)`);
+        for (const candidate of candidates) {
+          if (candidate.duplicateReason !== null) queue.run(candidate.rawRowid, now.toISOString());
+        }
+        this.db.prepare(`update codex_duplicate_fact_scan
+          set cursor_raw_rowid=?, complete=? where singleton=1`).run(
+          candidates.at(-1)?.rawRowid ?? duplicateScan.cursor,
+          candidates.length < DUPLICATE_FACT_SCAN_ROWS ? 1 : 0,
+        );
+      }
       if (!control.backfillComplete) {
         const rows = this.db.prepare(
           `select rowid as rawRowid, id, source, event_type as eventType,
@@ -3190,7 +3240,10 @@ export class DashboardProjectionStore {
 
       const backlog = this.backlog();
       const settled = this.control();
-      const complete = Boolean(settled.backfillComplete && settled.parityComplete&&settled.metricBackfillComplete);
+      const duplicateScanComplete = (this.db.prepare(`select complete from codex_duplicate_fact_scan
+        where singleton=1`).get() as { complete: number }).complete;
+      const complete = Boolean(settled.backfillComplete && settled.parityComplete &&
+        settled.metricBackfillComplete && duplicateScanComplete);
       if (complete && backlog.repairs === 0 && backlog.compactMutations===0 && backlog.compactGcDays===0 && backlog.dirtySessions === 0 &&
         backlog.accountInvalidations === 0 && backlog.expiryWindows === 0 &&
         settled.degradedReason !== "projection_clock_rollback") {
