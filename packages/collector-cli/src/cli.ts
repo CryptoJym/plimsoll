@@ -173,6 +173,7 @@ import { preflightMaintenanceRebuild, rebuildLedger, recoverInterruptedRebuild,
   observeRebuildConnectionOwnership, connectionOwnershipClosed,
   type RebuildStage, type RebuildHeadroomStatus } from "./maintenance-rebuild";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
+import { claimRebuildResumePermit } from "./rebuild-open-gate";
 import { WalCheckpointWorker } from "./wal-checkpoint-worker";
 import {
   MAINTENANCE_CENSUS_QUERIES,
@@ -2621,7 +2622,8 @@ async function main() {
         ledgerPath === collectorBufferPath() || copyRoot === resolveCollectorHome().home) {
         throw new Error("copy_drill_ledger_outside_clone");
       }
-    } else if (ledgerPath !== fs.realpathSync(collectorBufferPath())) {
+    } else if (ledgerPath !== (recovering
+      ? canonicalRecoveryLedgerPath(collectorBufferPath()) : fs.realpathSync(collectorBufferPath()))) {
       throw new Error("live_rebuild_requires_active_ledger");
     }
     if (recovering) {
@@ -2829,6 +2831,9 @@ async function main() {
       );
       return;
     }
+
+    try { claimRebuildResumePermit(collectorBufferPath(), ownership.lockPath, runtimeIdentity); }
+    catch (error) { ownership.release(); throw error; }
 
     const startupWalNonce = randomUUID();
     const startupWalReceipt = await runStartupWalSelfHeal({

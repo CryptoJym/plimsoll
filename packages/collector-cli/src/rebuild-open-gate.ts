@@ -2,9 +2,17 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { processIdentityIsLive, UTC_PROCESS_START_ALGORITHM } from "./runtime-ownership";
 
 export function rebuildOpenLeaseDirectory(ledgerPath: string) { return `${ledgerPath}.rebuild-open-leases`; }
 export function rebuildLockPath(ledgerPath: string) { return `${ledgerPath}.maintenance-rebuild.lock`; }
+export function rebuildResumeClaimPath(ledgerPath: string, nonce: string) {
+  return `${ledgerPath}.maintenance-rebuild-resume-claim.${nonce}`;
+}
+
+type ResumeIdentity = Readonly<{ pid: number; instanceId: string; processStartFingerprint: string }>;
+type ResumeClaim = ResumeIdentity & Readonly<{ nonce: string }>;
+const localResumeClaims = new Map<string, ResumeClaim>();
 
 function canonicalGatePath(inputPath: string) {
   if (inputPath === ":memory:") return inputPath;
@@ -21,17 +29,54 @@ function canonicalGatePath(inputPath: string) {
   }
 }
 
+function resumeState(canonical: string): { phase?: unknown; nonce?: unknown } | null {
+  try { return JSON.parse(fs.readFileSync(`${canonical}.maintenance-rebuild.json`, "utf8")); }
+  catch { return null; }
+}
+
+/** Called only after the daemon owns its start lock. The nonce-specific wx
+ * claim grants this process, and no second process, the resume-stage opens. */
+export function claimRebuildResumePermit(ledgerPath: string, startLockPath: string,
+  identity: ResumeIdentity) {
+  const canonical = canonicalGatePath(ledgerPath);
+  if (!fs.existsSync(rebuildLockPath(canonical))) return false;
+  const state = resumeState(canonical);
+  if (state?.phase !== "resume_started" || typeof state.nonce !== "string" ||
+    !/^[0-9a-f-]{36}$/i.test(state.nonce) || identity.pid !== process.pid ||
+    !processIdentityIsLive({ ...identity, processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM }) ||
+    localResumeClaims.has(canonical)) throw new Error("maintenance_rebuild_paused");
+  let owner: Partial<ResumeIdentity> & { version?: number; label?: string };
+  try {
+    const stat = fs.lstatSync(startLockPath);
+    if (!stat.isFile() || stat.isSymbolicLink() ||
+      (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
+      (stat.mode & 0o077) !== 0) throw new Error("start_lock_untrusted");
+    owner = JSON.parse(fs.readFileSync(startLockPath, "utf8"));
+  } catch { throw new Error("maintenance_rebuild_paused"); }
+  if (owner.version !== 3 || owner.label !== "com.plimsoll.collector" ||
+    owner.pid !== identity.pid || owner.instanceId !== identity.instanceId ||
+    owner.processStartFingerprint !== identity.processStartFingerprint) {
+    throw new Error("maintenance_rebuild_paused");
+  }
+  const claim: ResumeClaim = { nonce: state.nonce, pid: identity.pid,
+    instanceId: identity.instanceId, processStartFingerprint: identity.processStartFingerprint };
+  const descriptor = fs.openSync(rebuildResumeClaimPath(canonical, state.nonce), "wx", 0o600);
+  try { fs.writeFileSync(descriptor, `${JSON.stringify(claim)}\n`); fs.fsyncSync(descriptor); }
+  finally { fs.closeSync(descriptor); }
+  localResumeClaims.set(canonical, claim);
+  return true;
+}
+
 export function assertRebuildWriterGateOpen(ledgerPath: string) {
   const canonical = canonicalGatePath(ledgerPath);
   if (!fs.existsSync(rebuildLockPath(canonical))) return;
-  // The resumed launch agent must be able to reopen the verified replacement
-  // while every other opener stays fenced. This exception only starts after
-  // the durable no-rollback boundary and ends when resume completes.
-  if (process.argv[2] === "start") {
+  const claim = localResumeClaims.get(canonical);
+  if (claim?.pid === process.pid) {
     try {
-      const state = JSON.parse(fs.readFileSync(`${canonical}.maintenance-rebuild.json`, "utf8")) as
-        { phase?: unknown };
-      if (state.phase === "resume_started") return;
+      const state = resumeState(canonical);
+      if (state?.phase === "resume_started" && state.nonce === claim.nonce &&
+        fs.readFileSync(rebuildResumeClaimPath(canonical, claim.nonce), "utf8") ===
+          `${JSON.stringify(claim)}\n`) return;
     } catch { /* A missing or unreadable state never grants an opener. */ }
   }
   throw new Error("maintenance_rebuild_paused");

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import Database from "better-sqlite3";
+import { openRebuildFencedDatabase } from "./rebuild-open-gate";
 
 import {
   assertLearningReviewOutputPath,
@@ -87,15 +88,20 @@ export class LearningMaterializationStateStore {
 
   constructor(statePath: string) {
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    this.db = new Database(statePath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.exec(`
+    this.db = openRebuildFencedDatabase(statePath);
+    try {
+      this.db.pragma("journal_mode = WAL");
+      this.db.exec(`
       create table if not exists learning_materialization_state (
         singleton integer primary key check (singleton = 1),
         canonical_json text not null,
         updated_at text not null
       );
-    `);
+      `);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   read(): MaterializationState {

@@ -2,9 +2,11 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
   preflightMaintenanceRebuild, rebuildLedger, recoverInterruptedRebuild,
   renameBackBeforeResume, REQUIRED_REBUILD_WRITERS, readActiveRebuildWriterLeases,
@@ -98,7 +100,7 @@ async function main() {
       inventory: before }));
     return;
   }
-  if (mode === "first-rename-kill") {
+  if (mode === "first-rename-kill" || mode === "active-recover" || mode === "active-rename-back") {
     const killed = spawnSync(process.execPath, ["--import", "tsx", "packages/collector-cli/src/cli.ts",
       "maintenance", "rebuild", "--ledger", ledger, "--copy-drill", "--copy-root", cloneRoot,
       "--stage", "S10", "--wal-high-water-bytes", "0"], {
@@ -107,6 +109,32 @@ async function main() {
     });
     assert.equal(killed.signal, "SIGKILL", killed.stderr || killed.stdout);
     assert.equal(fs.existsSync(ledger), false);
+    if (mode !== "first-rename-kill") {
+      // Active-ledger validation is exercised against this disposable clone.
+      // The fixture has no producer auth or LaunchAgent manifest, so the CLI
+      // restores the file and then refuses before any service operation.
+      const portServer = http.createServer();
+      await new Promise<void>((resolve) => portServer.listen(0, "127.0.0.1", resolve));
+      const port = (portServer.address() as { port: number }).port;
+      await new Promise<void>((resolve) => portServer.close(() => resolve()));
+      assert.notEqual(port, 48271);
+      fs.writeFileSync(path.join(cloneRoot, "collector.config.json"),
+        `${JSON.stringify(collectorConfigSchema.parse({ port }))}\n`, { mode: 0o600 });
+      const flag = mode === "active-recover" ? "--recover" : "--rename-back";
+      const active = spawnSync(process.execPath, ["--import", "tsx", "packages/collector-cli/src/cli.ts",
+        "maintenance", "rebuild", "--ledger", ledger, flag], {
+        cwd: process.cwd(), env: { ...process.env, PLIMSOLL_HOME: cloneRoot },
+        encoding: "utf8", timeout: 120_000,
+      });
+      assert.notEqual(active.status, 0);
+      assert.match(active.stderr, /launch_agent_manifest_invalid/, active.stderr || active.stdout);
+      assert.doesNotMatch(active.stderr, /ENOENT/);
+      assert.deepEqual(snapshot(), before);
+      console.log(JSON.stringify({ check: "studio5_copy_active_ledger_first_rename_recovery",
+        mode, flag, signal: killed.signal, rows: before.events,
+        expectedFixtureRefusal: "launch_agent_manifest_invalid", port }));
+      return;
+    }
     const recovered = spawnSync(process.execPath, ["--import", "tsx", "packages/collector-cli/src/cli.ts",
       "maintenance", "rebuild", "--ledger", ledger, "--copy-drill", "--copy-root", cloneRoot,
       "--recover"], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 120_000 });

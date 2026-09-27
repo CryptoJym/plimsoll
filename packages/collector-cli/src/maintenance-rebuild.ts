@@ -6,7 +6,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { DashboardProjectionStore } from "./dashboard-projection";
-import { assertNoRebuildOpenTokens, assertRebuildWriterGateOpen, rebuildLockPath } from "./rebuild-open-gate";
+import { assertNoRebuildOpenTokens, assertRebuildWriterGateOpen, rebuildLockPath,
+  rebuildResumeClaimPath } from "./rebuild-open-gate";
 export { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 
 /** Static B13 inventory for coverage reporting. It is never a quiesce receipt. */
@@ -521,6 +522,7 @@ export async function rebuildLedger(input: RebuildRunInput) {
     await input.resume();
     state = advance(ledgerPath, state, "complete");
     removeIfExists(lockPath(ledgerPath));
+    removeIfExists(rebuildResumeClaimPath(ledgerPath, state.nonce));
     return { status: "rebuilt" as const, pauseMs: performance.now() - pausedAt,
       backupPath, quiesce: { ...receipt, fencedOwnership }, ...preflight };
   } catch (error) {
