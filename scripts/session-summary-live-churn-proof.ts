@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
@@ -95,6 +96,65 @@ function rowCount(buffer: LocalEventBuffer) {
     .get() as { count: number }).count;
 }
 
+// A bounded pass may take longer than a tick on a loaded host. Apply every
+// missed tick before the next pass, rather than pausing the advertised churn
+// while catch-up retries run. Ticks 1, 4, 7, ... each append two responses.
+class ChurnSchedule {
+  readonly startedAt = performance.now();
+  marks = 0;
+  appends = 0;
+  guardAppends = 0;
+  private lastId = "";
+
+  constructor(private readonly buffer: LocalEventBuffer, private readonly session: string,
+    private readonly size: number) {}
+
+  private applyThrough(ticks: number) {
+    for (let tick = this.marks + 1; tick <= ticks; tick += 1) {
+      const scheduledAppend = (tick - 1) % 3 === 0;
+      const latestRowid = this.lastId
+        ? (this.buffer.database.prepare("select rowid from buffered_events where id = ?")
+          .get(this.lastId) as { rowid: number }).rowid : 0;
+      const highWater = (this.buffer.database.prepare(`select high_water as highWater
+        from session_sync_summary_state where session_id = ?`)
+        .get(this.session) as { highWater: number }).highWater;
+      // If a retry just scanned the marked row, add a fresh response before
+      // the next correction. The two-per-three-tick append cadence is a floor.
+      if (scheduledAppend || latestRowid <= highWater) {
+        this.lastId = append(this.buffer, this.session, 2)[1]!;
+        this.appends += 2;
+        if (!scheduledAppend) this.guardAppends += 2;
+      }
+      const beforeRevision = revision(this.buffer, this.session);
+      assert.equal(this.buffer.database.prepare(`update buffered_events set cost_usd = ? where id = ?`)
+        .run(tick / 10_000, this.lastId).changes, 1);
+      assert.equal(revision(this.buffer, this.session), beforeRevision,
+        `unscanned ${this.size}-row edit must not invalidate the durable prefix`);
+      assert.equal(dirty(this.buffer, this.session), null);
+      this.marks = tick;
+    }
+    assert.ok(this.appends >= 2 * Math.ceil(this.marks / 3));
+  }
+
+  applyDue() {
+    this.applyThrough(Math.floor((performance.now() - this.startedAt) / 1_000));
+  }
+
+  async waitForTick(tick: number) {
+    while (this.marks < tick) {
+      const delayMs = this.startedAt + tick * 1_000 - performance.now();
+      if (delayMs > 0) await sleep(Math.max(1, Math.ceil(delayMs)));
+      this.applyDue();
+    }
+  }
+
+  stop() {
+    const elapsedMs = performance.now() - this.startedAt;
+    this.applyThrough(Math.floor(elapsedMs / 1_000));
+    return elapsedMs;
+  }
+}
+
 async function completeSummary(buffer: LocalEventBuffer, session: string,
   first: SessionSummaryUpdateResult, onPass?: (result: SessionSummaryUpdateResult) => void) {
   let result = first;
@@ -112,7 +172,7 @@ async function completeSummary(buffer: LocalEventBuffer, session: string,
   }
 }
 
-async function daemonCycle(buffer: LocalEventBuffer) {
+async function daemonCycle(buffer: LocalEventBuffer, summaryMaxRows?: number) {
   const until = new Date().toISOString();
   const prior = loadDaemonSessionSyncState(buffer.database);
   const plan = planDaemonSessionSync({ db: buffer.database, state: prior, uploadedBatches: [], until });
@@ -138,6 +198,7 @@ async function daemonCycle(buffer: LocalEventBuffer) {
   const result = await runSessionSync(config, {
     sessionIds,
     until: plan.until, ledgerDb: buffer.database, incremental: true,
+    ...(summaryMaxRows === undefined ? {} : { summaryMaxRows }),
     proofSummaryHooks: {
       read: proofRead(buffer),
       onUpdate: (sessionId, update) => { updates.set(sessionId, update); },
@@ -153,17 +214,31 @@ async function daemonCycle(buffer: LocalEventBuffer) {
   return { until, plan, result, sent, updates, state: loadDaemonSessionSyncState(buffer.database) };
 }
 
-async function initialCatchUp(buffer: LocalEventBuffer) {
-  const rows = rowCount(buffer);
+async function initialCatchUp(buffer: LocalEventBuffer, churn?: ChurnSchedule) {
   let elapsedMs = 0;
+  const marksBefore = churn?.marks ?? 0;
+  let marksAtPreviousPass = marksBefore;
   for (let pass = 1; ; pass += 1) {
-    const cycle = await daemonCycle(buffer);
+    if (churn) {
+      churn.applyDue();
+      // Every retry sees at least one scheduled mark. A fast pass waits for
+      // the next tick; a slow pass applies all ticks missed while it ran.
+      if (pass > 1 && churn.marks === marksAtPreviousPass) {
+        await churn.waitForTick(marksAtPreviousPass + 1);
+      }
+      marksAtPreviousPass = churn.marks;
+    }
+    // Make the active workload exercise a retry even on an unloaded host.
+    // Later passes retain the production 5,000-row summary cap.
+    const cycle = await daemonCycle(buffer, churn && pass === 1 ? 1 : undefined);
     elapsedMs += [...cycle.updates.values()].reduce((sum, update) => sum + update.durationMs, 0);
-    assert.ok(pass <= drainBound(rows, elapsedMs),
-      JSON.stringify({ pass, bound: drainBound(rows, elapsedMs), rows,
+    const rows = rowCount(buffer);
+    const bound = drainBound(rows, elapsedMs) + (churn ? 1 : 0);
+    assert.ok(pass <= bound,
+      JSON.stringify({ pass, bound, rows, marks: churn?.marks,
         pending: cycle.result?.pendingSummaryReasons }));
     if (cycle.state.caughtUp && cycle.state.lastSuccessfulUntil === cycle.until) {
-      return { passes: pass, cycle };
+      return { passes: pass, cycle, retryMarks: (churn?.marks ?? 0) - marksBefore };
     }
   }
 }
@@ -176,27 +251,19 @@ async function proveBusySession(size: number, ordinal: number) {
     const { passes: initialPasses } = await initialCatchUp(buffer);
     assert.equal(state(buffer, session).complete, 1);
     const baseRecomputes = sessionSummaryCounters(buffer.database).fallbackRecomputes;
-    const start = Date.now();
-    let lastId = "";
+    const churn = new ChurnSchedule(buffer, session, size);
     let previousHorizon = loadDaemonSessionSyncState(buffer.database).lastSuccessfulUntil;
     const activePasses: number[] = [];
-    for (let tick = 1; tick <= 6; tick += 1) {
-      await sleep(1_000);
-      // Two new responses every three seconds = 40 appends/minute. The
-      // reconciler changes one recent response cost each second, including
-      // repeated corrections before the next daemon pass.
-      if ((tick - 1) % 3 === 0) lastId = append(buffer, session, 2)[1]!;
-      const beforeRevision = revision(buffer, session);
-      assert.equal(buffer.database.prepare(`update buffered_events set cost_usd = ? where id = ?`)
-        .run(tick / 10_000, lastId).changes, 1);
-      assert.equal(revision(buffer, session), beforeRevision,
-        `unscanned ${size}-row edit must not invalidate the durable prefix`);
-      assert.equal(dirty(buffer, session), null);
-      if (tick % 3 !== 0) continue;
-      const { cycle, passes } = await initialCatchUp(buffer);
+    const retryMarks: number[] = [];
+    for (const checkpoint of [3, 6]) {
+      while (churn.marks < checkpoint) await churn.waitForTick(churn.marks + 1);
+      const { cycle, passes, retryMarks: duringRetries } = await initialCatchUp(buffer, churn);
       activePasses.push(passes);
+      retryMarks.push(duringRetries);
+      assert.ok(passes >= 2 && duringRetries >= 1,
+        JSON.stringify({ size, checkpoint, passes, duringRetries }));
       assert.ok(cycle.result?.ok && cycle.result.summaryComplete,
-        JSON.stringify({ size, tick, pending: cycle.result?.pendingSummaryReasons }));
+        JSON.stringify({ size, checkpoint, pending: cycle.result?.pendingSummaryReasons }));
       assert.equal(cycle.state.caughtUp, true);
       assert.equal(cycle.state.lastSuccessfulUntil, cycle.until);
       assert.notEqual(cycle.until, previousHorizon);
@@ -205,10 +272,24 @@ async function proveBusySession(size: number, ordinal: number) {
       assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes, baseRecomputes);
       previousHorizon = cycle.until;
     }
-    assert.ok(Date.now() - start >= 6_000);
+    // Include ticks due during the final pass, then drain that finite tail.
+    const marksBeforeStop = churn.marks;
+    const activeElapsedMs = churn.stop();
+    let cleanupPasses = 0;
+    if (churn.marks > marksBeforeStop) {
+      const cleanup = await initialCatchUp(buffer);
+      cleanupPasses = cleanup.passes;
+      assert.ok(cleanup.cycle.result?.ok && cleanup.cycle.result.summaryComplete);
+      assert.deepEqual(cleanup.cycle.sent.find((row) => row.session.id === session),
+        expectedWire(buffer, session, cleanup.cycle.until));
+    }
+    assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes, baseRecomputes);
+    assert.ok(activeElapsedMs >= 6_000);
+    assert.ok(churn.marks >= 6 && churn.appends >= 4);
     completion.check(`daemon_${size}_rows_1_mark_per_second_40_appends_per_minute`);
-    console.log(JSON.stringify({ size, initialPasses, activeCycles: 2, activePasses,
-      marks: 6, appends: 4, horizon: previousHorizon }));
+    console.log(JSON.stringify({ size, initialPasses, activeCycles: 2, activePasses, retryMarks,
+      marks: churn.marks, appends: churn.appends, guardAppends: churn.guardAppends, activeElapsedMs,
+      cleanupPasses, horizon: previousHorizon }));
   } finally { buffer.close(); }
 }
 
