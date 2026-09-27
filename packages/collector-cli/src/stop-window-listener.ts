@@ -22,6 +22,7 @@ import {
 } from "./http-boundary";
 import { blankForbiddenRawContent, hookSpoolEnabled, isHookSpoolSource, writeHookSpoolEnvelope } from "./hook-spool";
 import { assertManagementCredential, assertProducerToken, readLiveProducerAuth } from "./local-auth";
+import { assertLiveRoute, authenticatePausedLiveProducer, selectsLiveUsage } from "./codex-live-usage-auth";
 import { hasLiveUsageClaim } from "./codex-live-usage-protocol";
 import { conflictingOtlpServiceSource, explodeOtlpPayload } from "./otlp";
 import { OtlpIntakeSpool } from "./otlp-spool";
@@ -75,6 +76,14 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         return;
       }
       if (releasing) throw new HttpBoundaryRejection("internal_rejection", 503);
+      if (mode === "maintenance_rebuild" && selectsLiveUsage(request)) {
+        const selected = assertLiveRoute(request);
+        const auth = readLiveProducerAuth(home);
+        if (!auth) throw new HttpBoundaryRejection("producer_token_invalid", 401);
+        authenticatePausedLiveProducer(home, selected.producerId, selected.token, auth);
+        reply(response, 503, { status: "maintenance_rebuild_paused", source: "codex" }, true);
+        return;
+      }
       const source = request.method === "POST" && request.url?.startsWith("/hooks/")
         ? hookSourceFromPath(request.url)
         : request.method === "POST" && isOtlpPath(request.url)
