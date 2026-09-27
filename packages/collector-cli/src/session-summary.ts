@@ -1041,6 +1041,9 @@ export function listSessionSummaryPendingIds(db: Database.Database, until: strin
     `select session_id as sessionId from session_sync_summary_dirty
        where ${BOUNDED_SQL_READ_PREDICATE}
      union
+     select session_id as sessionId from session_sync_summary_pending
+       where ${BOUNDED_SQL_READ_PREDICATE}
+     union
      select session_id as sessionId from session_sync_summary_state
        where complete = 0 and ${BOUNDED_SQL_READ_PREDICATE}
      union
@@ -1114,7 +1117,7 @@ export async function updateSessionSummary(
     pending.queuedHighWater === queuedHighWaterAtStart;
   const finish = async (result: SessionSummaryUpdateResult, zeroProgressRead = false) => {
     if (result.complete) {
-      if (pending) await writeRetry.run(() => db.prepare(
+      await writeRetry.run(() => db.prepare(
         "delete from session_sync_summary_pending where session_id = ?",
       ).run(sessionId));
       return result;

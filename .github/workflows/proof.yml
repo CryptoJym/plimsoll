@@ -328,6 +328,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-stall
 
+      - name: Prove pending summaries replan and late reasons clear (eco-6hoxj.163.116 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-pending-review
+
       - name: Prove pending summary reasons and freshness in private status (eco-6hoxj.163.116)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:status-pending-reasons
