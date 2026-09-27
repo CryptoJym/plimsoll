@@ -27,6 +27,14 @@ import {
 import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import {
+  AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS,
+  AutomaticMaintenanceCadence,
+  CoalescingMaintenanceScheduler,
+  drainProjectionMigration,
+  type CollectorMaintenanceRunResult,
+  type AutomaticMaintenanceCadenceTimer,
+} from "../packages/collector-cli/src/maintenance";
+import {
   AUTOMATIC_DISCOVERY_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
@@ -196,6 +204,135 @@ function proveDuplicateFactRepair(root: string) {
       repaired.oracle === 1 && repaired.facts === 1 && repaired.events === 1, repaired);
   } finally {
     buffer.close();
+  }
+}
+
+async function proveDuplicateScanUpgradeAndDrain(root: string) {
+  const file = path.join(root, "duplicate-scan-upgrade.sqlite");
+  const factCount = 3_101;
+  let buffer = new LocalEventBuffer(file);
+  let firstId = "";
+  try {
+    for (let index = 0; index < factCount; index += 1) {
+      const row = event({source:"codex",sessionId:"duplicate-scan-session",model:"gpt-proof"});
+      if (index === 0) firstId = row.id;
+      assert.equal(buffer.append(row), true);
+    }
+    settle(buffer);
+    const before = buffer.projection.readSnapshot(30);
+    check("duplicate_scan_upgrade_fixture_starts_ready_with_over_3000_facts",
+      before.kind === "ready" && before.snapshot.projection.parityReady === true &&
+      (buffer.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n === factCount,
+      {kind:before.kind,factCount});
+    buffer.close();
+
+    // Recreate the pre-fix upgrade boundary: a ready published snapshot and
+    // stale fact, but no duplicate-scan state or trigger from this release.
+    const legacy = new Database(file);
+    legacy.exec(`drop table codex_duplicate_fact_scan;
+      drop trigger trg_dashboard_usage_duplicate_update;`);
+    legacy.prepare(`update buffered_events set usage_duplicate_reason='codex_sse_event_span'
+      where id=?`).run(firstId);
+    const queued = (legacy.prepare(`select count(*) as n from dashboard_projection_repairs`)
+      .get() as {n:number}).n;
+    legacy.close();
+    check("duplicate_scan_upgrade_fixture_has_no_old_repair_receipt",queued === 0,{queued});
+
+    buffer = new LocalEventBuffer(file);
+    const pending = buffer.projection.status();
+    const stale = buffer.projection.readSnapshot(30);
+    check("duplicate_scan_upgrade_withholds_ready_snapshot_parity_before_maintenance",
+      pending.ready && !pending.parityReady && pending.dirty && pending.degraded &&
+      !pending.backfill.duplicateFactScan.complete &&
+      stale.kind === "ready" && stale.snapshot.projection.parityReady === false &&
+      stale.snapshot.projection.degraded === true,
+      {pending,readKind:stale.kind});
+
+    const drain = await drainProjectionMigration(buffer.projection);
+    const after = buffer.projection.status();
+    const repaired = buffer.projection.readSnapshot(30);
+    const facts = (buffer.database.prepare(`select count(*) as n from dashboard_event_facts`)
+      .get() as {n:number}).n;
+    check("duplicate_scan_over_3000_facts_drains_during_startup",
+      drain.drain.slices >= 4 && drain.drain.slices <= drain.drain.maxSlices &&
+      drain.drain.migrationRowsVisited === factCount && !drain.drain.stillMigrating &&
+      after.backfill.duplicateFactScan.complete && after.parityReady && !after.dirty &&
+      facts === factCount - 1 && repaired.kind === "ready" &&
+      repaired.snapshot.projection.parityReady === true &&
+      Number((repaired.snapshot.summary.totals as Record<string,number>).events) === factCount - 1,
+      {drain:drain.drain,after,facts,readKind:repaired.kind,
+        events:repaired.kind === "ready" ?
+          (repaired.snapshot.summary.totals as Record<string,number>).events : null});
+  } finally {
+    buffer.close();
+  }
+}
+
+async function proveMillionFactScanCadence() {
+  const ledger = new Database(":memory:");
+  const factCount = 1_000_001;
+  try {
+    ledger.exec(`create table dashboard_event_facts (raw_rowid integer primary key);
+      with recursive sequence(rowid) as (
+        select 1 union all select rowid+1 from sequence where rowid<${factCount}
+      ) insert into dashboard_event_facts select rowid from sequence;`);
+    const candidates = ledger.prepare(`select raw_rowid as rowid from dashboard_event_facts
+      where raw_rowid>? order by raw_rowid limit 1000`);
+    let cursor = 0;
+    let ticks = 0;
+    let captureTurns = 0;
+    let syntheticNow = NOW.getTime();
+    let nextTimer: { at: number; callback: () => void } | null = null;
+    const timer: AutomaticMaintenanceCadenceTimer = {
+      now: () => syntheticNow,
+      setTimeout: (callback, delayMs) => {
+        nextTimer = { at: syntheticNow + delayMs, callback };
+        return nextTimer;
+      },
+      clearTimeout: () => { nextTimer = null; },
+    };
+    const scheduler = new CoalescingMaintenanceScheduler(async () => {
+      const rows = candidates.all(cursor) as Array<{rowid:number}>;
+      cursor = rows.at(-1)?.rowid ?? cursor;
+      ticks += 1;
+      captureTurns += 1;
+      return { captureAdvanced:false,rawEventWrites:0,
+        rollout:{filesRead:0,activity:{discoveryEntries:0}},
+        transcript:{filesRead:0,activity:{discoveryEntries:0}},
+        repricing:{rowsVisited:0},reconciliation:{rowsVisited:0},enrichment:{rowsVisited:0},
+      } as unknown as CollectorMaintenanceRunResult;
+    });
+    const cadence = new AutomaticMaintenanceCadence(scheduler,
+      () => ({ progress:{ state:"complete",sourcesComplete:2,sourcesInProgress:0,
+        sourcesFailed:0,filesDiscovered:0,filesValidated:0,filesBaselined:0,
+        pendingMetadata:0,pendingMetadataPerSourceCap:64,pendingMetadataAggregateCap:128,
+        deferredSources:0 },status:"complete",reason:null,sources:[] }),
+      {timer,repairProgress:()=>({pending:cursor<factCount,units:0,
+        duplicateScan:{pending:cursor<factCount,cursor}})});
+    cadence.start();
+    const startedAt = syntheticNow;
+    while (cursor < factCount) {
+      const due = nextTimer as {at:number;callback:()=>void}|null;
+      assert.ok(due, "scan cadence lost its pending timer");
+      nextTimer = null;
+      syntheticNow = due.at;
+      due.callback();
+      while (cadence.status().inFlight) await new Promise<void>((resolve)=>setImmediate(resolve));
+      assert.ok(ticks <= 1_002, "scan cadence exceeded its fixture-derived tick bound");
+    }
+    const elapsedMs = syntheticNow - startedAt;
+    const final = cadence.status();
+    cadence.stop();
+    check("million_fact_scan_uses_bounded_fast_ticks_and_preserves_capture_turns",
+      ticks === 1_001 && captureTurns === ticks && cursor === factCount &&
+      elapsedMs === 5_000 + 1_000 * AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS &&
+      elapsedMs < 60 * 60_000 && final.retryClass === "normal" &&
+      scheduler.status().maxConcurrentJobs === 1 &&
+      scheduler.status().overlappingJobs === 0 && scheduler.status().failedRuns === 0,
+      {factCount,ticks,captureTurns,elapsedMs,elapsedMinutes:elapsedMs/60_000,
+        retryClass:final.retryClass,maxConcurrentJobs:scheduler.status().maxConcurrentJobs});
+  } finally {
+    ledger.close();
   }
 }
 
@@ -410,6 +547,8 @@ async function main() {
 
   try {
     proveDuplicateFactRepair(root);
+    await proveDuplicateScanUpgradeAndDrain(root);
+    await proveMillionFactScanCadence();
     buffer.recordRepoLabel(repoA, "proof/repo-a");
     buffer.recordRepoLabel(repoB, "proof/repo-b");
     buffer.setPriorityRepo(repoA, URL_SENTINEL);
@@ -4207,6 +4346,10 @@ async function main() {
       checks: checks.length,
       names: checks.map((entry) => entry.name),
       evidence:{
+        duplicateScanUpgrade:checks.find((entry)=>entry.name===
+          "duplicate_scan_over_3000_facts_drains_during_startup")?.detail,
+        millionScanCadence:checks.find((entry)=>entry.name===
+          "million_fact_scan_uses_bounded_fast_ticks_and_preserves_capture_turns")?.detail,
         idleRestartReads:restartReads,
         missedClaude:missedClaudeEvidence,
         compactStorage:checks.find((entry)=>entry.name==="generic_zero_value_spans_use_bounded_compressed_projection_storage")?.detail,

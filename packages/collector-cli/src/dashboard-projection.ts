@@ -417,6 +417,7 @@ type ProjectionControl = {
 export type ProjectionMaintenanceReceipt = {
   backfillRowsVisited: number;
   parityRowsVisited: number;
+  duplicateFactScanRowsVisited: number;
   repairRowsVisited: number;
   dirtySessionsVisited: number;
   sessionRepairRowsVisited: number;
@@ -1173,8 +1174,20 @@ export class DashboardProjectionStore {
       cursor_raw_rowid integer not null default 0,
       complete integer not null default 0
     )`);
-    this.db.prepare(`insert or ignore into codex_duplicate_fact_scan (singleton, complete)
-      values (1, ?)`).run(newLedger ? 1 : 0);
+    // A preexisting green snapshot may still contain a fact for a row later
+    // marked duplicate. Withhold parity immediately on upgrade, before the
+    // first scheduled maintenance slice can inspect the historical facts.
+    // The scan record and parity refusal commit together, including on a
+    // restart after an interrupted open.
+    this.db.transaction(() => {
+      this.db.prepare(`insert or ignore into codex_duplicate_fact_scan
+        (singleton, complete) values (1, ?)`).run(newLedger ? 1 : 0);
+      this.db.prepare(`update dashboard_projection_control set parity_ready=0, dirty=1,
+        degraded_reason=coalesce(degraded_reason, 'projection_repair_backlog')
+        where singleton=1 and exists (select 1 from codex_duplicate_fact_scan
+          where singleton=1 and complete=0)
+          and (parity_ready!=0 or dirty!=1 or degraded_reason is null)`).run();
+    }).immediate();
 
     const deletedPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "old");
     const hasRetentionReceipts = Boolean(this.db.prepare(
@@ -3059,7 +3072,8 @@ export class DashboardProjectionStore {
     // guard withheld (bead eco-6hoxj.145).
     if (this.projectionOpenRefused()) {
       return {
-        backfillRowsVisited: 0, parityRowsVisited: 0, repairRowsVisited: 0,
+        backfillRowsVisited: 0, parityRowsVisited: 0, duplicateFactScanRowsVisited: 0,
+        repairRowsVisited: 0,
         dirtySessionsVisited: 0, sessionRepairRowsVisited: 0, metricRowsVisited: 0,
         expiryFacts: 0, compactSegmentsWritten: 0, compactGcItemsVisited: 0,
         compactGcItemsRemoved: 0, compactGcSegmentsRewritten: 0, compactGcSegmentsDeleted: 0,
@@ -3069,6 +3083,7 @@ export class DashboardProjectionStore {
     }
     let backfillRowsVisited = 0;
     let parityRowsVisited = 0;
+    let duplicateFactScanRowsVisited = 0;
     let repairRowsVisited = 0;
     let dirtySessionsVisited = 0;
     let sessionRepairRowsVisited = 0;
@@ -3114,6 +3129,7 @@ export class DashboardProjectionStore {
           where f.raw_rowid > ? order by f.raw_rowid limit ?`
         ).all(duplicateScan.cursor, DUPLICATE_FACT_SCAN_ROWS) as
           Array<{ rawRowid: number; duplicateReason: string | null }>;
+        duplicateFactScanRowsVisited = candidates.length;
         const queue = this.db.prepare(`insert or ignore into dashboard_projection_repairs
           (raw_rowid, reason, queued_at) values (?, 'legacy_usage_duplicate', ?)`);
         for (const candidate of candidates) {
@@ -3290,6 +3306,7 @@ export class DashboardProjectionStore {
     return {
       backfillRowsVisited,
       parityRowsVisited,
+      duplicateFactScanRowsVisited,
       repairRowsVisited,
       dirtySessionsVisited,
       sessionRepairRowsVisited,
@@ -4109,6 +4126,10 @@ export class DashboardProjectionStore {
 
   status() {
     const c=this.control(); const backlog=this.backlog();
+    const duplicateFactScan=this.db.prepare(`select cursor_raw_rowid as cursor,
+      complete, (select coalesce(max(raw_rowid),0) from dashboard_event_facts) as highWater
+      from codex_duplicate_fact_scan where singleton=1`).get() as
+      {cursor:number;complete:number;highWater:number};
     // Open-refusal reasons are sticky in the control row (triggers, compact
     // migration, and apply-failure all preserve them). In-process status still
     // derives the served reason from the open-time flag so a rolled-back host
@@ -4122,6 +4143,8 @@ export class DashboardProjectionStore {
         parityCursor:c.parityCursor,parityComplete:Boolean(c.parityComplete),
         metricHighWater:c.metricBackfillHighWater,metricCursor:c.metricBackfillCursor,
         metricComplete:Boolean(c.metricBackfillComplete),metricSampleCount:c.metricBackfillComplete?c.metricSampleCount:null,
+        duplicateFactScan:{cursor:duplicateFactScan.cursor,highWater:duplicateFactScan.highWater,
+          complete:Boolean(duplicateFactScan.complete),sliceRows:DUPLICATE_FACT_SCAN_ROWS},
         progressMode:"bounded_rowid_watermark_no_exact_remaining",sliceRows:BACKFILL_ROWS},
       backlog,snapshotLag:this.snapshotLag(c,backlog),counters:this.workCounters(),retention:{rawTtlActivation:"bounded_active",
         projectionParityReady:Boolean(c.parityReady)}};

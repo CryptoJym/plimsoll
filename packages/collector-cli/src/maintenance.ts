@@ -744,7 +744,9 @@ function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projec
   const metricHigh=status.backfill.metricHighWater??0;
   return Math.max(0,high-status.backfill.cursor)+
     Math.max(0,high-status.backfill.parityCursor)+
-    Math.max(0,metricHigh-status.backfill.metricCursor);
+    Math.max(0,metricHigh-status.backfill.metricCursor)+
+    (status.backfill.duplicateFactScan.complete ? 0 : Math.max(1,
+      status.backfill.duplicateFactScan.highWater-status.backfill.duplicateFactScan.cursor));
 }
 
 /**
@@ -767,9 +769,11 @@ export async function drainProjectionMigration(
     receipt=projection.runMaintenance();
     activeMs+=performance.now()-started;
     slices++;
-    migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+receipt.metricRowsVisited;
+    migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+
+      receipt.metricRowsVisited+receipt.duplicateFactScanRowsVisited;
     const status=projection.status();
-    const stillMigrating=!status.backfill.complete||!status.backfill.parityComplete||!status.backfill.metricComplete;
+    const stillMigrating=!status.backfill.complete||!status.backfill.parityComplete||
+      !status.backfill.metricComplete||!status.backfill.duplicateFactScan.complete;
     if(!stillMigrating||activeMs>=maxActiveMs)break;
   }
   const status=projection.status(),remainingRowidUpperBound=projectionMigrationRemaining(status);
@@ -777,7 +781,8 @@ export async function drainProjectionMigration(
   return {receipt:receipt!,drain:{slices,yields,migrationRowsVisited,
     activeMs:Number(activeMs.toFixed(3)),maxSlices,maxActiveMs,cadenceSeconds,remainingRowidUpperBound,
     estimatedMinutesUpperBound:Math.ceil(remainingRowidUpperBound/capacityPerCadence*cadenceSeconds/60),
-    stillMigrating:!status.backfill.complete||!status.backfill.parityComplete||!status.backfill.metricComplete} satisfies ProjectionDrainResult};
+    stillMigrating:!status.backfill.complete||!status.backfill.parityComplete||
+      !status.backfill.metricComplete||!status.backfill.duplicateFactScan.complete} satisfies ProjectionDrainResult};
 }
 
 export class CollectorMaintenance {
@@ -1012,6 +1017,7 @@ export class CollectorMaintenance {
               });
               rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
                 drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
+                drained.receipt.duplicateFactScanRowsVisited +
                 drained.receipt.sessionRepairRowsVisited;
               projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
               break;
@@ -1444,6 +1450,7 @@ export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOu
 
 export const AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS = 5_000;
 export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
+export const AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS = 2_000;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS = 1_000;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS = 5_000;
 const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
@@ -1451,7 +1458,7 @@ const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
 export type AutomaticMaintenanceCadenceStatus = {
   accepting: boolean;
   inFlight: boolean;
-  retryClass: "boot" | "startup" | "repair" | "capture" | "storage_busy" | "circuit" | "normal" | null;
+  retryClass: "boot" | "startup" | "repair" | "duplicate_scan" | "capture" | "storage_busy" | "circuit" | "normal" | null;
   nextRetryAt: string | null;
   startupIntervalMs: number;
   normalIntervalMs: number;
@@ -1496,7 +1503,8 @@ export class AutomaticMaintenanceCadence<
       startupIntervalMs?: number;
       normalIntervalMs?: number;
       activeBudgetMs?: number;
-      repairProgress?: () => { pending: boolean; units: number };
+      repairProgress?: () => { pending: boolean; units: number;
+        duplicateScan?: { pending: boolean; cursor: number } };
       retryNotBefore?: () => number | null;
       onError?: (error: unknown) => void;
       timer?: AutomaticMaintenanceCadenceTimer;
@@ -1577,6 +1585,7 @@ export class AutomaticMaintenanceCadence<
     const notBefore = this.options.retryNotBefore?.() ?? null;
     const delay = notBefore !== null && notBefore > now ? notBefore - now
       : retryClass === "normal" ? this.normalIntervalMs()
+        : retryClass === "duplicate_scan" ? AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS
         : retryClass === "storage_busy"
           ? Math.min(AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS,
             AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS *
@@ -1606,8 +1615,10 @@ export class AutomaticMaintenanceCadence<
     let storageBusy = false;
     let discoveryAdvanced = false;
     let baselineBefore: ReturnType<typeof captureBaselineStatus>["progress"] | null = null;
-    let repairBefore: { pending: boolean; units: number } | null = null;
+    let repairBefore: { pending: boolean; units: number;
+      duplicateScan?: { pending: boolean; cursor: number } } | null = null;
     let repairAdvanced = false;
+    let duplicateScanPending = false;
     try {
       baselineBefore = this.baselineStatus().progress;
       repairBefore = this.options.repairProgress?.() ?? null;
@@ -1622,6 +1633,12 @@ export class AutomaticMaintenanceCadence<
         : Math.max(0, this.captureFollowups - 1);
       const repairAfter = this.options.repairProgress?.();
       repairAdvanced = Boolean(repairAfter?.pending && repairAfter.units > (repairBefore?.units ?? 0));
+      // Keep a pending one-time scan on the short cadence even when this
+      // turn's fair repair rotation did not admit projection. Failed and
+      // storage-busy turns retain their existing backoff. The projection
+      // stage still admits one <=25 ms slice under the 200 ms capture budget.
+      duplicateScanPending = Boolean(repairAfter?.duplicateScan?.pending &&
+        results.some(result => !isMaintenancePartialOutcome(result)));
       // Entries actually visited this cadence, never pending candidates the
       // capture path carried over the pending-metadata gate. A mixed turn
       // (one source still baselining, the other gated) must not keep the
@@ -1648,12 +1665,13 @@ export class AutomaticMaintenanceCadence<
     } finally {
       this.inFlight = false;
       if (this.accepting) {
-        let retry: "normal" | "repair" | "startup" | "capture" | "storage_busy" =
+        let retry: "normal" | "repair" | "duplicate_scan" | "startup" | "capture" | "storage_busy" =
           storageBusy ? "storage_busy" : "normal";
         try {
           if (!storageBusy) {
             const baselineAfter = this.baselineStatus().progress;
-            if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
+            if (!failed && baselineBefore) retry = duplicateScanPending ? "duplicate_scan"
+              : repairAdvanced ? "repair"
               : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
                 : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
           }
