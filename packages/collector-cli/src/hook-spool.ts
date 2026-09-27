@@ -11,6 +11,7 @@ import {
   protectedMetadataFieldNames,
 } from "../../shared/src/index";
 import { resolveCollectorHome } from "./collector-home";
+import { isUuid } from "./normalizer";
 
 /**
  * Bead eco-6hoxj.61: hook events the local collector cannot accept right now
@@ -168,6 +169,8 @@ export type HookSpoolEnvelope = {
   source: HookSpoolSource;
   /** Set only by the update listener after authenticated probe admission. */
   probe?: boolean;
+  /** Validated HTTP producer id, if supplied; never a token. */
+  producerEventId?: string;
   /**
    * When the event arrived, stamped before the file is written: the hook
    * process's own time when the client spooled it, the daemon's request
@@ -787,6 +790,7 @@ export function writeHookSpoolEnvelope(options: {
   source: HookSpoolSource;
   body: string;
   probe?: boolean;
+  producerEventId?: string;
   /** Forbidden raw-content values the caller emptied before handing it over. */
   blanked?: number;
   nowMs?: number;
@@ -799,6 +803,7 @@ export function writeHookSpoolEnvelope(options: {
     v: 1,
     source: options.source,
     ...(options.probe ? { probe: true } : {}),
+    ...(options.producerEventId ? { producerEventId: options.producerEventId } : {}),
     receivedAt: new Date(nowMs).toISOString(),
     blanked: options.blanked ?? 0,
     body: options.body,
@@ -867,7 +872,8 @@ export type HookSpoolReadResult =
 /**
  * Read one spooled file under the trust boundary. Envelope shape failures are
  * untrusted (this file was not written by the client), not contract failures:
- * only the `body` string is ever handed to the hook route.
+ * only the body and optional validated producer event id are handed to the
+ * hook route.
  */
 export function readHookSpoolFile(file: string): HookSpoolReadResult {
   let text: string;
@@ -890,15 +896,21 @@ export function readHookSpoolFile(file: string): HookSpoolReadResult {
   if (!isHookSpoolSource(record.source)) return { ok: false, reason: "spool_untrusted" };
   if (typeof record.body !== "string") return { ok: false, reason: "spool_untrusted" };
   if (typeof record.receivedAt !== "string") return { ok: false, reason: "spool_untrusted" };
+  if (record.producerEventId !== undefined &&
+      (typeof record.producerEventId !== "string" || !isUuid(record.producerEventId.trim()))) {
+    return { ok: false, reason: "spool_untrusted" };
+  }
   return {
     ok: true,
     envelope: {
       v: 1,
       source: record.source,
       ...(record.probe === true ? { probe: true } : {}),
+      ...(typeof record.producerEventId === "string"
+        ? { producerEventId: record.producerEventId.trim().toLowerCase() }
+        : {}),
       receivedAt: record.receivedAt,
-      // A receipt of how much the hook process emptied, not a trust input: the
-      // drain hands the route `body` and nothing else either way.
+      // A receipt of how much the hook process emptied, not a trust input.
       blanked: counterValue(record.blanked),
       body: record.body,
     },

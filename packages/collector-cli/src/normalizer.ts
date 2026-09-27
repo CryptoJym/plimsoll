@@ -36,6 +36,8 @@ type NormalizeOptions = {
    * curl retries of the same hook post one ledger row.
    */
   producerEventId?: string;
+  /** Stable spool-unit UUID used only when neither producer nor body supplied one. */
+  fallbackEventId?: string;
   /**
    * Collector receive-time wall clock, defaulted to `Date.now`. Same kind of
    * outside-world seam as `JsonlTailerIo.now`: the hook intake clamp measures
@@ -437,7 +439,10 @@ export function normalizeHookPayload(
   const producerEventId = options.producerEventId && isUuid(options.producerEventId)
     ? options.producerEventId.trim().toLowerCase()
     : undefined;
-  const eventId = producerEventId ?? eventIdSelection.value ?? crypto.randomUUID();
+  const fallbackEventId = options.fallbackEventId && isUuid(options.fallbackEventId)
+    ? options.fallbackEventId.trim().toLowerCase()
+    : undefined;
+  const eventId = producerEventId ?? eventIdSelection.value ?? fallbackEventId ?? crypto.randomUUID();
   const eventTypeSelection = selectValidatedHookAuthority(
     authorityPartitions,
     "eventType",

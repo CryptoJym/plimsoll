@@ -89,13 +89,14 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         }
         const candidate = payload;
         // The daemon's normalizer is the contract for accepted hook shapes.
+        const producerEventId = readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]);
         normalizeForwardedHook(candidate, {
           config, source,
-          producerEventId: readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]),
+          producerEventId,
         });
         const sanitized = blankForbiddenRawContent(JSON.stringify(candidate));
         if (!sanitized) throw new HttpBoundaryRejection("internal_rejection", 400);
-        const write = writeHookSpoolEnvelope({ home, source, body: sanitized.text, blanked: sanitized.blanked, probe });
+        const write = writeHookSpoolEnvelope({ home, source, body: sanitized.text, blanked: sanitized.blanked, probe, producerEventId });
         if (!write.ok) throw new HttpBoundaryRejection("storage_busy_retry", 503);
         reply(response, 202, { status: "hook_spooled", source });
         return;

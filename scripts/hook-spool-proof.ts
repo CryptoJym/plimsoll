@@ -4406,6 +4406,79 @@ async function caseDeferredCountsAttempts() {
   }
 }
 
+/** Reproduce a process death after append committed and before spool unlink. */
+async function caseCrashAfterHookAdmission(producerEventId?: string) {
+  const { home } = fixtureHome(producerEventId ? "crash-header" : "crash-idless");
+  const collector = await startCollector(home);
+  const sessionId = crypto.randomUUID();
+  const lock = holdWriteLock(collector.ledgerPath);
+  let closed = false;
+  try {
+    let posted: Awaited<ReturnType<typeof postHookOverHttp>>;
+    try {
+      posted = await postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          ...(producerEventId ? { "x-plimsoll-event-id": producerEventId } : {}),
+        },
+        claudeHttpHookBody(sessionId, "crash fixture"),
+      );
+    } finally {
+      lock.release();
+    }
+    const pending = listHookSpoolFiles(home);
+    let intercepted = 0;
+    const originalUnlink = fs.unlinkSync;
+    try {
+      // The call is reached only after the synchronous ledger transaction
+      // returned. Refusing this exact unlink leaves the crash-on-disk state.
+      fs.unlinkSync = ((target: fs.PathLike) => {
+        if (pending.length === 1 && String(target) === pending[0]!.path) {
+          intercepted += 1;
+          throw Object.assign(new Error("injected_before_spool_unlink"), { code: "EIO" });
+        }
+        return originalUnlink(target);
+      }) as typeof fs.unlinkSync;
+      await collector.drain.tick();
+    } finally {
+      fs.unlinkSync = originalUnlink;
+    }
+    const firstIds = collector.buffer.database.prepare(
+      "select id from buffered_events where session_id = ? order by rowid",
+    ).all(sessionId) as Array<{ id: string }>;
+    const remained = listHookSpoolFiles(home).length;
+    await collector.close();
+    closed = true;
+
+    const restarted = new LocalEventBuffer(collector.ledgerPath);
+    let replayed: Awaited<ReturnType<HookSpoolDrain["tick"]>>;
+    let afterIds: Array<{ id: string }>;
+    try {
+      replayed = await createHookSpoolDrain(collectorConfigSchema.parse({}), restarted, { home }).tick();
+      afterIds = restarted.database.prepare(
+        "select id from buffered_events where session_id = ? order by rowid",
+      ).all(sessionId) as Array<{ id: string }>;
+    } finally {
+      restarted.close();
+    }
+    check(
+      producerEventId ? "crash_header_hook_replay_is_one_row" : "crash_idless_hook_replay_is_one_row",
+      posted.status === 202 && pending.length === 1 && intercepted === 1 &&
+        firstIds.length === 1 && remained === 1 && replayed.recovered === 1 &&
+        afterIds.length === 1 && listHookSpoolFiles(home).length === 0 &&
+        (!producerEventId || afterIds[0]?.id === producerEventId),
+      { status: posted.status, pending: pending.length, intercepted, firstIds,
+        remained, replayed, afterIds, pendingAfter: listHookSpoolFiles(home).length },
+    );
+  } finally {
+    lock.release();
+    if (!closed) await collector.close();
+  }
+}
+
 async function main() {
   // Stage markers on stderr: a hosted-runner hang has to name the case it hung
   // in without waiting for the final report.
@@ -4480,6 +4553,9 @@ async function main() {
     await caseTheIntakeBlanksAndSummarizes();
     stage("deferred_means_attempts");
     await caseDeferredCountsAttempts();
+    stage("crash_after_hook_admission");
+    await caseCrashAfterHookAdmission();
+    await caseCrashAfterHookAdmission("11111111-1111-4111-8111-111111111111");
     stage("report");
   } finally {
     for (const [key, value] of previousEnv) {

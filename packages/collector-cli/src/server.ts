@@ -79,7 +79,7 @@ import {
 import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 // The drain reuses the normalizer's own readers rather than re-implementing
 // them, so the two cannot drift on what counts as a usable time (review r3, N2).
-import { isUuid, otelScalar, timestampIsNotFromTheFuture, unixNanoToIso } from "./normalizer";
+import { deterministicEventId, isUuid, otelScalar, timestampIsNotFromTheFuture, unixNanoToIso } from "./normalizer";
 import {
   HOOK_SPOOL_LIMITS,
   blankForbiddenRawContent,
@@ -204,6 +204,7 @@ function admitHookBody(
     buffer: LocalEventBuffer;
     budget: RequestBudget;
     producerEventId?: string;
+    fallbackEventId?: string;
     probe?: boolean;
   },
 ) {
@@ -217,6 +218,7 @@ function admitHookBody(
       buffer: context.buffer,
       source,
       producerEventId: context.producerEventId,
+      fallbackEventId: context.fallbackEventId,
     };
     if (!context.probe) return appendForwardedHook(payload, options);
     const canonical = normalizeForwardedHook(payload, options);
@@ -501,7 +503,11 @@ export function createHookSpoolDrain(
         await admitHookBody(
           spooledBodyWithHookTime(read.envelope.body, read.envelope.receivedAt),
           read.envelope.source,
-          { config, buffer, budget: createRequestBudget(), probe: read.envelope.probe },
+          {
+            config, buffer, budget: createRequestBudget(), probe: read.envelope.probe,
+            producerEventId: read.envelope.producerEventId,
+            fallbackEventId: deterministicEventId(["hook-spool:v1", file.name]),
+          },
         );
         try {
           fs.unlinkSync(file.path);
@@ -925,6 +931,7 @@ export function createCollectorServer(
     source: LocalProducerSource,
     bodyText: string,
     receivedAtMs: number,
+    producerEventId?: string,
   ): IntakeSpoolOutcome => {
     // The kill switch, the two pre-write refusals and an unresolvable home all
     // answer before any byte is written, so none of them counts `refused` or
@@ -948,6 +955,7 @@ export function createCollectorServer(
       home,
       source,
       body: blanked.text,
+      producerEventId,
       blanked: blanked.blanked,
       // The daemon's request receive time, so the drain replays the event with
       // the time it ARRIVED rather than the time the ledger freed up.
@@ -1788,7 +1796,7 @@ export function createCollectorServer(
           const failure = asHttpBoundaryRejection(error);
           const spooled =
             failure.reason === "storage_busy_retry" && failure.status === 503
-              ? spoolHookAtIntake(source, body.text, receivedAtMs)
+              ? spoolHookAtIntake(source, body.text, receivedAtMs, producerEventId)
               : null;
           // A spool that could not be written — bounds exhausted, disk, EACCES,
           // kill switch — keeps today's answer exactly: the loss stays visible.

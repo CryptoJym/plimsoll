@@ -14,6 +14,7 @@ type ForwardedHookOptions = {
   transportPath?: string;
   now?: () => number;
   producerEventId?: string;
+  fallbackEventId?: string;
 };
 
 export function appendForwardedHook(
@@ -38,6 +39,7 @@ export function normalizeForwardedHook(payload: unknown, options: ForwardedHookO
     transportPath: options.transportPath,
     now: options.now,
     producerEventId: options.producerEventId,
+    fallbackEventId: options.fallbackEventId,
   });
   // Successful hook/fallback responses are public proof surfaces before the
   // durable outbox runs. Include the same deterministic local-only omissions
