@@ -44,6 +44,8 @@
     "proof:lifecycle-cross-version": "tsx scripts/run-proof.ts scripts/lifecycle-cross-version-proof.ts",
     "proof:lifecycle-preservation": "tsx scripts/run-proof.ts scripts/lifecycle-preservation-proof.ts",
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
+    "proof:maintenance-rebuild": "tsx scripts/maintenance-rebuild-proof.ts",
+    "proof:maintenance-rebuild-pause": "tsx scripts/maintenance-rebuild-pause-proof.ts",
     "proof:collector-reliability": "tsx scripts/collector-reliability-proof.ts",
     "proof:collector-clock": "tsx scripts/collector-integrated-correction-proof.ts",
     "proof:automatic-record-retry": "tsx scripts/automatic-record-retry-proof.ts",

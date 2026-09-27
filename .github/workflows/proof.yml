@@ -372,6 +372,12 @@ jobs:
       - name: Prove local HTTP trust boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:http-boundary
+
+      - name: Prove maintenance rebuild, refusal boundaries and paused push replay (eco-6hoxj.164.7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:maintenance-rebuild
+          pnpm proof:maintenance-rebuild-pause
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:otlp-admission
