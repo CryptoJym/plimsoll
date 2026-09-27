@@ -30,24 +30,17 @@ export type SessionSnapshot = {
   accountHash: string | null;
 };
 
-export const SESSION_SUMMARY_SCHEMA_VERSION = 3 as const;
+export const SESSION_SUMMARY_SCHEMA_VERSION = 4 as const;
 export const SESSION_SUMMARY_DEFAULT_MAX_ROWS = 5_000;
 export const SESSION_SUMMARY_DEFAULT_MAX_MS = 250;
 export const SESSION_SUMMARY_ZERO_PROGRESS_STUCK_AFTER = 3;
 const ZERO_PROGRESS_RETRY_BASE_MS = 100;
 const ZERO_PROGRESS_RETRY_MAX_MS = 5_000;
+const SESSION_SUMMARY_SEGMENT_ROWS = 4_096;
 
-type SummaryAccumulator = {
-  sessionId: string;
-  /** Rows through this rowid belong to the frozen historical scan. */
-  scanBoundary: number;
-  /** Historical scan cursor follows idx_events_session (session, observation, rowid). */
-  cursorObservedAt: string | null;
-  cursorRowid: number;
-  cursorId: string | null;
-  /** A preexisting future-created row needs a fallback when it becomes eligible. */
+type SummaryAggregate = {
+  /** The next future row in this bounded rowid segment. */
   futureRows: boolean;
-  /** Earliest skipped future row; older ledgers have only futureRows. */
   futureCreatedAt: string | null;
   sourceMax: string | null;
   startedAt: string | null;
@@ -69,6 +62,28 @@ type SummaryAccumulator = {
   accountNonNull: number;
   accountValue: string | null;
   accountMixed: boolean;
+};
+
+type SummaryRepair = {
+  segment: number;
+  revision: number;
+  until: string;
+  cursorRowid: number;
+  aggregate: SummaryAggregate;
+};
+
+type SummaryAccumulator = SummaryAggregate & {
+  sessionId: string;
+  /** Rows through this rowid belong to the frozen historical scan. */
+  scanBoundary: number;
+  /** Historical scan cursor follows idx_events_session (session, observation, rowid). */
+  cursorObservedAt: string | null;
+  cursorRowid: number;
+  cursorId: string | null;
+  /** A bounded rowid segment is replaced after a scanned edit or maturity. */
+  segments: Record<string, SummaryAggregate>;
+  scanComplete: boolean;
+  activeRepair: SummaryRepair | null;
 };
 
 type SummaryState = {
@@ -210,6 +225,11 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   const newOutboxChange = `${newOutboxMismatch} and
     (new.raw_rowid is not old.raw_rowid or not ${oldOutboxMismatch})`;
   const linkedUnscanned = unscannedRowSql("e.session_id", "e.rowid", "e.observed_at");
+  const queueLinkedRepair = (filter: string) => `insert into session_sync_summary_repairs
+    (session_id, segment, revision)
+    select e.session_id, cast((e.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1
+    from buffered_events e where ${filter} and e.session_id is not null and not ${linkedUnscanned}
+    on conflict(session_id, segment) do update set revision = revision + 1;`;
   const oldOutboxAffects = `exists (select 1 from buffered_events e
     join session_sync_summary_state s on s.session_id = e.session_id
     where e.rowid = old.raw_rowid and ${oldOutboxChange})`;
@@ -373,12 +393,24 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       session_id text not null,
       created_at text not null
     );
+    create table if not exists session_sync_summary_repairs (
+      session_id text not null,
+      segment integer not null,
+      revision integer not null,
+      primary key (session_id, segment)
+    );
+    create table if not exists session_sync_summary_due (
+      session_id text primary key,
+      next_due_at text not null
+    );
     create index if not exists idx_session_summary_state_incomplete
       on session_sync_summary_state (complete, updated_at);
     create index if not exists idx_session_summary_dirty_updated
       on session_sync_summary_dirty (updated_at);
     create index if not exists idx_session_summary_rows_session
       on session_sync_summary_rows (session_id, raw_rowid);
+    create index if not exists idx_session_summary_due_at
+      on session_sync_summary_due (next_due_at, session_id);
 
     create trigger if not exists trg_session_summary_raw_insert
     after insert on buffered_events
@@ -460,6 +492,55 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           reason = excluded.reason, updated_at = excluded.updated_at;
       delete from session_sync_summary_rows where raw_rowid = old.rowid;
     end;
+    -- These additive triggers survive upgrades from the v42 trigger names.
+    -- A scanned mutation records only its bounded rowid segment; an unscanned
+    -- mutation is still retried by the existing activity fence.
+    create trigger if not exists trg_session_summary_repair_insert_v1
+    after insert on buffered_events
+    when new.session_id is not null and exists (
+      select 1 from session_sync_summary_state where session_id = new.session_id
+    ) and not ${newUnscanned}
+    begin
+      insert into session_sync_summary_repairs (session_id, segment, revision)
+        values (new.session_id, cast((new.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1)
+        on conflict(session_id, segment) do update set revision = revision + 1;
+    end;
+    create trigger if not exists trg_session_summary_repair_update_old_v1
+    after update of id, source, data_mode, observed_at, created_at,
+      session_id, input_tokens, output_tokens, cache_read_tokens,
+      cache_creation_tokens, cost_usd, repo_hash, branch_hash, account_hash,
+      privacy_generation, privacy_disposition on buffered_events
+    when ${rawSummaryChanged} and old.session_id is not null and exists (
+      select 1 from session_sync_summary_state where session_id = old.session_id
+    ) and not ${oldUnscanned}
+    begin
+      insert into session_sync_summary_repairs (session_id, segment, revision)
+        values (old.session_id, cast((old.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1)
+        on conflict(session_id, segment) do update set revision = revision + 1;
+    end;
+    create trigger if not exists trg_session_summary_repair_update_new_v1
+    after update of id, source, data_mode, observed_at, created_at,
+      session_id, input_tokens, output_tokens, cache_read_tokens,
+      cache_creation_tokens, cost_usd, repo_hash, branch_hash, account_hash,
+      privacy_generation, privacy_disposition on buffered_events
+    when ${rawSummaryChanged} and new.session_id is not null and exists (
+      select 1 from session_sync_summary_state where session_id = new.session_id
+    ) and not ${newUnscanned}
+    begin
+      insert into session_sync_summary_repairs (session_id, segment, revision)
+        values (new.session_id, cast((new.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1)
+        on conflict(session_id, segment) do update set revision = revision + 1;
+    end;
+    create trigger if not exists trg_session_summary_repair_delete_v1
+    after delete on buffered_events
+    when old.session_id is not null and exists (
+      select 1 from session_sync_summary_state where session_id = old.session_id
+    ) and not ${oldUnscanned}
+    begin
+      insert into session_sync_summary_repairs (session_id, segment, revision)
+        values (old.session_id, cast((old.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1)
+        on conflict(session_id, segment) do update set revision = revision + 1;
+    end;
     `);
   }).immediate();
 
@@ -469,6 +550,36 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   if (revisionTableMissing) {
     db.exec(`insert or ignore into session_sync_summary_revision (session_id, mutation_revision)
       select session_id, mutation_revision from session_sync_summary_state`);
+  }
+
+  // Codex pairing can change only the duplicate eligibility column. Its
+  // response-span rewrite does not touch any of the v42 raw-update columns.
+  if (columnNames(db, "buffered_events").has("usage_duplicate_reason")) {
+    db.exec(`create trigger if not exists trg_session_summary_repair_duplicate_v1
+      after update of usage_duplicate_reason on buffered_events
+      when old.usage_duplicate_reason is not new.usage_duplicate_reason
+      begin
+        update session_sync_summary_control
+          set mutation_revision = mutation_revision + 1,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          where singleton = 1;
+        insert into session_sync_summary_activity (session_id, activity_revision)
+          select old.session_id, 1 where old.session_id is not null
+          on conflict(session_id) do update set activity_revision = activity_revision + 1;
+        insert into session_sync_summary_dirty (session_id, reason, updated_at)
+          select old.session_id, 'usage_duplicate', strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          where old.session_id is not null and exists (
+            select 1 from session_sync_summary_state where session_id = old.session_id
+          ) and not ${oldUnscanned}
+          on conflict(session_id) do update set
+            reason = excluded.reason, updated_at = excluded.updated_at;
+        insert into session_sync_summary_repairs (session_id, segment, revision)
+          select old.session_id, cast((old.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1
+          where old.session_id is not null and exists (
+            select 1 from session_sync_summary_state where session_id = old.session_id
+          ) and not ${oldUnscanned}
+          on conflict(session_id, segment) do update set revision = revision + 1;
+      end;`);
   }
 
   // These tables are created by DeliveryOutbox, but a small proof ledger or a
@@ -548,6 +659,27 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
+    `);
+    db.exec(`
+      create trigger if not exists trg_session_summary_repair_outbox_insert_v1
+      after insert on upload_outbox
+      when new.raw_rowid is not null and exists (
+        select 1 from buffered_events e join session_sync_summary_state s on s.session_id = e.session_id
+        where e.rowid = new.raw_rowid and ${newOutboxMismatch})
+      begin ${queueLinkedRepair(`e.rowid = new.raw_rowid and ${newOutboxMismatch}`)} end;
+      create trigger if not exists trg_session_summary_repair_outbox_update_v1
+      after update of raw_rowid, raw_id, raw_created_at, raw_generation on upload_outbox
+      when ${oldOutboxAffects} or ${newOutboxAffects}
+      begin
+        ${queueLinkedRepair(`e.rowid = old.raw_rowid and ${oldOutboxChange}`)}
+        ${queueLinkedRepair(`e.rowid = new.raw_rowid and ${newOutboxChange}`)}
+      end;
+      create trigger if not exists trg_session_summary_repair_outbox_delete_v1
+      after delete on upload_outbox
+      when old.raw_rowid is not null and exists (
+        select 1 from buffered_events e join session_sync_summary_state s on s.session_id = e.session_id
+        where e.rowid = old.raw_rowid and ${oldOutboxMismatch})
+      begin ${queueLinkedRepair(`e.rowid = old.raw_rowid and ${oldOutboxMismatch}`)} end;
     `);
   }
 
@@ -643,6 +775,29 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
             on conflict(session_id) do update set mutation_revision = mutation_revision + 1;
         end;
       `);
+      db.exec(`
+        create trigger if not exists trg_session_summary_repair_receipt_insert_v1
+        after insert on upload_receipts
+        when new.reason in ('local_evidence_quarantined','local_privacy_violation')
+          and exists (select 1 from buffered_events e
+            join session_sync_summary_state s on s.session_id = e.session_id
+            where e.id = new.delivery_id)
+        begin ${queueLinkedRepair("e.id = new.delivery_id")} end;
+        create trigger if not exists trg_session_summary_repair_receipt_update_v1
+        after update of delivery_id, reason on upload_receipts
+        when ${oldReceiptAffects} or ${newReceiptAffects}
+        begin
+          ${queueLinkedRepair(`e.id = old.delivery_id and ${oldReceiptChange}`)}
+          ${queueLinkedRepair(`e.id = new.delivery_id and ${newReceiptChange}`)}
+        end;
+        create trigger if not exists trg_session_summary_repair_receipt_delete_v1
+        after delete on upload_receipts
+        when old.reason in ('local_evidence_quarantined','local_privacy_violation')
+          and exists (select 1 from buffered_events e
+            join session_sync_summary_state s on s.session_id = e.session_id
+            where e.id = old.delivery_id)
+        begin ${queueLinkedRepair("e.id = old.delivery_id")} end;
+      `);
     }
   }
 }
@@ -677,13 +832,8 @@ export function sessionSummaryCounters(db: Database.Database): SessionSummaryCou
   return control(db);
 }
 
-function emptyAccumulator(sessionId: string): SummaryAccumulator {
+function emptyAggregate(): SummaryAggregate {
   return {
-    sessionId,
-    scanBoundary: 0,
-    cursorObservedAt: null,
-    cursorRowid: 0,
-    cursorId: null,
     futureRows: false,
     futureCreatedAt: null,
     sourceMax: null,
@@ -709,6 +859,25 @@ function emptyAccumulator(sessionId: string): SummaryAccumulator {
   };
 }
 
+function emptyAccumulator(sessionId: string): SummaryAccumulator {
+  return {
+    ...emptyAggregate(), sessionId, scanBoundary: 0,
+    cursorObservedAt: null, cursorRowid: 0, cursorId: null,
+    segments: {}, scanComplete: false, activeRepair: null,
+  };
+}
+
+function segmentOf(rowid: number): number {
+  return Math.floor((rowid - 1) / SESSION_SUMMARY_SEGMENT_ROWS);
+}
+
+function trackFuture(aggregate: SummaryAggregate, createdAt: string): void {
+  aggregate.futureRows = true;
+  if (aggregate.futureCreatedAt === null || createdAt < aggregate.futureCreatedAt) {
+    aggregate.futureCreatedAt = createdAt;
+  }
+}
+
 function foldIdentity(
   count: number,
   value: string | null,
@@ -720,7 +889,7 @@ function foldIdentity(
   return { count: count + 1, value, mixed: mixed || value !== next };
 }
 
-function fold(accumulator: SummaryAccumulator, row: RawSummaryRow): void {
+function fold(accumulator: SummaryAggregate, row: RawSummaryRow): void {
   accumulator.events += 1;
   accumulator.inputTokens += row.inputTokens ?? 0;
   accumulator.outputTokens += row.outputTokens ?? 0;
@@ -759,6 +928,58 @@ function fold(accumulator: SummaryAccumulator, row: RawSummaryRow): void {
   accumulator.accountMixed = account.mixed;
 }
 
+function addCost(accumulator: SummaryAggregate, cost: number): void {
+  const next = accumulator.costUsd + cost;
+  accumulator.costCompensation += Math.abs(accumulator.costUsd) >= Math.abs(cost)
+    ? (accumulator.costUsd - next) + cost
+    : (cost - next) + accumulator.costUsd;
+  accumulator.costUsd = next;
+}
+
+function mergeAggregate(target: SummaryAggregate, source: SummaryAggregate): void {
+  target.events += source.events;
+  target.inputTokens += source.inputTokens;
+  target.outputTokens += source.outputTokens;
+  target.cacheReadTokens += source.cacheReadTokens;
+  target.cacheCreationTokens += source.cacheCreationTokens;
+  target.pricedEvents += source.pricedEvents;
+  addCost(target, source.costUsd);
+  addCost(target, source.costCompensation);
+  if (source.sourceMax !== null && (target.sourceMax === null || source.sourceMax > target.sourceMax)) {
+    target.sourceMax = source.sourceMax;
+  }
+  if (source.startedAt !== null && (target.startedAt === null || source.startedAt < target.startedAt)) {
+    target.startedAt = source.startedAt;
+  }
+  if (source.endedAt !== null && (target.endedAt === null || source.endedAt > target.endedAt)) {
+    target.endedAt = source.endedAt;
+  }
+  for (const prefix of ["repo", "branch", "account"] as const) {
+    const countKey = `${prefix}NonNull` as const;
+    const valueKey = `${prefix}Value` as const;
+    const mixedKey = `${prefix}Mixed` as const;
+    const currentCount = target[countKey];
+    target[mixedKey] = target[mixedKey] || source[mixedKey] ||
+      (currentCount > 0 && source[countKey] > 0 && target[valueKey] !== source[valueKey]);
+    if (currentCount === 0) target[valueKey] = source[valueKey];
+    target[countKey] += source[countKey];
+  }
+  if (source.futureCreatedAt !== null) trackFuture(target, source.futureCreatedAt);
+  else target.futureRows ||= source.futureRows;
+}
+
+function combineSegments(segments: Record<string, SummaryAggregate>): SummaryAggregate {
+  const combined = emptyAggregate();
+  for (const key of Object.keys(segments).sort((a, b) => Number(a) - Number(b))) {
+    mergeAggregate(combined, segments[key]!);
+  }
+  return combined;
+}
+
+function refreshAggregate(accumulator: SummaryAccumulator): void {
+  Object.assign(accumulator, combineSegments(accumulator.segments));
+}
+
 function snapshot(accumulator: SummaryAccumulator): SessionSnapshot | null {
   if (accumulator.events === 0 || accumulator.sourceMax === null || accumulator.startedAt === null || accumulator.endedAt === null) {
     return null;
@@ -784,6 +1005,26 @@ function snapshot(accumulator: SummaryAccumulator): SessionSnapshot | null {
   };
 }
 
+function validAggregate(candidate: SummaryAggregate): boolean {
+  if (typeof candidate.futureRows !== "boolean") return false;
+  if (typeof candidate.futureCreatedAt !== "string" && candidate.futureCreatedAt !== null) return false;
+  if (!Number.isSafeInteger(candidate.events) || candidate.events < 0) return false;
+  for (const key of [
+    "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens",
+    "pricedEvents", "repoNonNull", "branchNonNull", "accountNonNull",
+  ] as const) {
+    if (!Number.isSafeInteger(candidate[key]) || candidate[key] < 0) return false;
+  }
+  if (!Number.isFinite(candidate.costUsd) || !Number.isFinite(candidate.costCompensation)) return false;
+  for (const key of ["sourceMax", "startedAt", "endedAt", "repoValue", "branchValue", "accountValue"] as const) {
+    if (typeof candidate[key] !== "string" && candidate[key] !== null) return false;
+  }
+  for (const key of ["repoMixed", "branchMixed", "accountMixed"] as const) {
+    if (typeof candidate[key] !== "boolean") return false;
+  }
+  return true;
+}
+
 function parseAccumulator(sessionId: string, value: string): SummaryAccumulator | null {
   try {
     const parsed = JSON.parse(value) as Partial<SummaryAccumulator>;
@@ -794,24 +1035,20 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
     if (typeof candidate.cursorObservedAt !== "string" && candidate.cursorObservedAt !== null) return null;
     if (!Number.isSafeInteger(candidate.cursorRowid) || candidate.cursorRowid < 0) return null;
     if (typeof candidate.cursorId !== "string" && candidate.cursorId !== null) return null;
-    if (typeof candidate.futureRows !== "boolean") return null;
-    if (typeof candidate.futureCreatedAt !== "string" && candidate.futureCreatedAt !== null) return null;
-    if (!Number.isSafeInteger(candidate.events) || candidate.events < 0) return null;
-    for (const key of [
-      "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens",
-      "pricedEvents", "repoNonNull", "branchNonNull", "accountNonNull",
-    ] as const) {
-      if (!Number.isSafeInteger(candidate[key]) || candidate[key] < 0) return null;
+    if (!validAggregate(candidate)) return null;
+    if (typeof candidate.scanComplete !== "boolean") return null;
+    if (!candidate.segments || typeof candidate.segments !== "object" || Array.isArray(candidate.segments)) return null;
+    for (const [key, aggregate] of Object.entries(candidate.segments)) {
+      const segment = Number(key);
+      if (!Number.isSafeInteger(segment) || segment < 0 || !aggregate || !validAggregate(aggregate)) return null;
     }
-    if (!Number.isFinite(candidate.costUsd) || !Number.isFinite(candidate.costCompensation)) return null;
-    if (typeof candidate.sourceMax !== "string" && candidate.sourceMax !== null) return null;
-    if (typeof candidate.startedAt !== "string" && candidate.startedAt !== null) return null;
-    if (typeof candidate.endedAt !== "string" && candidate.endedAt !== null) return null;
-    for (const key of ["repoValue", "branchValue", "accountValue"] as const) {
-      if (typeof candidate[key] !== "string" && candidate[key] !== null) return null;
-    }
-    for (const key of ["repoMixed", "branchMixed", "accountMixed"] as const) {
-      if (typeof candidate[key] !== "boolean") return null;
+    if (candidate.activeRepair !== null) {
+      const repair = candidate.activeRepair;
+      if (!repair || !Number.isSafeInteger(repair.segment) || repair.segment < 0 ||
+          !Number.isSafeInteger(repair.revision) || repair.revision < 0 ||
+          typeof repair.until !== "string" || Number.isNaN(Date.parse(repair.until)) ||
+          !Number.isSafeInteger(repair.cursorRowid) || repair.cursorRowid < 0 ||
+          !repair.aggregate || !validAggregate(repair.aggregate)) return null;
     }
     return candidate;
   } catch {
@@ -968,6 +1205,46 @@ function newerSummaryRowQuery(
   };
 }
 
+function repairQueueRow(db: Database.Database, sessionId: string, segment?: number):
+  { segment: number; revision: number } | null {
+  const row = segment === undefined
+    ? db.prepare(`select segment, revision from session_sync_summary_repairs
+       where session_id = ? order by segment limit 1`).get(sessionId)
+    : db.prepare(`select segment, revision from session_sync_summary_repairs
+       where session_id = ? and segment = ?`).get(sessionId, segment);
+  return (row as { segment: number; revision: number } | undefined) ?? null;
+}
+
+function dueSegment(accumulator: SummaryAccumulator, until: string): number | null {
+  for (const key of Object.keys(accumulator.segments).sort((a, b) => Number(a) - Number(b))) {
+    const date = accumulator.segments[key]?.futureCreatedAt;
+    if (date !== null && date !== undefined && date <= until) return Number(key);
+  }
+  return null;
+}
+
+function repairRowsQuery(
+  db: Database.Database, sessionId: string, repair: SummaryRepair, limit: number, maxMs: number,
+): SessionReadQuery {
+  const eligible = terminalPrivacyEligibilitySql(db, "e");
+  return {
+    sql: `select e.rowid as rowid, e.id, e.session_id as sessionId, e.source,
+       e.observed_at as observedAt, e.created_at as createdAt,
+       e.input_tokens as inputTokens, e.output_tokens as outputTokens,
+       e.cache_read_tokens as cacheReadTokens,
+       e.cache_creation_tokens as cacheCreationTokens, e.cost_usd as costUsd,
+       e.repo_hash as repoHash, e.branch_hash as branchHash,
+       e.account_hash as accountHash,
+       case when ${eligible} then 1 else 0 end as eligible
+     from buffered_events e
+     where e.rowid > @cursorRowid and e.rowid <= @upperRowid and e.session_id = @sessionId
+     order by e.rowid limit @limit`,
+    params: { sessionId, cursorRowid: repair.cursorRowid,
+      upperRowid: (repair.segment + 1) * SESSION_SUMMARY_SEGMENT_ROWS, limit },
+    maxMs,
+  };
+}
+
 function writeState(db: Database.Database, state: SummaryState): void {
   db.prepare(
     `insert into session_sync_summary_state
@@ -993,6 +1270,13 @@ function writeState(db: Database.Database, state: SummaryState): void {
     accumulatorJson: JSON.stringify(state.accumulator),
     updatedAt: new Date().toISOString(),
   });
+  if (state.accumulator.futureCreatedAt === null) {
+    db.prepare("delete from session_sync_summary_due where session_id = ?").run(state.sessionId);
+  } else {
+    db.prepare(`insert into session_sync_summary_due (session_id, next_due_at)
+      values (?, ?) on conflict(session_id) do update set next_due_at = excluded.next_due_at`)
+      .run(state.sessionId, state.accumulator.futureCreatedAt);
+  }
 }
 
 function stateFromStored(stored: StoredSummaryState, accumulator: SummaryAccumulator): SummaryState {
@@ -1015,7 +1299,8 @@ function fallbackReason(
   currentRevision: number,
   until: string,
   checkpointOk: boolean,
-  dirty: boolean,
+  dirtyReason: string | null,
+  repairAvailable: boolean,
 ): string | null {
   if (!stored) return null;
   if (!parsed) return "accumulator_corrupt";
@@ -1025,11 +1310,11 @@ function fallbackReason(
   if (Date.parse(stored.coveredUntil) > Date.parse(until)) return "until_rollback";
   // A skipped future row only invalidates the scanned prefix when it actually
   // enters the new horizon. Old 0.7.40 states lack the date and rebuild once.
-  if (parsed.futureRows && Date.parse(stored.coveredUntil) < Date.parse(until) &&
+  if (stored.schemaVersion < 4 && parsed.futureRows && Date.parse(stored.coveredUntil) < Date.parse(until) &&
       (parsed.futureCreatedAt === null || parsed.futureCreatedAt <= until)) return "future_horizon";
-  if (currentRevision !== stored.mutationRevision) return "ledger_mutation";
+  if (currentRevision !== stored.mutationRevision && !repairAvailable) return "ledger_mutation";
   if (!checkpointOk) return "checkpoint_mismatch";
-  if (dirty) return "dirty_marker";
+  if (dirtyReason !== null && !repairAvailable) return "dirty_marker";
   return null;
 }
 
@@ -1044,6 +1329,12 @@ export function listSessionSummaryPendingIds(db: Database.Database, until: strin
        where ${BOUNDED_SQL_READ_PREDICATE}
      union
      ` : "";
+  const repairs = tableExists(db, "session_sync_summary_repairs")
+    ? `union select session_id as sessionId from session_sync_summary_repairs
+       where ${BOUNDED_SQL_READ_PREDICATE}` : "";
+  const due = tableExists(db, "session_sync_summary_due")
+    ? `union select session_id as sessionId from session_sync_summary_due
+       where next_due_at <= @until and ${BOUNDED_SQL_READ_PREDICATE}` : "";
   const rows = boundedSqlRows<{ sessionId: string }>(db,
     `select session_id as sessionId from session_sync_summary_dirty
        where ${BOUNDED_SQL_READ_PREDICATE}
@@ -1059,6 +1350,8 @@ export function listSessionSummaryPendingIds(db: Database.Database, until: strin
      select r.session_id as sessionId from session_sync_summary_rows r
        join buffered_events e on e.rowid = r.raw_rowid
        where e.created_at <= @until and ${BOUNDED_SQL_READ_PREDICATE}
+     ${repairs}
+     ${due}
      limit @limit`,
     { until, limit: limit + 1 }, limit);
   return rows.map((row) => row.sessionId);
@@ -1084,6 +1377,7 @@ export function sessionSummaryCurrent(
     state.mutationRevision === mutationRevision && state.coveredUntil === until &&
     sessionRevision(db, sessionId) === mutationRevision &&
     !db.prepare("select 1 from session_sync_summary_dirty where session_id = ?").get(sessionId) &&
+    !db.prepare("select 1 from session_sync_summary_repairs where session_id = ? limit 1").get(sessionId) &&
     !queuedRowsAfter(db, sessionId, highWater, until);
 }
 
@@ -1159,9 +1453,10 @@ export async function updateSessionSummary(
     };
   }
   const parsed = stored ? parseAccumulator(sessionId, stored.accumulatorJson) : null;
-  const dirty = Boolean(db.prepare(
-    `select 1 from session_sync_summary_dirty where session_id = ? limit 1`,
-  ).get(sessionId));
+  const dirtyReason = (db.prepare(
+    `select reason from session_sync_summary_dirty where session_id = ? limit 1`,
+  ).get(sessionId) as { reason: string } | undefined)?.reason ?? null;
+  const pendingRepair = repairQueueRow(db, sessionId);
   let checkpointOk = false;
   if (stored && parsed && validStoredState(stored, sessionId, until)) {
     try {
@@ -1178,16 +1473,18 @@ export async function updateSessionSummary(
       });
     }
   }
-  const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk, dirty);
+  const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk,
+    dirtyReason, pendingRepair !== null);
   const resumableFallback = stored?.mode === "fallback" &&
-    !stored.complete && stored.mutationRevision === currentRevision &&
+    !stored.complete && (stored.mutationRevision === currentRevision || pendingRepair !== null) &&
     parsed !== null && checkpointOk && (reason === null || reason === "dirty_marker") &&
     Date.parse(stored.coveredUntil) <= Date.parse(until);
   const needsFallback = reason !== null && !resumableFallback;
   const fullRecompute = needsFallback;
   let mode: SessionSummaryUpdateResult["mode"] = needsFallback
     ? "fallback"
-    : stored?.complete && Date.parse(stored.coveredUntil) === Date.parse(until)
+    : stored?.complete && pendingRepair === null && parsed?.activeRepair === null &&
+        dueSegment(parsed, until) === null && Date.parse(stored.coveredUntil) === Date.parse(until)
       ? "cached"
       : stored ? "incremental" : "initial";
 
@@ -1210,6 +1507,7 @@ export async function updateSessionSummary(
       ).get() as { rowid: number } | undefined;
       const accumulator = emptyAccumulator(sessionId);
       accumulator.scanBoundary = boundary?.rowid ?? 0;
+      db.prepare("delete from session_sync_summary_repairs where session_id = ?").run(sessionId);
       const fresh: SummaryState = {
         sessionId,
         schemaVersion: SESSION_SUMMARY_SCHEMA_VERSION,
@@ -1226,6 +1524,9 @@ export async function updateSessionSummary(
     }).immediate());
   } else if (parsed) {
     state = stateFromStored(stored, parsed);
+    // The repair queue is durable. A changed segment must be read before this
+    // revision can be published, but it need not invalidate the old prefix.
+    if (pendingRepair !== null) state.mutationRevision = currentRevision;
   } else {
     throw new Error("session_summary_accumulator_missing");
   }
@@ -1285,9 +1586,9 @@ export async function updateSessionSummary(
   const queryLimit = Math.min(maxRows, 5_000);
   let rowsRead = 0;
   let rowsApplied = 0;
-  let complete = false;
+  let complete = state.accumulator.scanComplete && state.mode !== "incremental";
   let readInterrupted = false;
-  while (rowsRead < maxRows && performance.now() - started < maxMs) {
+  while (!complete && rowsRead < maxRows && performance.now() - started < maxMs) {
     const limit = Math.min(queryLimit, maxRows - rowsRead);
     let rows: RawSummaryRow[];
     try {
@@ -1328,14 +1629,13 @@ export async function updateSessionSummary(
         state.highWater = row.rowid;
         state.checkpointId = row.id;
       }
+      const segment = String(segmentOf(row.rowid));
+      const aggregate = state.accumulator.segments[segment] ?? emptyAggregate();
+      state.accumulator.segments[segment] = aggregate;
       if (row.createdAt > until) {
-        state.accumulator.futureRows = true;
-        if (state.accumulator.futureCreatedAt === null || row.createdAt < state.accumulator.futureCreatedAt) {
-          state.accumulator.futureCreatedAt = row.createdAt;
-        }
-      }
-      else if (row.eligible) {
-        fold(state.accumulator, row);
+        trackFuture(aggregate, row.createdAt);
+      } else if (row.eligible) {
+        fold(aggregate, row);
         rowsApplied += 1;
       }
       if (rowsRead >= maxRows || performance.now() - started >= maxMs) {
@@ -1348,6 +1648,58 @@ export async function updateSessionSummary(
       break;
     }
   }
+  if (complete) state.accumulator.scanComplete = true;
+
+  // Historical reads may visit segments in observation order. Scanned edits
+  // are queued until that walk ends; replacing a segment earlier would let a
+  // later historical slice count its rows twice. A repair itself is bounded
+  // by both the row and time budgets and can resume from a durable cursor.
+  let completedRepair: { segment: number; revision: number } | null = null;
+  if (complete && !readInterrupted && rowsRead < maxRows && performance.now() - started < maxMs) {
+    const queued = repairQueueRow(db, sessionId);
+    const nextSegment = state.accumulator.activeRepair?.segment ??
+      queued?.segment ?? dueSegment(state.accumulator, until);
+    if (nextSegment !== null) {
+      const queueRevision = repairQueueRow(db, sessionId, nextSegment)?.revision ?? 0;
+      let repair = state.accumulator.activeRepair;
+      if (repair === null || repair.segment !== nextSegment || repair.revision !== queueRevision) {
+        repair = {
+          segment: nextSegment, revision: queueRevision, until,
+          cursorRowid: nextSegment * SESSION_SUMMARY_SEGMENT_ROWS,
+          aggregate: emptyAggregate(),
+        };
+      }
+      const limit = maxRows - rowsRead;
+      try {
+        const repairRows = await options.read<RawSummaryRow>([
+          repairRowsQuery(db, sessionId, repair, limit,
+            Math.max(1, maxMs - (performance.now() - started))),
+        ]);
+        for (const row of repairRows) {
+          rowsRead += 1;
+          repair.cursorRowid = row.rowid;
+          if (row.createdAt > repair.until) trackFuture(repair.aggregate, row.createdAt);
+          else if (row.eligible) {
+            fold(repair.aggregate, row);
+            rowsApplied += 1;
+          }
+        }
+        if (repairRows.length < limit ||
+            repair.cursorRowid === (nextSegment + 1) * SESSION_SUMMARY_SEGMENT_ROWS) {
+          state.accumulator.segments[String(nextSegment)] = repair.aggregate;
+          state.accumulator.activeRepair = null;
+          completedRepair = { segment: nextSegment, revision: queueRevision };
+        } else {
+          state.accumulator.activeRepair = repair;
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("session_summary_read_interrupted")) {
+          readInterrupted = true;
+        } else throw error;
+      }
+    }
+  }
+  refreshAggregate(state.accumulator);
 
   if (readInterrupted && rowsRead === 0) {
     return finish({
@@ -1368,22 +1720,32 @@ export async function updateSessionSummary(
     // The read worker may have seen an older snapshot of a row that was still
     // beyond the durable cursor. Retry that slice; the prior cursor remains
     // valid and the next worker read sees the edit.
-    if (!activityStable) return { revisionStable, activityStable, noQueuedRows };
-    const finalComplete = complete && revisionStable && noQueuedRows;
+    if (!activityStable) return {
+      revisionStable, activityStable, noQueuedRows,
+      finalComplete: false, repairsRemaining: true,
+    };
+    if (completedRepair !== null) {
+      db.prepare(`delete from session_sync_summary_repairs
+        where session_id = ? and segment = ? and revision = ?`)
+        .run(sessionId, completedRepair.segment, completedRepair.revision);
+    }
+    const repairsRemaining = repairQueueRow(db, sessionId) !== null ||
+      state.accumulator.activeRepair !== null || dueSegment(state.accumulator, until) !== null;
+    const finalComplete = complete && revisionStable && noQueuedRows && !repairsRemaining;
     state.complete = finalComplete;
     state.mode = complete ? "incremental" : needsFallback ? "fallback" : state.mode;
     writeState(db, state);
     // The historical dirty cause is discharged once that scan is stable.
     // A post-boundary append remains in the durable queue and resumes in
     // incremental mode next cycle, even if its observed time sorts earlier.
-    if (complete && revisionStable) {
+    if (finalComplete) {
       db.prepare(`delete from session_sync_summary_dirty where session_id = ?`).run(sessionId);
     }
     if (finalComplete) {
       db.prepare(`delete from session_sync_summary_rows where session_id = ? and raw_rowid <= ?`)
         .run(sessionId, state.highWater);
     }
-    return { revisionStable, activityStable, noQueuedRows };
+    return { revisionStable, activityStable, noQueuedRows, finalComplete, repairsRemaining };
   }).immediate());
   const stable = stability.revisionStable && stability.activityStable && stability.noQueuedRows;
 
@@ -1391,8 +1753,8 @@ export async function updateSessionSummary(
     ? "fallback"
     : mode === "initial" ? "initial" : "incremental";
   return finish({
-    snapshot: complete && stable ? snapshot(state.accumulator) : null,
-    complete: complete && stable,
+    snapshot: stability.finalComplete && stable ? snapshot(state.accumulator) : null,
+    complete: stability.finalComplete && stable,
     rowsRead,
     rowsApplied,
     durationMs: Math.round(performance.now() - started),
@@ -1402,6 +1764,7 @@ export async function updateSessionSummary(
     fallbackReason: fullRecompute ? reason
       : !stability.revisionStable ? "ledger_mutation_during_slice"
       : !stability.activityStable ? "ledger_edit_during_slice"
+      : stability.repairsRemaining ? "segment_repair_in_progress"
       : !complete && state.mode === "fallback" ? "fallback_in_progress"
       : !stability.noQueuedRows ? "append_queue" : null,
     mutationRevision: state.mutationRevision,
