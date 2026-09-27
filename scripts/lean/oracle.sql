@@ -151,42 +151,43 @@ select days,group_name,group_key,metric,sum(value) as value
 from oracle_epoch_values group by days,group_name,group_key,metric;
 create index oracle_values_key on oracle_values(days,group_name,group_key,metric);
 
--- Session and dimensional groups have epoch-scoped row identities. Their
--- presentation is subsequently summed by the five old dashboard windows.
+-- Keep epochs on raw rows and the census, but fold session identities across
+-- epochs here: schema 2 publishes one root per (days,session_hash) and one
+-- source row per (days,session_hash,source).
 create temp table oracle_session_source as
-select days,epoch_key,session_hash,source,min(observed_at) as started_at,max(observed_at) as ended_at,
+select days,'__folded_epochs__' as epoch_key,session_hash,source,min(observed_at) as started_at,max(observed_at) as ended_at,
   count(*) as events,sum(input_tokens is not null) as token_events,
   coalesce(sum(input_tokens),0) as input_tokens,coalesce(sum(output_tokens),0) as output_tokens,
   coalesce(sum(cache_read_tokens),0) as cache_read_tokens,coalesce(sum(cost_nanos),0) as cost_nanos
-from oracle_window_rows where session_hash is not null group by days,epoch_key,session_hash,source;
+from oracle_window_rows where session_hash is not null group by days,session_hash,source;
 create temp table oracle_session_repo as
-select days,epoch_key,session_hash,repo_hash,count(*) as events,
+select days,'__folded_epochs__' as epoch_key,session_hash,repo_hash,count(*) as events,
   coalesce(sum(input_tokens),0) as input_tokens,coalesce(sum(output_tokens),0) as output_tokens,
   coalesce(sum(cost_nanos),0) as cost_nanos,count(distinct branch_hash) as branches
 from oracle_window_rows where session_hash is not null and repo_hash is not null
-group by days,epoch_key,session_hash,repo_hash;
+group by days,session_hash,repo_hash;
 create temp table oracle_session_account as
-select days,epoch_key,session_hash,account_hash,count(*) as events,coalesce(sum(cost_nanos),0) as cost_nanos
+select days,'__folded_epochs__' as epoch_key,session_hash,account_hash,count(*) as events,coalesce(sum(cost_nanos),0) as cost_nanos
 from oracle_window_rows where session_hash is not null and account_hash is not null
-group by days,epoch_key,session_hash,account_hash;
+group by days,session_hash,account_hash;
 create temp table oracle_session_root as
 with roots as (
-  select days,epoch_key,session_hash,max(source) as source,max(branch_hash) as branch_hash,
+  select days,'__folded_epochs__' as epoch_key,session_hash,max(source) as source,max(branch_hash) as branch_hash,
     count(*) as events,sum(input_tokens is not null) as token_events,
     coalesce(sum(input_tokens),0) as input_tokens,coalesce(sum(output_tokens),0) as output_tokens,
     coalesce(sum(cache_read_tokens),0) as cache_read_tokens,coalesce(sum(cost_nanos),0) as cost_nanos
-  from oracle_window_rows where session_hash is not null group by days,epoch_key,session_hash
+  from oracle_window_rows where session_hash is not null group by days,session_hash
 ), ranked_repo as (
-  select *,row_number() over(partition by days,epoch_key,session_hash order by events desc,branches desc,repo_hash) as rank
+  select *,row_number() over(partition by days,session_hash order by events desc,branches desc,repo_hash) as rank
   from oracle_session_repo
 ), ranked_account as (
-  select *,row_number() over(partition by days,epoch_key,session_hash order by cost_nanos desc,events desc,account_hash) as rank
+  select *,row_number() over(partition by days,session_hash order by cost_nanos desc,events desc,account_hash) as rank
   from oracle_session_account
 )
 select r.*,p.repo_hash as dominant_repo_hash,a.account_hash as dominant_account_hash,
-  (select count(*) from oracle_session_repo x where x.days=r.days and x.epoch_key=r.epoch_key and x.session_hash=r.session_hash) as repo_count
-from roots r left join ranked_repo p on p.days=r.days and p.epoch_key=r.epoch_key and p.session_hash=r.session_hash and p.rank=1
-left join ranked_account a on a.days=r.days and a.epoch_key=r.epoch_key and a.session_hash=r.session_hash and a.rank=1;
+  (select count(*) from oracle_session_repo x where x.days=r.days and x.session_hash=r.session_hash) as repo_count
+from roots r left join ranked_repo p on p.days=r.days and p.session_hash=r.session_hash and p.rank=1
+left join ranked_account a on a.days=r.days and a.session_hash=r.session_hash and a.rank=1;
 
 insert into oracle_values
 select days,'totals','all','sessions',count(*) from oracle_session_root group by days;
@@ -198,7 +199,7 @@ insert into oracle_values
 select days,'bySource',source,'sessionsWithTokens',sum(token_events>0) from oracle_session_source group by days,source;
 
 -- The old snapshot exposes the top 60 (session,source) rows, with root repo
--- labels and counts. Epoch stays in the row key until presentation.
+-- labels and counts. These rows already have the producer's folded identity.
 create temp table oracle_top_sessions as
 select s.*,r.branch_hash,r.repo_count,r.dominant_repo_hash,
   row_number() over(partition by s.days order by s.cost_nanos desc,s.events desc) as display_rank
@@ -209,11 +210,11 @@ with assigned as (
   select days,epoch_key,session_hash,repo_hash,input_tokens,output_tokens,cost_nanos
   from oracle_session_repo
   union all
-  select u.days,u.epoch_key,u.session_hash,r.dominant_repo_hash,
+  select u.days,r.epoch_key,u.session_hash,r.dominant_repo_hash,
     coalesce(sum(u.input_tokens),0),coalesce(sum(u.output_tokens),0),coalesce(sum(u.cost_nanos),0)
-  from oracle_window_rows u join oracle_session_root r using(days,epoch_key,session_hash)
+  from oracle_window_rows u join oracle_session_root r on r.days=u.days and r.session_hash=u.session_hash
   where u.repo_hash is null and u.session_hash is not null
-  group by u.days,u.epoch_key,u.session_hash
+  group by u.days,u.session_hash
 )
 select days,epoch_key,session_hash,repo_hash,
   coalesce(sum(input_tokens),0) as input_tokens,coalesce(sum(output_tokens),0) as output_tokens,
@@ -224,7 +225,7 @@ select x.days,x.repo_hash,count(*) as sessions,
   coalesce(sum(x.input_tokens),0) as input_tokens,coalesce(sum(x.output_tokens),0) as output_tokens,
   coalesce(sum(x.cost_nanos),0) as cost_nanos,
   (select count(distinct b.branch_hash) from oracle_window_rows b
-    join oracle_session_root r using(days,epoch_key,session_hash)
+    join oracle_session_root r on r.days=b.days and r.session_hash=b.session_hash
     where b.days=x.days and coalesce(b.repo_hash,r.dominant_repo_hash) is x.repo_hash
       and b.branch_hash is not null) as branch_refs
 from oracle_repo_sessions x group by x.days,x.repo_hash;
@@ -245,5 +246,5 @@ select s.days,s.account_hash,count(*) as sessions,
 from oracle_account_sessions s group by s.days,s.account_hash;
 create temp table oracle_account_machines as
 select distinct s.days,s.account_hash,r.machine_hash from oracle_account_sessions s
-join oracle_window_rows r using(days,epoch_key,session_hash)
+join oracle_window_rows r on r.days=s.days and r.session_hash=s.session_hash
 where r.machine_hash is not null;
