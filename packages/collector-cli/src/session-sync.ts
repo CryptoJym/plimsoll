@@ -708,8 +708,16 @@ export function planDaemonSessionSync(input: {
 export async function listLedgerSessionIdsOffThread(
   ledger: Database.Database,
   options: { until: string; since?: string | null; excludedIds?: string[]; maxIds?: number;
-    allSessions?: boolean; afterId?: string | null },
+    allSessions?: boolean; afterId?: string | null; proofReadMaxMs?: number },
 ): Promise<string[]> {
+  if (options.proofReadMaxMs !== undefined && !process.env.PLIMSOLL_PROOF_ROOT) {
+    throw new Error("proof_session_id_read_requires_disposable_root");
+  }
+  if (options.proofReadMaxMs !== undefined &&
+      (!Number.isSafeInteger(options.proofReadMaxMs) || options.proofReadMaxMs < 250)) {
+    throw new Error("proof_session_id_read_deadline_invalid");
+  }
+  const readMaxMs = options.proofReadMaxMs ?? 250;
   const excluded = new Set(options.excludedIds ?? []);
   // The planner only needs an overflow signal; a full catch-up needs every
   // session. Reuse one worker across bounded pages rather than opening a new
@@ -742,7 +750,7 @@ export async function listLedgerSessionIdsOffThread(
           from session_ids where session_id is not null
         ) select session_id as sessionId from session_ids
           where session_id is not null limit @pageSize`,
-        params: { cursor, pageSize }, maxMs: 250,
+        params: { cursor, pageSize }, maxMs: readMaxMs,
       } : {
         sql: `select e.created_at as createdAt, e.id, e.session_id as sessionId
           from buffered_events e indexed by idx_events_retention
@@ -751,7 +759,7 @@ export async function listLedgerSessionIdsOffThread(
               or (e.created_at = @createdCursor and e.id > @idCursor))
           order by e.created_at, e.id limit @pageSize`,
         params: { until: options.until, createdCursor: createdCursor ?? "", idCursor: idCursor ?? "", pageSize },
-        maxMs: 250,
+        maxMs: readMaxMs,
       };
       const rows = await reader.read<{ sessionId: string | null; createdAt?: string; id?: string }>([query]);
       for (const row of rows) {
