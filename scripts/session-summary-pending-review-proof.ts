@@ -134,11 +134,30 @@ async function latePendingReasonClearsOnCompletion() {
   } finally { writer?.close(); buffer.close(); }
 }
 
+async function plannerToleratesLedgerWithoutPendingTable() {
+  const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa45";
+  const buffer = new LocalEventBuffer(path.join(root, "pre-pending-ledger.sqlite"));
+  try {
+    appendOne(buffer, sessionId, "00000000-0000-4000-8000-000000000145");
+    ensureSessionSummarySchema(buffer.database);
+    // A ledger from before #412 has the summary state and dirty tables, with work waiting,
+    // but no pending table: its lazy summary migrations have not run yet.
+    buffer.database.prepare(`insert into session_sync_summary_dirty (session_id, reason, updated_at)
+      values (?, 'raw_row_moved', ?)`).run(sessionId, new Date().toISOString());
+    buffer.database.exec("drop table session_sync_summary_pending");
+    const until = new Date().toISOString();
+    const ids = listSessionSummaryPendingIds(buffer.database, until);
+    assert.ok(ids.includes(sessionId), JSON.stringify(ids));
+    completion.check("planner_tolerates_ledger_without_pending_table");
+  } finally { buffer.close(); }
+}
+
 async function main() {
   const selected = process.argv.find((arg) => arg.startsWith("--case="))?.slice("--case=".length);
-  if (selected && selected !== "planner" && selected !== "completion") throw new Error("unknown proof case");
+  if (selected && selected !== "planner" && selected !== "completion" && selected !== "upgrade") throw new Error("unknown proof case");
   if (!selected || selected === "planner") await pendingReasonReplansCompleteSummary();
   if (!selected || selected === "completion") await latePendingReasonClearsOnCompletion();
+  if (!selected || selected === "upgrade") await plannerToleratesLedgerWithoutPendingTable();
   completion.complete();
 }
 
