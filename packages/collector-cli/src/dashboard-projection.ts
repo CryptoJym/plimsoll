@@ -3084,6 +3084,7 @@ export class DashboardProjectionStore {
     let backfillRowsVisited = 0;
     let parityRowsVisited = 0;
     let duplicateFactScanRowsVisited = 0;
+    let duplicateFactScanExhausted = false;
     let repairRowsVisited = 0;
     let dirtySessionsVisited = 0;
     let sessionRepairRowsVisited = 0;
@@ -3130,16 +3131,15 @@ export class DashboardProjectionStore {
         ).all(duplicateScan.cursor, DUPLICATE_FACT_SCAN_ROWS) as
           Array<{ rawRowid: number; duplicateReason: string | null }>;
         duplicateFactScanRowsVisited = candidates.length;
+        duplicateFactScanExhausted = candidates.length < DUPLICATE_FACT_SCAN_ROWS;
         const queue = this.db.prepare(`insert or ignore into dashboard_projection_repairs
           (raw_rowid, reason, queued_at) values (?, 'legacy_usage_duplicate', ?)`);
         for (const candidate of candidates) {
           if (candidate.duplicateReason !== null) queue.run(candidate.rawRowid, now.toISOString());
         }
         this.db.prepare(`update codex_duplicate_fact_scan
-          set cursor_raw_rowid=?, complete=? where singleton=1`).run(
-          candidates.at(-1)?.rawRowid ?? duplicateScan.cursor,
-          candidates.length < DUPLICATE_FACT_SCAN_ROWS ? 1 : 0,
-        );
+          set cursor_raw_rowid=? where singleton=1`).run(
+          candidates.at(-1)?.rawRowid ?? duplicateScan.cursor);
       }
       if (!control.backfillComplete) {
         const rows = this.db.prepare(
@@ -3224,6 +3224,13 @@ export class DashboardProjectionStore {
       this.db.prepare(
         `update dashboard_projection_control set repair_facts=repair_facts+? where singleton=1`,
       ).run(repairs.length);
+      // The scan is settled only after its queued repairs have drained. A
+      // clean pass also gives parity and snapshot publication the same fast
+      // tick before automatic maintenance drops the scan cadence.
+      if (duplicateFactScanExhausted && repairRowsVisited === 0 &&
+          this.control().repairBacklog === 0) {
+        this.db.prepare(`update codex_duplicate_fact_scan set complete=1 where singleton=1`).run();
+      }
       const preGc=this.control();
       // Finish mutation/repair admission first. This freezes the useful GC
       // revision once per burst instead of repeatedly rescanning a hot day
