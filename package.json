@@ -158,6 +158,7 @@
     "proof:ingest-liveness": "tsx scripts/ingest-liveness-proof.ts",
     "proof:privacy-mode": "tsx scripts/privacy-mode-proof.ts",
     "proof:stop-window-probe": "tsx scripts/stop-window-probe-proof.ts",
+    "proof:stop-window-release": "tsx scripts/stop-window-release-proof.ts",
     "proof:system-e2e": "tsx scripts/system-e2e-proof.ts",
     "proof:system-e2e:path-normalization": "tsx scripts/system-e2e-path-normalization-proof.ts",
     "proof:system-e2e:verify": "tsx scripts/system-e2e-verifier.ts",
