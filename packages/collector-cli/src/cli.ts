@@ -154,7 +154,7 @@ import {
   validateCaptureRoots,
   type CaptureRoot,
 } from "./capture-root-inventory";
-import { bindDispatch,closeDispatch,restampDispatch } from "./dispatch-command";
+import { bindDispatch,closeDispatch,countUnlinkableDispatchBindings,restampDispatch } from "./dispatch-command";
 import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
 import { OtlpIntakeSpool } from "./otlp-spool";
 import { releaseStopWindowListener, runStopWindowListener, withStopWindowRelease } from "./stop-window-listener";
@@ -206,7 +206,7 @@ import {
   resolveSelfArtifact,
 } from "./lifecycle-adapters";
 import { PURGE_CONFIRMATION } from "./lifecycle";
-import { startStatusSummaryWriter, type StatusSummaryWriter } from "./status-summary";
+import { startStatusSummaryWriter, summaryPendingStatus, type StatusSummaryWriter } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
 import {
   applyCodexConfig,
@@ -394,12 +394,13 @@ Commands:
                         --allow-scan-errors registers a root whose walk is
                         ambiguous: the entries are named in the receipt and
                         left unfenced (so they are captured, not excluded)
-  dispatch bind --session-id S --work-item-id KEY --project-key sha256:HASH --attempt-id LANE
+  dispatch bind --session-id S --work-item-id beads:eco-ID --project-key sha256:HASH --attempt-id UUIDv4
                 [--parent-attempt-id LEAD_SESSION] [--role author|reviewer|lead]
                 [--work-class C] [--complexity-band B]
                 [--technique-id T --technique-version V --assignment-id A --arm control|treatment]
-                [--launched-by PERSON] --valid-from ISO [--valid-until ISO]
-                        Bind a session before its first event in every enrolled capture root
+                [--launched-by PERSON] --valid-from ISO [--valid-until ISO] [--strict]
+                        Bind a session before its first event in every enrolled capture root.
+                        Unlinkable IDs warn; --strict rejects them.
   dispatch close --attempt-id LANE
                         Close the lane's binding and prune old bindings
   dispatch restamp --attempt-id LANE
@@ -3879,6 +3880,8 @@ async function main() {
           reconciliation: codexReconciliationStatus(buffer.database),
           codexUsagePairing: codexUsagePairingStatus(buffer.database),
           sessionAttribution: sessionContextIndexStatus(buffer.database),
+          summaryPending: summaryPendingStatus(buffer.database),
+          unlinkableBindCount: countUnlinkableDispatchBindings(config.captureRoots ?? []),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
           learningFacts: buffer.learningFacts.statusWithWindow(),

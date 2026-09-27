@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import type Database from "better-sqlite3";
 
 /**
  * A small private summary the running daemon keeps for local readers such as
@@ -84,6 +85,53 @@ export function statusSummaryStats(stats: unknown): StatusSummaryStats | null {
     totalInputTokens: counter("totalInputTokens"),
     totalOutputTokens: counter("totalOutputTokens"),
   };
+}
+
+/** Fixed categories keep unexpected ledger text out of every status surface. */
+const PENDING_REASONS = [
+  "rows_read_timeout", "rows_read_stuck", "checkpoint_timeout", "newer_read_timeout",
+  "ledger_mutation", "ledger_mutation_during_slice", "ledger_edit_during_slice",
+  "accumulator_corrupt", "schema_version", "high_water_invalid", "covered_until_invalid",
+  "until_rollback", "future_horizon", "checkpoint_mismatch", "dirty_marker",
+  "append_queue", "initial_in_progress", "incremental_in_progress",
+  "fallback_in_progress", "cached_in_progress",
+] as const;
+
+export type SummaryPendingStatus = {
+  pendingCount: number | null;
+  reasonCounts: Record<string, number>;
+  freshness: { observedAt: string; oldestPendingAt: string | null; latestUpdateAt: string | null };
+};
+
+/** One bounded aggregate over durable reasons; no session id or raw reason leaves SQLite. */
+export function summaryPendingStatus(db: Database.Database, now = new Date()): SummaryPendingStatus {
+  const freshness = { observedAt: now.toISOString(), oldestPendingAt: null as string | null,
+    latestUpdateAt: null as string | null };
+  const exists = db.prepare("select 1 from sqlite_master where type='table' and name='session_sync_summary_pending'").get();
+  if (!exists) return { pendingCount: null, reasonCounts: {}, freshness };
+  const known = PENDING_REASONS.map((reason) => `'${reason}'`).join(", ");
+  const rows = db.prepare(`select case when reason in (${known}) then reason else 'other' end as category,
+      count(*) as count, min(updated_at) as oldestAt, max(updated_at) as latestAt
+    from session_sync_summary_pending group by category`).all() as Array<{
+      category: string; count: number; oldestAt: string | null; latestAt: string | null;
+    }>;
+  const safeTime = (value: string | null): string | null => {
+    if (!value) return null;
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) && date.toISOString() === value ? value : null;
+  };
+  const reasonCounts: Record<string, number> = {};
+  let pendingCount = 0;
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.count) || row.count < 0) continue;
+    reasonCounts[row.category] = row.count;
+    pendingCount += row.count;
+    const oldest = safeTime(row.oldestAt);
+    const latest = safeTime(row.latestAt);
+    if (oldest && (!freshness.oldestPendingAt || oldest < freshness.oldestPendingAt)) freshness.oldestPendingAt = oldest;
+    if (latest && (!freshness.latestUpdateAt || latest > freshness.latestUpdateAt)) freshness.latestUpdateAt = latest;
+  }
+  return { pendingCount, reasonCounts, freshness };
 }
 
 /** The collector home a writer started in, pinned by device and inode. */

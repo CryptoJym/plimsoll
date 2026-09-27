@@ -203,6 +203,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding
 
+      - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:dispatch-bind-linkability
+
       - name: Prove bound Codex dispatch survives response pairing (eco-6hoxj.163.99)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-pairing-integration
@@ -319,6 +323,14 @@ jobs:
       - name: Prove session summaries resume across moving daemon horizons (eco-6hoxj.163.86)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-cycle-resume
+
+      - name: Prove zero-row summary stalls recover after bounded retry (eco-6hoxj.163.115)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-stall
+
+      - name: Prove pending summary reasons and freshness in private status (eco-6hoxj.163.116)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:status-pending-reasons
 
       - name: Prove active-session edits and delivery acks do not stall summary sync (eco-6hoxj.163.87)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
