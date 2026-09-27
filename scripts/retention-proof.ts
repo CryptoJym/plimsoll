@@ -261,6 +261,56 @@ try {
     const after = buffer.retentionProgressStatus(90, now);
     assert.equal(after.states.heldForUpload, overdueHeld);
     assert.equal(after.lastPass.heldForUploadExact, true);
+    assert.equal(after.lastPass.heldForUploadAsOfCutoff, first.policy.cutoffAt);
+
+    // The worker's count is exact at its own cutoff. HTTP status is refreshed
+    // with a new clock value, so its policy cutoff must not relabel that count.
+    const originalRefresh = buffer.refreshRetentionHoldCount.bind(buffer);
+    let laterWorkerRequests = 0;
+    buffer.refreshRetentionHoldCount = (days, at) => {
+      laterWorkerRequests += 1;
+      return originalRefresh(days, at);
+    };
+    let refreshStatus: (() => boolean) | undefined;
+    const server = createCollectorServer(collectorConfigSchema.parse({ retentionDays: 90 }), buffer, {
+      registerStatusRefresher: (refresh) => { refreshStatus = refresh; },
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const statusUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/status`;
+      const readStatus = async () => {
+        const response = await fetch(statusUrl);
+        assert.equal(response.status, 200);
+        return response.json() as Promise<{ retention?: {
+          policy?: { cutoffAt?: string };
+          states?: { heldForUpload?: number };
+          lastPass?: { heldForUploadExact?: boolean; heldForUploadAsOfCutoff?: string | null };
+        } }>;
+      };
+      const httpAfterWorker = await readStatus();
+      assert.equal(httpAfterWorker.retention?.states?.heldForUpload, overdueHeld);
+      assert.equal(httpAfterWorker.retention?.lastPass?.heldForUploadExact, true);
+      assert.equal(httpAfterWorker.retention?.lastPass?.heldForUploadAsOfCutoff, first.policy.cutoffAt);
+      assert.notEqual(httpAfterWorker.retention?.policy?.cutoffAt, first.policy.cutoffAt);
+
+      assert.equal(refreshStatus?.(), true);
+      const later = await readStatus();
+      assert.equal(later.retention?.states?.heldForUpload, overdueHeld);
+      assert.equal(later.retention?.lastPass?.heldForUploadExact, true);
+      assert.equal(later.retention?.lastPass?.heldForUploadAsOfCutoff, first.policy.cutoffAt);
+      assert.notEqual(later.retention?.policy?.cutoffAt, first.policy.cutoffAt);
+      assert.equal(laterWorkerRequests, 0, "fresh cached status must not start another worker");
+      console.log(JSON.stringify({ fixture: "offline_status_http", heldForUpload: overdueHeld,
+        exact: later.retention?.lastPass?.heldForUploadExact,
+        asOfCutoff: later.retention?.lastPass?.heldForUploadAsOfCutoff,
+        currentPolicyCutoff: later.retention?.policy?.cutoffAt,
+        laterWorkerRequests }));
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
     console.log(JSON.stringify({ fixture: "offline_status", overdueHeld, refreshMs,
       exactAfterPrune: after.states.heldForUpload }));
     buffer.close();

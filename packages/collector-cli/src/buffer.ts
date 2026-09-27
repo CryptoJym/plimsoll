@@ -3202,7 +3202,9 @@ export class LocalEventBuffer {
     let heldForUploadExact: boolean;
     if (fresh) {
       heldForUpload = cached.count;
-      heldForUploadExact = cached.cutoffAt === cutoffAt;
+      // Exactness describes the completed count at its own cutoff, even when
+      // this status refresh has advanced the policy cutoff by milliseconds.
+      heldForUploadExact = true;
     } else {
       // Never walk an offline backlog on the collector's event loop. A small
       // ledger is exact here; the read-only worker counts a larger one.
@@ -3231,7 +3233,8 @@ export class LocalEventBuffer {
       lastPass: {rowsVisited:pass.rowsVisited,rowsExpired:pass.rowsExpired,
         hasMore:Boolean(pass.hasMore),at:pass.at,
         heldForUploadExact,
-        heldForUploadAsOfCutoff: heldForUploadExact ? cutoffAt : cached?.cutoffAt ?? null,
+        heldForUploadAsOfCutoff: fresh ? cached.cutoffAt :
+          heldForUploadExact ? cutoffAt : cached?.cutoffAt ?? null,
         migrationProtectedRows:scan ? Number(JSON.parse(scan.value).migrationProtectedRows ?? 0) : 0},
     };
   }
