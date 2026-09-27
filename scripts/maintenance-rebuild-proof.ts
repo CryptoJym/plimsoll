@@ -16,6 +16,7 @@ import {
   acquireRebuildOpenToken,
   releaseRebuildOpenToken,
   readMaintenanceRebuildHeadroomStatus,
+  observeRebuildConnectionOwnership, connectionOwnershipClosed,
 } from "../packages/collector-cli/src/maintenance-rebuild";
 
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-rebuild-proof-")));
@@ -50,19 +51,27 @@ async function main() {
   console.log(JSON.stringify({ check: "cli_copy_rebuild", exit: cli.status }));
   const leasedLedger = path.join(root, "leases.sqlite");
   const writer = new LocalEventBuffer(leasedLedger);
-  assert.deepEqual(readActiveRebuildWriterLeases(writer.database).map((lease) => lease.module).sort(),
-    [...REQUIRED_REBUILD_WRITERS].sort());
+  assert.deepEqual(readActiveRebuildWriterLeases(writer.database),
+    [{ pid: process.pid, owner: "local_event_buffer" }]);
+  const observedWriter = observeRebuildConnectionOwnership(leasedLedger);
+  assert.equal(observedWriter.writerLeases.length, 1);
+  assert.equal(observedWriter.openTokens.length, 1);
   writer.close();
   const leaseRead = new Database(leasedLedger, { readonly: true });
   assert.equal(readActiveRebuildWriterLeases(leaseRead).length, 0);
   leaseRead.close();
-  console.log(JSON.stringify({ check: "named_writer_leases", modules: REQUIRED_REBUILD_WRITERS.length }));
+  console.log(JSON.stringify({ check: "observed_connection_owner", observedWriter }));
+  const quiesce = async (file: string) => {
+    const before = observeRebuildConnectionOwnership(file);
+    const after = observeRebuildConnectionOwnership(file);
+    return { before, after, connectionsClosed: connectionOwnershipClosed(after) };
+  };
   fixture();
   const base = { ledgerPath: ledger, stage: "S10" as const, walHighWaterBytes: 0, copyDrill: true };
   const delayedWriterToken = acquireRebuildOpenToken(ledger);
   try {
     await assert.rejects(() => rebuildLedger({ ...base,
-      quiesce: async () => ({ modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true }),
+      quiesce: () => quiesce(ledger),
       resume: async () => undefined,
     }), /writer_not_quiesced/);
   } finally { releaseRebuildOpenToken(delayedWriterToken); }
@@ -101,12 +110,12 @@ async function main() {
   const before = fs.readFileSync(ledger);
   let resumed = 0;
   await assert.rejects(() => rebuildLedger({ ...base,
-    quiesce: async () => ({ modules: REQUIRED_REBUILD_WRITERS.slice(1), connectionsClosed: true }),
+    quiesce: async () => ({ ...await quiesce(ledger), connectionsClosed: false }),
     resume: async () => { resumed += 1; },
   }), /writer_not_quiesced/);
   assert.deepEqual(fs.readFileSync(ledger), before);
   const result = await rebuildLedger({ ...base,
-    quiesce: async () => ({ modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true }),
+    quiesce: () => quiesce(ledger),
     resume: async () => {
       assert.equal(fs.existsSync(`${ledger}.maintenance-rebuild.lock`), false);
       resumed += 1;
@@ -129,7 +138,7 @@ async function main() {
   const oldHash = fs.readFileSync(failing);
   let resumeAfterFailure = 0;
   await assert.rejects(() => rebuildLedger({ ...base, ledgerPath: failing,
-    quiesce: async () => ({ modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true }),
+    quiesce: () => quiesce(failing),
     reopen: () => { throw new Error("forced_reopen_failure"); },
     resume: async () => { resumeAfterFailure += 1; },
   }), /forced_reopen_failure/);
@@ -141,7 +150,7 @@ async function main() {
   fixture(manual);
   const manualBefore = fs.readFileSync(manual);
   await assert.rejects(() => rebuildLedger({ ...base, ledgerPath: manual,
-    quiesce: async () => ({ modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true }),
+    quiesce: () => quiesce(manual),
     reopen: (file) => { renameBackBeforeResume(file); throw new Error("manual_rename_back_complete"); },
     resume: async () => undefined,
   }), /manual_rename_back_complete/);
@@ -153,7 +162,7 @@ async function main() {
   fixture(busy);
   let resumedAfterBusy = false;
   await assert.rejects(() => rebuildLedger({ ...base, ledgerPath: busy,
-    quiesce: async () => ({ modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true }),
+    quiesce: () => quiesce(busy),
     checkpoint: () => [{ busy: 1, log: 1, checkpointed: 0 }],
     resume: async () => { resumedAfterBusy = true; },
   }), /wal_not_empty_after_checkpoint/);
@@ -164,7 +173,7 @@ async function main() {
   const interrupted = path.join(root, "interrupted.sqlite");
   fixture(interrupted);
   await assert.rejects(() => rebuildLedger({ ...base, ledgerPath: interrupted,
-    quiesce: async () => ({ modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true }),
+    quiesce: () => quiesce(interrupted),
     resume: async () => undefined,
     afterVacuum: () => { throw new Error("forced_vacuum_interrupt"); },
   }), /forced_vacuum_interrupt/);

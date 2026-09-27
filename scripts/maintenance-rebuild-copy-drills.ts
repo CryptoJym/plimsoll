@@ -8,6 +8,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
   preflightMaintenanceRebuild, rebuildLedger, recoverInterruptedRebuild,
   renameBackBeforeResume, REQUIRED_REBUILD_WRITERS, readActiveRebuildWriterLeases,
+  observeRebuildConnectionOwnership, connectionOwnershipClosed,
 } from "../packages/collector-cli/src/maintenance-rebuild";
 
 const cloneRoot = fs.realpathSync(process.argv[2] ?? "");
@@ -34,7 +35,11 @@ function snapshot() {
 }
 const input = { ledgerPath: ledger, stage: "S10" as const,
   walHighWaterBytes: 0, copyDrill: true };
-const quiesce = async () => ({ modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true });
+const quiesce = async () => {
+  const before = observeRebuildConnectionOwnership(ledger);
+  const after = observeRebuildConnectionOwnership(ledger);
+  return { before, after, connectionsClosed: connectionOwnershipClosed(after) };
+};
 
 async function main() {
   assert.equal(sha256(ledger), originalHash);
@@ -49,24 +54,24 @@ async function main() {
 
     const writer = new LocalEventBuffer(ledger);
     try {
-      const held = readActiveRebuildWriterLeases(writer.database).map((row) => row.module).sort();
-      assert.deepEqual(held, [...REQUIRED_REBUILD_WRITERS].sort());
+      const held = readActiveRebuildWriterLeases(writer.database);
+      assert.deepEqual(held, [{ pid: process.pid, owner: "local_event_buffer" }]);
       await assert.rejects(() => rebuildLedger({ ...input, quiesce,
         resume: async () => undefined }), /writer_not_quiesced/);
-      console.log(JSON.stringify({ check: "writer_refusal", namedLeasesHeld: held.length }));
+      console.log(JSON.stringify({ check: "writer_refusal", observedLeasesHeld: held.length }));
     } finally { writer.close(); }
     const check = new Database(ledger, { readonly: true });
     try { assert.equal(readActiveRebuildWriterLeases(check).length, 0); }
     finally { check.close(); }
-    console.log(JSON.stringify({ check: "writer_leases_released", namedLeasesRemaining: 0 }));
+    console.log(JSON.stringify({ check: "writer_leases_released", observedLeasesRemaining: 0 }));
 
     let resumedAfterIncomplete = false;
     await assert.rejects(() => rebuildLedger({ ...input,
-      quiesce: async () => ({ modules: REQUIRED_REBUILD_WRITERS.slice(1), connectionsClosed: true }),
+      quiesce: async () => ({ ...await quiesce(), connectionsClosed: false }),
       resume: async () => { resumedAfterIncomplete = true; },
-    }), /writer_not_quiesced:dashboard-projection/);
+    }), /writer_not_quiesced/);
     assert.equal(resumedAfterIncomplete, true);
-    console.log(JSON.stringify({ check: "missing_writer_receipt_refusal", resumed: true }));
+    console.log(JSON.stringify({ check: "failed_connection_receipt_refusal", resumed: true }));
 
     const beforeReopenFailure = sha256(ledger);
     let reopenedFailureResumed = false;
@@ -93,7 +98,25 @@ async function main() {
       inventory: before }));
     return;
   }
-  if (mode !== "kill") throw new Error("mode_must_be_main_or_kill");
+  if (mode === "first-rename-kill") {
+    const killed = spawnSync(process.execPath, ["--import", "tsx", "packages/collector-cli/src/cli.ts",
+      "maintenance", "rebuild", "--ledger", ledger, "--copy-drill", "--copy-root", cloneRoot,
+      "--stage", "S10", "--wal-high-water-bytes", "0"], {
+      cwd: process.cwd(), env: { ...process.env, PLIMSOLL_REBUILD_COPY_KILL_AFTER_FIRST_RENAME: "1" },
+      encoding: "utf8", timeout: 180_000,
+    });
+    assert.equal(killed.signal, "SIGKILL", killed.stderr || killed.stdout);
+    assert.equal(fs.existsSync(ledger), false);
+    const recovered = spawnSync(process.execPath, ["--import", "tsx", "packages/collector-cli/src/cli.ts",
+      "maintenance", "rebuild", "--ledger", ledger, "--copy-drill", "--copy-root", cloneRoot,
+      "--recover"], { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 120_000 });
+    assert.equal(recovered.status, 0, recovered.stderr || recovered.stdout);
+    assert.deepEqual(snapshot(), before);
+    console.log(JSON.stringify({ check: "studio5_copy_first_rename_sigkill_cli_recovery",
+      signal: killed.signal, recovered: JSON.parse(recovered.stdout), inventory: before }));
+    return;
+  }
+  if (mode !== "kill") throw new Error("mode_must_be_main_kill_or_first_rename_kill");
   const child = spawn(process.execPath, ["--import", "tsx", "packages/collector-cli/src/cli.ts",
     "maintenance", "rebuild", "--ledger", ledger, "--copy-drill", "--copy-root", cloneRoot,
     "--stage", "S10", "--wal-high-water-bytes", "0"],

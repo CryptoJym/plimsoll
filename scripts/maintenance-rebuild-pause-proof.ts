@@ -7,8 +7,10 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { advanceCaptureFrontier, CAPTURE_WRITE_LAG_MS } from "../packages/collector-cli/src/capture-frontier";
 import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { listHookSpoolFiles } from "../packages/collector-cli/src/hook-spool";
+import { listHookSpoolFiles, writeHookSpoolFile } from "../packages/collector-cli/src/hook-spool";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
+import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
+import { maintenanceRebuildPauseSeen } from "../packages/collector-cli/src/maintenance-rebuild-pause-state";
 import { preflightMaintenanceRebuild, readMaintenanceRebuildHeadroomStatus } from
   "../packages/collector-cli/src/maintenance-rebuild";
 import { OtlpIntakeSpool } from "../packages/collector-cli/src/otlp-spool";
@@ -51,29 +53,39 @@ async function main() {
     assert.equal(pausedStatus.status, 200);
     assert.equal(pausedBody.maintenance?.rebuild, "paused");
     assert.equal(pausedBody.captureClaim?.through, null);
+    const hookBody = JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "fixture-session",
+      timestamp: "2026-09-27T00:00:00.000Z", prompt: "private body" });
+    const hookHeaders = { "content-type": "application/json", "x-plimsoll-token": auth.claudeCodeProducer,
+      "x-plimsoll-event-id": "353aaf50-5a41-4099-a8d9-8ff9ae9c41fb" };
     const hook = await fetch(`http://127.0.0.1:${port}/hooks/claude-code`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-plimsoll-token": auth.claudeCodeProducer },
-      body: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "fixture-session",
-        timestamp: "2026-09-27T00:00:00.000Z", prompt: "private body" }),
+      headers: hookHeaders, body: hookBody,
     });
     assert.equal(hook.status, 503);
     assert.equal(hook.headers.get("retry-after"), "1");
-    assert.equal(listHookSpoolFiles(home).length, 1);
+    const repeatedHook = await fetch(`http://127.0.0.1:${port}/hooks/claude-code`, {
+      method: "POST", headers: hookHeaders, body: hookBody,
+    });
+    assert.equal(repeatedHook.status, 503);
+    assert.equal(listHookSpoolFiles(home).length, 0, "maintenance 503 creates no server hook spool");
+    const otlpBody = JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{
+      name: "handle_responses", traceId: "1".padStart(32, "0"), spanId: "1".padStart(16, "0"),
+      startTimeUnixNano: String(BigInt(Date.now()) * 1_000_000n),
+      attributes: [{ key: "gen_ai.usage.input_tokens", value: { intValue: "5" } }],
+    }] }] }] });
+    const otlpHeaders = { "content-type": "application/json", "x-plimsoll-source": "codex",
+      "x-plimsoll-token": auth.codexProducer };
     const otlp = await fetch(`http://127.0.0.1:${port}/v1/traces`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-plimsoll-source": "codex",
-        "x-plimsoll-token": auth.codexProducer },
-      body: JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{
-        name: "handle_responses", traceId: "1".padStart(32, "0"), spanId: "1".padStart(16, "0"),
-        startTimeUnixNano: String(BigInt(Date.now()) * 1_000_000n),
-        attributes: [{ key: "gen_ai.usage.input_tokens", value: { intValue: "5" } }],
-      }] }] }] }),
+      method: "POST", headers: otlpHeaders, body: otlpBody,
     });
     assert.equal(otlp.status, 503);
     assert.equal(otlp.headers.get("retry-after"), "1");
     const spool = new OtlpIntakeSpool({ home });
-    assert.equal(spool.status().pendingFiles, 1);
+    assert.equal(spool.status().pendingFiles, 0, "maintenance 503 creates no server OTLP spool");
+    const client = await forwardHookOverLoopback(hookBody, { source: "claude_code", port, auth,
+      env: { ...process.env, PLIMSOLL_HOME: home } });
+    assert.ok("spooled" in client && client.spooled, "the real hook client owns the retry spool");
+    assert.equal(listHookSpoolFiles(home).length, 1);
     const pending = captureSpoolState(home);
     assert.equal(pending.maintenanceRebuildPending, true);
     await releaseStopWindowListener(port, home);
@@ -88,12 +100,34 @@ async function main() {
       assert.equal(held?.through, null);
       const hookDrain = createHookSpoolDrain(config, buffer, { home });
       const hookResult = await hookDrain.tick();
-      const otlpResult = await spool.drain(buffer);
       assert.equal(hookResult.recovered, 1);
-      assert.equal(otlpResult.replayed, 1);
+      const otlpResult = await spool.drain(buffer);
+      assert.equal(otlpResult.replayed, 0);
       const drained = captureSpoolState(home);
       assert.equal(drained.pendingFiles, 0);
       assert.equal(drained.maintenanceRebuildPending, false);
+      assert.equal(maintenanceRebuildPauseSeen(home), false, "the drained pause marker is removed");
+      const unrelated = writeHookSpoolFile({ home, source: "claude_code", body: hookBody });
+      assert.ok(unrelated);
+      assert.equal(captureSpoolState(home).maintenanceRebuildPending, false,
+        "later unrelated backlog is not labelled as rebuild pending");
+      fs.unlinkSync(unrelated.path);
+      const normal = createCollectorServer(config, buffer, { localAuth: auth, localAuthHome: home });
+      try {
+        await new Promise<void>((resolve) => normal.listen(0, "127.0.0.1", resolve));
+        const normalPort = (normal.address() as { port: number }).port;
+        const post = (route: string, headers: Record<string, string>, body: string) => fetch(
+          `http://127.0.0.1:${normalPort}${route}`, { method: "POST", headers, body });
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const retriedHook = await post("/hooks/claude-code", hookHeaders, hookBody);
+          assert.equal(retriedHook.status, 202);
+          const retriedOtlp = await post("/v1/traces", otlpHeaders, otlpBody);
+          assert.equal(retriedOtlp.status, 202);
+        }
+        const rows = buffer.database.prepare("select id from buffered_events").all() as Array<{ id: string }>;
+        assert.equal(rows.length, 3, "one client hook, one retried hook and one deterministic OTLP event");
+        assert.equal(new Set(rows.map((row) => row.id)).size, 3);
+      } finally { await new Promise<void>((resolve) => normal.close(() => resolve())); }
       const coveredMs = Date.now();
       for (const source of ["codex", "claude_code", "grok"] as const) {
         advanceCaptureFrontier(buffer.database, source, { complete: true, files: [] },
@@ -124,8 +158,8 @@ async function main() {
         await new Promise<void>((resolve) => statusServer.close(() => resolve()));
       }
     } finally { buffer.close(); }
-    console.log(JSON.stringify({ check: "maintenance_pause_spools_503",
-      hookStatus: hook.status, otlpStatus: otlp.status, hookFiles: 1, otlpFiles: 1,
+    console.log(JSON.stringify({ check: "maintenance_503_client_retry_exactly_once",
+      hookStatus: hook.status, otlpStatus: otlp.status, clientHookFiles: 1, serverHookFiles: 0, serverOtlpFiles: 0,
       pausedStatus: pausedStatus.status, pausedClaimThrough: null,
       drained: true, claimRecovered: true, headroomStatus: true }));
   } finally {

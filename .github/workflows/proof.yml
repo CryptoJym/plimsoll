@@ -336,6 +336,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:stop-window-release
 
+      - name: Prove concurrent release and push durability (eco-6hoxj.164.7 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:stop-window-release-race
+
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
@@ -378,6 +382,8 @@ jobs:
         run: |
           pnpm proof:maintenance-rebuild
           pnpm proof:maintenance-rebuild-pause
+          pnpm proof:maintenance-rebuild-r2
+          pnpm proof:maintenance-rebuild-contract
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:otlp-admission
