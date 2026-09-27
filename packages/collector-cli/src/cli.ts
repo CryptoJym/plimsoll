@@ -3176,6 +3176,12 @@ async function main() {
             try {
               const step = await advanceLegacySessionSummaryRebuild(config, buffer.database);
               legacySummaryRebuild = step.state;
+              if (step.result?.settlements.length) {
+                for (const settlement of step.result.settlements) {
+                  sessionSyncState = recordSessionSyncSettlement(sessionSyncState, settlement);
+                }
+                if (!await persistSessionCarry()) return;
+              }
               const elapsedSeconds = step.state
                 ? Math.max(1, (Date.now() - Date.parse(step.state.startedAt)) / 1_000) : 0;
               const projectedSeconds = step.state && step.state.rowsRead > 0
@@ -3774,7 +3780,6 @@ async function main() {
         collectorVersion: PLIMSOLL_VERSION,
         port: config.port,
         stats: server.plimsollCachedStats,
-        sessionSyncStatus: () => sessionSyncClockSkewStatus(sessionSyncState),
       });
       console.log(
         JSON.stringify({

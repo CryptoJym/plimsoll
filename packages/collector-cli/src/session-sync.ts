@@ -1551,19 +1551,7 @@ export async function runSessionSync(
           if (init?.signal?.aborted) throw new TransportError("deadline_exceeded");
           refusal = null;
           fetchAttempts += 1;
-          const response = await fetchImpl(request, init);
-          if (response.status === 409) {
-            try {
-              const reply = await response.clone().json() as { error?: unknown; serverTime?: unknown };
-              if (typeof reply.serverTime === "string" && reply.serverTime.length <= 40 &&
-                  !Number.isNaN(Date.parse(reply.serverTime)) &&
-                  (reply.error === "session_sync_expired" || reply.error === "session_sync_clock_skew")) {
-                refusal = { status: reply.error === "session_sync_expired" ? "expired" : "clock_skew",
-                  serverTime: new Date(reply.serverTime).toISOString() };
-              }
-            } catch { /* An unrecognized 409 stays an uncertain send. */ }
-          }
-          return response;
+          return fetchImpl(request, init);
         } : fetchImpl;
         const result = await postHistoryBatch({
           url,
@@ -1576,6 +1564,16 @@ export async function runSessionSync(
           maxAttempts,
           timeoutMs: requestTimeoutMs,
           allowPartial: true,
+          onResponse: ({ status, body: reply }) => {
+            if (status !== 409 || !reply || typeof reply !== "object" || Array.isArray(reply)) return;
+            const body = reply as { error?: unknown; serverTime?: unknown };
+            if (typeof body.serverTime === "string" && body.serverTime.length <= 40 &&
+                !Number.isNaN(Date.parse(body.serverTime)) &&
+                (body.error === "session_sync_expired" || body.error === "session_sync_clock_skew")) {
+              refusal = { status: body.error === "session_sync_expired" ? "expired" : "clock_skew",
+                serverTime: new Date(body.serverTime).toISOString() };
+            }
+          },
           beforeSend: () => {
             const fresh = rows.every((row) => snapshotFresh(row.session.id));
             if (!fresh) stale();

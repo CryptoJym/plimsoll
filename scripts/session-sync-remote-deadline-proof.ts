@@ -176,7 +176,7 @@ async function main() {
                 serverTime: new Date(serverTimeMs).toISOString() }), { status: 409 });
         }) as typeof fetch,
       });
-      assert.notEqual(wireBody, "");
+      assert.notEqual(wireBody, "", JSON.stringify({ timeoutSeconds, result }));
       const wire = JSON.parse(wireBody) as { sentAt: string; expiresAt: string };
       assert.equal(Date.parse(wire.expiresAt) - Date.parse(wire.sentAt),
         effectiveTimeoutMs + 10_000,
@@ -335,21 +335,20 @@ async function main() {
       assert.match(daemonSource,
         /for \(const settlement of sessionResult\.settlements\)[\s\S]{0,160}recordSessionSyncSettlement/);
       assert.match(daemonSource, /syncStatus: \(\) =>[\s\S]{0,150}sessionSyncClockSkewStatus/);
-      assert.match(daemonSource, /sessionSyncStatus: \(\) => sessionSyncClockSkewStatus/);
-      completion.check("daemon_wires_skew_streak_into_both_status_surfaces");
+      assert.doesNotMatch(daemonSource, /sessionSyncStatus: \(\) => sessionSyncClockSkewStatus/);
+      completion.check("daemon_wires_skew_streak_into_status_without_changing_v1_summary");
 
       const home = path.join(root, "status-home");
       fs.mkdirSync(home, { mode: 0o700 });
       const writer = startStatusSummaryWriter({ home, instanceId: crypto.randomUUID(),
         healthzKey: Buffer.alloc(32).toString("base64url"), collectorVersion: "fixture",
-        port: 48319, stats: () => ({}),
-        sessionSyncStatus: () => sessionSyncClockSkewStatus(recovered) });
+        port: 48319, stats: () => ({}) });
       await writer.firstWrite;
       await writer.stop();
-      const summary = JSON.parse(fs.readFileSync(path.join(home, STATUS_SUMMARY_FILE), "utf8")) as {
-        sessionSync?: { reason?: string } };
-      assert.equal(summary.sessionSync?.reason, "clock_skew");
-      completion.check("status_summary_names_clock_skew");
+      const summary = JSON.parse(fs.readFileSync(path.join(home, STATUS_SUMMARY_FILE), "utf8")) as Record<string, unknown>;
+      assert.deepEqual(Object.keys(summary).sort(),
+        ["schema", "instanceId", "healthzKey", "collectorVersion", "port", "updatedAt", "stats"].sort());
+      completion.check("status_summary_keeps_v1_keys_during_clock_skew");
 
       const auth = loadOrCreateLocalIngestAuth(home);
       const statusServer = createCollectorServer(config(port), restarted, {

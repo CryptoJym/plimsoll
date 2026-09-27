@@ -368,6 +368,14 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-lease-retry
 
+      - name: Prove legacy rebuild records clock-skew refusals (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-legacy-skew
+
+      - name: Prove session sync refusal reads stay byte-bounded (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-refusal-bound
+
       - name: Prove bounded legacy outbox writer turns and retryable busy refusals (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:studio0-writer-contention

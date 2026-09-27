@@ -604,6 +604,8 @@ export async function postHistoryBatch(input: {
   allowPartial?: boolean;
   /** Rechecked by the transport immediately before every retry's fetch. */
   beforeSend?: () => boolean;
+  /** Observe a fully read, byte-bounded non-success response. */
+  onResponse?: (response: { status: number; body: unknown }) => void;
   log: (line: string) => void;
 }): Promise<{
   accepted: number;
@@ -626,6 +628,7 @@ export async function postHistoryBatch(input: {
         throw new FatalUploadError(`Workspace delivery deferred: ${lastError}. Resume state retained.`);
       }
     }
+    if (response && !response.ok) input.onResponse?.(response);
     if (response?.ok) {
       const acknowledgement = response.acknowledgement;
       if (!acknowledgement) {
