@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
-import * as outcomes from "../packages/collector-cli/src/outcomes-sync";
+import {
+  buildOutcomePush,
+  collectUsageEventLinks,
+  projectWorkUsage,
+  runOutcomesSync,
+} from "../packages/collector-cli/src/outcomes-sync";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { branchLinkageHash, remoteLinkageHash } from "../packages/shared/src/linkage";
 import { allocateEvents, collectAllocationEvents } from "./event-allocation";
 
-assert.equal(typeof (outcomes as Record<string, unknown>).collectUsageEventLinks, "function");
-assert.equal(typeof (outcomes as Record<string, unknown>).projectWorkUsage, "function");
+assert.equal(typeof collectUsageEventLinks, "function");
+assert.equal(typeof projectWorkUsage, "function");
 
 const repoHash = remoteLinkageHash("https://github.com/owner/repo.git")!;
 const branchHash = branchLinkageHash("feature/b")!;
@@ -40,7 +45,7 @@ db.exec(`alter table buffered_events add column input_tokens integer;
   alter table buffered_events add column cost_usd real;
   update buffered_events set input_tokens=10, output_tokens=2`);
 
-const links = outcomes.collectUsageEventLinks(db, {
+const links = collectUsageEventLinks(db, {
   since: "2026-09-26T00:00:00.000Z", until: "2026-09-27T00:00:00.000Z",
 });
 assert.deepEqual(links.map((row) => row.eventId), ["event-a", "event-b", "event-unbound"]);
@@ -54,7 +59,7 @@ const artifacts = [
   { workItemId: workB, artifactRef: "github:owner/repo/pull/13", evidenceRef: "receipt:b" },
 ];
 const project = (accepted = artifacts, explicitJoinEnabled = true) =>
-  outcomes.projectWorkUsage(links, pulls, repoHash, "owner/repo", accepted, { explicitJoinEnabled });
+  projectWorkUsage(links, pulls, repoHash, "owner/repo", accepted, { explicitJoinEnabled });
 const joined = project();
 assert.deepEqual(joined.map((row) => [row.eventId, row.workItemId, row.runId, row.pull, row.via]), [
   ["event-a", workA, runA, 12, "work_id"],
@@ -62,7 +67,7 @@ assert.deepEqual(joined.map((row) => [row.eventId, row.workItemId, row.runId, ro
   ["event-unbound", null, null, 13, "inferred_git"],
 ]);
 assert.equal(new Set(joined.map((row) => row.eventId)).size, 3);
-const push = outcomes.buildOutcomePush({
+const push = buildOutcomePush({
   tenantId: "63f4c837-f137-40b9-8495-91dc8f20cd39", owner: "owner", repo: "repo", pulls,
   joins: joined.filter((row) => row.pull !== null && row.sessionId !== null).map((row) => ({
     pull: row.pull!, sessionId: row.sessionId!, via: row.via as "work_id" | "inferred_git",
@@ -115,13 +120,13 @@ async function operational() {
   const base = { repository: "owner/repo", ledgerDb: db, githubToken: "fixture-token",
     fetchImpl: fakeFetch, until: "2026-09-27T00:00:00.000Z", dryRun: true,
     log: () => {} };
-  const explicit = await outcomes.runOutcomesSync(config, { ...base, workArtifacts: artifacts });
+  const explicit = await runOutcomesSync(config, { ...base, workArtifacts: artifacts });
   assert.equal(explicit.pullsJoined, 2);
   assert.ok(explicit.auditTable.includes("work_id"));
-  const noArtifact = await outcomes.runOutcomesSync(config, { ...base, workArtifacts: [] });
+  const noArtifact = await runOutcomesSync(config, { ...base, workArtifacts: [] });
   assert.equal(noArtifact.pullsJoined, 1);
   assert.ok(noArtifact.auditTable.includes("inferred_git"));
-  const disabled = await outcomes.runOutcomesSync(config,
+  const disabled = await runOutcomesSync(config,
     { ...base, workArtifacts: artifacts, explicitJoinEnabled: false });
   assert.equal(disabled.pullsJoined, 1);
   assert.ok(disabled.auditTable.includes("inferred_git"));
