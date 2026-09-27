@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import Database from "better-sqlite3";
+import { openRebuildFencedDatabase } from "./rebuild-open-gate";
 
 import {
   outcomeTimelineBackfillStateSchema,
@@ -49,9 +50,10 @@ export class OutcomeTimelineStore {
 
   constructor(databasePath: string) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true });
-    this.database = new Database(databasePath);
-    this.database.pragma("journal_mode = WAL");
-    this.database.exec(`
+    this.database = openRebuildFencedDatabase(databasePath);
+    try {
+      this.database.pragma("journal_mode = WAL");
+      this.database.exec(`
       create table if not exists outcome_timeline_facts (
         external_id text primary key,
         repository_external_id text not null,
@@ -109,7 +111,11 @@ export class OutcomeTimelineStore {
         generation integer not null
       );
       insert or ignore into outcome_timeline_performance_state (singleton, generation) values (1, 0);
-    `);
+      `);
+    } catch (error) {
+      this.database.close();
+      throw error;
+    }
   }
 
   private appendFactsInternal(facts: PullTimelineFact[], now: string): AppendFactResult {

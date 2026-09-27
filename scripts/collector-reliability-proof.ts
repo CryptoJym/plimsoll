@@ -64,6 +64,7 @@ async function main() {
   await check("stale_status_cache_is_not_current", async () => {
     const buffer = fixture("status"); buffer.append(event()); settle(buffer);
     const http = await serve(buffer);
+    const originalPrepare = buffer.database.prepare;
     try {
       Date.now = () => now + 12 * 3_600_000;
       // Availability must survive even a completely unavailable ledger.
@@ -74,7 +75,7 @@ async function main() {
       assert.equal(result.projection.ready, false);
       assert.ok(result.statusFreshness.lastGoodAt);
       return result.statusFreshness;
-    } finally { await http.close(); buffer.close(); }
+    } finally { buffer.database.prepare = originalPrepare; await http.close(); buffer.close(); }
   });
   await check("dirty_get_preserves_generation_and_never_writes", async () => {
     const buffer = fixture("dirty"); const item = event(); buffer.append(item); settle(buffer);

@@ -2,6 +2,7 @@
 import { AutomaticRetentionCadence } from "./retention-cadence";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
+import { openRebuildFencedDatabase } from "./rebuild-open-gate";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -167,7 +168,12 @@ import {
   type HookSpoolDaemonReading,
 } from "./hook-spool";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
+import { preflightMaintenanceRebuild, rebuildLedger, recoverInterruptedRebuild,
+  renameBackBeforeResume, readMaintenanceRebuildHeadroomStatus, canonicalRecoveryLedgerPath,
+  observeRebuildConnectionOwnership, connectionOwnershipClosed,
+  type RebuildStage, type RebuildHeadroomStatus } from "./maintenance-rebuild";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
+import { claimRebuildResumePermit } from "./rebuild-open-gate";
 import { WalCheckpointWorker } from "./wal-checkpoint-worker";
 import {
   MAINTENANCE_CENSUS_QUERIES,
@@ -326,10 +332,10 @@ import {
 
 const command = process.argv[2] ?? "help";
 
-async function startStopWindowChild(port: number) {
+async function startStopWindowChild(port: number, mode: "stop_window" | "maintenance_rebuild" = "stop_window") {
   const nonce = randomUUID();
   const child = spawn(process.execPath, [
-    ...process.execArgv, process.argv[1] ?? "", "__stop_window_listener", nonce,
+    ...process.execArgv, process.argv[1] ?? "", "__stop_window_listener", nonce, mode,
   ], {
     detached: true,
     stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -369,6 +375,11 @@ Commands:
                         (credentialed daemon /status; liveness is GET /healthz)
   maintenance --disable-account-assertion SOURCE --yes
                         Toggle one adapter; writes only account assertion state
+  maintenance rebuild --ledger ABSOLUTE_PATH --stage S10|ABORT --wal-high-water-bytes N
+                        Reclaim a stage-ready ledger under a full writer pause;
+                        --copy-drill --copy-root ABSOLUTE_DIR confines a rehearsal
+                        --recover restores an interrupted pre-resume source;
+                        --rename-back refuses once a writer may have resumed
   --disable-account-assertion SOURCE
                         Disable one account assertion adapter (requires --yes)
   --enable-account-assertion SOURCE
@@ -654,6 +665,7 @@ function accountAssertionSourceFromArg(value: string | undefined): AccountAssert
 }
 
 function accountAssertionMutationFromArgs() {
+  if (process.argv[2] === "maintenance" && process.argv[3] === "rebuild") return null;
   const direct = process.argv[2] === "--disable-account-assertion" || process.argv[2] === "--enable-account-assertion" ||
     process.argv[2]?.startsWith("--disable-account-assertion=") || process.argv[2]?.startsWith("--enable-account-assertion=");
   const maintenance = process.argv[2] === "maintenance";
@@ -2332,7 +2344,7 @@ async function main() {
       process.exitCode = 64;
       return;
     }
-    const database = new Database(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
+    const database = openRebuildFencedDatabase(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
     try {
       database.pragma(`busy_timeout = ${Math.max(1, timeoutMs - 250)}`);
       const rows = database.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
@@ -2523,7 +2535,7 @@ async function main() {
     try {
       if (accountAssertionMutation.yes) {
         ensureCollectorHome();
-        database = new Database(databasePath, { timeout: 5_000 });
+        database = openRebuildFencedDatabase(databasePath, { timeout: 5_000 });
         const state = setAccountAssertionAdapterEnabled(database, accountAssertionMutation.source, accountAssertionMutation.enabled);
         console.log(JSON.stringify({
           status: "account_assertion_adapter_updated",
@@ -2576,7 +2588,8 @@ async function main() {
     "lifecycle",
     "__stop_window_listener",
   ]);
-  const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
+  const rebuildCommand = command === "maintenance" && process.argv[3] === "rebuild";
+  const configRead = noCreateConfigCommands.has(command) || rebuildCommand ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
   if (command === "setup" && configRead?.status === "invalid") {
     // Strict parsing preserves the specific privacy/error reason without the
@@ -2585,18 +2598,130 @@ async function main() {
   }
   const configPath = configRead?.path ?? collectorConfigPath();
   const config = configRead?.config ?? strictSetupConfig ??
-    (noCreateConfigCommands.has(command) ? collectorConfigSchema.parse({}) : loadCollectorConfig());
+    (noCreateConfigCommands.has(command) || rebuildCommand ? collectorConfigSchema.parse({}) : loadCollectorConfig());
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
 
+  if (command === "maintenance" && process.argv[3] === "rebuild") {
+    const allowed = new Set(["--ledger", "--stage", "--wal-high-water-bytes", "--copy-drill", "--copy-root",
+      "--recover", "--rename-back"]);
+    for (const arg of process.argv.slice(4)) {
+      if (arg.startsWith("--") && !allowed.has(arg)) throw new Error(`unknown_rebuild_option:${arg}`);
+    }
+    const ledgerArgument = optionValue("--ledger");
+    if (!ledgerArgument || !path.isAbsolute(ledgerArgument)) throw new Error("rebuild_requires_absolute_ledger");
+    const recovering = flag("--recover") || flag("--rename-back");
+    const ledgerPath = recovering ? canonicalRecoveryLedgerPath(ledgerArgument) : fs.realpathSync(ledgerArgument);
+    const copyDrill = flag("--copy-drill");
+    if (copyDrill) {
+      const rootArgument = optionValue("--copy-root");
+      if (!rootArgument || !path.isAbsolute(rootArgument)) throw new Error("copy_drill_requires_root");
+      const copyRoot = fs.realpathSync(rootArgument);
+      const relative = path.relative(copyRoot, ledgerPath);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative) ||
+        ledgerPath === collectorBufferPath() || copyRoot === resolveCollectorHome().home) {
+        throw new Error("copy_drill_ledger_outside_clone");
+      }
+    } else if (ledgerPath !== (recovering
+      ? canonicalRecoveryLedgerPath(collectorBufferPath()) : fs.realpathSync(collectorBufferPath()))) {
+      throw new Error("live_rebuild_requires_active_ledger");
+    }
+    if (recovering) {
+      const result = flag("--rename-back")
+        ? (renameBackBeforeResume(ledgerPath), { status: "renamed_back" })
+        : recoverInterruptedRebuild(ledgerPath);
+      if (!copyDrill) {
+        await releaseStopWindowListener(config.port, resolveCollectorHome().home);
+        const visible = inspectLaunchAgentManifest();
+        if (!visible.ok) throw new Error("launch_agent_manifest_invalid");
+        const load = await loadVisibleLaunchAgent(visible.plistPath, config.port, false,
+          launchAgentMutationAuthority());
+        if (!load.loaded) throw new Error(`rebuild_resume_failed:${load.status}`);
+      }
+      console.log(JSON.stringify(result));
+      return;
+    }
+    const stage = optionValue("--stage");
+    if (stage !== "S10" && stage !== "ABORT") throw new Error("rebuild_stage_required");
+    const highWater = Number(optionValue("--wal-high-water-bytes"));
+    if (!Number.isSafeInteger(highWater) || highWater < 0 ||
+      optionValue("--wal-high-water-bytes") === undefined) throw new Error("wal_high_water_required");
+    const input = { ledgerPath, stage: stage as RebuildStage, walHighWaterBytes: highWater, copyDrill };
+    preflightMaintenanceRebuild(input);
+    const pauseWindow: { ready: Promise<void> | null } = { ready: null };
+    let pauseWindowStarted = false;
+    const resume = async () => {
+      if (copyDrill) return;
+      if (pauseWindowStarted) {
+        await releaseStopWindowListener(config.port, resolveCollectorHome().home);
+        pauseWindowStarted = false;
+      }
+      const visible = inspectLaunchAgentManifest();
+      if (!visible.ok) throw new Error("launch_agent_manifest_invalid");
+      const load = await loadVisibleLaunchAgent(visible.plistPath, config.port, false,
+        launchAgentMutationAuthority());
+      if (!load.loaded) throw new Error(`rebuild_resume_failed:${load.status}`);
+    };
+    const quiesce = async () => {
+      if (copyDrill) {
+        const before = observeRebuildConnectionOwnership(ledgerPath);
+        const after = observeRebuildConnectionOwnership(ledgerPath);
+        return { before, after, connectionsClosed: connectionOwnershipClosed(after) };
+      }
+      if (configRead?.status !== "valid" || !readLocalIngestAuth(resolveCollectorHome().home)) {
+        throw new Error("rebuild_pause_auth_unavailable");
+      }
+      let daemonUnloaded = false;
+      try {
+        const before = observeRebuildConnectionOwnership(ledgerPath);
+        pauseWindow.ready = startStopWindowChild(config.port, "maintenance_rebuild");
+        void pauseWindow.ready.catch(() => undefined);
+        const unloaded = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
+        if (!unloaded.unloaded) throw new Error(`writer_not_quiesced:${unloaded.reason}`);
+        daemonUnloaded = true;
+        await pauseWindow.ready;
+        pauseWindowStarted = true;
+        const after = observeRebuildConnectionOwnership(ledgerPath);
+        return { before, after, connectionsClosed: connectionOwnershipClosed(after) };
+      } catch (error) {
+        if (daemonUnloaded) {
+          await pauseWindow.ready?.catch(() => undefined);
+          await releaseStopWindowListener(config.port, resolveCollectorHome().home).catch(() => undefined);
+          const visible = inspectLaunchAgentManifest();
+          if (!visible.ok) throw new Error("rebuild_quiesce_resume_manifest_invalid", { cause: error });
+          const load = await loadVisibleLaunchAgent(visible.plistPath, config.port, false,
+            launchAgentMutationAuthority());
+          if (!load.loaded) throw new Error(`rebuild_quiesce_resume_failed:${load.status}`, { cause: error });
+        }
+        throw error;
+      }
+    };
+    try {
+      const result = await rebuildLedger({ ...input, quiesce, resume,
+        afterFirstRename: copyDrill && process.env.PLIMSOLL_REBUILD_COPY_KILL_AFTER_FIRST_RENAME === "1"
+          ? () => { process.kill(process.pid, "SIGKILL"); } : undefined,
+      });
+      console.log(JSON.stringify(result));
+    } finally {
+      if (!copyDrill && pauseWindow.ready) {
+        await pauseWindow.ready.catch(() => undefined);
+        await releaseStopWindowListener(config.port, resolveCollectorHome().home).catch(() => undefined);
+      }
+    }
+    return;
+  }
+
+
   if (command === "__stop_window_listener") {
+    const mode = process.argv[4] === "maintenance_rebuild" ? "maintenance_rebuild" :
+      process.argv[4] === "stop_window" ? "stop_window" : null;
     if (!process.send || process.argv[3] !== process.env.PLIMSOLL_STOP_WINDOW_NONCE ||
-        !/^[a-f0-9-]{36}$/i.test(process.argv[3] ?? "") || configRead?.status !== "valid") {
+        !/^[a-f0-9-]{36}$/i.test(process.argv[3] ?? "") || configRead?.status !== "valid" || !mode) {
       throw new Error("stop_window_listener_requires_lifecycle_update");
     }
     try {
-      await runStopWindowListener(config, resolveCollectorHome().home);
+      await runStopWindowListener(config, resolveCollectorHome().home, { mode });
     } catch (error) {
       process.send?.({ status: "error", reason: (error as Error).message });
       throw error;
@@ -2707,6 +2832,9 @@ async function main() {
       );
       return;
     }
+
+    try { claimRebuildResumePermit(collectorBufferPath(), ownership.lockPath, runtimeIdentity); }
+    catch (error) { ownership.release(); throw error; }
 
     const startupWalNonce = randomUUID();
     const startupWalReceipt = await runStartupWalSelfHeal({
@@ -2894,6 +3022,14 @@ async function main() {
     // drain armed below replays it. PLIMSOLL_OTLP_SPOOL=off disables both.
     const otlpSpool = new OtlpIntakeSpool({ home: collectorHome() });
     const syncBackoff = new SyncBackoff(config.syncIntervalSeconds * 1_000);
+    let rebuildHeadroom: RebuildHeadroomStatus | null = null;
+    const refreshRebuildHeadroom = () => {
+      try { rebuildHeadroom = readMaintenanceRebuildHeadroomStatus(collectorBufferPath()); }
+      catch { rebuildHeadroom = null; }
+    };
+    refreshRebuildHeadroom();
+    const rebuildHeadroomTimer = setInterval(refreshRebuildHeadroom, 1_000);
+    rebuildHeadroomTimer.unref();
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
@@ -2915,6 +3051,7 @@ async function main() {
         cadence: maintenanceCadence?.status() ?? null,
         retentionCadence: retentionCadence?.status() ?? null,
         starvation: cachedStarvationReceipt,
+        rebuild: rebuildHeadroom,
       }),
       detectedIdentities: () => detectedIdentities,
       outcomePerformance: (days, asOf) => outcomeTimelineStore.performanceSummary(days, asOf),
@@ -6545,7 +6682,9 @@ async function main() {
         throw new Error(others === null ? "pairing index upgrade cannot prove ledger quiescence" :
           "pairing index upgrade requires every other ledger connection to be stopped");
       }
-      const database = new Database(ledgerPath, { readonly: !apply, fileMustExist: true, timeout: 0 });
+      const database = apply
+        ? openRebuildFencedDatabase(ledgerPath, { fileMustExist: true, timeout: 0 })
+        : new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
       try {
         const before = codexUsagePairingStatus(database);
         if (!apply) {
@@ -6873,7 +7012,7 @@ async function main() {
       if (listener.kind !== "absent") throw new Error(`purge_requires_closed_listener:${listener.kind}`);
       if (fs.existsSync(ledgerPath)) {
         if (!fs.lstatSync(ledgerPath).isFile()) throw new Error("purge_ledger_not_regular_file");
-        const ledger = new Database(ledgerPath, { fileMustExist: true, timeout: 0 });
+        const ledger = openRebuildFencedDatabase(ledgerPath, { fileMustExist: true, timeout: 0 });
         try {
           const checkpoint = ledger.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
           if (checkpoint[0]?.busy !== 0) throw new Error("purge_wal_checkpoint_busy");

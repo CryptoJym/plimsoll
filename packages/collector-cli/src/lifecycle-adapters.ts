@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 
 import Database from "better-sqlite3";
+import { acquireRebuildOpenToken, openRebuildFencedDatabase,
+  releaseRebuildOpenToken } from "./rebuild-open-gate";
 
 import {
   collectorBufferPath,
@@ -888,7 +890,7 @@ function integrityComplaints(rows: unknown[]) {
 function integrityCheckInProcess(file: string): LedgerIntegrity {
   let db: InstanceType<typeof Database> | null = null;
   try {
-    db = new Database(file, { fileMustExist: true, timeout: 0 });
+    db = openRebuildFencedDatabase(file, { fileMustExist: true, timeout: 0 });
     db.pragma("locking_mode = EXCLUSIVE");
     const complaints = integrityComplaints(db.pragma(`integrity_check(${MAX_INTEGRITY_COMPLAINTS + 1})`) as unknown[]);
     return complaints.length === 0
@@ -943,15 +945,20 @@ export function whileKeepingLease<T>(guard: LifecycleFenceGuard | undefined, wor
  */
 export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
   let child: ReturnType<typeof spawn>;
+  // Reserve the helper's write-capable SQLite open before it can start. The
+  // token remains until its process has exited, including cancellation.
+  const openToken = acquireRebuildOpenToken(file);
   try {
     child = spawn(process.execPath, ["-e", INTEGRITY_CHECK_SCRIPT, BETTER_SQLITE3_ENTRY, file, String(MAX_INTEGRITY_COMPLAINTS)], {
       env: { PATH: "/usr/bin:/bin" },
       stdio: ["ignore", "pipe", "ignore"],
     });
   } catch {
+    releaseRebuildOpenToken(openToken);
     guard?.keepAlive();
     return Promise.resolve(integrityCheckInProcess(file));
   }
+  child.once("close", () => releaseRebuildOpenToken(openToken));
   const checked = new Promise<LedgerIntegrity>((resolve) => {
     let stdout = "";
     let settled = false;
@@ -991,7 +998,7 @@ export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
  * held until close.
  */
 function openExclusive(file: string) {
-  const connection = new Database(file, { fileMustExist: true, timeout: 0 });
+  const connection = openRebuildFencedDatabase(file, { fileMustExist: true, timeout: 0 });
   try {
     connection.pragma("locking_mode = EXCLUSIVE");
     connection.exec("BEGIN EXCLUSIVE");
@@ -1306,7 +1313,7 @@ function quiesceLedger(source: string, openHandles: OpenHandleCheck):
   | { fallback: LifecycleCloneFallback } {
   let connection: InstanceType<typeof Database>;
   try {
-    connection = new Database(source, { fileMustExist: true, timeout: 0 });
+    connection = openRebuildFencedDatabase(source, { fileMustExist: true, timeout: 0 });
   } catch {
     return { fallback: "quiescence_unproven" };
   }

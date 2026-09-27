@@ -33,7 +33,9 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { isSqliteContentionError } from "../packages/collector-cli/src/sqlite-contention";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
-import * as walCheckpointModule from "../packages/collector-cli/src/wal-checkpoint-worker";
+import { WalCheckpointWorker, WAL_AUTOCHECKPOINT_VALVE_FRAMES, WAL_TARGET_FRAMES,
+  WAL_HELD_FRAMES, SQLITE_DEFAULT_AUTOCHECKPOINT_FRAMES } from
+  "../packages/collector-cli/src/wal-checkpoint-worker";
 
 /** Twice the 20,000-frame bound at 4 KiB pages: room for the commits of one concurrent pass. */
 const WAL_LIMIT_MIB = 160;
@@ -130,7 +132,7 @@ async function main() {
   await check("wal_stays_bounded_under_continuous_intake_without_maintenance", async () => {
     const buffer = openLedger("continuous.sqlite");
     // Exactly the daemon's wiring (cli.ts): construct on its connection, start.
-    const walCheckpoint = new walCheckpointModule.WalCheckpointWorker(buffer.database);
+    const walCheckpoint = new WalCheckpointWorker(buffer.database);
     walCheckpoint.start();
     let commits = 0;
     let walMax = 0;
@@ -169,12 +171,12 @@ async function main() {
 
   await check("status_reports_the_worker_and_the_wal", async () => {
     const buffer = openLedger("status.sqlite");
-    const walCheckpoint = new walCheckpointModule.WalCheckpointWorker(buffer.database, 50);
+    const walCheckpoint = new WalCheckpointWorker(buffer.database, 50);
     try {
       assert.equal(typeof walCheckpoint.status, "function", "no status(): the worker is invisible to /status");
       assert.equal(walCheckpoint.start(), true);
       assert.equal(buffer.database.pragma("wal_autocheckpoint", { simple: true }),
-        walCheckpointModule.WAL_AUTOCHECKPOINT_VALVE_FRAMES, "the daemon connection lost its WAL bound");
+        WAL_AUTOCHECKPOINT_VALVE_FRAMES, "the daemon connection lost its WAL bound");
       await commit(buffer, chunk());
       const deadline = Date.now() + WAIT_MS;
       while (!walCheckpoint.status().lastSuccessAt && Date.now() < deadline) {
@@ -182,7 +184,7 @@ async function main() {
       }
       const status = walCheckpoint.status();
       assert.equal(status.mode, "worker");
-      assert.equal(status.autocheckpointFrames, walCheckpointModule.WAL_AUTOCHECKPOINT_VALVE_FRAMES);
+      assert.equal(status.autocheckpointFrames, WAL_AUTOCHECKPOINT_VALVE_FRAMES);
       assert.ok(status.lastSuccessAt, "no successful pass reported");
       assert.ok(status.lastPass && typeof status.lastPass.walFrames === "number", "last pass not reported");
       assert.ok(typeof status.walBytes === "number" && status.walBytes > 0, "WAL size not reported");
@@ -197,8 +199,8 @@ async function main() {
     const buffer = openLedger("silent.sqlite");
     // Started as the daemon starts it, but its first pass is a minute away: a
     // stalled worker, before the watchdog replaces it.
-    const walCheckpoint = new walCheckpointModule.WalCheckpointWorker(buffer.database, 60_000);
-    const limit = 1.25 * walCheckpointModule.WAL_AUTOCHECKPOINT_VALVE_FRAMES * 4_120;
+    const walCheckpoint = new WalCheckpointWorker(buffer.database, 60_000);
+    const limit = 1.25 * WAL_AUTOCHECKPOINT_VALVE_FRAMES * 4_120;
     let walMax = 0;
     try {
       assert.equal(walCheckpoint.start(), true);
@@ -220,16 +222,16 @@ async function main() {
 
   await check("the_worker_alone_bounds_the_wal_under_continuous_intake", async () => {
     const buffer = openLedger("worker-alone.sqlite");
-    const walCheckpoint = new walCheckpointModule.WalCheckpointWorker(buffer.database, 50);
+    const walCheckpoint = new WalCheckpointWorker(buffer.database, 50);
     try {
-      assert.equal(typeof walCheckpointModule.WAL_TARGET_FRAMES, "number",
+      assert.equal(typeof WAL_TARGET_FRAMES, "number",
         "no target: nothing but the hard bound's checkpoint, inside a commit, rewinds the WAL");
       assert.equal(walCheckpoint.start(), true);
       // Turn the hard bound off so that only the worker can bound the WAL: it
       // must, so the hard bound's checkpoint never has to run inside a commit.
       buffer.database.pragma("wal_autocheckpoint = 0");
       // The hard bound's size, with room for a runner ~10x slower than a Mac Studio.
-      const limit = 1.5 * walCheckpointModule.WAL_AUTOCHECKPOINT_VALVE_FRAMES * 4_120;
+      const limit = 1.5 * WAL_AUTOCHECKPOINT_VALVE_FRAMES * 4_120;
       let walMax = 0;
       // Dense enough that commits land during the worker's passes, so PASSIVE
       // alone never rewinds the WAL (it passes 150 MiB), with the writer lock
@@ -254,9 +256,9 @@ async function main() {
 
   await check("a_reader_holding_the_wal_raises_the_bound_until_the_worker_copies_the_backlog", async () => {
     const buffer = openLedger("held.sqlite");
-    const walCheckpoint = new walCheckpointModule.WalCheckpointWorker(buffer.database, 50);
+    const walCheckpoint = new WalCheckpointWorker(buffer.database, 50);
     const reader = new Database(buffer.database.name, { readonly: true, fileMustExist: true });
-    const valve = walCheckpointModule.WAL_AUTOCHECKPOINT_VALVE_FRAMES;
+    const valve = WAL_AUTOCHECKPOINT_VALVE_FRAMES;
     const waitFor = async (condition: () => boolean) => {
       const deadline = Date.now() + WAIT_MS;
       while (!condition() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -270,7 +272,7 @@ async function main() {
       reader.exec("begin");
       reader.prepare("select count(*) from buffered_events").get();
       // Hold more than the bound, so the daemon's own checkpoint would otherwise take the backlog.
-      while (walBytes(buffer) < (valve + walCheckpointModule.WAL_HELD_FRAMES) * 4_120) {
+      while (walBytes(buffer) < (valve + WAL_HELD_FRAMES) * 4_120) {
         await commit(buffer, chunk());
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
@@ -295,7 +297,7 @@ async function main() {
 
   await check("a_stalled_or_lost_worker_is_replaced_then_falls_back", async () => {
     const buffer = openLedger("watchdog.sqlite");
-    const walCheckpoint = new walCheckpointModule.WalCheckpointWorker(buffer.database, 25, 5_000);
+    const walCheckpoint = new WalCheckpointWorker(buffer.database, 25, 5_000);
     const warnings: string[] = [];
     const originalWarn = console.warn;
     console.warn = (line: unknown) => { warnings.push(String(line)); };
@@ -326,7 +328,7 @@ async function main() {
       const status = walCheckpoint.status();
       assert.equal(status.mode, "sqlite_autocheckpoint");
       assert.equal(buffer.database.pragma("wal_autocheckpoint", { simple: true }),
-        walCheckpointModule.SQLITE_DEFAULT_AUTOCHECKPOINT_FRAMES);
+        SQLITE_DEFAULT_AUTOCHECKPOINT_FRAMES);
       assert.ok(warnings.some((line) => line.includes("wal_checkpoint_worker_restarted")), "restart not reported");
       assert.ok(warnings.some((line) => line.includes("wal_checkpoint_worker_unavailable")), "fallback not reported");
       return { restarts: status.restarts, fallbackReason: status.fallbackReason };
@@ -339,7 +341,7 @@ async function main() {
 
   await check("failing_passes_are_counted_and_reported_once", async () => {
     const buffer = openLedger("errors.sqlite");
-    const walCheckpoint = new walCheckpointModule.WalCheckpointWorker(buffer.database, 60_000);
+    const walCheckpoint = new WalCheckpointWorker(buffer.database, 60_000);
     const warnings: string[] = [];
     const originalWarn = console.warn;
     console.warn = (line: unknown) => { warnings.push(String(line)); };
