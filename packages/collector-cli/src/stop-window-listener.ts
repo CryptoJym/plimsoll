@@ -27,7 +27,7 @@ import { conflictingOtlpServiceSource, explodeOtlpPayload } from "./otlp";
 import { OtlpIntakeSpool } from "./otlp-spool";
 import { readProducerEventIdHeader, PRODUCER_EVENT_ID_HEADER } from "./producer-parity";
 import { markStopWindowProbe, STOP_WINDOW_PROBE_HEADER } from "./stop-window-probe";
-import { markMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
+import { finishMaintenanceRebuildPause, markMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
 
 export const STOP_WINDOW_RELEASE_PATH = "/api/stop-window/release";
 
@@ -44,7 +44,6 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
   if (!hookSpoolEnabled() || !new OtlpIntakeSpool({ home }).enabled) {
     throw new Error("stop_window_spool_disabled");
   }
-  if (mode === "maintenance_rebuild") markMaintenanceRebuildPause(home);
   const managementAuth = readLiveProducerAuth(home);
   if (!managementAuth) throw new Error("stop_window_auth_unavailable");
   const limiter = createSourceRateLimiter();
@@ -83,10 +82,16 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
           : undefined;
       if (!source) throw new HttpBoundaryRejection("source_not_allowed", 404);
       if (request.url?.startsWith("/hooks/")) assertHookSource(request, source);
-      limiter.assertAdmissible(source);
       const auth = readLiveProducerAuth(home);
       if (!auth) throw new HttpBoundaryRejection("producer_token_invalid", 401);
       assertProducerToken(request, auth, source, url);
+      // A maintenance 503 is a rejection. The client owns the retry and its
+      // spool; no server capture cursor, ack or spool file may advance here.
+      if (mode === "maintenance_rebuild") {
+        reply(response, 503, { status: "maintenance_rebuild_paused", source }, true);
+        return;
+      }
+      limiter.assertAdmissible(source);
       const budget = createRequestBudget();
       const body = decodeBoundedRequestBody(request, await readBoundedRequestBody(request, budget));
       const payload = parseBoundedJson(body.text);
@@ -108,9 +113,7 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         if (!sanitized) throw new HttpBoundaryRejection("internal_rejection", 400);
         const write = writeHookSpoolEnvelope({ home, source, body: sanitized.text, blanked: sanitized.blanked, probe });
         if (!write.ok) throw new HttpBoundaryRejection("storage_busy_retry", 503);
-        reply(response, mode === "maintenance_rebuild" ? 503 : 202,
-          { status: mode === "maintenance_rebuild" ? "maintenance_rebuild_spooled" : "hook_spooled", source },
-          mode === "maintenance_rebuild");
+        reply(response, 202, { status: "hook_spooled", source });
         return;
       }
       assertBoundedOtlpCardinality(payload, body.decodedBytes);
@@ -131,10 +134,10 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         },
       });
       if (!result.ok) throw new HttpBoundaryRejection("storage_busy_retry", 503);
-      reply(response, mode === "maintenance_rebuild" ? 503 : 202, {
-        status: mode === "maintenance_rebuild" ? "maintenance_rebuild_spooled" : "otlp_spooled",
+      reply(response, 202, {
+        status: "otlp_spooled",
         source, events: exploded.events.length, metricSamples: exploded.metricSamples.length,
-      }, mode === "maintenance_rebuild");
+      });
     } catch (error) {
       const rejection = asHttpBoundaryRejection(error);
       reply(response, rejection.status, { error: rejection.reason },
@@ -161,8 +164,10 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
+  if (mode === "maintenance_rebuild") markMaintenanceRebuildPause(home);
   process.send?.({ status: "ready", port: config.port });
   await new Promise<void>((resolve) => server.once("close", resolve));
+  if (mode === "maintenance_rebuild") finishMaintenanceRebuildPause(home);
 }
 
 /**

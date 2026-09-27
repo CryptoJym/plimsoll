@@ -1,7 +1,7 @@
 import { hookSpoolDirectory, listHookSpoolArrivals } from "./hook-spool";
 import { listOtlpSpoolArrivals, otlpSpoolDirectory } from "./otlp-spool";
 import { readSpoolLosses, type SpoolLoss } from "./spool-losses";
-import { maintenanceRebuildPauseSeen } from "./maintenance-rebuild-pause-state";
+import { clearMaintenanceRebuildPause, settleInterruptedMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
 
 /**
  * What the hook and OTLP spools hold or lost, for the upload capture claim
@@ -26,11 +26,22 @@ export function captureSpoolState(home: string): CaptureSpoolState {
   const listings = [listHookSpoolArrivals(home), listOtlpSpoolArrivals(home)];
   const logs = [readSpoolLosses(hookSpoolDirectory(home)), readSpoolLosses(otlpSpoolDirectory(home))];
   const arrivals = listings.flatMap((listing) => listing ?? []);
+  const unreadable = [...listings, ...logs].some((value) => value === null);
+  let maintenanceRebuildPending = false;
+  try {
+    const marker = settleInterruptedMaintenanceRebuildPause(home);
+    if (marker && !unreadable) {
+      const start = Date.parse(marker.at);
+      const end = marker.endedAt ? Date.parse(marker.endedAt) : Infinity;
+      maintenanceRebuildPending = arrivals.some((at) => at >= start && at <= end);
+      if (marker.endedAt && !maintenanceRebuildPending) clearMaintenanceRebuildPause(home);
+    } else if (marker) maintenanceRebuildPending = arrivals.length > 0;
+  } catch { maintenanceRebuildPending = arrivals.length > 0; }
   return {
     pendingFiles: arrivals.length,
     oldestPendingMs: arrivals.reduce<number | null>((oldest, at) => (oldest === null || at < oldest ? at : oldest), null),
     losses: logs.flatMap((log) => log ?? []),
-    unreadable: [...listings, ...logs].some((value) => value === null),
-    maintenanceRebuildPending: arrivals.length > 0 && maintenanceRebuildPauseSeen(home),
+    unreadable,
+    maintenanceRebuildPending,
   };
 }
