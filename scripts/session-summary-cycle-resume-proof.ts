@@ -13,7 +13,8 @@ import { readLedgerOffThread, buildSessionSyncRow, collectSessionSnapshots,
   commitDaemonSessionSyncFailure, commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState, planDaemonSessionSync, runSessionSync,
   saveDaemonSessionSyncState } from "../packages/collector-cli/src/session-sync";
-import { sessionSummaryCounters, updateSessionSummary } from "../packages/collector-cli/src/session-summary";
+import { sessionSummaryCounters, updateSessionSummary, type SessionReadQuery } from
+  "../packages/collector-cli/src/session-summary";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
@@ -221,12 +222,17 @@ async function main() {
   const old = await load0740Summary();
   const upgraded = new LocalEventBuffer(path.join(root, "upgrade-0740.sqlite"), { workspaceId: tenantId });
   try {
+    // This stage checks the published 0.7.40 summary algorithm. Run its SQL
+    // against the fixture connection so worker startup does not consume its
+    // 250 ms slice budget; daemonCycle below still exercises the real reader.
+    const legacyRead = async <T>(queries: SessionReadQuery[]): Promise<T[]> =>
+      queries.flatMap((query) => upgraded.database.prepare(query.sql).all(query.params) as T[]);
     const inserted = insertEventRows(upgraded, ids.upgrade, 5_094);
     old.ensureSessionSummarySchema(upgraded.database);
     const initialUntil = nextUntil();
     for (let pass = 0; pass < 4; pass += 1) {
       const result = await old.updateSessionSummary(upgraded.database, ids.upgrade, initialUntil, {
-        read: (queries) => readLedgerOffThread(upgraded.database, queries),
+        read: legacyRead,
       });
       if (result.complete) break;
     }
@@ -236,7 +242,7 @@ async function main() {
     const cursors: number[] = [];
     for (let pass = 0; pass < 3; pass += 1) {
       const result = await old.updateSessionSummary(upgraded.database, ids.upgrade, nextUntil(), {
-        read: (queries) => readLedgerOffThread(upgraded.database, queries),
+        read: legacyRead,
       });
       assert.equal(result.complete, false);
       cursors.push(JSON.parse(stateRow(upgraded, ids.upgrade).accumulatorJson).events);
