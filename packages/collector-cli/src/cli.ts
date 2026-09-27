@@ -157,7 +157,7 @@ import {
 import { bindDispatch,closeDispatch,restampDispatch } from "./dispatch-command";
 import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
 import { OtlpIntakeSpool } from "./otlp-spool";
-import { releaseStopWindowListener, runStopWindowListener } from "./stop-window-listener";
+import { releaseStopWindowListener, runStopWindowListener, withStopWindowRelease } from "./stop-window-listener";
 import {
   HOOK_SPOOL_COLLECTOR_TOO_OLD,
   HOOK_SPOOL_COLLECTOR_UNREACHABLE,
@@ -6582,12 +6582,14 @@ async function main() {
       if (result.kind === "preflight" && !result.preflight.ok) process.exitCode = 1;
       return;
     }
+    let stopWindowStarted = false;
     if (action === "update") {
       // Managed/upload-enabled update windows are the fleet path. An
       // unenrolled offline install has no running authenticated receiver.
       if (configRead?.status === "valid" && (config.managed || config.uploadUrl)) {
         if (!readLocalIngestAuth(resolveCollectorHome().home)) throw new Error("stop_window_auth_unavailable");
         await startStopWindowChild(config.port);
+        stopWindowStarted = true;
       }
     }
     const resolveArtifact = async (reference: string) => {
@@ -6605,16 +6607,22 @@ async function main() {
       });
     };
     const readinessTimeoutOption = Number(optionValue("--readiness-timeout-ms"));
-    const result = await runLifecycleCommand({
-      argv: [action, ...process.argv.slice(4)],
-      adapter: composeLifecycleAdapter({ keepAll }),
-      resolveArtifact,
-      ...(action === "update" ? { pairingIndexes: buildPairingIndexesAfterUpdate } : {}),
-      ...(optionValue("--readiness-timeout-ms") !== undefined && Number.isFinite(readinessTimeoutOption)
-        ? { readinessTimeoutMs: readinessTimeoutOption }
-        : {}),
-    });
+    const { result, releaseError } = await withStopWindowRelease(stopWindowStarted,
+      () => releaseStopWindowListener(config.port, resolveCollectorHome().home),
+      () => runLifecycleCommand({
+        argv: [action, ...process.argv.slice(4)],
+        adapter: composeLifecycleAdapter({ keepAll }),
+        resolveArtifact,
+        ...(action === "update" ? { pairingIndexes: buildPairingIndexesAfterUpdate } : {}),
+        ...(optionValue("--readiness-timeout-ms") !== undefined && Number.isFinite(readinessTimeoutOption)
+          ? { readinessTimeoutMs: readinessTimeoutOption }
+          : {}),
+      }));
     console.log(JSON.stringify(result, null, 2));
+    if (releaseError) {
+      console.error(`stop_window_release_failed: ${releaseError.message}`);
+      process.exitCode = 1;
+    }
     return;
   }
 

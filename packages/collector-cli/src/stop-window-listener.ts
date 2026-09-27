@@ -151,6 +151,32 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
   await new Promise<void>((resolve) => server.once("close", resolve));
 }
 
+/**
+ * Run a lifecycle update that started the listener, and release the listener
+ * unless the update completed. Only a completed update hands the port to the
+ * new runtime, whose load-launch-agent releases the listener. After a thrown,
+ * refused or rolled-back update the restored runtime's loader does not know the
+ * listener, and its daemon could not bind the port.
+ */
+export async function withStopWindowRelease<T extends { receipt?: { status?: unknown } }>(
+  started: boolean, release: () => Promise<unknown>, run: () => Promise<T>,
+): Promise<{ result: T; releaseError: Error | null }> {
+  let result: T;
+  try {
+    result = await run();
+  } catch (error) {
+    if (started) await release().catch(() => undefined);
+    throw error;
+  }
+  if (!started || result.receipt?.status === "completed") return { result, releaseError: null };
+  try {
+    await release();
+    return { result, releaseError: null };
+  } catch (error) {
+    return { result, releaseError: error instanceof Error ? error : new Error(String(error)) };
+  }
+}
+
 /** Only the update listener answers this route; a normal daemon yields 404. */
 export async function releaseStopWindowListener(port: number, home: string) {
   const auth = readLiveProducerAuth(home);
