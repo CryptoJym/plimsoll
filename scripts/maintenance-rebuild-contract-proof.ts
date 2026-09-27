@@ -12,7 +12,9 @@ import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-s
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { writeHookSpoolFile } from "../packages/collector-cli/src/hook-spool";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
-import * as rebuild from "../packages/collector-cli/src/maintenance-rebuild";
+import { connectionOwnershipClosed, observeRebuildConnectionOwnership, readActiveRebuildWriterLeases,
+  recoverInterruptedRebuild, rebuildLedger, REQUIRED_REBUILD_WRITERS,
+  type QuiesceReceipt } from "../packages/collector-cli/src/maintenance-rebuild";
 import { releaseStopWindowListener, runStopWindowListener } from "../packages/collector-cli/src/stop-window-listener";
 
 const root = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "plimsoll-b13-contract-")));
@@ -56,14 +58,14 @@ async function lateWriter() {
   }) as typeof fs.renameSync;
   try {
     const quiesce = async () => {
-      if (typeof rebuild.observeRebuildConnectionOwnership === "function") {
-        const after = rebuild.observeRebuildConnectionOwnership(file);
-        return { before: after, after, connectionsClosed: rebuild.connectionOwnershipClosed(after) };
+      if (typeof observeRebuildConnectionOwnership === "function") {
+        const after = observeRebuildConnectionOwnership(file);
+        return { before: after, after, connectionsClosed: connectionOwnershipClosed(after) };
       }
-      return { modules: [...rebuild.REQUIRED_REBUILD_WRITERS], connectionsClosed: true } as unknown as
-        rebuild.QuiesceReceipt;
+      return { modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true } as unknown as
+        QuiesceReceipt;
     };
-    const result = await rebuild.rebuildLedger({ ledgerPath: file, stage: "S10", walHighWaterBytes: 0,
+    const result = await rebuildLedger({ ledgerPath: file, stage: "S10", walHighWaterBytes: 0,
       copyDrill: true, quiesce, resume: async () => undefined });
     assert.equal(writerBlocked, true, "the raw independent SQLite opener is blocked");
     assert.deepEqual(ids(file), ids(result.backupPath), "no committed late row is lost");
@@ -98,7 +100,7 @@ function observedLease() {
   const file = path.join(root, "owner.sqlite");
   const buffer = new LocalEventBuffer(file);
   try {
-    const owners = rebuild.readActiveRebuildWriterLeases(buffer.database);
+    const owners = readActiveRebuildWriterLeases(buffer.database);
     assert.deepEqual(owners, [{ pid: process.pid, owner: "local_event_buffer" }],
       "the receipt names the actual connection rather than 31 static modules");
     console.log(JSON.stringify({ check: "F4_observed_connection_lease", owners }));
@@ -108,7 +110,7 @@ function lockWithoutState() {
   const file = path.join(root, "stale.sqlite");
   fixture(file);
   fs.writeFileSync(`${file}.maintenance-rebuild.lock`, "fixture\n");
-  assert.deepEqual(rebuild.recoverInterruptedRebuild(file), { status: "recovered_stale_lock" });
+  assert.deepEqual(recoverInterruptedRebuild(file), { status: "recovered_stale_lock" });
   console.log(JSON.stringify({ check: "LOW_lock_without_state_recovery" }));
 }
 async function freePort(): Promise<number> {
