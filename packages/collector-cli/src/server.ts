@@ -207,6 +207,7 @@ function admitHookBody(
     fallbackEventId?: string;
     now?: () => number;
     probe?: boolean;
+    spoolReplay?: boolean;
   },
 ) {
   const payload = parseBoundedJson(bodyText);
@@ -214,16 +215,38 @@ function admitHookBody(
   if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
   context.budget.checkpoint();
   return retryStorageBusy(context.budget, () => {
+    // A producer ID names one logical hook even when a retry arrives during a
+    // later stop window or through the live route. For a body without its own
+    // time, the first row's observed_at is that ID's first receive instant.
+    // Read inside the storage retry, immediately before the synchronous append.
+    const receivedAtMs = context.now?.() ?? Date.now();
+    const firstRow = context.producerEventId
+      ? context.buffer.database.prepare(
+        "select observed_at as observedAt from buffered_events where id = ?",
+      ).get(context.producerEventId) as { observedAt: string } | undefined
+      : undefined;
+    const firstObservedAtMs = firstRow ? Date.parse(firstRow.observedAt) : NaN;
+    // The stored observed_at is the first receipt only when the body could not
+    // supply an event time at that receipt. A valid body time may be much older
+    // than receipt and must not become the clock for later metadata validation.
+    const firstRowUsedReceiveTime = Number.isFinite(firstObservedAtMs)
+      && (!payload || typeof payload !== "object" || Array.isArray(payload)
+        || !bodyCarriesItsOwnTime(payload as Record<string, unknown>, firstObservedAtMs));
+    const stableReceivedAtMs = firstRowUsedReceiveTime ? firstObservedAtMs : receivedAtMs;
+    const admittedPayload = context.spoolReplay
+      ? parseBoundedJson(spooledBodyWithHookTime(bodyText, new Date(stableReceivedAtMs).toISOString()))
+      : payload;
+    if (context.spoolReplay) assertBoundedJsonNodes(admittedPayload);
     const options = {
       config: context.config,
       buffer: context.buffer,
       source,
       producerEventId: context.producerEventId,
       fallbackEventId: context.fallbackEventId,
-      now: context.now,
+      now: () => stableReceivedAtMs,
     };
-    if (!context.probe) return appendForwardedHook(payload, options);
-    const canonical = normalizeForwardedHook(payload, options);
+    if (!context.probe) return appendForwardedHook(admittedPayload, options);
+    const canonical = normalizeForwardedHook(admittedPayload, options);
     canonical.event = markStopWindowProbe(canonical.event);
     return appendNormalizedHook(context.buffer, canonical);
   });
@@ -508,13 +531,14 @@ export function createHookSpoolDrain(
         const envelopeTime = Date.parse(read.envelope.receivedAt);
         const receivedAtMs = Number.isFinite(envelopeTime) ? envelopeTime : file.spooledAtMs;
         await admitHookBody(
-          spooledBodyWithHookTime(read.envelope.body, read.envelope.receivedAt),
+          read.envelope.body,
           read.envelope.source,
           {
             config, buffer, budget: createRequestBudget(), probe: read.envelope.probe,
             producerEventId: read.envelope.producerEventId,
             fallbackEventId: deterministicEventId(["hook-spool:v1", file.name]),
             now: () => receivedAtMs,
+            spoolReplay: true,
           },
         );
         try {
@@ -1782,6 +1806,7 @@ export function createCollectorServer(
             buffer,
             budget,
             producerEventId,
+            now: () => receivedAtMs,
           });
         } catch (error) {
           // The ONE outcome that is spooled here: the busy class that answers

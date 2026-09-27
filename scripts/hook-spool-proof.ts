@@ -64,6 +64,7 @@ import {
   hookSpoolOperatorStatus,
   hookSpoolRejectedDirectory,
   listHookSpoolFiles,
+  readHookSpoolFile,
   readHookSpoolCounters,
   recordHookSpoolIntake,
   recordHookSpoolRefusal,
@@ -89,6 +90,7 @@ import {
 } from "../packages/shared/src/index";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { timestampIsNotFromTheFuture } from "../packages/collector-cli/src/normalizer";
+import { releaseStopWindowListener, runStopWindowListener } from "../packages/collector-cli/src/stop-window-listener";
 import {
   createCollectorServer,
   createHookSpoolDrain,
@@ -4557,6 +4559,177 @@ async function caseCrashReplayAtFutureSkewBoundary() {
   );
 }
 
+async function postThroughStopWindow(home: string, producerEventId: string, bodies: string[], secondDelayMs: number) {
+  const port = await freePort();
+  const config = collectorConfigSchema.parse({ port });
+  const auth = loadOrCreateLocalIngestAuth(home);
+  const headers = {
+    "content-type": "application/json",
+    "x-plimsoll-token": auth.claudeCodeProducer!,
+    "x-plimsoll-event-id": producerEventId,
+  };
+  const listener = runStopWindowListener(config, home);
+  void listener.catch(() => undefined);
+  const posts: Array<Awaited<ReturnType<typeof postHookOverHttp>>> = [];
+  let receivedAts: string[] = [];
+  try {
+    const readyBy = Date.now() + 5_000;
+    for (;;) {
+      try {
+        if ((await getJson(port, "/healthz", auth.managementRead)).mode === "stop_window") break;
+      } catch { /* the listener has not bound yet */ }
+      if (Date.now() >= readyBy) throw new Error("stop_window_fixture_not_ready");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    for (const [index, body] of bodies.entries()) {
+      if (index === 1) await new Promise((resolve) => setTimeout(resolve, secondDelayMs));
+      posts.push(await postHookOverHttp(port, "/hooks/claude-code", headers, body));
+    }
+    receivedAts = listHookSpoolFiles(home).map((file) => {
+      const read = readHookSpoolFile(file.path);
+      return read.ok ? read.envelope.receivedAt : "invalid";
+    });
+  } finally {
+    await releaseStopWindowListener(port, home);
+    await listener;
+  }
+  return { config, posts, receivedAts };
+}
+
+/** Two durable stop-window retries must share the first admission's time. */
+async function caseStopWindowProducerIdRetry() {
+  const { home } = fixtureHome("stop-window-producer-retry");
+  const producerEventId = "22222222-2222-4222-8222-222222222222";
+  const body = claudeHttpHookBody(crypto.randomUUID(), "first receipt");
+  const { config, posts, receivedAts } = await postThroughStopWindow(home, producerEventId, [body, body], 2_100);
+  const buffer = new LocalEventBuffer(path.join(home, "work-ledger.sqlite"));
+  try {
+    const drain = createHookSpoolDrain(config, buffer, { home, maxFilesPerTick: 2 });
+    const first = await drain.tick();
+    const firstRows = buffer.database.prepare(
+      "select id, observed_at as observedAt from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ id: string; observedAt: string }>;
+    const firstConflicts = buffer.eventCollisionSummary();
+    const pendingAfterRetry = listHookSpoolFiles(home).length;
+    check("stop_window_same_producer_id_retry_deduplicates_without_collision",
+      posts.every((post) => post.status === 202) && receivedAts.length === 2 &&
+        Date.parse(receivedAts[1]!) - Date.parse(receivedAts[0]!) >= 2_000 &&
+        first.recovered === 2 && firstRows.length === 1 &&
+        firstRows[0]?.observedAt === receivedAts[0] &&
+        firstConflicts.totalConflicts === 0 && pendingAfterRetry === 0,
+      { statuses: posts.map((post) => post.status), receivedAts, first,
+        firstRows, firstConflicts, pendingAfterRetry });
+  } finally {
+    buffer.close();
+  }
+}
+
+/** A different body with the same producer ID remains an integrity conflict. */
+async function caseStopWindowProducerIdCollision() {
+  const { home } = fixtureHome("stop-window-producer-collision");
+  const producerEventId = "44444444-4444-4444-8444-444444444444";
+  const firstBody = claudeHttpHookBody(crypto.randomUUID(), "collision fixture");
+  const changedBody = claudeHttpHookBody(crypto.randomUUID(), "collision fixture");
+  const { config, posts } = await postThroughStopWindow(
+    home, producerEventId, [firstBody, changedBody], 20,
+  );
+  const buffer = new LocalEventBuffer(path.join(home, "work-ledger.sqlite"));
+  try {
+    const drained = await createHookSpoolDrain(config, buffer, { home }).tick();
+    const rows = buffer.database.prepare(
+      "select id from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ id: string }>;
+    const conflicts = buffer.eventCollisionSummary();
+    check("stop_window_changed_content_with_same_producer_id_is_quarantined",
+      posts.every((post) => post.status === 202) && drained.recovered === 2 &&
+        rows.length === 1 && conflicts.totalConflicts === 1 &&
+        listHookSpoolFiles(home).length === 0,
+      { statuses: posts.map((post) => post.status), drained, rows, conflicts,
+        pending: listHookSpoolFiles(home).length });
+  } finally {
+    buffer.close();
+  }
+}
+
+/** A body-owned event time must not replace the receive clock for metadata. */
+async function caseTimestampedProducerIdRetry() {
+  const { home } = fixtureHome("timestamped-producer-retry");
+  const producerEventId = "55555555-5555-4555-8555-555555555555";
+  const firstReceivedAtMs = Date.now();
+  const bodyTime = new Date(firstReceivedAtMs - 24 * 60 * 60 * 1_000).toISOString();
+  const rateObservedAt = new Date(
+    firstReceivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs - 1_000,
+  ).toISOString();
+  const body = JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: crypto.randomUUID(),
+    timestamp: bodyTime,
+    rateObservedAt,
+  });
+  const firstFile = writeHookSpoolFile({
+    home, source: "claude_code", producerEventId, nowMs: firstReceivedAtMs, body,
+  });
+  const retryFile = writeHookSpoolFile({
+    home, source: "claude_code", producerEventId, nowMs: firstReceivedAtMs + 2_100, body,
+  });
+  const buffer = new LocalEventBuffer(path.join(home, "work-ledger.sqlite"));
+  try {
+    const drained = await createHookSpoolDrain(collectorConfigSchema.parse({}), buffer, { home }).tick();
+    const rows = buffer.database.prepare(
+      "select observed_at as observedAt, payload_json as payloadJson from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ observedAt: string; payloadJson: string }>;
+    const metadata = rows[0] ? (JSON.parse(rows[0].payloadJson) as { metadata?: Record<string, unknown> }).metadata : undefined;
+    const conflicts = buffer.eventCollisionSummary();
+    check("timestamped_producer_id_retry_keeps_receive_clock_for_metadata",
+      firstFile !== null && retryFile !== null && drained.recovered === 2 &&
+        rows.length === 1 && rows[0]?.observedAt === bodyTime &&
+        metadata?.rateObservedAt === rateObservedAt && conflicts.totalConflicts === 0,
+      { saved: [firstFile !== null, retryFile !== null], drained,
+        rows: rows.map((row) => ({ observedAt: row.observedAt })),
+        rateObservedAt: metadata?.rateObservedAt, conflicts });
+  } finally {
+    buffer.close();
+  }
+}
+
+/** Live intake must give the same producer ID the same retry semantics. */
+async function caseLiveProducerIdRetry() {
+  const { home } = fixtureHome("live-producer-retry");
+  const collector = await startCollector(home);
+  const producerEventId = "33333333-3333-4333-8333-333333333333";
+  const body = claudeHttpHookBody(crypto.randomUUID(), "first receipt");
+  const headers = {
+    "content-type": "application/json",
+    "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+    "x-plimsoll-event-id": producerEventId,
+  };
+  try {
+    const first = await postHookOverHttp(collector.port, "/hooks/claude-code", headers, body);
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    const retry = await postHookOverHttp(collector.port, "/hooks/claude-code", headers, body);
+    const retryRows = collector.buffer.database.prepare(
+      "select id from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ id: string }>;
+    const retryConflicts = collector.buffer.eventCollisionSummary();
+    check("live_same_producer_id_retry_deduplicates_without_collision",
+      first.status === 202 && retry.status === 202 &&
+        retry.json?.deduplicated === true && retryRows.length === 1 &&
+        retryConflicts.totalConflicts === 0,
+      { firstStatus: first.status, retryStatus: retry.status,
+        retryDeduplicated: retry.json?.deduplicated, retryRows, retryConflicts });
+
+    const changed = await postHookOverHttp(collector.port, "/hooks/claude-code", headers,
+      claudeHttpHookBody(crypto.randomUUID(), "first receipt"));
+    check("live_changed_content_with_same_producer_id_is_quarantined",
+      changed.status === 202 && changed.json?.collisionQuarantined === true &&
+        collector.buffer.eventCollisionSummary().totalConflicts === 1,
+      { status: changed.status, collisionQuarantined: changed.json?.collisionQuarantined,
+        conflicts: collector.buffer.eventCollisionSummary() });
+  } finally {
+    await collector.close();
+  }
+}
+
 async function main() {
   // Stage markers on stderr: a hosted-runner hang has to name the case it hung
   // in without waiting for the final report.
@@ -4636,6 +4809,14 @@ async function main() {
     await caseCrashAfterHookAdmission("11111111-1111-4111-8111-111111111111");
     stage("crash_future_skew_boundary");
     await caseCrashReplayAtFutureSkewBoundary();
+    stage("stop_window_producer_id_retry");
+    await caseStopWindowProducerIdRetry();
+    stage("stop_window_producer_id_collision");
+    await caseStopWindowProducerIdCollision();
+    stage("timestamped_producer_id_retry");
+    await caseTimestampedProducerIdRetry();
+    stage("live_producer_id_retry");
+    await caseLiveProducerIdRetry();
     stage("report");
   } finally {
     for (const [key, value] of previousEnv) {
