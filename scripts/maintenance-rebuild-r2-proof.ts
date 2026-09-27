@@ -7,7 +7,9 @@ import { performance } from "node:perf_hooks";
 import Database from "better-sqlite3";
 import { connectionOwnershipClosed, observeRebuildConnectionOwnership, rebuildLedger,
   recoverInterruptedRebuild, canonicalRecoveryLedgerPath, REQUIRED_REBUILD_WRITERS } from "../packages/collector-cli/src/maintenance-rebuild";
-import { openRebuildFencedDatabase } from "../packages/collector-cli/src/rebuild-open-gate";
+import { claimRebuildResumePermit, openRebuildFencedDatabase } from
+  "../packages/collector-cli/src/rebuild-open-gate";
+import { createCollectorRuntimeIdentity } from "../packages/collector-cli/src/runtime-ownership";
 import { WalCheckpointWorker } from "../packages/collector-cli/src/wal-checkpoint-worker";
 
 const mutant = process.argv.includes("--skip-fence-mutation");
@@ -104,10 +106,13 @@ async function main() {
     resume: async () => {
       assert.equal(fs.existsSync(lock), true, "the fence remains through daemon resume");
       assert.throws(() => openRebuildFencedDatabase(ledger), /maintenance_rebuild_paused/);
-      const previous = process.argv[2];
-      process.argv[2] = "start";
-      try { openRebuildFencedDatabase(ledger).close(); fencedResume = true; }
-      finally { process.argv[2] = previous; }
+      const identity = createCollectorRuntimeIdentity();
+      const startLock = path.join(root, "collector.pid.start.lock");
+      fs.writeFileSync(startLock, JSON.stringify({ ...identity, version: 3,
+        label: "com.plimsoll.collector" }), { mode: 0o600 });
+      assert.equal(claimRebuildResumePermit(ledger, startLock, identity), true);
+      openRebuildFencedDatabase(ledger).close();
+      fencedResume = true;
     },
   });
   assert.equal(fencedResume, true);
