@@ -1467,24 +1467,6 @@ export async function runSessionSync(
     }
     const rows = sealedRows.flatMap((item) => item.ok ? [item.row] : []);
     const requestTimeoutMs = Math.min(120_000, config.delivery.requestTimeoutSeconds * 1_000);
-    // postJson starts its timer before fencedFetch acquires the lease. Give
-    // that bounded local retry its own time in both the timer and cloud gate.
-    const transportTimeoutMs = Math.min(120_000, requestTimeoutMs +
-      (options.incremental ? SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS : 0));
-    const sentAt = new Date().toISOString();
-    // Reserve the cloud's 10 s transaction window after the local HTTP wait.
-    const expiresAt = new Date(Date.parse(sentAt) + transportTimeoutMs + 10_000).toISOString();
-    const body = JSON.stringify(
-      aiWorkSessionSyncBatchSchema.parse({
-        kind: "session_sync",
-        tenantId: config.tenantId,
-        installKey: config.installKey,
-        appVersion,
-        sentAt,
-        expiresAt,
-        sessions: rows,
-      }),
-    );
     const task = (async () => {
       let sourceChanged = false;
       const stale = () => {
@@ -1492,43 +1474,83 @@ export async function runSessionSync(
         rows.forEach((row) => markStale(row.session.id));
         return new TransportError("source_changed");
       };
+      const leaseToken = options.incremental ? crypto.randomUUID() : null;
+      let leaseHeld = false;
+      let fetchAttempts = 0;
+      let refusal: { status: "expired" | "clock_skew"; serverTime: string } | null = null;
+      const leaseRetry = new SyncStorageRetryController({
+        budgetMs: SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS, sleep,
+      });
+      const clearLease = async () => {
+        if (!leaseHeld || !leaseToken) return true;
+        const retry = new SyncStorageRetryController({
+          budgetMs: SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS, sleep,
+        });
+        const fresh = await retry.run(() => ledger.transaction(() => {
+          const current = rows.every((row) => snapshotFresh(row.session.id));
+          ledger.prepare("delete from session_sync_upload_leases where lease_token = ?").run(leaseToken);
+          return current;
+        }).immediate());
+        leaseHeld = false;
+        return fresh;
+      };
       try {
-        let refusal: { status: "expired" | "clock_skew"; serverTime: string } | null = null;
+        // Acquire the durable lease before constructing the signed body or
+        // starting postJson's timer. BEGIN IMMEDIATE may itself wait for the
+        // CLI buffer's five-second SQLite busy timeout.
+        const wireTime = options.incremental ? await leaseRetry.run(() => ledger.transaction(() => {
+          ledger.prepare(`delete from session_sync_upload_leases
+            where lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')`).run();
+          if (!rows.every((row) => snapshotFresh(row.session.id))) throw stale();
+          const occupied = ledger.prepare(
+            "select 1 from session_sync_upload_leases where session_id = ?",
+          );
+          if (rows.some((row) => occupied.get(snapshotVersions.get(row.session.id)!.rawSessionId))) {
+            throw new TransportError("network_error");
+          }
+          const insert = ledger.prepare(`insert into session_sync_upload_leases
+            (session_id, lease_token, lease_expires_at, mutation_revision, high_water)
+            values (?, ?, ?, ?, ?)`);
+          // This provisional value is never committed. Stamp the wire clock
+          // only after all lease rows are held, then set their exact bound in
+          // the same transaction.
+          const provisionalUntil = new Date(Date.now() + requestTimeoutMs + 10_000 +
+            SESSION_SYNC_MAX_CLOCK_SKEW_MS + SESSION_SYNC_LEASE_SLACK_MS).toISOString();
+          for (const row of rows) {
+            const version = snapshotVersions.get(row.session.id)!;
+            insert.run(version.rawSessionId, leaseToken, provisionalUntil,
+              version.mutationRevision, version.highWater);
+          }
+          const sentAt = new Date().toISOString();
+          const expiresAt = new Date(Date.parse(sentAt) + requestTimeoutMs + 10_000).toISOString();
+          const leaseUntil = new Date(Date.parse(expiresAt) +
+            SESSION_SYNC_MAX_CLOCK_SKEW_MS + SESSION_SYNC_LEASE_SLACK_MS).toISOString();
+          ledger.prepare(`update session_sync_upload_leases set lease_expires_at = ?
+            where lease_token = ?`).run(leaseUntil, leaseToken);
+          return { sentAt, expiresAt };
+        }).immediate()) : (() => {
+          const sentAt = new Date().toISOString();
+          return { sentAt, expiresAt: new Date(Date.parse(sentAt) + requestTimeoutMs + 10_000).toISOString() };
+        })();
+        leaseHeld = Boolean(leaseToken);
+        const { sentAt, expiresAt } = wireTime;
+        const body = JSON.stringify(aiWorkSessionSyncBatchSchema.parse({
+          kind: "session_sync", tenantId: config.tenantId, installKey: config.installKey,
+          appVersion, sentAt, expiresAt, sessions: rows,
+        }));
+        const ownedLease = options.incremental ? ledger.prepare(`select lease_token as token
+          from session_sync_upload_leases where session_id = ?`) : null;
         const fencedFetch: typeof fetch = options.incremental ? async (request, init) => {
-          const leaseToken = crypto.randomUUID();
-          const retry = new SyncStorageRetryController({
-            budgetMs: SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS, sleep,
-          });
-          // These callbacks are synchronous: only freshness/lease bookkeeping
-          // holds a write reservation. Network I/O never runs in a transaction.
-          await retry.run(() => ledger.transaction(() => {
-            ledger.prepare(`delete from session_sync_upload_leases
-              where lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')`).run();
-            if (!rows.every((row) => snapshotFresh(row.session.id))) throw stale();
-            const occupied = ledger.prepare(
-              "select 1 from session_sync_upload_leases where session_id = ?",
-            );
-            if (rows.some((row) => occupied.get(snapshotVersions.get(row.session.id)!.rawSessionId))) {
-              // Another uploader owns this session. Reuse the bounded network
-              // retry policy without labelling an unchanged source stale.
-              throw new TransportError("network_error");
-            }
-            const insert = ledger.prepare(`insert into session_sync_upload_leases
-              (session_id, lease_token, lease_expires_at, mutation_revision, high_water)
-              values (?, ?, ?, ?, ?)`);
-            const leaseUntil = new Date(Date.parse(expiresAt) +
-              SESSION_SYNC_MAX_CLOCK_SKEW_MS + SESSION_SYNC_LEASE_SLACK_MS).toISOString();
-            for (const row of rows) {
-              const version = snapshotVersions.get(row.session.id)!;
-              insert.run(version.rawSessionId, leaseToken, leaseUntil, version.mutationRevision, version.highWater);
-            }
-          }).immediate());
-          const clear = () => ledger.prepare(
-            "delete from session_sync_upload_leases where lease_token = ?",
-          ).run(leaseToken);
-          // The HTTP deadline may expire while a short transaction retries.
-          // An aborted attempt must never start a delayed POST.
+          // No transport retry may replace this batch's token. A missing or
+          // elapsed lease makes its original body ineligible for another send.
+          if (!leaseHeld || Date.now() >= Date.parse(expiresAt) - 10_000 ||
+              rows.some((row) => (ownedLease!.get(
+                snapshotVersions.get(row.session.id)!.rawSessionId) as { token: string } | undefined)?.token !== leaseToken)) {
+            throw new TransportError("deadline_exceeded");
+          }
           if (init?.signal?.aborted) throw new TransportError("deadline_exceeded");
+          refusal = null;
+          fetchAttempts += 1;
           const response = await fetchImpl(request, init);
           if (response.status === 409) {
             try {
@@ -1541,22 +1563,6 @@ export async function runSessionSync(
               }
             } catch { /* An unrecognized 409 stays an uncertain send. */ }
           }
-          // Only a completed success or the two explicit no-write refusals
-          // settles the remote outcome. A timeout, abort, lost response or
-          // transient response leaves the durable lease until its bound.
-          if (response.ok || refusal) {
-            const fresh = await retry.run(() => ledger.transaction(() => {
-              const current = rows.every((row) => snapshotFresh(row.session.id));
-              clear();
-              return current;
-            }).immediate());
-            if (response.ok) settlements.push({ status: "accepted" });
-            else if (refusal) settlements.push(refusal);
-            if (!fresh) {
-              void response.body?.cancel().catch(() => undefined);
-              throw stale();
-            }
-          }
           return response;
         } : fetchImpl;
         const result = await postHistoryBatch({
@@ -1568,7 +1574,7 @@ export async function runSessionSync(
           fetchImpl: fencedFetch,
           sleep,
           maxAttempts,
-          timeoutMs: transportTimeoutMs,
+          timeoutMs: requestTimeoutMs,
           allowPartial: true,
           beforeSend: () => {
             const fresh = rows.every((row) => snapshotFresh(row.session.id));
@@ -1577,6 +1583,16 @@ export async function runSessionSync(
           },
           log,
         });
+        // A single fully parsed acknowledgement proves that the only send
+        // settled. After any earlier attempt, a lost or gateway-generated
+        // response could still conceal an in-flight write, so keep the lease
+        // until the wire deadline plus clock-skew allowance.
+        if (options.incremental) {
+          const fresh = fetchAttempts === 1 ? await clearLease() :
+            rows.every((row) => snapshotFresh(row.session.id));
+          settlements.push({ status: "accepted" });
+          if (!fresh) throw stale();
+        }
         batches += 1;
         sentSessions += rows.length;
         acceptedSessions += result.accepted;
@@ -1608,6 +1624,15 @@ export async function runSessionSync(
           }),
         );
       } catch (error) {
+        const settledRefusal = refusal as { status: "expired" | "clock_skew"; serverTime: string } | null;
+        // A failure before fetch is confirmed unsent. An explicit cloud 409
+        // proves no write for a single attempt. Both release promptly.
+        if (leaseHeld && (fetchAttempts === 0 || (settledRefusal && fetchAttempts === 1))) {
+          try {
+            await clearLease();
+          } catch { /* A failed local cleanup retains the finite lease. */ }
+        }
+        if (settledRefusal) settlements.push(settledRefusal);
         // A source change invalidates this body and leaves the summary dirty;
         // the next catch-up pass will rebuild and retry it. It is not a fatal
         // transport failure and must not abort later batches in this run.
@@ -1615,10 +1640,9 @@ export async function runSessionSync(
           staleReason = error instanceof Error ? error.message : String(error);
           return;
         }
-        const latest = settlements.at(-1);
-        abortReason = abortReason ?? (latest?.status === "clock_skew"
-          ? `session_sync_clock_skew: serverTime=${latest.serverTime}`
-          : latest?.status === "expired" ? "session_sync_expired"
+        abortReason = abortReason ?? (settledRefusal?.status === "clock_skew"
+          ? `session_sync_clock_skew: serverTime=${settledRefusal.serverTime}`
+          : settledRefusal?.status === "expired" ? "session_sync_expired"
           : error instanceof Error ? error.message : String(error));
       }
     })();

@@ -795,7 +795,7 @@ async function reviewRegressions() {
             log: () => undefined,
           });
         }
-        assert.equal(calls, 1);
+        assert.equal(calls, 2, "the 503 retry reaches the endpoint under the same held lease");
         assert.ok(result);
         assert.equal(result.sentSessions, 0);
         assert.equal(result.ok, false);

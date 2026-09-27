@@ -88,6 +88,7 @@ async function main() {
   delayedBuffer.database.pragma("busy_timeout = 0");
   const blocker = new Database(delayedLedgerPath);
   let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+  let lockStartedAtMs = 0;
   let wireBody = "";
   let requestArrivedAtMs = 0;
   let decisionAtMs = 0;
@@ -98,9 +99,9 @@ async function main() {
     wireBody = Buffer.concat(chunks).toString("utf8");
     requestArrivedAtMs = Date.now();
     const batch = JSON.parse(wireBody) as { sentAt: string; expiresAt: string };
-    // The transport timer starts before the lease. The reserved acquisition
-    // budget leaves time to answer after crossing the old sentAt + 1 s gate.
-    const targetMs = Date.parse(batch.sentAt) + 1_150;
+    // The lease acquisition finishes before sentAt, so the one-second remote
+    // window is still available after this 900 ms writer lock.
+    const targetMs = requestArrivedAtMs + 50;
     await new Promise((resolve) => setTimeout(resolve, Math.max(0, targetMs - Date.now())));
     decisionAtMs = Date.now();
     guardAllowed = decisionAtMs <= Date.parse(batch.expiresAt) - 10_000;
@@ -119,6 +120,7 @@ async function main() {
       proofSummaryHooks: { onUpdate: () => {
         assert.equal(releaseTimer, undefined);
         blocker.exec("BEGIN IMMEDIATE");
+        lockStartedAtMs = Date.now();
         releaseTimer = setTimeout(() => blocker.exec("COMMIT"), 900);
       } },
     });
@@ -129,8 +131,10 @@ async function main() {
     console.log(JSON.stringify({ case: "lease_acquisition_delay", sqliteHoldMs: 900, requestAgeMs,
       serverElapsedMs: decisionAtMs - Date.parse(batch.sentAt), guardAllowed,
       acceptedSessions: delayed.acceptedSessions, reason: delayed.reason }));
-    assert.ok(requestAgeMs >= 800, `request arrived only ${requestAgeMs}ms after sentAt`);
-    assert.ok(decisionAtMs - Date.parse(batch.sentAt) > 1_000);
+    assert.ok(Date.parse(batch.sentAt) - lockStartedAtMs >= 800,
+      "sentAt follows the 900 ms lease acquisition wait");
+    assert.ok(requestAgeMs >= 0 && requestAgeMs < 1_000,
+      `request arrived ${requestAgeMs}ms after sentAt`);
     assert.ok(decisionAtMs - requestArrivedAtMs < 1_000);
     assert.equal(guardAllowed, true, "cloud guard admits the request while HTTP still waits");
     assert.equal(delayed.acceptedSessions, 1);
@@ -175,7 +179,7 @@ async function main() {
       assert.notEqual(wireBody, "");
       const wire = JSON.parse(wireBody) as { sentAt: string; expiresAt: string };
       assert.equal(Date.parse(wire.expiresAt) - Date.parse(wire.sentAt),
-        Math.min(120_000, effectiveTimeoutMs + 1_000) + 10_000,
+        effectiveTimeoutMs + 10_000,
         `timeout ${timeoutSeconds}s deadline`);
       assert.equal(guardAllowed, true, `cloud guard must admit timeout ${timeoutSeconds}s`);
       assert.equal(result.acceptedSessions, 1);
@@ -236,7 +240,7 @@ async function main() {
     assert.equal(batch.sessions[0]?.session.id, firstSession);
     assert.ok(batch.sentAt && batch.expiresAt);
     completion.check("new_batch_carries_sent_at_and_expires_at");
-    assert.equal(Date.parse(batch.expiresAt!) - Date.parse(batch.sentAt!), 12_000);
+    assert.equal(Date.parse(batch.expiresAt!) - Date.parse(batch.sentAt!), 11_000);
     completion.check("wire_deadline_adds_cloud_commit_window");
 
     assert.equal(await waitFor(() => fs.existsSync(resultPath), 5_000), true);
@@ -260,7 +264,7 @@ async function main() {
       // The real wall clock reaches the stated bound; the receiver remains
       // paused throughout, so this is the old collector's late-commit window.
       const waitMs = Math.max(0, Date.parse(held.expiresAt) - Date.now() + 80);
-      assert.ok(waitMs <= 78_000);
+      assert.ok(waitMs <= 77_000);
       await new Promise((resolve) => setTimeout(resolve, waitMs));
       assert.equal(restarted.database.prepare("delete from buffered_events where session_id = ?")
         .run(firstSession).changes, 1);

@@ -364,6 +364,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-remote-deadline
 
+      - name: Prove session sync wire handoff and lease reuse across retries (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-lease-retry
+
       - name: Prove bounded legacy outbox writer turns and retryable busy refusals (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:studio0-writer-contention
