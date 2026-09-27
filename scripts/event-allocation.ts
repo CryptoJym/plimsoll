@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import { terminalPrivacyEligibilitySql } from "../packages/collector-cli/src/privacy-disposition";
+import { remoteLinkageHash } from "../packages/shared/src/linkage";
 
 export type AllocationAmounts = {
   inputTokens: number;
@@ -20,6 +22,16 @@ export type AllocationEvent = {
   repoHash: string | null;
   branchHash: string | null;
   headSha: string | null;
+  workItemId?: string | null;
+  runId?: string | null;
+  workEvidenceRef?: string | null;
+  workAttributionState?: string | null;
+};
+
+export type WorkArtifactLink = {
+  workItemId: string;
+  artifactRef: string;
+  evidenceRef: string;
 };
 
 export type PullCandidate = {
@@ -48,6 +60,10 @@ export type AllocationReceipt = {
   weight: 0 | 1;
   amounts: AllocationAmounts;
   costKnown: boolean;
+  workItemId: string | null;
+  runId: string | null;
+  workAllocation: "BOUND" | "UNLINKED";
+  via: "work_id" | "inferred_git" | "UNLINKED";
 };
 
 export type AllocationTotals = AllocationAmounts & {
@@ -72,6 +88,7 @@ export type PullAllocation = AllocationTotals & {
 export type AllocationResult = {
   receipts: AllocationReceipt[];
   pullRows: PullAllocation[];
+  workRows: Array<AllocationTotals & { workItemId: string | null; runs: string[]; pulls: number[] }>;
   coverage: {
     captured: AllocationTotals;
     direct: AllocationTotals;
@@ -98,11 +115,18 @@ export type AllocationOptions = {
   segmentWindowMs?: number;
   /** Fail closed instead of allowing an unbounded GitHub candidate set. */
   maxCandidates?: number;
+  /** Accepted local work-to-PR evidence for the named repository. */
+  workArtifacts?: WorkArtifactLink[];
+  repository?: string;
+  /** Rollback keeps source metadata and the original git inference. */
+  explicitJoinEnabled?: boolean;
 };
 
 const DEFAULT_FALLBACK_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_SEGMENT_WINDOW_MS = 30 * 60 * 1_000;
 const DEFAULT_MAX_CANDIDATES = 100;
+const BEADS_WORK = /^beads:eco-[a-z0-9]+(?:\.[1-9][0-9]*)*$/;
+const RUN_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const ZERO_AMOUNTS: AllocationAmounts = {
   inputTokens: 0,
@@ -335,6 +359,8 @@ function receipt(
   confidence: AllocationConfidence,
   reason: string,
   candidate: NormalizedCandidate | null,
+  workItemId: string | null = null,
+  runId: string | null = null,
 ): AllocationReceipt {
   return {
     eventId: event.eventId,
@@ -347,6 +373,10 @@ function receipt(
     weight: candidate ? 1 : 0,
     amounts: event.amounts,
     costKnown: event.costKnown,
+    workItemId,
+    runId,
+    workAllocation: workItemId ? "BOUND" : "UNLINKED",
+    via: workItemId && candidate ? "work_id" : candidate ? "inferred_git" : "UNLINKED",
   };
 }
 
@@ -407,6 +437,21 @@ export function allocateEvents(
   if (new Set(events.map((event) => event.eventId)).size !== events.length) {
     throw new Error("Duplicate allocation event id");
   }
+  const artifactPrefix = options.repository ? `github:${options.repository.toLowerCase()}/pull/` : null;
+  const artifactRepoHash = options.repository
+    ? remoteLinkageHash(`https://github.com/${options.repository.toLowerCase()}.git`) : null;
+  const artifactPulls = new Map<string, Set<number>>();
+  for (const artifact of options.workArtifacts ?? []) {
+    if (!BEADS_WORK.test(artifact.workItemId) || !artifact.evidenceRef || !artifactPrefix ||
+        !artifact.artifactRef.startsWith(artifactPrefix)) continue;
+    const number = Number(artifact.artifactRef.slice(artifactPrefix.length));
+    if (!Number.isSafeInteger(number) || number < 1 ||
+        artifact.artifactRef !== `${artifactPrefix}${number}` ||
+        !candidates.some((candidate) => candidate.pull === number && candidate.repoHash === artifactRepoHash)) continue;
+    const pulls = artifactPulls.get(artifact.workItemId) ?? new Set<number>();
+    pulls.add(number);
+    artifactPulls.set(artifact.workItemId, pulls);
+  }
 
   const bySession = new Map<string, NormalizedEvent[]>();
   for (const event of events) {
@@ -435,6 +480,22 @@ export function allocateEvents(
 
   const receipts: AllocationReceipt[] = [];
   for (const event of events) {
+    const bound = options.explicitJoinEnabled !== false &&
+      typeof event.workItemId === "string" && BEADS_WORK.test(event.workItemId) &&
+      event.workItemId.length - "beads:".length <= 128 &&
+      typeof event.runId === "string" && RUN_UUID_V4.test(event.runId) &&
+      typeof event.workEvidenceRef === "string" && event.workEvidenceRef.length > 0 &&
+      event.workAttributionState !== "conflict";
+    if (bound) {
+      const matches = artifactPulls.get(event.workItemId!);
+      const number = matches?.size === 1 ? [...matches][0] : null;
+      const candidate = number === null ? null : candidates.find((row) =>
+        row.pull === number && row.repoHash === artifactRepoHash) ?? null;
+      receipts.push(receipt(event, candidate ? "direct" : "unallocated",
+        candidate ? "work_id" : "work_without_unique_artifact_evidence",
+        candidate, event.workItemId!, event.runId!));
+      continue;
+    }
     let resolution = resolveCandidate(event, candidates, fallbackWindowMs);
     if (event.repoHash) {
       receipts.push(
@@ -535,26 +596,55 @@ export function allocateEvents(
     })
     .sort((a, b) => a.repoHash.localeCompare(b.repoHash) || a.pull - b.pull);
 
-  return { receipts, pullRows, coverage: { captured, direct, inferred, unallocated, reconciliation } };
+  const workBuckets = new Map<string | null, AllocationReceipt[]>();
+  for (const row of receipts) {
+    const bucket = workBuckets.get(row.workItemId) ?? [];
+    bucket.push(row);
+    workBuckets.set(row.workItemId, bucket);
+  }
+  const workRows = [...workBuckets.entries()].map(([workItemId, rows]) => ({
+    ...summarize(rows), workItemId,
+    runs: [...new Set(rows.map((row) => row.runId).filter((id): id is string => Boolean(id)))].sort(),
+    pulls: [...new Set(rows.map((row) => row.pull).filter((id): id is number => id !== null))].sort((a, b) => a - b),
+  })).sort((a, b) => (a.workItemId ?? "").localeCompare(b.workItemId ?? ""));
+  const workAmounts = workRows.reduce((total, row) => addAmounts(total, row), ZERO_AMOUNTS);
+  if (workRows.reduce((total, row) => total + row.events, 0) !== captured.events ||
+      Object.keys(ZERO_AMOUNTS).some((field) =>
+        workAmounts[field as keyof AllocationAmounts] !== captured[field as keyof AllocationAmounts])) {
+    throw new Error("Work allocation failed exact reconciliation");
+  }
+
+  return { receipts, pullRows, workRows, coverage: { captured, direct, inferred, unallocated, reconciliation } };
 }
 
 /**
- * The only ledger read used by the allocation spine. It is time-bounded and
- * reads promoted columns exclusively; payload_json is intentionally absent.
+ * The ledger read is time-bounded, applies the shared terminal privacy gate,
+ * and extracts only the four text-free binding fields from payload_json.
+ * Raw payloads never leave SQLite or enter the report.
  */
 export function collectAllocationEvents(
   db: Database.Database,
   since: string,
 ): AllocationEvent[] {
+  const columns = new Set((db.pragma("table_info(buffered_events)") as Array<{ name: string }>).map((column) => column.name));
+  const workField = (path: string) => columns.has("payload_json")
+    ? `case when json_valid(payload_json) then json_extract(payload_json, '${path}') else null end`
+    : "null";
+  const privacyEligible = terminalPrivacyEligibilitySql(db, "buffered_events");
   return db
     .prepare(
       `select id as eventId, session_id as sessionId, observed_at as observedAt,
          input_tokens as inputTokens, output_tokens as outputTokens,
          cache_read_tokens as cacheReadTokens,
          cache_creation_tokens as cacheWriteTokens, cost_usd as costUsd,
-         repo_hash as repoHash, branch_hash as branchHash, head_sha as headSha
+         repo_hash as repoHash, branch_hash as branchHash, head_sha as headSha,
+         ${workField("$.metadata.workItemId")} as workItemId,
+         ${workField("$.metadata.attemptId")} as runId,
+         ${workField("$.metadata.workEvidenceRef")} as workEvidenceRef,
+         ${workField("$.metadata.workAttributionState")} as workAttributionState
        from buffered_events
        where observed_at >= ?
+         and ${privacyEligible}
          and (input_tokens is not null or output_tokens is not null
            or cache_read_tokens is not null or cache_creation_tokens is not null
            or cost_usd is not null)

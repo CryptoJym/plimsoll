@@ -220,7 +220,20 @@ export function runWalCheckpointStage(
   const timer = budget(options);
   if (!timer.canStart()) return { ...timer.result(0), passive: null, truncate: null };
   const passive = checkpoint(database, "PASSIVE");
-  const truncate = passive.busy === 0 && timer.canStart() ? checkpoint(database, "TRUNCATE") : null;
+  let truncate: CheckpointReading | null = null;
+  // PASSIVE reports busy=0 even when a reader keeps frames from being copied.
+  // TRUNCATE would then hold the writer while waiting for that reader, beyond
+  // intake's busy-retry budget. Even after every frame was copied, a reader
+  // can still pin the WAL (or arrive now), so restart must never wait either.
+  if (passive.busy === 0 && passive.log === passive.checkpointed && timer.canStart()) {
+    const priorBusyTimeout = database.pragma("busy_timeout", { simple: true }) as number;
+    database.pragma("busy_timeout = 0");
+    try {
+      truncate = checkpoint(database, "TRUNCATE");
+    } finally {
+      database.pragma(`busy_timeout = ${priorBusyTimeout}`);
+    }
+  }
   const pages = Math.max(0, (truncate ?? passive).checkpointed);
   advance(database, "wal_checkpoint", pages, JSON.stringify(truncate ?? passive));
   return { ...timer.result(pages), passive, truncate };

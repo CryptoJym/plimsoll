@@ -15,7 +15,8 @@
  * Usage:
  *   GITHUB_TOKEN=... tsx scripts/efficiency-report.ts \
  *     --repository owner/repo [--since-days 30] [--yield-window-days 14] \
- *     [--ledger /path/to/work-ledger.sqlite]
+ *     [--ledger /path/to/work-ledger.sqlite] \
+ *     [--work-artifacts /path/to/accepted-artifacts.json] [--no-explicit-work-join]
  *
  *   # descriptive, local-only, no GitHub needed (issue 0010):
  *   tsx scripts/efficiency-report.ts --patterns [--since-days 90] [--ledger ...]
@@ -35,6 +36,7 @@ import {
   allocateEvents,
   collectAllocationEvents,
   type PullCandidate,
+  type WorkArtifactLink,
 } from "./event-allocation";
 
 type PullSummary = {
@@ -225,6 +227,17 @@ async function main() {
   const yieldWindowDays = Number(optionValue("--yield-window-days") ?? 14);
   const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
   const ledgerPath = optionValue("--ledger") ?? collectorBufferPath();
+  const workArtifactsPath = optionValue("--work-artifacts");
+  const artifactInput: unknown = workArtifactsPath ? JSON.parse(fs.readFileSync(workArtifactsPath, "utf8")) : [];
+  const workArtifacts = artifactInput && typeof artifactInput === "object" &&
+    (artifactInput as { schema?: unknown }).schema === "plimsoll-work-artifacts/v1" &&
+    Array.isArray((artifactInput as { links?: unknown }).links)
+      ? (artifactInput as { links: unknown[] }).links : null;
+  if (!workArtifacts || workArtifacts.some((item) => !item || typeof item !== "object" ||
+      typeof (item as WorkArtifactLink).workItemId !== "string" ||
+      typeof (item as WorkArtifactLink).artifactRef !== "string" ||
+      typeof (item as WorkArtifactLink).evidenceRef !== "string"))
+    throw new Error("Invalid work artifact evidence export.");
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const repoHash = remoteLinkageHash(`https://github.com/${owner}/${repo}.git`);
   if (!repoHash) throw new Error("Could not derive repository linkage hash.");
@@ -301,7 +314,10 @@ async function main() {
       // membership read never becomes fabricated direct evidence.
     }
   }
-  const allocation = allocateEvents(events, candidates);
+  const allocation = allocateEvents(events, candidates, {
+    repository: `${owner}/${repo}`, workArtifacts: workArtifacts as WorkArtifactLink[],
+    explicitJoinEnabled: !process.argv.includes("--no-explicit-work-join"),
+  });
 
   // Check runs for joined PRs only (cap GitHub calls).
   const joinedPullNumbers = allocation.pullRows
@@ -507,6 +523,7 @@ async function main() {
     },
     allocation: {
       hierarchy: [
+        "accepted work-to-PR evidence for a bound event (work_id)",
         "exact repo + HEAD membership (direct)",
         "time-bounded repo + branch or unique repo candidate (inferred)",
         "bounded stable same-session segment (inferred)",
@@ -523,6 +540,7 @@ async function main() {
       coverageScope:
         "all promoted token/cost events in the ledger window; events outside the named repository remain unallocated",
       coverage: allocation.coverage,
+      workRows: allocation.workRows,
     },
     pullRows,
   };

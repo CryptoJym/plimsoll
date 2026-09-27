@@ -10,8 +10,9 @@
  * snapshot; the Statement::JS_get -> BtreeTableMoveto -> pread stack in the
  * Studio0 sample). This fixture builds one Codex session whose observed_at
  * order is shuffled against insertion order, so walking the session index is a
- * cold point lookup per row, sized on the running host until that walk costs
- * at least twice the turn budget. Then:
+ * cold point lookup per row. The usage-authority index now makes that same
+ * query covering, so this fixture keeps the full 1.5M-row session and proves
+ * the old count itself stays within the turn budget. Then:
  *   - capture commits for that session (LocalEventBuffer.appendMany, the OTLP
  *     route's own commit) are timed directly, with the route's 25 ms projection
  *     allowance lifted so the result never depends on it;
@@ -51,10 +52,8 @@ import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 
 /** The bead's budget for one synchronous main-thread turn on this data. */
 const TURN_BUDGET_MS = 250;
-/** The fixture must make the old whole-session walk cost this multiple of the budget. */
-const WALK_FLOOR = 2;
-const INITIAL_SESSION_ROWS = Number(process.env.STUDIO0_TURNS_SESSION_ROWS ?? 250_000);
 const MAX_SESSION_ROWS = 1_500_000;
+const INITIAL_SESSION_ROWS = Number(process.env.STUDIO0_TURNS_SESSION_ROWS ?? MAX_SESSION_ROWS);
 /** Studio0's busiest session: 12,889 usage rows among 1.88M. */
 const USAGE_EVERY = 146;
 /** Studio0 ledger tail: ~600-850 bytes of payload_json per row. */
@@ -175,11 +174,15 @@ function threadCpuMs() {
 function wholeSessionWalk() {
   const db = new Database(ledgerPath, { readonly: true, fileMustExist: true });
   try {
+    const sql = `select count(*) as n from buffered_events
+      where source = 'codex' and session_id = ? and ${LIVE_USAGE_ROW}`;
+    const plan = (db.prepare(`explain query plan ${sql}`).all(sessionId) as Array<{ detail: string }>)
+      .map((row) => row.detail);
     const started = performance.now();
     const cpu = threadCpuMs();
-    const { n } = db.prepare(`select count(*) as n from buffered_events
-      where source = 'codex' and session_id = ? and ${LIVE_USAGE_ROW}`).get(sessionId) as { n: number };
-    return { usageRows: n, walkCpuMs: Math.round(threadCpuMs() - cpu), walkMs: Math.round(performance.now() - started) };
+    const { n } = db.prepare(sql).get(sessionId) as { n: number };
+    return { usageRows: n, walkCpuMs: Math.round(threadCpuMs() - cpu),
+      walkMs: Math.round(performance.now() - started), plan };
   } finally {
     db.close();
   }
@@ -300,24 +303,20 @@ async function waitFor<T>(read: () => T | Promise<T>, done: (value: T) => boolea
 }
 
 async function main() {
-  // Size the fixture on this host: a whole-session walk must cost WALK_FLOOR x
-  // the budget, so the defect this proof guards against would be visible here.
-  let seeded = seedLedger(INITIAL_SESSION_ROWS);
-  let walk = wholeSessionWalk();
-  while (walk.walkCpuMs < WALK_FLOOR * TURN_BUDGET_MS && seeded.rows < MAX_SESSION_ROWS) {
-    const rows = Math.min(MAX_SESSION_ROWS,
-      Math.ceil((seeded.rows * WALK_FLOOR * TURN_BUDGET_MS * 1.25) / Math.max(1, walk.walkCpuMs)));
-    seeded = seedLedger(rows);
-    walk = wholeSessionWalk();
-  }
+  // Keep the Studio0-sized adversarial history even though the covering index
+  // makes the old count fast; a missing index fails both plan and CPU checks.
+  const seeded = seedLedger(INITIAL_SESSION_ROWS);
+  const walk = wholeSessionWalk();
   Object.assign(measurements, { sessionRows: seeded.rows, seedMs: seeded.seedMs, ledgerBytes: seeded.ledgerBytes,
     wholeSessionWalkCpuMs: walk.walkCpuMs, wholeSessionWalkMs: walk.walkMs });
   console.log(JSON.stringify({ seeded: measurements }));
 
-  await check("fixture_session_walk_costs_twice_the_budget", () => {
+  await check("whole_session_usage_count_uses_covering_index_and_stays_under_budget", () => {
     assert.ok(walk.usageRows >= Math.floor(seeded.rows / USAGE_EVERY), `fixture has ${walk.usageRows} usage rows`);
-    assert.ok(walk.walkCpuMs >= WALK_FLOOR * TURN_BUDGET_MS,
-      `a ${seeded.rows}-row session walk takes only ${walk.walkCpuMs} ms of CPU here; the proof cannot see the defect`);
+    assert.ok(walk.plan.some((detail) => detail.includes("idx_events_usage_authority_live")),
+      `whole-session count lost its covering index: ${walk.plan.join("; ")}`);
+    assert.ok(walk.walkCpuMs <= TURN_BUDGET_MS,
+      `a ${seeded.rows}-row session count took ${walk.walkCpuMs} ms of CPU on the main thread`);
     return walk;
   });
 

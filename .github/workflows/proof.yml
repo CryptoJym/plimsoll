@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-14
     # Allow the measured sequential artifact, repeated E2E and resource gates.
     # Per-proof deadlines and acceptance thresholds remain unchanged.
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,6 +73,12 @@ jobs:
       - name: Prove event allocation conservation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:allocation
+
+      - name: Prove bound usage links to work and exports opaque work refs (eco-6hoxj.163.104)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:work-linkage
+          pnpm proof:work-ref
 
       - name: Prove integrated capture, provenance, supervision and delivery
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -318,6 +324,14 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-downgrade
 
+      - name: Prove a 0.7.39 ledger rebuilds its session summaries in bounded passes (eco-6hoxj.163.108)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-legacy-rebuild
+
+      - name: Prove update-window probe events never reach spend (eco-6hoxj.163.96)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:stop-window-probe
+
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
@@ -449,6 +463,12 @@ jobs:
       - name: Prove runtime capture promotes bounded learning facts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:runtime-facts
+
+      - name: Prove weekly tool statistics collection, upload bounds and later weeks (eco-6hoxj.165.25)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:weekly-tool-stats
+          pnpm proof:weekly-tool-stats-oversize
 
       - name: Run signal-fidelity proof
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

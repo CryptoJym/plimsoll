@@ -1112,6 +1112,22 @@ export class DashboardProjectionStore {
           or length(raw_generation)=0 or observed_at_ms is null;
     `);
     markOpenStep("projection.finance_indexes");
+    // Snapshot publication holds the writer. Keep the usage-authority
+    // intersection on small covering indexes instead of reading every raw
+    // event's payload-bearing table page once per dashboard window.
+    this.db.exec(`
+      create index if not exists idx_events_usage_authority_tailer
+        on buffered_events (source, session_id, observed_at)
+        where session_id is not null
+          and event_type in ('usage_rollout','usage_transcript')
+          and (input_tokens is not null or output_tokens is not null
+            or cache_read_tokens is not null or cache_creation_tokens is not null
+            or cost_usd is not null);
+      create index if not exists idx_events_usage_authority_live
+        on buffered_events (source, session_id)
+        where session_id is not null and ${LIVE_USAGE_ROW_SQL};
+    `);
+    markOpenStep("projection.usage_authority_indexes");
     this.db.prepare(`insert or ignore into dashboard_lifetime_totals (singleton) values (1)`).run();
 
     this.db.prepare(
@@ -3822,14 +3838,14 @@ export class DashboardProjectionStore {
   private usageAuthoritySummary(cutoff: string) {
     const dualSessions = this.db.prepare(
       `select count(*) as n from (
-         select source, session_id from buffered_events
+         select source, session_id from buffered_events indexed by idx_events_usage_authority_tailer
           where observed_at >= ? and session_id is not null
             and event_type in ('usage_rollout','usage_transcript')
             and (input_tokens is not null or output_tokens is not null
               or cache_read_tokens is not null or cache_creation_tokens is not null
               or cost_usd is not null)
          intersect
-         select source, session_id from buffered_events
+         select source, session_id from buffered_events indexed by idx_events_usage_authority_live
           where session_id is not null
             and event_type not in ('usage_rollout','usage_transcript')
             and (input_tokens is not null or output_tokens is not null

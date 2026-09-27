@@ -166,6 +166,8 @@ export function isHookSpoolSource(value: unknown): value is HookSpoolSource {
 export type HookSpoolEnvelope = {
   v: 1;
   source: HookSpoolSource;
+  /** Set only by the update listener after authenticated probe admission. */
+  probe?: boolean;
   /**
    * When the event arrived, stamped before the file is written: the hook
    * process's own time when the client spooled it, the daemon's request
@@ -784,6 +786,7 @@ export function writeHookSpoolEnvelope(options: {
   home: string;
   source: HookSpoolSource;
   body: string;
+  probe?: boolean;
   /** Forbidden raw-content values the caller emptied before handing it over. */
   blanked?: number;
   nowMs?: number;
@@ -795,6 +798,7 @@ export function writeHookSpoolEnvelope(options: {
   const envelope: HookSpoolEnvelope = {
     v: 1,
     source: options.source,
+    ...(options.probe ? { probe: true } : {}),
     receivedAt: new Date(nowMs).toISOString(),
     blanked: options.blanked ?? 0,
     body: options.body,
@@ -891,6 +895,7 @@ export function readHookSpoolFile(file: string): HookSpoolReadResult {
     envelope: {
       v: 1,
       source: record.source,
+      ...(record.probe === true ? { probe: true } : {}),
       receivedAt: record.receivedAt,
       // A receipt of how much the hook process emptied, not a trust input: the
       // drain hands the route `body` and nothing else either way.

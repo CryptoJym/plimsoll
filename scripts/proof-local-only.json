@@ -19,6 +19,15 @@
       "reviewedOn": "2026-09-24",
       "expires": "2026-10-24",
       "reason": "Needs a v0.7.4 checkout (PLIMSOLL_V074_ROOT, default ../plimsoll-v074) and the private plimsoll-cloud source (PLIMSOLL_CLOUD_ROOT, default ../plimsoll-cloud: src/lib/delivery-ack.ts and src/lib/delivery-ack-response.ts), which the public CI checkout cannot fetch. The rule it proves (skippedStale counts every submitted row) also runs in CI as proof:delivery partial_acknowledgement_counts_rejected_rows_as_skipped_stale."
+    },
+    "scripts/weekly-tool-stats-rollback-proof.ts": {
+      "owner": "eco-6hoxj.165.25",
+      "needs": [
+        "PLIMSOLL_V0743_ROOT"
+      ],
+      "reviewedOn": "2026-09-26",
+      "expires": "2026-10-26",
+      "reason": "Needs a 0.7.43 source tree with its dependencies (PLIMSOLL_V0743_ROOT), which the CI checkout does not have: the proof opens a ledger with 0.7.43's own buffer code after the current code wrote weekly tool statistics, then reopens it with the current code. Run locally: git worktree add --detach ../plimsoll-0743 c1969ae, pnpm install there, then PLIMSOLL_V0743_ROOT=../plimsoll-0743 tsx scripts/weekly-tool-stats-rollback-proof.ts (PASS in eco-6hoxj.165.25 on 2026-09-26: 1/1 tool-stat cell and upload state recovered)."
     }
   },
   "quarantined": {

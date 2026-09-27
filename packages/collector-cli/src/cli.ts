@@ -2,7 +2,7 @@
 import { AutomaticRetentionCadence } from "./retention-cadence";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -77,6 +77,7 @@ import { appendForwardedHook } from "./forwarder";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
+import { uploadCompletedToolStatsWeek } from "./weekly-tool-stats-upload";
 import {
   DEFAULT_PRODUCER_ROTATION_GRACE_MS,
   MAX_PRODUCER_ROTATION_GRACE_MS,
@@ -156,6 +157,7 @@ import {
 import { bindDispatch,closeDispatch,restampDispatch } from "./dispatch-command";
 import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
 import { OtlpIntakeSpool } from "./otlp-spool";
+import { releaseStopWindowListener, runStopWindowListener } from "./stop-window-listener";
 import {
   HOOK_SPOOL_COLLECTOR_TOO_OLD,
   HOOK_SPOOL_COLLECTOR_UNREACHABLE,
@@ -269,6 +271,8 @@ import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
 import { runLearningMaterialization } from "./learning-materializer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import {
+  advanceLegacySessionSummaryRebuild,
+  beginLegacySessionSummaryRebuild,
   commitDaemonSessionSyncFailure,
   commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState,
@@ -321,6 +325,39 @@ import {
 } from "./runtime-ownership";
 
 const command = process.argv[2] ?? "help";
+
+async function startStopWindowChild(port: number) {
+  const nonce = randomUUID();
+  const child = spawn(process.execPath, [
+    ...process.execArgv, process.argv[1] ?? "", "__stop_window_listener", nonce,
+  ], {
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+    env: { ...process.env, PLIMSOLL_STOP_WINDOW_NONCE: nonce },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("stop_window_listener_ready_timeout")), 95_000);
+      const fail = (error: Error) => { clearTimeout(timer); reject(error); };
+      child.once("error", fail);
+      child.once("exit", (code) => fail(new Error(`stop_window_listener_exit:${code}`)));
+      child.on("message", (message) => {
+        const row = message as { status?: unknown; port?: unknown; reason?: unknown };
+        if (row.status === "ready" && row.port === port) {
+          clearTimeout(timer);
+          resolve();
+        } else if (row.status === "error") {
+          fail(new Error(`stop_window_listener_error:${String(row.reason)}`));
+        }
+      });
+    });
+  } catch (error) {
+    child.kill();
+    throw error;
+  }
+  child.disconnect();
+  child.unref();
+}
 
 function printHelp() {
   console.log(`Plimsoll Collector
@@ -483,7 +520,7 @@ Config tools:
       nothing the JSON carries a hint naming --since; an exact --limit pool and inert
       skips alone never raise it. --dry-run classifies with zero writes.
   push-repo-labels [--dry-run] [--yes] [--url URL]
-  sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
+  sync-outcomes --repository owner/repo [--work-artifacts accepted-links.json] [--no-explicit-work-join] [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
       Same fetch surface as the local efficiency report (pull list, check-runs and
       rework scan for joined PRs only — bounded; GITHUB_TOKEN/GH_TOKEN honored, optional
       for public repos). Naming the repo is the same deliberate disclosure as
@@ -2536,6 +2573,7 @@ async function main() {
     "unload-launch-agent",
     "uninstall-launch-agent",
     "lifecycle",
+    "__stop_window_listener",
   ]);
   const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
@@ -2550,6 +2588,20 @@ async function main() {
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
+
+  if (command === "__stop_window_listener") {
+    if (!process.send || process.argv[3] !== process.env.PLIMSOLL_STOP_WINDOW_NONCE ||
+        !/^[a-f0-9-]{36}$/i.test(process.argv[3] ?? "") || configRead?.status !== "valid") {
+      throw new Error("stop_window_listener_requires_lifecycle_update");
+    }
+    try {
+      await runStopWindowListener(config, resolveCollectorHome().home);
+    } catch (error) {
+      process.send?.({ status: "error", reason: (error as Error).message });
+      throw error;
+    }
+    return;
+  }
 
   if (command === "dispatch") {
     if (configRead?.status !== "valid") throw new Error("dispatch_config_not_valid");
@@ -2888,6 +2940,7 @@ async function main() {
     // is accepted, each cycle catch-up-walks the ledger so a missed first
     // refresh does not wait for `upload-history --sessions`.
     let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
+    let legacySummaryRebuild = beginLegacySessionSummaryRebuild(buffer.database);
     let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
     let lastSessionPassAt = performance.now();
 
@@ -2984,19 +3037,42 @@ async function main() {
         ];
         const sessionUntil = new Date().toISOString();
         try {
-          const sessionPlan = planDaemonSessionSync({
-            db: buffer.database,
-            state: { ...sessionSyncState, pendingSessionIds },
-            uploadedBatches,
+          const legacyActive = legacySummaryRebuild !== null && legacySummaryRebuild.phase !== "done";
+          const newIds = sessionSyncState.caughtUp
+            ? await listLedgerSessionIdsOffThread(buffer.database, {
+                until: sessionUntil,
+                since: sessionSyncState.lastSuccessfulUntil,
+                excludedIds: sessionSyncState.blockedSessionIds,
+              }) : [];
+          // While the legacy cursor scans historical sessions, its incomplete
+          // ids belong to the rebuild, not the foreground sync planner. A
+          // current-id batch runs first and keeps its own durable pending set.
+          const blocked = new Set(sessionSyncState.blockedSessionIds ?? []);
+          const currentIds = [...new Set([...touchedSessionIds, ...newIds])]
+            .filter((id) => !blocked.has(id));
+          const foregroundIds = currentIds.slice(0, 64);
+          const sessionPlan = legacyActive ? {
+            skip: foregroundIds.length === 0,
+            sessionIds: foregroundIds,
             until: sessionUntil,
-            ledgerSessionIds: sessionSyncState.caughtUp
-              ? await listLedgerSessionIdsOffThread(buffer.database, {
-                  until: sessionUntil,
-                  since: sessionSyncState.lastSuccessfulUntil,
-                  excludedIds: sessionSyncState.blockedSessionIds,
-                })
-              : undefined,
-          });
+            reason: "incremental" as const,
+            state: { ...sessionSyncState, pendingSessionIds: currentIds },
+          } : (() => {
+            try {
+              const sessionPlan = planDaemonSessionSync({
+                db: buffer.database,
+                state: { ...sessionSyncState, pendingSessionIds },
+                uploadedBatches,
+                until: sessionUntil,
+                ledgerSessionIds: sessionSyncState.caughtUp ? newIds : undefined,
+              });
+              return sessionPlan;
+            } catch (error) {
+              console.warn(JSON.stringify({ warning: "session_sync_planner_failed",
+                message: error instanceof Error ? error.message : String(error) }));
+              throw error;
+            }
+          })();
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
           if (!await persistSessionCarry()) return;
@@ -3011,7 +3087,30 @@ async function main() {
             });
             const summaryPending = sessionResult.pendingSummarySessionIds;
             summaryCatchUp = summaryPending.length > 0;
-            if (sessionResult.ok && sessionResult.summaryComplete) {
+            if (legacyActive) {
+              // Only the completed historical scan may advance the daemon's
+              // full-catch-up horizon. A current-id batch still uploads real
+              // complete snapshots and retains unfinished ids for next time.
+              const unfinished = new Set(sessionResult.pendingSummarySessionIds);
+              const completed = sessionResult.ok
+                ? new Set(foregroundIds.filter((id) => !unfinished.has(id)))
+                : new Set<string>();
+              const blockedNext = new Set([
+                ...blocked, ...sessionResult.rejectedSessionIds,
+              ]);
+              pendingSessionIds = [...new Set([
+                ...pendingSessionIds.filter((id) => !completed.has(id)), ...unfinished,
+              ])].filter((id) => !blockedNext.has(id));
+              sessionSyncState = { ...sessionSyncState, pendingSessionIds,
+                blockedSessionIds: [...blockedNext] };
+              if (sessionResult.ok && sessionResult.summaryComplete &&
+                  currentIds.length === foregroundIds.length && sessionSyncState.caughtUp) {
+                sessionSyncState = commitDaemonSessionSyncSuccess(
+                  sessionSyncState, sessionPlan.until, sessionResult.rejectedSessionIds,
+                );
+                pendingSessionIds = sessionSyncState.pendingSessionIds;
+              }
+            } else if (sessionResult.ok && sessionResult.summaryComplete) {
               sessionSyncState = commitDaemonSessionSyncSuccess(
                 sessionSyncState,
                 sessionPlan.until,
@@ -3062,6 +3161,49 @@ async function main() {
               console.warn(
                 JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
               );
+            }
+          }
+          if (legacySummaryRebuild && legacySummaryRebuild.phase !== "done") {
+            try {
+              const step = await advanceLegacySessionSummaryRebuild(config, buffer.database);
+              legacySummaryRebuild = step.state;
+              const elapsedSeconds = step.state
+                ? Math.max(1, (Date.now() - Date.parse(step.state.startedAt)) / 1_000) : 0;
+              const projectedSeconds = step.state && step.state.rowsRead > 0
+                ? Math.round(elapsedSeconds * step.state.rawRowsAtStart / step.state.rowsRead)
+                : null;
+              console.log(JSON.stringify({
+                status: "session_summary_rebuild_progress",
+                phase: step.state?.phase ?? "none",
+                scannedSessions: step.state?.scanned ?? 0,
+                rowsRead: step.state?.rowsRead ?? 0,
+                rawRowsAtStart: step.state?.rawRowsAtStart ?? 0,
+                passes: step.state?.passes ?? 0,
+                projectedSeconds,
+                batchSessions: step.ids.length,
+                batchAccepted: step.result?.acceptedSessions ?? 0,
+                batchPending: step.result?.pendingSummarySessionIds.length ?? 0,
+              }));
+              if (step.result?.ok && step.result.acceptedSessions > 0) {
+                console.log(JSON.stringify({
+                  status: "session_sync", source: "legacy_summary_rebuild",
+                  sessions: step.result.sentSessions,
+                  accepted: step.result.acceptedSessions,
+                  summaryComplete: step.result.summaryComplete,
+                  rowsRead: step.result.summaryStats.rowsRead,
+                }));
+              }
+              if (step.state?.phase === "done" && !sessionSyncState.caughtUp) {
+                sessionSyncState = { ...sessionSyncState, caughtUp: true,
+                  lastSuccessfulUntil: step.state.startedAt };
+                await persistSessionCarry();
+              }
+              if (step.state?.phase !== "done") summaryCatchUp = true;
+              if (step.result && !step.result.ok) summaryCatchUp = true;
+            } catch (error) {
+              console.warn(JSON.stringify({ warning: "session_summary_rebuild_failed",
+                message: error instanceof Error ? error.message : String(error) }));
+              summaryCatchUp = true;
             }
           }
         } catch (error) {
@@ -3290,6 +3432,23 @@ async function main() {
     if (config.uploadUrl) {
       syncBackoff.arm();
       timers.push(setInterval(() => { syncBackoff.tick(); void runSync(); }, config.syncIntervalSeconds * 1000));
+      let toolStatsInFlight = false;
+      const runWeeklyToolStats = async () => {
+        if (toolStatsInFlight || shuttingDown) return;
+        toolStatsInFlight = true;
+        try {
+          const status = await uploadCompletedToolStatsWeek(config, buffer.database);
+          if (status === "accepted" || status === "conflict") {
+            console.log(JSON.stringify({ status: `weekly_tool_stats_${status}` }));
+          }
+        } catch {
+          console.warn(JSON.stringify({ warning: "weekly_tool_stats_retry_pending" }));
+        } finally {
+          toolStatsInFlight = false;
+        }
+      };
+      timers.push(setInterval(() => void runWeeklyToolStats(), config.syncIntervalSeconds * 1000));
+      setTimeout(() => void runWeeklyToolStats(), 1_000).unref();
     }
     // Self-healing managed-config reconcile (bead eco-6hoxj.50). The fleet's
     // seat and conductor tooling rewrites ~/.claude-seats/<slug>/settings.json
@@ -6073,6 +6232,8 @@ async function main() {
     };
     const outcomes = await runOutcomesSync(config, {
       repository,
+      workArtifactsPath: optionValue("--work-artifacts"),
+      explicitJoinEnabled: !flag("--no-explicit-work-join"),
       sinceDays: numberOption("--since-days"),
       reworkWindowDays: numberOption("--rework-window-days"),
       until: optionValue("--until"),
@@ -6421,6 +6582,14 @@ async function main() {
       if (result.kind === "preflight" && !result.preflight.ok) process.exitCode = 1;
       return;
     }
+    if (action === "update") {
+      // Managed/upload-enabled update windows are the fleet path. An
+      // unenrolled offline install has no running authenticated receiver.
+      if (configRead?.status === "valid" && (config.managed || config.uploadUrl)) {
+        if (!readLocalIngestAuth(resolveCollectorHome().home)) throw new Error("stop_window_auth_unavailable");
+        await startStopWindowChild(config.port);
+      }
+    }
     const resolveArtifact = async (reference: string) => {
       if (reference === "self") return resolveSelfArtifact();
       if (!path.isAbsolute(reference) || !fs.existsSync(reference)) {
@@ -6492,7 +6661,8 @@ async function main() {
       throw new Error("LaunchAgent visible manifest postcondition failed after install.");
     }
     const load = flag("--load")
-      ? await loadVisibleLaunchAgent(result.plistPath, config.port, result.receipt.changed, launchAgentMutationAuthority())
+      ? (await releaseStopWindowListener(config.port, resolveCollectorHome().home),
+        await loadVisibleLaunchAgent(result.plistPath, config.port, result.receipt.changed, launchAgentMutationAuthority()))
       : { loaded: false, status: "not_requested" as const, manifestDigest: visible.manifestDigest };
     console.log(
       JSON.stringify(
@@ -6530,6 +6700,7 @@ async function main() {
       process.exitCode = 1;
       return;
     }
+    await releaseStopWindowListener(config.port, resolveCollectorHome().home);
     const load = await loadVisibleLaunchAgent(plistPath, config.port, false, launchAgentMutationAuthority());
     console.log(JSON.stringify({ ...load, plistPath, label: LAUNCH_AGENT_LABEL }, null, 2));
     if (launchAgentLoadFailed(load) && process.exitCode === undefined) process.exitCode = 1;

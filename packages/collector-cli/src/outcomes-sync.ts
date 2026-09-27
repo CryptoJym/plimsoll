@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { postDelivery } from "./delivery-post";
 import { pinnedUploadUrl, TransportError, type JsonPostResult } from "./http-transport";
 
@@ -152,9 +153,115 @@ export type PullOutcome = {
 export type SessionPullJoin = {
   pull: number;
   sessionId: string;
-  via: "branch_hash" | "head_sha" | "merge_sha";
+  via: "branch_hash" | "head_sha" | "merge_sha" | "work_id" | "inferred_git";
   events: number;
+  eventId?: string;
+  workItemId?: string | null;
 };
+
+export type UsageEventLink = {
+  eventId: string;
+  sessionId: string | null;
+  workItemId: string | null;
+  runId: string | null;
+  workEvidenceRef: string | null;
+  workAttributionState: string | null;
+  repoHash: string | null;
+  branchHash: string | null;
+  headSha: string | null;
+};
+
+/** Read usage at event granularity. Session-level totals cannot separate two
+ * work binds in one native session. The shared privacy predicate also removes
+ * evidence-mode, terminally suppressed, and duplicate accounting rows. */
+export function collectUsageEventLinks(
+  ledger: Database.Database,
+  options: { since: string; until: string },
+): UsageEventLink[] {
+  const privacyEligible = terminalPrivacyEligibilitySql(ledger, "buffered_events");
+  return ledger.prepare(`select
+      id as eventId, session_id as sessionId,
+      json_extract(payload_json, '$.metadata.workItemId') as workItemId,
+      json_extract(payload_json, '$.metadata.attemptId') as runId,
+      json_extract(payload_json, '$.metadata.workEvidenceRef') as workEvidenceRef,
+      json_extract(payload_json, '$.metadata.workAttributionState') as workAttributionState,
+      repo_hash as repoHash, branch_hash as branchHash, head_sha as headSha
+    from buffered_events
+    where ${privacyEligible}
+      and observed_at >= @since and created_at <= @until
+      and (event_type in ('usage_rollout','usage_transcript','usage_live')
+        or json_extract(payload_json, '$.inputTokens') is not null
+        or json_extract(payload_json, '$.outputTokens') is not null
+        or json_extract(payload_json, '$.cacheReadTokens') is not null
+        or json_extract(payload_json, '$.cacheCreationTokens') is not null
+        or json_extract(payload_json, '$.costUsd') is not null)
+    order by created_at, id`).all(options) as UsageEventLink[];
+}
+
+export type WorkArtifactLink = {
+  workItemId: string;
+  /** An explicitly accepted Beads artifact reference, never a branch guess. */
+  artifactRef: string;
+  evidenceRef: string;
+};
+
+export type ProjectedWorkUsage = UsageEventLink & {
+  allocation: "BOUND" | "UNLINKED";
+  pull: number | null;
+  via: "work_id" | "inferred_git" | "UNLINKED";
+};
+
+const BEADS_WORK = /^beads:eco-[a-z0-9]+(?:\.[1-9][0-9]*)*$/;
+const RUN_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** One row per eligible event. A bound event without matching artifact
+ * evidence retains its work charge but proves no PR. Only unbound events take
+ * the legacy git fallback; it never mints a work identity. */
+export function projectWorkUsage(
+  events: UsageEventLink[], pulls: PullOutcome[], repoHash: string | undefined,
+  repository: string, artifacts: WorkArtifactLink[],
+  options: { explicitJoinEnabled?: boolean } = {},
+): ProjectedWorkUsage[] {
+  const enabled = options.explicitJoinEnabled !== false;
+  const prefix = `github:${repository.toLowerCase()}/pull/`;
+  const artifactsByWork = new Map<string, Set<number>>();
+  for (const artifact of artifacts) {
+    if (!BEADS_WORK.test(artifact.workItemId) || !artifact.evidenceRef ||
+        !artifact.artifactRef.startsWith(prefix)) continue;
+    const number = Number(artifact.artifactRef.slice(prefix.length));
+    if (!Number.isSafeInteger(number) || number < 1 ||
+        artifact.artifactRef !== `${prefix}${number}` ||
+        !pulls.some((pull) => pull.number === number)) continue;
+    const numbers = artifactsByWork.get(artifact.workItemId) ?? new Set<number>();
+    numbers.add(number);
+    artifactsByWork.set(artifact.workItemId, numbers);
+  }
+  const result = new Map<string, ProjectedWorkUsage>();
+  for (const event of events) {
+    if (result.has(event.eventId)) continue;
+    const bound = enabled && typeof event.workItemId === "string" &&
+      BEADS_WORK.test(event.workItemId) && event.workItemId.length - 6 <= 128 &&
+      typeof event.runId === "string" && RUN_UUID_V4.test(event.runId) &&
+      typeof event.workEvidenceRef === "string" && event.workEvidenceRef.length > 0 &&
+      event.workAttributionState !== "conflict";
+    const workItemId = bound ? event.workItemId : null;
+    const runId = bound ? event.runId : null;
+    const matchedArtifacts = workItemId ? artifactsByWork.get(workItemId) : undefined;
+    const explicitPull = matchedArtifacts?.size === 1 ? [...matchedArtifacts][0]! : null;
+    // A work-bound event with no unique accepted artifact has no proven PR.
+    // Disabling the explicit projection re-enables the old inferred git view.
+    const inferred = bound ? null : pulls.find((pull) =>
+      (!event.repoHash || event.repoHash === repoHash) &&
+      ((event.branchHash && pull.branchHash === event.branchHash) ||
+       (event.headSha && (pull.headSha === event.headSha || pull.mergeCommitSha === event.headSha))));
+    result.set(event.eventId, {
+      ...event, workItemId, runId, allocation: bound ? "BOUND" : "UNLINKED",
+      pull: explicitPull ?? inferred?.number ?? null,
+      via: explicitPull ? "work_id" : inferred ? "inferred_git" : "UNLINKED",
+    });
+  }
+  return [...result.values()];
+}
 
 /**
  * The report's join, verbatim: sessions whose repoHash matches (or is absent)
@@ -250,11 +357,15 @@ export function buildOutcomePush(input: {
   const repoSlug = `github.com/${owner}/${repo}`;
   const remoteUrlHash = remoteLinkageHash(`https://${repoSlug}.git`);
 
-  const byPull = new Map<number, { sessions: Map<string, SessionPullJoin>; via: Set<string> }>();
+  const byPull = new Map<number, { sessions: Map<string, SessionPullJoin>; via: Set<string>; workIds: Set<string> }>();
   for (const join of input.joins) {
-    const bucket = byPull.get(join.pull) ?? { sessions: new Map(), via: new Set<string>() };
-    if (!bucket.sessions.has(join.sessionId)) bucket.sessions.set(join.sessionId, join);
+    const bucket = byPull.get(join.pull) ?? { sessions: new Map(), via: new Set<string>(), workIds: new Set<string>() };
+    const prior = bucket.sessions.get(join.sessionId);
+    if (!prior) bucket.sessions.set(join.sessionId, join);
+    else if (join.eventId && prior.eventId !== join.eventId)
+      bucket.sessions.set(join.sessionId, { ...prior, events: prior.events + join.events });
     bucket.via.add(join.via);
+    if (join.via === "work_id" && join.workItemId) bucket.workIds.add(join.workItemId);
     byPull.set(join.pull, bucket);
   }
 
@@ -306,6 +417,7 @@ export function buildOutcomePush(input: {
       joinedVia: [...bucket.via].sort(),
       linkedSessions: linked.length,
       linkedSessionIds: linkedIds.slice(0, MAX_LINKED_SESSION_IDS),
+      ...(bucket.workIds.size > 0 ? { linkedWorkItemIds: [...bucket.workIds].sort().slice(0, MAX_LINKED_SESSION_IDS) } : {}),
       checks: pull.checks,
       checksFetched: pull.checksFetched,
       reworkWindowDays: input.reworkWindowDays,
@@ -610,6 +722,11 @@ export type OutcomesSyncOptions = {
   appVersion?: string;
   ledgerPath?: string;
   ledgerDb?: Database.Database;
+  /** Explicit local export of accepted work-to-PR evidence. No Beads content crosses. */
+  workArtifactsPath?: string;
+  workArtifacts?: WorkArtifactLink[];
+  /** Rollback: retain event metadata and inferred git joins, disable explicit work joins. */
+  explicitJoinEnabled?: boolean;
   githubToken?: string;
   fetchImpl?: typeof fetch;
   log?: (line: string) => void;
@@ -694,9 +811,15 @@ export async function runOutcomesSync(
       );
     }
   }
-  let sessions: LedgerSessionLink[];
+  const columns = new Set((ledger.pragma("table_info(buffered_events)") as Array<{ name: string }>).map((column) => column.name));
+  // Older synthetic/legacy ledgers have only session linkage columns. The
+  // event projection activates only when event identity and payload exist.
+  const eventProjectionAvailable = ["id", "payload_json", "event_type"].every((name) => columns.has(name));
+  let events: UsageEventLink[] = [];
+  let legacySessions: LedgerSessionLink[] = [];
   try {
-    sessions = collectSessionLinks(ledger, { since, until });
+    if (eventProjectionAvailable) events = collectUsageEventLinks(ledger, { since, until });
+    else legacySessions = collectSessionLinks(ledger, { since, until });
   } finally {
     if (ownsLedger) ledger.close();
   }
@@ -708,14 +831,33 @@ export async function runOutcomesSync(
       sinceDays,
       reworkWindowDays,
       until,
-      ledgerSessions: sessions.length,
+      ledgerSessions: eventProjectionAvailable
+        ? new Set(events.map((event) => event.sessionId).filter(Boolean)).size : legacySessions.length,
       githubAuth: Boolean(token),
       dryRun: Boolean(options.dryRun),
     }),
   );
 
   const pulls = await fetchPullOutcomes({ owner, repo, since, token, fetchImpl });
-  const joins = joinSessionsToPulls(sessions, pulls, repoHash);
+  const artifactInput: unknown = options.workArtifacts ?? (options.workArtifactsPath
+    ? JSON.parse(fs.readFileSync(options.workArtifactsPath, "utf8")) : []);
+  const artifacts = Array.isArray(artifactInput) ? artifactInput :
+    artifactInput && typeof artifactInput === "object" &&
+    (artifactInput as { schema?: unknown }).schema === "plimsoll-work-artifacts/v1" &&
+    Array.isArray((artifactInput as { links?: unknown }).links)
+      ? (artifactInput as { links: unknown[] }).links : null;
+  if (!artifacts || artifacts.some((item) => !item || typeof item !== "object" ||
+      typeof (item as WorkArtifactLink).workItemId !== "string" ||
+      typeof (item as WorkArtifactLink).artifactRef !== "string" ||
+      typeof (item as WorkArtifactLink).evidenceRef !== "string"))
+    throw new Error("Invalid work artifact evidence export.");
+  const joins: SessionPullJoin[] = eventProjectionAvailable
+    ? projectWorkUsage(events, pulls, repoHash, `${owner}/${repo}`,
+      artifacts as WorkArtifactLink[], { explicitJoinEnabled: options.explicitJoinEnabled })
+      .filter((row) => row.pull !== null && row.sessionId !== null)
+      .map((row) => ({ pull: row.pull!, sessionId: row.sessionId!, via: row.via as "work_id" | "inferred_git",
+        events: 1, eventId: row.eventId, workItemId: row.workItemId }))
+    : joinSessionsToPulls(legacySessions, pulls, repoHash);
   const joinedNumbers = [...new Set(joins.map((join) => join.pull))].sort((a, b) => a - b);
   await fetchChecksForJoined(pulls, joinedNumbers, { owner, repo, token, fetchImpl });
   const mergedJoined = pulls.filter((pull) => joinedNumbers.includes(pull.number) && pull.merged);
@@ -739,7 +881,8 @@ export async function runOutcomesSync(
     until,
     sinceDays,
     reworkWindowDays,
-    ledgerSessions: sessions.length,
+    ledgerSessions: eventProjectionAvailable
+      ? new Set(events.map((event) => event.sessionId).filter(Boolean)).size : legacySessions.length,
     pullsExamined: pulls.length,
     pullsJoined: push.pullsJoined,
     sessionsLinked: push.sessionsLinked,

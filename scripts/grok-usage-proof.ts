@@ -31,6 +31,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { AUTOMATIC_CAPTURE_LIMITS, CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { resolveGitContextUncached } from "../packages/collector-cli/src/git-context";
+import { buildGrokUsageEvent } from "../packages/collector-cli/src/grok-usage-tailer";
 import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
 import { CollectorMaintenance, type CollectorMaintenanceRunResult } from "../packages/collector-cli/src/maintenance";
 import { projectMaintenanceResult } from "../packages/collector-cli/src/maintenance-protocol";
@@ -41,7 +42,7 @@ import { resolveMaintenanceRepoContexts } from "../packages/collector-cli/src/ma
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema, aiWorkIngestBatchSchema } from "../packages/shared/src/index";
 
-const EXPECTED_CHECKS = 40;
+const EXPECTED_CHECKS = 41;
 const completion = createProofCompletion("grok-usage", EXPECTED_CHECKS);
 const SENTINEL = "PLIMSOLL_GROK_CONTENT_SENTINEL_5c1e";
 const TICKS_PER_USD = 10_000_000_000;
@@ -557,13 +558,28 @@ async function main() {
   check("every_grok_usage_event_passes_the_shared_ingest_schema_and_outbound_seal",
     sealed.every((outcome) => outcome.ok &&
       Object.keys(outcome.envelope.event.metadata).every((key) =>
-        ["usageSource", "turnIndex", "reasoningOutputTokens"].includes(key)) &&
+        ["usageSource", "turnIndex", "reasoningOutputTokens", "costUsdTicks"].includes(key)) &&
       outcome.envelope.suppressedFields.length === 0) &&
       bodies.length > 0 && bodies.every((body) => aiWorkIngestBatchSchema.safeParse(JSON.parse(body)).success) &&
       uploadedGrok.length === allRows.length &&
       uploadedGrok.every((envelope) => aiInteractionEventSchema.safeParse(envelope.event).success &&
         typeof envelope.event.inputTokens === "number"),
     { sealed: sealed.length, uploadedGrok: uploadedGrok.length, uploadedEvents: upload.uploadedEvents });
+
+  const exactUsage = { input: 1, cachedRead: 0, cacheCreation: 0, output: 1, reasoning: 0, costTicks: 1_200 };
+  const exactEvent = buildGrokUsageEvent(uuid(912), 1, at(1), {
+    stream: { ...exactUsage, model: "grok-4.7-build", billIncomplete: false, labelIncomplete: false },
+    delta: exactUsage,
+    absolute: exactUsage,
+    revision: false,
+  });
+  const exactEnvelope = sealOutboundEnvelope({ event: exactEvent, suppressedFields: [] });
+  check("grok_1200_vendor_ticks_survive_event_and_upload_metadata",
+    exactEvent.costUsd === 1.2e-7 && exactEvent.costKind === "reported" &&
+      exactEvent.metadata.costUsdTicks === 1_200 && exactEnvelope.ok &&
+      exactEnvelope.envelope.event.metadata.costUsdTicks === 1_200,
+    { eventTicks: exactEvent.metadata.costUsdTicks,
+      envelopeTicks: exactEnvelope.ok ? exactEnvelope.envelope.event.metadata.costUsdTicks : null });
 
   buffer.database.pragma("wal_checkpoint(TRUNCATE)");
   const ledgerBytes = [path.join(work, "ledger.sqlite"), path.join(work, "ledger.sqlite-wal")]

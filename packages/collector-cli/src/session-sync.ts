@@ -706,49 +706,204 @@ export function planDaemonSessionSync(input: {
 /** Daemon planner's distinct-id scan, without blocking HTTP intake. */
 export async function listLedgerSessionIdsOffThread(
   ledger: Database.Database,
-  options: { until: string; since?: string | null; excludedIds?: string[]; maxIds?: number; allSessions?: boolean },
+  options: { until: string; since?: string | null; excludedIds?: string[]; maxIds?: number;
+    allSessions?: boolean; afterId?: string | null },
 ): Promise<string[]> {
   const excluded = new Set(options.excludedIds ?? []);
   // The planner only needs an overflow signal; a full catch-up needs every
-  // session. Both paths read at most one bounded page on the worker at a time.
+  // session. Reuse one worker across bounded pages rather than opening a new
+  // SQLite connection per page on large ledgers.
   const maxIds = options.maxIds ?? MAX_PENDING_SESSION_IDS + 1;
   const ids: string[] = [];
-  let cursor: string | null = null;
-  for (;;) {
-    // The first catch-up only needs candidate ids; each session's summary
-    // applies the privacy and horizon predicates. Seek to the next distinct
-    // session through the existing index instead of scanning 1.9M duplicate
-    // entries in the largest session merely to emit one id.
-    const query: SessionReadQuery = options.allSessions ? {
-      sql: `with recursive session_ids(session_id) as (
-        select min(session_id) from buffered_events indexed by idx_events_session
-          where ${cursor === null ? "session_id is not null" : "session_id > @cursor"}
-        union all
-        select (select min(session_id) from buffered_events indexed by idx_events_session
-          where session_id > session_ids.session_id)
-        from session_ids where session_id is not null
-      ) select session_id as sessionId from session_ids
-        where session_id is not null limit @pageSize`,
-      params: { cursor, pageSize: SESSION_ID_PAGE_SIZE },
-    } : ledgerSessionIdsQuery(ledger, options);
-    if (!options.allSessions) {
-      if (cursor !== null) {
-        query.sql += " and e.session_id > @cursor";
-        query.params.cursor = cursor;
+  const seen = new Set<string>();
+  let cursor: string | null = options.afterId ?? null;
+  let createdCursor: string | null = options.since ?? null;
+  let idCursor: string | null = null;
+  const reader = createPersistentLedgerReader(ledger);
+  try {
+    for (;;) {
+      const pageSize = options.allSessions
+        ? Math.min(SESSION_ID_PAGE_SIZE, Math.max(1, maxIds - ids.length))
+        : 512;
+      // A full migration seeks distinct ids through idx_events_session. The
+      // normal delta path instead seeks (created_at,id) through the existing
+      // retention index. Its former DISTINCT/privacy query chose the privacy
+      // index on Studio0, inspected millions of old rows, and hit 250 ms on
+      // every cycle before summary setup could even begin. Summaries apply the
+      // authoritative privacy predicate after these candidate ids are found.
+      const query: SessionReadQuery = options.allSessions ? {
+        sql: `with recursive session_ids(session_id) as (
+          select min(session_id) from buffered_events indexed by idx_events_session
+            where ${cursor === null ? "session_id is not null" : "session_id > @cursor"}
+          union all
+          select (select min(session_id) from buffered_events indexed by idx_events_session
+            where session_id > session_ids.session_id)
+          from session_ids where session_id is not null
+        ) select session_id as sessionId from session_ids
+          where session_id is not null limit @pageSize`,
+        params: { cursor, pageSize }, maxMs: 250,
+      } : {
+        sql: `select e.created_at as createdAt, e.id, e.session_id as sessionId
+          from buffered_events e indexed by idx_events_retention
+          where e.created_at <= @until
+            and (e.created_at > @createdCursor
+              or (e.created_at = @createdCursor and e.id > @idCursor))
+          order by e.created_at, e.id limit @pageSize`,
+        params: { until: options.until, createdCursor: createdCursor ?? "", idCursor: idCursor ?? "", pageSize },
+        maxMs: 250,
+      };
+      const rows = await reader.read<{ sessionId: string | null; createdAt?: string; id?: string }>([query]);
+      for (const row of rows) {
+        if (row.sessionId !== null && !excluded.has(row.sessionId) && !seen.has(row.sessionId)) {
+          seen.add(row.sessionId);
+          ids.push(row.sessionId);
+          if (ids.length >= maxIds) return ids;
+        }
       }
-      query.sql += " order by e.session_id asc limit @pageSize";
-      query.params.pageSize = SESSION_ID_PAGE_SIZE;
+      if (rows.length < pageSize) return ids;
+      const last = rows[rows.length - 1]!;
+      if (options.allSessions) cursor = last.sessionId;
+      else { createdCursor = last.createdAt!; idCursor = last.id!; }
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    query.maxMs = 250;
-    const rows = await readLedgerOffThread<{ sessionId: string }>(ledger, [query]);
-    for (const row of rows) {
-      if (!excluded.has(row.sessionId)) ids.push(row.sessionId);
-      if (ids.length >= maxIds) return ids;
-    }
-    if (rows.length < SESSION_ID_PAGE_SIZE) return ids;
-    cursor = rows[rows.length - 1]!.sessionId;
-    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    await reader.close();
   }
+}
+
+export const LEGACY_SESSION_SUMMARY_REBUILD_KEY = "session_summary_legacy_rebuild_v1";
+export type LegacySessionSummaryRebuildState = {
+  schemaVersion: 1;
+  phase: "scan" | "pending" | "done";
+  startedAt: string;
+  cursor: string | null;
+  pendingCursor: string | null;
+  scanned: number;
+  passes: number;
+  rawRowsAtStart: number;
+  rowsRead: number;
+};
+
+function readLegacyRebuildState(db: Database.Database): LegacySessionSummaryRebuildState | null {
+  const row = db.prepare("select value from maintenance_state where key = ?")
+    .get(LEGACY_SESSION_SUMMARY_REBUILD_KEY) as { value: string } | undefined;
+  if (!row) return null;
+  const state = JSON.parse(row.value) as LegacySessionSummaryRebuildState;
+  if (state.schemaVersion !== 1 || !["scan", "pending", "done"].includes(state.phase) ||
+      !Number.isSafeInteger(state.scanned) || state.scanned < 0 ||
+      !Number.isSafeInteger(state.passes) || state.passes < 0 ||
+      !Number.isSafeInteger(state.rawRowsAtStart) || state.rawRowsAtStart < 0 ||
+      !Number.isSafeInteger(state.rowsRead) || state.rowsRead < 0 ||
+      (state.cursor !== null && typeof state.cursor !== "string") ||
+      (state.pendingCursor !== null && typeof state.pendingCursor !== "string") ||
+      Number.isNaN(Date.parse(state.startedAt))) {
+    throw new Error("legacy_session_summary_rebuild_state_invalid");
+  }
+  return state;
+}
+
+function saveLegacyRebuildState(db: Database.Database, state: LegacySessionSummaryRebuildState): void {
+  db.prepare(`insert into maintenance_state (key, value, updated_at) values (?, ?, ?)
+    on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`)
+    .run(LEGACY_SESSION_SUMMARY_REBUILD_KEY, JSON.stringify(state), new Date().toISOString());
+}
+
+/** Record the need for a legacy scan before creating summary tables, so a
+ * crash between those two steps cannot make the migration disappear. */
+export function beginLegacySessionSummaryRebuild(db: Database.Database): LegacySessionSummaryRebuildState | null {
+  ensureSessionSyncStateTable(db);
+  const existing = readLegacyRebuildState(db);
+  if (existing) return existing;
+  const summaryPresent = Boolean(db.prepare(`select 1 from sqlite_master
+    where type='table' and name='session_sync_summary_control' limit 1`).get());
+  if (summaryPresent) return null;
+  const state: LegacySessionSummaryRebuildState = {
+    schemaVersion: 1, phase: "scan", startedAt: new Date().toISOString(),
+    cursor: null, pendingCursor: null, scanned: 0, passes: 0,
+    rawRowsAtStart: (db.prepare("select max(rowid) as n from buffered_events")
+      .get() as { n: number | null }).n ?? 0, rowsRead: 0,
+  };
+  saveLegacyRebuildState(db, state);
+  return state;
+}
+
+/** One bounded, durable migration step. It runs after the ordinary daemon
+ * sync pass, so its historical work cannot starve current session uploads.
+ * runSessionSync reads on a worker, commits one short transaction per summary
+ * slice, and yields to intake between ids. The cursor advances only after the
+ * summary writes and accepted network batches; incomplete ids stay in the
+ * summary state table for the pending phase. */
+export async function advanceLegacySessionSummaryRebuild(
+  config: CollectorConfig,
+  db: Database.Database,
+  options: Pick<SessionSyncOptions, "fetchImpl" | "sleep" | "summaryMaxRows" | "summaryMaxMs"> &
+    { maxSessionIds?: number } = {},
+): Promise<{ state: LegacySessionSummaryRebuildState | null; result: SessionSyncResult | null; ids: string[] }> {
+  const state = beginLegacySessionSummaryRebuild(db);
+  if (!state || state.phase === "done") return { state, result: null, ids: [] };
+  ensureSessionSummarySchema(db);
+  // A summary can be complete when an append makes its upload fence stale.
+  // Keep every unsent legacy id here, independent of the summary's local
+  // complete flag, until an accepted pass settles it.
+  db.exec(`create table if not exists session_sync_legacy_rebuild_pending (
+    session_id text primary key
+  )`);
+  const maxSessionIds = Math.max(1, Math.min(Math.trunc(options.maxSessionIds ?? 32), 32));
+  let ids: string[];
+  if (state.phase === "scan") {
+    ids = await listLedgerSessionIdsOffThread(db, {
+      until: new Date().toISOString(), allSessions: true,
+      afterId: state.cursor, maxIds: maxSessionIds,
+    });
+    if (ids.length === 0) {
+      state.phase = "pending";
+      state.pendingCursor = null;
+      saveLegacyRebuildState(db, state);
+      return { state, result: null, ids };
+    }
+  } else {
+    const pending = (after: string | null) => db.prepare(`select session_id as sessionId
+      from session_sync_legacy_rebuild_pending where session_id > ?
+      order by session_id limit ?`).all(after ?? "", maxSessionIds) as Array<{ sessionId: string }>;
+    let rows = pending(state.pendingCursor);
+    if (rows.length === 0) rows = pending(null);
+    ids = rows.map((row) => row.sessionId);
+    if (ids.length === 0) {
+      state.phase = "done";
+      saveLegacyRebuildState(db, state);
+      return { state, result: null, ids };
+    }
+  }
+  const result = await runSessionSync(config, {
+    ledgerDb: db, incremental: true, sessionIds: ids,
+    until: new Date().toISOString(), summaryMaxRows: options.summaryMaxRows ?? 5_000,
+    ...(options.summaryMaxMs === undefined ? {} : { summaryMaxMs: options.summaryMaxMs }),
+    ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+    ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+    log: () => undefined,
+  });
+  if (!result.ok) return { state, result, ids };
+  // Cursor and pending queue commit together. A crash before this transaction
+  // replays the same idempotent batch; afterward every unfinished id is durable.
+  db.transaction(() => {
+    const unfinished = new Set(result.pendingSummarySessionIds);
+    const addPending = db.prepare("insert or ignore into session_sync_legacy_rebuild_pending (session_id) values (?)");
+    const removePending = db.prepare("delete from session_sync_legacy_rebuild_pending where session_id = ?");
+    for (const id of ids) {
+      if (unfinished.has(id)) addPending.run(id);
+      else removePending.run(id);
+    }
+    if (state.phase === "scan") {
+      state.cursor = ids[ids.length - 1]!;
+      state.scanned += ids.length;
+    } else {
+      state.pendingCursor = ids[ids.length - 1]!;
+    }
+    state.passes += 1;
+    state.rowsRead += result.summaryStats.rowsRead;
+    saveLegacyRebuildState(db, state);
+  }).immediate();
+  return { state, result, ids };
 }
 
 export function commitDaemonSessionSyncSuccess(

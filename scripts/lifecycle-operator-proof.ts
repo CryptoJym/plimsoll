@@ -199,7 +199,7 @@ async function main(): Promise<void> {
       !fs.existsSync(path.join(LIFECYCLE_ROOT, "journal.json")) &&
       !fs.existsSync(path.join(LIFECYCLE_ROOT, "completed-operations", "op-busy.json")) &&
       !fs.existsSync(path.join(LIFECYCLE_ROOT, "state.json")),
-    { stderr: busy.combined.slice(-400), receipt: busyReceipt });
+    { stderr: busy.combined.slice(-1400), receipt: busyReceipt });
   liveLedger.close();
   liveLedger = null;
 
@@ -343,7 +343,8 @@ syncBuiltinESMExports();
     "lifecycle", "update", "--operation-id", "op-interrupted", "--artifact", "self"],
     { cwd: fixtureHome, env: childEnv, encoding: "utf8", timeout: 120_000 });
   check("packaged_update_interruption_occurs_after_durable_switch", interrupted.status === 86 &&
-    JSON.parse(fs.readFileSync(path.join(LIFECYCLE_ROOT, "journal.json"), "utf8")).phase === "switched");
+    JSON.parse(fs.readFileSync(path.join(LIFECYCLE_ROOT, "journal.json"), "utf8")).phase === "switched",
+    { exit: interrupted.status, stderr: interrupted.stderr?.slice(-1400) });
   const beforeExpiry = cli(["lifecycle", "update", "--operation-id", "op-interrupted", "--artifact", "self"]);
   check("interrupted_update_cannot_bypass_unexpired_mutation_lease",
     beforeExpiry.code !== 0 && /another lifecycle operation owns the lock/.test(beforeExpiry.stderrText));
