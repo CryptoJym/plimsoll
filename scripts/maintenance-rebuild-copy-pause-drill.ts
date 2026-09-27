@@ -7,13 +7,16 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { LearningMaterializationStateStore } from "../packages/collector-cli/src/learning-materializer";
+import { OutcomeTimelineStore } from "../packages/collector-cli/src/outcome-timeline-store";
 import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { listHookSpoolFiles } from "../packages/collector-cli/src/hook-spool";
 import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { connectionOwnershipClosed, observeRebuildConnectionOwnership,
-  REQUIRED_REBUILD_WRITERS } from "../packages/collector-cli/src/maintenance-rebuild";
+  rebuildLedger } from "../packages/collector-cli/src/maintenance-rebuild";
+import { exerciseRebuildWriterRoutes } from "./maintenance-rebuild-writer-routes";
 import { createHookSpoolDrain } from "../packages/collector-cli/src/server";
 import { releaseStopWindowListener, runStopWindowListener } from "../packages/collector-cli/src/stop-window-listener";
 
@@ -56,23 +59,38 @@ async function main() {
     assert.equal(listHookSpoolFiles(home).length, 1);
     const pending = captureSpoolState(home);
     assert.equal(pending.maintenanceRebuildPending, true);
-    // Every inventory target writer in the daemon gets its connection through
-    // LocalEventBuffer. Exercise that acquisition for each route while the
-    // same target fence a rebuild takes is held; two inventory modules own
-    // separate state databases and cannot write this ledger.
-    const separate = new Set(["outcome-timeline-store", "learning-materializer"]);
+    const bindingDb = new Database(ledger, { readonly: true, fileMustExist: true });
+    const binding = bindingDb.prepare(`select current_workspace_id as workspaceId,
+      current_device_id as deviceId, current_installation_epoch_id as epochId
+      from collector_workspace_binding where singleton=1`).get() as
+      { workspaceId: string; deviceId: string | null; epochId: string | null };
+    bindingDb.close();
+    const writer = new LocalEventBuffer(ledger, { workspaceId: binding.workspaceId,
+      deviceId: binding.deviceId ?? undefined });
+    let routeProbes: Awaited<ReturnType<typeof exerciseRebuildWriterRoutes>>;
+    try {
+      writer.useWorkspace(binding.workspaceId, binding.deviceId, binding.epochId ?? undefined);
+      routeProbes = await exerciseRebuildWriterRoutes(writer, ledger, home);
+      const held = observeRebuildConnectionOwnership(ledger);
+      assert.equal(held.openTokens.length, 1);
+      assert.ok(held.writerLeases.some((lease) => lease.owner === "local_event_buffer"));
+      await assert.rejects(rebuildLedger({ ledgerPath: ledger, stage: "S10", walHighWaterBytes: 0,
+        copyDrill: true,
+        quiesce: async () => ({ before: held, after: held, connectionsClosed: connectionOwnershipClosed(held) }),
+        resume: async () => undefined,
+      }), /writer_not_quiesced/);
+      console.log(JSON.stringify({ check: "studio5_copy_real_writer_entries_held",
+        routes: routeProbes, observedOwner: held }));
+    } finally { writer.close(); }
+    assert.equal(connectionOwnershipClosed(observeRebuildConnectionOwnership(ledger)), true);
     const lock = `${ledger}.maintenance-rebuild.lock`;
     fs.writeFileSync(lock, `${process.pid}\n`);
     try {
       const ownership = observeRebuildConnectionOwnership(ledger);
       assert.equal(connectionOwnershipClosed(ownership), true);
-      const routeProbes: string[] = [];
-      for (const module of REQUIRED_REBUILD_WRITERS) {
-        if (separate.has(module)) continue;
-        assert.throws(() => new LocalEventBuffer(ledger), /maintenance_rebuild_paused/,
-          `${module} cannot reacquire its shared target connection during pause`);
-        routeProbes.push(module);
-      }
+      assert.throws(() => new LocalEventBuffer(ledger), /maintenance_rebuild_paused/);
+      assert.throws(() => new OutcomeTimelineStore(ledger), /maintenance_rebuild_paused/);
+      assert.throws(() => new LearningMaterializationStateStore(ledger), /maintenance_rebuild_paused/);
       const cli = path.resolve("packages/collector-cli/src/cli.ts");
       for (const args of [
         ["maintenance", "--disable-account-assertion", "codex", "--yes"],
@@ -86,18 +104,12 @@ async function main() {
         assert.match(refused.stderr, /maintenance_rebuild_paused/);
       }
       console.log(JSON.stringify({ check: "studio5_copy_writer_routes_during_pause",
-        sharedRoutesRefused: routeProbes, separateStateDatabases: [...separate], ownership,
+        realEntriesExercised: routeProbes.length, independentStoresRefused: 2, ownership,
         independentCliOpenersRefused: 2 }));
     } finally { fs.unlinkSync(lock); }
     await releaseStopWindowListener(port, home);
     await listener;
     const pauseMs = performance.now() - started;
-    const bindingDb = new Database(ledger, { readonly: true, fileMustExist: true });
-    const binding = bindingDb.prepare(`select current_workspace_id as workspaceId,
-      current_device_id as deviceId, current_installation_epoch_id as epochId
-      from collector_workspace_binding where singleton=1`).get() as
-      { workspaceId: string; deviceId: string | null; epochId: string | null };
-    bindingDb.close();
     const buffer = new LocalEventBuffer(ledger, { workspaceId: binding.workspaceId,
       deviceId: binding.deviceId ?? undefined });
     try {

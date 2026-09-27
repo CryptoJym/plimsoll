@@ -47,6 +47,8 @@
     "proof:maintenance-rebuild": "tsx scripts/maintenance-rebuild-proof.ts",
     "proof:maintenance-rebuild-pause": "tsx scripts/maintenance-rebuild-pause-proof.ts",
     "proof:maintenance-rebuild-r2": "tsx scripts/maintenance-rebuild-r2-proof.ts",
+    "proof:maintenance-rebuild-r3": "tsx scripts/maintenance-rebuild-r3-proof.ts",
+    "proof:maintenance-rebuild-writers": "tsx scripts/maintenance-rebuild-writer-routes-proof.ts",
     "proof:maintenance-rebuild-contract": "tsx scripts/maintenance-rebuild-contract-proof.ts",
     "proof:collector-reliability": "tsx scripts/collector-reliability-proof.ts",
     "proof:collector-clock": "tsx scripts/collector-integrated-correction-proof.ts",
