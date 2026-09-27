@@ -6,9 +6,10 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { DashboardProjectionStore } from "./dashboard-projection";
+import { assertNoRebuildOpenTokens, assertRebuildWriterGateOpen, rebuildLockPath } from "./rebuild-open-gate";
+export { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 
-/** Static B13 inventory from plan-r6-checks/writer-modules.log. A process-level
- * quiesce closes the common ledger connection used by these modules. */
+/** Static B13 inventory for coverage reporting. It is never a quiesce receipt. */
 export const REQUIRED_REBUILD_WRITERS = [
   "dashboard-projection", "buffer", "outbox", "session-summary",
   "codex-reconciliation", "session-context-index", "codex-live-usage-ledger",
@@ -25,9 +26,14 @@ export const REQUIRED_REBUILD_WRITERS = [
 
 export type RebuildStage = "S10" | "ABORT";
 export type QuiesceReceipt = {
-  modules: readonly string[];
-  /** True only after the parent and both worker connections are closed. */
+  before: ConnectionOwnership;
+  after: ConnectionOwnership;
   connectionsClosed: boolean;
+};
+export type ConnectionOwnership = {
+  openTokens: Array<{ pid: number | null; token: string }>;
+  sqlitePids: number[];
+  writerLeases: Array<{ pid: number; owner: string }>;
 };
 export type RebuildInput = {
   ledgerPath: string;
@@ -47,6 +53,10 @@ export type RebuildRunInput = RebuildInput & {
   reopen?: (ledgerPath: string) => void;
   /** Fault seam for the interrupted-copy drill. */
   afterVacuum?: () => void;
+  /** Fault seam for a delayed independent opener after verification. */
+  beforeSwap?: () => void | Promise<void>;
+  /** Copy-only fault seam for a real SIGKILL between the two renames. */
+  afterFirstRename?: () => void | Promise<void>;
   /** Fault seam for a busy checkpoint refusal. */
   checkpoint?: (db: Database.Database) => Array<{ busy: number; log: number; checkpointed: number }>;
 };
@@ -67,10 +77,9 @@ type RebuildState = {
 function fail(code: string): never { throw new Error(code); }
 function quoteIdentifier(name: string) { return `"${name.replaceAll('"', '""')}"`; }
 function statePath(ledgerPath: string) { return `${ledgerPath}.maintenance-rebuild.json`; }
-function lockPath(ledgerPath: string) { return `${ledgerPath}.maintenance-rebuild.lock`; }
+const lockPath = rebuildLockPath;
 function targetPath(ledgerPath: string) { return `${ledgerPath}.rebuild`; }
 function headroomPath(ledgerPath: string) { return `${ledgerPath}.maintenance-rebuild-headroom.json`; }
-function openLeaseDirectory(ledgerPath: string) { return `${ledgerPath}.rebuild-open-leases`; }
 function sqliteSidecars(ledgerPath: string) { return [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`]; }
 function fsyncDirectory(file: string) {
   const directory = fs.openSync(path.dirname(file), "r");
@@ -82,6 +91,43 @@ function regularLedger(inputPath: string) {
   if (!stat.isFile() || stat.isSymbolicLink()) fail("ledger_not_regular_file");
   if (fs.realpathSync(inputPath) !== inputPath) fail("ledger_path_not_canonical");
   return inputPath;
+}
+/** Recovery must accept a missing basename in the first-rename crash gap. */
+export function canonicalRecoveryLedgerPath(inputPath: string) {
+  if (!path.isAbsolute(inputPath) || path.normalize(inputPath) !== inputPath ||
+    path.basename(inputPath) === "." || path.basename(inputPath) === "..") fail("ledger_path_not_canonical");
+  const parent = path.dirname(inputPath);
+  if (fs.realpathSync(parent) !== parent) fail("ledger_path_not_canonical");
+  const inspect = (file: string, reason: string) => {
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink()) fail(reason);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  };
+  inspect(inputPath, "ledger_not_regular_file");
+  for (const sibling of [statePath(inputPath), lockPath(inputPath), targetPath(inputPath)]) {
+    inspect(sibling, "rebuild_state_path_invalid");
+  }
+  return inputPath;
+}
+function validatedRecoveryState(ledgerPath: string) {
+  canonicalRecoveryLedgerPath(ledgerPath);
+  const state = readState(ledgerPath);
+  if (!state) return null;
+  if (state.version !== 1 || !/^[0-9a-f-]{36}$/i.test(state.nonce) ||
+    state.targetPath !== targetPath(ledgerPath) ||
+    !new RegExp(`^${ledgerPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.pre-lean-\\d{4}-\\d{2}-\\d{2}$`).test(state.backupPath)) {
+    fail("rebuild_state_path_invalid");
+  }
+  try {
+    const stat = fs.lstatSync(state.backupPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) fail("rebuild_backup_invalid");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return state;
 }
 function readState(ledgerPath: string): RebuildState | null {
   try { return JSON.parse(fs.readFileSync(statePath(ledgerPath), "utf8")) as RebuildState; }
@@ -109,60 +155,53 @@ function advance(ledgerPath: string, state: RebuildState, phase: RebuildPhase, r
 function hasTable(db: Database.Database, name: string) {
   return Boolean(db.prepare("select 1 from sqlite_master where type='table' and name=?").get(name));
 }
-export function assertRebuildWriterGateOpen(ledgerPath: string) {
-  if (fs.existsSync(lockPath(ledgerPath))) fail("maintenance_rebuild_paused");
-}
-/** A token exists before a writer may open SQLite. A rebuild creates its gate
- * before scanning tokens; thus a delayed open cannot cross the final lsof. */
-export function acquireRebuildOpenToken(ledgerPath: string) {
-  if (ledgerPath === ":memory:") return null;
-  const directory = openLeaseDirectory(ledgerPath);
-  try { fs.mkdirSync(directory, { mode: 0o700 }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) fail("writer_lease_directory_invalid");
-  const token = path.join(directory, `${process.pid}.${randomUUID()}.lease`);
-  const descriptor = fs.openSync(token, "wx", 0o600);
-  try { fs.writeFileSync(descriptor, `${process.pid}\n`); fs.fsyncSync(descriptor); }
-  finally { fs.closeSync(descriptor); }
-  try { assertRebuildWriterGateOpen(ledgerPath); }
-  catch (error) { fs.unlinkSync(token); throw error; }
-  return token;
-}
-export function releaseRebuildOpenToken(token: string | null) {
-  if (token) removeIfExists(token);
-}
-function assertNoOpenTokens(ledgerPath: string) {
-  const directory = openLeaseDirectory(ledgerPath);
-  let entries: string[];
-  try { entries = fs.readdirSync(directory); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    fail("writer_lease_check_unavailable");
-  }
-  if (entries.some((entry) => entry.endsWith(".lease"))) fail("writer_not_quiesced");
-}
 export function acquireRebuildWriterLeases(db: Database.Database, ledgerPath: string) {
   assertRebuildWriterGateOpen(ledgerPath);
   const nonce = randomUUID();
-  const insert = db.prepare(`insert into maintenance_state(key,value,updated_at) values (?,?,?)`);
-  const at = new Date().toISOString();
-  db.transaction(() => {
-    for (const module of REQUIRED_REBUILD_WRITERS) {
-      insert.run(`rebuild_writer_lease:${nonce}:${module}`, JSON.stringify({ pid: process.pid, module }), at);
-    }
-  }).immediate();
+  db.prepare(`insert into maintenance_state(key,value,updated_at) values (?,?,?)`)
+    .run(`rebuild_writer_lease:${nonce}`, JSON.stringify({ pid: process.pid, owner: "local_event_buffer" }),
+      new Date().toISOString());
   return nonce;
 }
 export function releaseRebuildWriterLeases(db: Database.Database, nonce: string) {
-  db.prepare("delete from maintenance_state where key like ?")
-    .run(`rebuild_writer_lease:${nonce}:%`);
+  // A collector connection can use timeout 0 for request admission. Shutdown
+  // still has to wait briefly for an independent writer's transaction so its
+  // durable owner lease is removed before the connection closes.
+  db.pragma("busy_timeout = 1000");
+  db.prepare("delete from maintenance_state where key=?").run(`rebuild_writer_lease:${nonce}`);
 }
 export function readActiveRebuildWriterLeases(db: Database.Database) {
   if (!hasTable(db, "maintenance_state")) return [];
   const rows = db.prepare("select value from maintenance_state where key like 'rebuild_writer_lease:%' order by key")
     .all() as Array<{ value: string }>;
-  return rows.map((row) => JSON.parse(row.value) as { pid: number; module: string });
+  return rows.map((row) => JSON.parse(row.value) as { pid: number; owner: string });
+}
+/** Native observation, captured before and after daemon unload and again
+ * under the rebuild fence. No inventory name is presented as an open handle. */
+export function observeRebuildConnectionOwnership(ledgerPath: string): ConnectionOwnership {
+  let entries: string[];
+  try { entries = fs.readdirSync(`${ledgerPath}.rebuild-open-leases`); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") fail("writer_lease_check_unavailable");
+    entries = [];
+  }
+  const openTokens = entries.filter((entry) => entry.endsWith(".lease")).map((entry) => ({
+    pid: /^\d+\./.test(entry) ? Number(entry.slice(0, entry.indexOf("."))) : null,
+    token: entry,
+  }));
+  let writerLeases: Array<{ pid: number; owner: string }> = [];
+  if (fs.existsSync(ledgerPath)) {
+    const db = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+    try { writerLeases = readActiveRebuildWriterLeases(db); } finally { db.close(); }
+  }
+  const result = spawnSync("/usr/sbin/lsof", ["-n", "-P", "-t", "--", ...sqliteSidecars(ledgerPath)],
+    { encoding: "utf8", timeout: 15_000 });
+  if (result.error || ![0, 1].includes(result.status ?? -1)) fail("writer_lease_check_unavailable");
+  const sqlitePids = [...new Set(result.stdout.trim().split(/\s+/).filter(Boolean).map(Number))];
+  return { openTokens, sqlitePids, writerLeases };
+}
+export function connectionOwnershipClosed(observed: ConnectionOwnership) {
+  return observed.openTokens.length === 0 && observed.sqlitePids.length === 0 && observed.writerLeases.length === 0;
 }
 function integrity(db: Database.Database) {
   const rows = db.prepare("PRAGMA integrity_check").all() as Array<Record<string, unknown>>;
@@ -213,7 +252,7 @@ function writeHeadroomStatus(ledgerPath: string, status: RebuildHeadroomStatus) 
   fsyncDirectory(file);
 }
 function assertUnused(ledgerPath: string) {
-  assertNoOpenTokens(ledgerPath);
+  assertNoRebuildOpenTokens(ledgerPath);
   // An unknown lsof result is never interpreted as an empty lease set.
   const result = spawnSync("/usr/sbin/lsof", ["-n", "-P", "-t", "--", ...sqliteSidecars(ledgerPath)],
     { encoding: "utf8", timeout: 15_000 });
@@ -333,8 +372,7 @@ function verifyRegeneratedSnapshots(source: Database.Database, rebuilt: Database
     }
   }
 }
-function verifyCopy(source: string, rebuilt: string, copyDrill: boolean) {
-  const old = new Database(source, { readonly: true, fileMustExist: true, timeout: 0 });
+function verifyCopy(old: Database.Database, rebuilt: string, copyDrill: boolean) {
   const next = new Database(rebuilt, { readonly: true, fileMustExist: true, timeout: 0 });
   try {
     integrity(next);
@@ -342,7 +380,17 @@ function verifyCopy(source: string, rebuilt: string, copyDrill: boolean) {
       fail("rebuild_logical_mismatch");
     }
     verifyRegeneratedSnapshots(old, next, copyDrill);
-  } finally { next.close(); old.close(); }
+  } finally { next.close(); }
+}
+function assertExclusiveSourceOwner(db: Database.Database, ledgerPath: string) {
+  assertNoRebuildOpenTokens(ledgerPath);
+  if (db.pragma("locking_mode", { simple: true }) !== "exclusive") fail("writer_not_quiesced");
+  const result = spawnSync("/usr/sbin/lsof", ["-n", "-P", "-t", "--", ...sqliteSidecars(ledgerPath)],
+    { encoding: "utf8", timeout: 15_000 });
+  if (result.error || ![0, 1].includes(result.status ?? -1)) fail("writer_lease_check_unavailable");
+  if (result.stdout.trim().split(/\s+/).filter(Boolean).some((pid) => Number(pid) !== process.pid)) {
+    fail("writer_not_quiesced");
+  }
 }
 function removeIfExists(file: string) {
   try { fs.unlinkSync(file); }
@@ -355,7 +403,7 @@ function removeSqliteSidecars(ledgerPath: string) {
 
 /** Only the paused, pre-resume state allows replacing the rebuilt file. */
 export function renameBackBeforeResume(ledgerPath: string) {
-  const state = readState(ledgerPath);
+  const state = validatedRecoveryState(ledgerPath);
   if (!state || !["verified", "swapped"].includes(state.phase)) fail("forward_repair_only");
   assertUnused(ledgerPath);
   if (!fs.existsSync(state.backupPath)) fail("old_file_unavailable");
@@ -372,7 +420,17 @@ export function renameBackBeforeResume(ledgerPath: string) {
 
 /** Recovery after SIGKILL before any writer resumed; never rewinds a resumed file. */
 export function recoverInterruptedRebuild(ledgerPath: string) {
-  const state = readState(ledgerPath);
+  const state = validatedRecoveryState(ledgerPath);
+  if (!state && fs.existsSync(lockPath(ledgerPath))) {
+    // Lock creation precedes the first durable state write. With no target or
+    // state there has been no checkpoint, swap or resume to reverse.
+    if (!fs.existsSync(ledgerPath) || fs.existsSync(targetPath(ledgerPath))) fail("rebuild_state_unavailable");
+    assertUnused(ledgerPath);
+    const db = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    try { integrity(db); } finally { db.close(); }
+    removeIfExists(lockPath(ledgerPath));
+    return { status: "recovered_stale_lock" as const };
+  }
   if (!state || ["resume_started", "complete"].includes(state.phase)) fail("forward_repair_only");
   assertUnused(ledgerPath);
   if (fs.existsSync(state.backupPath)) {
@@ -394,10 +452,9 @@ export async function rebuildLedger(input: RebuildRunInput) {
   const ledgerPath = input.ledgerPath;
   const pausedAt = performance.now();
   const receipt = await input.quiesce();
-  const missing = REQUIRED_REBUILD_WRITERS.filter((name) => !receipt.modules.includes(name));
-  if (!receipt.connectionsClosed || missing.length) {
+  if (!receipt.connectionsClosed || !connectionOwnershipClosed(receipt.after)) {
     await input.resume();
-    fail(`writer_not_quiesced:${missing.join(",")}`);
+    fail("writer_not_quiesced");
   }
   let preflight: ReturnType<typeof preflightMaintenanceRebuild>;
   try { preflight = preflightMaintenanceRebuild(input); }
@@ -413,6 +470,8 @@ export async function rebuildLedger(input: RebuildRunInput) {
       fs.fsyncSync(descriptor);
     } finally { fs.closeSync(descriptor); }
     assertUnused(ledgerPath);
+    const fencedOwnership = observeRebuildConnectionOwnership(ledgerPath);
+    if (!connectionOwnershipClosed(fencedOwnership)) fail("writer_not_quiesced");
     const leaseDb = new Database(ledgerPath, { readonly: true, fileMustExist: true });
     try { if (readActiveRebuildWriterLeases(leaseDb).length > 0) fail("writer_not_quiesced"); }
     finally { leaseDb.close(); }
@@ -433,17 +492,22 @@ export async function rebuildLedger(input: RebuildRunInput) {
       }
       state = advance(ledgerPath, state, "vacuum");
       db.exec(`VACUUM INTO '${state.targetPath.replaceAll("'", "''")}'`);
+      input.afterVacuum?.();
+      const targetDescriptor = fs.openSync(state.targetPath, "r");
+      try { fs.fsyncSync(targetDescriptor); } finally { fs.closeSync(targetDescriptor); }
+      fsyncDirectory(state.targetPath);
+      verifyCopy(db, state.targetPath, input.copyDrill === true);
+      state = advance(ledgerPath, state, "verified");
+      // Keep SQLite's exclusive source lock through both renames. It also
+      // rejects a raw SQLite opener that does not participate in our token
+      // protocol at the reviewer's verify-to-rename boundary.
+      assertExclusiveSourceOwner(db, ledgerPath);
+      await input.beforeSwap?.();
+      fs.renameSync(ledgerPath, backupPath);
+      await input.afterFirstRename?.();
+      fs.renameSync(state.targetPath, ledgerPath);
+      fsyncDirectory(ledgerPath);
     } finally { db.close(); }
-    input.afterVacuum?.();
-    const targetDescriptor = fs.openSync(state.targetPath, "r");
-    try { fs.fsyncSync(targetDescriptor); } finally { fs.closeSync(targetDescriptor); }
-    fsyncDirectory(state.targetPath);
-    verifyCopy(ledgerPath, state.targetPath, input.copyDrill === true);
-    state = advance(ledgerPath, state, "verified");
-    assertUnused(ledgerPath);
-    fs.renameSync(ledgerPath, backupPath);
-    fs.renameSync(state.targetPath, ledgerPath);
-    fsyncDirectory(ledgerPath);
     state = advance(ledgerPath, state, "swapped");
     if (input.reopen) input.reopen(ledgerPath);
     else {
@@ -458,7 +522,7 @@ export async function rebuildLedger(input: RebuildRunInput) {
     await input.resume();
     state = advance(ledgerPath, state, "complete");
     return { status: "rebuilt" as const, pauseMs: performance.now() - pausedAt,
-      backupPath, ...preflight };
+      backupPath, quiesce: { ...receipt, fencedOwnership }, ...preflight };
   } catch (error) {
     if (!resumeStarted && ownsLock) {
       if (state && fs.existsSync(state.backupPath)) {

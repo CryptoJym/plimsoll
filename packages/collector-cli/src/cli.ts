@@ -2,6 +2,7 @@
 import { AutomaticRetentionCadence } from "./retention-cadence";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
+import { openRebuildFencedDatabase } from "./rebuild-open-gate";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -168,8 +169,9 @@ import {
 } from "./hook-spool";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { preflightMaintenanceRebuild, rebuildLedger, recoverInterruptedRebuild,
-  renameBackBeforeResume, readMaintenanceRebuildHeadroomStatus,
-  REQUIRED_REBUILD_WRITERS, type RebuildStage, type RebuildHeadroomStatus } from "./maintenance-rebuild";
+  renameBackBeforeResume, readMaintenanceRebuildHeadroomStatus, canonicalRecoveryLedgerPath,
+  observeRebuildConnectionOwnership, connectionOwnershipClosed,
+  type RebuildStage, type RebuildHeadroomStatus } from "./maintenance-rebuild";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
 import { WalCheckpointWorker } from "./wal-checkpoint-worker";
 import {
@@ -2340,7 +2342,7 @@ async function main() {
       process.exitCode = 64;
       return;
     }
-    const database = new Database(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
+    const database = openRebuildFencedDatabase(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
     try {
       database.pragma(`busy_timeout = ${Math.max(1, timeoutMs - 250)}`);
       const rows = database.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
@@ -2531,7 +2533,7 @@ async function main() {
     try {
       if (accountAssertionMutation.yes) {
         ensureCollectorHome();
-        database = new Database(databasePath, { timeout: 5_000 });
+        database = openRebuildFencedDatabase(databasePath, { timeout: 5_000 });
         const state = setAccountAssertionAdapterEnabled(database, accountAssertionMutation.source, accountAssertionMutation.enabled);
         console.log(JSON.stringify({
           status: "account_assertion_adapter_updated",
@@ -2607,7 +2609,8 @@ async function main() {
     }
     const ledgerArgument = optionValue("--ledger");
     if (!ledgerArgument || !path.isAbsolute(ledgerArgument)) throw new Error("rebuild_requires_absolute_ledger");
-    const ledgerPath = fs.realpathSync(ledgerArgument);
+    const recovering = flag("--recover") || flag("--rename-back");
+    const ledgerPath = recovering ? canonicalRecoveryLedgerPath(ledgerArgument) : fs.realpathSync(ledgerArgument);
     const copyDrill = flag("--copy-drill");
     if (copyDrill) {
       const rootArgument = optionValue("--copy-root");
@@ -2621,7 +2624,7 @@ async function main() {
     } else if (ledgerPath !== fs.realpathSync(collectorBufferPath())) {
       throw new Error("live_rebuild_requires_active_ledger");
     }
-    if (flag("--recover") || flag("--rename-back")) {
+    if (recovering) {
       const result = flag("--rename-back")
         ? (renameBackBeforeResume(ledgerPath), { status: "renamed_back" })
         : recoverInterruptedRebuild(ledgerPath);
@@ -2658,12 +2661,17 @@ async function main() {
       if (!load.loaded) throw new Error(`rebuild_resume_failed:${load.status}`);
     };
     const quiesce = async () => {
-      if (copyDrill) return { modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true };
+      if (copyDrill) {
+        const before = observeRebuildConnectionOwnership(ledgerPath);
+        const after = observeRebuildConnectionOwnership(ledgerPath);
+        return { before, after, connectionsClosed: connectionOwnershipClosed(after) };
+      }
       if (configRead?.status !== "valid" || !readLocalIngestAuth(resolveCollectorHome().home)) {
         throw new Error("rebuild_pause_auth_unavailable");
       }
       let daemonUnloaded = false;
       try {
+        const before = observeRebuildConnectionOwnership(ledgerPath);
         pauseWindow.ready = startStopWindowChild(config.port, "maintenance_rebuild");
         void pauseWindow.ready.catch(() => undefined);
         const unloaded = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
@@ -2671,7 +2679,8 @@ async function main() {
         daemonUnloaded = true;
         await pauseWindow.ready;
         pauseWindowStarted = true;
-        return { modules: [...REQUIRED_REBUILD_WRITERS], connectionsClosed: true };
+        const after = observeRebuildConnectionOwnership(ledgerPath);
+        return { before, after, connectionsClosed: connectionOwnershipClosed(after) };
       } catch (error) {
         if (daemonUnloaded) {
           await pauseWindow.ready?.catch(() => undefined);
@@ -2686,7 +2695,10 @@ async function main() {
       }
     };
     try {
-      const result = await rebuildLedger({ ...input, quiesce, resume });
+      const result = await rebuildLedger({ ...input, quiesce, resume,
+        afterFirstRename: copyDrill && process.env.PLIMSOLL_REBUILD_COPY_KILL_AFTER_FIRST_RENAME === "1"
+          ? () => { process.kill(process.pid, "SIGKILL"); } : undefined,
+      });
       console.log(JSON.stringify(result));
     } finally {
       if (!copyDrill && pauseWindow.ready) {
@@ -6662,7 +6674,9 @@ async function main() {
         throw new Error(others === null ? "pairing index upgrade cannot prove ledger quiescence" :
           "pairing index upgrade requires every other ledger connection to be stopped");
       }
-      const database = new Database(ledgerPath, { readonly: !apply, fileMustExist: true, timeout: 0 });
+      const database = apply
+        ? openRebuildFencedDatabase(ledgerPath, { fileMustExist: true, timeout: 0 })
+        : new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
       try {
         const before = codexUsagePairingStatus(database);
         if (!apply) {
@@ -6990,7 +7004,7 @@ async function main() {
       if (listener.kind !== "absent") throw new Error(`purge_requires_closed_listener:${listener.kind}`);
       if (fs.existsSync(ledgerPath)) {
         if (!fs.lstatSync(ledgerPath).isFile()) throw new Error("purge_ledger_not_regular_file");
-        const ledger = new Database(ledgerPath, { fileMustExist: true, timeout: 0 });
+        const ledger = openRebuildFencedDatabase(ledgerPath, { fileMustExist: true, timeout: 0 });
         try {
           const checkpoint = ledger.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
           if (checkpoint[0]?.busy !== 0) throw new Error("purge_wal_checkpoint_busy");
