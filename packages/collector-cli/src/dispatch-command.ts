@@ -19,6 +19,46 @@ const BIND_FLAGS = new Set([
 const CLOSE_FLAGS = new Set(["--attempt-id"]);
 const RESTAMP_FLAGS = CLOSE_FLAGS;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+// The intersection of the local outcome matcher, outbound work_ref/v1, and
+// the router's canonical receipt contract. Legacy bindings remain readable.
+const LINKABLE_WORK_ITEM = /^beads:eco-[a-z0-9]+(?:\.[1-9][0-9]*)*$/;
+const LINKABLE_ATTEMPT = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export function dispatchBindLinkage(binding: Pick<DispatchBinding, "workItemId" | "attemptId">) {
+  const invalid: Array<"work-item-id" | "attempt-id"> = [];
+  if (!LINKABLE_WORK_ITEM.test(binding.workItemId) ||
+      Buffer.byteLength(binding.workItemId.slice("beads:".length), "utf8") > 128) {
+    invalid.push("work-item-id");
+  }
+  if (!LINKABLE_ATTEMPT.test(binding.attemptId)) invalid.push("attempt-id");
+  return { state: invalid.length ? "unlinkable" as const : "linkable" as const, invalid };
+}
+
+export function countUnlinkableDispatchBindings(roots: readonly CaptureRoot[], now = new Date()): number {
+  const seen = new Set<string>();
+  let count = 0;
+  for (const root of roots) for (const binding of root.dispatch ?? []) {
+    if (Date.parse(binding.validFrom) > now.getTime() ||
+        (binding.validUntil && Date.parse(binding.validUntil) <= now.getTime())) continue;
+    const key = JSON.stringify(binding);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (dispatchBindLinkage(binding).state === "unlinkable") count += 1;
+  }
+  return count;
+}
+
+function warnUnlinkableBind(binding: DispatchBinding) {
+  const linkage = dispatchBindLinkage(binding);
+  if (linkage.invalid.includes("work-item-id")) {
+    console.warn(`dispatch bind warning: --work-item-id ${JSON.stringify(binding.workItemId)} cannot link; ` +
+      "expected beads:<exact lowercase canonical Beads ID>, eco-... and at most 128 bytes");
+  }
+  if (linkage.invalid.includes("attempt-id")) {
+    console.warn(`dispatch bind warning: --attempt-id ${JSON.stringify(binding.attemptId)} cannot link; ` +
+      "expected a lowercase canonical UUIDv4 run ID");
+  }
+}
 
 function options(args: string[], allowed: Set<string>) {
   const values = new Map<string, string>();
@@ -45,7 +85,9 @@ function newestBindings(bindings: DispatchBinding[], now: Date) {
 }
 
 export function bindDispatch(args: string[], now = new Date()) {
-  const value = options(args, BIND_FLAGS);
+  const strict = args.filter(arg => arg === "--strict").length;
+  if (strict > 1) throw new Error("dispatch_invalid_options");
+  const value = options(args.filter(arg => arg !== "--strict"), BIND_FLAGS);
   const technique = [value("--technique-id"), value("--technique-version"),
     value("--assignment-id"), value("--arm")];
   if (technique.some(Boolean) && !technique.every(Boolean)) throw new Error("dispatch_technique_flags_incomplete");
@@ -66,6 +108,11 @@ export function bindDispatch(args: string[], now = new Date()) {
   });
   if (binding.validUntil && Date.parse(binding.validUntil) <= Date.parse(binding.validFrom))
     throw new Error("capture_dispatch_window_invalid");
+  const linkage = dispatchBindLinkage(binding);
+  if (strict && linkage.state === "unlinkable") {
+    warnUnlinkableBind(binding);
+    throw new Error("dispatch_bind_unlinkable");
+  }
   let pruned = 0;
   const updated = mutateCollectorConfigTransactionally(current => {
     if (!current.captureRoots?.length) throw new Error("dispatch_capture_roots_missing");
@@ -82,8 +129,9 @@ export function bindDispatch(args: string[], now = new Date()) {
       return { ...root,dispatch: result.bindings };
     }) };
   });
+  if (linkage.state === "unlinkable") warnUnlinkableBind(binding);
   return { status: "dispatch_bound" as const,sessionId,workItemId,projectKey: binding.projectKey,
-    attemptId,role: binding.role,roots: updated.captureRoots?.length ?? 0,pruned };
+    attemptId,role: binding.role,roots: updated.captureRoots?.length ?? 0,pruned,linkage };
 }
 
 export function closeDispatch(args: string[], now = new Date()) {
