@@ -979,8 +979,63 @@ export class CollectorMaintenance {
     // Assigned inside the runRepairs closure below; the typed null initializer keeps
     // the declared union so control-flow narrowing does not reduce it to null.
     let drained = null as Awaited<ReturnType<typeof drainProjectionMigration>> | null;
+    const scanPending = !this.buffer.projection.status().backfill.duplicateFactScan.complete;
+    let priorityProjectionRan = false;
+    const executeRepairStage = async (stage: RepairStage) => {
+      const counter = repairService.stages[stage];
+      counter.attempts += 1;
+      saveRepairService();
+      const stageStarted = clock();
+      try {
+        let rows = 0;
+        switch (stage) {
+          case "projection":
+            drained = await drainProjectionMigration(this.buffer.projection, {
+              maxSlices: 1, maxActiveMs: 25, signal: this.signal,
+            });
+            rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
+              drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
+              drained.receipt.duplicateFactScanRowsVisited +
+              drained.receipt.sessionRepairRowsVisited;
+            projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "reconciliation":
+            reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
+              legacyRowLimit: 64, legacyChunkLimit: 64, contextWindowLimit: 2,
+              contextRowLimit: 64, candidateLimit: 32, freshCandidateLimit: 16,
+              timeLimitMs: 25,
+            });
+            rows = reconciliation.rowsVisited;
+            reconciliationMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "repricing":
+            repricing = runRepricingMaintenance(this.buffer.database, { backfillLimit: 32, candidateLimit: 32 });
+            rows = repricing.rowsVisited;
+            repricingMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "repo_context_suppression":
+            rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
+            break;
+          case "learning_facts":
+            rows = this.buffer.learningFacts.runMaintenance(
+              DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH,
+            ).evicted;
+            break;
+        }
+        counter.completed += 1;
+        counter.rowsVisited += rows;
+        counter.lastSuccessAt = new Date(Date.now()).toISOString();
+      } catch (error) {
+        // A live session send lease refuses this transaction temporarily.
+        // The work remains queued, so this attempt is deferred, not failed.
+        if (isSessionSyncUploadLeaseError(error)) {
+          repairService.next = REPAIR_STAGES.indexOf(stage);
+        } else counter.failures += 1;
+        throw error;
+      } finally { saveRepairService(); }
+    };
     const runRepairs = async () => {
-      const repairStarted = performance.now();
+      const repairStarted = clock();
       // Historical Codex pairs must advance on every admitted repair turn;
       // reconciliation itself rotates with four other repair stages.
       if (!this.signal?.aborted && budget.canStart(15) &&
@@ -994,69 +1049,29 @@ export class CollectorMaintenance {
       }
       for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
         const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
+        // The pending scan already had its bounded slice before capture.
+        // Keep the rotating allowance for the other repair stages.
+        if (priorityProjectionRan && stage === "projection") continue;
         if (this.signal?.aborted || !budget.canStart(5) ||
-            (offset > 0 && performance.now() - repairStarted >= 75)) {
+            (offset > 0 && clock() - repairStarted >= 75)) {
           postCaptureDeferred.push(stage);
           continue;
         }
-        const counter = repairService.stages[stage];
-        counter.attempts += 1;
         // Rotate only admitted repair turns, avoiding a parity lock on stages.
         if (!repairTurnAdvanced) {
-          repairService.next = (firstRepair + 1) % REPAIR_STAGES.length;
+          repairService.next = (REPAIR_STAGES.indexOf(stage) + 1) % REPAIR_STAGES.length;
           repairTurnAdvanced = true;
         }
-        saveRepairService();
-        const stageStarted = clock();
-        try {
-          let rows = 0;
-          switch (stage) {
-            case "projection":
-              drained = await drainProjectionMigration(this.buffer.projection, {
-                maxSlices: 1, maxActiveMs: 25, signal: this.signal,
-              });
-              rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
-                drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
-                drained.receipt.duplicateFactScanRowsVisited +
-                drained.receipt.sessionRepairRowsVisited;
-              projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
-              break;
-            case "reconciliation":
-              reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
-                legacyRowLimit: 64, legacyChunkLimit: 64, contextWindowLimit: 2,
-                contextRowLimit: 64, candidateLimit: 32, freshCandidateLimit: 16,
-                timeLimitMs: 25,
-              });
-              rows = reconciliation.rowsVisited;
-              reconciliationMs = Math.max(0, Math.round(clock() - stageStarted));
-              break;
-            case "repricing":
-              repricing = runRepricingMaintenance(this.buffer.database, { backfillLimit: 32, candidateLimit: 32 });
-              rows = repricing.rowsVisited;
-              repricingMs = Math.max(0, Math.round(clock() - stageStarted));
-              break;
-            case "repo_context_suppression":
-              rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
-              break;
-            case "learning_facts":
-              rows = this.buffer.learningFacts.runMaintenance(
-                DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH,
-              ).evicted;
-              break;
-          }
-          counter.completed += 1;
-          counter.rowsVisited += rows;
-          counter.lastSuccessAt = new Date(Date.now()).toISOString();
-        } catch (error) {
-          // A live session send lease refuses this transaction temporarily.
-          // The work remains queued, so this attempt is deferred, not failed.
-          if (isSessionSyncUploadLeaseError(error)) {
-            repairService.next = REPAIR_STAGES.indexOf(stage);
-          } else counter.failures += 1;
-          throw error;
-        } finally { saveRepairService(); }
+        await executeRepairStage(stage);
       }
     };
+    // A long historical duplicate scan must advance on every admitted tick.
+    // Run one projection slice with a 25 ms active target before either order, then
+    // let the normal 75 ms rotating allowance serve the remaining stages.
+    if (scanPending && !this.signal?.aborted && budget.canStart(5)) {
+      await executeRepairStage("projection");
+      priorityProjectionRan = true;
+    }
     if (!captureFirst) await runRepairs();
     const baselineAtStart = captureBaselineStatus(this.buffer.database);
     // Completed source snapshots stay armed while a per-generation ambiguity
@@ -1633,10 +1648,9 @@ export class AutomaticMaintenanceCadence<
         : Math.max(0, this.captureFollowups - 1);
       const repairAfter = this.options.repairProgress?.();
       repairAdvanced = Boolean(repairAfter?.pending && repairAfter.units > (repairBefore?.units ?? 0));
-      // Keep a pending one-time scan on the short cadence even when this
-      // turn's fair repair rotation did not admit projection. Failed and
-      // storage-busy turns retain their existing backoff. The projection
-      // stage still admits one <=25 ms slice under the 200 ms capture budget.
+      // Keep a pending one-time scan on the short cadence after its priority
+      // projection slice. Failed and storage-busy turns retain their existing
+      // backoff. The slice stays within the 200 ms capture budget.
       duplicateScanPending = Boolean(repairAfter?.duplicateScan?.pending &&
         results.some(result => !isMaintenancePartialOutcome(result)));
       // Entries actually visited this cadence, never pending candidates the
