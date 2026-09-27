@@ -42,6 +42,8 @@ export const SESSION_SYNC_MAX_DEFERRAL_MS = 60_000;
 export const SESSION_SYNC_MAX_CLOCK_SKEW_MS = 60_000;
 /** Extra local scheduling slack after the cloud's latest possible commit. */
 export const SESSION_SYNC_LEASE_SLACK_MS = 5_000;
+/** The incremental uploader may retry lease acquisition for this long. */
+const SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS = 1_000;
 
 export function shouldDeferDaemonSessionSync(input: {
   batchCapReached: boolean;
@@ -1465,9 +1467,13 @@ export async function runSessionSync(
     }
     const rows = sealedRows.flatMap((item) => item.ok ? [item.row] : []);
     const requestTimeoutMs = Math.min(120_000, config.delivery.requestTimeoutSeconds * 1_000);
+    // postJson starts its timer before fencedFetch acquires the lease. Give
+    // that bounded local retry its own time in both the timer and cloud gate.
+    const transportTimeoutMs = Math.min(120_000, requestTimeoutMs +
+      (options.incremental ? SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS : 0));
     const sentAt = new Date().toISOString();
     // Reserve the cloud's 10 s transaction window after the local HTTP wait.
-    const expiresAt = new Date(Date.parse(sentAt) + requestTimeoutMs + 10_000).toISOString();
+    const expiresAt = new Date(Date.parse(sentAt) + transportTimeoutMs + 10_000).toISOString();
     const body = JSON.stringify(
       aiWorkSessionSyncBatchSchema.parse({
         kind: "session_sync",
@@ -1490,7 +1496,9 @@ export async function runSessionSync(
         let refusal: { status: "expired" | "clock_skew"; serverTime: string } | null = null;
         const fencedFetch: typeof fetch = options.incremental ? async (request, init) => {
           const leaseToken = crypto.randomUUID();
-          const retry = new SyncStorageRetryController({ budgetMs: 1_000, sleep });
+          const retry = new SyncStorageRetryController({
+            budgetMs: SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS, sleep,
+          });
           // These callbacks are synchronous: only freshness/lease bookkeeping
           // holds a write reservation. Network I/O never runs in a transaction.
           await retry.run(() => ledger.transaction(() => {
@@ -1560,7 +1568,7 @@ export async function runSessionSync(
           fetchImpl: fencedFetch,
           sleep,
           maxAttempts,
-          timeoutMs: requestTimeoutMs,
+          timeoutMs: transportTimeoutMs,
           allowPartial: true,
           beforeSend: () => {
             const fresh = rows.every((row) => snapshotFresh(row.session.id));

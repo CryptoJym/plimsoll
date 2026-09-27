@@ -80,7 +80,70 @@ async function child(port: number) {
 }
 
 async function main() {
-  const completion = createProofCompletion("session-sync-remote-deadline", 20);
+  const completion = createProofCompletion("session-sync-remote-deadline", 21);
+  const delayedLedgerPath = path.join(root, "lease-acquisition-delay.sqlite");
+  const delayedBuffer = new LocalEventBuffer(delayedLedgerPath, { workspaceId: tenantId });
+  const delayedSession = "00000900-1111-4111-8111-000000000118";
+  addRow(delayedBuffer, delayedSession, "00000900-aaaa-4aaa-8aaa-aaaaaaaaa118");
+  delayedBuffer.database.pragma("busy_timeout = 0");
+  const blocker = new Database(delayedLedgerPath);
+  let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+  let wireBody = "";
+  let requestArrivedAtMs = 0;
+  let decisionAtMs = 0;
+  let guardAllowed = false;
+  const delayedEndpoint = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    wireBody = Buffer.concat(chunks).toString("utf8");
+    requestArrivedAtMs = Date.now();
+    const batch = JSON.parse(wireBody) as { sentAt: string; expiresAt: string };
+    // The transport timer starts before the lease. The reserved acquisition
+    // budget leaves time to answer after crossing the old sentAt + 1 s gate.
+    const targetMs = Date.parse(batch.sentAt) + 1_150;
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, targetMs - Date.now())));
+    decisionAtMs = Date.now();
+    guardAllowed = decisionAtMs <= Date.parse(batch.expiresAt) - 10_000;
+    response.writeHead(guardAllowed ? 200 : 409, { "content-type": "application/json" });
+    response.end(JSON.stringify(guardAllowed
+      ? acceptedFixtureDelivery(wireBody, installKey)
+      : { error: "session_sync_expired", serverTime: new Date(decisionAtMs).toISOString() }));
+  });
+  await new Promise<void>((resolve) => delayedEndpoint.listen(0, "127.0.0.1", resolve));
+  try {
+    const delayedPort = (delayedEndpoint.address() as { port: number }).port;
+    assert.notEqual(delayedPort, 48271);
+    const delayed = await runSessionSync(config(delayedPort, 1), {
+      ledgerDb: delayedBuffer.database, sessionIds: [delayedSession], until,
+      incremental: true, maxAttemptsPerBatch: 1, delayMs: 0, log: () => undefined,
+      proofSummaryHooks: { onUpdate: () => {
+        assert.equal(releaseTimer, undefined);
+        blocker.exec("BEGIN IMMEDIATE");
+        releaseTimer = setTimeout(() => blocker.exec("COMMIT"), 900);
+      } },
+    });
+    assert.equal(await waitFor(() => decisionAtMs > 0, 1_000), true);
+    assert.notEqual(wireBody, "", "a real signed HTTP request must reach the endpoint");
+    const batch = JSON.parse(wireBody) as { sentAt: string; expiresAt: string };
+    const requestAgeMs = requestArrivedAtMs - Date.parse(batch.sentAt);
+    console.log(JSON.stringify({ case: "lease_acquisition_delay", sqliteHoldMs: 900, requestAgeMs,
+      serverElapsedMs: decisionAtMs - Date.parse(batch.sentAt), guardAllowed,
+      acceptedSessions: delayed.acceptedSessions, reason: delayed.reason }));
+    assert.ok(requestAgeMs >= 800, `request arrived only ${requestAgeMs}ms after sentAt`);
+    assert.ok(decisionAtMs - Date.parse(batch.sentAt) > 1_000);
+    assert.ok(decisionAtMs - requestArrivedAtMs < 1_000);
+    assert.equal(guardAllowed, true, "cloud guard admits the request while HTTP still waits");
+    assert.equal(delayed.acceptedSessions, 1);
+    assert.equal(lease(delayedBuffer.database, delayedSession), undefined);
+    completion.check("one_second_timeout_survives_nine_hundred_ms_lease_acquisition");
+  } finally {
+    if (releaseTimer) clearTimeout(releaseTimer);
+    if (blocker.inTransaction) blocker.exec("ROLLBACK");
+    blocker.close();
+    delayedBuffer.close();
+    delayedEndpoint.closeAllConnections();
+    await new Promise<void>((resolve) => delayedEndpoint.close(() => resolve()));
+  }
   const timeoutBuffer = new LocalEventBuffer(path.join(root, "timeout-guard.sqlite"),
     { workspaceId: tenantId });
   try {
@@ -112,7 +175,8 @@ async function main() {
       assert.notEqual(wireBody, "");
       const wire = JSON.parse(wireBody) as { sentAt: string; expiresAt: string };
       assert.equal(Date.parse(wire.expiresAt) - Date.parse(wire.sentAt),
-        effectiveTimeoutMs + 10_000, `timeout ${timeoutSeconds}s deadline`);
+        Math.min(120_000, effectiveTimeoutMs + 1_000) + 10_000,
+        `timeout ${timeoutSeconds}s deadline`);
       assert.equal(guardAllowed, true, `cloud guard must admit timeout ${timeoutSeconds}s`);
       assert.equal(result.acceptedSessions, 1);
       completion.check(`cloud_guard_admits_${timeoutSeconds}s_timeout_before_local_deadline`);
@@ -172,7 +236,7 @@ async function main() {
     assert.equal(batch.sessions[0]?.session.id, firstSession);
     assert.ok(batch.sentAt && batch.expiresAt);
     completion.check("new_batch_carries_sent_at_and_expires_at");
-    assert.equal(Date.parse(batch.expiresAt!) - Date.parse(batch.sentAt!), 11_000);
+    assert.equal(Date.parse(batch.expiresAt!) - Date.parse(batch.sentAt!), 12_000);
     completion.check("wire_deadline_adds_cloud_commit_window");
 
     assert.equal(await waitFor(() => fs.existsSync(resultPath), 5_000), true);
@@ -196,7 +260,7 @@ async function main() {
       // The real wall clock reaches the stated bound; the receiver remains
       // paused throughout, so this is the old collector's late-commit window.
       const waitMs = Math.max(0, Date.parse(held.expiresAt) - Date.now() + 80);
-      assert.ok(waitMs <= 77_000);
+      assert.ok(waitMs <= 78_000);
       await new Promise((resolve) => setTimeout(resolve, waitMs));
       assert.equal(restarted.database.prepare("delete from buffered_events where session_id = ?")
         .run(firstSession).changes, 1);
