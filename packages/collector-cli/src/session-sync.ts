@@ -1466,7 +1466,8 @@ export async function runSessionSync(
     const rows = sealedRows.flatMap((item) => item.ok ? [item.row] : []);
     const requestTimeoutMs = Math.min(120_000, config.delivery.requestTimeoutSeconds * 1_000);
     const sentAt = new Date().toISOString();
-    const expiresAt = new Date(Date.parse(sentAt) + requestTimeoutMs).toISOString();
+    // Reserve the cloud's 10 s transaction window after the local HTTP wait.
+    const expiresAt = new Date(Date.parse(sentAt) + requestTimeoutMs + 10_000).toISOString();
     const body = JSON.stringify(
       aiWorkSessionSyncBatchSchema.parse({
         kind: "session_sync",

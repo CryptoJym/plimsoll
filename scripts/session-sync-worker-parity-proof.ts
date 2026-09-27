@@ -62,7 +62,7 @@ async function main() {
     const sent = aiWorkSessionSyncBatchSchema.parse(JSON.parse(wireBody));
     assert.ok(sent.sentAt && sent.expiresAt);
     assert.equal(Date.parse(sent.expiresAt) - Date.parse(sent.sentAt),
-      config.delivery.requestTimeoutSeconds * 1_000);
+      Math.min(config.delivery.requestTimeoutSeconds * 1_000, 120_000) + 10_000);
     const expectedBody = JSON.stringify(aiWorkSessionSyncBatchSchema.parse({
       kind: "session_sync", tenantId, installKey: config.installKey,
       appVersion: "0.1.0", sentAt: sent.sentAt, expiresAt: sent.expiresAt,

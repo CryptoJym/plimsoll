@@ -32,11 +32,11 @@ const secondSession = "22222222-2222-4222-8222-222222222218";
 const thirdSession = "33333333-3333-4333-8333-333333333318";
 const until = new Date(Date.now() + 120_000).toISOString();
 
-function config(port: number) {
+function config(port: number, timeoutSeconds = 1) {
   return collectorConfigSchema.parse({
     port: 48319, uploadUrl: `http://127.0.0.1:${port}/ingest`, tenantId, installKey,
     uploadSigningSecret: "remote-deadline-fixture-secret",
-    delivery: { requestTimeoutSeconds: 1 },
+    delivery: { requestTimeoutSeconds: timeoutSeconds },
   });
 }
 
@@ -80,7 +80,46 @@ async function child(port: number) {
 }
 
 async function main() {
-  const completion = createProofCompletion("session-sync-remote-deadline", 15);
+  const completion = createProofCompletion("session-sync-remote-deadline", 20);
+  const timeoutBuffer = new LocalEventBuffer(path.join(root, "timeout-guard.sqlite"),
+    { workspaceId: tenantId });
+  try {
+    for (const timeoutSeconds of [1, 5, 10, 30, 300]) {
+      const effectiveTimeoutMs = Math.min(timeoutSeconds, 120) * 1_000;
+      const segment = String(timeoutSeconds).padStart(8, "0");
+      const sessionId = `${segment}-1111-4111-8111-000000000118`;
+      addRow(timeoutBuffer, sessionId, `${segment}-aaaa-4aaa-8aaa-aaaaaaaaa118`);
+      let wireBody = "";
+      let guardAllowed = false;
+      const result = await runSessionSync(config(48319, timeoutSeconds), {
+        ledgerDb: timeoutBuffer.database, sessionIds: [sessionId], until,
+        incremental: true, maxAttemptsPerBatch: 1, delayMs: 0, log: () => undefined,
+        fetchImpl: (async (_url, init) => {
+          const raw = String(init?.body ?? "");
+          wireBody = raw;
+          const wire = JSON.parse(raw) as { sentAt: string; expiresAt: string };
+          // The cloud tests the DB clock against expiresAt minus its 10 s
+          // transaction budget. This instant is just before the local HTTP
+          // timeout, including the collector's 120 s timeout cap.
+          const serverTimeMs = Date.parse(wire.sentAt) + effectiveTimeoutMs - 1;
+          guardAllowed = serverTimeMs <= Date.parse(wire.expiresAt) - 10_000;
+          return guardAllowed
+            ? new Response(JSON.stringify(acceptedFixtureDelivery(raw, installKey)), { status: 200 })
+            : new Response(JSON.stringify({ error: "session_sync_expired",
+                serverTime: new Date(serverTimeMs).toISOString() }), { status: 409 });
+        }) as typeof fetch,
+      });
+      assert.notEqual(wireBody, "");
+      const wire = JSON.parse(wireBody) as { sentAt: string; expiresAt: string };
+      assert.equal(Date.parse(wire.expiresAt) - Date.parse(wire.sentAt),
+        effectiveTimeoutMs + 10_000, `timeout ${timeoutSeconds}s deadline`);
+      assert.equal(guardAllowed, true, `cloud guard must admit timeout ${timeoutSeconds}s`);
+      assert.equal(result.acceptedSessions, 1);
+      completion.check(`cloud_guard_admits_${timeoutSeconds}s_timeout_before_local_deadline`);
+    }
+  } finally {
+    timeoutBuffer.close();
+  }
   const seeded = new LocalEventBuffer(ledgerPath, { workspaceId: tenantId });
   addRow(seeded, firstSession, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa118");
   seeded.close();
@@ -133,8 +172,8 @@ async function main() {
     assert.equal(batch.sessions[0]?.session.id, firstSession);
     assert.ok(batch.sentAt && batch.expiresAt);
     completion.check("new_batch_carries_sent_at_and_expires_at");
-    assert.equal(Date.parse(batch.expiresAt!) - Date.parse(batch.sentAt!), 1_000);
-    completion.check("wire_deadline_matches_request_timeout");
+    assert.equal(Date.parse(batch.expiresAt!) - Date.parse(batch.sentAt!), 11_000);
+    completion.check("wire_deadline_adds_cloud_commit_window");
 
     assert.equal(await waitFor(() => fs.existsSync(resultPath), 5_000), true);
     const childResult = JSON.parse(fs.readFileSync(resultPath, "utf8")) as { ok: boolean; reason: string };
@@ -157,7 +196,7 @@ async function main() {
       // The real wall clock reaches the stated bound; the receiver remains
       // paused throughout, so this is the old collector's late-commit window.
       const waitMs = Math.max(0, Date.parse(held.expiresAt) - Date.now() + 80);
-      assert.ok(waitMs <= 67_000);
+      assert.ok(waitMs <= 77_000);
       await new Promise((resolve) => setTimeout(resolve, waitMs));
       assert.equal(restarted.database.prepare("delete from buffered_events where session_id = ?")
         .run(firstSession).changes, 1);
