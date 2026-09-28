@@ -8,6 +8,7 @@ import { createProofCompletion } from "./lib/proof-completion";
 
 const target = "00000000-0000-4000-8000-000000000106";
 const other = "00000000-0000-4000-8000-000000000107";
+const lateSession = "00000000-0000-4000-8000-000000000109";
 const workspace = "00000000-0000-4000-8000-000000000108";
 const until = "2026-09-25T00:00:00.000Z";
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,16 +48,16 @@ function insert(buffer: any, first: number, last: number, sessionId: string, obs
   }
 }
 
-async function drain(version: any, buffer: any, max = 10) {
+async function drain(version: any, buffer: any, max = 10, sessionId = target) {
   let latest: any;
   for (let n = 0; n < max; n++) {
-    latest = await version.updateSessionSummary(buffer.database, target, until, { read: read(buffer) });
+    latest = await version.updateSessionSummary(buffer.database, sessionId, until, { read: read(buffer) });
     if (latest.complete) return latest;
   }
   throw new Error(`summary_not_complete ${JSON.stringify(latest)}`);
 }
 
-function state(db: any) {
+function state(db: any, sessionId = target) {
   const cols = new Set((db.prepare("pragma table_info(session_sync_summary_state)").all() as any[])
     .map(row => row.name));
   const row = db.prepare(`select schema_version as version,
@@ -66,12 +67,12 @@ function state(db: any) {
       ${cols.has("cursor_observed_at") ? "cursor_observed_at" : "null"} as cursorObservedAt,
       ${cols.has("cursor_rowid") ? "cursor_rowid" : "null"} as cursorRowid,
       accumulator_json as accumulatorJson
-      from session_sync_summary_state where session_id = ?`).get(target) as any;
+      from session_sync_summary_state where session_id = ?`).get(sessionId) as any;
   return { ...row, accumulator: JSON.parse(row.accumulatorJson) };
 }
 
 async function main() {
-  const completion = createProofCompletion("session-summary-v44-downgrade", 5);
+  const completion = createProofCompletion("session-summary-v44-downgrade", 6);
   const root = process.env.PLIMSOLL_PROOF_ROOT!;
   const dbPath = path.join(root, "downgrade-v44.sqlite");
   const headRepo = repo;
@@ -183,6 +184,16 @@ async function main() {
   assert.equal(drift.scanBoundary, drift.accumulator.scanBoundary);
   assert.equal(drift.cursorObservedAt, drift.accumulator.cursorObservedAt);
   completion.check("0744_cursor_json_and_columns_stay_equal");
+  // A downgraded binary can also create a state row after the v4 schema was
+  // installed. Its INSERT omits every materialized cursor column.
+  insert(buffer, 16_001, 16_001, lateSession, "2026-09-22T00:00:00.000Z");
+  const inserted = await drain(old, buffer, 10, lateSession);
+  assert.equal(inserted.complete, true);
+  const insertedState = state(db, lateSession);
+  assert.equal(insertedState.scanBoundary, insertedState.accumulator.scanBoundary);
+  assert.equal(insertedState.cursorRowid, insertedState.accumulator.cursorRowid);
+  assert.equal(insertedState.cursorObservedAt, insertedState.accumulator.cursorObservedAt);
+  completion.check("0744_insert_projects_cursor_from_json");
   buffer.close(); buffer = null;
 
   buffer = new HeadBuffer(dbPath, { workspaceId: workspace });
