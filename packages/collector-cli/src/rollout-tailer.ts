@@ -52,6 +52,8 @@ import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budg
 import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import { CaptureRevisitQueue } from "./capture-revisit-queue";
 import { recordCaptureRecordLoss } from "./capture-record-loss";
+import { captureFileKeyDigest, declareUnresolvedFileGap, fileGapId,
+  recordCountedJsonlGap, resolveCaptureGap, rolloutGapScope } from "./lean/capture-gaps";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -1183,6 +1185,7 @@ export class RolloutTailer {
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            const fileKeyDigest = captureFileKeyDigest(jsonlScanStateKey(this.cursorKey(candidate.file)));
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();
@@ -1191,7 +1194,15 @@ export class RolloutTailer {
               // Deletion and provider writes share this transaction. Failure
               // restores the envelope as well as cursor/events/outbox/handoffs.
               read.continuation?.remove();
+              const gapScope = rolloutGapScope(this.buffer.database);
               if (read.unresolvedRecord) {
+                declareUnresolvedFileGap(this.buffer.database, {
+                  ...gapScope, source: "codex", fileKeyDigest,
+                  generationIdentity: read.fileIdentity,
+                  reason: read.unresolvedRecord.reason,
+                  lastWriteAtMs: Math.max(0, Math.floor(read.mtimeMs)),
+                  unreadBytes: Math.max(0, read.observedSize - read.committedOffset),
+                });
                 rememberJsonlScanCursor(
                   this.buffer.database,
                   this.cursorKey(candidate.file),
@@ -1206,6 +1217,12 @@ export class RolloutTailer {
               if (read.skippedRecord) {
                 recordCaptureRecordLoss(this.buffer.database, {
                   source: "codex", fileKey: jsonlScanStateKey(this.cursorKey(candidate.file)), record: read.skippedRecord,
+                });
+                recordCountedJsonlGap(this.buffer.database, {
+                  ...gapScope, source: "codex", fileKeyDigest,
+                  offset: read.skippedRecord.offset, fingerprint: read.skippedRecord.fingerprint,
+                  kind: read.skippedRecord.kind,
+                  atMs: Math.max(gapScope.epochStartMs, Date.now()),
                 });
                 if (read.skippedRecord.usagePossible) {
                   initialState.counterUncertain = true;
@@ -1222,6 +1239,12 @@ export class RolloutTailer {
               if (result.parseErrors !== parseErrorsBefore) {
                 parseFailure = true;
                 throw new Error("rollout_slice_parse_failed");
+              }
+              if (!read.workRemaining && read.deferredBytes === 0) {
+                resolveCaptureGap(this.buffer.database, fileGapId({
+                  ...gapScope, source: "codex", fileKeyDigest,
+                  generationIdentity: read.fileIdentity,
+                }), Math.max(gapScope.epochStartMs, Date.now()));
               }
               rememberJsonlScanCursor(
                 this.buffer.database,

@@ -1197,6 +1197,7 @@ export function createCollectorServer(
       captureHealth: status.health ?? null,
       historyCoverage,
       captureBaseline: refreshControl ? captureBaselineStatus(buffer.database) : cachedControl?.captureBaseline ?? null,
+      captureDurability: refreshControl ? buffer.captureDurability.status() : cachedControl?.captureDurability ?? null,
       accountAssertions,
       accountAssertionAdapters: refreshControl ? accountAssertions : cachedControl?.accountAssertionAdapters ?? null,
       accountAssertionStatusLine: refreshControl ? formatAccountAssertionStatusLine(buffer.database)
@@ -1283,6 +1284,7 @@ export function createCollectorServer(
       maintenance: options.maintenanceStatus?.() ?? null,
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
+      captureDurability: buffer.captureDurability.status(),
       accountAssertions,
       accountAssertionAdapters: accountAssertions,
       accountAssertionStatusLine: formatAccountAssertionStatusLine(buffer.database),
@@ -1459,6 +1461,7 @@ export function createCollectorServer(
             maintenance: options.maintenanceStatus?.() ?? null,
             historyCoverage: null,
             captureBaseline: null,
+            captureDurability: lastCoherentStatus?.body.captureDurability ?? buffer.captureDurability.status(),
             accountAssertions: defaultAccountAssertionStatus(),
             accountAssertionAdapters: defaultAccountAssertionStatus(),
             accountAssertionStatusLine: formatAccountAssertionStatusRows(defaultAccountAssertionStatus()),
@@ -2156,7 +2159,8 @@ export function createCollectorServer(
           // A deadline refusal the OTLP intake spool could not hold is a 503
           // for the same reason (bead eco-6hoxj.163.17).
           ...(failure.status === 503 &&
-            (failure.reason === "storage_busy_retry" || failure.reason === "request_deadline_exceeded")
+            (failure.reason === "storage_busy_retry" || failure.reason === "request_deadline_exceeded" ||
+              failure.reason === "gap_record_unavailable")
             ? { "retry-after": "1" }
             : {}),
         });

@@ -2,7 +2,8 @@ import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallati
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
 import os from "node:os";
-import { ensureCaptureGapSchema } from "./lean/capture-gaps";
+import { ensureCaptureGapSchema, recordRefusedEventGap } from "./lean/capture-gaps";
+import { CaptureDurability } from "./lean/capture-durability";
 import { performance } from "node:perf_hooks";
 
 import Database from "better-sqlite3";
@@ -225,6 +226,7 @@ export class LocalEventBuffer {
   readonly delivery: DeliveryOutbox;
   readonly projection: DashboardProjectionStore;
   readonly learningFacts: LearningFactStore;
+  readonly captureDurability: CaptureDurability;
   private insertEventStatement?: Database.Statement;
   private budgetAttemptedRows = 0;
 
@@ -790,6 +792,7 @@ export class LocalEventBuffer {
         : undefined,
     });
     markOpenStep("ledger.projection_schema");
+    this.captureDurability = new CaptureDurability(this.db, path, newLedger);
   }
 
   /**
@@ -1340,6 +1343,7 @@ export class LocalEventBuffer {
     this.activeRepoContextCommitScope = handoffs;
     try {
       const result = this.db.transaction(() => {
+        this.captureDurability.repairInTransaction();
         const value = work();
         if (handoffs.overflowCount > 0) {
           this.recordRepoContextDrop("queue_overflow", handoffs.overflowCount);
@@ -1351,6 +1355,7 @@ export class LocalEventBuffer {
       return result;
     } catch (error) {
       this.activeRepoContextCommitScope = null;
+      this.captureDurability.reportGapFailure(error);
       throw error;
     }
   }
@@ -2504,6 +2509,7 @@ export class LocalEventBuffer {
       return { appended: false, deduplicated: true, repoContextRequest: null };
     }
     this.recordEventCollisionDigest(event.id, `sha256:${storedDigest.toString("hex")}`);
+    recordRefusedEventGap(this.db, event, incomingDigest.toString("hex"));
     return { appended: false, collisionQuarantined: true, repoContextRequest: null };
   }
 
@@ -2623,6 +2629,7 @@ export class LocalEventBuffer {
     let result: ReturnType<LocalEventBuffer["appendInCurrentTransaction"]>;
     try {
       const run = () => {
+        if (ownsHandoffs) this.captureDurability.repairInTransaction();
         const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
@@ -2639,6 +2646,9 @@ export class LocalEventBuffer {
         return appended;
       };
       result = ownsHandoffs ? this.db.transaction(run).immediate() : run();
+    } catch (error) {
+      if (ownsHandoffs) this.captureDurability.reportGapFailure(error);
+      throw error;
     } finally {
       takeRepoContextSidecar(event);
       takeRepoContextId(event);
@@ -2673,6 +2683,7 @@ export class LocalEventBuffer {
     let workStarted = false;
     const work = () => {
       workStarted = true;
+      if (ownsHandoffs) this.captureDurability.repairInTransaction();
       for (const entry of entries) {
         const result = this.appendInCurrentTransaction(entry.event, entry.suppressedFields, performance.now() < projectionDeadlineMs);
         appended.push(result);
@@ -2695,6 +2706,9 @@ export class LocalEventBuffer {
     try {
       if (ownsHandoffs) this.db.transaction(work).immediate();
       else work();
+    } catch (error) {
+      if (ownsHandoffs) this.captureDurability.reportGapFailure(error);
+      throw error;
     } finally {
       // BEGIN IMMEDIATE can lose to maintenance before the callback starts.
       // Preserve sidecars for the listener's bounded retry in that case.

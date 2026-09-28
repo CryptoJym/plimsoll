@@ -1,6 +1,7 @@
 import type http from "node:http";
 import zlib from "node:zlib";
 import { isSqliteContentionError } from "./sqlite-contention";
+import { CaptureGapWriteError } from "./lean/capture-gaps";
 
 export const LOCAL_HTTP_LIMITS = Object.freeze({
   // Issue #196 raised the standalone 256 KiB wire cap to 2 MiB so gzip
@@ -63,6 +64,7 @@ export const HTTP_BOUNDARY_REASONS = [
   "compressed_body_too_large",
   "compression_ratio_too_large",
   "decoded_body_too_large",
+  "gap_record_unavailable",
   "host_not_allowed",
   "internal_rejection",
   "invalid_compressed_body",
@@ -120,6 +122,7 @@ export class HttpBoundaryRejection extends Error {
 
 export function asHttpBoundaryRejection(error: unknown) {
   if (error instanceof HttpBoundaryRejection) return error;
+  if (error instanceof CaptureGapWriteError) return new HttpBoundaryRejection("gap_record_unavailable", 503);
   return isSqliteContentionError(error)
     ? new HttpBoundaryRejection("storage_busy_retry", 503)
     : new HttpBoundaryRejection("internal_rejection", 400);

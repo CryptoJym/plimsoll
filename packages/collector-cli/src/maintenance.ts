@@ -868,7 +868,12 @@ export class CollectorMaintenance {
         this.coverageWalks = null;
         return;
       }
-      if (this.coverageWalks.every(({ walk }) => walk.done)) this.coverageWalks = null;
+      if (this.coverageWalks.every(({ walk }) => walk.done)) {
+        if (walks.length > 0 && walks.every(({ walk }) => walk.complete)) {
+          this.buffer.captureDurability.markFreshWalkComplete();
+        }
+        this.coverageWalks = null;
+      }
     } catch {
       // A failed check leaves the frontier where it was; capture goes on.
       this.coverageWalks?.forEach(({ walk }) => walk.close());

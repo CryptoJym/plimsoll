@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import type Database from "better-sqlite3";
 import type { CaptureSkippedRecord } from "../capture-record-loss";
+import { CAPTURE_WRITE_LAG_MS } from "../capture-frontier";
+import type { AiInteractionEvent } from "../../../shared/src/index";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 const tupleHash = (parts: readonly (string | number)[]) => sha256(parts.map((part) => {
@@ -125,8 +127,9 @@ export function declareUnresolvedFileGap(db: Database.Database, input: FileGapIn
 
 export function resolveCaptureGap(db: Database.Database, gapId: string, atMs: number): void {
   if (!safeMs(atMs)) throw new Error("invalid_capture_gap_resolution");
-  gapWrite("unknown", null, () => db.prepare(`update capture_gaps set resolved_at_ms=?,revision=revision+1,upload_state='pending'
-    where gap_id=? and resolved_at_ms is null and started_at_ms<=?`).run(atMs, gapId, atMs));
+  gapWrite("unknown", null, () => db.prepare(`update capture_gaps set ended_at_ms=coalesce(ended_at_ms,?),
+    resolved_at_ms=?,revision=revision+1,upload_state='pending'
+    where gap_id=? and resolved_at_ms is null and started_at_ms<=?`).run(atMs, atMs, gapId, atMs));
 }
 
 export function coverageCompleteForPeriod(db: Database.Database,
@@ -175,6 +178,47 @@ export function recordCountedJsonlGap(db: Database.Database, input: {
       : input.kind === "unknown" ? null : 0,
   }));
   return { gapId };
+}
+
+/** Persist the conservative interval of a failed capture transaction. The
+ * caller must do this in the same retry transaction as its source unit. */
+export function recordFaultIntervalGap(db: Database.Database, input: {
+  faultId: string; source: string | null; fileKeyDigest: string | null;
+  atMs: number; repairedAtMs: number;
+}): string {
+  const scope = rolloutGapScope(db);
+  const gapId = tupleHash(["plimsoll-capture-fault-v1", input.faultId]);
+  const startedAtMs = Math.max(scope.epochStartMs, input.atMs - CAPTURE_WRITE_LAG_MS);
+  const endedAtMs = Math.max(startedAtMs, input.repairedAtMs);
+  gapWrite(input.source ?? "unknown", input.fileKeyDigest, () => db.prepare(`
+    insert into capture_gaps
+      (gap_id,workspace_id,installation_epoch_id,source,machine_hash,epoch_key,
+       started_at_ms,ended_at_ms,interval_basis,count_basis,reason,file_key_digest)
+    values (@gapId,@workspaceId,@installationEpochId,@source,@machineHash,@installationEpochId,
+      @startedAtMs,@endedAtMs,'fault_interval','unknown','gap_record_unavailable',@fileKeyDigest)
+    on conflict(gap_id) do nothing
+  `).run({ ...scope, ...input, gapId, startedAtMs, endedAtMs,
+    source: input.source ?? "unknown", machineHash: MACHINE_HASH }));
+  return gapId;
+}
+
+/** A parsed row with a conflicting identity was not admitted or deduplicated. */
+export function recordRefusedEventGap(db: Database.Database, event: AiInteractionEvent, fingerprint: string): string {
+  const scope = rolloutGapScope(db);
+  const gapId = tupleHash(["plimsoll-refused-event-v1", scope.installationEpochId,
+    event.source, event.id, fingerprint]);
+  const observedMs = Date.parse(event.observedAt);
+  const startedAtMs = Math.max(scope.epochStartMs, safeMs(observedMs) ? observedMs : Date.now());
+  const droppedUsageRows = event.inputTokens !== undefined || event.outputTokens !== undefined ||
+    event.costUsd !== undefined ? 1 : 0;
+  gapWrite(event.source, null, () => db.prepare(`insert or ignore into capture_gaps
+    (gap_id,workspace_id,installation_epoch_id,source,machine_hash,epoch_key,
+     started_at_ms,ended_at_ms,interval_basis,dropped_rows,dropped_usage_rows,count_basis,reason)
+    values (@gapId,@workspaceId,@installationEpochId,@source,@machineHash,@installationEpochId,
+      @startedAtMs,@endedAtMs,'counted_interval',1,@droppedUsageRows,'counted','contract_violation')`)
+    .run({ ...scope, gapId, source: event.source, machineHash: MACHINE_HASH,
+      startedAtMs, endedAtMs: startedAtMs + 1, droppedUsageRows }));
+  return gapId;
 }
 
 export const captureFileKeyDigest = sha256;

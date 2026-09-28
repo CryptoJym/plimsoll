@@ -3688,6 +3688,7 @@ async function main() {
             !persistentCleanup.ambiguous &&
             !cleanupAttempt?.ambiguous;
           const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped && enrichmentChildReaped;
+          const captureCleanShutdown = shutdownReady && buffer.captureDurability.markCleanShutdown();
           console.log(
             JSON.stringify({
               // The process is still executing this receipt. Only the stop or
@@ -3707,6 +3708,7 @@ async function main() {
               processState: "exiting",
               processLiveAtReceipt: processIdentityIsLive(runtimeIdentity),
               hardDeadlineMs,
+              captureCleanShutdown,
             }),
           );
           process.exit(shutdownReady ? 0 : 1);

@@ -27,6 +27,8 @@ test("B22 C5: an unresolved file's gap is epoch_open from the epoch start with a
     for (let h = 0; h < 11; h += 1) assert.equal(complete(db, { startMs: t(`${String(h).padStart(2, "0")}:00`), endMs: t(`${String(h + 1).padStart(2, "0")}:00`) }, FIRST_PARSE), false, `hour ${h}`);
     assert.ok(STAMPED > LAST_WRITE, "the clamp keeps a stamp after the file's last write (normalizer.ts:203-214)");
     resolve(db, gapId, FIRST_PARSE);
+    assert.equal((db.prepare("select ended_at_ms as ended from capture_gaps where gap_id=?").get(gapId) as { ended: number }).ended,
+      FIRST_PARSE, "a resolved gap has a known end for the strict v2 receiver");
     assert.equal(complete(db, { startMs: t("10:01"), endMs: FIRST_PARSE }, FIRST_PARSE), true, "parsed to its end: resolved");
   } finally { close(); }
 });
