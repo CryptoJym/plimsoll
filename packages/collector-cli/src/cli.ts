@@ -3368,6 +3368,8 @@ async function main() {
               projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited +
               sessionIndex.backfill.rowsVisited + pairing.units,
             duplicateScan: { pending: !duplicateScan.complete, cursor: duplicateScan.cursor },
+            projectionMigration: { pending: !projection.backfill.complete ||
+              !projection.backfill.parityComplete || !projection.backfill.metricComplete },
           };
         },
         retryNotBefore: () => {

@@ -99,6 +99,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const BACKFILL_ROWS = 1_000;
 const REPAIR_ROWS = 250;
 const DUPLICATE_FACT_SCAN_ROWS = 1_000;
+const TIMED_BACKFILL_BATCH_ROWS = 32;
 const TIMED_REPAIR_BATCH_ROWS = 8;
 const COMPACT_GC_ITEMS = 1_000;
 const SESSION_REPAIR_ROWS = 1_000;
@@ -3097,7 +3098,7 @@ export class DashboardProjectionStore {
     maxActiveMs?: number;
     /** Monotonic clock and row cost hook for deterministic slow-host proofs. */
     clock?: () => number;
-    onWorkRowForProof?: (phase: "scan" | "repair") => void;
+    onWorkRowForProof?: (phase: "scan" | "repair" | "backfill" | "metric" | "parity") => void;
     onPhaseForProof?: (phase: "scan" | "pre_repair" | "repair" | "finish" | "commit",
       durationMs: number) => void;
   } = {}): ProjectionMaintenanceReceipt {
@@ -3131,8 +3132,10 @@ export class DashboardProjectionStore {
     const deadline = options.maxActiveMs === undefined ? Infinity :
       clock() + Math.max(1, options.maxActiveMs);
     const hasActiveTime = () => clock() < deadline;
-    // A timed pass admits one small unit at a time. The unbudgeted explicit
-    // drain retains the historical row allowances.
+    // Migration can use the whole allowance in bounded batches. Repairs and
+    // expiry keep their smaller deadline-sensitive admission units.
+    const migrationBatchRows = options.maxActiveMs === undefined ?
+      BACKFILL_ROWS : TIMED_BACKFILL_BATCH_ROWS;
     const phaseRows = options.maxActiveMs === undefined ? BACKFILL_ROWS : TIMED_REPAIR_BATCH_ROWS;
     let phaseStarted = options.onPhaseForProof ? performance.now() : 0;
     const markPhase = (phase: "scan" | "pre_repair" | "repair" | "finish" | "commit") => {
@@ -3204,7 +3207,7 @@ export class DashboardProjectionStore {
       }
       markPhase("scan");
       if (!control.backfillComplete && hasActiveTime()) {
-        const rows = this.db.prepare(
+        const fetch = this.db.prepare(
           `select rowid as rawRowid, id, source, event_type as eventType,
             case when ${rawPrivacyEligible} then 1 else 0 end as privacyEligible,
             observed_at as observedAt, session_id as sessionId, action_class as actionClass,
@@ -3217,33 +3220,51 @@ export class DashboardProjectionStore {
             installation_epoch_id as installationEpochId, project_key as projectKey,
             case when event_type='usage_live' then payload_json else '{}' end as payloadJson, created_at as createdAt, cost_kind as costKind
            from buffered_events where rowid > ? and rowid <= ? order by rowid limit ?`,
-        ).all(control.backfillCursor, control.backfillHighWater ?? 0, phaseRows) as RawProjectionRow[];
-        this.applyProjectionRows(rows,now);
-        for (const row of rows) {
-          this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(row.rawRowid);
+        );
+        const removeQueued = this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`);
+        let cursor = control.backfillCursor, exhausted = false;
+        while (backfillRowsVisited < BACKFILL_ROWS && hasActiveTime()) {
+          const batchLimit = Math.min(migrationBatchRows, BACKFILL_ROWS-backfillRowsVisited);
+          const rows = fetch.all(cursor,control.backfillHighWater ?? 0,batchLimit) as RawProjectionRow[];
+          this.applyProjectionRows(rows,now);
+          for (const row of rows) {
+            removeQueued.run(row.rawRowid);
+            options.onWorkRowForProof?.("backfill");
+          }
+          backfillRowsVisited += rows.length;
+          cursor = rows.at(-1)?.rawRowid ?? cursor;
+          if (rows.length < batchLimit) { exhausted = true; break; }
+          if (cursor >= (control.backfillHighWater ?? 0)) break;
         }
-        backfillRowsVisited = rows.length;
-        const exhausted=rows.length<phaseRows;
-        const cursor = exhausted?(control.backfillHighWater??0):(rows.at(-1)?.rawRowid ?? control.backfillCursor);
+        cursor = exhausted ? (control.backfillHighWater ?? 0) : cursor;
         this.db.prepare(
           `update dashboard_projection_control set backfill_cursor=?,
             backfill_complete=case when ? >= coalesce(backfill_high_water,0) then 1 else 0 end,
             backfill_facts=backfill_facts+? where singleton=1`,
-        ).run(cursor, cursor, rows.length);
+        ).run(cursor, cursor, backfillRowsVisited);
       }
 
       const metricControl=this.control();
       if(!metricControl.metricBackfillComplete && hasActiveTime()){
-        const rows=this.db.prepare(
+        const fetch=this.db.prepare(
           `select rowid as rawRowid from metric_samples where rowid>? and rowid<=? order by rowid limit ?`,
-        ).all(metricControl.metricBackfillCursor,metricControl.metricBackfillHighWater??0,phaseRows) as Array<{rawRowid:number}>;
-        metricRowsVisited=rows.length;
-        const exhausted=rows.length<phaseRows;
-        const cursor=exhausted?(metricControl.metricBackfillHighWater??0):(rows.at(-1)?.rawRowid??metricControl.metricBackfillCursor);
+        );
+        let cursor=metricControl.metricBackfillCursor,exhausted=false;
+        while(metricRowsVisited<BACKFILL_ROWS&&hasActiveTime()){
+          const batchLimit=Math.min(migrationBatchRows,BACKFILL_ROWS-metricRowsVisited);
+          const rows=fetch.all(cursor,metricControl.metricBackfillHighWater??0,batchLimit) as
+            Array<{rawRowid:number}>;
+          for(const _row of rows) options.onWorkRowForProof?.("metric");
+          metricRowsVisited+=rows.length;
+          cursor=rows.at(-1)?.rawRowid??cursor;
+          if(rows.length<batchLimit){exhausted=true;break;}
+          if(cursor>=(metricControl.metricBackfillHighWater??0))break;
+        }
+        cursor=exhausted?(metricControl.metricBackfillHighWater??0):cursor;
         this.db.prepare(
           `update dashboard_projection_control set metric_backfill_cursor=?,
             metric_backfill_complete=?,metric_sample_count=coalesce(metric_sample_count,0)+?,dirty=1 where singleton=1`,
-        ).run(cursor,exhausted?1:0,rows.length);
+        ).run(cursor,cursor>=(metricControl.metricBackfillHighWater??0)?1:0,metricRowsVisited);
       }
 
       if (hasActiveTime()) this.drainCompactMutations(
@@ -3314,14 +3335,25 @@ export class DashboardProjectionStore {
       if(hasActiveTime()&&preGc.compactMutationBacklog===0&&preGc.repairBacklog===0){
         compactGc=this.runCompactGcSlice(now);
       }
+      // Expiry must finish its current cutoff before a new parity scan starts.
+      // Otherwise a faster backfill can reach high water after only part of
+      // that cutoff has left the flat totals, then compare unlike windows.
+      // An already-started parity scan keeps its existing cutoff: expiry's
+      // own cursor guard yields until that scan completes.
+      if (hasActiveTime()) expiryFacts = this.advanceExpiry(now, phaseRows);
       // Legacy privacy migration queues rows that have not entered flat totals.
       // Admit them before parity scans, or later repairs count them twice.
+      const parityControl = this.control();
       const cleanForParity = backfillRowsVisited === 0 &&
-        repairRowsVisited === 0 && this.control().repairBacklog === 0;
-      parityRowsVisited = cleanForParity && hasActiveTime() ? this.runParitySlice(phaseRows) : 0;
+        repairRowsVisited === 0 && parityControl.repairBacklog === 0;
+      if (cleanForParity && !parityControl.parityComplete && hasActiveTime() &&
+          (parityControl.parityCursor > 0 || !this.expiryCutoffBehind(now)) &&
+          hasActiveTime()) {
+        parityRowsVisited = this.runParitySlice(
+          BACKFILL_ROWS,hasActiveTime,migrationBatchRows,options.onWorkRowForProof);
+      }
       if (hasActiveTime()) this.drainAccountInvalidations(now,
         options.maxActiveMs === undefined ? REPAIR_ROWS : TIMED_REPAIR_BATCH_ROWS);
-      if (hasActiveTime()) expiryFacts = this.advanceExpiry(now, phaseRows);
 
       const repairStarted=performance.now();
       // Session repair can finish one 1,000-row checkpoint in a transaction;
@@ -3426,11 +3458,12 @@ export class DashboardProjectionStore {
     };
   }
 
-  private runParitySlice(limit=BACKFILL_ROWS) {
+  private runParitySlice(limit=BACKFILL_ROWS,hasActiveTime=()=>true,
+    batchRows=limit,onWorkRowForProof?: (phase:"parity")=>void) {
     const control = this.control();
     if (!control.backfillComplete || control.parityComplete) return 0;
     const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
-    const rows = this.db.prepare(
+    const fetch = this.db.prepare(
       `select rowid as rawRowid,id,source,event_type as eventType,observed_at as observedAt,
         case when ${privacyEligible} then 1 else 0 end as privacyEligible,
         session_id as sessionId,action_class as actionClass,model,input_tokens as inputTokens,
@@ -3442,19 +3475,28 @@ export class DashboardProjectionStore {
         installation_epoch_id as installationEpochId,project_key as projectKey,
         case when event_type='usage_live' then payload_json else '{}' end as payloadJson, created_at as createdAt, cost_kind as costKind
        from buffered_events where rowid>? and rowid<=? order by rowid limit ?`,
-    ).all(control.parityCursor, control.backfillHighWater ?? 0, limit) as RawProjectionRow[];
+    );
     const windows = this.db.prepare(
       `select days,cutoff_at as cutoffAt from dashboard_window_control
        where days in (30,90,182,365,1825)`,
     ).all() as Array<{days:number;cutoffAt:string}>;
-    this.applyReferenceBatch(
-      "dashboard_parity_window",
-      windows,
-      rows.filter((row) => Boolean(row.privacyEligible))
-        .map((row) => factFromRaw(row, backfillUsageSuppressed(this.db, row))),
-    );
-    const exhausted=rows.length<limit;
-    const cursor = exhausted?(control.backfillHighWater??0):(rows.at(-1)?.rawRowid ?? control.parityCursor);
+    let cursor=control.parityCursor,rowsVisited=0,exhausted=false;
+    while(rowsVisited<limit&&hasActiveTime()){
+      const batchLimit=Math.min(batchRows,limit-rowsVisited);
+      const rows=fetch.all(cursor,control.backfillHighWater??0,batchLimit) as RawProjectionRow[];
+      this.applyReferenceBatch(
+        "dashboard_parity_window",
+        windows,
+        rows.filter((row) => Boolean(row.privacyEligible))
+          .map((row) => factFromRaw(row, backfillUsageSuppressed(this.db, row))),
+      );
+      for(const _row of rows)onWorkRowForProof?.("parity");
+      rowsVisited+=rows.length;
+      cursor=rows.at(-1)?.rawRowid??cursor;
+      if(rows.length<batchLimit){exhausted=true;break;}
+      if(cursor>=(control.backfillHighWater??0))break;
+    }
+    cursor=exhausted?(control.backfillHighWater??0):cursor;
     let complete = cursor >= (control.backfillHighWater ?? 0);
     if (complete) {
       const mismatches = this.db.prepare(
@@ -3482,7 +3524,7 @@ export class DashboardProjectionStore {
     this.db.prepare(
       `update dashboard_projection_control set parity_cursor=?,parity_complete=? where singleton=1`,
     ).run(cursor, complete ? 1 : 0);
-    return rows.length;
+    return rowsVisited;
   }
 
   private expiryCutoffBehind(now: Date) {

@@ -761,11 +761,11 @@ function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projec
  */
 export async function drainProjectionMigration(
   projection:LocalEventBuffer["projection"],
-  options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number;signal?:AbortSignal;budget?:CaptureWorkBudget}={},
+  options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number|(()=>number);
+    signal?:AbortSignal;budget?:CaptureWorkBudget}={},
 ){
   const maxSlices=Math.max(1,Math.min(options.maxSlices??PROJECTION_DRAIN_MAX_SLICES,100));
   const maxActiveMs=Math.max(1,Math.min(options.maxActiveMs??PROJECTION_DRAIN_MAX_ACTIVE_MS,5_000));
-  const cadenceSeconds=Math.max(1,options.cadenceSeconds??PROJECTION_CADENCE_SECONDS);
   let slices=0,yields=0,migrationRowsVisited=0,activeMs=0;
   let receipt:ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>|undefined;
   while(slices<maxSlices && !options.signal?.aborted && (options.budget?.canStart(5) ?? true)){
@@ -787,7 +787,14 @@ export async function drainProjectionMigration(
     if(!stillMigrating||activeMs>=maxActiveMs)break;
   }
   const status=projection.status(),remainingRowidUpperBound=projectionMigrationRemaining(status);
-  const capacityPerCadence=1_000*maxSlices;
+  // The active-time allowance may admit fewer than 1,000 rows per slice or
+  // fewer than maxSlices per turn. Quote the rows this turn actually visited
+  // at the interval that will schedule the next turn, including a pending
+  // duplicate scan's faster cadence.
+  const nextCadence=typeof options.cadenceSeconds==="function" ?
+    options.cadenceSeconds() : options.cadenceSeconds;
+  const cadenceSeconds=Math.max(0.25,nextCadence??PROJECTION_CADENCE_SECONDS);
+  const capacityPerCadence=Math.max(1,migrationRowsVisited);
   return {receipt:receipt!,drain:{slices,yields,migrationRowsVisited,
     activeMs:Number(activeMs.toFixed(3)),maxSlices,maxActiveMs,cadenceSeconds,remainingRowidUpperBound,
     estimatedMinutesUpperBound:Math.ceil(remainingRowidUpperBound/capacityPerCadence*cadenceSeconds/60),
@@ -990,7 +997,9 @@ export class CollectorMaintenance {
     // Assigned inside the runRepairs closure below; the typed null initializer keeps
     // the declared union so control-flow narrowing does not reduce it to null.
     let drained = null as Awaited<ReturnType<typeof drainProjectionMigration>> | null;
-    const scanPending = !this.buffer.projection.status().backfill.duplicateFactScan.complete;
+    const migrationStatus=this.buffer.projection.status().backfill;
+    const migrationPending=!migrationStatus.complete || !migrationStatus.parityComplete ||
+      !migrationStatus.metricComplete || !migrationStatus.duplicateFactScan.complete;
     let priorityProjectionRan = false;
     const executeRepairStage = async (stage: RepairStage) => {
       const counter = repairService.stages[stage];
@@ -1003,6 +1012,12 @@ export class CollectorMaintenance {
           case "projection":
             drained = await drainProjectionMigration(this.buffer.projection, {
               maxSlices: 1, maxActiveMs: 25, signal: this.signal,
+              cadenceSeconds:()=>{
+                const migration=this.buffer.projection.status().backfill;
+                return !migration.duplicateFactScan.complete ? 0.25 :
+                  !migration.complete || !migration.parityComplete || !migration.metricComplete
+                    ? 1 : 5;
+              },
             });
             rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
               drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
@@ -1076,10 +1091,9 @@ export class CollectorMaintenance {
         await executeRepairStage(stage);
       }
     };
-    // A long historical duplicate scan must advance on every admitted tick.
-    // Run one projection slice with a 25 ms active target before either order, then
-    // let the normal 75 ms rotating allowance serve the remaining stages.
-    if (scanPending && !this.signal?.aborted && budget.canStart(5)) {
+    // Every pending projection migration gets one slice per admitted tick.
+    // The other stages retain the 75 ms rotating allowance after that slice.
+    if (migrationPending && !this.signal?.aborted && budget.canStart(5)) {
       await executeRepairStage("projection");
       priorityProjectionRan = true;
     }
@@ -1480,6 +1494,7 @@ export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
 // 250-row repair batch. Keep upgrade parity within an hour without extending
 // any individual writer transaction.
 export const AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS = 250;
+export const AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS = 1_000;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS = 1_000;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS = 5_000;
 const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
@@ -1487,7 +1502,8 @@ const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
 export type AutomaticMaintenanceCadenceStatus = {
   accepting: boolean;
   inFlight: boolean;
-  retryClass: "boot" | "startup" | "repair" | "duplicate_scan" | "capture" | "storage_busy" | "circuit" | "normal" | null;
+  retryClass: "boot" | "startup" | "repair" | "duplicate_scan" | "projection_migration" |
+    "capture" | "storage_busy" | "circuit" | "normal" | null;
   nextRetryAt: string | null;
   startupIntervalMs: number;
   normalIntervalMs: number;
@@ -1533,7 +1549,8 @@ export class AutomaticMaintenanceCadence<
       normalIntervalMs?: number;
       activeBudgetMs?: number;
       repairProgress?: () => { pending: boolean; units: number;
-        duplicateScan?: { pending: boolean; cursor: number } };
+        duplicateScan?: { pending: boolean; cursor: number };
+        projectionMigration?: { pending: boolean } };
       retryNotBefore?: () => number | null;
       onError?: (error: unknown) => void;
       timer?: AutomaticMaintenanceCadenceTimer;
@@ -1615,6 +1632,7 @@ export class AutomaticMaintenanceCadence<
     const delay = notBefore !== null && notBefore > now ? notBefore - now
       : retryClass === "normal" ? this.normalIntervalMs()
         : retryClass === "duplicate_scan" ? AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS
+        : retryClass === "projection_migration" ? AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS
         : retryClass === "storage_busy"
           ? Math.min(AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS,
             AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS *
@@ -1645,9 +1663,11 @@ export class AutomaticMaintenanceCadence<
     let discoveryAdvanced = false;
     let baselineBefore: ReturnType<typeof captureBaselineStatus>["progress"] | null = null;
     let repairBefore: { pending: boolean; units: number;
-      duplicateScan?: { pending: boolean; cursor: number } } | null = null;
+      duplicateScan?: { pending: boolean; cursor: number };
+      projectionMigration?: { pending: boolean } } | null = null;
     let repairAdvanced = false;
     let duplicateScanPending = false;
+    let projectionMigrationPending = false;
     try {
       baselineBefore = this.baselineStatus().progress;
       repairBefore = this.options.repairProgress?.() ?? null;
@@ -1666,6 +1686,8 @@ export class AutomaticMaintenanceCadence<
       // projection slice. Failed and storage-busy turns retain their existing
       // backoff. The slice stays within the 200 ms capture budget.
       duplicateScanPending = Boolean(repairAfter?.duplicateScan?.pending &&
+        results.some(result => !isMaintenancePartialOutcome(result)));
+      projectionMigrationPending = Boolean(repairAfter?.projectionMigration?.pending &&
         results.some(result => !isMaintenancePartialOutcome(result)));
       // Entries actually visited this cadence, never pending candidates the
       // capture path carried over the pending-metadata gate. A mixed turn
@@ -1693,12 +1715,14 @@ export class AutomaticMaintenanceCadence<
     } finally {
       this.inFlight = false;
       if (this.accepting) {
-        let retry: "normal" | "repair" | "duplicate_scan" | "startup" | "capture" | "storage_busy" =
+        let retry: "normal" | "repair" | "duplicate_scan" | "projection_migration" |
+          "startup" | "capture" | "storage_busy" =
           storageBusy ? "storage_busy" : "normal";
         try {
           if (!storageBusy) {
             const baselineAfter = this.baselineStatus().progress;
             if (!failed && baselineBefore) retry = duplicateScanPending ? "duplicate_scan"
+              : projectionMigrationPending ? "projection_migration"
               : repairAdvanced ? "repair"
               : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
                 : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);

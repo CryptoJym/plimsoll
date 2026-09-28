@@ -31,6 +31,7 @@ import { historyCoverageStatus } from "../packages/collector-cli/src/history-cov
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import {
   AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS,
+  AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS,
   AutomaticMaintenanceCadence,
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
@@ -562,6 +563,228 @@ function proveWholeTransactionAdmission(root: string) {
   } finally {buffer.close();}
 }
 
+function proveTimedBackfillsUseAvailableBudget(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root, "timed-backfill-budget.sqlite"));
+  try {
+    for (let i = 0; i < 128; i++) assert.equal(buffer.append(event({source:"codex"})), true);
+    settle(buffer);
+    const db = buffer.database;
+    db.exec(`update dashboard_projection_control set backfill_high_water=128,
+      backfill_cursor=0,backfill_complete=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const fact = buffer.projection.runMaintenance(NOW,{maxActiveMs:25,clock:()=>0});
+    db.exec(`update dashboard_projection_control set backfill_cursor=128,
+      backfill_complete=1 where singleton=1`);
+    db.exec(`with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<128
+    ) insert into metric_samples (id,source,metric_name,observed_at,value,created_at)
+      select 'timed-metric-'||rowid,'codex','timed-proof',
+        '${NOW.toISOString()}',0,'${NOW.toISOString()}' from sequence;
+    update dashboard_projection_control set metric_backfill_high_water=128,
+      metric_backfill_cursor=0,metric_backfill_complete=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const metric = buffer.projection.runMaintenance(NOW,{maxActiveMs:25,clock:()=>0});
+    db.exec(`update dashboard_projection_control set metric_backfill_cursor=128,
+      metric_backfill_complete=1,parity_cursor=0,parity_complete=0,
+      dirty=1,parity_ready=0,degraded_reason='projection_backfilling' where singleton=1;
+      update dashboard_parity_window set events=0,token_events=0,input_tokens=0,
+        output_tokens=0,cache_read_tokens=0,cache_creation_tokens=0,cost_nanos=0`);
+    const parity = buffer.projection.runMaintenance(NOW,{maxActiveMs:25,clock:()=>0});
+    check("timed_fact_metric_and_parity_backfills_use_more_than_one_small_batch",
+      fact.backfillRowsVisited===128 && metric.metricRowsVisited===128 &&
+      parity.parityRowsVisited===128,
+      {factRows:fact.backfillRowsVisited,metricRows:metric.metricRowsVisited,
+        parityRows:parity.parityRowsVisited});
+
+    let maxWriterHoldMs=0;
+    const slowed = (phase:"backfill"|"metric"|"parity") => {
+      let virtualMs=0;
+      const started=performance.now();
+      const receipt=buffer.projection.runMaintenance(NOW,{maxActiveMs:25,
+        clock:()=>virtualMs,
+        onWorkRowForProof:rowPhase=>{if(rowPhase===phase)virtualMs++;}});
+      maxWriterHoldMs=Math.max(maxWriterHoldMs,performance.now()-started);
+      return {receipt,virtualMs};
+    };
+    db.exec(`update dashboard_projection_control set backfill_cursor=0,
+      backfill_complete=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const slowFact=slowed("backfill");
+    db.exec(`update dashboard_projection_control set backfill_cursor=128,
+      backfill_complete=1,metric_backfill_cursor=0,metric_backfill_complete=0,
+      dirty=1,parity_ready=0,degraded_reason='projection_backfilling' where singleton=1`);
+    const slowMetric=slowed("metric");
+    db.exec(`update dashboard_projection_control set metric_backfill_cursor=128,
+      metric_backfill_complete=1,parity_cursor=0,parity_complete=0,
+      dirty=1,parity_ready=0,degraded_reason='projection_backfilling' where singleton=1;
+      update dashboard_parity_window set events=0,token_events=0,input_tokens=0,
+        output_tokens=0,cache_read_tokens=0,cache_creation_tokens=0,cost_nanos=0`);
+    const slowParity=slowed("parity");
+    check("timed_backfill_batches_recheck_deadline_after_one_bounded_unit",
+      slowFact.receipt.backfillRowsVisited===32 && slowMetric.receipt.metricRowsVisited===32 &&
+      slowParity.receipt.parityRowsVisited===32 &&
+      [slowFact,slowMetric,slowParity].every(row=>row.virtualMs===32) &&
+      maxWriterHoldMs<750,
+      {factRows:slowFact.receipt.backfillRowsVisited,
+        metricRows:slowMetric.receipt.metricRowsVisited,
+        parityRows:slowParity.receipt.parityRowsVisited,
+        virtualMs:[slowFact.virtualMs,slowMetric.virtualMs,slowParity.virtualMs],
+        maxWriterHoldMs});
+  } finally {buffer.close();}
+}
+
+async function proveMillionFactTimedUpgrade(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root,"million-fact-timed-upgrade.sqlite"));
+  const factCount = 1_000_000;
+  try {
+    const db = buffer.database;
+    // A million retained historical facts coexist with a million-row metric
+    // migration. The metrics exercise the ordinary timed backfill without
+    // making the duplicate scan or a raw-event rebuild the rate limiter.
+    db.exec(`with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<${factCount}
+    ) insert into dashboard_event_facts
+      (projection_id,raw_rowid,source,event_type,observed_at,suppressed)
+      select 'upgrade-fact-'||rowid,rowid,'codex','otel_span',
+        '${NOW.toISOString()}',1 from sequence;
+    with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<${factCount}
+    ) insert into metric_samples (id,source,metric_name,observed_at,value,created_at)
+      select 'upgrade-metric-'||rowid,'codex','upgrade-proof',
+        '${NOW.toISOString()}',0,'${NOW.toISOString()}' from sequence;
+    update codex_duplicate_fact_scan set cursor_raw_rowid=${factCount},complete=1
+      where singleton=1;
+    update dashboard_projection_control set metric_backfill_high_water=${factCount},
+      metric_backfill_cursor=0,metric_backfill_complete=0,metric_sample_count=0,
+      backfill_high_water=0,backfill_cursor=0,backfill_complete=1,
+      parity_cursor=0,parity_complete=1,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1;`);
+    let maxWriterHoldMs=0,maxMetricRowsPerSlice=0;
+    const runSlice=buffer.projection.runMaintenance.bind(buffer.projection);
+    buffer.projection.runMaintenance=(now,options)=>{
+      const started=performance.now();
+      const receipt=runSlice(now,options);
+      maxWriterHoldMs=Math.max(maxWriterHoldMs,performance.now()-started);
+      maxMetricRowsPerSlice=Math.max(maxMetricRowsPerSlice,receipt.metricRowsVisited);
+      return receipt;
+    };
+    let simulatedMinutes=0,drains=0,visited=0;
+    const first=await drainProjectionMigration(buffer.projection,
+      {maxSlices:40,maxActiveMs:2_000,cadenceSeconds:60});
+    visited+=first.drain.migrationRowsVisited;drains++;simulatedMinutes++;
+    const oldSingleStageDays=factCount/8*5/(24*60*60);
+    check("million_fact_upgrade_first_drain_uses_timed_budget_and_observed_eta",
+      first.drain.migrationRowsVisited>320 &&
+      first.drain.estimatedMinutesUpperBound===Math.ceil(
+        first.drain.remainingRowidUpperBound/first.drain.migrationRowsVisited),
+      {firstDrain:first.drain,oldSingleStageDays,maxWriterHoldMs});
+    while(!buffer.projection.status().parityReady&&drains<90){
+      const next=await drainProjectionMigration(buffer.projection,
+        {maxSlices:40,maxActiveMs:2_000,cadenceSeconds:60});
+      visited+=next.drain.migrationRowsVisited;drains++;simulatedMinutes++;
+    }
+    const final=buffer.projection.status();
+    const facts=(db.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n;
+    check("million_fact_timed_upgrade_reaches_parity_with_bounded_writer_holds",
+      facts===factCount && visited===factCount && final.parityReady && !final.dirty &&
+      maxMetricRowsPerSlice<=1_000 && maxWriterHoldMs<750 && simulatedMinutes<=60,
+      {facts,visited,drains,simulatedMinutes,maxMetricRowsPerSlice,maxWriterHoldMs,
+        parityReady:final.parityReady,dirty:final.dirty,backlog:final.backlog,
+        firstDrain:first.drain});
+
+    // Repeat on the production scheduler and repair-stage rotation. Ordinary
+    // backfill gets a priority projection slice on each migration tick; the
+    // other stages keep their rotating allowance after that slice.
+    db.exec(`update dashboard_projection_control set metric_backfill_cursor=0,
+      metric_backfill_complete=0,metric_sample_count=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const codexRoot=path.join(root,"million-timed-codex");
+    const claudeRoot=path.join(root,"million-timed-claude");
+    fs.mkdirSync(codexRoot);fs.mkdirSync(claudeRoot);
+    const maintenance=new CollectorMaintenance(buffer,
+      new RolloutTailer(buffer,codexRoot,()=>[]),
+      new TranscriptTailer(buffer,claudeRoot));
+    let syntheticNow=NOW.getTime(),repairClock=0,ticks=0;
+    let nextTimer:{at:number;callback:()=>void}|null=null;
+    let projectionEveryTick=true,maxOtherStageGap=0;
+    let observedEtaMinutes:number|null=null,observedEtaAt:number|null=null;
+    let observedCadenceSeconds:number|null=null;
+    const otherStages=["reconciliation","repricing","repo_context_suppression","learning_facts"] as const;
+    const lastProgress=Object.fromEntries(otherStages.map(stage=>[stage,0])) as
+      Record<typeof otherStages[number],number>;
+    const timer:AutomaticMaintenanceCadenceTimer={
+      now:()=>syntheticNow,
+      setTimeout:(callback,delayMs)=>{
+        nextTimer={at:syntheticNow+delayMs,callback};return nextTimer;
+      },
+      clearTimeout:()=>{nextTimer=null;},
+    };
+    const scheduler=new CoalescingMaintenanceScheduler(async()=>
+      maintenance.runRecent({clock:()=>repairClock+=40}));
+    const cadence=new AutomaticMaintenanceCadence(scheduler,
+      ()=>captureBaselineStatus(db),{timer,repairProgress:()=>{
+        const state=buffer.projection.status();
+        const scan=state.backfill.duplicateFactScan;
+        return {pending:!state.parityReady || !state.backfill.metricComplete,
+          units:automaticRepairServiceStatus(db).stages.projection.rowsVisited,
+          duplicateScan:{pending:!scan.complete,cursor:scan.cursor},
+          projectionMigration:{pending:!state.backfill.complete ||
+            !state.backfill.parityComplete || !state.backfill.metricComplete}};
+      }});
+    try {
+      cadence.start();
+      while(!buffer.projection.status().parityReady&&ticks<2_000){
+        const due=nextTimer as {at:number;callback:()=>void}|null;
+        assert.ok(due,"timed upgrade lost its scheduled tick");
+        nextTimer=null;syntheticNow=due.at;
+        const before=automaticRepairServiceStatus(db);
+        const metricPending=!buffer.projection.status().backfill.metricComplete;
+        due.callback();
+        while(cadence.status().inFlight)await new Promise<void>(resolve=>setImmediate(resolve));
+        ticks++;
+        const run=scheduler.status().lastRun;
+        if(observedEtaMinutes===null &&
+            (run?.projectionDrain?.migrationRowsVisited??0)>=1_000){
+          observedEtaMinutes=run!.projectionDrain!.estimatedMinutesUpperBound;
+          observedCadenceSeconds=run!.projectionDrain!.cadenceSeconds;
+          observedEtaAt=syntheticNow;
+        }
+        const after=automaticRepairServiceStatus(db);
+        if(metricPending&&after.stages.projection.completed!==before.stages.projection.completed+1)
+          projectionEveryTick=false;
+        for(const stage of otherStages){
+          if(after.stages[stage].completed>before.stages[stage].completed)lastProgress[stage]=ticks;
+          maxOtherStageGap=Math.max(maxOtherStageGap,ticks-lastProgress[stage]);
+        }
+      }
+      const state=buffer.projection.status();
+      const elapsedMs=syntheticNow-NOW.getTime();
+      const actualRemainingMinutes=observedEtaAt===null?null:
+        (syntheticNow-observedEtaAt)/60_000;
+      check("million_fact_timed_upgrade_uses_fast_production_scheduler_without_starving_stages",
+        state.parityReady && !state.dirty && projectionEveryTick &&
+        ticks<=1_100 && elapsedMs<=44*60_000 &&
+        maxWriterHoldMs<750 && maxOtherStageGap<=8 &&
+        observedEtaMinutes!==null && actualRemainingMinutes!==null &&
+        observedCadenceSeconds===1 &&
+        Math.abs(observedEtaMinutes-actualRemainingMinutes)<=2 &&
+        otherStages.every(stage=>automaticRepairServiceStatus(db).stages[stage].completed>=100) &&
+        cadence.status().retryClass==="normal",
+        {facts,ticks,elapsedMs,simulatedMinutes:elapsedMs/60_000,
+          projectionEveryTick,maxWriterHoldMs,maxOtherStageGap,
+          otherStageCompleted:Object.fromEntries(otherStages.map(stage=>
+            [stage,automaticRepairServiceStatus(db).stages[stage].completed])),
+          parityReady:state.parityReady,dirty:state.dirty,
+          retryClass:cadence.status().retryClass,
+          observedEtaMinutes,actualRemainingMinutes,observedCadenceSeconds,
+          migrationIntervalMs:AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS});
+    } finally {
+      cadence.stop();scheduler.stopAccepting();await scheduler.waitForIdle();
+      maintenance.close();
+    }
+  } finally {buffer.close();}
+}
+
 async function proveMillionFactScanCadence(root: string) {
   const buffer = new LocalEventBuffer(path.join(root, "million-fact-scan.sqlite"));
   const factCount = 1_000_001;
@@ -584,6 +807,18 @@ async function proveMillionFactScanCadence(root: string) {
       update codex_duplicate_fact_scan set cursor_raw_rowid=0,complete=0 where singleton=1;
       update dashboard_projection_control set parity_ready=0,dirty=1,
         degraded_reason='projection_repair_backlog' where singleton=1;`);
+    // This fixture isolates production scheduler and stage rotation. Its
+    // deterministic monotonic clock charges 10 ms per 1,000 scan rows, so a
+    // cold SQLite page fault cannot change the admitted first-tick prefix.
+    // The calibrated slow-host fixture below measures the real writer hold.
+    const runProjectionSlice=buffer.projection.runMaintenance.bind(buffer.projection);
+    let projectionClock=0;
+    buffer.projection.runMaintenance=(now,options)=>runProjectionSlice(now,{
+      ...options,clock:()=>projectionClock,
+      onWorkRowForProof:phase=>{
+        if(phase==="scan")projectionClock+=0.01;
+      },
+    });
     let ticks = 0;
     let captureTurns = 0;
     let projectionEveryTick = true;
@@ -781,8 +1016,9 @@ async function proveMillionFactDuplicateRepairCadence(root: string, slow = false
       ...options,
       ...(slow ? {
         clock: () => simulatedClock,
-        onWorkRowForProof: (phase: "scan" | "repair") => {
-          simulatedClock += phase === "scan" ? injectedScanRowMs : injectedRepairRowMs;
+        onWorkRowForProof: (phase: "scan" | "repair" | "backfill" | "metric" | "parity") => {
+          if (phase === "scan") simulatedClock += injectedScanRowMs;
+          if (phase === "repair") simulatedClock += injectedRepairRowMs;
         },
       } : {}),
       onPhaseForProof: (phase, durationMs) => { phases[phase] = durationMs; },
@@ -1140,6 +1376,12 @@ async function main() {
         detail:checks.at(-1)?.detail},null,2));
       return;
     }
+    if (process.argv.includes("--million-scan-only")) {
+      await proveMillionFactScanCadence(root);
+      console.log(JSON.stringify({status:"pass",check:checks.at(-1)?.name,
+        detail:checks.at(-1)?.detail},null,2));
+      return;
+    }
     if (process.argv.includes("--million-duplicate-slow-only")) {
       const reference = await proveMillionFactDuplicateRepairCadence(root);
       await proveMillionFactDuplicateRepairCadence(root, true, reference);
@@ -1158,10 +1400,28 @@ async function main() {
       console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
       return;
     }
+    if (process.argv.includes("--round8-small-only")) {
+      proveTimedBackfillsUseAvailableBudget(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    if (process.argv.includes("--round8-million-only")) {
+      await proveMillionFactTimedUpgrade(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    if (process.argv.includes("--round8-only")) {
+      proveTimedBackfillsUseAvailableBudget(root);
+      await proveMillionFactTimedUpgrade(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
     proveDuplicateFactRepair(root);
     await proveDuplicateScanUpgradeAndDrain(root);
     await proveScanSettlesUnderSteadyCapture(root);
     proveWholeTransactionAdmission(root);
+    proveTimedBackfillsUseAvailableBudget(root);
+    await proveMillionFactTimedUpgrade(root);
     await proveMillionFactScanCadence(root);
     proveMillionFactVersionFenceCost(root);
     const millionDuplicateReference = await proveMillionFactDuplicateRepairCadence(root);

@@ -1403,6 +1403,27 @@ async function proveProjectionDutyCycle(){
     result.drain.remainingRowidUpperBound===196_000&&result.drain.estimatedMinutesUpperBound===49&&
     result.drain.stillMigrating,
     result.drain as unknown as Record<string,unknown>);
+
+  let slowCursor=0;
+  const slow={
+    runMaintenance(){slowCursor+=8;return {backfillRowsVisited:8,parityRowsVisited:0,
+      metricRowsVisited:0,duplicateFactScanRowsVisited:0};},
+    status(){return {parityReady:false,dirty:true,backlog:{repairs:0,compactMutations:0,
+      compactGcDays:0,dirtySessions:0,accountInvalidations:0,expiryWindows:0},
+      backfill:{highWater:1_000_000,cursor:slowCursor,complete:false,
+        parityCursor:1_000_000,parityComplete:true,metricHighWater:0,metricCursor:0,
+        metricComplete:true,duplicateFactScan:{cursor:0,highWater:0,complete:true,
+          sliceRows:1_000}}};},
+  };
+  const slowEstimate=await drainProjectionMigration(
+    slow as unknown as LocalEventBuffer["projection"],
+    {maxSlices:1,maxActiveMs:5_000,cadenceSeconds:()=>5});
+  check("projection_migration_eta_uses_observed_rows_and_next_cadence",
+    slowEstimate.drain.migrationRowsVisited===8 &&
+    slowEstimate.drain.remainingRowidUpperBound===999_992 &&
+    slowEstimate.drain.cadenceSeconds===5 &&
+    slowEstimate.drain.estimatedMinutesUpperBound===10_417,
+    slowEstimate.drain as unknown as Record<string,unknown>);
 }
 
 function event(options: {
