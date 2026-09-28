@@ -95,6 +95,7 @@ import {
   inspectLaunchAgentOwnership,
   LAUNCH_AGENT_LABEL,
   LAUNCH_AGENT_SYSTEM_PATHS,
+  launchAgentOwnedTemplatePath,
   launchAgentPlistPath,
   launchctlBootoutCommand,
   launchctlBootstrapCommand,
@@ -140,6 +141,20 @@ import {
   unsealCaptureBaselineGenerations,
   type CaptureBaselineSealResult,
 } from "./capture-baseline";
+import {
+  clearJoinRestartObligation,
+  clearJoinedRootJournal,
+  joinRestartObligationPath,
+  journalJoinedRootSeals,
+  markJoinedRootJournalCommitted,
+  readJoinRestartObligation,
+  readJoinedRootJournal,
+  restoreJoinConfigBytes,
+  rollbackJoinedRootJournal,
+  withJoinRootJournal,
+  writeJoinRestartObligation,
+  type JoinRestartObligation,
+} from "./join-setup-journal";
 import {
   captureRootBaselineFiles,
   captureRootBaselineObservations,
@@ -496,6 +511,8 @@ Config tools:
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
       --machine LABEL supplies an existing fleet label; --replace-launch-agent explicitly
       replaces a valid manifest with owner edits after naming the differing keys.
+      --add-root codex|claude_code FOLDER explicitly records a physical folder under this home
+      when discovery found it but could not verify its agent format; repeat for more folders.
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|gemini-cli|grok|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
@@ -806,16 +823,36 @@ function joinMachineLabel(config: CollectorConfig, explicit?: string): string {
   throw new Error("Existing agent folders use an unknown machine label. Run join with --machine <fleet label>; no token was redeemed.");
 }
 
-function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false): JoinRootPlan {
+function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false,
+  explicitRoots: Array<{ source: CaptureRoot["source"]; directory: string }> = []): JoinRootPlan {
   const read = readCollectorConfig();
   if (read.status === "invalid") throw new Error("Collector config is invalid. No token was redeemed.");
   const config = read.status === "valid" ? read.config : collectorConfigSchema.parse({});
   const machine = joinMachineLabel(config, machineArgument);
   const entries = discoverCaptureRoots(os.homedir(), config.captureRoots ?? [], config.port);
+  const discoveryHome = resolveDiscoveryHome(os.homedir());
+  for (const selected of explicitRoots) {
+    const directory = path.resolve(selected.directory);
+    let physicalDirectory = false;
+    try { physicalDirectory = physicalBelowHome(discoveryHome, directory) && fs.lstatSync(directory).isDirectory(); }
+    catch { /* the same explicit preflight message covers a missing folder */ }
+    if (!physicalDirectory)
+      throw new Error(`--add-root requires a physical agent folder under this home: ${selected.directory}. No token was redeemed.`);
+    const relative = path.relative(discoveryHome, directory);
+    const existing = entries.find((entry) => entry.source === selected.source && entry.directory === relative);
+    if (existing?.state === "registered") continue;
+    if (existing) {
+      existing.state = "candidate";
+      existing.reason = undefined;
+    } else {
+      entries.push({ source: selected.source, state: "candidate", directory: relative,
+        outsideHome: false, shape: "owner_selected", rootId: null });
+    }
+  }
   const candidates = entries.filter((entry) =>
     (entry.state === "candidate" || entry.state === "live_covered") && entry.directory !== null)
     .map((entry) => ({ source: entry.source,
-      directory: path.join(resolveDiscoveryHome(os.homedir()), entry.directory!) }));
+      directory: path.join(discoveryHome, entry.directory!) }));
   const proposed = [...(config.captureRoots ?? []), ...candidates.map((entry) => ({
     ...deriveCaptureRootIdentity(machine, entry.source, entry.directory), source: entry.source,
     directory: entry.directory, installationEpochId: randomUUID(),
@@ -883,7 +920,7 @@ async function acknowledgeJoinedCollector(
       const response = await postDelivery({
         url: config.uploadUrl!, body, installKey: config.installKey,
         ingestKey: config.ingestKey, signingSecret: config.uploadSigningSecret,
-        timeoutMs: Math.max(1, Math.min(config.delivery.requestTimeoutSeconds * 1000,
+        timeoutMs: Math.max(1, Math.min(5_000, config.delivery.requestTimeoutSeconds * 1000,
           Math.floor(remainingMs))),
       });
       if (response.ok && response.acknowledgement?.acceptedIds.includes(expected.itemIds[0]!))
@@ -897,7 +934,7 @@ async function acknowledgeJoinedCollector(
 
 async function restorePriorJoinedCollector(port: number, manifest: ReturnType<typeof inspectLaunchAgentManifest>) {
   if (!manifest.ok) return;
-  const deadline = performance.now() + 25_000;
+  const deadline = performance.now() + 35_000;
   let lastStatus = "not_attempted";
   while (performance.now() < deadline) {
     const before = await verifyPostBootstrapReadiness(port, { timeoutMs: 0 });
@@ -908,7 +945,7 @@ async function restorePriorJoinedCollector(port: number, manifest: ReturnType<ty
     const loaded = await loadVisibleLaunchAgent(manifest.plistPath, port, false, launchAgentMutationAuthority());
     lastStatus = loaded.status;
     if (loaded.loaded) {
-      const after = await verifyPostBootstrapReadiness(port, { timeoutMs: 15_000 });
+      const after = await verifyPostBootstrapReadiness(port, { timeoutMs: 30_000 });
       if (after.verified) return;
     }
     if (loaded.status !== "lifecycle_fence_busy") break;
@@ -919,6 +956,7 @@ async function restorePriorJoinedCollector(port: number, manifest: ReturnType<ty
 
 async function finishJoinedCollectorSetupCore(
   result: Extract<Awaited<ReturnType<typeof performJoin>>, { joined: true }>, plan: JoinRootPlan,
+  obligation: JoinRestartObligation,
 ) {
   const read = readCollectorConfig();
   if (read.status !== "valid") throw new Error("Joined collector config could not be read back.");
@@ -931,26 +969,26 @@ async function finishJoinedCollectorSetupCore(
   const unverified = entries.filter((entry) => entry.state === "found_not_recorded" && entry.directory !== null);
   console.log(`Will record ${recording.length} agent folder${recording.length === 1 ? "" : "s"}: ` +
     (recording.length ? recording.map((entry) => entry.directory).join(", ") : "none found yet") + ".");
-  if (unverified.length) console.log(`Found, not recorded: ${unverified.map((entry) => entry.directory).join(", ")}. ` +
-    "Use capture-roots add with an explicit --directory and --machine to enroll one.");
+  if (unverified.length) console.log(`Found, not verified; add with --add-root <codex|claude_code> <folder>: ` +
+    unverified.map((entry) => `${entry.directory}${entry.reason === "codex_evidence_exhausted" ? " (search exhausted)" : ""}`).join(", ") + ".");
   const priorManifest = inspectLaunchAgentManifest();
   if ((priorManifest.ok ? priorManifest.manifestDigest : null) !== plan.manifestDigest)
     throw new Error("The LaunchAgent changed after join preflight; refusing to unload it.");
-  let added: number;
-  try { added = addJoinedCaptureRoots(plan); }
-  catch (error) {
-    const current = readCollectorConfig();
-    if (current.status === "valid" &&
-        !isDeepStrictEqual(current.config.captureRoots ?? [], config.captureRoots ?? [])) {
-      const raw = JSON.parse(fs.readFileSync(current.path, "utf8")) as Record<string, unknown>;
-      const unknown = Object.fromEntries(Object.entries(raw).filter(([key]) => !(key in current.config)));
-      writeCollectorConfigTransactionally({ ...current.config, captureRoots: config.captureRoots },
-        current.path, { preserveUnknownFields: unknown });
-    }
-    throw error;
-  }
+  const added = addJoinedCaptureRoots(plan);
   const updated = readCollectorConfig();
   if (updated.status !== "valid") throw new Error("Agent folder config could not be read back.");
+  if (added !== plan.candidates.length)
+    throw new Error("Agent folder registration did not commit the complete root set.");
+  if (plan.candidates.length) {
+    const marked = withJoinRootJournal(path.join(collectorHome(), "work-ledger.sqlite"), (database) => {
+      const journal = readJoinedRootJournal(database, obligation.operationId);
+      if (!journal || journal.beforeConfigSha256 !== obligation.configBeforeSha256)
+        throw new Error("Agent folder commit has no matching durable baseline journal.");
+      markJoinedRootJournalCommitted(database, obligation.operationId);
+      return true;
+    });
+    if (!marked) throw new Error("Agent folder baseline journal could not be opened.");
+  }
   config = updated.config;
 
   const script = fs.realpathSync(process.argv[1] ?? "");
@@ -974,7 +1012,7 @@ async function finishJoinedCollectorSetupCore(
   }
   await releaseStopWindowListener(config.port, resolveCollectorHome().home);
   const load = await loadVisibleLaunchAgent(installed.plistPath, config.port, false, launchAgentMutationAuthority());
-  const readiness = await verifyPostBootstrapReadiness(config.port, { timeoutMs: 15_000 });
+  const readiness = await verifyPostBootstrapReadiness(config.port, { timeoutMs: 30_000 });
   const connectivity = await checkCollectorConnectivity(config.port,
     readLocalIngestAuth(collectorHome())?.managementRead);
   const daemonState = await readDaemonState(config.port,
@@ -997,45 +1035,101 @@ async function finishJoinedCollectorSetupCore(
     readinessVerified: true, runtimeIdentityVerified: true, syncArmed: true }, enrollment: result.enrollment };
 }
 
+async function recoverPendingJoinedCollector(): Promise<boolean> {
+  const home = collectorHome();
+  const obligation = readJoinRestartObligation(home);
+  if (!obligation) return false;
+  const ledgerPath = path.join(home, "work-ledger.sqlite");
+  const journal = withJoinRootJournal(ledgerPath, (database) =>
+    readJoinedRootJournal(database, obligation.operationId));
+  if (journal && journal.beforeConfigSha256 !== obligation.configBeforeSha256)
+    throw new Error("The pending root journal does not match the prior collector config.");
+
+  const stopForRecovery = async () => {
+    const stopped = await executeLaunchAgentUnload(obligation.port, launchAgentMutationAuthority());
+    if (!stopped.unloaded)
+      throw new Error(`Could not stop the collector safely for join recovery (${stopped.reason ?? stopped.status}).`);
+  };
+  if (journal?.state === "pending") {
+    const currentConfigDigest = createHash("sha256")
+      .update(fs.readFileSync(obligation.configPath)).digest("hex");
+    const serving = (await verifyPostBootstrapReadiness(obligation.port, { timeoutMs: 0 })).verified;
+    if (serving && currentConfigDigest === journal.afterConfigSha256) {
+      // The child can die after both commits and bootstrap but before its
+      // receipt. The new inventory is serving with its seals, so keep it.
+      withJoinRootJournal(ledgerPath, (database) =>
+        markJoinedRootJournalCommitted(database, obligation.operationId));
+    } else {
+      // An interrupted child may have published the config without starting
+      // its replacement. Stop any late starter before restoring both stores.
+      await stopForRecovery();
+      restoreJoinConfigBytes(obligation, journal.afterConfigSha256);
+      const rolledBack = withJoinRootJournal(ledgerPath, (database) => {
+        rollbackJoinedRootJournal(database, journal);
+        return true;
+      });
+      if (!rolledBack) throw new Error("The pending root seals could not be recovered.");
+    }
+  } else if (!journal) {
+    restoreJoinConfigBytes(obligation, null);
+  }
+
+  let visible = inspectLaunchAgentManifest();
+  if (obligation.priorContent && obligation.priorManifestDigest) {
+    if (!visible.ok || visible.manifestDigest !== obligation.priorManifestDigest) {
+      if (visible.ok && visible.manifestDigest !== obligation.replacementManifestDigest)
+        throw new Error("The LaunchAgent changed during recovery; refusing to overwrite owner edits.");
+      await stopForRecovery();
+      const script = fs.realpathSync(process.argv[1] ?? "");
+      const options = { repoRoot: path.dirname(script),
+        programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script) };
+      installLaunchAgent({ ...options, restoreContent: obligation.priorContent,
+        restoreOwnedTemplateContent: obligation.priorOwnedTemplateContent,
+        ...(visible.ok && visible.manifestDigest ? { expectedCurrentDigest: visible.manifestDigest } : {}),
+        mutationAuthority: launchAgentMutationAuthority() });
+      visible = inspectLaunchAgentManifest();
+    }
+    if (!visible.ok || visible.manifestDigest !== obligation.priorManifestDigest)
+      throw new Error("The prior LaunchAgent could not be restored exactly.");
+  } else if (!visible.ok) {
+    throw new Error("No LaunchAgent is available to restore the collector after join.");
+  }
+  await restorePriorJoinedCollector(obligation.port, visible);
+  clearJoinRestartObligation(home);
+  withJoinRootJournal(ledgerPath, (database) => clearJoinedRootJournal(database, obligation.operationId));
+  return true;
+}
+
 async function finishJoinedCollectorSetup(
   result: Extract<Awaited<ReturnType<typeof performJoin>>, { joined: true }>, plan: JoinRootPlan,
 ) {
   const configRead = readCollectorConfig();
   if (configRead.status !== "valid") throw new Error("Joined collector config could not be read back.");
+  if (fs.existsSync(joinRestartObligationPath(collectorHome())))
+    throw new Error("A previous collector restart obligation remains unresolved; refusing another setup.");
   const priorManifest = inspectLaunchAgentManifest();
   const priorContent = priorManifest.ok ? fs.readFileSync(priorManifest.plistPath, "utf8") : null;
-  const obligationPath = path.join(collectorHome(), "join.restart-obligation.json");
-  if (fs.existsSync(obligationPath))
-    throw new Error("A previous collector restart obligation remains unresolved; refusing another setup.");
-  fs.writeFileSync(obligationPath, `${JSON.stringify({ schema: "plimsoll.join-restart-obligation/v1",
+  const templatePath = launchAgentOwnedTemplatePath();
+  const priorOwnedTemplateContent = fs.existsSync(templatePath) ? fs.readFileSync(templatePath, "utf8") : null;
+  const script = fs.realpathSync(process.argv[1] ?? "");
+  const installOptions = { repoRoot: path.dirname(script),
+    programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script) };
+  const replacementManifestDigest = installLaunchAgent({ ...installOptions, dryRun: true }).receipt.manifestDigest;
+  const obligation = writeJoinRestartObligation(collectorHome(), {
     priorManifestDigest: priorManifest.ok ? priorManifest.manifestDigest : null,
-    priorContent, port: configRead.config.port, createdAt: new Date().toISOString() })}\n`,
-  { flag: "wx", mode: 0o600 });
+    priorContent, priorOwnedTemplateContent, replacementManifestDigest,
+    port: configRead.config.port, configPath: configRead.path,
+    configBeforeRoots: fs.readFileSync(configRead.path, "utf8"),
+  });
   try {
-    const finished = await finishJoinedCollectorSetupCore(result, plan);
-    fs.rmSync(obligationPath);
+    const finished = await finishJoinedCollectorSetupCore(result, plan, obligation);
+    clearJoinRestartObligation(collectorHome());
+    withJoinRootJournal(path.join(collectorHome(), "work-ledger.sqlite"), (database) =>
+      clearJoinedRootJournal(database, obligation.operationId));
     return finished;
   } catch (error) {
-    if (!priorManifest.ok || !priorContent) {
-      fs.rmSync(obligationPath, { force: true });
-      throw error;
-    }
-    try {
-      const current = inspectLaunchAgentManifest();
-      if (!current.ok) throw new Error("The previous LaunchAgent manifest is missing.");
-      if (current.manifestDigest !== priorManifest.manifestDigest) {
-        const script = fs.realpathSync(process.argv[1] ?? "");
-        const options = { repoRoot: path.dirname(script),
-          programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script) };
-        const desiredDigest = installLaunchAgent({ ...options, dryRun: true }).receipt.manifestDigest;
-        if (current.manifestDigest !== desiredDigest)
-          throw new Error("The replacement LaunchAgent changed unexpectedly; recovery will not overwrite it.");
-        installLaunchAgent({ ...options, restoreContent: priorContent,
-          expectedCurrentDigest: desiredDigest, mutationAuthority: launchAgentMutationAuthority() });
-      }
-      await restorePriorJoinedCollector(configRead.config.port, priorManifest);
-      fs.rmSync(obligationPath, { force: true });
-    } catch (recovery) {
+    try { await recoverPendingJoinedCollector(); }
+    catch (recovery) {
       throw new Error(`${error instanceof Error ? error.message : String(error)} ` +
         `Recovery also failed: ${recovery instanceof Error ? recovery.message : String(recovery)}`);
     }
@@ -2666,9 +2760,24 @@ async function main() {
     const machineArgument = machineIndex >= 0 ? rawJoinArguments[machineIndex + 1] : undefined;
     if (machineIndex >= 0 && (!machineArgument || machineArgument.startsWith("--")))
       throw new Error("join --machine requires a fleet label.");
+    const explicitRoots: Array<{ source: CaptureRoot["source"]; directory: string }> = [];
+    const explicitIndices = new Set<number>();
+    for (let index = 0; index < rawJoinArguments.length; index += 1) {
+      if (rawJoinArguments[index] !== "--add-root") continue;
+      const source = rawJoinArguments[index + 1];
+      const directory = rawJoinArguments[index + 2];
+      if ((source !== "codex" && source !== "claude_code") || !directory || directory.startsWith("--"))
+        throw new Error("join --add-root requires <codex|claude_code> <folder>.");
+      explicitRoots.push({ source, directory });
+      explicitIndices.add(index);
+      explicitIndices.add(index + 1);
+      explicitIndices.add(index + 2);
+      index += 2;
+    }
     const joinArguments = rawJoinArguments.filter((argument, index) =>
       argument !== "--reassign" && argument !== "--no-daemon" &&
       argument !== "--replace-launch-agent" &&
+      !explicitIndices.has(index) &&
       (machineIndex < 0 || index !== machineIndex && index !== machineIndex + 1));
     const targetArgument = joinArguments[0];
     const resume = targetArgument === "--resume";
@@ -2728,12 +2837,25 @@ async function main() {
       index += 1;
     }
 
+    // A killed join parent cannot run its catch block. A later join command
+    // must discharge the durable restart obligation before touching a token.
+    try {
+      if (await recoverPendingJoinedCollector())
+        console.log("Recovered the previous collector and verified its health before retrying join.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Collector restart recovery failed.";
+      console.error(message);
+      console.log(JSON.stringify({ status: "join_recovery_failed", message, configTouched: false }, null, 2));
+      process.exitCode = 1;
+      return;
+    }
+
     if (!resume && !tokenFromPrompt && !tokenFromStdin && !tokenFromFd)
       console.error("Warning: a positional join token can appear in shell history and process lists. Use --token-prompt.");
     const skip = joinOnlyReason(noDaemon);
     let setupPlan: JoinRootPlan | null = null;
     if (!skip) {
-      try { setupPlan = preflightJoinSetup(machineArgument, replaceLaunchAgent); }
+      try { setupPlan = preflightJoinSetup(machineArgument, replaceLaunchAgent, explicitRoots); }
       catch (error) {
         const message = error instanceof Error ? error.message : "Setup preflight failed.";
         console.error(message);
@@ -6059,6 +6181,16 @@ async function main() {
         ambiguousEntries: preexisting[index]!.ambiguous.length,
       })),
     };
+    let joinObligation: JoinRestartObligation | null = null;
+    if (flag("--join-setup-child")) {
+      try { joinObligation = readJoinRestartObligation(collectorHome()); }
+      catch { refuse("join_restart_obligation_invalid"); return; }
+      if (!joinObligation || joinObligation.configPath !== configPath ||
+          joinObligation.configBeforeSha256 !== plan.beforeSha256) {
+        refuse("join_restart_obligation_mismatch");
+        return;
+      }
+    }
     if (flag("--dry-run")) {
       console.log(JSON.stringify({ status: "capture_roots_add_plan", applied: false, ...plan }, null, 2));
       return;
@@ -6176,7 +6308,7 @@ async function main() {
           .map((row) => [row.source, { status: row.status, startedAt: row.latestRun?.startedAt ?? null }]),
       );
       const before = statusFor();
-      const seals: CaptureBaselineSealResult[] = baselineSources.map((baselineSource) =>
+      const sealAll = (): CaptureBaselineSealResult[] => baselineSources.map((baselineSource) =>
         sealCaptureBaselineGenerations(
           buffer!.database,
           baselineSource,
@@ -6185,6 +6317,10 @@ async function main() {
             .flatMap((entry) => entry.observations),
           appendedAt,
         ));
+      const seals = joinObligation
+        ? journalJoinedRootSeals(buffer.database, joinObligation.operationId,
+          plan.beforeSha256, plan.afterSha256, sealAll)
+        : sealAll();
       // Exactly what this run inserted, keyed as the ledger keys it, so the
       // failure path below can remove those rows and only those rows.
       sealedThisRun = seals
@@ -6287,6 +6423,7 @@ async function main() {
 
     if (restart.attempted) {
       const load = await loadVisibleLaunchAgent(manifest.plistPath, config.port, false, authority);
+      const readiness = await verifyPostBootstrapReadiness(config.port, { timeoutMs: 30_000 });
       const connectivity = await checkCollectorConnectivity(
         config.port,
         readLocalIngestAuth(collectorHome())?.managementRead,
@@ -6308,10 +6445,10 @@ async function main() {
       // a note in a receipt an operator may never read.
       const failedStep = launchAgentLoadFailed(load)
         ? "load"
-        : !(daemon.reachable && daemon.processLive && daemon.runtimeIdentityMatches)
+        : !(readiness.verified && daemon.reachable && daemon.processLive && daemon.runtimeIdentityMatches)
           ? "daemon_verification"
           : null;
-      restart = { ...restart, load, daemon, verified: failedStep === null, failedStep };
+      restart = { ...restart, load, readiness, daemon, verified: failedStep === null, failedStep };
     }
 
     const restartFailed = restart.attempted === true && restart.verified !== true;

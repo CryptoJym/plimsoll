@@ -54,6 +54,8 @@ export type LaunchAgentOptions = {
   mutationAuthority?: LifecycleMutationAuthority;
   /** Recovery only: exact previously validated manifest bytes. */
   restoreContent?: string;
+  /** Recovery only: preserve the prior owned preimage (null means a legacy install). */
+  restoreOwnedTemplateContent?: string | null;
   expectedCurrentDigest?: string;
 };
 
@@ -987,7 +989,7 @@ function readOwnedTemplate(homeDir: string): string | null {
   } finally { fs.closeSync(descriptor); }
 }
 
-function writeOwnedTemplate(homeDir: string, source: Buffer) {
+function publishOwnedTemplate(homeDir: string, content: string | null) {
   const file = launchAgentOwnedTemplatePath(homeDir);
   const existing = (() => {
     try { return fs.lstatSync(file); }
@@ -998,17 +1000,38 @@ function writeOwnedTemplate(homeDir: string, source: Buffer) {
   })();
   if (existing && (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1 ||
       permissionMode(existing.mode) !== MANIFEST_MODE)) fail("OWNED_TEMPLATE_INVALID");
+  if (content === null) {
+    if (existing) {
+      fs.unlinkSync(file);
+      fsyncDirectory(path.dirname(file));
+    }
+    return;
+  }
+  try {
+    const value = JSON.parse(content) as Record<string, unknown>;
+    if (value.schema !== "plimsoll.launch-agent-owned-template/v1" ||
+        typeof value.manifest !== "string" || digest(value.manifest) !== value.manifestDigest)
+      fail("OWNED_TEMPLATE_INVALID");
+    validateOwnedManifest(value.manifest);
+  } catch (error) {
+    if (error instanceof LaunchAgentTransactionError) throw error;
+    fail("OWNED_TEMPLATE_INVALID");
+  }
   const prepared = `${file}.prepared-${randomUUID()}`;
   const descriptor = fs.openSync(prepared, "wx", MANIFEST_MODE);
   try {
-    fs.writeFileSync(descriptor, `${JSON.stringify({ schema: "plimsoll.launch-agent-owned-template/v1",
-      manifestDigest: digest(source), manifest: source.toString("utf8") })}\n`);
+    fs.writeFileSync(descriptor, content);
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
   try {
     fs.renameSync(prepared, file);
     fsyncDirectory(path.dirname(file));
   } finally { fs.rmSync(prepared, { force: true }); }
+}
+
+function writeOwnedTemplate(homeDir: string, source: Buffer) {
+  publishOwnedTemplate(homeDir, `${JSON.stringify({ schema: "plimsoll.launch-agent-owned-template/v1",
+    manifestDigest: digest(source), manifest: source.toString("utf8") })}\n`);
 }
 
 export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInstallResult {
@@ -1161,7 +1184,12 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
         assertVisibleContent(snapshot, visible.leaf, desired);
       }
       published = undefined;
-      writeOwnedTemplate(homeDir, desired);
+      if (Object.hasOwn(options, "restoreOwnedTemplateContent")) {
+        if (options.restoreContent === undefined) fail("RECOVERY_TEMPLATE_WITHOUT_MANIFEST");
+        publishOwnedTemplate(homeDir, options.restoreOwnedTemplateContent ?? null);
+      } else {
+        writeOwnedTemplate(homeDir, desired);
+      }
       return {
         plistPath,
         receipt: installReceipt("installed", digest(desired), rollback, initial),

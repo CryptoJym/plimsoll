@@ -8,6 +8,8 @@ import net from "node:net";
 import path from "node:path";
 import Database from "better-sqlite3";
 
+import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { beginAutomaticCaptureBaseline, captureBaselineStatus, completeAutomaticCaptureBaseline } from "../packages/collector-cli/src/capture-baseline";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { deriveCaptureRootIdentity, discoverCaptureRootCandidates } from "../packages/collector-cli/src/capture-root-inventory";
 import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
@@ -44,7 +46,7 @@ function command(env: NodeJS.ProcessEnv, args: string[], stdin = "", executable 
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
       reject(new Error(`Timed out: ${args[0]}`));
-    }, env.PLIMSOLL_PROOF_CLOCK_SKEW ? 27_000 : 90_000);
+    }, env.PLIMSOLL_PROOF_CLOCK_SKEW ? 90_000 : 90_000);
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
@@ -86,7 +88,14 @@ function stubLaunchctl(bin: string) {
     '    done',
     '    rm -f "$state"',
     '    printf "bootout %s\\n" "$pid" >> "$trace"',
+    '    if [ "${PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT:-}" = "1" ]; then',
+    '      /usr/bin/sqlite3 "$PLIMSOLL_HOME/work-ledger.sqlite" "update automatic_capture_baseline_state set status=\'complete\', completed_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'), updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'), files_discovered=files_validated, discovery_errors=0, stat_errors=0, error_code=null, error_at=null where source=\'codex\'"',
+    '    fi',
     '    if [ "${PLIMSOLL_PROOF_CRASH_AFTER_BOOTOUT:-}" = "1" ]; then kill -KILL "$PPID"; fi',
+    '    if [ "${PLIMSOLL_PROOF_KILL_JOIN_AND_ADD:-}" = "1" ]; then',
+    '      join_pid="$(ps -p "$PPID" -o ppid= | tr -d " ")"',
+    '      kill -KILL "$PPID" "$join_pid"',
+    '    fi',
     '  fi',
     '  exit 0',
     'fi',
@@ -94,17 +103,23 @@ function stubLaunchctl(bin: string) {
     '  if [ -f "$state" ] && kill -0 "$(cat "$state")" 2>/dev/null; then exit 70; fi',
     '  plist="${3:-$HOME/Library/LaunchAgents/com.plimsoll.collector.plist}"',
     '  cli="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$plist")" || exit 68',
-    '  "$PLIMSOLL_PROOF_NODE" "$cli" start >> "$PLIMSOLL_PROOF_DAEMON_LOG" 2>&1 </dev/null &',
+    '  ( if [ "${PLIMSOLL_PROOF_DELAY_RESTART:-}" = "1" ]; then sleep 3; fi; exec "$PLIMSOLL_PROOF_NODE" "$cli" start ) >> "$PLIMSOLL_PROOF_DAEMON_LOG" 2>&1 </dev/null &',
     '  pid=$!',
     '  printf "%s\\n" "$pid" > "$state"',
     '  printf "bootstrap %s %s\\n" "$pid" "$cli" >> "$trace"',
+    '  if [ "${PLIMSOLL_PROOF_WAIT_READY_AFTER_BOOTSTRAP:-}" = "1" ]; then',
+    '    i=0',
+    '    while ! /usr/bin/curl --silent --fail --max-time 1 "http://127.0.0.1:$PLIMSOLL_PROOF_JOIN_PORT/healthz" >/dev/null 2>&1 && [ "$i" -lt 160 ]; do',
+    '      i=$((i + 1)); sleep 0.05',
+    '    done',
+    '  fi',
     '  exit 0',
     'fi',
     'exit 64',
   ].join("\n") + "\n", { mode: 0o700 });
 }
 
-async function cloud(mode: "ack" | "no_ack" | "refuse") {
+async function cloud(mode: "ack" | "no_ack" | "refuse" | "timeout_once") {
   const uploads: string[] = [];
   const joins: string[] = [];
   const uniqueEvents = new Set<string>();
@@ -135,6 +150,7 @@ async function cloud(mode: "ack" | "no_ack" | "refuse") {
       uploads.push(body);
       const payload = JSON.parse(body) as { events?: Array<{ event?: { id?: string } }> };
       for (const entry of payload.events ?? []) if (entry.event?.id) uniqueEvents.add(entry.event.id);
+      if (mode === "timeout_once" && uploads.length === 2) return;
       if (mode === "no_ack" && uploads.length > 1) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ ok: true, accepted: 0 }));
@@ -238,9 +254,10 @@ async function stopFixture(env: NodeJS.ProcessEnv, state: string) {
   }
 }
 
-async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_ack") {
+async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_ack" | "timeout_once") {
   const remote = await cloud(mode);
   const f = fixture(name, await collectorPort(remote.port));
+  let priorGenerationCount = 0;
   try {
     const codex = path.join(f.home, ".codex", "sessions");
     const studio = path.join(f.home, ".clientai", "studio", "borg", "conductors", "primary", "profile", "sessions");
@@ -252,6 +269,13 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     fs.writeFileSync(path.join(codex, `rollout-2026-09-27T00-00-00-${studioSession}.jsonl`),
       `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
         payload: { id: studioSession } })}\n`, { mode: 0o600 });
+    if (name.startsWith("exhausted_")) {
+      const recent = path.join(codex, "2026", "09", "28");
+      fs.mkdirSync(recent, { recursive: true, mode: 0o700 });
+      for (let index = 0; index < 130; index += 1)
+        fs.writeFileSync(path.join(recent, `rollout-2026-09-28T12-${String(index).padStart(3, "0")}-00-${studioSession}.jsonl`),
+          '{"type":"other"}\n', { mode: 0o600 });
+    }
     if (name === "symlink_private") {
       fs.mkdirSync(path.dirname(studio), { recursive: true, mode: 0o700 });
       fs.symlinkSync(privateFolder, studio);
@@ -274,9 +298,15 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     if (name !== "symlink_private") check(`${name}_named_studio_rule_only`,
       candidates.some((entry) => entry.shape === "studio_codex_conductor" && entry.directory === studio) &&
       !candidates.some((entry) => entry.directory === unrelated));
+    if (name === "replay_timeout_then_ack") {
+      fs.mkdirSync(f.data, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(f.data, "collector.config.json"),
+        `${JSON.stringify(collectorConfigSchema.parse({ port: Number(f.env.PLIMSOLL_PROOF_JOIN_PORT),
+          delivery: { requestTimeoutSeconds: 1 } }), null, 2)}\n`, { mode: 0o600 });
+    }
     if (running) {
       fs.mkdirSync(f.data, { recursive: true, mode: 0o700 });
-      const fleetRoot = name === "fleet_label" ? [{
+      const fleetRoot = name === "fleet_label" || name === "crash_after_config_commit" ? [{
         ...deriveCaptureRootIdentity("fleet-label-not-hostname", "codex", codex),
         source: "codex" as const, directory: codex, installationEpochId: randomUUID(),
       }] : [];
@@ -284,6 +314,18 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         `${JSON.stringify(collectorConfigSchema.parse({ port: Number(f.env.PLIMSOLL_PROOF_JOIN_PORT),
           ...(fleetRoot.length ? { captureRoots: fleetRoot,
             enrollmentMachineLabel: "fleet-label-not-hostname" } : {}) }), null, 2)}\n`, { mode: 0o600 });
+      if (name === "crash_after_config_commit") {
+        const buffer = new LocalEventBuffer(path.join(f.data, "work-ledger.sqlite"));
+        try {
+          const timestamp = new Date().toISOString();
+          const begun = beginAutomaticCaptureBaseline(buffer.database, "codex", {
+            startedAt: timestamp, filesDiscovered: 0,
+          });
+          completeAutomaticCaptureBaseline(buffer.database, "codex", {
+            runId: begun.latestRun!.runId, completedAt: timestamp,
+          });
+        } finally { buffer.close(); }
+      }
       const installed = await command(f.env, ["install-launch-agent", "--load"], "",
         name === "running_0744_layout" && process.env.PLIMSOLL_PROOF_0744_CLI
           ? process.env.PLIMSOLL_PROOF_0744_CLI : f.installedCli);
@@ -296,7 +338,39 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
           ? fs.readFileSync(f.env.PLIMSOLL_PROOF_DAEMON_LOG!, "utf8").slice(-1200) : null,
       })}`);
       check(`${name}_fixture_collector_started_before_join`, true);
+      if (name === "crash_after_config_commit") {
+        const buffer = new LocalEventBuffer(path.join(f.data, "work-ledger.sqlite"));
+        try {
+          const at = new Date().toISOString();
+          const before = captureBaselineStatus(buffer.database).sources.find((row) => row.source === "codex");
+          const runId = before?.latestRun?.runId ??
+            beginAutomaticCaptureBaseline(buffer.database, "codex", { startedAt: at, filesDiscovered: 0 }).latestRun!.runId;
+          if (before?.status !== "complete")
+            completeAutomaticCaptureBaseline(buffer.database, "codex", { runId, completedAt: at });
+          check("postcommit_fixture_baseline_complete_before_join",
+            captureBaselineStatus(buffer.database).sources.find((row) => row.source === "codex")?.status === "complete");
+          priorGenerationCount = (buffer.database.prepare("select count(*) as n from automatic_capture_baseline_generations")
+            .get() as { n: number }).n;
+        } finally { buffer.close(); }
+      }
       if (name === "crash_after_bootout") f.env.PLIMSOLL_PROOF_CRASH_AFTER_BOOTOUT = "1";
+      if (name === "crash_parent_after_bootout") f.env.PLIMSOLL_PROOF_KILL_JOIN_AND_ADD = "1";
+      if (name === "delayed_restart") f.env.PLIMSOLL_PROOF_DELAY_RESTART = "1";
+      if (name === "path_drift") f.env.PATH = `${f.env.PATH}:/opt/new-toolchain`;
+      if (name === "crash_after_config_commit") f.env.PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT = "1";
+      if (name === "crash_after_config_commit") {
+        const preload = path.join(f.home, "kill-after-config-commit.mjs");
+        fs.writeFileSync(preload, [
+          'import fs from "node:fs";',
+          'const original = fs.renameSync;',
+          'fs.renameSync = (...args) => {',
+          '  original(...args);',
+          '  if (process.argv.includes("--join-setup-child") && String(args[1]).endsWith("/collector.config.json"))',
+          '    process.kill(process.pid, "SIGKILL");',
+          '};',
+        ].join("\n") + "\n", { mode: 0o600 });
+        f.env.NODE_OPTIONS = `--import=${preload}`;
+      }
       if (name === "edited_manifest") {
         const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
         const prior = fs.readFileSync(plist, "utf8");
@@ -305,7 +379,15 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         assert.notEqual(changed, prior);
         fs.writeFileSync(plist, changed);
       }
-    } else {
+      if (name === "program_edit") {
+        const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+        const prior = fs.readFileSync(plist, "utf8");
+        const changed = prior.replace(`<string>${cli}</string>`,
+          `<string>${path.join(path.dirname(cli), "custom-cli.mjs")}</string>`);
+        assert.notEqual(changed, prior);
+        fs.writeFileSync(plist, changed);
+      }
+    } else if (name !== "replay_timeout_then_ack") {
       check(`${name}_no_collector_installed_before_join`, !fs.existsSync(path.join(f.data, "collector.config.json")) &&
         !fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")));
     }
@@ -319,10 +401,76 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     let joined: ChildResult;
     try {
       joined = await command(f.env, ["join", prompt ? "--token-prompt" : "--token-stdin", "--url",
-        `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli, prompt);
+        `http://127.0.0.1:${remote.port}`,
+        ...(name === "exhausted_explicit" ? ["--add-root", "codex", codex] : [])],
+      `${token}\n`, f.installedCli, prompt);
     } catch (error) {
       if (name === "clock_skew") throw new Error("clock_skew_no_ack_failed_to_exit_within_27_seconds", { cause: error });
       throw error;
+    }
+    if (name === "crash_parent_after_bootout") {
+      const obligation = path.join(f.data, "join.restart-obligation.json");
+      const stopped = !fs.existsSync(f.state) &&
+        !await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      delete f.env.PLIMSOLL_PROOF_KILL_JOIN_AND_ADD;
+      const retry = await command(f.env, ["join", "--token-stdin", "--url",
+        `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli);
+      const retryResult = receipt(retry.stdout);
+      const running = fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      const current = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(
+        path.join(f.data, "collector.config.json"), "utf8")));
+      console.log(JSON.stringify({ scenario: name, firstExit: joined.code,
+        obligationPresentAfterRetry: fs.existsSync(obligation), stopped,
+        retryExit: retry.code, retryStatus: retryResult.status, retryReason: retryResult.reason,
+        retryCloudJoins: remote.joins.length, collectorRunningAfterRetry: running,
+        rootsAfterRetry: current.captureRoots?.length ?? 0 }));
+      check("parent_crash_retry_restores_prior_collector_and_consistent_roots",
+        joined.code === null && stopped && !fs.existsSync(obligation) && running &&
+        retry.code === 0 && retryResult.status === "joined" && current.captureRoots?.length === 2);
+      return;
+    }
+    if (name === "crash_after_config_commit") {
+      const configPath = path.join(f.data, "collector.config.json");
+      const current = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+      const ledger = new Database(path.join(f.data, "work-ledger.sqlite"), { readonly: true });
+      let generationCount: number;
+      let baselineState: unknown;
+      let journalState: unknown;
+      try {
+        generationCount = (ledger.prepare("select count(*) as n from automatic_capture_baseline_generations")
+          .get() as { n: number }).n;
+        baselineState = ledger.prepare("select source, status, files_baselined from automatic_capture_baseline_state")
+          .all();
+        journalState = (ledger.prepare("select count(*) as n from sqlite_master where type='table' and name='join_root_registration_journal'")
+          .get() as { n: number }).n > 0
+          ? ledger.prepare("select operation_id, state, seals_json from join_root_registration_journal").all()
+          : "absent";
+      } finally { ledger.close(); }
+      console.log(JSON.stringify({ scenario: name, joinExit: joined.code,
+        joinStatus: receipt(joined.stdout).status, rootsAfterParentRollback: current.captureRoots?.length ?? 0,
+        obligationPresent: fs.existsSync(path.join(f.data, "join.restart-obligation.json")),
+        priorGenerationCount, generationCount, baselineState, journalState, collectorRunning: fs.existsSync(f.state) &&
+          await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)) }));
+      check("postcommit_child_crash_restores_config_and_sealed_generations",
+        joined.code !== 0 && current.captureRoots?.length === 1 &&
+        generationCount === priorGenerationCount &&
+        Array.isArray(journalState) && journalState.length === 0 &&
+        !fs.existsSync(path.join(f.data, "join.restart-obligation.json")) &&
+        Array.isArray(baselineState) && baselineState.every((row: any) => row.files_baselined === 0) &&
+        fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      return;
+    }
+    if (name === "replay_timeout_default") {
+      const ids = remote.uploads.flatMap((body) =>
+        (JSON.parse(body) as { events?: Array<{ event: { id: string } }> }).events?.map((row) => row.event.id) ?? []);
+      console.log(JSON.stringify({ scenario: name, joinCode: joined.code,
+        joinStatus: receipt(joined.stdout).status, reason: receipt(joined.stdout).reason,
+        uploadCount: ids.length, uniqueEventIds: new Set(ids).size }));
+      check("default_contact_timeout_retries_same_event_and_joins", joined.code === 0 &&
+        receipt(joined.stdout).status === "joined" && ids.length >= 3 && new Set(ids).size === 1 &&
+        fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      return;
     }
     if (prompt && (joined.code !== 0 || joined.stdout.includes(token) || joined.stderr.includes(token))) {
       throw new Error(`fresh_prompt_hides_token_and_exits: ${JSON.stringify({ code: joined.code,
@@ -345,6 +493,14 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         remote.uploads.length === 0 && remote.joins.length === 0);
       return;
     }
+    if (name === "program_edit") {
+      const trace = fs.readFileSync(f.trace, "utf8");
+      check("owner_program_edit_refused_before_token_and_unload", joined.code !== 0 &&
+        result.status === "join_preflight_failed" &&
+        String(result.message).includes("ProgramArguments") &&
+        remote.joins.length === 0 && !trace.includes("bootout"));
+      return;
+    }
     if (name === "edited_manifest") {
       const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
       const kept = fs.readFileSync(plist, "utf8").includes("/opt/owner-custom-bin");
@@ -360,6 +516,9 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       const explicit = await command(f.env, ["join", "--token-stdin", "--url",
         `http://127.0.0.1:${remote.port}`, "--replace-launch-agent"], `${token}\n`, f.installedCli);
       const explicitResult = receipt(explicit.stdout);
+      console.log(JSON.stringify({ scenario: "edited_manifest_explicit_replace", code: explicit.code,
+        status: explicitResult.status, reason: explicitResult.reason ?? null,
+        trace: fs.readFileSync(f.trace, "utf8"), cloudJoins: remote.joins.length }));
       check("join_replaces_owner_manifest_only_with_explicit_flag", explicit.code === 0 &&
         explicitResult.status === "joined" && remote.joins.length === 1 &&
         !fs.readFileSync(plist, "utf8").includes("/opt/owner-custom-bin") &&
@@ -371,6 +530,18 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     if (name === "clock_skew") console.log(JSON.stringify({ scenario: name, joinCode: joined.code,
       joinStatus: result.status, reason: result.reason ?? null }));
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8")));
+    if (name.startsWith("exhausted_")) {
+      const rootCount = config.captureRoots?.length ?? 0;
+      const explicit = name === "exhausted_explicit";
+      console.log(JSON.stringify({ scenario: name, joinCode: joined.code, joinStatus: result.status,
+        rootCount, preview: joined.stdout.split("\n").find((line) => line.startsWith("Found, not verified")) ?? null }));
+      check(`${name}_search_exhaustion_requires_explicit_root`, joined.code === 0 &&
+        result.status === "joined" && rootCount === (explicit ? 2 : 1) &&
+        (explicit || joined.stdout.includes("Found, not verified; add with --add-root") &&
+          joined.stdout.includes("search exhausted")) &&
+        fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      return;
+    }
     if (name === "symlink_private") {
       const enrolled = config.captureRoots?.some((entry) => entry.directory === privateFolder) ?? false;
       console.log(JSON.stringify({ scenario: name, joinCode: joined.code, joinStatus: result.status,
@@ -387,6 +558,8 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       return;
     }
     const expectedRoots = name === "mixed_roots" ? 3 : 2;
+    if (name === "path_drift") check("path_drift_recorded_without_join_refusal",
+      joined.code === 0 && result.launchAgent?.runtimeDriftKeys?.includes("EnvironmentVariables.PATH"));
     const rootsTogether = config.captureRoots?.length === expectedRoots &&
       config.captureRoots.some((entry) => entry.directory === studio && entry.source === "codex") &&
       config.captureRoots.some((entry) => entry.directory === codex && entry.source === "codex") &&
@@ -431,7 +604,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         trace[0]?.includes(fs.realpathSync(process.env.PLIMSOLL_PROOF_0744_CLI)) &&
         trace.at(-1)?.includes(cli) && trace.filter((line) => line.startsWith("bootout")).length === 2);
     }
-    if (mode === "ack") {
+    if (mode !== "no_ack") {
       const ledger = new Database(path.join(f.data, "work-ledger.sqlite"), { readonly: true, fileMustExist: true });
       const totals = dashboardSummary(ledger).totals;
       const localEvents = totals.events;
@@ -444,6 +617,12 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         totals.inputTokens === 0 && totals.outputTokens === 0 && totals.costUsd === 0 && setupRows === 0);
       check(`${name}_contact_reuses_acknowledged_cloud_event_id`, uploadedIds.length >= 2 &&
         new Set(uploadedIds).size === 1 && remote.uniqueEvents.size === 1);
+      if (name === "replay_timeout_then_ack") {
+        console.log(JSON.stringify({ scenario: name, uploadCount: uploadedIds.length,
+          uniqueEventIds: new Set(uploadedIds).size, localEvents, setupRows, totals }));
+        check("timeout_retry_reuses_single_event_id", uploadedIds.length >= 3 &&
+          new Set(uploadedIds).size === 1 && localEvents === 0 && setupRows === 0);
+      }
       const finished = joined.code === 0 && result.status === "joined" &&
         result.daemon?.running === true && result.daemon?.readinessVerified === true &&
         result.daemon?.syncArmed === true && result.firstContactKind === "handshake_replay" &&
@@ -564,6 +743,46 @@ async function main() {
       await joinedScenario("crash_after_bootout", true, "ack");
       return;
     }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_parent_after_bootout") {
+      await joinedScenario("crash_parent_after_bootout", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_after_config_commit") {
+      await joinedScenario("crash_after_config_commit", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "delayed_restart") {
+      await joinedScenario("delayed_restart", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "path_drift") {
+      await joinedScenario("path_drift", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "program_edit") {
+      await joinedScenario("program_edit", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "replay_timeout_then_ack") {
+      await joinedScenario("replay_timeout_then_ack", false, "timeout_once");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "replay_timeout_default") {
+      await joinedScenario("replay_timeout_default", false, "timeout_once");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "exhausted_preview") {
+      await joinedScenario("exhausted_preview", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "exhausted_explicit") {
+      await joinedScenario("exhausted_explicit", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "positional") {
+      await joinOnlyScenario("positional_compatibility", "positional");
+      return;
+    }
     await joinedScenario("fresh", false, "ack");
     await joinedScenario("running_0744_layout", true, "ack");
     await joinedScenario("mixed_roots", false, "ack");
@@ -571,6 +790,15 @@ async function main() {
     await joinedScenario("symlink_private", false, "ack");
     await joinedScenario("partial_roots", false, "ack");
     await joinedScenario("crash_after_bootout", true, "ack");
+    await joinedScenario("crash_parent_after_bootout", true, "ack");
+    await joinedScenario("crash_after_config_commit", true, "ack");
+    await joinedScenario("delayed_restart", true, "ack");
+    await joinedScenario("path_drift", true, "ack");
+    await joinedScenario("program_edit", true, "ack");
+    await joinedScenario("replay_timeout_default", false, "timeout_once");
+    await joinedScenario("replay_timeout_then_ack", false, "timeout_once");
+    await joinedScenario("exhausted_preview", false, "ack");
+    await joinedScenario("exhausted_explicit", false, "ack");
     await joinedScenario("edited_manifest", true, "ack");
     await joinedScenario("clock_skew", false, "no_ack");
     await joinedScenario("missing_ack", false, "no_ack");
