@@ -739,6 +739,7 @@ try {
     const now = new Date();
     const overdueRows = 110_000;
     const uuidId = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    const unlinkedOutboxId = uuidId(overdueRows - 4);
     const acknowledgedId = uuidId(overdueRows - 2);
     const locallyRejectedId = uuidId(overdueRows - 1);
     const expectedHeld = overdueRows - 2;
@@ -754,12 +755,20 @@ try {
     })();
     assert.equal(ensureUuidEventId(acknowledgedId).id, acknowledgedId);
     assert.equal(ensureUuidEventId(locallyRejectedId).id, locallyRejectedId);
+    assert.equal(ensureUuidEventId(unlinkedOutboxId).id, unlinkedOutboxId);
     assert.equal(ensureUuidEventId(uuidId(overdueRows - 3)).id, uuidId(overdueRows - 3));
     const legacyId = "legacy-status-ack";
     insert.run(legacyId, oldCreatedAt, oldCreatedAt);
     const at = now.toISOString();
-    db.prepare("update buffered_events set uploaded_at=? where id in (?,?)")
-      .run(at, legacyId, acknowledgedId);
+    db.prepare("update buffered_events set uploaded_at=? where id in (?,?,?)")
+      .run(at, legacyId, acknowledgedId, unlinkedOutboxId);
+    // A pre-lineage outbox can still hold an uploaded-at UUID row. The worker
+    // must recognize that literal UUID exactly as the synchronous path does.
+    db.prepare(`insert into upload_outbox
+      (delivery_id,raw_rowid,raw_id,workspace_id,device_id,base_envelope_json,
+       base_bytes,state,next_attempt_at,created_at,updated_at)
+      values (?,null,null,?,null,'{}',2,'pending',?,?,?)`).run(
+        unlinkedOutboxId, "tenant-retention-proof", oldCreatedAt, oldCreatedAt, oldCreatedAt);
     receiptForRaw(db, legacyId, ensureUuidEventId(legacyId).id,
       "acknowledged", "remote_acknowledged", "success", at);
     receiptForRaw(db, acknowledgedId, acknowledgedId,
@@ -847,7 +856,7 @@ try {
     assert.equal(recounted.lastPass.heldForUploadExact, true);
     assert.equal(recounted.states.heldForUpload, expectedHeld - 1);
     console.log(JSON.stringify({ fixture: "offline_status", overdueRows, synchronousHeld,
-      workerHeld: after.states.heldForUpload, acknowledgedId, locallyRejectedId,
+      workerHeld: after.states.heldForUpload, acknowledgedId, locallyRejectedId, unlinkedOutboxId,
       raceDiscarded: !afterRace.lastPass.heldForUploadExact, refreshMs }));
     buffer.close();
     completion.check("large_offline_status_is_bounded_and_exact_after_prune");
