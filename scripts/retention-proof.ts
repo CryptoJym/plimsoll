@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 12);
+const completion = createProofCompletion("retention", 17);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -44,6 +44,159 @@ function prune(buffer: LocalEventBuffer, maxRows: number) {
 
 async function main() {
 try {
+  const heldNow = new Date();
+  const heldStatus = (buffer: LocalEventBuffer, expected: number) => {
+    const status = buffer.retentionProgressStatus(90, heldNow);
+    assert.equal(status.lastPass.heldForUploadExact, true);
+    assert.equal(status.states.heldForUpload, expected);
+  };
+  const insertHeldRaw = (buffer: LocalEventBuffer, row: AiInteractionEvent,
+    workspaceId: string, deviceId: string | null, dataMode = "metadata") => {
+    buffer.database.prepare(`insert into buffered_events
+      (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+       workspace_id,device_id)
+      values (?, 'codex', 'assistant_response', ?, ?, ?, ?, ?, ?)`).run(
+        row.id, dataMode, oldCreatedAt, JSON.stringify(row), oldCreatedAt,
+        workspaceId, deviceId);
+  };
+
+  {
+    const buffer = new LocalEventBuffer(path.join(root, "cached-ack.sqlite"), {
+      workspaceId: "cached-ack-workspace", deviceId: "cached-ack-device",
+      delivery: { enabled: true }, enrollmentNow: () => new Date(oldCreatedAt),
+    });
+    const row = event();
+    buffer.delivery.configure({ enabled: false });
+    assert.equal(buffer.append(row), true);
+    buffer.database.prepare("update buffered_events set created_at=? where id=?")
+      .run(oldCreatedAt, row.id);
+    buffer.delivery.configure({ enabled: true });
+    assert.equal(buffer.delivery.repairRawById(row.id).enqueued, 1);
+    heldStatus(buffer, 1);
+    let refreshStatus: (() => boolean) | undefined;
+    const server = createCollectorServer(collectorConfigSchema.parse({ retentionDays: 90 }), buffer, {
+      registerStatusRefresher: (refresh) => { refreshStatus = refresh; },
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const statusUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/status`;
+    const httpHeld = async () => {
+      const response = await fetch(statusUrl);
+      assert.equal(response.status, 200);
+      const status = await response.json() as { retention?: {
+        states?: { heldForUpload?: number };
+        lastPass?: { heldForUploadExact?: boolean };
+      } };
+      return status.retention;
+    };
+    assert.equal((await httpHeld())?.states?.heldForUpload, 1);
+    const leaseAt = new Date(heldNow.getTime() + 5_000);
+    const lease = buffer.delivery.lease({ now: leaseAt });
+    assert.deepEqual(lease.items.map((item) => item.deliveryId), [row.id]);
+    assert.equal(buffer.delivery.acknowledge(lease.leaseId, [row.id], leaseAt).acknowledged, 1);
+    heldStatus(buffer, 0);
+    assert.equal(refreshStatus?.(), true);
+    const afterAck = await httpHeld();
+    assert.equal(afterAck?.lastPass?.heldForUploadExact, true);
+    assert.equal(afterAck?.states?.heldForUpload, 0);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    buffer.close();
+    completion.check("acknowledgement_invalidates_exact_held_count");
+  }
+
+  {
+    const workspaceId = "cached-local-rejection";
+    const buffer = new LocalEventBuffer(path.join(root, "cached-local-rejection.sqlite"), {
+      workspaceId, deviceId: "cached-device", delivery: { enabled: true },
+      enrollmentNow: () => new Date(oldCreatedAt),
+    });
+    const invalid = event();
+    buffer.database.prepare(`insert into buffered_events
+      (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+       workspace_id,device_id)
+      values (?, 'unsupported_source', 'assistant_response', 'metadata', ?, ?, ?, ?, ?)`).run(
+        invalid.id, oldCreatedAt,
+        JSON.stringify({ ...invalid, source: "unsupported_source", eventType: "unsupported_kind" }), oldCreatedAt,
+        workspaceId, "cached-device");
+    heldStatus(buffer, 1);
+    assert.equal(buffer.delivery.repairRawById(invalid.id).dead, 1);
+    assert.equal((buffer.database.prepare("select reason from upload_receipts where delivery_id=?")
+      .get(invalid.id) as { reason: string }).reason, "local_schema_invalid");
+    heldStatus(buffer, 0);
+    buffer.close();
+    completion.check("local_terminal_receipt_invalidates_exact_held_count");
+  }
+
+  for (const changed of ["workspace", "device"] as const) {
+    const workspaceId = `cached-${changed}-prior`;
+    const deviceId = changed === "workspace" ? `cached-${changed}-device` : null;
+    const buffer = new LocalEventBuffer(path.join(root, `cached-${changed}-binding.sqlite`), {
+      workspaceId, ...(deviceId ? { deviceId } : {}), delivery: { enabled: true },
+      enrollmentNow: () => new Date(oldCreatedAt),
+    });
+    insertHeldRaw(buffer, event(), workspaceId, deviceId);
+    heldStatus(buffer, 1);
+    if (changed === "workspace") {
+      buffer.transitionWorkspace(workspaceId, "cached-workspace-current", deviceId!);
+    } else {
+      buffer.useWorkspace(workspaceId, "cached-device-current");
+    }
+    heldStatus(buffer, 0);
+    buffer.close();
+    completion.check(`${changed}_binding_invalidates_exact_held_count`);
+  }
+
+  {
+    const workspaceId = "cached-predicate-fields";
+    const deviceId = "cached-device";
+    const buffer = new LocalEventBuffer(path.join(root, "cached-fields.sqlite"), {
+      workspaceId, deviceId, delivery: { enabled: true },
+      enrollmentNow: () => new Date(oldCreatedAt),
+    });
+    const db = buffer.database;
+    heldStatus(buffer, 0);
+    const mutateHeldRaw = (sql: string, value: string) => {
+      const row = event();
+      insertHeldRaw(buffer, row, workspaceId, deviceId);
+      heldStatus(buffer, 1);
+      db.prepare(sql).run(value, row.id);
+      heldStatus(buffer, 0);
+      db.prepare("delete from buffered_events where id=?").run(row.id);
+    };
+    mutateHeldRaw("update buffered_events set uploaded_at=? where id=?", heldNow.toISOString());
+    mutateHeldRaw("update buffered_events set privacy_disposition=? where id=?", "local_privacy_violation");
+    mutateHeldRaw("update buffered_events set usage_duplicate_reason=? where id=?", "codex_sse_event_span");
+    mutateHeldRaw("update buffered_events set data_mode=? where id=?", "evidence");
+    mutateHeldRaw("update buffered_events set workspace_id=? where id=?", "old-workspace");
+    mutateHeldRaw("update buffered_events set device_id=? where id=?", "old-device");
+    mutateHeldRaw("update buffered_events set created_at=? where id=?", heldNow.toISOString());
+    const row = event();
+    insertHeldRaw(buffer, row, workspaceId, deviceId);
+    heldStatus(buffer, 1);
+    buffer.delivery.configure({ enabled: false });
+    heldStatus(buffer, 0);
+    buffer.delivery.configure({ enabled: true });
+    heldStatus(buffer, 1);
+    db.prepare("delete from buffered_events where id=?").run(row.id);
+    heldStatus(buffer, 0);
+    const evidence = event();
+    insertHeldRaw(buffer, evidence, workspaceId, deviceId, "evidence");
+    heldStatus(buffer, 0);
+    db.prepare(`insert into upload_outbox
+      (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,workspace_id,device_id,
+       base_envelope_json,base_bytes,state,next_attempt_at,created_at,updated_at)
+      select id,rowid,id,created_at,privacy_generation,workspace_id,device_id,
+        '{}',2,'pending',created_at,created_at,created_at
+      from buffered_events where id=?`).run(evidence.id);
+    heldStatus(buffer, 1);
+    db.prepare("delete from upload_outbox where delivery_id=?").run(evidence.id);
+    heldStatus(buffer, 0);
+    buffer.close();
+    completion.check("raw_outbox_and_delivery_mode_mutations_invalidate_exact_held_count");
+  }
+
   for (const changed of ["workspace", "device"] as const) {
     const firstWorkspace = `managed-prior-${changed}`;
     const nextWorkspace = `managed-current-${changed}`;
@@ -609,8 +762,27 @@ try {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+    // A count started before a committed delivery change must not replace the
+    // cached count as exact, regardless of which snapshot the worker read.
+    let staleWorkerPublications = 0;
+    const stopRaceListener = buffer.onRetentionHoldCountChanged(() => {
+      staleWorkerPublications += 1;
+    });
+    const racingCount = originalRefresh(90, now);
+    db.prepare("update buffered_events set uploaded_at=? where id=?")
+      .run(at, uuidId(overdueRows - 3));
+    await racingCount;
+    assert.equal(staleWorkerPublications, 0, "stale worker result was published");
+    stopRaceListener();
+    const afterRace = buffer.retentionProgressStatus(90, now);
+    assert.equal(afterRace.lastPass.heldForUploadExact, false);
+    assert.equal(await originalRefresh(90, now), expectedHeld - 1);
+    const recounted = buffer.retentionProgressStatus(90, now);
+    assert.equal(recounted.lastPass.heldForUploadExact, true);
+    assert.equal(recounted.states.heldForUpload, expectedHeld - 1);
     console.log(JSON.stringify({ fixture: "offline_status", overdueRows, synchronousHeld,
-      workerHeld: after.states.heldForUpload, acknowledgedId, locallyRejectedId, refreshMs }));
+      workerHeld: after.states.heldForUpload, acknowledgedId, locallyRejectedId,
+      raceDiscarded: !afterRace.lastPass.heldForUploadExact, refreshMs }));
     buffer.close();
     completion.check("large_offline_status_is_bounded_and_exact_after_prune");
   }

@@ -230,7 +230,10 @@ export class LocalEventBuffer {
   readonly learningFacts: LearningFactStore;
   private insertEventStatement?: Database.Statement;
   private budgetAttemptedRows = 0;
-  private retentionHoldCount: { count: number; cutoffAt: string; measuredAt: number } | null = null;
+  private retentionHoldCount: {
+    count: number; cutoffAt: string; measuredAt: number;
+    revision: number; generation: number; retentionDays: number;
+  } | null = null;
   private retentionHoldTask: { worker: Worker; result: Promise<number> } | null = null;
   private retentionHoldCountDirty = false;
   private retentionHoldCountClosed = false;
@@ -585,8 +588,68 @@ export class LocalEventBuffer {
     this.delivery = new DeliveryOutbox(this.db, {
       ...(options.delivery ?? {}),
       deviceId: options.deviceId,
+      onHoldChange: () => this.invalidateRetentionHoldCount(),
     });
     markOpenStep("ledger.delivery_schema");
+    // The revision is durable so every writer, including legacy repair and
+    // direct ledger mutations, fences an in-flight read-only count worker.
+    // No historical rows are scanned or rewritten when these triggers land.
+    this.db.exec(`
+      create table if not exists retention_hold_revision (
+        singleton integer primary key check (singleton = 1),
+        revision integer not null default 0
+      );
+      insert or ignore into retention_hold_revision (singleton,revision) values (1,0);
+      create trigger if not exists trg_retention_hold_raw_insert
+      after insert on buffered_events begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_raw_delete
+      after delete on buffered_events begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_raw_update
+      after update of id,created_at,data_mode,uploaded_at,privacy_disposition,
+        usage_duplicate_reason,workspace_id,device_id on buffered_events begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_outbox_insert
+      after insert on upload_outbox begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_outbox_delete
+      after delete on upload_outbox begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_outbox_lineage
+      after update of delivery_id,raw_rowid,raw_id on upload_outbox begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_receipt_insert
+      after insert on upload_receipts begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_receipt_update
+      after update of delivery_id,terminal_state,reason on upload_receipts begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_receipt_delete
+      after delete on upload_receipts begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_binding_insert
+      after insert on collector_workspace_binding begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_binding_update
+      after update of current_workspace_id,current_device_id on collector_workspace_binding begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_binding_delete
+      after delete on collector_workspace_binding begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+    `);
     // A 0.7.40 ledger can still hold an unexpired upload lease. Remove its
     // insert fence before the daemon accepts the first intake request.
     // Other ledgers keep the lazy session-summary schema initialization.
@@ -3193,10 +3256,7 @@ export class LocalEventBuffer {
         hasMore,
       };
     }).immediate();
-    if (run.events > 0) {
-      this.retentionHoldGeneration += 1;
-      this.retentionHoldCountDirty = true;
-    }
+    if (run.events > 0) this.invalidateRetentionHoldCount();
     return {
       cutoff,
       events: run.events,
@@ -3208,6 +3268,17 @@ export class LocalEventBuffer {
     };
   }
 
+  private invalidateRetentionHoldCount() {
+    this.retentionHoldGeneration += 1;
+    this.retentionHoldCountDirty = true;
+  }
+
+  private retentionHoldRevision() {
+    return (this.db.prepare(
+      `select revision from retention_hold_revision where singleton=1`,
+    ).get() as { revision: number }).revision;
+  }
+
   /** Bound the synchronous sample; a worker supplies the exact large-ledger count. */
   retentionProgressStatus(retentionDays = 90, now = new Date()) {
     const pass = this.db.prepare(`select last_rows_visited as rowsVisited,
@@ -3217,8 +3288,12 @@ export class LocalEventBuffer {
       };
     const scan = this.db.prepare(`select value from maintenance_state where key='raw_retention_scan_v1'`).get() as {value:string}|undefined;
     const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
+    const revision = this.retentionHoldRevision();
+    const generation = this.retentionHoldGeneration;
     const cached = this.retentionHoldCount;
-    const fresh = cached && !this.retentionHoldCountDirty && Date.now() - cached.measuredAt < 60_000;
+    const fresh = cached && !this.retentionHoldCountDirty &&
+      cached.revision === revision && cached.generation === generation &&
+      cached.retentionDays === retentionDays && Date.now() - cached.measuredAt < 60_000;
     let heldForUpload: number;
     let heldForUploadExact: boolean;
     if (fresh) {
@@ -3235,12 +3310,14 @@ export class LocalEventBuffer {
          where e.created_at < ? order by e.created_at,e.id limit 513`,
       ).all(cutoffAt) as Array<{ held: number }>;
       heldForUpload = sample.reduce((count, row) => count + row.held, 0);
-      heldForUploadExact = sample.length < 513;
+      heldForUploadExact = sample.length < 513 &&
+        revision === this.retentionHoldRevision() && generation === this.retentionHoldGeneration;
       if (heldForUploadExact) {
-        this.retentionHoldCount = { count: heldForUpload, cutoffAt, measuredAt: Date.now() };
+        this.retentionHoldCount = { count: heldForUpload, cutoffAt, measuredAt: Date.now(),
+          revision, generation, retentionDays };
         this.retentionHoldCountDirty = false;
       } else {
-        if (cached) heldForUpload = cached.count;
+        if (cached?.retentionDays === retentionDays) heldForUpload = cached.count;
         if (!this.db.memory) {
           try { void this.refreshRetentionHoldCount(retentionDays, now).catch(() => undefined); }
           catch { /* retain the bounded observation for this refresh */ }
@@ -3255,7 +3332,8 @@ export class LocalEventBuffer {
         hasMore:Boolean(pass.hasMore),at:pass.at,
         heldForUploadExact,
         heldForUploadAsOfCutoff: fresh ? cached.cutoffAt :
-          heldForUploadExact ? cutoffAt : cached?.cutoffAt ?? null,
+          heldForUploadExact ? cutoffAt :
+            cached?.retentionDays === retentionDays ? cached.cutoffAt : null,
         migrationProtectedRows:scan ? Number(JSON.parse(scan.value).migrationProtectedRows ?? 0) : 0},
     };
   }
@@ -3265,20 +3343,26 @@ export class LocalEventBuffer {
     if (this.retentionHoldCountClosed) return Promise.reject(new Error("retention_hold_count_closed"));
     if (this.retentionHoldTask) return this.retentionHoldTask.result;
     const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
+    const revision = this.retentionHoldRevision();
+    const generation = this.retentionHoldGeneration;
     if (this.db.memory) {
       const count = (this.db.prepare(
         `select count(*) as n from buffered_events e indexed by idx_events_retention
          where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
       ).get(cutoffAt) as { n: number }).n;
-      this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now() };
-      this.retentionHoldCountDirty = false;
+      if (revision === this.retentionHoldRevision() && generation === this.retentionHoldGeneration) {
+        this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now(),
+          revision, generation, retentionDays };
+        this.retentionHoldCountDirty = false;
+      }
       return Promise.resolve(count);
     }
     const { worker, result } = countRetentionHoldsOffThread(this.db, cutoffAt, this.rawRetentionUploadHoldSql());
-    const generation = this.retentionHoldGeneration;
     const settled = result.then((count) => {
-      if (!this.retentionHoldCountClosed && generation === this.retentionHoldGeneration) {
-        this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now() };
+      if (!this.retentionHoldCountClosed && generation === this.retentionHoldGeneration &&
+          revision === this.retentionHoldRevision()) {
+        this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now(),
+          revision, generation, retentionDays };
         this.retentionHoldCountDirty = false;
         this.retentionHoldCountChanged?.();
       }

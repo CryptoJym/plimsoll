@@ -433,6 +433,7 @@ export class DeliveryOutbox {
    * never from the wall clock, or an injected caller clock can silently
    * disagree with these stamps and empty a claim. */
   private readonly clock: () => Date;
+  private readonly onHoldChange: (() => void) | undefined;
 
   constructor(
     private readonly db: Database.Database,
@@ -442,11 +443,13 @@ export class DeliveryOutbox {
       workspaceId?: string;
       deviceId?: string;
       now?: () => Date;
+      onHoldChange?: () => void;
     } = {},
   ) {
     this.enabled = options.enabled ?? false;
     this.limits = asLimits(options.limits);
     this.clock = options.now ?? (() => new Date());
+    this.onHoldChange = options.onHoldChange;
     this.workspaceId = options.workspaceId?.trim() || null;
     this.deviceId = options.deviceId?.trim() || null;
     this.initializeSchema();
@@ -459,7 +462,9 @@ export class DeliveryOutbox {
     workspaceId?: string;
     deviceId?: string;
   }) {
+    const enabledChanged = this.enabled !== options.enabled;
     this.enabled = options.enabled;
+    if (enabledChanged) this.onHoldChange?.();
     this.limits = asLimits(options.limits);
     if (options.workspaceId) this.setWorkspace(options.workspaceId);
     if (options.deviceId) this.setDevice(options.deviceId);
