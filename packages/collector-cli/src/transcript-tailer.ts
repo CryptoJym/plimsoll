@@ -989,7 +989,10 @@ export class TranscriptTailer {
         this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateTranscriptParserState,
       );
       const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
-      const cursor = storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity
+      // A fenced automatic generation starts at its own byte boundary with
+      // fresh parser state. Other scans retain the old cursor as reset
+      // evidence; the JSONL reader will discard it on generation change.
+      const cursor = growthStart !== null && storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity
         ? undefined : storedCursor;
       let initialOffset: number | undefined;
       if (growthStart !== null) {
