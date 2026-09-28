@@ -2,7 +2,9 @@ import path from "node:path";
 
 /** The tailer and enrollment discovery must agree on Codex rollout identity. */
 const UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const ROLLOUT_FILE_RE = /^rollout-.+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+// The tailer has always accepted both rollout-<uuid>.jsonl and
+// rollout-<timestamp>-<uuid>.jsonl. Discovery must share that identity rule.
+const ROLLOUT_FILE_RE = /^rollout-(?:.+-)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 
 export function isCodexUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_EXACT_RE.test(value);

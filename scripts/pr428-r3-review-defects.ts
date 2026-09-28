@@ -77,6 +77,18 @@ try {
     entry.shape === "studio_codex_conductor");
   check("invalid_codex_rollout_stays_out_of_auto_enrollment", candidate?.autoEnroll === false,
     { autoEnroll: candidate?.autoEnroll, reason: candidate?.reason ?? null });
+  const compactHome = path.join(root, "compact-valid-studio");
+  const compactId = "12345678-1234-4234-8234-123456789abc";
+  const compact = path.join(compactHome,
+    ".clientai/studio/borg/conductors/primary/profile/sessions/2026/09/28");
+  fs.mkdirSync(compact, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(compact, `rollout-${compactId}.jsonl`),
+    `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-28T00:00:00Z",
+      payload: { id: compactId } })}\n`);
+  const compactCandidate = discoverCaptureRootCandidates(compactHome).find((entry) =>
+    entry.shape === "studio_codex_conductor");
+  check("valid_compact_codex_rollout_remains_auto_enrollable",
+    compactCandidate?.autoEnroll === true, compactCandidate);
   }
 
   if (active("r3-4")) {
