@@ -88,6 +88,8 @@ type SummaryAccumulator = SummaryAggregate & {
 
 type SummaryState = {
   sessionId: string;
+  /** Incremented with every durable replacement, independent of ledger revision. */
+  stateGeneration: number;
   schemaVersion: number;
   highWater: number;
   checkpointId: string | null;
@@ -279,6 +281,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       (singleton, updated_at) values (1, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
     create table if not exists session_sync_summary_state (
       session_id text primary key,
+      state_generation integer not null default 0 check (state_generation >= 0),
       schema_version integer not null,
       high_water integer not null check (high_water >= 0),
       checkpoint_id text,
@@ -543,6 +546,13 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     end;
     `);
   }).immediate();
+
+  // Existing v4 states gain a constant-size conflict fence without reading
+  // buffered_events or rebuilding their summary.
+  if (!columnNames(db, "session_sync_summary_state").has("state_generation")) {
+    db.exec(`alter table session_sync_summary_state
+      add column state_generation integer not null default 0 check (state_generation >= 0)`);
+  }
 
   // The previous schema stored the global revision in each state. Preserve
   // that baseline once, then let dirty-marker triggers advance only the
@@ -1058,13 +1068,22 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
 
 function storedState(db: Database.Database, sessionId: string): StoredSummaryState | null {
   const row = db.prepare(
-    `select session_id as sessionId, schema_version as schemaVersion, high_water as highWater,
+    `select session_id as sessionId, state_generation as stateGeneration,
+       schema_version as schemaVersion, high_water as highWater,
        checkpoint_id as checkpointId, covered_until as coveredUntil, complete,
        mutation_revision as mutationRevision, mode, accumulator_json as accumulatorJson
      from session_sync_summary_state where session_id = ?`,
   ).get(sessionId) as (Omit<StoredSummaryState, "complete"> & { complete: number }) | undefined;
   if (!row) return null;
   return { ...row, complete: Boolean(row.complete), mode: row.mode } as StoredSummaryState;
+}
+
+function currentStateGeneration(db: Database.Database, sessionId: string): number | null {
+  const row = db.prepare(`select state_generation as stateGeneration
+    from session_sync_summary_state
+    where session_id = ?`)
+    .get(sessionId) as { stateGeneration: number } | undefined;
+  return row?.stateGeneration ?? null;
 }
 
 type PendingSummaryRow = {
@@ -1090,6 +1109,7 @@ function queuedSummaryHighWater(db: Database.Database, sessionId: string): numbe
 
 function validStoredState(state: StoredSummaryState, sessionId: string, until: string): boolean {
   return state.sessionId === sessionId &&
+    Number.isSafeInteger(state.stateGeneration) && state.stateGeneration >= 0 &&
     state.schemaVersion === SESSION_SUMMARY_SCHEMA_VERSION &&
     Number.isSafeInteger(state.highWater) && state.highWater >= 0 &&
     (typeof state.checkpointId === "string" || state.checkpointId === null) &&
@@ -1291,13 +1311,15 @@ function repairRowsQuery(
 }
 
 function writeState(db: Database.Database, state: SummaryState): void {
+  const nextGeneration = state.stateGeneration + 1;
   db.prepare(
     `insert into session_sync_summary_state
-       (session_id, schema_version, high_water, checkpoint_id, covered_until, complete,
+       (session_id, state_generation, schema_version, high_water, checkpoint_id, covered_until, complete,
         mutation_revision, mode, accumulator_json, updated_at)
-     values (@sessionId, @schemaVersion, @highWater, @checkpointId, @coveredUntil, @complete,
+     values (@sessionId, @stateGeneration, @schemaVersion, @highWater, @checkpointId, @coveredUntil, @complete,
        @mutationRevision, @mode, @accumulatorJson, @updatedAt)
      on conflict(session_id) do update set
+       state_generation=excluded.state_generation,
        schema_version=excluded.schema_version, high_water=excluded.high_water,
        checkpoint_id=excluded.checkpoint_id, covered_until=excluded.covered_until,
        complete=excluded.complete, mutation_revision=excluded.mutation_revision,
@@ -1305,6 +1327,7 @@ function writeState(db: Database.Database, state: SummaryState): void {
        updated_at=excluded.updated_at`,
   ).run({
     sessionId: state.sessionId,
+    stateGeneration: nextGeneration,
     schemaVersion: state.schemaVersion,
     highWater: state.highWater,
     checkpointId: state.checkpointId,
@@ -1315,6 +1338,7 @@ function writeState(db: Database.Database, state: SummaryState): void {
     accumulatorJson: JSON.stringify(state.accumulator),
     updatedAt: new Date().toISOString(),
   });
+  state.stateGeneration = nextGeneration;
   if (state.accumulator.futureCreatedAt === null) {
     db.prepare("delete from session_sync_summary_due where session_id = ?").run(state.sessionId);
   } else {
@@ -1327,6 +1351,7 @@ function writeState(db: Database.Database, state: SummaryState): void {
 function stateFromStored(stored: StoredSummaryState, accumulator: SummaryAccumulator): SummaryState {
   return {
     sessionId: stored.sessionId,
+    stateGeneration: stored.stateGeneration,
     schemaVersion: stored.schemaVersion,
     highWater: stored.highWater,
     checkpointId: stored.checkpointId,
@@ -1438,6 +1463,16 @@ export async function updateSessionSummary(
   until: string,
   options: SessionSummaryUpdateOptions,
 ): Promise<SessionSummaryUpdateResult> {
+  return updateSessionSummaryAttempt(db, sessionId, until, options, 0);
+}
+
+async function updateSessionSummaryAttempt(
+  db: Database.Database,
+  sessionId: string,
+  until: string,
+  options: SessionSummaryUpdateOptions,
+  generationRetries: number,
+): Promise<SessionSummaryUpdateResult> {
   const started = performance.now();
   const writeRetry = options.writeRetry ?? new SyncStorageRetryController({ budgetMs: 1_000 });
   const requestedRows = options.maxRows ?? SESSION_SUMMARY_DEFAULT_MAX_ROWS;
@@ -1453,6 +1488,7 @@ export async function updateSessionSummary(
   const activityAtStart = sessionActivityRevision(db, sessionId);
   const currentRevision = sessionRevision(db, sessionId);
   const stored = storedState(db, sessionId);
+  const stateGenerationAtStart = stored?.stateGeneration ?? null;
   const pending = pendingSummaryRow(db, sessionId);
   const queuedHighWaterAtStart = queuedSummaryHighWater(db, sessionId);
   const now = options.now ?? (() => new Date());
@@ -1487,6 +1523,22 @@ export async function updateSessionSummary(
         delayMs === null ? null : new Date(observedAt.getTime() + delayMs).toISOString(),
         observedAt.toISOString()));
     return { ...result, fallbackReason: reason };
+  };
+  const retryFromLatest = async (discardedRows: number): Promise<SessionSummaryUpdateResult> => {
+    const elapsedMs = performance.now() - started;
+    if (generationRetries === 0 && discardedRows < maxRows && elapsedMs < maxMs) {
+      const retry = await updateSessionSummaryAttempt(db, sessionId, until, {
+        ...options, maxRows: maxRows - discardedRows, maxMs: maxMs - elapsedMs,
+      }, 1);
+      return { ...retry, rowsRead: discardedRows + retry.rowsRead,
+        durationMs: Math.round(performance.now() - started) };
+    }
+    return finish({
+      snapshot: null, complete: false, rowsRead: discardedRows, rowsApplied: 0,
+      durationMs: Math.round(elapsedMs), highWater: stored?.highWater ?? 0,
+      mode: stored?.mode ?? "initial", fullRecompute: false,
+      fallbackReason: "state_generation_changed", mutationRevision: currentRevision,
+    });
   };
   if (pending?.nextRetryAt && samePendingInput() &&
       Date.parse(pending.nextRetryAt) > now().getTime()) {
@@ -1549,7 +1601,10 @@ export async function updateSessionSummary(
     // Freeze the old rowid range while installing the trigger-visible state.
     // Rows inserted afterward enter the append queue, even if their observed
     // time sorts behind the historical cursor.
-    state = await writeRetry.run(() => db.transaction(() => {
+    const installed = await writeRetry.run(() => db.transaction(() => {
+      // A second connection may have replaced the state while checkpoint
+      // validation ran. Never clear its repair queue or reset its prefix.
+      if (currentStateGeneration(db, sessionId) !== stateGenerationAtStart) return null;
       if (needsFallback) {
         db.prepare(
           `update session_sync_summary_control
@@ -1566,6 +1621,7 @@ export async function updateSessionSummary(
       db.prepare("delete from session_sync_summary_repairs where session_id = ?").run(sessionId);
       const fresh: SummaryState = {
         sessionId,
+        stateGeneration: stored?.stateGeneration ?? 0,
         schemaVersion: SESSION_SUMMARY_SCHEMA_VERSION,
         highWater: 0,
         checkpointId: null,
@@ -1578,6 +1634,8 @@ export async function updateSessionSummary(
       writeState(db, fresh);
       return fresh;
     }).immediate());
+    if (installed === null) return retryFromLatest(0);
+    state = installed;
   } else if (parsed) {
     state = stateFromStored(stored, parsed);
     // The repair queue is durable. A changed segment must be read before this
@@ -1773,6 +1831,12 @@ export async function updateSessionSummary(
   // A concurrent append can land before it (and is observed) or afterward
   // (and remains in the queue for the upload fence).
   const stability = await writeRetry.run(() => db.transaction(() => {
+    // The ledger revision does not change when another connection completes a
+    // repair. Fence the exact state version before clearing a queue or writing.
+    if (currentStateGeneration(db, sessionId) !== state.stateGeneration) return {
+      stateStable: false, revisionStable: false, activityStable: false,
+      noQueuedRows: false, finalComplete: false, repairsRemaining: true,
+    };
     const revisionStable = sessionRevision(db, sessionId) === state.mutationRevision;
     const activityStable = sessionActivityRevision(db, sessionId) === activityAtStart;
     const noQueuedRows = !queuedRowsAfter(db, sessionId, state.highWater, until);
@@ -1780,6 +1844,7 @@ export async function updateSessionSummary(
     // beyond the durable cursor. Retry that slice; the prior cursor remains
     // valid and the next worker read sees the edit.
     if (!activityStable) return {
+      stateStable: true,
       revisionStable, activityStable, noQueuedRows,
       finalComplete: false, repairsRemaining: true,
     };
@@ -1804,8 +1869,10 @@ export async function updateSessionSummary(
       db.prepare(`delete from session_sync_summary_rows where session_id = ? and raw_rowid <= ?`)
         .run(sessionId, state.highWater);
     }
-    return { revisionStable, activityStable, noQueuedRows, finalComplete, repairsRemaining };
+    return { stateStable: true, revisionStable, activityStable, noQueuedRows,
+      finalComplete, repairsRemaining };
   }).immediate());
+  if (!stability.stateStable) return retryFromLatest(rowsRead);
   const stable = stability.revisionStable && stability.activityStable && stability.noQueuedRows;
 
   const finalMode: SessionSummaryUpdateResult["mode"] = fullRecompute
