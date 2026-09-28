@@ -108,6 +108,7 @@ function stubLaunchctl(bin: string) {
     '  pid=$!',
     '  printf "%s\\n" "$pid" > "$state"',
     '  printf "bootstrap %s %s\\n" "$pid" "$cli" >> "$trace"',
+    '  if [ "${PLIMSOLL_PROOF_KILL_PARENT_AFTER_BOOTSTRAP:-}" = "1" ]; then kill -KILL "$PPID"; fi',
     '  if [ "${PLIMSOLL_PROOF_WAIT_READY_AFTER_BOOTSTRAP:-}" = "1" ]; then',
     '    i=0',
     '    while ! /usr/bin/curl --silent --fail --max-time 1 "http://127.0.0.1:$PLIMSOLL_PROOF_JOIN_PORT/healthz" >/dev/null 2>&1 && [ "$i" -lt 160 ]; do',
@@ -328,7 +329,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         } finally { buffer.close(); }
       }
       const installed = await command(f.env, ["install-launch-agent", "--load"], "",
-        name === "running_0744_layout" && process.env.PLIMSOLL_PROOF_0744_CLI
+        (name === "running_0744_layout" || name === "crash_manifest_link_running") && process.env.PLIMSOLL_PROOF_0744_CLI
           ? process.env.PLIMSOLL_PROOF_0744_CLI : f.installedCli);
       const started = installed.code === 0 && fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
@@ -405,6 +406,28 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       ].join("\n") + "\n", { mode: 0o600 });
       f.env.NODE_OPTIONS = `--import=${preload}`;
     }
+    if (name === "crash_after_bootstrap") f.env.PLIMSOLL_PROOF_KILL_PARENT_AFTER_BOOTSTRAP = "1";
+    if (name.startsWith("crash_manifest_link")) {
+      const preload = path.join(f.home, "crash-manifest-link.mjs");
+      fs.writeFileSync(preload, [
+        'import fs from "node:fs";',
+        'const native = fs.linkSync;',
+        'fs.linkSync = (...args) => { native(...args); if (process.argv[2] === "join" && String(args[1]).endsWith("/com.plimsoll.collector.plist")) process.kill(process.pid, "SIGKILL"); };',
+      ].join("\n") + "\n", { mode: 0o600 });
+      f.env.NODE_OPTIONS = `--import=${preload}`;
+    }
+    if (name.startsWith("crash_obligation_")) {
+      const preload = path.join(f.home, "crash-obligation.mjs");
+      const atOpen = name === "crash_obligation_open";
+      fs.writeFileSync(preload, [
+        'import fs from "node:fs";',
+        'const tracked = new Set();',
+        'const nativeOpen = fs.openSync, nativeFsync = fs.fsyncSync;',
+        'fs.openSync = (...args) => { const fd = nativeOpen(...args); if (process.argv[2] === "join" && String(args[0]).endsWith("/join.restart-obligation.json")) { tracked.add(fd); if (' + String(atOpen) + ') process.kill(process.pid, "SIGKILL"); } return fd; };',
+        'fs.fsyncSync = (fd) => { nativeFsync(fd); if (process.argv[2] === "join" && tracked.has(fd)) process.kill(process.pid, "SIGKILL"); };',
+      ].join("\n") + "\n", { mode: 0o600 });
+      f.env.NODE_OPTIONS = `--import=${preload}`;
+    }
     if (name === "clock_skew") {
       const preload = path.join(f.home, "freeze-join-clock.mjs");
       fs.writeFileSync(preload, 'if (process.argv[2] === "join") { const native = Date.now; Date.now = () => new Error().stack?.includes("acknowledgeJoinedCollector") ? 0 : native(); }\n');
@@ -421,6 +444,48 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     } catch (error) {
       if (name === "clock_skew") throw new Error("clock_skew_no_ack_failed_to_exit_within_27_seconds", { cause: error });
       throw error;
+    }
+    if (name === "crash_after_bootstrap") {
+      delete f.env.PLIMSOLL_PROOF_KILL_PARENT_AFTER_BOOTSTRAP;
+      const retry = await command(f.env, ["join", "--token-stdin", "--url",
+        `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli);
+      const retryResult = receipt(retry.stdout);
+      const running = fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      console.log(JSON.stringify({ scenario: name, firstExit: joined.code, retryExit: retry.code,
+        retryStatus: retryResult.status, retryReason: retryResult.reason, retryMessage: retryResult.message, retryCloudJoins: remote.joins.length, runningAfterRetry: running }));
+      check("post_bootstrap_parent_crash_retry_recovers", joined.code === null && retry.code === 0 &&
+        retryResult.status === "joined" && running);
+      return;
+    }
+    if (name.startsWith("crash_manifest_link")) {
+      const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+      const stats = fs.existsSync(plist) ? fs.statSync(plist) : null;
+      delete f.env.NODE_OPTIONS;
+      const retry = await command(f.env, ["join", "--token-stdin", "--url",
+        `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli);
+      const retryResult = receipt(retry.stdout);
+      const running = fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      console.log(JSON.stringify({ scenario: name, firstExit: joined.code, plistLinks: stats?.nlink ?? null,
+        retryExit: retry.code, retryStatus: retryResult.status, retryMessage: retryResult.message,
+        collectorRunningAfterRetry: running }));
+      check("manifest_publish_crash_retry_recovers_and_serves", joined.code === null && retry.code === 0 &&
+        retryResult.status === "joined" && running);
+      return;
+    }
+    if (name.startsWith("crash_obligation_")) {
+      const obligation = path.join(f.data, "join.restart-obligation.json");
+      const bytes = fs.existsSync(obligation) ? fs.statSync(obligation).size : -1;
+      delete f.env.NODE_OPTIONS;
+      const retry = await command(f.env, ["join", "--token-stdin", "--url",
+        `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli);
+      const retryResult = receipt(retry.stdout);
+      const running = fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      console.log(JSON.stringify({ scenario: name, firstExit: joined.code, obligationBytes: bytes,
+        retryExit: retry.code, retryStatus: retryResult.status, retryCloudJoins: remote.joins.length,
+        collectorRunningAfterRetry: running }));
+      check("fresh_obligation_write_crash_retry_recovers_and_serves", joined.code === null && retry.code === 0 &&
+        retryResult.status === "joined" && running);
+      return;
     }
     if (name === "crash_fresh_after_config_commit") {
       const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(
@@ -628,7 +693,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     const trace = fs.readFileSync(f.trace, "utf8").trim().split("\n");
     check(`${name}_never_bootstraps_two_live_daemons`, trace.filter((line) => line.startsWith("bootstrap")).length >= 1 &&
       trace.every((line, index) => !line.startsWith("bootstrap") || index === 0 || trace[index - 1]?.startsWith("bootout")));
-    if (name === "running_0744_layout" && process.env.PLIMSOLL_PROOF_0744_CLI && mode === "ack") {
+    if ((name === "running_0744_layout" || name === "crash_manifest_link_running") && process.env.PLIMSOLL_PROOF_0744_CLI && mode === "ack") {
       console.log(JSON.stringify({ scenario: "running_actual_0744", trace }));
       check("running_0744_daemon_is_replaced_by_head_daemon",
         trace[0]?.includes(fs.realpathSync(process.env.PLIMSOLL_PROOF_0744_CLI)) &&
@@ -783,6 +848,23 @@ async function main() {
     }
     if (process.env.PR428_REVIEW_SCENARIO === "crash_fresh_after_config_commit") {
       await joinedScenario("crash_fresh_after_config_commit", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_after_bootstrap") {
+      await joinedScenario("crash_after_bootstrap", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_manifest_link") {
+      await joinedScenario("crash_manifest_link", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_manifest_link_running") {
+      await joinedScenario("crash_manifest_link_running", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_obligation_open" ||
+        process.env.PR428_REVIEW_SCENARIO === "crash_obligation_fsync") {
+      await joinedScenario(process.env.PR428_REVIEW_SCENARIO, false, "ack");
       return;
     }
     if (process.env.PR428_REVIEW_SCENARIO === "delayed_restart") {
