@@ -51,8 +51,10 @@ async function main() {
       released = true;
       endedAtMs = Date.parse(readMaintenanceRebuildPause(home)!.endedAt!);
       assert.equal(captureSpoolState(home).pendingFiles, 0);
-      assert.equal(maintenanceRebuildPauseSeen(home), false,
-        "the old marker can clear before the client writes its retry file");
+      assert.equal(captureSpoolState(home).maintenanceRebuildPending, true,
+        "the authenticated 503 holds attestation before the client writes its retry file");
+      assert.equal(maintenanceRebuildPauseSeen(home), true,
+        "the marker stays until the durable refusal is resolved");
       await new Promise((resolve) => setTimeout(resolve, 5));
       return response;
     };
@@ -60,6 +62,8 @@ async function main() {
       auth, fetchImpl, env: { ...process.env, PLIMSOLL_HOME: home } });
     assert.ok("spooled" in forwarded && forwarded.spooled);
     const lateFile = listHookSpoolFiles(home)[0]!;
+    assert.match(lateFile.name, /^\d{13,}-\d+-[0-9a-f]{6}\.json$/,
+      "the client retry remains readable by the 0.7.44 spool reader");
     const writtenAtMs = fs.statSync(lateFile.path).mtimeMs;
     assert.ok(writtenAtMs > endedAtMs, "the client wrote its spool after endedAt");
     const pending = captureSpoolState(home);

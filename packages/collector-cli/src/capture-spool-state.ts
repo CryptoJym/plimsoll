@@ -30,9 +30,8 @@ export function captureSpoolState(home: string): CaptureSpoolState {
   const arrivals = listings.flatMap((listing) => listing ?? []);
   const refused = countMaintenanceRebuildRefusals(home);
   const unreadable = [...listings, ...logs, refused].some((value) => value === null);
-  // A client may write its retry file after the listener stamps endedAt and
-  // the empty marker is cleared. The filename's maintenance cause survives
-  // that interval and keeps the capture claim unattested until drain.
+  // Current client retries use the 0.7.44-compatible filename and a durable
+  // refusal receipt until drain. Recognize previously tagged files as well.
   const taggedPending = hookArrivals?.some((arrival) => arrival.maintenanceRebuild) ?? false;
   let maintenanceRebuildPending = taggedPending || refused === null || refused > 0;
   try {

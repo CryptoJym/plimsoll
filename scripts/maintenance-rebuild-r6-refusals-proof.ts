@@ -78,7 +78,7 @@ async function scenario(route: "otlp" | "live", terminal: "malformed" | "enrollm
     headers = { "content-type": "application/json", "x-plimsoll-producer-id": first.packet.producerId,
       "x-plimsoll-token": fs.readFileSync(enrolled.credentialFile, "utf8") };
   } else {
-    body = JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{
+    body = terminal === "malformed" ? "{invalid OTLP JSON" : JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{
       name: "handle_responses", traceId: "1".padStart(32, "0"), spanId: "1".padStart(16, "0"),
       startTimeUnixNano: String(BigInt(Date.now()) * 1_000_000n),
       attributes: [{ key: "gen_ai.usage.input_tokens", value: { intValue: "5" } }],
@@ -138,7 +138,8 @@ async function scenario(route: "otlp" | "live", terminal: "malformed" | "enrollm
         const afterTerminal = claim(buffer, home);
         assert.equal(afterTerminal?.unattested, undefined);
         assert.notEqual(afterTerminal?.through, null);
-        console.log(JSON.stringify({ check: `r7_live_${terminal}_terminal_retirement`,
+        console.log(JSON.stringify({ check: route === "live" ? `r7_live_${terminal}_terminal_retirement` :
+          `review_${route}_${terminal}_terminal_retirement`,
           paused: paused.status, rejected: rejected.status, before: before?.unattested,
           after: afterTerminal?.through }));
         return;
@@ -187,6 +188,7 @@ async function main() {
     if (selected === "all" || selected === "live") await scenario("live");
     if (selected === "terminal-live" || selected === "terminal-all") await scenario("live", "malformed");
     if (selected === "terminal-enrollment" || selected === "terminal-all") await scenario("live", "enrollment");
+    if (selected === "terminal-otlp") await scenario("otlp", "malformed");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 

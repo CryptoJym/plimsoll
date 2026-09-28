@@ -6,7 +6,7 @@ const MARKER = "maintenance-rebuild-pause.json";
 const REFUSALS = "maintenance-rebuild-refusals";
 type PauseMarker = { version: 1; at: string; pid?: number; endedAt?: string };
 
-type RefusalRoute = "otlp" | "live";
+type RefusalRoute = "hook" | "otlp" | "live";
 function refusalDirectory(home: string) { return path.join(home, REFUSALS); }
 function refusalPath(home: string, route: RefusalRoute, source: string, body: string | Buffer) {
   const digest = createHash("sha256").update(`${route}\0${source}\0`).update(body).digest("hex");

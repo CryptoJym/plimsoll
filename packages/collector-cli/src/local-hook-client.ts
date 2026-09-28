@@ -189,7 +189,7 @@ export async function forwardHookOverLoopback(
     } catch {
       return null;
     }
-    return writeHookSpoolFile({
+    const written = writeHookSpoolFile({
       home,
       source: options.source,
       body: blanked.text,
@@ -197,6 +197,9 @@ export async function forwardHookOverLoopback(
       limits: options.spoolLimits,
       ...(maintenanceRebuild ? { cause: "maintenance_rebuild" as const, nowMs: requestAtMs } : {}),
     });
+    // The receipt remains until the daemon durably admits or rejects the file.
+    // This keeps an attested claim held even if the client clock is skewed.
+    return written;
   };
 
   let response: Response;

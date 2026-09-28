@@ -102,11 +102,16 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
       // A maintenance 503 is a rejection. The client owns the retry and its
       // spool; no server capture cursor, ack or spool file may advance here.
       if (mode === "maintenance_rebuild") {
+        const budget = createRequestBudget();
+        const body = decodeBoundedRequestBody(request, await readBoundedRequestBody(request, budget));
         if (isOtlpPath(request.url)) {
-          const budget = createRequestBudget();
-          const body = decodeBoundedRequestBody(request, await readBoundedRequestBody(request, budget));
           recordMaintenanceRebuildRefusal(home, "otlp",
             `${source}:${canonicalOtlpTransportPath(request.url)}`, body.text);
+        } else {
+          // The client writes the privacy-blanked body into its compatible
+          // spool. Key both the pending receipt and later drain to that body.
+          recordMaintenanceRebuildRefusal(home, "hook", source,
+            blankForbiddenRawContent(body.text)?.text ?? body.text);
         }
         reply(response, 503, { status: "maintenance_rebuild_paused", source }, true, true);
         return;

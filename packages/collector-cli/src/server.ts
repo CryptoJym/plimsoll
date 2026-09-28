@@ -504,10 +504,21 @@ export function createHookSpoolDrain(
           read.envelope.source,
           { config, buffer, budget: createRequestBudget(), probe: read.envelope.probe },
         );
+        let removed = false;
         try {
           fs.unlinkSync(file.path);
-        } catch {
-          /* already gone; the counter still reflects the applied event */
+          removed = true;
+        } catch (error) {
+          // An absent file has already reached its final outcome. A file that
+          // remains after an unlink error keeps its attestation hold.
+          removed = (error as NodeJS.ErrnoException).code === "ENOENT";
+        }
+        if (removed) {
+          try {
+            resolveMaintenanceRebuildRefusal(options.home, "hook", read.envelope.source, read.envelope.body);
+          } catch (error) {
+            warn({ warning: "maintenance_refusal_retirement_failed", code: errorCodeOnly(error) });
+          }
         }
         result.recovered += 1;
       } catch (error) {
@@ -518,6 +529,13 @@ export function createHookSpoolDrain(
           break;
         }
         rejectHookSpoolFile(options.home, file, failure.reason);
+        if (!fs.existsSync(file.path)) {
+          try {
+            resolveMaintenanceRebuildRefusal(options.home, "hook", read.envelope.source, read.envelope.body);
+          } catch (retireError) {
+            warn({ warning: "maintenance_refusal_retirement_failed", code: errorCodeOnly(retireError) });
+          }
+        }
         result.rejected += 1;
       }
       // Yield between files: the drain shares this loop with /hooks/* and the
@@ -1306,6 +1324,13 @@ export function createCollectorServer(
     // post and the spool said no; read by this request's rejection line below.
     // One request, one handler invocation, so this cannot cross requests.
     let intakeSpoolDiagnostic: Record<string, unknown> | undefined;
+    let maintenanceRetry: { route: "hook" | "otlp"; source: string; body: string } | undefined;
+    const retireMaintenanceRetry = () => {
+      if (maintenanceRefusalHome && maintenanceRetry) {
+        resolveMaintenanceRebuildRefusal(maintenanceRefusalHome,
+          maintenanceRetry.route, maintenanceRetry.source, maintenanceRetry.body);
+      }
+    };
     try {
       assertAllowedHost(request);
       if (selectsLiveUsage(request)) {
@@ -1771,6 +1796,8 @@ export function createCollectorServer(
           request,
           await readBoundedRequestBody(request, budget),
         );
+        maintenanceRetry = { route: "hook", source,
+          body: blankForbiddenRawContent(body.text)?.text ?? body.text };
         const producerEventId = readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]);
         let normalized: Awaited<ReturnType<typeof admitHookBody>>;
         try {
@@ -1818,6 +1845,7 @@ export function createCollectorServer(
           if (!spooled?.ok) throw error;
           observeIntakeSpool(spooled.source, classifyRejectionClient(request));
           recordHookObservation(source, "202", producerEventId);
+          retireMaintenanceRetry();
           // 202 only after the file and directory flushes returned. The event
           // is private and blanked; the drain uses this same admission callable.
           response.writeHead(202, { "content-type": "application/json" });
@@ -1826,6 +1854,7 @@ export function createCollectorServer(
         }
         rejectionDiagnostics.recordAccepted(source);
         recordHookObservation(source, "202", producerEventId ?? normalized.event.id);
+        retireMaintenanceRetry();
         if (normalized.futureTimestampClampedEvents) {
           console.log(JSON.stringify({
             status: "hook_capture",
@@ -1865,6 +1894,8 @@ export function createCollectorServer(
             completeAfterDeadline: otlpSpool?.enabled === true,
           }),
         );
+        const transportPath = canonicalOtlpTransportPath(request.url);
+        maintenanceRetry = { route: "otlp", source: `${source}:${transportPath}`, body: body.text };
         const parsedEnvelope = parseBoundedJson(body.text);
         assertBoundedOtlpCardinality(parsedEnvelope, body.decodedBytes);
         if (hasLiveUsageClaim(parsedEnvelope)) throw new HttpBoundaryRejection("source_not_allowed", 403);
@@ -1872,10 +1903,8 @@ export function createCollectorServer(
           throw new HttpBoundaryRejection("source_mismatch", 401);
         }
 
-        const transportPath = canonicalOtlpTransportPath(request.url);
         const retireMaintenanceRefusal = () => {
-          if (maintenanceRefusalHome) resolveMaintenanceRebuildRefusal(maintenanceRefusalHome,
-            "otlp", `${source}:${transportPath}`, body.text);
+          retireMaintenanceRetry();
         };
         const repoLabels: Array<{ hash: string; label: string }> = [];
         const exploded = explodeOtlpPayload(parsedEnvelope, {
@@ -2042,6 +2071,11 @@ export function createCollectorServer(
       response.end(JSON.stringify({ error: "not_found" }));
     } catch (error) {
       const failure = asHttpBoundaryRejection(error);
+      // A matching, authenticated retry with a complete body can be terminal
+      // before normal ingestion reaches its accepted-result retirement path.
+      // Keep the receipt for deadline, rate-limit and server-side retry cases.
+      if (maintenanceRetry && failure.status >= 400 && failure.status < 500 &&
+        failure.status !== 408 && failure.status !== 429) retireMaintenanceRetry();
       const hookSource = request.url?.startsWith("/hooks/") ? hookSourceFromPath(request.url) : undefined;
       if (hookSource) {
         recordHookObservation(

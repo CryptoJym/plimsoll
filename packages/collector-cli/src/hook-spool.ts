@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { maintenanceRebuildPauseSeen, recordMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 import { recordSpoolLoss } from "./spool-losses";
 
@@ -115,10 +116,10 @@ export const HOOK_SPOOL_LIMITS = Object.freeze({
 export type HookSpoolBounds = { maxFiles: number; maxBytes: number };
 
 /**
- * A spooled file name is `<utcMillis>-<pid>-<random6>.json`, optionally with
- * `.maintenance_rebuild` before `.json` for a client-owned retry of a pause
- * 503. The cause stays visible without reading the captured body. The pattern is
- * strict on purpose: it is the only thing that makes a pending file, and it
+ * A spooled file name is `<utcMillis>-<pid>-<random6>.json`, including a
+ * client-owned retry of a pause 503. That grammar is also understood by the
+ * 0.7.44 reader. Older tagged files remain readable after an upgrade; new
+ * pause causes live in separate refusal receipts. The pattern is strict: it
  * keeps `.counters.json`, a half-written `.tmp`, and the `rejected/`
  * subdirectory out of every listing by construction.
  */
@@ -798,7 +799,7 @@ export function writeHookSpoolEnvelope(options: {
   /** Forbidden raw-content values the caller emptied before handing it over. */
   blanked?: number;
   nowMs?: number;
-  /** Client-owned retry of a maintenance 503; encoded in the pending file name. */
+  /** Client-owned retry of a maintenance 503; receipt is separate from this file. */
   cause?: "maintenance_rebuild";
   limits?: Partial<HookSpoolBounds>;
 }): HookSpoolWriteResult {
@@ -831,8 +832,7 @@ export function writeHookSpoolEnvelope(options: {
     const usedBytes =
       existing.reduce((total, file) => total + file.bytes, 0) + temporaries.remainingBytes;
     if (usedBytes + contentBytes > maxBytes) return { ok: false, refused: "spool_bounds" };
-    const name = `${nowMs}-${process.pid}-${crypto.randomBytes(3).toString("hex")}` +
-      `${options.cause === "maintenance_rebuild" ? ".maintenance_rebuild" : ""}.json`;
+    const name = `${nowMs}-${process.pid}-${crypto.randomBytes(3).toString("hex")}.json`;
     target = path.join(directory, name);
     temporary = `${target}.tmp`;
     // Exclusive creation cannot truncate an existing temporary or follow a
@@ -855,6 +855,11 @@ export function writeHookSpoolEnvelope(options: {
     fs.renameSync(temporary, target);
     published = true;
     syncHookSpoolDirectory(directory);
+    // The filename stays readable by 0.7.44. A private metadata receipt
+    // carries the maintenance cause until this file reaches a final outcome.
+    if (options.cause === "maintenance_rebuild" && maintenanceRebuildPauseSeen(options.home)) {
+      recordMaintenanceRebuildRefusal(options.home, "hook", options.source, options.body);
+    }
     return { ok: true, path: target };
   } catch {
     // A failed directory flush is NOT durable acceptance. Hide this writer's
