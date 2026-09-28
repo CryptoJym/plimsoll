@@ -84,6 +84,8 @@ try {
     const insert = old.prepare(`insert into upload_receipts
       (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
       values (?,'dead',?,?,0,?,?)`);
+    for (let n = 0; n < 16; n++) insert.run(generation(9000 + n),
+      "local_schema_invalid", "local", oldAt, terminalAt);
     for (const [id, reason, statusClass] of [
       [ids.unparseable, "local_payload_unparseable", "local"],
       [ids.invalid, "local_schema_invalid", "local"],
@@ -92,13 +94,19 @@ try {
       [ids.privacy, "local_privacy_violation", "local"],
       [collisionUuid, "local_schema_invalid", "local"],
     ] as const) insert.run(ensureUuidEventId(id).id, reason, statusClass, oldAt, terminalAt);
+    for (let n = 16; n < 20; n++) insert.run(generation(9000 + n),
+      "local_schema_invalid", "local", oldAt, terminalAt);
+    const acknowledged = old.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?,'acknowledged','uploaded','success',1,?,?)`);
+    for (let n = 0; n < 40; n++) acknowledged.run(generation(2300 + n), oldAt, terminalAt);
     old.prepare(`update upload_control set privacy_migration_version=1,
       migration_cursor_rowid=(select max(rowid) from buffered_events),migration_complete=1
       where singleton=1`).run();
     const columns = (old.pragma("table_info(upload_receipts)") as Array<{ name: string }>).map((r) => r.name);
     assert.deepEqual(columns, ["delivery_id", "terminal_state", "reason", "status_class",
       "attempt_count", "created_at", "terminal_at"]);
-    console.log(JSON.stringify({ phase: "old_0_7_44_shape", receipts: 6,
+    console.log(JSON.stringify({ phase: "old_0_7_44_shape", receipts: 66,
       privacyMigrationVersion: 1, migrationComplete: 1, rawRows: 48 }));
   } finally {
     old.close();
@@ -154,12 +162,12 @@ try {
     if (backfillFor().backfillLegacyReceiptLineage) {
       const first = backfillFor().backfillLegacyReceiptLineage!({ maxRows: 2, maxWriterMs: 100 });
       assert.equal(first.complete, false, "the first bounded slice must leave work to resume");
-      const cursor = (db.prepare(`select scan_cursor_rowid as n
+      const cursor = (db.prepare(`select cursor_rowid as n
         from upload_receipt_lineage_backfill where singleton=1`).get() as { n: number }).n;
       upgraded.close();
       upgraded = openUpgraded();
       db = upgraded.database;
-      assert.ok((db.prepare(`select scan_cursor_rowid as n from
+      assert.ok((db.prepare(`select cursor_rowid as n from
         upload_receipt_lineage_backfill where singleton=1`).get() as { n: number }).n >= cursor,
         "the receipt cursor must survive a reopen");
       slices = 1;
@@ -171,9 +179,9 @@ try {
       assert.ok(slices < 64, "legacy receipt lineage did not finish bounded repair");
     }
     const before = upgraded.retentionStatus(90, now).states.heldForUpload;
-    const collisionOwners = db.prepare(`select generation,delivery_id as deliveryId,
-      raw_rowid as rawRowid,raw_id as rawId from upload_receipt_lineage_candidates
-      where delivery_id=? order by generation,raw_rowid`).all(collisionUuid);
+    const collisionOwners = db.prepare(`select rowid as rawRowid,id as rawId
+      from buffered_events where id in (?,?) order by rowid`)
+      .all(ids.collisionLegacy, collisionUuid);
     const collisionReceipt = db.prepare(`select raw_rowid as rawRowid,raw_id as rawId
       from upload_receipts where delivery_id=?`).get(collisionUuid);
     for (const id of [ids.unparseable, ids.invalid, ids.oversize, ids.unacknowledged, ids.privacy]) {
@@ -181,6 +189,9 @@ try {
         where delivery_id=?`).get(id) as { rawId: string | null };
       assert.equal(linked.rawId, id, "one-owner old receipt must bind to its raw");
     }
+    assert.equal((db.prepare(`select count(*) as n from upload_receipts
+      where terminal_state='acknowledged' and raw_rowid is null`).get() as { n: number }).n, 40,
+      "upgrade must leave acknowledged receipt lineage NULL");
     assert.throws(() => db.prepare(`update upload_receipts set raw_id='rewritten'
       where delivery_id=?`).run(ids.unparseable), /upload_receipt_lineage_is_immutable/);
     const receiptIds = db.prepare(`select delivery_id as id,reason from upload_receipts
@@ -203,25 +214,29 @@ try {
       heldAfter: after };
     console.log(JSON.stringify(observations));
     assert.deepEqual(l1, [false, false, false], "L1 local-dead raw must expire");
-    assert.equal(before, 4, "L1 must not inflate heldForUpload after repair");
+    assert.equal(before, 3, "L1 must not inflate heldForUpload after repair");
     assert.equal(l2, true, "L2 uploaded-at raw with non-acknowledgment must remain held");
     assert.equal(privacyVisible, false, "L3 terminal privacy receipt must exclude raw");
     assert.equal(f1, true, "F1 unrelated legacy raw must stay held");
-    assert.equal(after, 4);
+    assert.equal(after, 3);
     assert.equal(upgraded.list(20).some((row) => row.id === ids.privacy), false);
     assert.equal(upgraded.listUnuploaded({ maxRows: 20 }).some((row) => row.id === ids.privacy), false);
+    const rawMigration = db.prepare(`select migration_cursor_rowid as cursor,
+      migration_complete as complete from upload_control where singleton=1`).get() as
+      { cursor: number; complete: number };
+    assert.equal(rawMigration.cursor, 48, "ambiguous receipt must not rewind the completed raw cursor");
+    assert.equal(rawMigration.complete, 1, "attestation must not wait on a second raw scan");
     const collisionRepair = upgraded.delivery.migrateLegacy({ maxRows: 100 });
     const collisionDelivery = db.prepare(`select delivery_id as id from upload_outbox
       where raw_id=?`).get(ids.collisionLegacy) as { id: string } | undefined;
     assert.equal(collisionDelivery?.id,
       collisionSafeDeliveryId(ids.collisionLegacy, 1),
-      "a completed old raw cursor must reopen and choose a collision-safe ID");
+      "a completed old raw cursor must repair only the ambiguous raw with a collision-safe ID");
     console.log(JSON.stringify({ phase: "collision_safe_repair",
       visited: collisionRepair.visited, deliveryId: collisionDelivery?.id }));
 
-    // A raw appended between the completed scan and the bind can take the
-    // same literal UUID as a legacy raw's derived delivery ID. The bind must
-    // scan that tail before claiming the old receipt has one owner.
+    // The receipt-side probe must see a literal UUID competitor inserted
+    // after the receipt, before it can claim the legacy raw as its owner.
     const lateLegacyId = "late-backfill-collision";
     const lateDeliveryId = ensureUuidEventId(lateLegacyId).id;
     const addLateRaw = db.prepare(`insert into buffered_events
@@ -234,26 +249,16 @@ try {
       (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
       values (?,'dead','local_schema_invalid','local',0,?,?)`)
       .run(lateDeliveryId, oldAt, terminalAt);
-    const scanRows = (db.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
-    const scan = backfillFor().backfillLegacyReceiptLineage!({ maxRows: scanRows, maxWriterMs: 500 });
-    assert.equal(scan.visited, scanRows);
-    assert.equal((db.prepare(`select phase from upload_receipt_lineage_backfill
-      where singleton=1`).get() as { phase: string }).phase, "bind");
     addLateRaw.run(lateDeliveryId, oldAt, validPayload(lateDeliveryId), oldAt,
       workspaceId, deviceId, generation(3002));
     const restarted = backfillFor().backfillLegacyReceiptLineage!({ maxRows: 10, maxWriterMs: 500 });
-    assert.equal(restarted.complete, false, "a new raw must invalidate bind uniqueness");
-    let completed = false;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      completed = backfillFor().backfillLegacyReceiptLineage!({ maxRows: 10, maxWriterMs: 500 }).complete;
-      if (completed) break;
-    }
-    assert.equal(completed, true);
+    assert.equal(restarted.visited, 1, "late dead receipt must reopen the durable cursor");
+    assert.equal(restarted.complete, true);
     const lateReceipt = db.prepare(`select raw_rowid as rawRowid
       from upload_receipts where delivery_id=?`).get(lateDeliveryId) as { rawRowid: number | null };
     assert.equal(lateReceipt.rawRowid, null, "two current owners make the old receipt ambiguous");
-    console.log(JSON.stringify({ phase: "late_collision_fence", scanRows,
-      receiptBound: lateReceipt.rawRowid !== null, resumed: completed }));
+    console.log(JSON.stringify({ phase: "late_collision_fence",
+      receiptBound: lateReceipt.rawRowid !== null, resumed: restarted.complete }));
 
     // Deleting the highest rowid permits SQLite to reuse that rowid. A
     // watermark alone cannot notice the new literal-UUID competitor.
@@ -268,21 +273,16 @@ try {
       (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
       values (?,'dead','local_schema_invalid','local',0,?,?)`)
       .run(reusedDeliveryId, oldAt, terminalAt);
-    const reuseScanRows = (db.prepare("select count(*) as n from buffered_events").get() as
-      { n: number }).n;
-    assert.equal(backfillFor().backfillLegacyReceiptLineage!({
-      maxRows: reuseScanRows, maxWriterMs: 500,
-    }).visited, reuseScanRows);
-    assert.equal((db.prepare(`select phase from upload_receipt_lineage_backfill
-      where singleton=1`).get() as { phase: string }).phase, "bind");
     const tailRowid = Number(filler.lastInsertRowid);
     db.prepare("delete from buffered_events where rowid=?").run(tailRowid);
     const replacement = addLateRaw.run(reusedDeliveryId, oldAt,
       validPayload(reusedDeliveryId), oldAt, workspaceId, deviceId, generation(3005));
     assert.equal(Number(replacement.lastInsertRowid), tailRowid);
-    assert.equal(backfillFor().backfillLegacyReceiptLineage!({
+    const reusedProgress = backfillFor().backfillLegacyReceiptLineage!({
       maxRows: 10, maxWriterMs: 500,
-    }).complete, true);
+    });
+    assert.equal(reusedProgress.visited, 1);
+    assert.equal(reusedProgress.complete, true);
     const reusedReceipt = db.prepare(`select raw_rowid as rawRowid from upload_receipts
       where delivery_id=?`).get(reusedDeliveryId) as { rawRowid: number | null };
     assert.equal(reusedReceipt.rawRowid, null,

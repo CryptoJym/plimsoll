@@ -78,18 +78,25 @@ export function terminalPrivacyEligibilitySql(
       .every((column) => receiptColumns.has(column)) && rawColumns.has("privacy_generation");
     const includeUnbound = options.includeUnboundLegacyReceipts !== false;
     if (receiptLineage && includeUnbound) registerRetentionDeliveryId(db);
-    terms.push(
-      `not exists (
-         select 1 from upload_receipts privacy_receipt
-         where ${receiptLineage ? `((privacy_receipt.raw_rowid = ${alias}.rowid
-           and privacy_receipt.raw_id = ${alias}.id
-           and privacy_receipt.raw_created_at = ${alias}.created_at
-           and privacy_receipt.raw_generation is ${alias}.privacy_generation)
-           ${includeUnbound ? `or ${legacyNullLineageReceiptMatchSql(alias, "privacy_receipt")}` : ""})` :
-           `privacy_receipt.delivery_id = ${alias}.id`}
-           and privacy_receipt.reason in (${TERMINAL_REASONS_SQL})
-       )`,
-    );
+    const dead = receiptColumns.has("terminal_state")
+      ? "and privacy_receipt.terminal_state = 'dead'" : "";
+    if (receiptLineage) {
+      // Separate indexed probes: an OR would scan every dead receipt for each
+      // raw row on a large upgraded ledger.
+      terms.push(`not exists (select 1 from upload_receipts privacy_receipt
+        where privacy_receipt.raw_rowid = ${alias}.rowid
+          and privacy_receipt.raw_id = ${alias}.id
+          and privacy_receipt.raw_created_at = ${alias}.created_at
+          and privacy_receipt.raw_generation is ${alias}.privacy_generation
+          ${dead} and privacy_receipt.reason in (${TERMINAL_REASONS_SQL}))`);
+      if (includeUnbound) terms.push(`not exists (select 1 from upload_receipts privacy_receipt
+        where ${legacyNullLineageReceiptMatchSql(alias, "privacy_receipt")}
+          ${dead} and privacy_receipt.reason in (${TERMINAL_REASONS_SQL}))`);
+    } else {
+      terms.push(`not exists (select 1 from upload_receipts privacy_receipt
+        where privacy_receipt.delivery_id = ${alias}.id
+          ${dead} and privacy_receipt.reason in (${TERMINAL_REASONS_SQL}))`);
+    }
   }
 
   const outboxColumns = columns(db, "upload_outbox");

@@ -72,6 +72,7 @@
     "timing:maintenance-stages": "tsx scripts/maintenance-stage-timing.ts",
     "proof:maintenance-boundary": "tsx scripts/maintenance-boundary-proof.ts",
     "proof:retention": "tsx scripts/run-proof.ts scripts/retention-proof.ts",
+    "proof:receipt-lineage-scale": "tsx scripts/receipt-lineage-scale-proof.ts",
     "proof:maintenance-worker-ready": "tsx scripts/maintenance-worker-ready-proof.ts",
     "proof:startup-wal-self-heal": "tsx scripts/run-proof.ts --direct-node scripts/startup-wal-self-heal-proof.ts",
     "proof:incremental-capture": "tsx scripts/incremental-capture-proof.ts",

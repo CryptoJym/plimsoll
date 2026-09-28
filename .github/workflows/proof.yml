@@ -70,6 +70,10 @@ jobs:
           pnpm proof:status-http-rollout
           pnpm proof:retention
 
+      - name: Prove 0.7.44 dead-receipt lineage scale
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:receipt-lineage-scale
+
       - name: Prove event allocation conservation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:allocation

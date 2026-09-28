@@ -3157,7 +3157,7 @@ export class LocalEventBuffer {
           and unacknowledged.raw_id = e.id
           and unacknowledged.raw_created_at = e.created_at
           and unacknowledged.raw_generation is e.privacy_generation
-          and unacknowledged.terminal_state <> 'acknowledged'
+          and unacknowledged.terminal_state = 'dead'
       ) or exists (
         -- Until the bounded lineage repair proves an owner, a legacy remote
         -- rejection can only add a hold. It must never waive one.

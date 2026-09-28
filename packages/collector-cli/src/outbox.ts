@@ -266,15 +266,10 @@ type LegacyCandidateRow = Pick<
 > & { dataMode: string; rowBytes: number };
 
 type ReceiptBackfillControl = {
-  generation: number;
-  phase: "scan" | "bind" | "complete";
-  scanCursorRowid: number;
-  scanHighwaterRowid: number;
-  bindCursorDeliveryId: string;
+  cursorRowid: number;
 };
 
 type ReceiptBackfillCandidate = {
-  deliveryId: string;
   rawRowid: number;
   rawId: string;
   rawCreatedAt: string;
@@ -612,8 +607,7 @@ export class DeliveryOutbox {
             }) as { count: number; earliestSeconds: number | null });
       const lost = this.deadLetterSummary(epochStartedAt, epochStartMs);
       const spoolLosses = (spool?.losses ?? []).filter((loss) => loss.toMs >= epochStartMs);
-      const receiptLineageComplete = (this.db.prepare(`select phase from
-        upload_receipt_lineage_backfill where singleton=1`).get() as { phase: string }).phase === "complete";
+      const receiptLineageComplete = this.receiptLineageComplete();
       const unattested: CaptureUnattestedReason | null =
         control.migrationComplete !== 1 || !receiptLineageComplete ? "migration_incomplete"
           : overBudget ? "over_row_budget"
@@ -1010,15 +1004,19 @@ export class DeliveryOutbox {
       }
     }
     const receiptColumns = this.db.pragma("table_info(upload_receipts)") as Array<{ name: string }>;
-    let receiptLineageAdded = false;
     for (const [column, type] of [
       ["raw_rowid", "integer"], ["raw_id", "text"],
       ["raw_created_at", "text"], ["raw_generation", "text"],
     ] as const) {
       if (!receiptColumns.some((existing) => existing.name === column)) {
         this.db.exec(`alter table upload_receipts add column ${column} ${type}`);
-        receiptLineageAdded = true;
       }
+    }
+    const lineageIndex = this.db.prepare(`select sql from sqlite_master
+      where type='index' and name='idx_upload_receipts_raw_lineage'`).get() as
+      { sql: string } | undefined;
+    if (lineageIndex && !lineageIndex.sql.includes("where terminal_state='dead'")) {
+      this.db.exec(`drop index idx_upload_receipts_raw_lineage`);
     }
     this.db.exec(
       `create index if not exists idx_upload_outbox_workspace_due
@@ -1026,7 +1024,7 @@ export class DeliveryOutbox {
        create index if not exists idx_upload_outbox_raw_generation
          on upload_outbox (raw_generation, created_at, delivery_id);
        create index if not exists idx_upload_receipts_raw_lineage
-         on upload_receipts (raw_rowid, raw_id);
+         on upload_receipts (raw_rowid, raw_id) where terminal_state='dead';
        drop trigger if exists trg_upload_receipt_lineage_immutable;
        create trigger trg_upload_receipt_lineage_immutable
        before update of raw_rowid, raw_id, raw_created_at, raw_generation on upload_receipts
@@ -1051,60 +1049,36 @@ export class DeliveryOutbox {
          select raise(abort, 'upload_outbox_lineage_is_immutable');
        end`,
     );
-    // A separate cursor is essential: the older privacy/raw migration can
-    // already be complete when an upgraded receipt still has NULL lineage.
+    // The old raw-scan table was never shipped. A receipt cursor is independent
+    // of the already-complete privacy/raw migration on upgraded 0.7.44 ledgers.
+    const lineageControlColumns = this.db.pragma("table_info(upload_receipt_lineage_backfill)") as
+      Array<{ name: string }>;
+    if (lineageControlColumns.some((column) => column.name === "scan_cursor_rowid")) {
+      this.db.exec(`drop trigger if exists trg_receipt_lineage_backfill_insert;
+        drop table if exists upload_receipt_lineage_candidates;
+        drop table upload_receipt_lineage_backfill`);
+    }
     this.db.exec(`
       create table if not exists upload_receipt_lineage_backfill (
         singleton integer primary key check (singleton = 1),
-        generation integer not null,
-        phase text not null check (phase in ('scan','bind','complete')),
-        scan_cursor_rowid integer not null,
-        scan_highwater_rowid integer not null,
-        bind_cursor_delivery_id text not null,
+        cursor_rowid integer not null,
         updated_at text not null
       );
-      create table if not exists upload_receipt_lineage_candidates (
-        generation integer not null,
-        delivery_id text not null,
-        raw_rowid integer not null,
-        raw_id text not null,
-        raw_created_at text not null,
-        raw_generation text,
-        primary key (generation,delivery_id,raw_rowid)
-      );
-      create index if not exists idx_receipt_lineage_candidates_raw
-        on upload_receipt_lineage_candidates (generation,raw_rowid);
+      insert or ignore into upload_receipt_lineage_backfill
+        (singleton,cursor_rowid,updated_at)
+        values (1,0,strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       create trigger if not exists trg_receipt_lineage_backfill_insert
       after insert on upload_receipts
-      when new.raw_rowid is null and new.raw_id is null
+      when new.terminal_state='dead'
+        and new.raw_rowid is null and new.raw_id is null
         and new.raw_created_at is null and new.raw_generation is null
       begin
         update upload_receipt_lineage_backfill set
-          generation=generation+1,phase='scan',scan_cursor_rowid=0,
-          scan_highwater_rowid=(select coalesce(max(rowid),0) from buffered_events),
-          bind_cursor_delivery_id='',
+          cursor_rowid=min(cursor_rowid,new.rowid-1),
           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where singleton=1;
       end;
     `);
-    const oldReceipt = Boolean(this.db.prepare(`select 1 from upload_receipts
-      indexed by idx_upload_receipts_raw_lineage where raw_rowid is null limit 1`).get());
-    const highwater = (this.db.prepare(`select coalesce(max(rowid),0) as n
-      from buffered_events`).get() as { n: number }).n;
-    const existingBackfill = this.db.prepare(`select generation from upload_receipt_lineage_backfill
-      where singleton=1`).get() as { generation: number } | undefined;
-    if (!existingBackfill) {
-      this.db.prepare(`insert into upload_receipt_lineage_backfill
-        (singleton,generation,phase,scan_cursor_rowid,scan_highwater_rowid,
-         bind_cursor_delivery_id,updated_at) values (1,1,?,0,?,'',?)`)
-        .run(oldReceipt ? "scan" : "complete", highwater, this.clock().toISOString());
-    } else if (receiptLineageAdded && oldReceipt) {
-      // A 0.7.44 reopen may have replaced the table and its insert trigger.
-      this.db.prepare(`update upload_receipt_lineage_backfill set
-        generation=generation+1,phase='scan',scan_cursor_rowid=0,
-        scan_highwater_rowid=?,bind_cursor_delivery_id='',updated_at=?
-        where singleton=1`).run(highwater, this.clock().toISOString());
-    }
     this.db.prepare(
       `update upload_control set migration_cursor_rowid = 0,
          migration_complete = 0, migration_paused_reason = null,
@@ -1113,161 +1087,140 @@ export class DeliveryOutbox {
      ).run({ now: this.clock().toISOString() });
    }
 
+  /** Only dead NULL-lineage receipts ahead of the durable cursor block attestation. */
+  private receiptLineageComplete() {
+    const cursor = (this.db.prepare(`select cursor_rowid as cursorRowid
+      from upload_receipt_lineage_backfill where singleton=1`).get() as ReceiptBackfillControl).cursorRowid;
+    return !this.db.prepare(`select 1 from upload_receipts indexed by idx_upload_receipts_raw_lineage
+      where terminal_state='dead' and raw_rowid is null and raw_id is null
+        and raw_created_at is null and raw_generation is null and rowid>? limit 1`).get(cursor);
+  }
+
+  private hasUnprocessedDeadReceipt(rawId: string) {
+    return Boolean(this.db.prepare(`select 1 from upload_receipts where delivery_id=?
+      and terminal_state='dead' and raw_rowid is null and raw_id is null
+      and raw_created_at is null and raw_generation is null
+      and rowid>(select cursor_rowid from upload_receipt_lineage_backfill where singleton=1)`)
+      .get(ensureUuidEventId(rawId).id));
+  }
+
   /**
-   * Bind old NULL-lineage receipts only after a complete bounded raw scan
-   * proves one matching owner. The candidate and phase cursors commit with
-   * each slice, so a crash resumes without trusting a partial uniqueness
-   * result. Read-only candidate selection stays outside the writer turn.
+   * Receipt-side repair. Primary-key and created-at index probes prove an
+   * owner inside the writer transaction. An oversized timestamp cohort stays
+   * unresolved; it cannot extend a writer slice or claim false uniqueness.
    */
   backfillLegacyReceiptLineage(options: { maxRows?: number; maxWriterMs?: number } = {}) {
     const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? 256), 5_000));
     const maxWriterMs = Math.max(1, Math.min(Math.trunc(options.maxWriterMs ?? 100), 500));
     const deadline = performance.now() + maxWriterMs;
-    const readControl = () => this.db.prepare(`select generation,phase,
-      scan_cursor_rowid as scanCursorRowid,scan_highwater_rowid as scanHighwaterRowid,
-      bind_cursor_delivery_id as bindCursorDeliveryId
-      from upload_receipt_lineage_backfill where singleton=1`).get() as ReceiptBackfillControl;
-    let visited = 0;
-    let bound = 0;
-    let control = readControl();
-    while (control.phase !== "complete" && visited < maxRows && performance.now() < deadline) {
-      const room = maxRows - visited;
-      if (control.phase === "scan") {
-        const rows = this.db.prepare(`select rowid as rawRowid,id as rawId,
-          created_at as rawCreatedAt,privacy_generation as rawGeneration
-          from buffered_events where rowid>? and rowid<=?
-          order by rowid limit ?`).all(control.scanCursorRowid,
-            control.scanHighwaterRowid, room) as Array<Omit<ReceiptBackfillCandidate, "deliveryId">>;
-        const oldReceipt = this.db.prepare(`select 1 from upload_receipts
-          where delivery_id=? and raw_rowid is null
-            and raw_id is null and raw_created_at is null and raw_generation is null`);
-        const candidates = new Map(rows.map((raw) => ({
-          ...raw, deliveryId: ensureUuidEventId(raw.rawId).id,
-        })).filter((raw) => oldReceipt.get(raw.deliveryId))
-          .map((raw) => [raw.rawRowid, raw] as const));
-        const insert = this.db.prepare(`insert or ignore into upload_receipt_lineage_candidates
-          (generation,delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation)
-          values (?,?,?,?,?,?)`);
-        const run = this.db.transaction(() => {
-          const current = readControl();
-          if (current.generation !== control.generation || current.phase !== "scan") return 0;
-          let consumed = 0;
-          let lastRowid = current.scanCursorRowid;
-          for (const row of rows) {
-            if (performance.now() >= deadline) break;
-            const candidate = candidates.get(row.rawRowid);
-            if (candidate) insert.run(current.generation, candidate.deliveryId,
-              candidate.rawRowid, candidate.rawId, candidate.rawCreatedAt, candidate.rawGeneration);
-            consumed += 1;
-            lastRowid = row.rawRowid;
+    type Candidate = ReceiptBackfillCandidate & { uploadedAt: string | null };
+    const rawById = this.db.prepare(`select rowid as rawRowid,id as rawId,
+      created_at as rawCreatedAt,privacy_generation as rawGeneration,
+      uploaded_at as uploadedAt from buffered_events where id=?`);
+    const rawAtTime = this.db.prepare(`select rowid as rawRowid,id as rawId,
+      created_at as rawCreatedAt,privacy_generation as rawGeneration,
+      uploaded_at as uploadedAt from buffered_events indexed by idx_events_retention
+      where created_at=? order by created_at,id limit 1025`);
+    const pendingCandidate = this.db.prepare(`select rowid as rawRowid,id as rawId,
+      created_at as createdAt,privacy_generation as privacyGeneration,
+      uploaded_at as uploadedAt,data_mode as dataMode,payload_json as payloadJson,
+      suppressed_fields_json as suppressedFieldsJson,repo_hash as repoHash,
+      branch_hash as branchHash,workspace_id as workspaceId,device_id as deviceId,
+      privacy_disposition as privacyDisposition,
+      usage_duplicate_reason as usageDuplicateReason
+      from buffered_events where rowid=? and id=? and created_at=?
+        and privacy_generation is ? and uploaded_at is null
+        and length(cast(payload_json as blob)) +
+          length(cast(suppressed_fields_json as blob)) <= ?`);
+    const bind = this.db.prepare(`update upload_receipts set
+      raw_rowid=@rawRowid,raw_id=@rawId,raw_created_at=@rawCreatedAt,
+      raw_generation=@rawGeneration
+      where rowid=@receiptRowid and delivery_id=@deliveryId
+        and terminal_state='dead' and created_at=@rawCreatedAt
+        and raw_rowid is null and raw_id is null
+        and raw_created_at is null and raw_generation is null
+        and exists (select 1 from buffered_events b where b.rowid=@rawRowid
+          and b.id=@rawId and b.created_at=@rawCreatedAt
+          and b.privacy_generation is @rawGeneration)
+        and not exists (select 1 from buffered_events competing_raw
+          where competing_raw.id=@deliveryId and competing_raw.rowid<>@rawRowid)
+        and not exists (select 1 from raw_retention_receipts old_raw
+          where old_raw.event_id in (@rawId,@deliveryId)
+            and (old_raw.raw_rowid is not @rawRowid
+              or old_raw.raw_created_at is not @rawCreatedAt
+              or old_raw.raw_generation is not @rawGeneration))
+        and not exists (select 1 from upload_outbox o
+          where o.delivery_id=@deliveryId and
+            (o.raw_rowid is not @rawRowid or o.raw_id is not @rawId
+             or o.raw_created_at is not @rawCreatedAt
+             or o.raw_generation is not @rawGeneration))`);
+    const run = this.db.transaction(() => {
+      const cursor = (this.db.prepare(`select cursor_rowid as cursorRowid
+        from upload_receipt_lineage_backfill where singleton=1`).get() as ReceiptBackfillControl).cursorRowid;
+      const migrationCursor = (this.db.prepare(`select migration_cursor_rowid as n
+        from upload_control where singleton=1`).get() as { n: number }).n;
+      const receipts = this.db.prepare(`select rowid as receiptRowid,
+        delivery_id as deliveryId,created_at as createdAt
+        from upload_receipts indexed by idx_upload_receipts_raw_lineage
+        where terminal_state='dead' and raw_rowid is null and raw_id is null
+          and raw_created_at is null and raw_generation is null and rowid>?
+        order by rowid limit ?`).all(cursor, maxRows) as Array<{
+          receiptRowid: number; deliveryId: string; createdAt: string;
+        }>;
+      let visited = 0;
+      let bound = 0;
+      let lastRowid = cursor;
+      for (const receipt of receipts) {
+        if (performance.now() >= deadline) break;
+        const literal = rawById.get(receipt.deliveryId) as Candidate | undefined;
+        const cohort = rawAtTime.all(receipt.createdAt) as Candidate[];
+        const candidates = cohort.length > 1024 ? [] :
+          cohort.filter((raw) => ensureUuidEventId(raw.rawId).id === receipt.deliveryId);
+        if (literal && literal.rawCreatedAt === receipt.createdAt &&
+            !candidates.some((raw) => raw.rawRowid === literal.rawRowid)) candidates.push(literal);
+        const unique = cohort.length <= 1024 && candidates.length === 1
+          ? candidates[0] : undefined;
+        const changes = unique ? bind.run({
+          rawRowid: unique.rawRowid, rawId: unique.rawId,
+          rawCreatedAt: unique.rawCreatedAt, rawGeneration: unique.rawGeneration,
+          receiptRowid: receipt.receiptRowid, deliveryId: receipt.deliveryId,
+        }).changes : 0;
+        bound += changes;
+        if (!changes && candidates.length <= 2 && this.enabled) {
+          // A completed raw cursor must not rewind over millions of uploaded
+          // rows just because an old receipt is ambiguous. Finish this receipt
+          // first, then give only its already-passed eligible raw candidates a
+          // collision-safe delivery ID in the same transaction.
+          this.db.prepare(`update upload_receipt_lineage_backfill
+            set cursor_rowid=?,updated_at=? where singleton=1`)
+            .run(receipt.receiptRowid, this.clock().toISOString());
+          for (const raw of candidates) {
+            if (raw.rawRowid > migrationCursor || raw.uploadedAt !== null) continue;
+            const row = pendingCandidate.get(raw.rawRowid, raw.rawId,
+              raw.rawCreatedAt, raw.rawGeneration, this.limits.maxItemBytes) as
+              RawDeliveryRow | undefined;
+            if (!row || row.dataMode !== "metadata" || row.privacyDisposition ||
+                row.usageDuplicateReason ||
+                (this.workspaceId !== null && row.workspaceId !== this.workspaceId) ||
+                (this.deviceId !== null && row.deviceId !== this.deviceId)) continue;
+            this.enqueueRaw(row);
           }
-          const finished = consumed === rows.length &&
-            (rows.length < room || lastRowid >= current.scanHighwaterRowid);
-          this.db.prepare(`update upload_receipt_lineage_backfill set
-            scan_cursor_rowid=?,phase=?,updated_at=? where singleton=1`)
-            .run(lastRowid, finished ? "bind" : "scan", this.clock().toISOString());
-          return consumed;
-        });
-        visited += run();
-      } else {
-        const groups = this.db.prepare(`select delivery_id as deliveryId,
-          count(*) as owners from upload_receipt_lineage_candidates
-          where generation=? and delivery_id>?
-          group by delivery_id order by delivery_id limit ?`)
-          .all(control.generation, control.bindCursorDeliveryId, room) as
-          Array<{ deliveryId: string; owners: number }>;
-        const candidateFor = this.db.prepare(`select delivery_id as deliveryId,
-          raw_rowid as rawRowid,raw_id as rawId,raw_created_at as rawCreatedAt,
-          raw_generation as rawGeneration from upload_receipt_lineage_candidates
-          where generation=? and delivery_id=? limit 1`);
-        const bind = this.db.prepare(`update upload_receipts set
-          raw_rowid=@rawRowid,raw_id=@rawId,raw_created_at=@rawCreatedAt,
-          raw_generation=@rawGeneration
-          where delivery_id=@deliveryId and created_at=@rawCreatedAt
-            and raw_rowid is null and raw_id is null
-            and raw_created_at is null and raw_generation is null
-            and exists (select 1 from buffered_events b where b.rowid=@rawRowid
-              and b.id=@rawId and b.created_at=@rawCreatedAt
-              and b.privacy_generation is @rawGeneration)
-            and not exists (select 1 from buffered_events competing_raw
-              where competing_raw.id=@deliveryId and competing_raw.rowid<>@rawRowid)
-            and not exists (select 1 from raw_retention_receipts old_raw
-              where old_raw.event_id in (@rawId,@deliveryId)
-                and (old_raw.raw_rowid is not @rawRowid
-                  or old_raw.raw_created_at is not @rawCreatedAt
-                  or old_raw.raw_generation is not @rawGeneration))
-            and not exists (select 1 from upload_outbox o
-              where o.delivery_id=@deliveryId and
-                (o.raw_rowid is not @rawRowid or o.raw_id is not @rawId
-                 or o.raw_created_at is not @rawCreatedAt
-                 or o.raw_generation is not @rawGeneration))`);
-        const removeCandidate = this.db.prepare(`delete from upload_receipt_lineage_candidates
-          where generation=? and delivery_id=?`);
-        const run = this.db.transaction(() => {
-          const current = readControl();
-          if (current.generation !== control.generation || current.phase !== "bind")
-            return { consumed: 0, bound: 0 };
-          // A raw inserted after the scan may own the same deterministic ID.
-          // Catch the new tail before treating any candidate as unique. This
-          // check and the binds share the writer transaction.
-          const latestRowid = (this.db.prepare(`select coalesce(max(rowid),0) as n
-            from buffered_events`).get() as { n: number }).n;
-          if (latestRowid > current.scanHighwaterRowid) {
-            this.db.prepare(`update upload_receipt_lineage_backfill set
-              phase='scan',scan_highwater_rowid=?,updated_at=? where singleton=1`)
-              .run(latestRowid, this.clock().toISOString());
-            return { consumed: 0, bound: 0 };
-          }
-          let consumed = 0;
-          let written = 0;
-          let lastId = current.bindCursorDeliveryId;
-          for (const group of groups) {
-            if (performance.now() >= deadline) break;
-            if (group.owners === 1) {
-              const candidate = candidateFor.get(current.generation, group.deliveryId) as
-                ReceiptBackfillCandidate | undefined;
-              if (candidate) {
-                const changes = bind.run(candidate).changes;
-                written += changes;
-                if (changes) removeCandidate.run(current.generation, group.deliveryId);
-              }
-            }
-            consumed += 1;
-            lastId = group.deliveryId;
-          }
-          const finished = consumed === groups.length && groups.length < room;
-          this.db.prepare(`update upload_receipt_lineage_backfill set
-            bind_cursor_delivery_id=?,phase=?,updated_at=? where singleton=1`)
-            .run(lastId, finished ? "complete" : "bind", this.clock().toISOString());
-          if (finished) {
-            // A completed 0.7.44 raw cursor will never revisit ambiguous old
-            // receipts. Reopen it at the first unbound candidate so the
-            // existing bounded migration can choose a collision-safe ID.
-            const firstUnbound = this.db.prepare(`select raw_rowid as n
-              from upload_receipt_lineage_candidates where generation=?
-              order by raw_rowid limit 1`).get(current.generation) as { n: number } | undefined;
-            if (firstUnbound) this.db.prepare(`update upload_control set
-              migration_cursor_rowid=min(migration_cursor_rowid,?),
-              migration_complete=0,migration_paused_reason=null,updated_at=?
-              where singleton=1 and migration_cursor_rowid>=?`)
-              .run(firstUnbound.n - 1, this.clock().toISOString(), firstUnbound.n);
-          }
-          if (written && this.db.prepare(`select 1 from sqlite_master
-            where type='table' and name='retention_hold_revision'`).get()) {
-            this.db.prepare(`update retention_hold_revision set revision=revision+1
-              where singleton=1`).run();
-          }
-          return { consumed, bound: written };
-        });
-        const result = run();
-        visited += result.consumed;
-        bound += result.bound;
+        }
+        visited += 1;
+        lastRowid = receipt.receiptRowid;
       }
-      control = readControl();
-      if (visited === 0 && control.phase !== "complete") break;
-    }
+      if (visited) this.db.prepare(`update upload_receipt_lineage_backfill
+        set cursor_rowid=?,updated_at=? where singleton=1`)
+        .run(lastRowid, this.clock().toISOString());
+      if (bound && this.db.prepare(`select 1 from sqlite_master
+        where type='table' and name='retention_hold_revision'`).get())
+        this.db.prepare(`update retention_hold_revision set revision=revision+1
+          where singleton=1`).run();
+      return { visited, bound };
+    });
+    const { visited, bound } = run.immediate();
     if (bound) this.onHoldChange?.();
-    return { visited, bound, complete: control.phase === "complete" };
+    return { visited, bound, complete: this.receiptLineageComplete() };
   }
 
   /**
@@ -1351,10 +1304,7 @@ export class DeliveryOutbox {
     if (!this.enabled || row.uploadedAt) return { enqueued: 0, dead: 0 };
     if (row.privacyDisposition) return { enqueued: 0, dead: 0 };
     if (row.usageDuplicateReason) return { enqueued: 0, dead: 0 };
-    const backfill = this.db.prepare(`select phase,scan_highwater_rowid as highwater
-      from upload_receipt_lineage_backfill where singleton=1`).get() as
-      { phase: string; highwater: number };
-    if (backfill.phase !== "complete" && row.rawRowid <= backfill.highwater)
+    if (this.hasUnprocessedDeadReceipt(row.rawId))
       return { enqueued: 0, dead: 0 };
     // A pre-upgrade privacy receipt may be ambiguous. It cannot prove raw
     // lineage, but it must still prevent a privacy-rejected raw from escaping.
@@ -1814,15 +1764,10 @@ export class DeliveryOutbox {
   }
 
   migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}) {
-    const receiptLineageComplete = () => (this.db.prepare(`select phase from
-      upload_receipt_lineage_backfill where singleton=1`).get() as { phase: string }).phase === "complete";
     const receiptBackfill = this.backfillLegacyReceiptLineage({
       maxRows: Math.min(options.maxRows ?? 256, 256),
       maxWriterMs: Math.min(options.maxWriterMs ?? 100, 100),
     });
-    if (!receiptBackfill.complete) return { visited: 0, enqueued: 0, dead: 0,
-      skippedUploaded: 0, quarantinedEvidence: 0, complete: false,
-      paused: "receipt_lineage_pending" as const };
     if (!this.enabled) return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: null };
     const now = options.now ?? new Date();
     const nowIso = now.toISOString();
@@ -1855,7 +1800,9 @@ export class DeliveryOutbox {
       )
       .get() as { cursorRowid: number; complete: number };
     if (control.complete) {
-      return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0, quarantinedEvidence: 0, complete: true, paused: null };
+      return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0,
+        quarantinedEvidence: 0, complete: this.receiptLineageComplete(),
+        paused: receiptBackfill.complete ? null : "receipt_lineage_pending" as const };
     }
 
     const maxBytes = Math.max(1, Math.trunc(options.maxBytes ?? this.limits.migrationBatchBytes));
@@ -1880,6 +1827,7 @@ export class DeliveryOutbox {
     let skippedUploaded = 0;
     let quarantinedEvidence = 0;
     let cursor = control.cursorRowid;
+    let firstDeferredRowid: number | null = null;
     let paused: "slice_budget_too_small" | "receipt_lineage_pending" | null = null;
     let writerBudgetExhausted = false;
     const readRaw = this.db.prepare(
@@ -1903,13 +1851,6 @@ export class DeliveryOutbox {
     const run = this.db.transaction(() => {
       const writerDeadline = writerBudgetMs === undefined ? undefined : performance.now() + writerBudgetMs;
       for (const candidate of rows) {
-        // Retiring an unlinked legacy outbox entry can write a new NULL-lineage
-        // receipt during this same turn. Do not advance past a raw whose
-        // terminal state still needs the bounded ownership repair.
-        if (!receiptLineageComplete() && candidate.dataMode !== "evidence") {
-          paused = "receipt_lineage_pending";
-          break;
-        }
         if (writerDeadline !== undefined && performance.now() >= writerDeadline) {
           writerBudgetExhausted = true;
           break;
@@ -1957,6 +1898,10 @@ export class DeliveryOutbox {
           continue;
         }
         if (row.privacyDisposition || row.usageDuplicateReason) continue;
+        if (this.hasUnprocessedDeadReceipt(row.rawId)) {
+          firstDeferredRowid = Math.min(firstDeferredRowid ?? row.rawRowid, row.rawRowid);
+          continue;
+        }
         // A pre-outbox legacy row can be arbitrarily large. Classify a row
         // already above the item ceiling from its SQLite length metadata;
         // never materialize it into the migration process merely to reject it.
@@ -1992,8 +1937,12 @@ export class DeliveryOutbox {
         enqueued += result.enqueued;
         dead += result.dead;
       }
+      if (firstDeferredRowid !== null) {
+        cursor = Math.min(cursor, firstDeferredRowid - 1);
+        paused = "receipt_lineage_pending";
+      }
       const complete = !writerBudgetExhausted && paused === null &&
-        receiptLineageComplete() && rows.length < maxRows && visited === rows.length;
+        this.receiptLineageComplete() && rows.length < maxRows && visited === rows.length;
       this.db
         .prepare(
           `update upload_control set
@@ -2646,8 +2595,7 @@ export class DeliveryOutbox {
   }
 
   status(now = new Date()): DeliveryStatus {
-    const receiptLineageComplete = (this.db.prepare(`select phase from
-      upload_receipt_lineage_backfill where singleton=1`).get() as { phase: string }).phase === "complete";
+    const receiptLineageComplete = this.receiptLineageComplete();
     const control = this.db
       .prepare(
         `select migration_cursor_rowid as cursorRowid,
