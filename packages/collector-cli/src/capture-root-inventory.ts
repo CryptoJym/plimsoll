@@ -220,14 +220,39 @@ function activeIndexedBindings(snapshot: DispatchBindingSnapshot,source: Capture
   const at=Date.parse(observedAt);
   return snapshot.bySession.get(`${source}\0${sessionId}`)?.filter(entry => at>=entry.from&&at<entry.until) ?? [];
 }
+/** Resolve one active attempt, checking every configured copy of that attempt.
+ * A retired, disjoint attempt does not disagree with its successor. */
+function claudeCandidateBinding(snapshot: DispatchBindingSnapshot,sessionId: string,observedAt: string) {
+  const entries=snapshot.bySession.get(`claude_code\0${sessionId}`)??[];
+  const at=Date.parse(observedAt);
+  let candidate: IndexedBinding|undefined;
+  for(const entry of entries) {
+    if(at<entry.from||at>=entry.until) continue;
+    if(candidate && (entry.binding.attemptId!==candidate.binding.attemptId ||
+      entry.signature!==candidate.signature)) return { binding:null,conflict:true,rootDigests:new Set<string>() };
+    candidate=entry;
+  }
+  if(!candidate) return { binding:null,conflict:false,rootDigests:new Set<string>() };
+  const roots=new Set<string>();
+  const rootDigests=new Set<string>();
+  for(const entry of entries) {
+    if(entry.binding.attemptId===candidate.binding.attemptId) {
+      if(entry.signature!==candidate.signature||roots.has(entry.root.rootId))
+        return { binding:null,conflict:true,rootDigests:new Set<string>() };
+      roots.add(entry.root.rootId);
+      rootDigests.add(snapshot.rootDigests.get(entry.root.rootId)!);
+    } else if(entry.from<candidate.until&&candidate.from<entry.until) {
+      // Different attempts with overlapping windows cannot own one event.
+      return { binding:null,conflict:true,rootDigests:new Set<string>() };
+    }
+  }
+  return { binding:candidate.binding,conflict:false,rootDigests };
+}
 export function dispatchBindingForSession(source: CaptureRoot["source"],sessionId: string,observedAt: string,
   roots: readonly CaptureRoot[]=currentDispatchCaptureRoots()): DispatchBinding|null {
   const snapshot=dispatchIndex(roots);
-  // Claude copies are distributed to every configured root. A stale copy is
-  // still evidence of disagreement, even after its own window has closed.
-  const entries=source==="claude_code"
-    ? snapshot.bySession.get(`${source}\0${sessionId}`)??[]
-    : activeIndexedBindings(snapshot,source,sessionId,observedAt);
+  if(source==="claude_code") return claudeCandidateBinding(snapshot,sessionId,observedAt).binding;
+  const entries=activeIndexedBindings(snapshot,source,sessionId,observedAt);
   if (entries.length === 0) return null;
   const byRoot=new Set(entries.map(entry => entry.root.rootId));
   const signatures=new Set(entries.map(entry => entry.signature));
@@ -252,26 +277,21 @@ export function claudeDispatchSkipStatus() {
 /** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
   snapshot=currentDispatchBindingSnapshot(),durableSightings?: ReadonlySet<string>): DispatchBinding|null {
-  const entries=snapshot.bySession.get(`claude_code\0${sessionId}`)??[];
-  if(entries.length===0) return null;
-  const byRoot=new Set(entries.map(entry => entry.root.rootId));
-  const signatures=new Set(entries.map(entry => entry.signature));
-  if(byRoot.size!==entries.length||signatures.size!==1) {
+  const candidate=claudeCandidateBinding(snapshot,sessionId,observedAt);
+  if(candidate.conflict) {
     claudeDispatchSkips.conflictingBindings++;
     return null;
   }
-  const at=Date.parse(observedAt);
-  if(at<entries[0].from||at>=entries[0].until) return null;
+  if(!candidate.binding) return null;
   if(claudeSessionRootSightings(sessionId).size===0 && !durableSightings?.size)
-    return entries[0].binding;
+    return candidate.binding;
   const seen=new Set([...claudeSessionRootSightings(sessionId),...(durableSightings??[])]);
   const configuredSeen=[...seen].filter(digest => snapshot.claudeRootDigests.has(digest));
-  const boundRootDigests=new Set(entries.map(entry => snapshot.rootDigests.get(entry.root.rootId)));
-  if(configuredSeen.some(digest => !boundRootDigests.has(digest))) {
+  if(configuredSeen.some(digest => !candidate.rootDigests.has(digest))) {
     claudeDispatchSkips.otherRootSeen++;
     return null;
   }
-  return entries[0].binding;
+  return candidate.binding;
 }
 export function dispatchBindingMetadata(binding: DispatchBinding): Record<string,unknown> {
   return {
@@ -406,6 +426,39 @@ export function durableClaudeRootSessionSightings(database: import("better-sqlit
   cache.sessions.set(sessionId,roots);
   return roots;
 }
+/** Persist a known Claude root before its first raw event can be interrupted.
+ * A later file or slice of the same root/session only reads the cached sighting. */
+export function recordClaudeRootSessionSighting(buffer: import("./buffer").LocalEventBuffer,
+  root: CaptureRoot,sessionId: string,observedAt: string): boolean {
+  if(root.source!=="claude_code") return false;
+  const database=buffer.database;
+  ensureRootObservationSchema(database);
+  const rootDigest=captureRootDigest(root);
+  if(durableClaudeRootSessionSightings(database,sessionId).has(rootDigest)) {
+    observeClaudeRootSession(root,sessionId);
+    return false;
+  }
+  // A savepoint inside a raw/cursor transaction would roll back on SIGKILL.
+  if(database.inTransaction) throw new Error("claude_sighting_must_precede_raw_transaction");
+  const write=() => database.transaction(() => database.prepare(`
+    insert into capture_root_session_sightings(source,session_id,root_digest,first_seen_at)
+    values('claude_code',?,?,?) on conflict do nothing`).run(sessionId,rootDigest,observedAt)).immediate();
+  try { write(); }
+  catch(error) {
+    // A caught, one-shot failure must still leave the truthful veto durable.
+    // If persistence keeps failing, intake stops before any raw row is written.
+    try { write(); }
+    finally {
+      sessionSightingCaches.delete(database);
+      if(durableClaudeRootSessionSightings(database,sessionId).has(rootDigest))
+        observeClaudeRootSession(root,sessionId);
+    }
+    throw error;
+  }
+  sessionSightingCaches.delete(database);
+  observeClaudeRootSession(root,sessionId);
+  return true;
+}
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
 export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined): boolean {
   const parsedAccount = root?.account ? accountAssertionV1Schema.safeParse(root.account) : null;
@@ -417,16 +470,16 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
     return buffer.append(event,[]);
   const database=buffer.database;
   ensureRootObservationSchema(database);
+  if(root.source==="claude_code"&&event.sessionId)
+    recordClaudeRootSessionSighting(buffer,root,event.sessionId,event.observedAt);
   const nativeSignature=(value: typeof event) => crypto.createHash("sha256").update(JSON.stringify([
     value.source,value.id,value.sessionId,value.observedAt,value.model,value.inputTokens??null,value.outputTokens??null,
     value.cacheReadTokens??null,value.cacheCreationTokens??null,value.costUsd??null,
   ])).digest("hex");
   const payloadDigest=nativeSignature(event),rootDigest=captureRootDigest(root);
-  // The raw event, root receipt and durable session veto share one commit.
-  // buffer.append uses a nested savepoint when called inside this transaction.
-  let result: { inserted:boolean;state:string|null };
-  try {
-    result=database.transaction(() => {
+  // The sighting is already committed. The raw event and root receipt share
+  // one commit; buffer.append uses a nested savepoint inside this transaction.
+  const result=database.transaction(() => {
       const existing=database.prepare("select payload_json as payload from buffered_events where id=?").get(event.id) as {
         payload: string;
       }|undefined;
@@ -457,26 +510,8 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
       database.prepare(`insert into capture_root_observations values(?,?,?,?,?)
         on conflict(root_digest,event_id) do update set state=case when payload_digest<>excluded.payload_digest then 'conflict' else state end`)
         .run(rootDigest,event.id,payloadDigest,event.observedAt,state);
-      if(root.source==="claude_code"&&event.sessionId) database.prepare(`
-        insert into capture_root_session_sightings(source,session_id,root_digest,first_seen_at)
-        values('claude_code',?,?,?) on conflict do nothing`).run(event.sessionId,rootDigest,event.observedAt);
       return { inserted,state };
     }).immediate();
-  } catch(error) {
-    // A failed known-root intake is still an observed session. Keep a compact
-    // veto after rollback so a later rootless event cannot inherit A's bind.
-    if(root.source==="claude_code"&&event.sessionId) {
-      database.prepare(`insert into capture_root_session_sightings(source,session_id,root_digest,first_seen_at)
-        values('claude_code',?,?,?) on conflict do nothing`).run(event.sessionId,rootDigest,event.observedAt);
-      sessionSightingCaches.delete(database);
-      observeClaudeRootSession(root,event.sessionId);
-    }
-    throw error;
-  }
-  if(result.state&&root.source==="claude_code"&&event.sessionId) {
-    sessionSightingCaches.get(database)?.sessions.get(event.sessionId)?.add(rootDigest);
-    observeClaudeRootSession(root,event.sessionId);
-  }
   if(result.state==="conflict")
     throw new Error("capture_logical_source_conflict");
   return result.inserted;

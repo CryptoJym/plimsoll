@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { bindCaptureInventory, appendRootObservation, currentDispatchBindingSnapshot, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage, type DispatchBindingSnapshot } from "./capture-root-inventory";
+import { bindCaptureInventory, appendRootObservation, currentDispatchBindingSnapshot, inspectCaptureRoots, recordClaudeRootSessionSighting, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage, type DispatchBindingSnapshot } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import {
@@ -1055,6 +1055,7 @@ export class TranscriptTailer {
         let cursor = candidate.cursor;
         let countedFile = candidate.countedFile;
         let pausedWithWork = false;
+        const sightedSessions = new Set<string>();
         while (true) {
           if (options.signal?.aborted) {
             result.aborted = true;
@@ -1144,6 +1145,25 @@ export class TranscriptTailer {
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            // Persist the first known-root session sighting before the raw,
+            // receipt and cursor transaction. A process kill cannot erase it.
+            if(this.activeCaptureRoot && (read.lines.length>0 || initialState.pending)) {
+              let sessionId=initialState.sessionId;
+              if(!sessionId) for(const line of read.lines) {
+                if(!line.includes('"assistant"')||!line.includes('"usage"')) continue;
+                try {
+                  const parsed=JSON.parse(line) as Record<string,unknown>;
+                  if(parsed.type==="assistant"&&typeof parsed.sessionId==="string") {
+                    sessionId=parsed.sessionId.match(UUID_RE)?.[0]?.toLowerCase();
+                    if(sessionId) break;
+                  }
+                } catch { /* The ordinary parser counts malformed records. */ }
+              }
+              if(sessionId&&!sightedSessions.has(sessionId)) {
+                recordClaudeRootSessionSighting(this.buffer,this.activeCaptureRoot,sessionId,fallbackObservedAt.observedAt);
+                sightedSessions.add(sessionId);
+              }
+            }
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();

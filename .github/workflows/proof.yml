@@ -215,7 +215,7 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r2-window-divergence
 
-      - name: Prove Claude raw row and root sighting commit atomically (PR #429 round two)
+      - name: Prove Claude known-root sighting survives a caught raw intake failure (PR #429 round two)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r2-sighting-atomicity
 
@@ -226,6 +226,18 @@ jobs:
       - name: Prove Claude fanout edge controls (PR #429 round two)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r2-edge-controls
+
+      - name: Prove consecutive Claude dispatch attempts retain attribution (PR #429 round three)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r3-sequential-bind-cli
+
+      - name: Prove a SIGKILL leaves the known-root veto durable (PR #429 round three)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r3-atomicity-crash
+
+      - name: Prove a Claude file records one sighting before its raw rows (PR #429 round three)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r3-tailer-sighting-first
 
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
