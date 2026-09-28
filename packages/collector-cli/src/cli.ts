@@ -713,15 +713,16 @@ function readSecretFromPrompt() {
   if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
     throw new Error("join --token-prompt requires an interactive terminal; use --token-stdin or --token-fd in automation.");
   }
-  process.stderr.write("Join token (input hidden): ");
   process.stdin.setRawMode(true);
   process.stdin.resume();
+  process.stderr.write("Join token (input hidden): ");
   return new Promise<string>((resolve, reject) => {
     let secret = "";
     let onData: (chunk: Buffer | string) => void;
     const cleanup = () => {
       process.stdin.removeListener("data", onData);
       process.stdin.setRawMode?.(false);
+      process.stdin.pause();
       process.stderr.write("\n");
     };
     onData = (chunk: Buffer | string) => {

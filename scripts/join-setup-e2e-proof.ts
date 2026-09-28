@@ -26,9 +26,14 @@ function check(name: string, condition: unknown) {
 }
 
 type ChildResult = { code: number | null; stdout: string; stderr: string };
-function command(env: NodeJS.ProcessEnv, args: string[], stdin = "", executable = cli): Promise<ChildResult> {
+function command(env: NodeJS.ProcessEnv, args: string[], stdin = "", executable = cli,
+  tokenPrompt = false): Promise<ChildResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [executable, ...args], {
+    const program = tokenPrompt ? "python3" : process.execPath;
+    const argv = tokenPrompt
+      ? [path.join(repo, "scripts/lib/join-token-prompt-pty.py"), process.execPath, executable, ...args]
+      : [executable, ...args];
+    const child = spawn(program, argv, {
       cwd: repo, env, stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -245,8 +250,15 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       check(`${name}_no_collector_installed_before_join`, !fs.existsSync(path.join(f.data, "collector.config.json")) &&
         !fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")));
     }
-    const joined = await command(f.env, ["join", "--token-stdin", "--url", `http://127.0.0.1:${remote.port}`],
-      `${token}\n`, f.installedCli);
+    const prompt = name === "fresh";
+    const joined = await command(f.env, ["join", prompt ? "--token-prompt" : "--token-stdin", "--url",
+      `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli, prompt);
+    if (prompt && (joined.code !== 0 || joined.stdout.includes(token) || joined.stderr.includes(token))) {
+      throw new Error(`fresh_prompt_hides_token_and_exits: ${JSON.stringify({ code: joined.code,
+        tokenEchoed: joined.stdout.includes(token) || joined.stderr.includes(token),
+        stderr: joined.stderr.slice(-600), stdoutTail: joined.stdout.slice(-600).replaceAll(token, "<fixture-token>") })}`);
+    }
+    if (prompt) check("fresh_prompt_hides_token_and_exits", true);
     const result = receipt(joined.stdout);
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8")));
     check(`${name}_registers_exactly_two_native_folders`, config.captureRoots?.length === 2 &&
