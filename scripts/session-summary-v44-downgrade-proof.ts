@@ -184,8 +184,20 @@ async function main() {
   assert.equal(drift.scanBoundary, drift.accumulator.scanBoundary);
   assert.equal(drift.cursorObservedAt, drift.accumulator.cursorObservedAt);
   completion.check("0744_cursor_json_and_columns_stay_equal");
-  // A downgraded binary can also create a state row after the v4 schema was
-  // installed. Its INSERT omits every materialized cursor column.
+  // Check the old binary's INSERT shape before a later UPDATE can project it.
+  // Its state write omits every materialized cursor column.
+  db.prepare(`insert into session_sync_summary_state
+    (session_id, schema_version, high_water, checkpoint_id, covered_until,
+     complete, mutation_revision, mode, accumulator_json, updated_at)
+    values (?, 3, 0, null, ?, 0, 0, 'initial', ?, ?)`)
+    .run(lateSession, until, drift.accumulatorJson, until);
+  const insertedFromOldSql = state(db, lateSession);
+  assert.ok(insertedFromOldSql.accumulator.cursorRowid > 0);
+  assert.equal(insertedFromOldSql.scanBoundary, insertedFromOldSql.accumulator.scanBoundary);
+  assert.equal(insertedFromOldSql.cursorRowid, insertedFromOldSql.accumulator.cursorRowid);
+  assert.equal(insertedFromOldSql.cursorObservedAt, insertedFromOldSql.accumulator.cursorObservedAt);
+  db.prepare("delete from session_sync_summary_state where session_id = ?").run(lateSession);
+  // Then have the actual 0.7.44 code insert and finish that session too.
   insert(buffer, 16_001, 16_001, lateSession, "2026-09-22T00:00:00.000Z");
   const inserted = await drain(old, buffer, 10, lateSession);
   assert.equal(inserted.complete, true);
