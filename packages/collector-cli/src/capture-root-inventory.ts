@@ -242,7 +242,7 @@ const claudeDispatchSkips={ conflictingBindings:0,otherRootSeen:0,ambiguousRoot:
 export function claudeDispatchSkipStatus() {
   return { ...claudeDispatchSkips,total:Object.values(claudeDispatchSkips).reduce((a,b)=>a+b,0) };
 }
-/** Rootless transports may use only a binding whose owning root is unambiguous. */
+/** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
   snapshot=currentDispatchBindingSnapshot(),durableSightings?: ReadonlySet<string>): DispatchBinding|null {
   const entries=activeIndexedBindings(snapshot,"claude_code",sessionId,observedAt);
@@ -253,14 +253,10 @@ export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: stri
     claudeDispatchSkips.conflictingBindings++;
     return null;
   }
-  if(entries.length!==1) {
-    claudeDispatchSkips.ambiguousRoot++;
-    return null;
-  }
   const seen=new Set([...claudeSessionRootSightings(sessionId),...(durableSightings??[])]);
   const configuredSeen=[...seen].filter(digest => snapshot.claudeRootDigests.has(digest));
-  const bindingDigest=snapshot.rootDigests.get(entries[0].root.rootId);
-  if(configuredSeen.some(digest => digest!==bindingDigest)) {
+  const boundRootDigests=new Set(entries.map(entry => snapshot.rootDigests.get(entry.root.rootId)));
+  if(configuredSeen.some(digest => !boundRootDigests.has(digest))) {
     claudeDispatchSkips.otherRootSeen++;
     return null;
   }

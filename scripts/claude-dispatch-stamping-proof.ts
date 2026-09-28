@@ -91,8 +91,9 @@ function transcriptLine(session: string, offset: number, index: number) {
 async function main() {
   const claudeA = path.join(home, ".claude", "projects");
   const claudeB = path.join(home, ".claude-seats", "seat-1", "projects");
+  const claudeC = path.join(home, ".claude-seats", "seat-2", "projects");
   const codex = path.join(home, ".codex", "sessions");
-  for (const directory of [claudeA, claudeB, codex, plimsoll]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  for (const directory of [claudeA, claudeB, claudeC, codex, plimsoll]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const base = collectorConfigSchema.parse({ deviceId: "dev_claude-dispatch-fixture",
     port: 49873, uploadUrl: "http://127.0.0.1:1/unused" });
   const buffer = new LocalEventBuffer(path.join(plimsoll, "work-ledger.sqlite"), {
@@ -104,6 +105,7 @@ async function main() {
   const roots = [
     { rootId: "claude-a", profileId: "claude-a", installationEpochId, source: "claude_code" as const, directory: claudeA },
     { rootId: "claude-b", profileId: "claude-b", installationEpochId, source: "claude_code" as const, directory: claudeB },
+    { rootId: "claude-c", profileId: "claude-c", installationEpochId, source: "claude_code" as const, directory: claudeC },
     { rootId: "codex", profileId: "codex", installationEpochId, source: "codex" as const, directory: codex },
   ];
   const configPath = path.join(plimsoll, "collector.config.json");
@@ -112,14 +114,14 @@ async function main() {
     "--session-id", session, "--work-item-id", work, "--project-key", projectKey,
     "--attempt-id", attempt, "--valid-from", at(-10), "--valid-until", at(10),
   ]);
-  assert.equal(bind(sessionId, attemptId).roots, 3);
-  const rooted = (session: string, eventType: "session_start" | "tool_use") => {
+  assert.equal(bind(sessionId, attemptId).roots, 4);
+  const rooted = (session: string, eventType: "session_start" | "tool_use", rootIndex = 0) => {
     const id = crypto.randomUUID();
     const observedAt=at(0);
     const event=aiInteractionEventSchema.parse({ id,sessionId:session,source:"claude_code",
       dataMode:"metadata",eventType,observedAt,
-      metadata:rootEventMetadata(roots[0],id,observedAt,session) });
-    assert.equal(appendRootObservation(buffer,event,roots[0]),true);
+      metadata:rootEventMetadata(roots[rootIndex],id,observedAt,session) });
+    assert.equal(appendRootObservation(buffer,event,roots[rootIndex]),true);
     return id;
   };
   const binding = currentDispatchCaptureRoots()[0].dispatch?.find(row => row.sessionId === sessionId);
@@ -169,39 +171,25 @@ async function main() {
         timestamp: at(offset), prompt: "SENSITIVE_CLAUDE_FIXTURE_PAYLOAD" });
       return id;
     };
-    // `dispatch bind` fans out to every configured root. Source-level hook
-    // credentials cannot identify one of two bound roots, even after A is seen.
-    const ambiguousId = await hook(sessionId, "AssistantResponse", 0);
-    unstamped(buffer, ambiguousId);
-    const statusResponse = await fetch("http://127.0.0.1:49873/status", {
-      headers: { "x-plimsoll-token": auth.managementRead },
-    });
-    assert.equal(statusResponse.status, 200);
-    const status = await statusResponse.json() as { claudeDispatchSkips?: { ambiguousRoot?: number } };
-    assert.ok((status.claudeDispatchSkips?.ambiguousRoot ?? 0) >= 1);
-    const statusCli = await new Promise<string>((resolve, reject) => {
-      const child = spawn(process.execPath, ["--import", path.join(process.cwd(),
-        "node_modules/tsx/dist/loader.mjs"), "packages/collector-cli/src/cli.ts", "status"], {
-        cwd: process.cwd(), env: process.env,
-      });
-      let stdout = "", stderr = "";
-      child.stdout.setEncoding("utf8").on("data", data => { stdout += data; });
-      child.stderr.setEncoding("utf8").on("data", data => { stderr += data; });
-      child.once("error", reject);
-      child.once("close", code => code === 0 ? resolve(stdout) : reject(new Error(
-        `synthetic plimsoll status exited ${code}: ${stderr}`)));
-    });
-    const cliStatus = JSON.parse(statusCli) as { claudeDispatchSkips?: { ambiguousRoot?: number } };
-    assert.ok((cliStatus.claudeDispatchSkips?.ambiguousRoot ?? 0) >= 1);
-    proof.check("anonymous_intake_skips_multi_root_binding_and_status_counts_it");
+    // Identical copies in three Claude roots describe one fanout binding.
+    const kinds = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "AssistantResponse",
+      "Stop", "SessionStart", "Notification"];
+    const fanoutHookIds = [];
+    for (const kind of kinds) fanoutHookIds.push(await hook(sessionId, kind, 0));
+    for (const id of fanoutHookIds) stamped(buffer, id, binding);
+    const priorFanoutOtlp = ids(buffer, "claude_code", sessionId).length;
+    await post("/v1/logs", logPayload(sessionId, 0));
+    await post("/v1/traces", spanPayload(sessionId, 0));
+    const fanoutOtlpIds = ids(buffer, "claude_code", sessionId).slice(priorFanoutOtlp);
+    assert.equal(fanoutOtlpIds.length, 2);
+    for (const id of fanoutOtlpIds) stamped(buffer, id, binding);
+    proof.check("identical_three_root_fanout_stamps_all_hook_kinds_and_otlp");
     // Model a later root B that was not present when A's dispatch was bound.
     // Only A retains this session's binding for the ordinary hook/OTLP cases.
     const uniquelyBound = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
-    uniquelyBound.captureRoots![1].dispatch = uniquelyBound.captureRoots![1].dispatch
-      ?.filter(row => row.sessionId !== sessionId);
+    for (const root of uniquelyBound.captureRoots!.filter(root => root.source === "claude_code" && root.rootId !== "claude-a"))
+      root.dispatch = root.dispatch?.filter(row => row.sessionId !== sessionId);
     fs.writeFileSync(configPath, JSON.stringify(uniquelyBound) + "\n");
-    const kinds = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "AssistantResponse",
-      "Stop", "SessionStart", "Notification"];
     const hookIds = [];
     for (const kind of kinds) hookIds.push(await hook(sessionId, kind, 0));
     for (const id of hookIds) stamped(buffer, id, binding);
@@ -221,8 +209,8 @@ async function main() {
     proof.check("hook_privacy_and_metadata_allowlist_are_unchanged");
 
     const beforeLog = ids(buffer, "claude_code", sessionId).length;
-    await post("/v1/logs", logPayload(sessionId, 0));
-    await post("/v1/traces", spanPayload(sessionId, 0));
+    await post("/v1/logs", logPayload(sessionId, 1));
+    await post("/v1/traces", spanPayload(sessionId, 1));
     const newRows = ids(buffer, "claude_code", sessionId).slice(beforeLog);
     assert.equal(newRows.length, 2);
     for (const id of newRows) stamped(buffer, id, binding);
@@ -249,6 +237,39 @@ async function main() {
       assert.equal(JSON.stringify(envelope(buffer, id)).includes("SENSITIVE_CLAUDE_FIXTURE_PAYLOAD"), false);
     }
     proof.check("otlp_privacy_and_metadata_allowlist_are_unchanged");
+
+    // B has no copy of this binding and independently records the same session.
+    // Anonymous transports must now refuse A's work and report the veto.
+    rooted(sessionId, "session_start", 1);
+    const otherRootHook = await hook(sessionId, "AssistantResponse", 0);
+    unstamped(buffer, otherRootHook);
+    const priorOtherRootOtlp = ids(buffer, "claude_code", sessionId).length;
+    await post("/v1/logs", logPayload(sessionId, 2));
+    await post("/v1/traces", spanPayload(sessionId, 2));
+    const otherRootOtlpIds = ids(buffer, "claude_code", sessionId).slice(priorOtherRootOtlp);
+    assert.equal(otherRootOtlpIds.length, 2);
+    for (const id of otherRootOtlpIds) unstamped(buffer, id);
+    const statusResponse = await fetch("http://127.0.0.1:49873/status", {
+      headers: { "x-plimsoll-token": auth.managementRead },
+    });
+    assert.equal(statusResponse.status, 200);
+    const status = await statusResponse.json() as { claudeDispatchSkips?: { otherRootSeen?: number } };
+    assert.ok((status.claudeDispatchSkips?.otherRootSeen ?? 0) >= 3);
+    const statusCli = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", path.join(process.cwd(),
+        "node_modules/tsx/dist/loader.mjs"), "packages/collector-cli/src/cli.ts", "status"], {
+        cwd: process.cwd(), env: process.env,
+      });
+      let stdout = "", stderr = "";
+      child.stdout.setEncoding("utf8").on("data", data => { stdout += data; });
+      child.stderr.setEncoding("utf8").on("data", data => { stderr += data; });
+      child.once("error", reject);
+      child.once("close", code => code === 0 ? resolve(stdout) : reject(new Error(
+        `synthetic plimsoll status exited ${code}: ${stderr}`)));
+    });
+    const cliStatus = JSON.parse(statusCli) as { claudeDispatchSkips?: { otherRootSeen?: number } };
+    assert.ok((cliStatus.claudeDispatchSkips?.otherRootSeen ?? 0) >= 3);
+    proof.check("other_root_sighting_vetoes_anonymous_intake_and_status_counts_it");
 
     const codexSession = "33333333-3333-4333-8333-333333333333";
     bind(codexSession, "44444444-4444-4444-8444-444444444444");
@@ -287,6 +308,14 @@ async function main() {
     const conflictUsage = ids(buffer, "claude_code", conflictTranscriptSession, "usage_transcript");
     assert.equal(conflictUsage.length, 1);
     unstamped(buffer, conflictUsage[0]);
+    const conflictStatusResponse = await fetch("http://127.0.0.1:49873/status", {
+      headers: { "x-plimsoll-token": auth.managementRead },
+    });
+    assert.equal(conflictStatusResponse.status, 200);
+    const conflictStatus = await conflictStatusResponse.json() as {
+      claudeDispatchSkips?: { conflictingBindings?: number }
+    };
+    assert.ok((conflictStatus.claudeDispatchSkips?.conflictingBindings ?? 0) >= 3);
     proof.check("cross_root_conflict_stamps_no_claude_path");
     const conflictedRestamp = restampDispatch(["--attempt-id", "66666666-6666-4666-8666-666666666666"],
       buffer, currentDispatchCaptureRoots());
