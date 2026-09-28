@@ -829,6 +829,7 @@ async function reviewRegressions() {
         add(1);
         await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
         let calls = 0;
+        let erasureDeferred = false;
         let result: Awaited<ReturnType<typeof runSessionSync>> | undefined;
         let elapsedMs = 0;
         for (let attempt = 1; calls === 0; attempt += 1) {
@@ -840,7 +841,12 @@ async function reviewRegressions() {
               return new Response("{}", { status: 503 });
             }) as typeof fetch,
             sleep: async () => {
-              buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(451));
+              try {
+                buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(451));
+              } catch (error) {
+                assert.match(String(error), /session_sync_upload_lease/);
+                erasureDeferred = true;
+              }
             },
             log: () => undefined,
           });
@@ -850,11 +856,19 @@ async function reviewRegressions() {
           assert.ok(attempt <= bound,
             JSON.stringify({ attempt, bound, elapsedMs, pending: result.pendingSummaryReasons }));
         }
-        assert.equal(calls, 1);
+        assert.equal(calls, 2, "the 503 retry reaches the endpoint under the same held lease");
         assert.ok(result);
         assert.equal(result.sentSessions, 0);
-        assert.equal(result.summaryComplete, false);
-        assert.ok(result.pendingSummarySessionIds.includes(sessionId));
+        assert.equal(result.ok, false);
+        assert.equal(erasureDeferred, true, "uncertain send keeps erasure fenced");
+        assert.equal(result.summaryComplete, true, "snapshot was complete before the held send");
+        assert.equal((buffer.database.prepare("select count(*) as n from buffered_events where id = ?")
+          .get(uuid(451)) as { n: number }).n, 1);
+        // Advance this disposable fixture's lease clock to its bounded expiry.
+        buffer.database.prepare(`update session_sync_upload_leases
+          set lease_expires_at = '2000-01-01T00:00:00.000Z' where session_id = ?`).run(sessionId);
+        assert.equal(buffer.database.prepare("delete from buffered_events where id = ?")
+          .run(uuid(451)).changes, 1);
       } else if (name === "hard_bounds") {
         for (let index = 1; index <= 5_200; index += 1) {
           insertRaw(buffer, {
@@ -1098,6 +1112,12 @@ async function reviewRegressions() {
         });
         assert.equal(transmitted, null, "a body crossed the handoff after erasure");
         assert.equal(result.sentSessions, 0);
+        assert.equal((buffer.database.prepare("select count(*) as n from session_sync_upload_leases")
+          .get() as { n: number }).n, 1, "uncertain handoff keeps a durable lease");
+        // The next attempt begins after that bounded lease expires. The
+        // disposable fixture advances only its local lease row clock.
+        buffer.database.prepare(`update session_sync_upload_leases
+          set lease_expires_at = '2000-01-01T00:00:00.000Z' where session_id = ?`).run(sessionId);
         const external = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
         try {
           let externalErasureBlocked = false;
