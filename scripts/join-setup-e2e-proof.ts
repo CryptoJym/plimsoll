@@ -211,7 +211,7 @@ function fixture(name: string, port: number) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const bin = path.join(directory, "bin");
   stubLaunchctl(bin);
-  const installedCli = path.join(bin, "plimsoll");
+  const installedCli = path.join(bin, "plimsoll.mjs");
   fs.symlinkSync(cli, installedCli);
   const state = path.join(directory, "launchctl.state");
   const trace = path.join(directory, "launchctl.trace");
@@ -287,8 +287,15 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       const installed = await command(f.env, ["install-launch-agent", "--load"], "",
         name === "running_0744_layout" && process.env.PLIMSOLL_PROOF_0744_CLI
           ? process.env.PLIMSOLL_PROOF_0744_CLI : f.installedCli);
-      check(`${name}_fixture_collector_started_before_join`, installed.code === 0 && fs.existsSync(f.state) &&
-        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      const started = installed.code === 0 && fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      if (!started) throw new Error(`${name}_fixture_collector_started_before_join: ${JSON.stringify({
+        code: installed.code, stdout: installed.stdout.slice(-1200), stderr: installed.stderr.slice(-1200),
+        trace: fs.existsSync(f.trace) ? fs.readFileSync(f.trace, "utf8") : null,
+        daemonLog: fs.existsSync(f.env.PLIMSOLL_PROOF_DAEMON_LOG!)
+          ? fs.readFileSync(f.env.PLIMSOLL_PROOF_DAEMON_LOG!, "utf8").slice(-1200) : null,
+      })}`);
+      check(`${name}_fixture_collector_started_before_join`, true);
       if (name === "crash_after_bootout") f.env.PLIMSOLL_PROOF_CRASH_AFTER_BOOTOUT = "1";
       if (name === "edited_manifest") {
         const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
@@ -324,6 +331,11 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     }
     if (prompt) check("fresh_prompt_hides_token_and_exits", true);
     const result = receipt(joined.stdout);
+    if (name === "fresh" && process.env.PLIMSOLL_PROOF_TRANSCRIPT === "1") {
+      console.log(JSON.stringify({ scenario: "fresh_transcript", lines: joined.stdout.split("\n")
+        .filter((line) => line.startsWith("Will record ") ||
+          line.startsWith("Found, not recorded:") || line.startsWith("Connected to ")) }));
+    }
     if (name === "partial_roots") {
       const inventoryExists = fs.existsSync(path.join(f.data, "collector.config.json"));
       console.log(JSON.stringify({ scenario: name, joinStatus: result.status, joinCode: joined.code,
@@ -375,12 +387,19 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       return;
     }
     const expectedRoots = name === "mixed_roots" ? 3 : 2;
-    check(`${name}_registers_native_folders_together`, config.captureRoots?.length === expectedRoots &&
+    const rootsTogether = config.captureRoots?.length === expectedRoots &&
       config.captureRoots.some((entry) => entry.directory === studio && entry.source === "codex") &&
       config.captureRoots.some((entry) => entry.directory === codex && entry.source === "codex") &&
       (name !== "mixed_roots" || config.captureRoots.some((entry) =>
         entry.directory === path.join(f.home, ".claude", "projects") && entry.source === "claude_code")) &&
-      !config.captureRoots.some((entry) => entry.directory === unrelated));
+      !config.captureRoots.some((entry) => entry.directory === unrelated);
+    if (!rootsTogether) throw new Error(`${name}_registers_native_folders_together: ${JSON.stringify({
+      roots: config.captureRoots, joinCode: joined.code, joinStatus: result.status,
+      reason: result.reason, stderr: joined.stderr.slice(-1200), stdout: joined.stdout.slice(-1200),
+      cloudJoins: remote.joins.length, cloudUploads: remote.uploads.length,
+      trace: fs.existsSync(f.trace) ? fs.readFileSync(f.trace, "utf8") : null,
+    })}`);
+    check(`${name}_registers_native_folders_together`, true);
     if (name === "mixed_roots") {
       const receipts = fs.readdirSync(path.join(f.data, "receipts"))
         .filter((file) => file.startsWith("capture-roots-add-") && file.endsWith(".json"));
