@@ -2346,7 +2346,7 @@ export class LocalEventBuffer {
 
   private appendInCurrentTransaction(
     event: AiInteractionEvent, suppressedFields: string[] = [], project = true,
-    firstReceivedAt?: string,
+    firstReceivedAt?: string, historyImportNoLiveSibling = false,
   ) {
     if (!liveUsageAppendAllowed(this.db, event)) return { appended: false, repoContextRequest: null };
     if (event.dataMode === "evidence") {
@@ -2484,7 +2484,9 @@ export class LocalEventBuffer {
       // The raw row, privacy-safe fact delta, and delivery envelope share the
       // caller's SQLite transaction. Projection failure is contained as a
       // durable repair receipt so capture remains available.
-      if (project) this.projection.tryApplyRawRow(Number(result.lastInsertRowid));
+      if (project) this.projection.tryApplyRawRow(Number(result.lastInsertRowid), new Date(),
+        historyImportNoLiveSibling && this.historyImportEpoch !== null &&
+        (event.eventType === "usage_rollout" || event.eventType === "usage_transcript"));
       // Otherwise the insert trigger's durable repair receipt remains queued.
       // Capture admission never depends on finishing all derived aggregates.
       // Runtime learning facts (#156) promote from the same durable moment.
@@ -2615,12 +2617,12 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields?: string[],
-    options?: { integrityReceipt?: false | undefined },
+    options?: { integrityReceipt?: false | undefined; historyImportNoLiveSibling?: boolean },
   ): boolean;
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] | undefined,
-    options: { integrityReceipt: true; firstReceivedAt?: string },
+    options: { integrityReceipt: true; firstReceivedAt?: string; historyImportNoLiveSibling?: boolean },
   ): {
     appended: boolean;
     deduplicated?: true;
@@ -2630,14 +2632,16 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] = [],
-    options: { integrityReceipt?: boolean; firstReceivedAt?: string } = {},
+    options: { integrityReceipt?: boolean; firstReceivedAt?: string;
+      historyImportNoLiveSibling?: boolean } = {},
   ) {
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
     let result: ReturnType<LocalEventBuffer["appendInCurrentTransaction"]>;
     try {
       const run = () => {
-        const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
+        const appended = this.appendInCurrentTransaction(event, suppressedFields, true,
+          options.firstReceivedAt, options.historyImportNoLiveSibling);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
           handoffs,

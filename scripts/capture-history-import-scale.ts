@@ -142,6 +142,9 @@ async function main() {
     const probeReceipt = JSON.parse(probeOutput.trim()) as { count: number; maxMs: number; p99Ms: number; errors: number };
     const ledgerRows = (buffer.database.prepare(`select count(*) as n from buffered_events
       where event_type='usage_rollout'`).get() as { n: number }).n;
+    const projected = buffer.database.prepare(`select count(*) as rows,sum(input_tokens) as input
+      from dashboard_event_facts where event_type='usage_rollout'`).get() as
+      { rows: number; input: number };
     const probeRows = (buffer.database.prepare(`select count(*) as n from history_import_probe`).get() as { n: number }).n;
     console.log(JSON.stringify({ schema: "capture_history_scale_v1", roots: ROOTS,
       historyRows: HISTORY_ROWS, usageRows: USAGE_ROWS,
@@ -149,9 +152,10 @@ async function main() {
       peakRssBytes: Math.max(peakRss, process.resourceUsage().maxRSS * 1024),
       maxWriterSliceMs, maxWriterWorkMs, maxWriterRowMs, overBudgetSlices,
       writerSlices, timeBudgetStops, writerSliceHistogram,
-      intake: probeReceipt, ledgerRows }, null, 2));
+      intake: probeReceipt, ledgerRows, projected }, null, 2));
     assert.equal(imported, USAGE_ROWS);
     assert.equal(ledgerRows, USAGE_ROWS);
+    assert.deepEqual(projected, { rows: USAGE_ROWS, input: USAGE_ROWS });
     assert.equal(probeRows, probeReceipt.count);
     assert.equal(Object.values(writerSliceHistogram).reduce((sum, count) => sum + count, 0), writerSlices);
     // A million-row host must exercise the deadline, not merely the row cap.

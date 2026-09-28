@@ -83,11 +83,17 @@ async function main() {
       sum(output_tokens) as output from buffered_events where session_id=?`).get(session) as
       { rows: number; input: number; output: number };
     assert.deepEqual(totals, { rows: 512, input: 512, output: 512 });
+    const projected = buffer.database.prepare(`select count(*) as rows,sum(input_tokens) as input
+      from dashboard_event_facts where event_type='usage_rollout'`).get() as { rows: number; input: number };
+    assert.deepEqual(projected, { rows: 512, input: 512 });
+    assert.equal((buffer.database.prepare(`select count(*) as rows from dashboard_projection_repairs`)
+      .get() as { rows: number }).rows, 0);
     const rerun = await applyCaptureHistory(buffer, captureRoot);
     assert.equal(rerun.importedRows, 0);
-    console.log(JSON.stringify({ checks: 11, cursor: cursor.position,
+    console.log(JSON.stringify({ checks: 13, cursor: cursor.position,
       maxWriterSliceMs: receipt.maxWriterSliceMs, timeBudgetStops: receipt.timeBudgetStops,
-      writerSliceHistogram: receipt.writerSliceHistogram, rows: totals.rows }));
+      writerSliceHistogram: receipt.writerSliceHistogram, rows: totals.rows,
+      projectedRows: projected.rows }));
   } finally {
     buffer.close();
     fixture.restore();

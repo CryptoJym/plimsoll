@@ -272,7 +272,7 @@ export function captureRootObservationPayloadDigest(value: Pick<import("../../sh
   ])).digest("hex");
 }
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
-export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined): boolean {
+export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined,historyImportNoLiveSibling=false): boolean {
   const parsedAccount = root?.account ? accountAssertionV1Schema.safeParse(root.account) : null;
   const trustedEpoch = root && parsedAccount?.success && accountAssertionContains(parsedAccount.data, event.observedAt) &&
     event.metadata?.installationEpochId===root.installationEpochId ? root.installationEpochId : undefined;
@@ -308,7 +308,7 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
   let inserted=false;
   if(!alreadyObserved) {
     if(trustedEpoch) captureRootEpochCapabilities.set(event,trustedEpoch);
-    try { inserted=buffer.append(event,[]); }
+    try { inserted=buffer.append(event,[],{historyImportNoLiveSibling}); }
     finally { captureRootEpochCapabilities.delete(event); }
   }
   // Another connection may have enrolled between the first check and append.
