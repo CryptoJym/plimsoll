@@ -571,6 +571,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-isolation
 
+      - name: Prove one-command join setup with fixture cloud and LaunchAgent
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-setup-e2e
+
       - name: Prove future-only enrollment withholds pre-join history (eco-6hoxj.163.22)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:enrollment-privacy
