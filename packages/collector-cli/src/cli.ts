@@ -3089,6 +3089,9 @@ async function main() {
               until: sessionPlan.until,
               ledgerDb: buffer.database,
               incremental: true,
+              // A settled skew refusal must stop the next foreground chunk
+              // before this daemon sync cycle can enter the legacy rebuild.
+              concurrency: 1,
               log: () => undefined,
             });
             const summaryPending = sessionResult.pendingSummarySessionIds;

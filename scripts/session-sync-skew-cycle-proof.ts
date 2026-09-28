@@ -72,7 +72,7 @@ async function main() {
     const result = await runSessionSync(config(48316), {
       ledgerDb: multi.database, sessionIds: [firstId, secondId],
       until: new Date(Date.now() + 60_000).toISOString(),
-      incremental: true, batchSize: 1, concurrency: 2,
+      incremental: true, batchSize: 1, concurrency: 1,
       maxAttemptsPerBatch: 1, delayMs: 0, log: () => undefined,
       fetchImpl: (async () => {
         directRequests += 1;

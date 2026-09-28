@@ -1297,10 +1297,7 @@ export async function runSessionSync(
     throw new Error(`--until must be an ISO timestamp, got: ${until}`);
   }
   const batchSize = Math.max(1, Math.min(options.batchSize ?? 500, 500));
-  // Incremental batches share durable lease and skew state. Serialize them
-  // so a settled refusal stops the next chunk before handoff. Read-only
-  // full walks retain their configured concurrency.
-  const concurrency = options.incremental ? 1 : Math.max(1, Math.min(options.concurrency ?? 2, 8));
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, 8));
   const delayMs = Math.max(0, options.delayMs ?? 100);
   const maxAttempts = Math.max(1, Math.min(options.maxAttemptsPerBatch ?? 5, 10));
   const appVersion = options.appVersion ?? "0.1.0";
