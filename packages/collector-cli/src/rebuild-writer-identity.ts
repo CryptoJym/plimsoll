@@ -8,11 +8,15 @@ export type RebuildWriterIdentity = Readonly<{
 }>;
 
 let current: RebuildWriterIdentity | null = null;
+// A caller's PATH can intentionally shadow ps (for example, the read-only
+// doctor fixture). Durable writer ownership must observe the kernel process
+// through the same trusted executable when acquired and when reaped.
+const REBUILD_IDENTITY_PS = "/bin/ps";
 
 /** Both the opener token and durable SQLite row name the same process run. */
 export function currentRebuildWriterIdentity(): RebuildWriterIdentity {
   if (current) return current;
-  const processStartFingerprint = readUtcProcessStartFingerprint(process.pid);
+  const processStartFingerprint = readUtcProcessStartFingerprint(process.pid, REBUILD_IDENTITY_PS);
   if (!processStartFingerprint) throw new Error("writer_identity_unavailable");
   current = { pid: process.pid, processStartFingerprint,
     processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM };
@@ -35,5 +39,5 @@ export function rebuildWriterIdentityLiveness(value: unknown): ProcessIdentityLi
       !/^sha256:[0-9a-f]{64}$/.test(record.processStartFingerprint) ||
       record.processStartFingerprintAlgorithm !== UTC_PROCESS_START_ALGORITHM) return "indeterminate";
   return classifyProcessIdentity({ pid, processStartFingerprint: record.processStartFingerprint,
-    processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM });
+    processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM }, REBUILD_IDENTITY_PS);
 }

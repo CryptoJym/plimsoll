@@ -364,9 +364,9 @@ function processIsRunning(pid: number) {
 // timezone with a C locale. The algorithm, its text handling, and its hash
 // domain are immutable — changing any of them would invalidate persisted
 // legacy records.
-export function readProcessStartFingerprint(pid: number) {
+export function readProcessStartFingerprint(pid: number, psExecutable = "ps") {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+  const result = spawnSync(psExecutable, ["-p", String(pid), "-o", "lstart="], {
     encoding: "utf8",
     env: { ...process.env, LANG: "C", LC_ALL: "C" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -385,9 +385,9 @@ export function readProcessStartFingerprint(pid: number) {
 // UTC v2 observation: the same ps source rendered under TZ=UTC so the text
 // is identical regardless of the observer's timezone or locale. Fresh hash
 // domain; the legacy domain is never reused.
-export function readUtcProcessStartFingerprint(pid: number) {
+export function readUtcProcessStartFingerprint(pid: number, psExecutable = "ps") {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+  const result = spawnSync(psExecutable, ["-p", String(pid), "-o", "lstart="], {
     encoding: "utf8",
     env: { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC" },
     stdio: ["ignore", "pipe", "pipe"],
@@ -406,10 +406,11 @@ export function readUtcProcessStartFingerprint(pid: number) {
 function readProcessStartFingerprintFor(
   algorithm: string,
   pid: number,
+  psExecutable = "ps",
 ): string | null {
   return algorithm === UTC_PROCESS_START_ALGORITHM
-    ? readUtcProcessStartFingerprint(pid)
-    : readProcessStartFingerprint(pid);
+    ? readUtcProcessStartFingerprint(pid, psExecutable)
+    : readProcessStartFingerprint(pid, psExecutable);
 }
 
 const PROCESS_TREE_MAX_NODES = 64;
@@ -571,6 +572,7 @@ export function portOwnershipAgainstMembers(
 // (unreadable ps, EPERM, unknown/mismatched algorithm) is indeterminate.
 export function classifyProcessIdentity(
   identity: ProcessIdentity,
+  psExecutable = "ps",
 ): ProcessIdentityLiveness {
   try {
     process.kill(identity.pid, 0);
@@ -586,6 +588,7 @@ export function classifyProcessIdentity(
   const observed = readProcessStartFingerprintFor(
     identity.processStartFingerprintAlgorithm ?? LEGACY_PROCESS_START_ALGORITHM,
     identity.pid,
+    psExecutable,
   );
   if (!observed) return "indeterminate";
   if (observed === identity.processStartFingerprint) return "live";
