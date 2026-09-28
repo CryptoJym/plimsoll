@@ -118,9 +118,17 @@ function validatedRecoveryState(ledgerPath: string) {
   canonicalRecoveryLedgerPath(ledgerPath);
   const state = readState(ledgerPath);
   if (!state) return null;
+  const backupPrefix = `${ledgerPath}.pre-lean-`;
+  const backupName = typeof state.backupPath === "string" && state.backupPath.startsWith(backupPrefix)
+    ? state.backupPath.slice(backupPrefix.length) : "";
+  // Old in-flight states used a date-only backup; new states bind the backup
+  // basename to their durable nonce so another same-day rebuild can retain it.
+  const legacyBackup = /^\d{4}-\d{2}-\d{2}$/.test(backupName);
+  const nonceBackup = typeof state.startedAt === "string" &&
+    backupName === `${state.startedAt.slice(0, 10)}-${state.nonce}`;
   if (state.version !== 1 || !/^[0-9a-f-]{36}$/i.test(state.nonce) ||
     state.targetPath !== targetPath(ledgerPath) ||
-    !new RegExp(`^${ledgerPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.pre-lean-\\d{4}-\\d{2}-\\d{2}$`).test(state.backupPath)) {
+    !(legacyBackup || (nonceBackup && /^\d{4}-\d{2}-\d{2}-[0-9a-f-]{36}$/i.test(backupName)))) {
     fail("rebuild_state_path_invalid");
   }
   try {
@@ -140,7 +148,9 @@ function readState(ledgerPath: string): RebuildState | null {
 }
 function writeState(ledgerPath: string, state: RebuildState) {
   const file = statePath(ledgerPath);
-  const temporary = `${file}.${state.nonce}.tmp`;
+  // A killed write can leave its temp behind. Every later state transition,
+  // including recovery of the same nonce, needs an exclusive fresh name.
+  const temporary = `${file}.${state.nonce}.${randomUUID()}.tmp`;
   const descriptor = fs.openSync(temporary, "wx", 0o600);
   try {
     fs.writeFileSync(descriptor, `${JSON.stringify(state)}\n`);
@@ -423,7 +433,8 @@ function removeIfExists(file: string) {
 }
 /** The hard-linked fence is published only after its owner identity is durable.
  * A legacy PID-only lock is recoverable only if that PID no longer exists. */
-function staleRecoveryLock(ledgerPath: string) {
+type LockObservation = { raw: string; dev: number; ino: number };
+function observeLock(ledgerPath: string): LockObservation {
   const file = lockPath(ledgerPath);
   let raw: string;
   let descriptor: number;
@@ -433,15 +444,20 @@ function staleRecoveryLock(ledgerPath: string) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") fail("rebuild_lock_missing");
     return fail("rebuild_owner_unverified");
   }
+  let stat: fs.Stats;
   try {
-    const stat = fs.fstatSync(descriptor);
+    stat = fs.fstatSync(descriptor);
     if (!stat.isFile() || stat.size > 4096) fail("rebuild_owner_unverified");
     raw = fs.readFileSync(descriptor, "utf8");
   } finally { fs.closeSync(descriptor); }
+  return { raw, dev: stat.dev, ino: stat.ino };
+}
+function staleRecoveryLock(ledgerPath: string): LockObservation {
+  const observed = observeLock(ledgerPath);
   let identity: unknown;
-  if (/^[1-9]\d*\n?$/.test(raw)) identity = { pid: Number(raw.trim()) };
+  if (/^[1-9]\d*\n?$/.test(observed.raw)) identity = { pid: Number(observed.raw.trim()) };
   else {
-    try { identity = JSON.parse(raw); }
+    try { identity = JSON.parse(observed.raw); }
     catch { fail("rebuild_owner_unverified"); }
     if (!identity || typeof identity !== "object" || Array.isArray(identity) ||
       !("processStartFingerprint" in identity) ||
@@ -450,14 +466,30 @@ function staleRecoveryLock(ledgerPath: string) {
   const liveness = rebuildWriterIdentityLiveness(identity);
   if (liveness === "live") fail("rebuild_owner_active");
   if (liveness !== "stale") fail("rebuild_owner_unverified");
-  return raw;
+  return observed;
 }
-function removeStaleRecoveryLock(ledgerPath: string, observed: string) {
+function sameLock(left: LockObservation, right: LockObservation) {
+  return left.raw === right.raw && left.dev === right.dev && left.ino === right.ino;
+}
+function removeStaleRecoveryLock(ledgerPath: string, observed: LockObservation) {
   // A second recovery must not remove a lock whose owner changed while this
-  // recovery verified SQLite. Revalidate both contents and process identity.
-  if (staleRecoveryLock(ledgerPath) !== observed) fail("rebuild_owner_changed");
+  // recovery verified SQLite. Revalidate inode, contents and process identity.
+  if (!sameLock(staleRecoveryLock(ledgerPath), observed)) fail("rebuild_owner_changed");
   fs.unlinkSync(lockPath(ledgerPath));
   fsyncDirectory(lockPath(ledgerPath));
+}
+function removeOwnedRebuildLock(ledgerPath: string, observed: LockObservation) {
+  // Never let a failed run's later cleanup unlink a successor's fence.
+  let current: LockObservation;
+  try { current = observeLock(ledgerPath); }
+  catch (error) {
+    if (error instanceof Error && error.message === "rebuild_lock_missing") return false;
+    throw error;
+  }
+  if (!sameLock(current, observed)) return false;
+  fs.unlinkSync(lockPath(ledgerPath));
+  fsyncDirectory(lockPath(ledgerPath));
+  return true;
 }
 function removeSqliteSidecars(ledgerPath: string) {
   removeIfExists(`${ledgerPath}-wal`);
@@ -497,16 +529,15 @@ export function recoverInterruptedRebuild(ledgerPath: string) {
     removeStaleRecoveryLock(ledgerPath, staleLock);
     return { status: "recovered_stale_lock" as const };
   }
-  if (state.phase === "complete") {
-    // The replacement was verified and the daemon resumed before this state
-    // was written. A crash before unlink leaves only the stale fence behind;
-    // the resumed daemon may still have this ledger open. There is no rename
-    // to perform, so its live connection does not prevent retiring the fence.
+  if (["complete", "failed", "recovered"].includes(state.phase)) {
+    // The replacement was verified and resumed, or rollback/recovery was
+    // finalized before its lock unlink. There is no rename left to perform.
     const db = new Database(ledgerPath, { readonly: true, fileMustExist: true });
     try { integrity(db); } finally { db.close(); }
+    if (state.phase === "complete") removeIfExists(rebuildResumeClaimPath(ledgerPath, state.nonce));
     removeStaleRecoveryLock(ledgerPath, staleLock);
-    removeIfExists(rebuildResumeClaimPath(ledgerPath, state.nonce));
-    return { status: "recovered_completed_rebuild" as const };
+    return { status: state.phase === "complete" ? "recovered_completed_rebuild" as const :
+      "recovered_untouched_source" as const };
   }
   if (state.phase === "resume_started") fail("forward_repair_only");
   assertUnused(ledgerPath);
@@ -519,8 +550,8 @@ export function recoverInterruptedRebuild(ledgerPath: string) {
   removeIfExists(state.targetPath);
   const db = new Database(ledgerPath, { readonly: true, fileMustExist: true });
   try { integrity(db); } finally { db.close(); }
-  removeStaleRecoveryLock(ledgerPath, staleLock);
   advance(ledgerPath, state, "recovered", "interrupted_before_resume");
+  removeStaleRecoveryLock(ledgerPath, staleLock);
   return { status: "recovered_untouched_source" as const };
 }
 
@@ -541,16 +572,28 @@ export async function rebuildLedger(input: RebuildRunInput) {
   let state: RebuildState | null = null;
   let resumeStarted = false;
   let ownsLock = false;
+  let ownedLock: LockObservation | null = null;
+  const retireOwnedLock = () => {
+    if (!ownedLock) return true;
+    const observed = ownedLock;
+    ownedLock = null; // A failed run must never make a second unlink attempt.
+    return removeOwnedRebuildLock(ledgerPath, observed);
+  };
   try {
     const stagingLock = `${lockPath(ledgerPath)}.${randomUUID()}.tmp`;
     const descriptor = fs.openSync(stagingLock, "wx", 0o600);
+    const contents = `${JSON.stringify(currentRebuildWriterIdentity())}\n`;
+    let stagedLock!: LockObservation;
     try {
-      fs.writeFileSync(descriptor, `${JSON.stringify(currentRebuildWriterIdentity())}\n`);
+      fs.writeFileSync(descriptor, contents);
       fs.fsyncSync(descriptor);
+      const stat = fs.fstatSync(descriptor);
+      stagedLock = { raw: contents, dev: stat.dev, ino: stat.ino };
     } finally { fs.closeSync(descriptor); }
     try {
       fs.linkSync(stagingLock, lockPath(ledgerPath));
       ownsLock = true;
+      ownedLock = stagedLock;
       fsyncDirectory(lockPath(ledgerPath));
     } finally { removeIfExists(stagingLock); }
     assertUnused(ledgerPath);
@@ -560,10 +603,11 @@ export async function rebuildLedger(input: RebuildRunInput) {
     try { if (readActiveRebuildWriterLeases(leaseDb).length > 0) fail("writer_not_quiesced"); }
     finally { leaseDb.close(); }
     const nonce = randomUUID();
-    const backupPath = `${ledgerPath}.pre-lean-${new Date().toISOString().slice(0, 10)}`;
+    const startedAt = new Date().toISOString();
+    const backupPath = `${ledgerPath}.pre-lean-${startedAt.slice(0, 10)}-${nonce}`;
     if (fs.existsSync(backupPath)) fail("old_file_already_exists");
     state = { version: 1, nonce, phase: "paused", stage: input.stage, backupPath,
-      targetPath: targetPath(ledgerPath), startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      targetPath: targetPath(ledgerPath), startedAt, updatedAt: startedAt };
     writeState(ledgerPath, state);
     const db = new Database(ledgerPath, { fileMustExist: true, timeout: 0 });
     try {
@@ -604,7 +648,7 @@ export async function rebuildLedger(input: RebuildRunInput) {
     // command may open the verified replacement while this fence remains.
     await input.resume();
     state = advance(ledgerPath, state, "complete");
-    removeIfExists(lockPath(ledgerPath));
+    if (!retireOwnedLock()) fail("rebuild_owner_changed");
     removeIfExists(rebuildResumeClaimPath(ledgerPath, state.nonce));
     return { status: "rebuilt" as const, pauseMs: performance.now() - pausedAt,
       backupPath, quiesce: { ...receipt, fencedOwnership }, ...preflight };
@@ -619,16 +663,12 @@ export async function rebuildLedger(input: RebuildRunInput) {
         }
         removeIfExists(targetPath(ledgerPath));
         if (state) advance(ledgerPath, state, "failed", error instanceof Error ? error.message : "unknown");
-        removeIfExists(lockPath(ledgerPath));
+        retireOwnedLock();
       }
       // Quiesce has already unloaded the daemon even when a competing rebuild
       // wins the lock race. Resume ours without touching that owner's lock.
       await input.resume();
     }
     throw error;
-  } finally {
-    if (ownsLock && (!state || !["vacuum", "verified", "swapped"].includes(readState(ledgerPath)?.phase ?? ""))) {
-      removeIfExists(lockPath(ledgerPath));
-    }
   }
 }
