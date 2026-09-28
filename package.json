@@ -51,6 +51,8 @@
     "proof:maintenance-rebuild-r4-live": "tsx scripts/maintenance-rebuild-r4-live-proof.ts",
     "proof:maintenance-rebuild-r4-spool": "tsx scripts/maintenance-rebuild-r4-spool-proof.ts",
     "proof:maintenance-rebuild-r4-lease": "tsx scripts/maintenance-rebuild-r4-lease-proof.ts",
+    "proof:maintenance-rebuild-r6-lock": "tsx scripts/maintenance-rebuild-r6-lock-proof.ts",
+    "proof:maintenance-rebuild-r6-refusals": "tsx scripts/maintenance-rebuild-r6-refusals-proof.ts",
     "proof:maintenance-rebuild-writers": "tsx scripts/maintenance-rebuild-writer-routes-proof.ts",
     "proof:maintenance-rebuild-contract": "tsx scripts/maintenance-rebuild-contract-proof.ts",
     "proof:collector-reliability": "tsx scripts/collector-reliability-proof.ts",

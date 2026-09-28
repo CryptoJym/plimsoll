@@ -123,6 +123,7 @@ import {
   scanProducerProcesses,
 } from "./producer-processes";
 import { healthzProof, isHealthzChallenge } from "./status-summary";
+import { resolveMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -729,6 +730,7 @@ export function createCollectorServer(
   const healthzKey = crypto.randomBytes(32);
   const localAuth = options.localAuth ?? null;
   const authEnforced = localAuth !== null;
+  const maintenanceRefusalHome = options.localAuthHome ?? options.liveProducerHome ?? options.hookSpoolHome;
   // Keep one bounded read result, not another persistent ledger or worker.
   let jevCache: { days: number; at: number; snapshot: JevAnalysisSnapshot } | null = null;
   const sourceRateLimiter = createSourceRateLimiter(
@@ -1315,6 +1317,9 @@ export function createCollectorServer(
         const result = packet.producerId !== binding.binding.producerId || packet.credentialId !== binding.binding.credentialId
           ? liveReceipt(packet, digest, "enrollment_rejected", false, null)
           : ingestLiveUsage(buffer, packet, digest, authenticate);
+        if (result.committed && maintenanceRefusalHome) {
+          resolveMaintenanceRebuildRefusal(maintenanceRefusalHome, "live", selected.producerId, bytes);
+        }
         response.writeHead(result.disposition === "retryable" ? 503 : result.disposition === "enrollment_rejected" ? 403 : 200,
           { "content-type": "application/json", "cache-control": "no-store" });
         response.end(canonicalJson(result));
@@ -1851,6 +1856,10 @@ export function createCollectorServer(
         }
 
         const transportPath = canonicalOtlpTransportPath(request.url);
+        const retireMaintenanceRefusal = () => {
+          if (maintenanceRefusalHome) resolveMaintenanceRebuildRefusal(maintenanceRefusalHome,
+            "otlp", `${source}:${transportPath}`, body.text);
+        };
         const repoLabels: Array<{ hash: string; label: string }> = [];
         const exploded = explodeOtlpPayload(parsedEnvelope, {
           policy: config.policy,
@@ -1873,6 +1882,7 @@ export function createCollectorServer(
           },
         });
         const answerSpooled = (spooledEvents: number, spooledMetricSamples: number) => {
+          retireMaintenanceRefusal();
           response.writeHead(202, { "content-type": "application/json" });
           response.end(JSON.stringify({
             status: "otlp_spooled",
@@ -1937,6 +1947,7 @@ export function createCollectorServer(
             return;
           }
           rejectionDiagnostics.recordAccepted(source);
+          retireMaintenanceRefusal();
           response.writeHead(202, { "content-type": "application/json" });
           response.end(
             JSON.stringify({
@@ -1989,6 +2000,7 @@ export function createCollectorServer(
           return;
         }
         rejectionDiagnostics.recordAccepted(source);
+        retireMaintenanceRefusal();
         if (normalized.futureTimestampClampedEvents) {
           console.log(JSON.stringify({
             status: "hook_capture",

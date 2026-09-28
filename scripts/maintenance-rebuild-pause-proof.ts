@@ -103,15 +103,10 @@ async function main() {
       assert.equal(hookResult.recovered, 1);
       const otlpResult = await spool.drain(buffer);
       assert.equal(otlpResult.replayed, 0);
-      const drained = captureSpoolState(home);
-      assert.equal(drained.pendingFiles, 0);
-      assert.equal(drained.maintenanceRebuildPending, false);
-      assert.equal(maintenanceRebuildPauseSeen(home), false, "the drained pause marker is removed");
-      const unrelated = writeHookSpoolFile({ home, source: "claude_code", body: hookBody });
-      assert.ok(unrelated);
-      assert.equal(captureSpoolState(home).maintenanceRebuildPending, false,
-        "later unrelated backlog is not labelled as rebuild pending");
-      fs.unlinkSync(unrelated.path);
+      const awaitingOtlpRetry = captureSpoolState(home);
+      assert.equal(awaitingOtlpRetry.pendingFiles, 0);
+      assert.equal(awaitingOtlpRetry.maintenanceRebuildPending, true,
+        "the authenticated OTLP 503 remains unresolved after the hook drain");
       const normal = createCollectorServer(config, buffer, { localAuth: auth, localAuthHome: home });
       try {
         await new Promise<void>((resolve) => normal.listen(0, "127.0.0.1", resolve));
@@ -128,6 +123,15 @@ async function main() {
         assert.equal(rows.length, 3, "one client hook, one retried hook and one deterministic OTLP event");
         assert.equal(new Set(rows.map((row) => row.id)).size, 3);
       } finally { await new Promise<void>((resolve) => normal.close(() => resolve())); }
+      const drained = captureSpoolState(home);
+      assert.equal(drained.pendingFiles, 0);
+      assert.equal(drained.maintenanceRebuildPending, false);
+      assert.equal(maintenanceRebuildPauseSeen(home), false, "the drained pause marker is removed");
+      const unrelated = writeHookSpoolFile({ home, source: "claude_code", body: hookBody });
+      assert.ok(unrelated);
+      assert.equal(captureSpoolState(home).maintenanceRebuildPending, false,
+        "later unrelated backlog is not labelled as rebuild pending");
+      fs.unlinkSync(unrelated.path);
       const coveredMs = Date.now();
       for (const source of ["codex", "claude_code", "grok"] as const) {
         advanceCaptureFrontier(buffer.database, source, { complete: true, files: [] },
