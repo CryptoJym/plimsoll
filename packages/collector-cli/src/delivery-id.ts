@@ -19,3 +19,17 @@ export function registerRetentionDeliveryId(db: Database.Database) {
     (rawId: string) => ensureUuidEventId(rawId).id);
   registered.add(db);
 }
+
+/** Inject the same delivery-ID function into eval workers' SQLite readers. */
+export const RETENTION_DELIVERY_ID_WORKER_SOURCE = `
+  (() => {
+    const crypto = require('node:crypto');
+    const postgresUuid = workerData.postgresUuid;
+    db.function('retention_delivery_id', { deterministic: true }, (rawId) => {
+      if (postgresUuid.test(rawId)) return rawId;
+      const digest = crypto.createHash('sha256').update('workspace-backfill|' + rawId).digest('hex');
+      return [digest.slice(0, 8), digest.slice(8, 12),
+        '5' + digest.slice(13, 16), '9' + digest.slice(17, 20), digest.slice(20, 32)].join('-');
+    });
+  })();
+`;

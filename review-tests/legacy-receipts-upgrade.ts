@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { terminalPrivacyEligibilitySql } from "../packages/collector-cli/src/privacy-disposition";
+import { readLedgerOffThread } from "../packages/collector-cli/src/session-sync";
 import { ensureUuidEventId } from "../packages/collector-cli/src/upload-history";
 
 // Recreate the exact 0.7.44 upload_receipts columns while retaining the
@@ -21,6 +22,7 @@ const oldReceiptTable = `create table upload_receipts (
   terminal_at text not null
 )`;
 
+async function main() {
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "pr417-legacy-receipts-"));
 const ledgerPath = path.join(root, "ledger.sqlite");
 const oldAt = "2025-01-01T00:00:00.000Z";
@@ -112,6 +114,13 @@ try {
     assert.equal(Boolean(db.prepare(`select 1 from buffered_events
       where id=? and ${prebindPrivacySql}`).get(ids.privacy)), false,
     "unbound old privacy receipt must exclude reads while repair is pending");
+    const workerVisible = await readLedgerOffThread(db, [{
+      sql: `select id from buffered_events e where id=@id and
+        ${terminalPrivacyEligibilitySql(db, "e")}`,
+      params: { id: ids.privacy },
+    }]);
+    assert.equal(workerVisible.length, 0,
+      "session read worker must exclude an unbound old privacy receipt");
     const holdSql = (upgraded as unknown as { rawRetentionUploadHoldSql: () => string })
       .rawRetentionUploadHoldSql();
     assert.equal((db.prepare(`select case when ${holdSql} then 1 else 0 end as held
@@ -231,3 +240,6 @@ try {
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
+}
+
+main().catch((error) => { console.error(error); process.exitCode = 1; });

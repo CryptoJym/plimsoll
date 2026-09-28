@@ -14,6 +14,7 @@ import { BOUNDED_SQL_READ_PREDICATE, BoundedSqlReadError, boundedSqlRows } from 
 import { TransportError } from "./http-transport";
 import { SyncStorageRetryController } from "./sqlite-contention";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import { POSTGRES_UUID_RE as DELIVERY_UUID_RE, RETENTION_DELIVERY_ID_WORKER_SOURCE } from "./delivery-id";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import { deliveryItemId } from "./delivery-ack";
 import { pinnedUploadUrl } from "./http-transport";
@@ -114,6 +115,7 @@ const sessionReadWorkerSource = `
   const { parentPort, workerData } = require('node:worker_threads');
   const Database = require(workerData.sqliteModule);
   const db = new Database(workerData.ledgerPath, { readonly: true, fileMustExist: true });
+  ${RETENTION_DELIVERY_ID_WORKER_SOURCE}
   parentPort.on('message', (message) => {
     let timer;
     try {
@@ -158,6 +160,7 @@ function createPersistentLedgerReader(ledger: Database.Database): {
     workerData: {
       ledgerPath: ledger.name,
       sqliteModule: createRequire(import.meta.url).resolve("better-sqlite3"),
+      postgresUuid: DELIVERY_UUID_RE,
     },
   };
   let nextId = 1;
