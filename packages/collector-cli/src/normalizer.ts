@@ -241,11 +241,11 @@ function rejectedAttributeReceipts(
   });
 }
 
-function safeSignalNames(names: readonly string[]) {
+function safeSignalNames(names: readonly string[], receivedAtMs: number) {
   const accepted: string[] = [];
   const rejected: string[] = [];
   for (const name of names) {
-    const result = validatedMetadataAttribute("otelEventName", name);
+    const result = validatedMetadataAttribute("otelEventName", name, receivedAtMs);
     if (result.accepted && typeof result.value === "string") {
       accepted.push(result.value);
     } else {
@@ -429,7 +429,7 @@ export function normalizeHookPayload(
   const otelAuthority = partitionHookAuthority(otelSignals.attributes);
   const admittedTopLevel = admittedMetadataAttributes(topLevelAuthority.metadata, "record", receivedAtMs);
   const admittedOtel = admittedMetadataAttributes(otelAuthority.metadata, "record", receivedAtMs);
-  const admittedNames = safeSignalNames(otelSignals.names);
+  const admittedNames = safeSignalNames(otelSignals.names, receivedAtMs);
   const sourceRecords = [admittedTopLevel.attributes, admittedOtel.attributes];
   const eventIdSelection = selectValidatedHookAuthority(
     authorityPartitions,
@@ -493,7 +493,7 @@ export function normalizeHookPayload(
     futureObservedAtRefused && observedAtSelection.value === undefined;
   const validatedTransportPath = options.transportPath === undefined
     ? undefined
-    : validatedMetadataAttribute("transport_path", options.transportPath);
+    : validatedMetadataAttribute("transport_path", options.transportPath, receivedAtMs);
   if (validatedTransportPath && !validatedTransportPath.accepted) {
     throw new Error("InvalidHookTransportPath");
   }

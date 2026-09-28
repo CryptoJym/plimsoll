@@ -13,6 +13,8 @@ type ForwardedHookOptions = {
   source: ToolSource;
   transportPath?: string;
   now?: () => number;
+  /** Local-only receipt clock stored atomically with a producer-ID hook row. */
+  firstReceivedAt?: string;
   producerEventId?: string;
   fallbackEventId?: string;
 };
@@ -21,7 +23,7 @@ export function appendForwardedHook(
   payload: unknown,
   options: ForwardedHookOptions & { buffer: LocalEventBuffer },
 ) {
-  return appendNormalizedHook(options.buffer, normalizeForwardedHook(payload, options));
+  return appendNormalizedHook(options.buffer, normalizeForwardedHook(payload, options), options.firstReceivedAt);
 }
 
 /**
@@ -62,11 +64,12 @@ export function normalizeForwardedHook(payload: unknown, options: ForwardedHookO
 export function appendNormalizedHook(
   buffer: LocalEventBuffer,
   canonical: ReturnType<typeof normalizeForwardedHook>,
+  firstReceivedAt?: string,
 ) {
   const appended = buffer.append(
     canonical.event,
     canonical.suppressedFields,
-    { integrityReceipt: true },
+    { integrityReceipt: true, firstReceivedAt },
   );
   return {
     ...canonical,

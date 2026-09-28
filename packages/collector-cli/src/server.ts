@@ -215,24 +215,28 @@ function admitHookBody(
   if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
   context.budget.checkpoint();
   return retryStorageBusy(context.budget, () => {
-    // A producer ID names one logical hook even when a retry arrives during a
-    // later stop window or through the live route. For a body without its own
-    // time, the first row's observed_at is that ID's first receive instant.
-    // Read inside the storage retry, immediately before the synchronous append.
+    // A producer ID names one logical hook across live, stop-window and crash
+    // replay. Its first receive clock is committed with the row, independent
+    // of a body-owned event timestamp. Read it inside the storage retry,
+    // immediately before the synchronous append.
     const receivedAtMs = context.now?.() ?? Date.now();
     const firstRow = context.producerEventId
       ? context.buffer.database.prepare(
-        "select observed_at as observedAt from buffered_events where id = ?",
-      ).get(context.producerEventId) as { observedAt: string } | undefined
+        "select first_received_at as firstReceivedAt, observed_at as observedAt " +
+        "from buffered_events where id = ?",
+      ).get(context.producerEventId) as { firstReceivedAt: string | null; observedAt: string } | undefined
       : undefined;
+    const firstReceivedAtMs = firstRow?.firstReceivedAt ? Date.parse(firstRow.firstReceivedAt) : NaN;
     const firstObservedAtMs = firstRow ? Date.parse(firstRow.observedAt) : NaN;
-    // The stored observed_at is the first receipt only when the body could not
-    // supply an event time at that receipt. A valid body time may be much older
-    // than receipt and must not become the clock for later metadata validation.
-    const firstRowUsedReceiveTime = Number.isFinite(firstObservedAtMs)
+    // Older rows have no receipt column. Their observed_at is a safe fallback
+    // only when the body had no usable event time; otherwise the old receipt
+    // cannot be reconstructed from this row.
+    const legacyRowUsedReceiveTime = !Number.isFinite(firstReceivedAtMs) && Number.isFinite(firstObservedAtMs)
       && (!payload || typeof payload !== "object" || Array.isArray(payload)
         || !bodyCarriesItsOwnTime(payload as Record<string, unknown>, firstObservedAtMs));
-    const stableReceivedAtMs = firstRowUsedReceiveTime ? firstObservedAtMs : receivedAtMs;
+    const stableReceivedAtMs = Number.isFinite(firstReceivedAtMs)
+      ? firstReceivedAtMs
+      : legacyRowUsedReceiveTime ? firstObservedAtMs : receivedAtMs;
     const admittedPayload = context.spoolReplay
       ? parseBoundedJson(spooledBodyWithHookTime(bodyText, new Date(stableReceivedAtMs).toISOString()))
       : payload;
@@ -244,11 +248,12 @@ function admitHookBody(
       producerEventId: context.producerEventId,
       fallbackEventId: context.fallbackEventId,
       now: () => stableReceivedAtMs,
+      firstReceivedAt: context.producerEventId ? new Date(stableReceivedAtMs).toISOString() : undefined,
     };
     if (!context.probe) return appendForwardedHook(admittedPayload, options);
     const canonical = normalizeForwardedHook(admittedPayload, options);
     canonical.event = markStopWindowProbe(canonical.event);
-    return appendNormalizedHook(context.buffer, canonical);
+    return appendNormalizedHook(context.buffer, canonical, options.firstReceivedAt);
   });
 }
 

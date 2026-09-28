@@ -4559,7 +4559,16 @@ async function caseCrashReplayAtFutureSkewBoundary() {
   );
 }
 
-async function postThroughStopWindow(home: string, producerEventId: string, bodies: string[], secondDelayMs: number) {
+async function withFixedWallClock<T>(nowMs: number, run: () => Promise<T>): Promise<T> {
+  const originalNow = Date.now;
+  Date.now = () => nowMs;
+  try { return await run(); } finally { Date.now = originalNow; }
+}
+
+async function postThroughStopWindow(
+  home: string, producerEventId: string, bodies: string[], secondDelayMs: number,
+  receiveTimesMs?: number[],
+) {
   const port = await freePort();
   const config = collectorConfigSchema.parse({ port });
   const auth = loadOrCreateLocalIngestAuth(home);
@@ -4583,7 +4592,10 @@ async function postThroughStopWindow(home: string, producerEventId: string, bodi
     }
     for (const [index, body] of bodies.entries()) {
       if (index === 1) await new Promise((resolve) => setTimeout(resolve, secondDelayMs));
-      posts.push(await postHookOverHttp(port, "/hooks/claude-code", headers, body));
+      const post = () => postHookOverHttp(port, "/hooks/claude-code", headers, body);
+      posts.push(receiveTimesMs
+        ? await withFixedWallClock(receiveTimesMs[index]!, post)
+        : await post());
     }
     receivedAts = listHookSpoolFiles(home).map((file) => {
       const read = readHookSpoolFile(file.path);
@@ -4689,6 +4701,113 @@ async function caseTimestampedProducerIdRetry() {
         rateObservedAt: metadata?.rateObservedAt, conflicts });
   } finally {
     buffer.close();
+  }
+}
+
+/** A valid body time must not let a secondary time cross the skew boundary on retry. */
+async function caseTimestampedSecondarySkewStopWindow() {
+  const { home } = fixtureHome("timestamped-secondary-stop-window");
+  const producerEventId = "66666666-6666-4666-8666-666666666666";
+  const firstReceivedAtMs = Date.now();
+  const secondReceivedAtMs = firstReceivedAtMs + 2_100;
+  const bodyTime = new Date(firstReceivedAtMs - 24 * 60 * 60 * 1_000).toISOString();
+  const rateObservedAt = new Date(
+    firstReceivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs + 1,
+  ).toISOString();
+  const body = JSON.stringify({
+    hook_event_name: "UserPromptSubmit", session_id: crypto.randomUUID(),
+    timestamp: bodyTime, rateObservedAt,
+  });
+  const { config, posts, receivedAts } = await postThroughStopWindow(
+    home, producerEventId, [body, body], 0, [firstReceivedAtMs, secondReceivedAtMs],
+  );
+  const ledgerPath = path.join(home, "work-ledger.sqlite");
+  const firstBuffer = new LocalEventBuffer(ledgerPath);
+  let first: Awaited<ReturnType<HookSpoolDrain["tick"]>>;
+  try {
+    first = await withFixedWallClock(firstReceivedAtMs, () =>
+      createHookSpoolDrain(config, firstBuffer, { home, maxFilesPerTick: 1 }).tick());
+  } finally {
+    firstBuffer.close();
+  }
+  const restarted = new LocalEventBuffer(ledgerPath);
+  try {
+    const second = await withFixedWallClock(secondReceivedAtMs, () =>
+      createHookSpoolDrain(config, restarted, { home, maxFilesPerTick: 1 }).tick());
+    const rows = restarted.database.prepare(
+      "select observed_at as observedAt, payload_json as payloadJson from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ observedAt: string; payloadJson: string }>;
+    const metadata = rows[0]
+      ? (JSON.parse(rows[0].payloadJson) as { metadata?: Record<string, unknown> }).metadata
+      : undefined;
+    const conflicts = restarted.eventCollisionSummary();
+    check("timestamped_stop_window_secondary_skew_retry_deduplicates_after_restart",
+      posts.every((post) => post.status === 202) &&
+        receivedAts[0] === new Date(firstReceivedAtMs).toISOString() &&
+        receivedAts[1] === new Date(secondReceivedAtMs).toISOString() &&
+        first.recovered === 1 && second.recovered === 1 && rows.length === 1 &&
+        rows[0]?.observedAt === bodyTime && metadata?.rateObservedAt === undefined &&
+        conflicts.totalConflicts === 0 && listHookSpoolFiles(home).length === 0,
+      { statuses: posts.map((post) => post.status), receivedAts, first, second,
+        rows: rows.map(({ observedAt }) => ({ observedAt })),
+        rateObservedAt: metadata?.rateObservedAt, conflicts,
+        pending: listHookSpoolFiles(home).length });
+  } finally {
+    restarted.close();
+  }
+}
+
+/** Live retries must use that same first receipt clock for secondary metadata. */
+async function caseTimestampedSecondarySkewLive() {
+  const { home } = fixtureHome("timestamped-secondary-live");
+  const collector = await startCollector(home);
+  const producerEventId = "77777777-7777-4777-8777-777777777777";
+  const firstReceivedAtMs = Date.now();
+  const bodyTime = new Date(firstReceivedAtMs - 24 * 60 * 60 * 1_000).toISOString();
+  const rateObservedAt = new Date(
+    firstReceivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs + 1,
+  ).toISOString();
+  const sessionId = crypto.randomUUID();
+  const body = JSON.stringify({
+    hook_event_name: "UserPromptSubmit", session_id: sessionId,
+    timestamp: bodyTime, rateObservedAt,
+  });
+  const headers = {
+    "content-type": "application/json",
+    "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+    "x-plimsoll-event-id": producerEventId,
+  };
+  const post = (candidate: string) => postHookOverHttp(collector.port, "/hooks/claude-code", headers, candidate);
+  try {
+    const first = await withFixedWallClock(firstReceivedAtMs, () => post(body));
+    const second = await withFixedWallClock(firstReceivedAtMs + 2_100, () => post(body));
+    const rows = collector.buffer.database.prepare(
+      "select observed_at as observedAt, payload_json as payloadJson from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ observedAt: string; payloadJson: string }>;
+    const metadata = rows[0]
+      ? (JSON.parse(rows[0].payloadJson) as { metadata?: Record<string, unknown> }).metadata
+      : undefined;
+    const conflicts = collector.buffer.eventCollisionSummary();
+    check("timestamped_live_secondary_skew_retry_deduplicates",
+      first.status === 202 && second.status === 202 && second.json?.deduplicated === true &&
+        rows.length === 1 && rows[0]?.observedAt === bodyTime &&
+        metadata?.rateObservedAt === undefined && conflicts.totalConflicts === 0,
+      { statuses: [first.status, second.status], deduplicated: second.json?.deduplicated,
+        rows: rows.map(({ observedAt }) => ({ observedAt })),
+        rateObservedAt: metadata?.rateObservedAt, conflicts });
+
+    const changedBody = JSON.stringify({
+      hook_event_name: "UserPromptSubmit", session_id: crypto.randomUUID(),
+      timestamp: bodyTime, rateObservedAt,
+    });
+    const changed = await withFixedWallClock(firstReceivedAtMs + 4_200, () => post(changedBody));
+    check("timestamped_live_changed_content_still_quarantines",
+      changed.status === 202 && changed.json?.collisionQuarantined === true &&
+        collector.buffer.eventCollisionSummary().totalConflicts === 1,
+      { status: changed.status, collisionQuarantined: changed.json?.collisionQuarantined,
+        conflicts: collector.buffer.eventCollisionSummary() });
+  } finally {
+    await collector.close();
   }
 }
 
@@ -4815,6 +4934,10 @@ async function main() {
     await caseStopWindowProducerIdCollision();
     stage("timestamped_producer_id_retry");
     await caseTimestampedProducerIdRetry();
+    stage("timestamped_secondary_skew_stop_window");
+    await caseTimestampedSecondarySkewStopWindow();
+    stage("timestamped_secondary_skew_live");
+    await caseTimestampedSecondarySkewLive();
     stage("live_producer_id_retry");
     await caseLiveProducerIdRetry();
     stage("report");
