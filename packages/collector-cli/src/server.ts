@@ -36,6 +36,7 @@ import {
   otlpBatchRemainder,
   otlpChunk,
   otlpChunkCount,
+  syncLedger,
   type OtlpIntakeBatch,
   type OtlpIntakeSpool,
   type OtlpSpoolCause,
@@ -455,6 +456,8 @@ export function createHookSpoolDrain(
     maxFilesPerTick?: number;
     nowMs?: () => number;
     onWarning?: (line: Record<string, unknown>) => void;
+    /** Fixture seam for the required WAL flush before spool-file removal. */
+    flushLedger?: () => Promise<void>;
   },
 ): HookSpoolDrain {
   const env = options.env ?? process.env;
@@ -462,6 +465,7 @@ export function createHookSpoolDrain(
   const intervalMs = options.intervalMs ?? HOOK_SPOOL_LIMITS.drainIntervalMs;
   const maxFilesPerTick = options.maxFilesPerTick ?? HOOK_SPOOL_LIMITS.maxFilesPerTick;
   const warn = options.onWarning ?? ((line) => console.warn(JSON.stringify(line)));
+  const flushLedger = options.flushLedger ?? (() => syncLedger(buffer.database));
   const enabled = hookSpoolEnabled(env);
   let counters = readHookSpoolCounters(options.home);
   let pending = hookSpoolPending(options.home, nowMs());
@@ -547,9 +551,24 @@ export function createHookSpoolDrain(
           },
         );
         try {
+          await flushLedger();
+        } catch (error) {
+          // Admission committed, but the stronger spool durability must not
+          // be discarded until the WAL (or checkpointed DB) reaches disk.
+          warn({ warning: "hook_spool_ledger_flush_failed", code: errorCodeOnly(error) });
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
+        try {
           fs.unlinkSync(file.path);
-        } catch {
-          /* already gone; the counter still reflects the applied event */
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            warn({ warning: "hook_spool_remove_failed", code: errorCodeOnly(error) });
+            result.deferred += 1;
+            result.deferredTick = true;
+            break;
+          }
         }
         result.recovered += 1;
       } catch (error) {

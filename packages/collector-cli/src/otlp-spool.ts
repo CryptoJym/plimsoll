@@ -358,7 +358,7 @@ async function syncPath(target: string) {
  * so one flush of the WAL (or of the database file when no WAL exists) covers
  * frames a checkpoint may already have copied into the main file.
  */
-async function syncLedger(db: Database.Database) {
+export async function syncLedger(db: Database.Database) {
   if (db.memory || !db.name) return;
   for (const candidate of [`${db.name}-wal`, db.name]) {
     try {

@@ -3365,7 +3365,7 @@ function postHookOverHttp(
   body: string,
   options: { chunked?: boolean } = {},
 ) {
-  return new Promise<{ status: number; json: Record<string, unknown> | null; text: string }>(
+  return new Promise<{ status: number; retryAfter: string | null; json: Record<string, unknown> | null; text: string }>(
     (resolve, reject) => {
       const request = http.request(
         {
@@ -3392,7 +3392,8 @@ function postHookOverHttp(
             } catch {
               json = null;
             }
-            resolve({ status: response.statusCode ?? 0, json, text });
+            resolve({ status: response.statusCode ?? 0,
+              retryAfter: (response.headers["retry-after"] as string | undefined) ?? null, json, text });
           });
         },
       );
@@ -4849,11 +4850,103 @@ async function caseLiveProducerIdRetry() {
   }
 }
 
+async function caseB22GapTransactions() {
+  const hasGaps = (collector: Collector) => Boolean(collector.buffer.database.prepare(
+    "select 1 from sqlite_master where type='table' and name='capture_gaps'").get());
+  const gaps = (collector: Collector) => hasGaps(collector) ?
+    (collector.buffer.database.prepare("select count(*) as n from capture_gaps where reason='contract_violation'").get() as { n: number }).n : 0;
+  const trigger = (collector: Collector) => {
+    if (!hasGaps(collector)) return false;
+    collector.buffer.database.exec(`create trigger b22_hook_gap_failure before insert on capture_gaps
+      begin select raise(abort, 'b22_hook_gap_failure'); end`);
+    return true;
+  };
+  const firstBody = claudeHttpHookBody(crypto.randomUUID(), "b22 first");
+  const changedBody = claudeHttpHookBody(crypto.randomUUID(), "b22 changed");
+  const producerEventId = crypto.randomUUID();
+
+  const { home: liveHome } = fixtureHome("b22-live-gap");
+  const live = await startCollector(liveHome);
+  try {
+    const headers = { "content-type": "application/json",
+      "x-plimsoll-token": live.auth.claudeCodeProducer!, "x-plimsoll-event-id": producerEventId };
+    const first = await postHookOverHttp(live.port, "/hooks/claude-code", headers, firstBody);
+    const armed = trigger(live);
+    const failed = await postHookOverHttp(live.port, "/hooks/claude-code", headers, changedBody);
+    const rows = () => (live.buffer.database.prepare("select count(*) as n from buffered_events where id=?")
+      .get(producerEventId) as { n: number }).n;
+    check("b22_hook_live_gap_failure_answers_503_and_keeps_event_and_gap_unchanged",
+      armed && first.status === 202 && failed.status === 503 && failed.retryAfter === "1" &&
+        rows() === 1 && gaps(live) === 0 && listHookSpoolFiles(liveHome).length === 0,
+      { first, failed, rows: rows(), gaps: gaps(live), files: listHookSpoolFiles(liveHome).length });
+    if (armed) live.buffer.database.exec("drop trigger b22_hook_gap_failure");
+    const retry = await postHookOverHttp(live.port, "/hooks/claude-code", headers, changedBody);
+    check("b22_hook_live_retry_commits_counted_gap_with_refusal",
+      retry.status === 202 && retry.json?.collisionQuarantined === true && rows() === 1 && gaps(live) === 1,
+      { retry, rows: rows(), gaps: gaps(live) });
+  } finally { await live.close(); }
+
+  const { home: spoolHome } = fixtureHome("b22-spool-gap");
+  const spool = await startCollector(spoolHome);
+  try {
+    const headers = { "content-type": "application/json",
+      "x-plimsoll-token": spool.auth.claudeCodeProducer!, "x-plimsoll-event-id": producerEventId };
+    const first = await postHookOverHttp(spool.port, "/hooks/claude-code", headers, firstBody);
+    const saved = writeHookSpoolFile({ home: spoolHome, source: "claude_code",
+      producerEventId, body: changedBody });
+    const armed = trigger(spool);
+    const failed = await spool.drain.tick();
+    const rows = () => (spool.buffer.database.prepare("select count(*) as n from buffered_events where id=?")
+      .get(producerEventId) as { n: number }).n;
+    check("b22_hook_spool_gap_failure_keeps_file_event_and_gap_unchanged",
+      armed && first.status === 202 && saved !== null && failed.deferred === 1 &&
+        listHookSpoolFiles(spoolHome).length === 1 && rows() === 1 && gaps(spool) === 0,
+      { first, saved: saved !== null, failed, files: listHookSpoolFiles(spoolHome).length,
+        rows: rows(), gaps: gaps(spool) });
+    if (armed) spool.buffer.database.exec("drop trigger b22_hook_gap_failure");
+    const retry = await spool.drain.tick();
+    check("b22_hook_spool_retry_commits_counted_gap_before_unlink",
+      retry.recovered === 1 && listHookSpoolFiles(spoolHome).length === 0 && rows() === 1 && gaps(spool) === 1,
+      { retry, files: listHookSpoolFiles(spoolHome).length, rows: rows(), gaps: gaps(spool) });
+  } finally { await spool.close(); }
+
+  const { home: flushHome } = fixtureHome("b22-spool-flush");
+  const flushCollector = await startCollector(flushHome);
+  try {
+    const saved = writeHookSpoolFile({ home: flushHome, source: "claude_code",
+      body: claudeHttpHookBody(crypto.randomUUID(), "b22 flush") });
+    let flushAttempts = 0;
+    const failingDrain = createHookSpoolDrain(collectorConfigSchema.parse({}), flushCollector.buffer, {
+      home: flushHome,
+      flushLedger: async () => { flushAttempts += 1; throw Object.assign(new Error("fixture flush"), { code: "EIO" }); },
+      onWarning: () => undefined,
+    });
+    const failed = await failingDrain.tick();
+    const rows = () => (flushCollector.buffer.database.prepare("select count(*) as n from buffered_events")
+      .get() as { n: number }).n;
+    check("b22_hook_spool_flush_failure_retains_the_last_replayable_file",
+      saved !== null && flushAttempts === 1 && failed.deferred === 1 &&
+        listHookSpoolFiles(flushHome).length === 1 && rows() === 1,
+      { saved: saved !== null, flushAttempts, failed,
+        files: listHookSpoolFiles(flushHome).length, rows: rows() });
+    const retry = await flushCollector.drain.tick();
+    check("b22_hook_spool_flush_retry_unlinks_after_durable_admission",
+      retry.recovered === 1 && listHookSpoolFiles(flushHome).length === 0 && rows() === 1,
+      { retry, files: listHookSpoolFiles(flushHome).length, rows: rows() });
+  } finally { await flushCollector.close(); }
+}
+
 async function main() {
   // Stage markers on stderr: a hosted-runner hang has to name the case it hung
   // in without waiting for the final report.
   const stage = (name: string) => console.error(JSON.stringify({ proof: "hook_spool", stage: name }));
   try {
+    if (process.env.HOOK_SPOOL_PROOF_ONLY === "b22-gaps") {
+      stage("b22_gap_transactions");
+      await caseB22GapTransactions();
+      reportChecks();
+      return;
+    }
     // The two defect classes that used to abort this suite as a stack trace
     // run FIRST (review r1 of PR #321, finding N5): acknowledging before
     // publication used to surface as an `ENOENT: chmod` inside
@@ -4940,6 +5033,8 @@ async function main() {
     await caseTimestampedSecondarySkewLive();
     stage("live_producer_id_retry");
     await caseLiveProducerIdRetry();
+    stage("b22_gap_transactions");
+    await caseB22GapTransactions();
     stage("report");
   } finally {
     for (const [key, value] of previousEnv) {
