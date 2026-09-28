@@ -7,6 +7,7 @@ import {
 } from "../../shared/src/index";
 import { sealOutboundEvent } from "./outbound-envelope";
 import { attachRepoContextSidecar, extractRepoContextCwd } from "./repo-context";
+import { dispatchBindingForSession, dispatchBindingMetadata } from "./capture-root-inventory";
 
 type ForwardedHookOptions = {
   config: CollectorConfig;
@@ -43,6 +44,13 @@ export function normalizeForwardedHook(payload: unknown, options: ForwardedHookO
     producerEventId: options.producerEventId,
     fallbackEventId: options.fallbackEventId,
   });
+  if (options.source === "claude_code" && normalized.event.sessionId) {
+    const binding = dispatchBindingForSession("claude_code", normalized.event.sessionId,
+      normalized.event.observedAt);
+    if (binding) normalized.event.metadata = {
+      ...normalized.event.metadata, ...dispatchBindingMetadata(binding),
+    };
+  }
   // Successful hook/fallback responses are public proof surfaces before the
   // durable outbox runs. Include the same deterministic local-only omissions
   // the outbound sealer will add later so response, ledger and wire receipts

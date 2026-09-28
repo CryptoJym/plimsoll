@@ -209,7 +209,15 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
   const accountEpochs = account ? (root.accountAssertionEpochs ?? []).filter(epoch =>
     epoch.actorHash===account.actorHash&&epoch.validFrom===account.validFrom&&epoch.evidenceRef===account.evidenceRef) : [];
   const installationEpochId = accountEpochs.length===1 ? accountEpochs[0].installationEpochId : root.installationEpochId;
-  const { binding,conflict }=bindingAt(root.dispatch??[],sessionId??"",observedAt);
+  const localBinding=bindingAt(root.dispatch??[],sessionId??"",observedAt);
+  const claudeRoots=root.source==="claude_code" ? currentDispatchCaptureRoots()
+    .filter(candidate => candidate.source==="claude_code") : [];
+  // A transcript belongs to one root, but dispatch binds every Claude root.
+  // Apply the same cross-root conflict rule as hook and OTLP intake.
+  const binding=claudeRoots.length && sessionId
+    ? dispatchBindingForSession("claude_code",sessionId,observedAt,claudeRoots)
+    : localBinding.binding;
+  const conflict=localBinding.conflict;
   return {
     ...(binding? dispatchBindingMetadata(binding):{}),...(conflict? { workAttributionState: "conflict" }:{}),
     captureRootId: root.rootId,captureProfileId: root.profileId,installationEpochId,

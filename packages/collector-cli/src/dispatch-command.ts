@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { mutateCollectorConfigTransactionally } from "./config";
 import {
   dispatchBindingSchema,
+  dispatchBindingForSession,
   dispatchBindingMetadata,
   namespacedWorkItemIdSchema,
   type DispatchBinding,
@@ -170,6 +171,7 @@ export function restampDispatch(args: string[],buffer: LocalEventBuffer,roots: r
   if(!bySession.size) throw new Error("dispatch_attempt_not_found");
   let scanned=0,restamped=0,skipped=0,truncated=false;
   for(const {binding,source} of bySession.values()) {
+    const expectedBinding=JSON.stringify(binding);
     const rows=buffer.database.prepare(`select raw.id,raw.payload_json as payloadJson,raw.observed_at as observedAt
       from buffered_events as raw where raw.source=? and raw.session_id=? and raw.observed_at>=?
         and (? is null or raw.observed_at<?) and json_valid(raw.payload_json)=1
@@ -184,6 +186,8 @@ export function restampDispatch(args: string[],buffer: LocalEventBuffer,roots: r
       scanned++;
       if(Date.parse(row.observedAt)<Date.parse(binding.validFrom) ||
           (binding.validUntil&&Date.parse(row.observedAt)>=Date.parse(binding.validUntil))) { skipped++;continue; }
+      if(source==="claude_code" && JSON.stringify(dispatchBindingForSession(source,binding.sessionId,
+        row.observedAt,roots))!==expectedBinding) { skipped++;continue; }
       const event=aiInteractionEventSchema.parse(JSON.parse(row.payloadJson));
       const corrected=aiInteractionEventSchema.parse({ ...event,
         metadata: { ...event.metadata,...dispatchBindingMetadata(binding) } });

@@ -362,8 +362,8 @@ function buildLogEvent(
   const traceId = validatedTraceId.accepted && typeof validatedTraceId.value === "string"
     ? validatedTraceId.value
     : undefined;
-  const dispatchBinding = context.source === "codex" && sessionId
-    ? dispatchBindingForSession("codex", sessionId, observedAt, context.dispatchRoots)
+  const dispatchBinding = (context.source === "codex" || context.source === "claude_code") && sessionId
+    ? dispatchBindingForSession(context.source, sessionId, observedAt, context.dispatchRoots)
     : null;
 
   const event = aiInteractionEventSchema.parse({
@@ -438,6 +438,7 @@ function buildSpanEvent(
     serviceName?: string;
     serviceVersion?: string;
     containerSuppressedFields?: string[];
+    dispatchRoots?: readonly CaptureRoot[];
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const repoContextCwd = workdirFromRawRecord(span);
@@ -453,6 +454,9 @@ function buildSpanEvent(
     : undefined;
   const observedAt = recordTimestamp(safeSpan, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
+  const dispatchBinding = context.source === "claude_code" && sessionId
+    ? dispatchBindingForSession("claude_code", sessionId, observedAt, context.dispatchRoots)
+    : null;
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
   const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
@@ -561,6 +565,7 @@ function buildSpanEvent(
     ...(costUsd !== undefined && costUsd >= 0 ? { costUsd, costKind } : {}),
     metadata: {
       ...metadataAttrs.attrs,
+      ...(dispatchBinding ? dispatchBindingMetadata(dispatchBinding) : {}),
       ...(costEstimated ? { costEstimated: true } : {}),
       ...(spanName ? { otelEventName: spanName } : {}),
       ...(toolName ? { toolName } : {}),
@@ -675,7 +680,8 @@ export function explodeOtlpPayload(
 ): ExplodedOtlp {
   const policy = options.policy ?? DEFAULT_POLICY;
   const source = options.source ?? "unknown";
-  const dispatchRoots = source === "codex" ? currentDispatchCaptureRoots() : [];
+  const dispatchRoots = source === "codex" || source === "claude_code"
+    ? currentDispatchCaptureRoots() : [];
   const root = asRecord(payload);
   const result: ExplodedOtlp = {
     events: [],
@@ -746,6 +752,7 @@ export function explodeOtlpPayload(
                 ...resource.suppressedFields,
                 ...scopeReceipts,
               ],
+              dispatchRoots,
             });
           const decision = decideOtlpSpanAdmission(entry.event);
           if (decision.admitted) {

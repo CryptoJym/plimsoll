@@ -142,6 +142,7 @@
     "proof:managed-config-reconcile": "tsx scripts/managed-config-reconcile-proof.ts",
     "proof:capture-roots-add": "tsx scripts/capture-roots-add-proof.ts",
     "proof:dispatch-binding": "tsx scripts/run-proof.ts scripts/dispatch-binding-proof.ts",
+    "proof:claude-dispatch-stamping": "tsx scripts/run-proof.ts scripts/claude-dispatch-stamping-proof.ts",
     "proof:dispatch-bind-linkability": "tsx scripts/run-proof.ts scripts/dispatch-bind-linkability-proof.ts",
     "proof:dispatch-pairing-integration": "tsx scripts/run-proof.ts scripts/dispatch-pairing-integration-proof.ts",
     "proof:capture-roots-live": "tsx scripts/capture-roots-live-proof.ts",
