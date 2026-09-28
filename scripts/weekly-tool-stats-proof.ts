@@ -59,17 +59,52 @@ const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
   const request = JSON.parse(bodies.at(-1)!) as { reportSequence:number; deviceId:string };
   const stored = db.prepare(`select digest from weekly_tool_stats_uploads where week_start='2026-09-21'`).get() as { digest:string };
   return new Response(JSON.stringify({ schema:'fleet-device-report-receipt/v1', deviceId:request.deviceId,
-    reportSequence:request.reportSequence, disposition:'replay_ignored', nextReportSequence:request.reportSequence + 1,
+    reportSequence:request.reportSequence, disposition:'replay_ignored', nextReportSequence:requests === 2 ? 2 : request.reportSequence,
     toolStatsDigest:stored.digest }), { status:200, headers:{'content-type':'application/json'} });
 }) as typeof fetch;
 await assert.rejects(uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:05:00.000Z'), fetchImpl }));
-assert.equal(await uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:06:00.000Z'), fetchImpl }), 'accepted');
-assert.equal(bodies.length, 2);
+assert.equal(await uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:06:00.000Z'), fetchImpl }), 'retry');
+assert.equal(await uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:07:00.000Z'), fetchImpl }), 'accepted');
+assert.equal(bodies.length, 3);
 assert.equal(bodies[0], bodies[1], 'an ambiguous send retries the same body and sequence');
+assert.equal((JSON.parse(bodies[2]!) as { reportSequence:number }).reportSequence, 2,
+  'a stored-week replay first resynchronizes its sequence, then acknowledges the matching digest');
 assert.doesNotMatch(bodies.join(''), /PRIVATE_|other-tenant|metadata|path|prompt|output/i);
 assert.equal((db.prepare(`select delivered from weekly_tool_stats_uploads where week_start='2026-09-21'`).get() as {delivered:number}).delivered, 1);
 db.close();
-console.log('weekly tool statistics: 2/2 pass');
+
+// A replacement ledger begins its first completed week at sequence 1 while
+// this device's cloud high water can be much higher. The cloud's current
+// service echoes the proposed digest for a replay even when that week has no
+// stored row; the collector must repair the sequence before claiming delivery.
+const freshDb = new Database(":memory:");
+new LearningFactStore(freshDb);
+freshDb.exec(`create table buffered_events (
+  id text primary key, source text, session_id text, event_type text, observed_at text,
+  workspace_id text, device_id text, data_mode text, metadata text
+);`);
+ensureWeeklyToolStatsSchema(freshDb);
+freshDb.prepare(`insert into weekly_tool_stats_control(workspace_id,device_id,first_week)
+  values('tenant-1','device-1','2026-09-28')`).run();
+const freshBodies: Array<{ reportSequence:number }> = [];
+const freshFetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+  const request = JSON.parse(String(init?.body ?? '')) as { reportSequence:number; deviceId:string };
+  freshBodies.push(request);
+  const pending = freshDb.prepare(`select digest from weekly_tool_stats_uploads where week_start='2026-09-28'`).get() as { digest:string };
+  return new Response(JSON.stringify({ schema:'fleet-device-report-receipt/v1', deviceId:request.deviceId,
+    reportSequence:request.reportSequence, disposition:freshBodies.length === 1 ? 'replay_ignored' : 'accepted',
+    nextReportSequence:freshBodies.length === 1 ? 42 : 43, toolStatsDigest:pending.digest }),
+  { status:200, headers:{'content-type':'application/json'} });
+}) as typeof fetch;
+assert.equal(await uploadCompletedToolStatsWeek(config, freshDb,
+  { now:() => new Date('2026-10-05T00:05:00.000Z'), fetchImpl:freshFetch }), 'retry');
+assert.equal((freshDb.prepare(`select delivered from weekly_tool_stats_uploads where week_start='2026-09-28'`).get() as {delivered:number}).delivered, 0);
+assert.equal(await uploadCompletedToolStatsWeek(config, freshDb,
+  { now:() => new Date('2026-10-05T00:06:00.000Z'), fetchImpl:freshFetch }), 'accepted');
+assert.deepEqual(freshBodies.map(body => body.reportSequence), [1, 42]);
+assert.equal((freshDb.prepare(`select delivered from weekly_tool_stats_uploads where week_start='2026-09-28'`).get() as {delivered:number}).delivered, 1);
+freshDb.close();
+console.log('weekly tool statistics: 3/3 pass');
 }
 
 void main().catch((error) => { console.error(error); process.exitCode = 1; });

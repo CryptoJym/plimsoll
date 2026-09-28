@@ -235,6 +235,9 @@ export class LocalEventBuffer {
       };
       workspaceId?: string;
       deviceId?: string;
+      /** Only a new ledger may inherit the agreed epoch of configured capture roots.
+       * null means roots disagree and a new ledger must refuse to open. */
+      freshCaptureRootEpoch?: string | null;
       /** Clock seam for deterministic enrollment fixtures; never replaces a persisted cutoff. */
       enrollmentNow?: () => Date;
       learningFacts?: { limits?: Partial<LearningFactLimits> };
@@ -266,6 +269,10 @@ export class LocalEventBuffer {
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
       .get();
+    if (newLedger && options.freshCaptureRootEpoch === null) {
+      this.db.close();
+      throw new Error("fresh_ledger_capture_root_epochs_conflict");
+    }
     markOpenStep("ledger.sqlite_open");
     this.db.exec(`
       create table if not exists buffered_events (
@@ -581,7 +588,8 @@ export class LocalEventBuffer {
       ensureSessionSummarySchema(this.db);
       markOpenStep("ledger.session_summary_schema");
     }
-    if (options.workspaceId) this.useWorkspace(options.workspaceId);
+    if (options.workspaceId) this.useWorkspace(options.workspaceId, this.deviceId,
+      newLedger ? options.freshCaptureRootEpoch ?? undefined : undefined);
     markOpenStep("ledger.workspace_binding");
     this.db.exec(`
       create index if not exists idx_events_upload on buffered_events (uploaded_at, created_at);

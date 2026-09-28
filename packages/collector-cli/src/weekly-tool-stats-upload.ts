@@ -98,8 +98,13 @@ export async function uploadCompletedToolStatsWeek(
   const receipt = response.body as Receipt | null;
   if (!response.ok || !receipt || receipt.schema !== "fleet-device-report-receipt/v1" ||
     receipt.deviceId !== config.cloudDeviceId || receipt.reportSequence !== pending.reportSequence) return "retry";
+  // A fresh ledger restarts its local report sequence. The server may call an
+  // old sequence a replay and echo this request's digest even when it stored
+  // no report for the week. Only the server's current next sequence can prove
+  // that a matching replay names an already-stored week.
   if (receipt.disposition === "accepted" && receipt.toolStatsDigest === pending.digest ||
-    receipt.disposition === "replay_ignored" && receipt.toolStatsDigest === pending.digest) {
+    receipt.disposition === "replay_ignored" && receipt.nextReportSequence === pending.reportSequence &&
+      receipt.toolStatsDigest === pending.digest) {
     db.prepare(`update weekly_tool_stats_uploads set delivered=1 where workspace_id=? and device_id=? and week_start=?
       and report_sequence=? and digest=?`).run(config.tenantId, config.deviceId, pending.weekStart,
         pending.reportSequence, pending.digest);

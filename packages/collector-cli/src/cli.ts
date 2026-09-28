@@ -384,6 +384,9 @@ Commands:
   capture-roots discover [--json]
                         List native capture roots under $HOME with their state
                         (registered | candidate | missing); read-only
+  capture-roots epoch-plan [--json]
+                        Refuse unless the ledger is absent and configured roots
+                        agree on the epoch a fresh ledger will adopt; read-only
   capture-roots add --source codex|claude_code --directory DIR [--directory DIR]
                         [--machine LABEL] [--allow-scan-errors] [--dry-run] [--json]
                         Append a newly discovered capture root: derives the
@@ -623,9 +626,15 @@ function openBuffer(
     seed: { deviceId: config.deviceId, keyId: config.keyId },
   });
   recordDeviceSeen();
+  const rootEpochs = new Set((config.captureRoots ?? []).map((root) => root.installationEpochId));
   return new LocalEventBuffer(diagnostics.databasePath ?? collectorBufferPath(), {
     workspaceId: config.tenantId,
     deviceId: identity.deviceId,
+    // A replacement ledger has no cursor or events to relabel. Preserve the
+    // installation identity already stamped on its configured capture roots;
+    // existing ledgers keep their own binding, even if config is stale.
+    freshCaptureRootEpoch: rootEpochs.size === 0 ? undefined :
+      rootEpochs.size === 1 ? [...rootEpochs][0] : null,
     delivery: {
       enabled: Boolean(config.uploadUrl) || deliveryOverride,
       limits: config.delivery,
@@ -5381,7 +5390,8 @@ async function main() {
     return;
   }
 
-  // Append-only registration of a native capture root a host gained after
+  // Read-only fresh-ledger epoch preflight, or append-only registration of a
+  // native capture root a host gained after
   // enrollment (bead eco-6hoxj.53). Enrollment mints roots; nothing until now
   // registered one that appeared later, so a new Claude seat, a new Codex
   // profile, or a `~/.claude/projects` an older enrollment skipped stayed
@@ -5390,8 +5400,8 @@ async function main() {
   // change an existing root, epoch or enrollment field.
   if (command === "capture-roots") {
     const action = process.argv[3] ?? "";
-    if (!["discover", "add"].includes(action)) {
-      throw new Error("Expected capture-roots discover|add");
+    if (!["discover", "epoch-plan", "add"].includes(action)) {
+      throw new Error("Expected capture-roots discover|epoch-plan|add");
     }
     const home = os.homedir();
     const configuredRoots = configRead?.status === "valid" ? config.captureRoots ?? [] : [];
@@ -5399,6 +5409,27 @@ async function main() {
       console.log(JSON.stringify({ status: "capture_roots_add_refused", reason, ...detail }, null, 2));
       process.exitCode = 1;
     };
+
+    if (action === "epoch-plan") {
+      const ledgerPath = collectorBufferPath();
+      const epochs = new Set(configuredRoots.map((root) => root.installationEpochId));
+      const reason = configRead?.status !== "valid" ? "config_not_valid"
+        : config.installKey === "local-dev" || !config.deviceId ? "joined_identity_required"
+          : configuredRoots.length === 0 ? "capture_roots_required"
+            : epochs.size !== 1 ? "capture_root_epochs_conflict"
+              : [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`].some((file) => fs.existsSync(file))
+                ? "ledger_not_archived" : null;
+      if (reason) {
+        console.log(JSON.stringify({ status: "capture_roots_epoch_plan_refused", reason,
+          rootCount: configuredRoots.length }, null, 2));
+        process.exitCode = 1;
+      } else {
+        console.log(JSON.stringify({ status: "capture_roots_epoch_plan", readOnly: true,
+          rootCount: configuredRoots.length, installationEpochId: [...epochs][0],
+          ledgerAbsent: true }, null, 2));
+      }
+      return;
+    }
 
     if (action === "discover") {
       const entries = discoverCaptureRoots(home, configuredRoots, config.port);
