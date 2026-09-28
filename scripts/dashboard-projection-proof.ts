@@ -1365,6 +1365,16 @@ async function main() {
   ];
 
   try {
+    if (process.argv.includes("--pr419-duplicate-only")) {
+      proveDuplicateFactRepair(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
+    if (process.argv.includes("--pr419-upgrade-only")) {
+      await proveDuplicateScanUpgradeAndDrain(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
     if (process.argv.includes("--rollback-only")) {
       await prove044RollbackScanFence(root);
       console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
