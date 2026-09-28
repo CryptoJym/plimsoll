@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 425,
+  "headSha": "f2a96f94be687879c13bab8a398d7c4b849d7004",
+  "reviewedAt": "2026-09-28T21:57:45Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0e753-3610-7a10-83b7-3c38741f9e9d",
+    "model": "gpt-6-sol",
+    "host": "jamess-macbook-pro-2"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0e334-fd4b-75d0-8da4-c7b7922a4f1e"
+    }
+  ],
+  "summary": "Independent Codex review lane (MacBook, gpt-6-sol max, thread 01a0e753) of the final head f2a96f94, after three review rounds: R1 (two-connection stale commit), R2 (deleted high-water predecessor at 1.88M rows) and R3 (retargeted checkpoint) red on 62d74520 and green; the lead's L1 (trigger JSON parsing: 1,000-row burst 98.9 ms vs 1,769 ms) and L2 (lazy v3 conversion of a 1.2M-row ledger) hold; the r2 findings are fixed: a real 0.7.44 downgrade now sends 33,013 = scratch (33,003 at df7bca73) and stays exact after re-upgrade, and two concurrent upgrade workers both succeed. Idle-resource scenarios pass on both revisions. CI proof green on f2a96f94."
+}
