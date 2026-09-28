@@ -575,6 +575,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-setup-e2e
 
+      - name: Prove join privacy and machine-label review regressions
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-review-regressions
+
       - name: Prove future-only enrollment withholds pre-join history (eco-6hoxj.163.22)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:enrollment-privacy

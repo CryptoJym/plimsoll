@@ -120,7 +120,15 @@ async function main() {
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     }
     fs.mkdirSync(plimsollHome, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(claudeProjects, "history.jsonl"), "{}\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), '{"permissions":{}}\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(claudeProjects, "history.jsonl"), '{"type":"user","message":{}}\n', { mode: 0o600 });
+    const evidenceSession = "12345678-1234-4234-8234-123456789abc";
+    fs.writeFileSync(path.join(home, ".codex-profiles", "profile-a", "config.toml"),
+      'model = "gpt-6-sol"\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(codexProfileSessions,
+      `rollout-2026-09-27T00-00-00-${evidenceSession}.jsonl`),
+      `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
+        payload: { id: evidenceSession } })}\n`, { mode: 0o600 });
     // A transcript in a root that is ALREADY registered, born long after the
     // enrollment baseline at BASELINE_BEFORE. Registering another root must
     // not flip this file from capturable to excluded (review r1, finding 1).

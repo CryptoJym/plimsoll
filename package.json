@@ -103,6 +103,7 @@
     "proof:usage-dedupe": "tsx scripts/usage-dedupe-proof.ts",
     "proof:join-isolation": "tsx scripts/join-isolation-proof.ts",
     "proof:join-setup-e2e": "tsx scripts/join-setup-e2e-proof.ts",
+    "proof:join-review-regressions": "tsx scripts/pr428-review-regressions.ts",
     "proof:device-registry": "tsx scripts/device-registry-proof.ts",
     "proof:enrollment-privacy": "tsx scripts/enrollment-privacy-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",

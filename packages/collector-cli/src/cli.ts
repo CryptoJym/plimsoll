@@ -10,7 +10,6 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
-import { aiInteractionEventSchema } from "../../shared/src/index";
 
 const privatePathReceipt = (value: string) =>
   `sha256:${createHash("sha256").update(path.resolve(value)).digest("hex")}`;
@@ -93,6 +92,7 @@ import { enrollCodexLiveProducer } from "./codex-live-usage-auth";
 import {
   installLaunchAgent,
   inspectLaunchAgentManifest,
+  launchAgentOwnerEditedKeys,
   LAUNCH_AGENT_LABEL,
   LAUNCH_AGENT_SYSTEM_PATHS,
   launchAgentPlistPath,
@@ -150,6 +150,7 @@ import {
   discoverCaptureRootCandidates,
   discoverCaptureRoots,
   physicalCaptureRootDirectory,
+  physicalBelowHome,
   resolveCaptureRootMachineLabel,
   resolveDiscoveryHome,
   validateCaptureRoots,
@@ -288,6 +289,8 @@ import {
   shouldDeferDaemonSessionSync,
 } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
+import { postDelivery } from "./delivery-post";
+import { deliveryExpectation } from "./delivery-ack";
 import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
@@ -376,7 +379,7 @@ Commands:
                         Disable one account assertion adapter (requires --yes)
   --enable-account-assertion SOURCE
                         Enable one account assertion adapter (requires --yes)
-  join TOKEN|URL        Join a hosted workspace: redeem the admin's single-use
+  join                  Join a hosted workspace: redeem the admin's single-use
                         token, write sync credentials, verify with a handshake
                         (use --reassign for an explicit workspace change)
   sync-account-salt     Refresh the tenant-scoped actor salt over the
@@ -386,7 +389,7 @@ Commands:
                         assertion discovery is best-effort and never printed
   capture-roots discover [--json]
                         List native capture roots under $HOME with their state
-                        (registered | candidate | missing); read-only
+                        (registered | candidate | found_not_recorded | missing); read-only
   capture-roots add --source codex|claude_code --directory DIR [--directory DIR]
                         [--machine LABEL] [--allow-scan-errors] [--dry-run] [--json]
                         Append a newly discovered capture root: derives the
@@ -484,13 +487,15 @@ Commands:
   stop                  Stop the foreground daemon using the local PID file
 
 Config tools:
-  join "<join-url>#<token>" | join --token-prompt --url <cloud-base-url> | join --token-stdin --url <cloud-base-url> | join --token-fd FD --url <cloud-base-url> | join --resume
+  join --token-prompt --url <cloud-base-url> | join --token-stdin --url <cloud-base-url> | join --token-fd FD --url <cloud-base-url> | join --resume
       Add --reassign only after reviewing the explicit A → B boundary.
       On macOS, packaged join registers discovered agent folders, installs or safely restarts
       the collector, verifies readiness and waits for its first acknowledged upload.
       Add --no-daemon to keep join-only behavior; CI and source-tree runs are join-only.
-      Prefer --token-prompt, --token-stdin, --token-fd, or join - so the single-use secret never enters
+      Use --token-prompt, --token-stdin, --token-fd, or join - so the single-use secret never enters
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
+      --machine LABEL supplies an existing fleet label; --replace-launch-agent explicitly
+      replaces a valid manifest with owner edits after naming the differing keys.
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|gemini-cli|grok|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
@@ -770,30 +775,78 @@ function joinOnlyReason(noDaemon: boolean): string | null {
   return null;
 }
 
-function joinMachineLabel(roots: readonly CaptureRoot[]): string {
-  const host = os.hostname();
-  const candidates = [...new Set([host, host.split(".")[0] ?? "", host.toLowerCase(),
-    (host.split(".")[0] ?? "").toLowerCase()])].filter(Boolean);
-  if (!roots.length) return candidates[0] ?? "local";
-  const recovered = resolveCaptureRootMachineLabel(roots, candidates);
-  if (!recovered) throw new Error("Agent folders need a machine label matching the existing capture inventory.");
-  return recovered;
+type JoinRootPlan = { machine: string; entries: ReturnType<typeof discoverCaptureRoots>;
+  candidates: Array<{ source: CaptureRoot["source"]; directory: string }>;
+  manifestDigest: string | null };
+
+function joinMachineLabel(config: CollectorConfig, explicit?: string): string {
+  const roots = config.captureRoots ?? [];
+  if (explicit) {
+    if (roots.length && !captureRootsDeriveFrom(roots, explicit))
+      throw new Error("--machine does not match the existing capture roots. No token was redeemed.");
+    return explicit;
+  }
+  if (config.enrollmentMachineLabel) {
+    if (roots.length && !captureRootsDeriveFrom(roots, config.enrollmentMachineLabel))
+      throw new Error("The saved machine label does not match the existing capture roots. No token was redeemed.");
+    return config.enrollmentMachineLabel;
+  }
+  if (!roots.length) return "local";
+  // An older root-add receipt is a clear-text, local attestation of the label.
+  const receipts = path.join(collectorHome(), "receipts");
+  try {
+    for (const name of fs.readdirSync(receipts).filter((entry) =>
+      /^capture-roots-add-.*\.json$/.test(entry)).sort().reverse().slice(0, 32)) {
+      const file = path.join(receipts, name);
+      if (fs.lstatSync(file).size > 1_048_576) continue;
+      const value = JSON.parse(fs.readFileSync(file, "utf8")) as { machine?: unknown };
+      if (typeof value.machine === "string" && captureRootsDeriveFrom(roots, value.machine)) return value.machine;
+    }
+  } catch { /* no trustworthy label receipt */ }
+  throw new Error("Existing agent folders use an unknown machine label. Run join with --machine <fleet label>; no token was redeemed.");
 }
 
-function addJoinedCaptureRoots(config: CollectorConfig, entries: ReturnType<typeof discoverCaptureRoots>) {
+function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false): JoinRootPlan {
+  const read = readCollectorConfig();
+  if (read.status === "invalid") throw new Error("Collector config is invalid. No token was redeemed.");
+  const config = read.status === "valid" ? read.config : collectorConfigSchema.parse({});
+  const machine = joinMachineLabel(config, machineArgument);
+  const entries = discoverCaptureRoots(os.homedir(), config.captureRoots ?? [], config.port);
   const candidates = entries.filter((entry) =>
-    (entry.state === "candidate" || entry.state === "live_covered") && entry.directory !== null);
-  if (!candidates.length) return 0;
-  const machine = joinMachineLabel(config.captureRoots ?? []);
+    (entry.state === "candidate" || entry.state === "live_covered") && entry.directory !== null)
+    .map((entry) => ({ source: entry.source,
+      directory: path.join(resolveDiscoveryHome(os.homedir()), entry.directory!) }));
+  const proposed = [...(config.captureRoots ?? []), ...candidates.map((entry) => ({
+    ...deriveCaptureRootIdentity(machine, entry.source, entry.directory), source: entry.source,
+    directory: entry.directory, installationEpochId: randomUUID(),
+  }))];
+  validateCaptureRoots(proposed);
+  for (const entry of candidates) {
+    const scan = captureRootBaselineFiles(entry.source, entry.directory);
+    const observed = captureRootBaselineObservations(scan.files);
+    if (scan.errors || observed.errors) {
+      throw new Error(`Agent folder ${path.relative(os.homedir(), entry.directory)} cannot be sealed ` +
+        `(${scan.errors + observed.errors} ambiguous entries). No token was redeemed.`);
+    }
+  }
+  const manifest = inspectLaunchAgentManifest();
+  if (!manifest.ok && manifest.status !== "missing")
+    throw new Error("The existing collector LaunchAgent is not owned by Plimsoll. No token was redeemed.");
+  if (manifest.ok && !replaceLaunchAgent) {
+    const differences = launchAgentOwnerEditedKeys();
+    if (differences.length) throw new Error(`The existing LaunchAgent has owner edits in ${
+      differences.join(", ")}. Use --replace-launch-agent to replace it; no token was redeemed.`);
+  }
+  return { machine, entries, candidates, manifestDigest: manifest.ok ? manifest.manifestDigest : null };
+}
+
+function addJoinedCaptureRoots(plan: JoinRootPlan) {
+  if (!plan.candidates.length) return 0;
   const cli = process.argv[1] ?? "";
-  let added = 0;
-  for (const source of ["codex", "claude_code"] as const) {
-    const directories = candidates.filter((entry) => entry.source === source)
-      .map((entry) => path.join(resolveDiscoveryHome(os.homedir()), entry.directory!));
-    if (!directories.length) continue;
-    const child = spawnSync(process.execPath, [...process.execArgv, cli,
-      "capture-roots", "add", "--source", source, "--machine", machine,
-      ...directories.flatMap((directory) => ["--directory", directory]), "--json"], {
+  const child = spawnSync(process.execPath, [...process.execArgv, cli,
+      "capture-roots", "add", "--machine", plan.machine,
+      ...plan.candidates.flatMap((entry) => ["--root", entry.source, entry.directory]),
+      "--join-setup-child", "--json"], {
       encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -803,64 +856,96 @@ function addJoinedCaptureRoots(config: CollectorConfig, entries: ReturnType<type
       const restart = receipt?.restart as { failedStep?: unknown; unload?: { status?: unknown };
         load?: { status?: unknown }; daemon?: { reachable?: unknown } } | undefined;
       const failure = receipt?.failure as { step?: unknown; error?: unknown } | undefined;
-      throw new Error(`Agent folder registration failed (${source}: ${String(receipt?.reason ?? receipt?.status ??
+      throw new Error(`Agent folder registration failed (${String(receipt?.reason ?? receipt?.status ??
         (child.error as NodeJS.ErrnoException | undefined)?.code ?? "no_receipt")}, ` +
         `step=${String(failure?.step ?? restart?.failedStep ?? "unknown")}, ` +
         `detail=${String(failure?.error ?? restart?.load?.status ?? restart?.unload?.status ?? "none")}).`);
     }
-    added += Array.isArray(receipt.addedRoots) ? receipt.addedRoots.length : 0;
-  }
-  return added;
+  return Array.isArray(receipt.addedRoots) ? receipt.addedRoots.length : 0;
 }
 
-async function acknowledgeJoinedCollector(config: CollectorConfig): Promise<string> {
-  const buffer = openBuffer(config);
-  const id = `join-setup-${randomUUID()}`;
-  try {
-    const appended = buffer.append(aiInteractionEventSchema.parse({
-      id, tenantId: config.tenantId, source: "codex", dataMode: "metadata",
-      eventType: "unknown", observedAt: new Date().toISOString(),
-      metadata: { collectorSetupProbe: true },
-    }));
-    if (!appended) throw new Error("The local setup probe was not admitted.");
-    const deadline = Date.now() + JOIN_FIRST_UPLOAD_WAIT_MS;
-    const boundedConfig = { ...config, delivery: { ...config.delivery,
-      requestTimeoutSeconds: Math.min(config.delivery.requestTimeoutSeconds, 3) } };
-    const acknowledgedAt = () => (buffer.database.prepare(
-      "select uploaded_at as uploadedAt from buffered_events where id = ?",
-    ).get(id) as { uploadedAt: string | null } | undefined)?.uploadedAt ?? null;
-    while (Date.now() < deadline) {
-      const existing = acknowledgedAt();
-      if (existing) return existing;
-      try {
-        await uploadBufferedEvents(boundedConfig, buffer, {
-          limit: 500, includeLegacyRemainingUnuploaded: false,
-        });
-      } catch {
-        // The durable outbox retains the probe. A running daemon may also
-        // own its lease, so observe the ledger until the bounded deadline.
-      }
-      const accepted = acknowledgedAt();
-      if (accepted) return accepted;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+async function acknowledgeJoinedCollector(
+  config: CollectorConfig,
+  batch: Extract<Awaited<ReturnType<typeof performJoin>>, { joined: true }>["contactReplayBatch"],
+): Promise<string> {
+  if (!batch) throw new Error("The acknowledged join handshake cannot be replayed; no contact was claimed.");
+  const body = JSON.stringify(batch);
+  const expected = deliveryExpectation(body, config.installKey);
+  if (expected.itemIds.length !== 1) throw new Error("Join contact requires exactly one prior handshake item.");
+  const deadline = performance.now() + JOIN_FIRST_UPLOAD_WAIT_MS;
+  while (performance.now() < deadline) {
+    const remainingMs = deadline - performance.now();
+    if (remainingMs < 100) break;
+    try {
+      const response = await postDelivery({
+        url: config.uploadUrl!, body, installKey: config.installKey,
+        ingestKey: config.ingestKey, signingSecret: config.uploadSigningSecret,
+        timeoutMs: Math.max(1, Math.min(config.delivery.requestTimeoutSeconds * 1000,
+          Math.floor(remainingMs))),
+      });
+      if (response.ok && response.acknowledgement?.acceptedIds.includes(expected.itemIds[0]!))
+        return new Date().toISOString();
+    } catch { /* retry within the monotonic deadline */ }
+    await new Promise((resolve) => setTimeout(resolve,
+      Math.min(250, Math.max(1, deadline - performance.now()))));
+  }
+  throw new Error(`No first contact acknowledgement arrived within ${JOIN_FIRST_UPLOAD_WAIT_MS / 1000} seconds.`);
+}
+
+async function restorePriorJoinedCollector(port: number, manifest: ReturnType<typeof inspectLaunchAgentManifest>) {
+  if (!manifest.ok) return;
+  const deadline = performance.now() + 25_000;
+  let lastStatus = "not_attempted";
+  while (performance.now() < deadline) {
+    const before = await verifyPostBootstrapReadiness(port, { timeoutMs: 0 });
+    if (before.verified) return;
+    const visible = inspectLaunchAgentManifest();
+    if (!visible.ok || visible.manifestDigest !== manifest.manifestDigest)
+      throw new Error("The previous LaunchAgent changed during recovery; collector restart needs manual repair.");
+    const loaded = await loadVisibleLaunchAgent(manifest.plistPath, port, false, launchAgentMutationAuthority());
+    lastStatus = loaded.status;
+    if (loaded.loaded) {
+      const after = await verifyPostBootstrapReadiness(port, { timeoutMs: 15_000 });
+      if (after.verified) return;
     }
-    throw new Error(`No first upload acknowledgement arrived within ${JOIN_FIRST_UPLOAD_WAIT_MS / 1000} seconds.`);
-  } finally {
-    buffer.close();
+    if (loaded.status !== "lifecycle_fence_busy") break;
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
+  throw new Error(`Could not restore the previous running collector (${lastStatus}).`);
 }
 
-async function finishJoinedCollectorSetup(result: Extract<Awaited<ReturnType<typeof performJoin>>, { joined: true }>) {
+async function finishJoinedCollectorSetupCore(
+  result: Extract<Awaited<ReturnType<typeof performJoin>>, { joined: true }>, plan: JoinRootPlan,
+) {
   const read = readCollectorConfig();
   if (read.status !== "valid") throw new Error("Joined collector config could not be read back.");
   let config = read.config;
-  const entries = discoverCaptureRoots(os.homedir(), config.captureRoots ?? [], config.port);
+  const entries = plan.entries;
   const recording = entries.filter((entry) => entry.state !== "missing" && entry.directory !== null)
+    .filter((entry) => entry.state !== "found_not_recorded")
     .map((entry) => ({ source: entry.source, directory: entry.directory!, shape: entry.shape,
       alreadyRegistered: entry.state === "registered" }));
+  const unverified = entries.filter((entry) => entry.state === "found_not_recorded" && entry.directory !== null);
   console.log(`Will record ${recording.length} agent folder${recording.length === 1 ? "" : "s"}: ` +
     (recording.length ? recording.map((entry) => entry.directory).join(", ") : "none found yet") + ".");
-  const added = addJoinedCaptureRoots(config, entries);
+  if (unverified.length) console.log(`Found, not recorded: ${unverified.map((entry) => entry.directory).join(", ")}. ` +
+    "Use capture-roots add with an explicit --directory and --machine to enroll one.");
+  const priorManifest = inspectLaunchAgentManifest();
+  if ((priorManifest.ok ? priorManifest.manifestDigest : null) !== plan.manifestDigest)
+    throw new Error("The LaunchAgent changed after join preflight; refusing to unload it.");
+  let added: number;
+  try { added = addJoinedCaptureRoots(plan); }
+  catch (error) {
+    const current = readCollectorConfig();
+    if (current.status === "valid" &&
+        !isDeepStrictEqual(current.config.captureRoots ?? [], config.captureRoots ?? [])) {
+      const raw = JSON.parse(fs.readFileSync(current.path, "utf8")) as Record<string, unknown>;
+      const unknown = Object.fromEntries(Object.entries(raw).filter(([key]) => !(key in current.config)));
+      writeCollectorConfigTransactionally({ ...current.config, captureRoots: config.captureRoots },
+        current.path, { preserveUnknownFields: unknown });
+    }
+    throw error;
+  }
   const updated = readCollectorConfig();
   if (updated.status !== "valid") throw new Error("Agent folder config could not be read back.");
   config = updated.config;
@@ -868,13 +953,17 @@ async function finishJoinedCollectorSetup(result: Extract<Awaited<ReturnType<typ
   const script = fs.realpathSync(process.argv[1] ?? "");
   const manifest = inspectLaunchAgentManifest();
   if (!manifest.ok && manifest.status !== "missing") throw new Error("The existing collector LaunchAgent is not owned by Plimsoll.");
-  if (manifest.ok) {
+  if ((manifest.ok ? manifest.manifestDigest : null) !== plan.manifestDigest)
+    throw new Error("The LaunchAgent changed during root registration; refusing to unload it.");
+  const installOptions = { repoRoot: path.dirname(script), programArguments: [process.execPath, script, "start"],
+    workingDirectory: path.dirname(script) };
+  const installPreview = installLaunchAgent({ ...installOptions, dryRun: true });
+  if (manifest.ok && installPreview.receipt.wouldChange) {
     const unload = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
     if (!unload.unloaded) throw new Error(`Collector restart was not proven safe (${unload.reason ?? unload.status}).`);
   }
   const installed = installLaunchAgent({
-    repoRoot: path.dirname(script), programArguments: [process.execPath, script, "start"],
-    workingDirectory: path.dirname(script), mutationAuthority: launchAgentMutationAuthority(),
+    ...installOptions, mutationAuthority: launchAgentMutationAuthority(),
   });
   const visible = inspectLaunchAgentManifest();
   if (!visible.ok || visible.manifestDigest !== installed.receipt.manifestDigest) {
@@ -898,11 +987,56 @@ async function finishJoinedCollectorSetup(result: Extract<Awaited<ReturnType<typ
     throw new Error(`Collector was installed but readiness could not be verified (load=${load.status}, ` +
       `listener=${readiness.listenerState}, reachable=${connectivity.reachable}, pid=${pidRead.kind}).`);
   }
-  const firstUploadAt = await acknowledgeJoinedCollector(config);
-  recordDeviceUpload(undefined, new Date(firstUploadAt));
-  return { recording, added, firstUploadAt, firstUploadKind: "setup_probe" as const,
+  const firstContactAt = await acknowledgeJoinedCollector(config, result.contactReplayBatch);
+  return { recording, added, firstContactAt, firstContactKind: "handshake_replay" as const,
     daemon: { installed: true, running: true,
     readinessVerified: true, runtimeIdentityVerified: true, syncArmed: true }, enrollment: result.enrollment };
+}
+
+async function finishJoinedCollectorSetup(
+  result: Extract<Awaited<ReturnType<typeof performJoin>>, { joined: true }>, plan: JoinRootPlan,
+) {
+  const configRead = readCollectorConfig();
+  if (configRead.status !== "valid") throw new Error("Joined collector config could not be read back.");
+  const priorManifest = inspectLaunchAgentManifest();
+  const priorContent = priorManifest.ok ? fs.readFileSync(priorManifest.plistPath, "utf8") : null;
+  const obligationPath = path.join(collectorHome(), "join.restart-obligation.json");
+  if (fs.existsSync(obligationPath))
+    throw new Error("A previous collector restart obligation remains unresolved; refusing another setup.");
+  fs.writeFileSync(obligationPath, `${JSON.stringify({ schema: "plimsoll.join-restart-obligation/v1",
+    priorManifestDigest: priorManifest.ok ? priorManifest.manifestDigest : null,
+    priorContent, port: configRead.config.port, createdAt: new Date().toISOString() })}\n`,
+  { flag: "wx", mode: 0o600 });
+  try {
+    const finished = await finishJoinedCollectorSetupCore(result, plan);
+    fs.rmSync(obligationPath);
+    return finished;
+  } catch (error) {
+    if (!priorManifest.ok || !priorContent) {
+      fs.rmSync(obligationPath, { force: true });
+      throw error;
+    }
+    try {
+      const current = inspectLaunchAgentManifest();
+      if (!current.ok) throw new Error("The previous LaunchAgent manifest is missing.");
+      if (current.manifestDigest !== priorManifest.manifestDigest) {
+        const script = fs.realpathSync(process.argv[1] ?? "");
+        const options = { repoRoot: path.dirname(script),
+          programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script) };
+        const desiredDigest = installLaunchAgent({ ...options, dryRun: true }).receipt.manifestDigest;
+        if (current.manifestDigest !== desiredDigest)
+          throw new Error("The replacement LaunchAgent changed unexpectedly; recovery will not overwrite it.");
+        installLaunchAgent({ ...options, restoreContent: priorContent,
+          expectedCurrentDigest: desiredDigest, mutationAuthority: launchAgentMutationAuthority() });
+      }
+      await restorePriorJoinedCollector(configRead.config.port, priorManifest);
+      fs.rmSync(obligationPath, { force: true });
+    } catch (recovery) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)} ` +
+        `Recovery also failed: ${recovery instanceof Error ? recovery.message : String(recovery)}`);
+    }
+    throw error;
+  }
 }
 
 function runLaunchctl(args: string[], setExitCode = true) {
@@ -2519,7 +2653,19 @@ async function main() {
     if (rawJoinArguments.filter((argument) => argument === "--reassign").length > 1) {
       throw new Error("join --reassign may be provided only once.");
     }
-    const joinArguments = rawJoinArguments.filter((argument) => argument !== "--reassign" && argument !== "--no-daemon");
+    const replaceLaunchAgent = rawJoinArguments.includes("--replace-launch-agent");
+    if (rawJoinArguments.filter((argument) => argument === "--replace-launch-agent").length > 1)
+      throw new Error("join --replace-launch-agent may be provided only once.");
+    const machineIndex = rawJoinArguments.indexOf("--machine");
+    if (machineIndex >= 0 && rawJoinArguments.lastIndexOf("--machine") !== machineIndex)
+      throw new Error("join --machine may be provided only once.");
+    const machineArgument = machineIndex >= 0 ? rawJoinArguments[machineIndex + 1] : undefined;
+    if (machineIndex >= 0 && (!machineArgument || machineArgument.startsWith("--")))
+      throw new Error("join --machine requires a fleet label.");
+    const joinArguments = rawJoinArguments.filter((argument, index) =>
+      argument !== "--reassign" && argument !== "--no-daemon" &&
+      argument !== "--replace-launch-agent" &&
+      (machineIndex < 0 || index !== machineIndex && index !== machineIndex + 1));
     const targetArgument = joinArguments[0];
     const resume = targetArgument === "--resume";
     if (resume && (joinArguments.length !== 1 || reassign)) {
@@ -2537,7 +2683,7 @@ async function main() {
           !tokenFromFd))
     ) {
       throw new Error(
-        'Usage: plimsoll join --token-prompt --url <cloud-base-url>  |  plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+        'Usage: plimsoll join --token-prompt --url <cloud-base-url>  |  plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join --resume',
       );
     }
     let joinBaseUrl: string | undefined;
@@ -2578,6 +2724,20 @@ async function main() {
       index += 1;
     }
 
+    if (!resume && !tokenFromPrompt && !tokenFromStdin && !tokenFromFd)
+      console.error("Warning: a positional join token can appear in shell history and process lists. Use --token-prompt.");
+    const skip = joinOnlyReason(noDaemon);
+    let setupPlan: JoinRootPlan | null = null;
+    if (!skip) {
+      try { setupPlan = preflightJoinSetup(machineArgument, replaceLaunchAgent); }
+      catch (error) {
+        const message = error instanceof Error ? error.message : "Setup preflight failed.";
+        console.error(message);
+        console.log(JSON.stringify({ status: "join_preflight_failed", message, configTouched: false }, null, 2));
+        process.exitCode = 1;
+        return;
+      }
+    }
     // The join handshake cleans its own temporary state after redemption.
     // Before the cloud answers, even an unrelated stale temporary directory
     // stays untouched on a refused token or network failure.
@@ -2595,13 +2755,14 @@ async function main() {
                 : targetArgument;
           if (!target) {
             throw new Error(
-              'Usage: plimsoll join --token-prompt --url <cloud-base-url>  |  plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+              'Usage: plimsoll join --token-prompt --url <cloud-base-url>  |  plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join --resume',
             );
           }
             return performJoin({
               target,
               baseUrl: joinBaseUrl ?? process.env.PLIMSOLL_CLOUD_URL,
               reassign,
+              enrollmentMachineLabel: setupPlan?.machine,
             });
           })();
     } catch (error) {
@@ -2633,6 +2794,7 @@ async function main() {
     const baseReceipt = {
       configPath: result.configPath,
       tenantId: result.tenantId,
+      workspaceName: result.workspaceName,
       deviceId: result.deviceId,
       keyId: result.keyId,
       policyVersion: result.policyVersion,
@@ -2647,7 +2809,6 @@ async function main() {
       handshake: result.handshake,
       accountSaltSynced: result.accountSaltSynced ?? false,
     };
-    const skip = joinOnlyReason(noDaemon);
     if (skip) {
       console.log("Connected to workspace. Background collector setup was skipped.");
       console.log(JSON.stringify({ status: "joined", ...baseReceipt,
@@ -2655,10 +2816,10 @@ async function main() {
       return;
     }
     try {
-      const setup = await finishJoinedCollectorSetup(result);
-      console.log(`Connected to workspace. Recording ${setup.recording.length} agent folder${
-        setup.recording.length === 1 ? "" : "s"}. First upload acknowledged at ${
-        new Date(setup.firstUploadAt).toLocaleTimeString()}.`);
+      const setup = await finishJoinedCollectorSetup(result, setupPlan!);
+      console.log(`Connected to ${result.workspaceName ?? result.tenantId}. Recording ${setup.recording.length} agent folder${
+        setup.recording.length === 1 ? "" : "s"}. First contact confirmed at ${
+        new Date(setup.firstContactAt).toLocaleTimeString()}.`);
       console.log(JSON.stringify({ status: "joined", ...baseReceipt, ...setup }, null, 2));
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Collector setup failed.";
@@ -5460,6 +5621,7 @@ async function main() {
       (config.captureRoots ?? []).map((root) => configuredCaptureRootDirectory(root)),
     );
     const unregisteredCaptureRootCandidates = discoverCaptureRootCandidates(os.homedir())
+      .filter((candidate) => candidate.autoEnroll)
       .filter((candidate) => !configuredRootDirectories.has(candidate.directory));
     const bufferPath = collectorBufferPath();
     // Producers that still run the config they read before the collector
@@ -5619,6 +5781,7 @@ async function main() {
               registered: entries.filter((entry) => entry.state === "registered").length,
               candidate: entries.filter((entry) => entry.state === "candidate").length,
               liveCovered: liveCovered.length,
+              foundNotRecorded: entries.filter((entry) => entry.state === "found_not_recorded").length,
               missing: entries.filter((entry) => entry.state === "missing").length,
             },
             roots: entries.filter((entry) => entry.state !== "live_covered"),
@@ -5636,16 +5799,34 @@ async function main() {
       return;
     }
     const sourceArgument = optionValue("--source");
-    if (sourceArgument !== "codex" && sourceArgument !== "claude_code") {
+    const batchArguments: Array<{ source: string | undefined; directory: string | undefined }> = [];
+    process.argv.forEach((argument, index) => {
+      if (argument === "--root") batchArguments.push({
+        source: process.argv[index + 1], directory: process.argv[index + 2],
+      });
+    });
+    if (batchArguments.length && (sourceArgument || process.argv.includes("--directory"))) {
+      refuse("mixed_root_argument_forms");
+      return;
+    }
+    if (!batchArguments.length && sourceArgument !== "codex" && sourceArgument !== "claude_code") {
       refuse("unknown_source", { source: sourceArgument ?? null });
       return;
     }
-    const source = sourceArgument;
-    const requested = process.argv
-      .map((argument, index) => (argument === "--directory" ? process.argv[index + 1] : undefined))
-      .filter((value): value is string => typeof value === "string" && !value.startsWith("--"));
+    const requested: Array<{ source: string | undefined; directory: string | undefined }> =
+      [...batchArguments];
+    if (!batchArguments.length) process.argv.forEach((argument, index) => {
+      if (argument === "--directory") requested.push({
+        source: sourceArgument, directory: process.argv[index + 1],
+      });
+    });
     if (!requested.length) {
       refuse("directory_required");
+      return;
+    }
+    if (requested.some((entry) => (entry.source !== "codex" && entry.source !== "claude_code") ||
+        !entry.directory || entry.directory.startsWith("--"))) {
+      refuse("invalid_root_pair");
       return;
     }
 
@@ -5679,9 +5860,9 @@ async function main() {
     // config); no label at all with nothing to recover one from is
     // `identity_machine_unresolved` (pass `--machine`).
     const machineArgument = optionValue("--machine");
-    const machineCandidates = machineArgument
-      ? [machineArgument]
-      : [os.hostname(), os.hostname().split(".")[0] ?? ""].filter((value) => value.length > 0);
+    const machineCandidates = machineArgument ? [machineArgument] :
+      config.enrollmentMachineLabel ? [config.enrollmentMachineLabel] :
+        [os.hostname(), os.hostname().split(".")[0] ?? ""].filter(Boolean);
     let machine: string;
     if (machineArgument) {
       if (configuredRoots.length && !captureRootsDeriveFrom(configuredRoots, machineArgument)) {
@@ -5712,7 +5893,12 @@ async function main() {
     }
 
     for (const candidate of requested) {
-      const requestedPath = path.resolve(candidate);
+      const source = candidate.source as CaptureRoot["source"];
+      const requestedPath = path.resolve(candidate.directory!);
+      if (flag("--join-setup-child") && !physicalBelowHome(resolvedHome, requestedPath)) {
+        refuse("automatic_root_not_physical", { directory: privatePathReceipt(requestedPath) });
+        return;
+      }
       const directory = physicalCaptureRootDirectory(requestedPath);
       if (directory === undefined) {
         refuse(fs.existsSync(requestedPath) ? "not_a_directory" : "directory_missing", {
@@ -5767,7 +5953,13 @@ async function main() {
     }
 
     const beforeBytes = fs.readFileSync(configPath);
-    const next = { ...config, captureRoots: [...configuredRoots, ...added] };
+    if (flag("--join-setup-child") && requested.some((entry) =>
+      !physicalBelowHome(resolvedHome, path.resolve(entry.directory!)))) {
+      refuse("automatic_root_changed_before_commit");
+      return;
+    }
+    const next = { ...config, ...(flag("--join-setup-child") ? { enrollmentMachineLabel: machine } : {}),
+      captureRoots: [...configuredRoots, ...added] };
     let validated: CollectorConfig;
     try {
       validated = collectorConfigSchema.parse(next);
@@ -5781,9 +5973,11 @@ async function main() {
     // Append-only, proved on the exact object that will be written: the
     // existing roots keep their bytes and every other enrollment field is the
     // one already on disk.
-    const withoutRoots = (value: CollectorConfig) => ({ ...value, captureRoots: undefined });
+    const withoutRoots = (value: CollectorConfig) => ({ ...value,
+      captureRoots: undefined, enrollmentMachineLabel: undefined });
     if (
       !isDeepStrictEqual(withoutRoots(validated), withoutRoots(config)) ||
+      (config.enrollmentMachineLabel !== undefined && config.enrollmentMachineLabel !== machine) ||
       !isDeepStrictEqual((validated.captureRoots ?? []).slice(0, configuredRoots.length), configuredRoots)
     ) {
       refuse("append_only_violation");
@@ -5884,7 +6078,9 @@ async function main() {
       return;
     }
     const installed = manifest.ok && manifest.status === "valid";
-    const authority = installed ? launchAgentMutationAuthority() : undefined;
+    const authority = installed ? flag("--join-setup-child")
+      ? new LifecycleMutationAuthority(defaultLifecycleAuthorityRoot(), { defaultLeaseMs: 10_000 })
+      : launchAgentMutationAuthority() : undefined;
     let restart: Record<string, unknown> = {
       attempted: false,
       skipped: true,

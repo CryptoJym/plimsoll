@@ -350,11 +350,14 @@ export type CaptureRootCandidate = {
   directory: string;
   /** Directory relative to the operator home; a candidate never leaves it. */
   relativeDirectory: string;
+  /** Automatic enrollment requires a physical path and source evidence. */
+  autoEnroll: boolean;
+  reason?: "symlink_component" | "codex_evidence_missing" | "claude_evidence_missing";
 };
 
 export type CaptureRootDiscoveryEntry = {
   source: CaptureRoot["source"];
-  state: "registered" | "candidate" | "missing" | "live_covered";
+  state: "registered" | "candidate" | "missing" | "live_covered" | "found_not_recorded";
   /** Relative to the operator home, or null for a configured root outside it. */
   directory: string | null;
   outsideHome: boolean;
@@ -362,7 +365,108 @@ export type CaptureRootDiscoveryEntry = {
   rootId: string | null;
   /** Names of config sections and keys that establish a live path; no values. */
   evidence?: string[];
+  reason?: CaptureRootCandidate["reason"];
 };
+
+/** Do not follow a link in any component beneath the physical home. */
+export function physicalBelowHome(home: string, entry: string): boolean {
+  const relative = path.relative(home, entry);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
+  let current = home;
+  try {
+    for (const segment of relative.split(path.sep)) {
+      current = path.join(current, segment);
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink()) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+/** A bounded first-line check, with no rollout body or path exposed in a receipt. */
+function codexHomeEvidence(home: string, sessions: string): boolean {
+  const profile = path.dirname(sessions);
+  const marker = path.join(profile, "config.toml");
+  if (!physicalBelowHome(home, marker)) return false;
+  try {
+    const stat = fs.lstatSync(marker);
+    if (!stat.isFile() || stat.size === 0 || stat.size > 1_048_576) return false;
+    const config = parseToml(fs.readFileSync(marker, "utf8")) as Record<string, unknown>;
+    const codexMarker = typeof config.model === "string" && config.model.length > 0 ||
+      typeof config.model_provider === "string" && config.model_provider.length > 0 ||
+      typeof config.model_providers === "object" && config.model_providers !== null ||
+      typeof config.hooks === "object" && config.hooks !== null;
+    if (!codexMarker) return false;
+    const pending = [{ directory: sessions, depth: 0 }];
+    let inspected = 0;
+    while (pending.length && inspected < 128) {
+      const current = pending.shift()!;
+      const entries = fs.readdirSync(current.directory, { withFileTypes: true });
+      for (const entry of entries) {
+      inspected += 1;
+      if (entry.isDirectory() && current.depth < 3) {
+        pending.push({ directory: path.join(current.directory, entry.name), depth: current.depth + 1 });
+        continue;
+      }
+      if (!entry.isFile() || !/^rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i.test(entry.name)) continue;
+      const file = path.join(current.directory, entry.name);
+      if (!physicalBelowHome(home, file)) continue;
+      try {
+        const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        try {
+        const bytes = Buffer.alloc(4096);
+        const size = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+        const firstLine = bytes.subarray(0, size).toString("utf8").split("\n", 1)[0];
+        const row = JSON.parse(firstLine) as { type?: unknown; timestamp?: unknown; payload?: { id?: unknown } };
+        const id = /([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i.exec(entry.name)?.[1];
+        if (row.type === "session_meta" && typeof row.timestamp === "string" &&
+          Number.isFinite(Date.parse(row.timestamp)) && typeof row.payload?.id === "string" &&
+          row.payload.id.toLowerCase() === id?.toLowerCase()) return true;
+        } finally { fs.closeSync(descriptor); }
+      } catch { /* another rollout may provide the evidence */ }
+      }
+    }
+  } catch { return false; }
+  return false;
+}
+
+function claudeHomeEvidence(home: string, projects: string): boolean {
+  const marker = path.join(path.dirname(projects), "settings.json");
+  if (!physicalBelowHome(home, marker)) return false;
+  try {
+    const stat = fs.lstatSync(marker);
+    if (!stat.isFile() || stat.size === 0 || stat.size > 1_048_576) return false;
+    const settings = JSON.parse(fs.readFileSync(marker, "utf8")) as Record<string, unknown>;
+    if (!settings || typeof settings !== "object" ||
+        !["env", "hooks", "permissions"].some((key) => Object.hasOwn(settings, key))) return false;
+    const pending = [{ directory: projects, depth: 0 }];
+    let inspected = 0;
+    while (pending.length && inspected < 128) {
+      const current = pending.shift()!;
+      for (const entry of fs.readdirSync(current.directory, { withFileTypes: true })) {
+        inspected += 1;
+        if (entry.isDirectory() && current.depth < 3) {
+          pending.push({ directory: path.join(current.directory, entry.name), depth: current.depth + 1 });
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+        const file = path.join(current.directory, entry.name);
+        if (!physicalBelowHome(home, file)) continue;
+        try {
+          const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+          try {
+          const bytes = Buffer.alloc(4096);
+          const size = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+          const row = JSON.parse(bytes.subarray(0, size).toString("utf8").split("\n", 1)[0]) as
+            { type?: unknown };
+          if (["user", "assistant", "system", "summary", "queue-operation"].includes(String(row.type))) return true;
+          } finally { fs.closeSync(descriptor); }
+        } catch { /* another transcript may provide the evidence */ }
+      }
+    }
+  } catch { return false; }
+  return false;
+}
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -536,13 +640,19 @@ export function discoverCaptureRootCandidates(home: string): CaptureRootCandidat
   const resolvedHome = resolveDiscoveryHome(home);
   const found: CaptureRootCandidate[] = [];
   const add = (shape: string, source: CaptureRoot["source"], entry: string) => {
-    const directory = physicalCaptureRootDirectory(entry);
-    if (directory === undefined) return;
-    const relativeDirectory = path.relative(resolvedHome, directory);
+    const relativeDirectory = path.relative(resolvedHome, entry);
     // A seat relocated to shared storage and symlinked in resolves outside the
     // home; that is the seat tooling's root to register, not a home candidate.
     if (relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) return;
-    found.push({ shape, source, directory, relativeDirectory });
+    const physical = physicalBelowHome(resolvedHome, entry);
+    if (!physical && !fs.existsSync(entry)) return;
+    if (physical && !fs.statSync(entry).isDirectory()) return;
+    const evidence = physical && (source === "codex"
+      ? codexHomeEvidence(resolvedHome, entry) : claudeHomeEvidence(resolvedHome, entry));
+    found.push({ shape, source, directory: entry, relativeDirectory,
+      autoEnroll: evidence, ...(!physical ? { reason: "symlink_component" as const } :
+        !evidence ? { reason: source === "codex" ? "codex_evidence_missing" as const :
+          "claude_evidence_missing" as const } : {}) });
   };
   for (const shape of CAPTURE_ROOT_SHAPES) {
     if ("segments" in shape) {
@@ -550,6 +660,7 @@ export function discoverCaptureRootCandidates(home: string): CaptureRootCandidat
       continue;
     }
     const parent = path.join(resolvedHome, shape.parent);
+    if (!physicalBelowHome(resolvedHome, parent)) continue;
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(parent, { withFileTypes: true }); }
     catch { continue; }
@@ -592,14 +703,16 @@ export function discoverCaptureRoots(
   });
   for (const candidate of candidates) {
     if (configured.has(candidate.directory)) continue;
-    const evidence = captureRootLiveCoverage(resolvedHome, candidate.source, candidate.directory, port);
+    const evidence = candidate.autoEnroll
+      ? captureRootLiveCoverage(resolvedHome, candidate.source, candidate.directory, port) : [];
     entries.push({
       source: candidate.source,
-      state: evidence.length ? "live_covered" : "candidate",
+      state: !candidate.autoEnroll ? "found_not_recorded" : evidence.length ? "live_covered" : "candidate",
       directory: candidate.relativeDirectory,
       outsideHome: false,
       shape: candidate.shape,
       rootId: null,
+      ...(candidate.reason ? { reason: candidate.reason } : {}),
       ...(evidence.length ? { evidence } : {}),
     });
   }

@@ -1,6 +1,7 @@
 /** One packaged join through a local cloud and a fixture-only launchctl. */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -8,8 +9,9 @@ import path from "node:path";
 import Database from "better-sqlite3";
 
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { discoverCaptureRootCandidates } from "../packages/collector-cli/src/capture-root-inventory";
+import { deriveCaptureRootIdentity, discoverCaptureRootCandidates } from "../packages/collector-cli/src/capture-root-inventory";
 import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
+import { dashboardSummary } from "../packages/collector-cli/src/dashboard-api";
 import { useFixtureRoot } from "./lib/fixture-root";
 
 const repo = path.resolve(import.meta.dirname, "..");
@@ -18,6 +20,7 @@ const root = fs.realpathSync(fs.mkdtempSync(path.join(repo, "join-setup-e2e-")))
 const token = "pljt_fixture-only-secret-never-print";
 const tenantId = "753a5a4f-c092-484b-b15e-0cfab3de4550";
 const installKey = "pli_fixture_join_install_key";
+const studioSession = "12345678-1234-4234-8234-123456789abc";
 const checks: string[] = [];
 
 function check(name: string, condition: unknown) {
@@ -101,12 +104,15 @@ function stubLaunchctl(bin: string) {
 
 async function cloud(mode: "ack" | "no_ack" | "refuse") {
   const uploads: string[] = [];
+  const joins: string[] = [];
+  const uniqueEvents = new Set<string>();
   const server = http.createServer((request, response) => {
     let body = "";
     request.setEncoding("utf8");
     request.on("data", (chunk: string) => { body += chunk; });
     request.on("end", () => {
       if (request.url?.endsWith("/join")) {
+        joins.push(body);
         if (mode === "refuse") {
           response.writeHead(401, { "content-type": "application/json" });
           response.end(JSON.stringify({ ok: false, reason: "used" }));
@@ -115,7 +121,7 @@ async function cloud(mode: "ack" | "no_ack" | "refuse") {
         const address = server.address();
         assert.ok(address && typeof address !== "string");
         response.writeHead(201, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, tenantId, installKey,
+        response.end(JSON.stringify({ ok: true, tenantId, workspaceName: "Utlyze | AI Native", installKey,
           uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest` }));
         return;
       }
@@ -125,6 +131,8 @@ async function cloud(mode: "ack" | "no_ack" | "refuse") {
         return;
       }
       uploads.push(body);
+      const payload = JSON.parse(body) as { events?: Array<{ event?: { id?: string } }> };
+      for (const entry of payload.events ?? []) if (entry.event?.id) uniqueEvents.add(entry.event.id);
       if (mode === "no_ack" && uploads.length > 1) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({ ok: true, accepted: 0 }));
@@ -153,7 +161,7 @@ async function cloud(mode: "ack" | "no_ack" | "refuse") {
     }
   }
   assert.ok(port, "No fixture port available in 49300-49399");
-  return { port, uploads, close: async () => {
+  return { port, uploads, joins, uniqueEvents, close: async () => {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   } };
@@ -238,6 +246,10 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     const privateFolder = path.join(f.home, "Documents", "private-sessions");
     for (const directory of [codex, unrelated, ...(name === "symlink_private" ? [privateFolder] : [studio])])
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(path.dirname(codex), "config.toml"), 'model = "gpt-6-sol"\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(codex, `rollout-2026-09-27T00-00-00-${studioSession}.jsonl`),
+      `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
+        payload: { id: studioSession } })}\n`, { mode: 0o600 });
     if (name === "symlink_private") {
       fs.mkdirSync(path.dirname(studio), { recursive: true, mode: 0o700 });
       fs.symlinkSync(privateFolder, studio);
@@ -245,17 +257,30 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     if (name === "partial_roots") {
       const claude = path.join(f.home, ".claude", "projects");
       fs.mkdirSync(claude, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(path.dirname(claude), "settings.json"), '{"permissions":{}}\n', { mode: 0o600 });
+      fs.writeFileSync(path.join(claude, `${studioSession}.jsonl`), '{"type":"user","message":{}}\n',
+        { mode: 0o600 });
       fs.symlinkSync(path.join(f.home, "missing-target"), path.join(claude, "ambiguous.jsonl"));
     }
-    fs.writeFileSync(path.join(studio, "rollout-prejoin.jsonl"), "{}\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(path.dirname(studio), "config.toml"),
+      'model = "gpt-6-sol"\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(studio, `rollout-2026-09-27T00-00-00-${studioSession}.jsonl`),
+      `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
+        payload: { id: studioSession } })}\n`, { mode: 0o600 });
     const candidates = discoverCaptureRootCandidates(f.home);
     if (name !== "symlink_private") check(`${name}_named_studio_rule_only`,
       candidates.some((entry) => entry.shape === "studio_codex_conductor" && entry.directory === studio) &&
       !candidates.some((entry) => entry.directory === unrelated));
     if (running) {
       fs.mkdirSync(f.data, { recursive: true, mode: 0o700 });
+      const fleetRoot = name === "fleet_label" ? [{
+        ...deriveCaptureRootIdentity("fleet-label-not-hostname", "codex", codex),
+        source: "codex" as const, directory: codex, installationEpochId: randomUUID(),
+      }] : [];
       fs.writeFileSync(path.join(f.data, "collector.config.json"),
-        `${JSON.stringify(collectorConfigSchema.parse({ port: Number(f.env.PLIMSOLL_PROOF_JOIN_PORT) }), null, 2)}\n`, { mode: 0o600 });
+        `${JSON.stringify(collectorConfigSchema.parse({ port: Number(f.env.PLIMSOLL_PROOF_JOIN_PORT),
+          ...(fleetRoot.length ? { captureRoots: fleetRoot,
+            enrollmentMachineLabel: "fleet-label-not-hostname" } : {}) }), null, 2)}\n`, { mode: 0o600 });
       const installed = await command(f.env, ["install-launch-agent", "--load"]);
       check(`${name}_fixture_collector_started_before_join`, installed.code === 0 && fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
@@ -294,6 +319,38 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     }
     if (prompt) check("fresh_prompt_hides_token_and_exits", true);
     const result = receipt(joined.stdout);
+    if (name === "partial_roots") {
+      const inventoryExists = fs.existsSync(path.join(f.data, "collector.config.json"));
+      console.log(JSON.stringify({ scenario: name, joinStatus: result.status, joinCode: joined.code,
+        inventoryExists, cloudRequests: remote.uploads.length + remote.joins.length }));
+      check("partial_registration_refuses_before_token_or_first_config_write", joined.code !== 0 &&
+        result.status === "join_preflight_failed" && !inventoryExists &&
+        remote.uploads.length === 0 && remote.joins.length === 0);
+      return;
+    }
+    if (name === "edited_manifest") {
+      const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+      const kept = fs.readFileSync(plist, "utf8").includes("/opt/owner-custom-bin");
+      const trace = fs.readFileSync(f.trace, "utf8");
+      console.log(JSON.stringify({ scenario: name, joinStatus: result.status, joinCode: joined.code,
+        reason: result.message, ownerPathPreserved: kept,
+        cloudRequests: remote.uploads.length + remote.joins.length }));
+      check("join_refuses_owner_edited_manifest_before_unload_or_token", joined.code !== 0 &&
+        result.status === "join_preflight_failed" && kept &&
+        result.message?.includes("EnvironmentVariables.PATH") &&
+        !trace.includes("bootout") && remote.uploads.length === 0 && remote.joins.length === 0 &&
+        fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      const explicit = await command(f.env, ["join", "--token-stdin", "--url",
+        `http://127.0.0.1:${remote.port}`, "--replace-launch-agent"], `${token}\n`, f.installedCli);
+      const explicitResult = receipt(explicit.stdout);
+      check("join_replaces_owner_manifest_only_with_explicit_flag", explicit.code === 0 &&
+        explicitResult.status === "joined" && remote.joins.length === 1 &&
+        !fs.readFileSync(plist, "utf8").includes("/opt/owner-custom-bin") &&
+        fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      check("changed_manifest_requires_second_unload_before_new_bootstrap",
+        fs.readFileSync(f.trace, "utf8").split("\n").filter((line) => line.startsWith("bootout ")).length === 2);
+      return;
+    }
     if (name === "clock_skew") console.log(JSON.stringify({ scenario: name, joinCode: joined.code,
       joinStatus: result.status, reason: result.reason ?? null }));
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8")));
@@ -304,15 +361,10 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       check("join_never_registers_symlinked_private_folder", !enrolled);
       return;
     }
-    if (name === "partial_roots") {
-      console.log(JSON.stringify({ scenario: name, joinStatus: result.status, joinCode: joined.code,
-        registeredRoots: config.captureRoots?.map((entry) => entry.directory) ?? [] }));
-      check("partial_registration_leaves_no_roots", config.captureRoots?.length === 0);
-      return;
-    }
     if (name === "crash_after_bootout") {
       console.log(JSON.stringify({ scenario: name, joinStatus: result.status, joinCode: joined.code,
-        collectorStateFileExists: fs.existsSync(f.state) }));
+        collectorStateFileExists: fs.existsSync(f.state), reason: result.reason,
+        stderr: joined.stderr.slice(-800), trace: fs.existsSync(f.trace) ? fs.readFileSync(f.trace, "utf8") : null }));
       check("crashed_add_restores_running_collector", fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
       return;
@@ -321,6 +373,10 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       config.captureRoots.some((entry) => entry.directory === studio && entry.source === "codex") &&
       config.captureRoots.some((entry) => entry.directory === codex && entry.source === "codex") &&
       !config.captureRoots.some((entry) => entry.directory === unrelated));
+    if (name === "fleet_label") check("join_reuses_persisted_nonhostname_fleet_label",
+      config.enrollmentMachineLabel === "fleet-label-not-hostname" &&
+      config.captureRoots?.some((entry) => entry.rootId ===
+        deriveCaptureRootIdentity("fleet-label-not-hostname", "codex", studio).rootId));
     check(`${name}_announces_folders_before_capture`, joined.stdout.indexOf("Will record 2 agent folders") >= 0 &&
       joined.stdout.indexOf("Will record 2 agent folders") < joined.stdout.indexOf('"status":'));
     check(`${name}_joined_forward_only`, result.enrollment?.mode === "future_only" &&
@@ -336,28 +392,23 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       trace.every((line, index) => !line.startsWith("bootstrap") || index === 0 || trace[index - 1]?.startsWith("bootout")));
     if (mode === "ack") {
       const ledger = new Database(path.join(f.data, "work-ledger.sqlite"), { readonly: true, fileMustExist: true });
-      const probe = ledger.prepare("select uploaded_at as uploadedAt from buffered_events where id like 'join-setup-%'")
-        .get() as { uploadedAt: string | null } | undefined;
+      const localEvents = dashboardSummary(ledger).totals.events;
+      const setupRows = (ledger.prepare("select count(*) as n from buffered_events where id like 'join-setup-%'")
+        .get() as { n: number }).n;
       ledger.close();
       const finished = joined.code === 0 && result.status === "joined" &&
         result.daemon?.running === true && result.daemon?.readinessVerified === true &&
-        result.daemon?.syncArmed === true && result.firstUploadKind === "setup_probe" &&
-        typeof result.firstUploadAt === "string" && remote.uploads.length >= 2 &&
-        probe?.uploadedAt === result.firstUploadAt &&
-        joined.stdout.includes("First upload acknowledged");
+        result.daemon?.syncArmed === true && result.firstContactKind === "handshake_replay" &&
+        typeof result.firstContactAt === "string" && remote.uploads.length >= 2 &&
+        remote.uniqueEvents.size === 1 && localEvents === 0 && setupRows === 0 &&
+        joined.stdout.includes("First contact confirmed");
       if (!finished) throw new Error(`${name}_single_command_finishes_ready_and_acknowledged: ` +
         JSON.stringify({ code: joined.code, status: result.status, reason: result.reason,
-          daemon: result.daemon, firstUploadAt: result.firstUploadAt,
-          uploadCount: remote.uploads.length,
-          setupProbeAcknowledged: probe?.uploadedAt === result.firstUploadAt,
-          plainResultSeen: joined.stdout.includes("First upload acknowledged") }));
+          daemon: result.daemon, firstContactAt: result.firstContactAt,
+          uploadCount: remote.uploads.length, uniqueEvents: remote.uniqueEvents.size,
+          localEvents, setupRows,
+          plainResultSeen: joined.stdout.includes("First contact confirmed") }));
       check(`${name}_single_command_finishes_ready_and_acknowledged`, true);
-      if (name === "edited_manifest") {
-        const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
-        const kept = fs.readFileSync(plist, "utf8").includes("/opt/owner-custom-bin");
-        console.log(JSON.stringify({ scenario: name, ownerPathPreserved: kept }));
-        check("join_preserves_valid_owner_edited_launchagent_path", kept);
-      }
       if (name === "fresh" && process.env.PLIMSOLL_PROOF_0744_CLI) {
         const old = await command(f.env, ["status", "--json"], "", process.env.PLIMSOLL_PROOF_0744_CLI);
         check("released_0744_cli_opens_head_joined_ledger", old.code === 0 &&
@@ -365,7 +416,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       }
     } else {
       check(`${name}_missing_ack_is_nonzero_but_collector_keeps_running`, joined.code !== 0 &&
-        result.status === "joined_setup_incomplete" && /No first upload acknowledgement/.test(result.reason) &&
+        result.status === "joined_setup_incomplete" && /No first contact acknowledgement/.test(result.reason) &&
         result.daemon?.running === true && joined.stderr.includes("Collector remains running") &&
         fs.existsSync(f.state) && fs.existsSync(path.join(f.data, "collector.config.json")));
     }
@@ -434,6 +485,10 @@ async function main() {
     }
     if (process.env.PR428_REVIEW_SCENARIO === "edited_manifest") {
       await joinedScenario("edited_manifest", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "fleet_label") {
+      await joinedScenario("fleet_label", true, "ack");
       return;
     }
     if (process.env.PR428_REVIEW_SCENARIO === "symlink_private") {

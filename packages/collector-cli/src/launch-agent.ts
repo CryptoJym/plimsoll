@@ -52,6 +52,9 @@ export type LaunchAgentOptions = {
    * installs, and read-only inspection never acquire the lease.
    */
   mutationAuthority?: LifecycleMutationAuthority;
+  /** Recovery only: exact previously validated manifest bytes. */
+  restoreContent?: string;
+  expectedCurrentDigest?: string;
 };
 
 export type LaunchAgentEnvironmentKeys =
@@ -956,11 +959,14 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
   const normalized = normalizedOptions(options);
   const homeDir = ensureHomeRoot(normalized.homeDir ?? os.homedir());
   const plistPath = launchAgentPlistPath(homeDir);
-  const desired = Buffer.from(renderLaunchAgentPlist({ ...normalized, homeDir }));
+  const desired = Buffer.from(options.restoreContent ?? renderLaunchAgentPlist({ ...normalized, homeDir }));
   validateOwnedManifest(desired.toString("utf8"));
   const initial = readPreimage(plistPath);
   try {
     if (initial.content) validateOwnedManifest(initial.content.toString("utf8"));
+    if (options.expectedCurrentDigest &&
+        (!initial.content || digest(initial.content) !== options.expectedCurrentDigest))
+      fail("RECOVERY_PREIMAGE_CHANGED");
     const exactNoop = Boolean(
       initial.content &&
       initial.snapshot.leaf &&
@@ -1134,6 +1140,35 @@ export function inspectLaunchAgentManifest(options: { homeDir?: string } = {}) {
       manifestIdentityDigest: identityDigest(preimage.snapshot.leaf!),
       mode: formatPermissionMode(preimage.snapshot.leaf!.mode),
     };
+  } finally {
+    if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);
+  }
+}
+
+/** Compare an installed manifest with the owned template for its existing runtime. */
+export function launchAgentOwnerEditedKeys(options: { homeDir?: string } = {}): string[] {
+  const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
+  const preimage = readPreimage(launchAgentPlistPath(homeDir));
+  try {
+    if (!preimage.content) return [];
+    const actual = validateOwnedManifest(preimage.content.toString("utf8"));
+    assertStablePath(preimage.snapshot);
+    const workingDirectory = actual.WorkingDirectory as string;
+    const expected = parsePlist(renderLaunchAgentPlist({ homeDir, repoRoot: workingDirectory,
+      workingDirectory, programArguments: strings(actual.ProgramArguments, "PLIST_ARGUMENTS_INVALID") }));
+    const differences: string[] = [];
+    for (const key of Object.keys(expected)) {
+      if (key === "EnvironmentVariables") {
+        const actualEnv = record(actual[key], "PLIST_ENVIRONMENT_INVALID");
+        const expectedEnv = record(expected[key], "PLIST_ENVIRONMENT_INVALID");
+        for (const envKey of Object.keys(expectedEnv)) {
+          if (!isDeepStrictEqual(actualEnv[envKey], expectedEnv[envKey]))
+            differences.push(`EnvironmentVariables.${envKey}`);
+        }
+      } else if (!isDeepStrictEqual(actual[key], expected[key])) differences.push(key);
+    }
+    if (Object.hasOwn(actual, "ProcessType")) differences.push("ProcessType");
+    return differences;
   } finally {
     if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);
   }

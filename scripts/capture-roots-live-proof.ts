@@ -32,12 +32,20 @@ function check(name: string, condition: unknown, detail: unknown) {
 }
 
 async function freePort() {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return address.port;
+  for (let port = 49300; port <= 49399; port += 1) {
+    const server = net.createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, "127.0.0.1", resolve);
+      });
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      return port;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+    }
+  }
+  throw new Error("No fixture port available in 49300-49399");
 }
 
 async function main() {
@@ -56,7 +64,7 @@ async function main() {
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     }
     fs.writeFileSync(path.join(home, ".codex-profiles/live/config.toml"),
-      `[otel.trace_exporter."otlp-http"]\nendpoint = "http://127.0.0.1:${port}/v1/traces"\nprotocol = "json"\nheaders = { "x-plimsoll-source" = "codex", "x-plimsoll-token" = "never-print-this-token" }\n`,
+      `model = "gpt-6-sol"\n[otel.trace_exporter."otlp-http"]\nendpoint = "http://127.0.0.1:${port}/v1/traces"\nprotocol = "json"\nheaders = { "x-plimsoll-source" = "codex", "x-plimsoll-token" = "never-print-this-token" }\n`,
       { mode: 0o600 });
     fs.writeFileSync(path.join(home, ".claude-seats/hooks/settings.json"), JSON.stringify({
       hooks: { Stop: [{ hooks: [{ type: "http", url: `http://127.0.0.1:${port}/hooks/claude-code`,
@@ -70,6 +78,14 @@ async function main() {
     fs.writeFileSync(path.join(home, ".claude-seats/gap/settings.json"), JSON.stringify({
       env: { OTEL_LOGS_EXPORTER: "otlp", OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://127.0.0.1:1/v1/logs" },
     }), { mode: 0o600 });
+    const evidenceSession = "12345678-1234-4234-8234-123456789abc";
+    fs.writeFileSync(path.join(codexLive,
+      `rollout-2026-09-27T00-00-00-${evidenceSession}.jsonl`),
+      `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
+        payload: { id: evidenceSession } })}\n`, { mode: 0o600 });
+    for (const directory of [claudeHooks, claudeOtel, gap])
+      fs.writeFileSync(path.join(directory, `${evidenceSession}.jsonl`),
+        '{"type":"user","message":{}}\n', { mode: 0o600 });
 
     const ledger = path.join(data, "work-ledger.sqlite");
     const buffer = new LocalEventBuffer(ledger, { workspaceId: workspace, deviceId: device });

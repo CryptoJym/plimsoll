@@ -1,18 +1,17 @@
-/** Independent PR #428 regression witnesses. Expected to fail until the PR is fixed. */
+/** Independent PR #428 privacy and machine-label regression witnesses. */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
+  captureRootsDeriveFrom,
   deriveCaptureRootIdentity,
   discoverCaptureRootCandidates,
   resolveCaptureRootMachineLabel,
 } from "../packages/collector-cli/src/capture-root-inventory";
-import { dashboardSummary } from "../packages/collector-cli/src/dashboard-api";
-import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 
 const root = fs.mkdtempSync(path.join(process.cwd(), "pr428-review-"));
 const failures: string[] = [];
@@ -47,9 +46,13 @@ try {
 
   const other = path.join(home, ".clientai/studio/borg/conductors/not-an-agent/profile/sessions");
   fs.mkdirSync(other, { recursive: true });
+  fs.writeFileSync(path.join(path.dirname(other), "config.toml"), 'model = "gpt-6-sol"\n');
+  fs.writeFileSync(path.join(other, "rollout-2026-09-27T00-00-00-12345678-1234-4234-8234-123456789abc.jsonl"),
+    '{}\n');
   const nameOnlyCandidates = discoverCaptureRootCandidates(home);
-  check("studio_name_only_folder_is_not_assumed_to_be_agent_sessions",
-    nameOnlyCandidates.some((entry) => entry.shape === "studio_codex_conductor" && entry.directory === other), false);
+  check("studio_name_only_folder_is_preview_only",
+    nameOnlyCandidates.find((entry) => entry.shape === "studio_codex_conductor" && entry.directory === other)?.autoEnroll,
+    false);
 
   const machine = "fleet-label-not-the-hostname";
   const directory = path.join(home, ".codex/sessions");
@@ -59,21 +62,14 @@ try {
   const hostname = os.hostname();
   const candidates = [...new Set([hostname, hostname.split(".")[0] ?? "", hostname.toLowerCase(),
     (hostname.split(".")[0] ?? "").toLowerCase()])].filter(Boolean);
+  check("nonhostname_label_cannot_be_guessed_from_hostname",
+    resolveCaptureRootMachineLabel(roots, candidates), null);
+  const persisted = collectorConfigSchema.parse({ captureRoots: roots, enrollmentMachineLabel: machine });
   check("join_can_recover_existing_nonhostname_machine_label",
-    resolveCaptureRootMachineLabel(roots, candidates) !== null, true);
-
-  const buffer = new LocalEventBuffer(path.join(root, "probe.sqlite"));
-  try {
-    const before = dashboardSummary(buffer.database).totals.events;
-    const appended = buffer.append(aiInteractionEventSchema.parse({
-      id: `join-setup-${randomUUID()}`, tenantId: "753a5a4f-c092-484b-b15e-0cfab3de4550",
-      source: "codex", dataMode: "metadata", eventType: "unknown",
-      observedAt: new Date().toISOString(), metadata: { collectorSetupProbe: true },
-    }));
-    assert.equal(appended, true);
-    const after = dashboardSummary(buffer.database).totals.events;
-    check("setup_probe_does_not_inflate_local_dashboard_event_total", after, before);
-  } finally { buffer.close(); }
+    resolveCaptureRootMachineLabel(roots, [persisted.enrollmentMachineLabel ?? ""]) === machine &&
+      captureRootsDeriveFrom(roots, persisted.enrollmentMachineLabel ?? ""), true);
+  // The packaged join proof checks local event and hosted unique-event totals
+  // across the first-contact replay; this unit witness never fakes an append.
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

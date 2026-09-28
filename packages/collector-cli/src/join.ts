@@ -6,7 +6,7 @@ import path from "node:path";
 import { z } from "zod";
 
 import collectorPackage from "../package.json";
-import { DEFAULT_POLICY } from "../../shared/src/index";
+import { DEFAULT_POLICY, aiWorkIngestBatchSchema, type AiWorkIngestBatch } from "../../shared/src/index";
 import { LocalEventBuffer } from "./buffer";
 import {
   assertCollectorPrivacyMode,
@@ -67,6 +67,7 @@ export function parseJoinTarget(raw: string, explicitBaseUrl?: string): JoinTarg
 const joinGrantSchema = z.object({
   ok: z.literal(true),
   tenantId: z.string().trim().min(1),
+  workspaceName: z.string().trim().min(1).max(200).optional(),
   deviceId: z.string().uuid().optional(),
   installKey: z.string().trim().min(1),
   uploadUrl: z.string().url(),
@@ -89,6 +90,7 @@ const pendingJoinSchema = z.object({
   /** Persisted activation identity, distinct for each native join; resumes reuse it. */
   installationEpochId: z.string().uuid().optional(),
   handshakeEventId: z.string().trim().min(1).optional(),
+  contactReplayBatch: aiWorkIngestBatchSchema.optional(),
   stagedConfig: collectorConfigSchema,
   accountActorSaltEndpoint: z.string().url().optional(),
 });
@@ -114,6 +116,7 @@ export type JoinResult =
       joined: true;
       configPath: string;
       tenantId: string;
+      workspaceName?: string;
       deviceId: string;
       keyId: string;
       policyVersion: string;
@@ -139,6 +142,8 @@ export type JoinResult =
         response: unknown;
       };
       accountSaltSynced?: boolean;
+      /** In-memory duplicate of the acknowledged handshake; never printed or persisted. */
+      contactReplayBatch?: AiWorkIngestBatch;
     }
   | {
       joined: false;
@@ -212,6 +217,7 @@ function stageGrant(
   existing: CollectorConfig,
   grant: z.infer<typeof joinGrantSchema>,
   identity: ReturnType<typeof loadOrCreateDeviceIdentity>,
+  enrollmentMachineLabel?: string,
 ) {
   // Credential absence is meaningful. Destructure every stale credential out
   // before applying the grant so a rejoin cannot inherit an old secret/key.
@@ -219,6 +225,7 @@ function stageGrant(
     ingestKey: _staleIngestKey,
     installKey: _staleInstallKey,
     tenantId: _staleTenantId,
+    workspaceName: _staleWorkspaceName,
     uploadSigningSecret: _staleSigningSecret,
     uploadUrl: _staleUploadUrl,
     accountActorSaltEndpoint: _staleAccountActorSaltEndpoint,
@@ -229,8 +236,10 @@ function stageGrant(
   } = existing;
   return collectorConfigSchema.parse({
     ...localSettings,
+    ...(enrollmentMachineLabel ? { enrollmentMachineLabel } : {}),
     managed: true,
     tenantId: grant.tenantId,
+    ...(grant.workspaceName ? { workspaceName: grant.workspaceName } : {}),
     deviceId: identity.deviceId,
     ...(grant.deviceId ? { cloudDeviceId: grant.deviceId } : {}),
     keyId: grant.keyId ?? identity.keyId,
@@ -417,6 +426,7 @@ function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult 
     joined: true,
     configPath: collectorConfigPath(homeDir),
     tenantId: pending.stagedConfig.tenantId,
+    workspaceName: pending.stagedConfig.workspaceName,
     deviceId: pending.stagedConfig.deviceId ?? "",
     keyId: pending.stagedConfig.keyId ?? "",
     policyVersion: pending.stagedConfig.policy.version,
@@ -438,6 +448,7 @@ function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult 
       signedUpload: Boolean(pending.stagedConfig.uploadSigningSecret),
       response: { status: "already_activated" },
     },
+    contactReplayBatch: pending.contactReplayBatch,
   };
 }
 
@@ -601,7 +612,8 @@ async function activatePendingJoin(
       throw new Error("Join handshake did not explicitly acknowledge exactly its one synthetic probe.");
     }
     handshakeAcknowledged = true;
-    pending = pendingJoinSchema.parse({ ...pending, handshakeEventId: selfTestEventId });
+    pending = pendingJoinSchema.parse({ ...pending, handshakeEventId: selfTestEventId,
+      contactReplayBatch: uploaded.batch });
     replacePendingJoin(pending, options.pendingFile);
 
     cleanupTemporaryState();
@@ -697,6 +709,7 @@ async function activatePendingJoin(
       joined: true,
       configPath: activeConfigPath,
       tenantId: pending.stagedConfig.tenantId,
+      workspaceName: pending.stagedConfig.workspaceName,
       deviceId: identity.deviceId,
       keyId: pending.stagedConfig.keyId ?? identity.keyId,
       policyVersion: pending.stagedConfig.policy.version,
@@ -716,6 +729,7 @@ async function activatePendingJoin(
         signedUpload: uploaded.signedUpload,
         response: uploaded.response,
       },
+      contactReplayBatch: uploaded.batch!,
       accountSaltSynced,
     };
   } catch (error) {
@@ -791,16 +805,18 @@ export async function performJoin(options: {
   afterConfigActivation?: () => void;
   /** Required when a managed collector changes its workspace audience. */
   reassign?: boolean;
+  /** Read-only setup preflight resolves this before the single-use redemption. */
+  enrollmentMachineLabel?: string;
 }): Promise<JoinResult> {
   const { token, baseUrl } = parseJoinTarget(options.target, options.baseUrl);
   if (!token) {
     throw new Error(
-      'No token found. Use the full join URL from your admin ("https://…#pljt_…") or provide it with --token-stdin.',
+      "No token found. Use --token-prompt, --token-stdin, or --token-fd with --url.",
     );
   }
   if (!baseUrl) {
     throw new Error(
-      'No workspace URL. Use the full join URL from your admin ("https://…#pljt_…"), or pass --url <cloud-base-url> (or set PLIMSOLL_CLOUD_URL).',
+      "No workspace URL. Pass --url <cloud-base-url> or set PLIMSOLL_CLOUD_URL.",
     );
   }
 
@@ -885,7 +901,7 @@ export async function performJoin(options: {
     const identity = loadOrCreateDeviceIdentity(homeDir, {
       seed: { deviceId: existingConfig.deviceId, keyId: existingConfig.keyId },
     });
-    const stagedConfig = stageGrant(existingConfig, grant, identity);
+    const stagedConfig = stageGrant(existingConfig, grant, identity, options.enrollmentMachineLabel);
     const pending = pendingJoinSchema.parse({
       version: 1,
       createdAt: new Date().toISOString(),
