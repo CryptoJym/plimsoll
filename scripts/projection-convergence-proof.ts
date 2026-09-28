@@ -26,14 +26,15 @@ function seedLedger(databasePath: string) {
   );
   const expiredAt = new Date(NOW.getTime() - 29 * DAY_MS).toISOString();
   const retainedAt = new Date(NOW.getTime() - 20 * DAY_MS).toISOString();
+  const expiringFacts = 4_100;
+  const retainedFacts = 1_501;
   db.transaction(() => {
-    // The first 2,000 facts are older than the advanced 30-day cutoff; all
-    // 3,501 are older than the 7-day cutoff. Expiry therefore stays active in
-    // bounded slices, while the 1,501 facts that remain inside the 30-day
-    // window make one session repair exceed its 1,000-row slice and expose the
-    // cursor restart on every cadence.
-    for (let index = 0; index < 3_501; index += 1) {
-      const observedAt = index < 2_000 ? expiredAt : retainedAt;
+    // More than four full 1,000-row expiry turns must remain after the four
+    // bounded maintenance calls below. The retained facts make one session
+    // repair exceed its 1,000-row slice and expose cursor restart on every
+    // cadence while expiry still has work.
+    for (let index = 0; index < expiringFacts + retainedFacts; index += 1) {
+      const observedAt = index < expiringFacts ? expiredAt : retainedAt;
       const id = `projection-convergence-${index}`;
       insert.run(
         id,
