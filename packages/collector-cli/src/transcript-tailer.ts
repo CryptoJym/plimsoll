@@ -985,9 +985,12 @@ export class TranscriptTailer {
           continue;
         }
       }
-      const cursor = loadJsonlScanCursor<TranscriptParserState>(
+      const storedCursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateTranscriptParserState,
       );
+      const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+      const cursor = storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity
+        ? undefined : storedCursor;
       let initialOffset: number | undefined;
       if (growthStart !== null) {
         if (cursor && (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart)) {

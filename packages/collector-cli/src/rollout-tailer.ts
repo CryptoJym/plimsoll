@@ -1030,9 +1030,12 @@ export class RolloutTailer {
           continue;
         }
       }
-      const cursor = loadJsonlScanCursor<RolloutParserState>(
+      const storedCursor = loadJsonlScanCursor<RolloutParserState>(
         this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateRolloutParserState,
       );
+      const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+      const cursor = storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity
+        ? undefined : storedCursor;
       let initialOffset: number | undefined;
       if (growthStart !== null) {
         if (cursor && (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart)) {

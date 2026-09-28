@@ -64,6 +64,15 @@ jobs:
           pnpm proof:pr426-r6-crash-mid-carry
           pnpm proof:pr426-r6-stale-generation-growth
 
+      - name: Prove replacement and restore recovery boundaries (PR 426 round 7)
+        run: |
+          pnpm proof:pr426-r7-replaced-during-switch
+          pnpm proof:pr426-r7-append-before-first-scan
+          pnpm proof:pr426-r7-replace-after-rename
+          pnpm proof:pr426-r7-restore-weekly-control
+          pnpm proof:pr426-r7-plan-open-refusal-sidecars
+          pnpm proof:pr426-r7-restore-rerun
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit

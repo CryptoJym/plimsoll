@@ -44,9 +44,11 @@ keys, and capture-root configuration stay in place.
    ```
 
    Before scheduling the 90-second window, run the same read-only command
-   with `--sizes` on a private Studio0 **ledger and root copy**. Require
+   with `--sizes` on a private Studio0 **ledger and root copy**, and time that
+   invocation on the copy before booking the cutover window. Require
    `totalCarriedBytes <= carryBudgetBytes` (8 MiB). The plan reports exact
-   row counts and SQLite value-payload bytes per carried table; the budget
+   row counts and SQLite value-payload bytes per carried table. The 8 MiB
+   budget counts value bytes only, not SQLite pages or filesystem overhead. It
    includes cursor and authorization rows, not the 88.7 GB archive. A fixture
    with 20,000 retained rows had 948,890 carried value bytes and took 4.6 to
    7.0 seconds to plan and switch in two runs. Scaling both measured totals
@@ -75,7 +77,10 @@ keys, and capture-root configuration stay in place.
    takes SQLite exclusive ownership of the old inode, checkpoints its WAL,
    creates and binds a staged replacement to the agreed root epoch, and
    carries each valid per-file committed cursor whose file generation still
-   matches, plus Codex live authorization rows. It creates a hard link for
+   matches, plus Codex live authorization rows. Immediately before rename,
+   under the switch lease, it rechecks each carried cursor against the file's
+   current generation and size. A replaced or shortened generation loses its
+   old cursor and is fenced at its size at that moment. It creates a hard link for
    the archive and atomically swaps the
    already-bound stage into the active pathname. The archive is never
    deleted. The replacement's durable marker records the archive identity,
@@ -128,7 +133,9 @@ plimsoll capture-roots epoch-restore --archive "$archive" --save-fresh "$freshAt
 The command checks the marker and archive identity, clones the archived old
 ledger into a restore stage, and folds the replacement's weekly event, tool
 attempt, and dimension rows from the cutover UTC week onward in one SQLite
-transaction. It commits and checkpoints that fold before atomically swapping
+transaction. The same transaction restores weekly upload control with the
+archive's first week if it precedes the cutover week, or the cutover week
+otherwise. It commits and checkpoints that fold before atomically swapping
 the clone into the active pathname. The replacement is retained at
 `freshAttempt`; the archive is unchanged. If a replacement weekly report is
 already frozen, restore refuses with `restore_weekly_report_reconcile_required`
@@ -142,6 +149,13 @@ see the replacement file. Check the old outbox and cloud history after it
 starts. Events already accepted from the replacement remain in the cloud;
 retain the fresh attempt for reconciliation rather than replaying it through
 the old runtime.
+
+If the restore process dies, rerun the same `epoch-restore` command with the
+same three paths. A pre-rename stage is recovered and folded again under the
+mutation lease; a post-rename rerun confirms the active archived image and
+durably syncs its directory. Wait for the killed lease's fencing deadline if
+the command reports it busy. Keep the archive, retained fresh attempt, and
+all sidecars; no manual cleanup is required.
 
 If the restore command refuses, keep the daemon stopped and inspect its reason
 and the three paths. Do not hand the replacement pathname to an old runtime.

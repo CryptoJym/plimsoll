@@ -53,6 +53,7 @@ const CARRIED_COLUMNS: Record<(typeof CARRIED_TABLES)[number], readonly string[]
   session_usage_authority: ["source", "session_id", "authority", "claimed_at"],
 };
 const STAGE_SUFFIX = ".replacement-stage";
+const RESTORE_LEASE_MS = 60_000;
 
 export type FreshLedgerCutoverPlan = {
   status: "ready" | "refused";
@@ -350,7 +351,7 @@ function assertPrivateDirectory(directory: string, reason: string): fs.Stats {
 }
 
 function stageArtifactPresent(stage: string): boolean {
-  const artifacts = [stage, `${stage}-wal`, `${stage}-shm`].filter(file => {
+  const artifacts = [stage, `${stage}-wal`, `${stage}-shm`, `${stage}-journal`].filter(file => {
     try { fs.lstatSync(file); return true; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -401,29 +402,78 @@ function assertPaths(input: CutoverInput) {
   return old;
 }
 
-function untrackedRootFiles(db: Database.Database, input: CutoverInput): Array<{
+function observedRootFiles(input: CutoverInput, heartbeat?: () => void): Array<{
   source: "codex" | "claude_code"; fileKey: string;
   observation: CaptureBaselineFileObservation;
 }> {
   const result: Array<{ source: "codex" | "claude_code";
     fileKey: string; observation: CaptureBaselineFileObservation }> = [];
-  const cursor = hasTable(db, "rollout_scan_state")
-    ? db.prepare("select file_identity as fileIdentity from rollout_scan_state where file=?") : null;
   const roots = input.config.captureRoots ?? [];
   for (const root of roots) {
+    heartbeat?.();
     const files = captureRootBaselineFiles(root.source, root.directory);
     if (files.errors) throw new Error("capture_root_file_inventory_unreadable");
     const observed = captureRootBaselineObservations(files.files);
     if (observed.errors) throw new Error("capture_root_file_stat_unreadable");
     for (const observation of observed.observations) {
       const key = jsonlScanStateKey(rootCursorKey(roots, observation.path));
-      const row = cursor?.get(key) as { fileIdentity: string } | undefined;
-      const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
-      if (row?.fileIdentity !== identity) result.push({ source: root.source,
-        fileKey: key, observation });
+      result.push({ source: root.source, fileKey: key, observation });
+      if (result.length % 128 === 0) heartbeat?.();
     }
   }
   return result;
+}
+
+function untrackedRootFiles(db: Database.Database, input: CutoverInput) {
+  const cursor = hasTable(db, "rollout_scan_state")
+    ? db.prepare("select file_identity as fileIdentity from rollout_scan_state where file=?") : null;
+  return observedRootFiles(input).filter(({ fileKey, observation }) => {
+    const row = cursor?.get(fileKey) as { fileIdentity: string } | undefined;
+    return row?.fileIdentity !==
+      `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+  });
+}
+
+/** Rebind the staged cursor/fence set to the final observed file generations.
+ * This runs under the old-ledger lock and lifecycle lease immediately before
+ * the active pathname is replaced. A stale cursor cannot suppress growth. */
+function finalizeReplacementFileFences(stage: Database.Database, input: CutoverInput,
+  heartbeat: () => void): { cursorRows: number; fencedFiles: number } {
+  const observations = observedRootFiles(input, heartbeat);
+  const byKey = new Map<string, (typeof observations)[number]>();
+  for (const entry of observations) {
+    if (byKey.has(entry.fileKey)) throw new Error("capture_root_file_key_conflict");
+    byKey.set(entry.fileKey, entry);
+  }
+  const carried = stage.prepare(`select file_key as fileKey, source, file_identity as fileIdentity,
+    committed_offset as committedOffset from replacement_capture_cursors`).all() as Array<{
+      fileKey: string; source: "codex" | "claude_code";
+      fileIdentity: string; committedOffset: number;
+    }>;
+  const dropMark = stage.prepare("delete from replacement_capture_cursors where file_key=?");
+  const dropCursor = stage.prepare("delete from rollout_scan_state where file=?");
+  const validKeys = new Set<string>();
+  for (const row of carried) {
+    const current = byKey.get(row.fileKey);
+    const identity = current &&
+      `${current.observation.device}:${current.observation.inode}:${current.observation.birthtimeNs}`;
+    if (current?.source === row.source && identity === row.fileIdentity &&
+        row.committedOffset <= current.observation.size) validKeys.add(row.fileKey);
+    else {
+      dropMark.run(row.fileKey);
+      dropCursor.run(row.fileKey);
+    }
+    heartbeat();
+  }
+  const untracked = observations.filter(entry => !validKeys.has(entry.fileKey));
+  for (const source of ["codex", "claude_code"] as const) {
+    recordReplacementUnseenFileFences(stage, source,
+      untracked.filter(entry => entry.source === source).map(entry => entry.observation));
+    heartbeat();
+  }
+  stage.prepare("update collector_replacement_ledger set cursor_rows=? where singleton=1")
+    .run(validKeys.size);
+  return { cursorRows: validKeys.size, fencedFiles: untracked.length };
 }
 
 function openReadOnlyPlanDatabase(ledgerPath: string): {
@@ -467,6 +517,7 @@ function openReadOnlyPlanDatabase(ledgerPath: string): {
  * original inode exclusively; a prior plan is never an authorization token. */
 export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverPlan {
   const roots = input.config.captureRoots ?? [];
+  let sidecarsMayAppear = false;
   const base = {
     readOnly: true as const, rootCount: roots.length, installationEpochId: null as string | null,
     archiveIdentity: null as string | null, archiveLatestRecordedAt: null as string | null,
@@ -482,7 +533,9 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
   try {
     const epoch = rootEpoch(input);
     const old = assertPaths(input);
-    const { db, sidecarsMayAppear } = openReadOnlyPlanDatabase(input.ledgerPath);
+    const opened = openReadOnlyPlanDatabase(input.ledgerPath);
+    const { db } = opened;
+    sidecarsMayAppear = opened.sidecarsMayAppear;
     try {
       if (sidecarsMayAppear) db.pragma("query_only = ON");
       const untracked = untrackedRootFiles(db, input);
@@ -519,7 +572,8 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
       return { ...fields, status: "ready", reason: null };
     } finally { db.close(); }
   } catch (error) {
-    return { ...base, status: "refused", reason: error instanceof Error ? error.message : "archive_unreadable" };
+    return { ...base, sidecarsMayAppear,
+      status: "refused", reason: error instanceof Error ? error.message : "archive_unreadable" };
   }
 }
 
@@ -549,8 +603,20 @@ function fsyncDirectory(directory: string) {
 }
 
 function removeOwnedStage(stage: string) {
-  for (const file of [stage, `${stage}-wal`, `${stage}-shm`]) {
+  for (const file of [stage, `${stage}-wal`, `${stage}-shm`, `${stage}-journal`]) {
     if (fs.existsSync(file)) fs.unlinkSync(file);
+  }
+}
+
+function retainRestoreStageSidecars(stage: string, freshAttemptPath: string) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const source = `${stage}${suffix}`;
+    if (!fs.existsSync(source)) continue;
+    const destinationBase = `${freshAttemptPath}.restore-stage${suffix}`;
+    let ordinal = 1;
+    while (fs.existsSync(`${destinationBase}.recovered-${ordinal}`)) ordinal++;
+    fs.chmodSync(source, 0o600);
+    fs.renameSync(source, `${destinationBase}.recovered-${ordinal}`);
   }
 }
 
@@ -599,10 +665,10 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     // A clock adjustment between inspection and first open cannot move the
     // replacement's cutoff behind the archive.
     const switchNow = (input.now ?? (() => new Date()))();
-    const untracked = untrackedRootFiles(old, input);
-    const staleFileKeys = new Set(untracked.map(row => row.fileKey));
+    // Copy every validated archive cursor first. The final root snapshot,
+    // taken just before the active rename, decides which generations survive.
     const inspection = inspectArchive(old, { ...input, now: () => switchNow }, stat,
-      staleFileKeys);
+      new Set());
     if (inspection.totalCarriedBytes > MAX_CARRIED_VALUE_BYTES) {
       throw new Error("carried_state_exceeds_8_mib_budget");
     }
@@ -637,10 +703,6 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
         let copied = 0;
         for (const row of old!.prepare(`select ${names} from rollout_scan_state`).iterate() as
           Iterable<Record<string, unknown>>) {
-          // A path can now point at a different inode. Its archive cursor is
-          // still validated above, but carrying it would prevent the new
-          // generation's fenced growth from starting at the switch size.
-          if (staleFileKeys.has(row.file as string)) continue;
           insert.run(...cursorColumns.map(column => row[column]));
           mark.run(row.file, row.parser_kind === "codex-rollout-v2" ? "codex" : "claude_code",
             row.file_identity, row.committed_offset);
@@ -651,11 +713,6 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
         heartbeat();
       }
       for (const table of CARRIED_TABLES) copyTable(old!, target, table, heartbeat, input.onCopyRow);
-      for (const source of ["codex", "claude_code"] as const) {
-        recordReplacementUnseenFileFences(target, source,
-          untracked.filter(row => row.source === source).map(row => row.observation));
-        heartbeat();
-      }
       if (hasTable(old!, "maintenance_state")) {
         const row = old!.prepare("select key,value,updated_at from maintenance_state where key=?")
           .get(ACCOUNT_ASSERTION_STATE_KEY) as { key: string; value: string; updated_at: string } | undefined;
@@ -695,12 +752,17 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     fsyncDirectory(path.dirname(input.archivePath));
     input.onStep?.("archive_linked");
     heartbeat();
+    const finalFiles = finalizeReplacementFileFences(replacementLock, input, heartbeat);
+    replacementLock.exec("COMMIT");
+    heartbeat();
+    replacementLock.exec("BEGIN EXCLUSIVE");
     fs.renameSync(stage, input.ledgerPath);
     fsyncDirectory(path.dirname(input.ledgerPath));
     switched = true;
     input.onStep?.("switched");
     return { ...first, archiveIdentity: inspection.archiveIdentity,
-      archiveLatestRecordedAt: inspection.latest, untrackedFileFences: untracked.length };
+      archiveLatestRecordedAt: inspection.latest, cursorRows: finalFiles.cursorRows,
+      untrackedFileFences: finalFiles.fencedFiles };
   } finally {
     staged?.close();
     if (old?.inTransaction) old.exec("COMMIT");
@@ -732,13 +794,29 @@ export function readReplacementLedgerMarker(ledgerPath: string): ReplacementLedg
 
 function foldReplacementWeeklyFacts(replacement: Database.Database, restored: Database.Database,
   switchedAt: string, heartbeat: () => void): number {
-  const firstWeek = `${utcWeekStart(new Date(switchedAt))}T00:00:00.000Z`;
+  const cutoverWeek = utcWeekStart(new Date(switchedAt));
+  const firstWeek = `${cutoverWeek}T00:00:00.000Z`;
   const pending = replacement.prepare(`select week_start as weekStart
     from weekly_tool_stats_uploads where week_start>=? limit 1`).get(firstWeek.slice(0, 10)) as
     { weekStart: string } | undefined;
   // A frozen upload may already have reached the cloud. Refuse before the
   // pathname swap rather than publish a partial week after restore.
   if (pending) throw new Error(`restore_weekly_report_reconcile_required:${pending.weekStart}`);
+  const binding = restored.prepare(`select current_workspace_id as workspaceId,
+    current_device_id as deviceId from collector_workspace_binding where singleton=1`).get() as
+    { workspaceId: string; deviceId: string | null } | undefined;
+  if (!binding?.deviceId) throw new Error("restore_weekly_binding_missing");
+  const prior = restored.prepare(`select first_week as firstWeek from weekly_tool_stats_control
+    where workspace_id=? and device_id=?`).get(binding.workspaceId, binding.deviceId) as
+    { firstWeek: string } | undefined;
+  if (prior && (!/^\d{4}-\d{2}-\d{2}$/.test(prior.firstWeek) ||
+      utcWeekStart(new Date(`${prior.firstWeek}T00:00:00.000Z`)) !== prior.firstWeek)) {
+    throw new Error("restore_weekly_control_invalid");
+  }
+  const restoredFirstWeek = prior && prior.firstWeek <= cutoverWeek ? prior.firstWeek : cutoverWeek;
+  restored.prepare(`insert into weekly_tool_stats_control(workspace_id,device_id,first_week)
+    values(?,?,?) on conflict(workspace_id,device_id) do update set first_week=excluded.first_week`)
+    .run(binding.workspaceId, binding.deviceId, restoredFirstWeek);
   const copy = (table: string, where: string, params: unknown[]) => {
     const names = columns(restored, table).map(name => `"${name.replaceAll('"', '""')}"`).join(",");
     const targetColumns = columns(restored, table);
@@ -788,7 +866,10 @@ export function restoreArchivedLedger(input: {
         .map(file => path.resolve(file))).size !== 3) {
     throw new Error("restore_path_invalid");
   }
-  const marker = readReplacementLedgerMarker(input.ledgerPath);
+  const activeMarker = readReplacementLedgerMarker(input.ledgerPath);
+  const freshExists = fs.existsSync(input.freshAttemptPath);
+  const marker = activeMarker ?? (freshExists
+    ? readReplacementLedgerMarker(input.freshAttemptPath) : null);
   if (!marker || marker.archivePath !== path.resolve(input.archivePath)) {
     throw new Error("replacement_archive_marker_mismatch");
   }
@@ -797,13 +878,16 @@ export function restoreArchivedLedger(input: {
   const attemptDirectory = fs.lstatSync(path.dirname(input.freshAttemptPath));
   assertPrivateDirectory(path.dirname(input.archivePath), "archive_directory_unsafe");
   assertPrivateDirectory(path.dirname(input.freshAttemptPath), "fresh_attempt_directory_unsafe");
+  const freshStat = freshExists ? fs.lstatSync(input.freshAttemptPath) : null;
   if (!archiveStat.isFile() || archiveStat.isSymbolicLink() ||
       !currentStat.isFile() || currentStat.isSymbolicLink() ||
       !attemptDirectory.isDirectory() || attemptDirectory.isSymbolicLink() ||
       attemptDirectory.dev !== currentStat.dev || archiveStat.dev !== currentStat.dev ||
-      fs.existsSync(input.freshAttemptPath) ||
-      fs.existsSync(`${input.freshAttemptPath}-wal`) ||
-      fs.existsSync(`${input.freshAttemptPath}-shm`)) {
+      (freshStat && (!freshStat.isFile() || freshStat.isSymbolicLink() ||
+        freshStat.uid !== process.getuid?.() || freshStat.dev !== currentStat.dev ||
+        (activeMarker && freshStat.ino !== currentStat.ino))) ||
+      (!freshStat && (fs.existsSync(`${input.freshAttemptPath}-wal`) ||
+        fs.existsSync(`${input.freshAttemptPath}-shm`)))) {
     throw new Error("restore_paths_unsafe");
   }
   const archived = new Database(input.archivePath, { readonly: true, fileMustExist: true, timeout: 0 });
@@ -817,17 +901,63 @@ export function restoreArchivedLedger(input: {
     }
   } finally { archived.close(); }
   const stage = `${input.ledgerPath}.restore-stage`;
-  if ([stage, `${stage}-wal`, `${stage}-shm`].some(fs.existsSync)) {
-    throw new Error("restore_stage_exists");
+  const stageExists = stageArtifactPresent(stage);
+  if (stageExists && !fs.existsSync(stage)) throw new Error("restore_stage_incomplete");
+  if (!activeMarker && (stageExists || !freshStat)) throw new Error("restore_completion_ambiguous");
+  if (!activeMarker) {
+    // The stage rename is the commit point. A kill before the following
+    // directory fsync leaves a complete restored ledger and retained fresh
+    // attempt; a rerun only needs to durably publish the directory entry.
+    fsyncDirectory(path.dirname(input.ledgerPath));
+    return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
+      archivePreserved: true };
   }
   const authority = new LifecycleMutationAuthority(input.authorityRoot ??
-    path.join(path.dirname(input.ledgerPath), "lifecycle-authority"));
-  const acquired = authority.acquire();
+    path.join(path.dirname(input.ledgerPath), "lifecycle-authority"),
+  { defaultLeaseMs: RESTORE_LEASE_MS });
+  let acquired = authority.acquire();
+  if (acquired.kind === "busy" && (stageExists || freshStat)) {
+    // A SIGKILL leaves an immutable held lease until its deadline. A rerun
+    // waits for that fencing deadline, then acquires a newer revision.
+    const deadline = Date.now() + 11 * 60_000;
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    while (acquired.kind === "busy" && Date.now() < deadline) {
+      Atomics.wait(sleeper, 0, 0, Math.min(1_000,
+        Math.max(1, acquired.busyUntilMs - Date.now() + 10)));
+      acquired = authority.acquire();
+    }
+  }
   if (acquired.kind !== "acquired") throw new Error("restore_lifecycle_authority_unavailable");
   const lease = acquired.lease;
+  let stageExistsNow: boolean;
+  let freshExistsNow: boolean;
+  try {
+    stageExistsNow = stageArtifactPresent(stage);
+    const activeMarkerNow = readReplacementLedgerMarker(input.ledgerPath);
+    if (!activeMarkerNow) {
+      if (stageExistsNow || !fs.existsSync(input.freshAttemptPath)) {
+        throw new Error("restore_completion_ambiguous");
+      }
+      fsyncDirectory(path.dirname(input.ledgerPath));
+      lease.release();
+      return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
+        archivePreserved: true };
+    }
+    if (activeMarkerNow.archiveIdentity !== marker.archiveIdentity ||
+        (stageExistsNow && !fs.existsSync(stage))) {
+      throw new Error("restore_stage_or_marker_changed");
+    }
+    freshExistsNow = fs.existsSync(input.freshAttemptPath);
+    if (freshExistsNow && fs.lstatSync(input.freshAttemptPath).ino !==
+        fs.lstatSync(input.ledgerPath).ino) {
+      throw new Error("restore_fresh_attempt_changed");
+    }
+  } catch (error) {
+    lease.release();
+    throw error;
+  }
   let replacement: Database.Database | null = null;
   let restoredLock: Database.Database | null = null;
-  let restored = false;
   try {
     replacement = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
     replacement.pragma("locking_mode = EXCLUSIVE");
@@ -848,12 +978,14 @@ export function restoreArchivedLedger(input: {
       if (!checkpoint || checkpoint.busy || checkpoint.log) throw new Error("replacement_wal_not_checkpointed");
     }
     replacement.exec("BEGIN EXCLUSIVE");
-    // A clone is copy-on-write: the preserved archive inode is never handed
-    // to the old runtime as a hard link it could modify.
-    const clone = spawnSync("/bin/cp", ["-c", input.archivePath, stage], {
-      stdio: "ignore", timeout: 300_000,
-    });
-    if (clone.error || clone.status !== 0) throw new Error("archive_clone_unavailable");
+    if (!stageExistsNow) {
+      // The archive inode is never handed to the old runtime. A killed clone
+      // leaves a stage which SQLite can recover and fold on the next attempt.
+      const clone = spawnSync("/bin/cp", ["-c", input.archivePath, stage], {
+        stdio: "ignore", timeout: 300_000,
+      });
+      if (clone.error || clone.status !== 0) throw new Error("archive_clone_unavailable");
+    }
     restoredLock = new Database(stage, { fileMustExist: true, timeout: 0 });
     restoredLock.pragma("locking_mode = EXCLUSIVE");
     restoredLock.exec("BEGIN EXCLUSIVE");
@@ -871,27 +1003,34 @@ export function restoreArchivedLedger(input: {
     }
     restoredLock.pragma("journal_mode = DELETE");
     restoredLock.close(); restoredLock = null;
-    for (const sidecar of [`${stage}-wal`, `${stage}-shm`]) {
-      if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar);
-    }
+    // A kill between journal conversion and close can leave empty checkpointed
+    // sidecars behind. Keep them privately as recovery evidence; do not hand
+    // them to the restored archive image or delete them.
+    retainRestoreStageSidecars(stage, input.freshAttemptPath);
     fs.chmodSync(stage, 0o600);
     restoredLock = new Database(stage, { fileMustExist: true, timeout: 0 });
     restoredLock.pragma("locking_mode = EXCLUSIVE");
     restoredLock.exec("BEGIN EXCLUSIVE");
     heartbeat();
     fs.chmodSync(input.ledgerPath, 0o600);
-    fs.linkSync(input.ledgerPath, input.freshAttemptPath);
+    if (!freshExistsNow) fs.linkSync(input.ledgerPath, input.freshAttemptPath);
     for (const suffix of ["-wal", "-shm"] as const) {
       const source = `${input.ledgerPath}${suffix}`;
       if (fs.existsSync(source)) {
         fs.chmodSync(source, 0o600);
-        fs.renameSync(source, `${input.freshAttemptPath}${suffix}`);
+        const destination = `${input.freshAttemptPath}${suffix}`;
+        if (fs.existsSync(destination)) {
+          // Both copies can appear after a crash following the hard link.
+          // Preserve the first retained sidecar and the retry's sidecar.
+          let ordinal = 1;
+          while (fs.existsSync(`${destination}.retry-${ordinal}`)) ordinal++;
+          fs.renameSync(source, `${destination}.retry-${ordinal}`);
+        } else fs.renameSync(source, destination);
       }
     }
     fsyncDirectory(path.dirname(input.freshAttemptPath));
     fs.renameSync(stage, input.ledgerPath);
     fsyncDirectory(path.dirname(input.ledgerPath));
-    restored = true;
     return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
       archivePreserved: true };
   } finally {
@@ -899,7 +1038,6 @@ export function restoreArchivedLedger(input: {
     replacement?.close();
     if (restoredLock?.inTransaction) restoredLock.exec("COMMIT");
     restoredLock?.close();
-    if (!restored) removeOwnedStage(stage);
     lease.release();
   }
 }
