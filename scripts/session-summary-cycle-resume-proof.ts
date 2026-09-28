@@ -159,9 +159,8 @@ function rowCount(buffer: LocalEventBuffer, sessionId: string) {
     .get(sessionId) as { count: number }).count;
 }
 
-// A raw edit must restart a historical scan only after that row is behind its
-// durable cursor. Under CPU contention, a bounded pass can expire before its
-// first row, so establish this prerequisite before each storm mutation.
+// A raw edit queues a segment repair only after that row is behind the durable
+// cursor. Establish this prerequisite before each storm mutation.
 async function ensureRowScanned(buffer: LocalEventBuffer, sessionId: string, eventId: string) {
   const row = buffer.database.prepare(`select rowid, observed_at as observedAt
     from buffered_events where id = ?`).get(eventId) as { rowid: number; observedAt: string };
@@ -275,10 +274,12 @@ async function main() {
     let last: Cycle | null = null;
     for (let pass = 1; ; pass += 1) {
       const previousHighWater = stateRow(buffer, ids.studio4).highWater;
-      last = await daemonCycle(buffer, rowReadDelayMs > 0);
+      // A deliberately smaller first slice leaves the repaired segment
+      // partial while the backdated append arrives.
+      last = await daemonCycle(buffer, rowReadDelayMs > 0, pass === 1 ? 1_000 : undefined);
       if (pass === 1) {
         const firstState = stateRow(buffer, ids.studio4);
-        assert.equal(firstState.mode, "fallback");
+        assert.equal(firstState.mode, "incremental");
         assert.equal(firstState.complete, 0);
         frozenBoundary = accumulator(buffer, ids.studio4).scanBoundary;
         assert.ok(frozenBoundary > 0);
@@ -297,10 +298,15 @@ async function main() {
         const update = last.updates.get(sessionId);
         assert.ok(update, `missing summary update for ${sessionId} on pass ${pass}`);
         if (completedAt.has(sessionId)) continue;
-        assert.ok(update.complete || update.rowsRead >= SESSION_SUMMARY_DEFAULT_MAX_ROWS ||
+        const rowCap = pass === 1 ? 1_000 : SESSION_SUMMARY_DEFAULT_MAX_ROWS;
+        assert.ok(update.complete || update.rowsRead >= rowCap ||
           update.durationMs >= SESSION_SUMMARY_DEFAULT_MAX_MS ||
-          update.fallbackReason === "append_queue",
+          update.fallbackReason === "append_queue" ||
+          update.fallbackReason === "segment_repair_in_progress" && update.rowsRead > 0,
         JSON.stringify({ sessionId, pass, update, reason: "unaccounted_partial_pass" }));
+        assert.equal(update.fullRecompute, false, `scanned edit restarted ${sessionId}`);
+        if (!update.complete) assert.ok(!last.sent.some((row) => row.session.id === sessionId),
+          "a partial segment aggregate cannot be sent");
         elapsedBySession.set(sessionId, (elapsedBySession.get(sessionId) ?? 0) + update.durationMs);
         appliedBySession.set(sessionId, (appliedBySession.get(sessionId) ?? 0) + update.rowsApplied);
         if (!update.complete && update.durationMs >= SESSION_SUMMARY_DEFAULT_MAX_MS &&
@@ -311,15 +317,20 @@ async function main() {
       }
       if (appendedRowid !== null && previousHighWater < appendedRowid &&
           stateRow(buffer, ids.studio4).highWater >= appendedRowid) {
-        assert.equal(last.updates.get(ids.studio4)?.rowsApplied, 1);
+        // This slice may also finish a repaired segment. The one append is
+        // identified by its high-water crossing; final wire equality below
+        // catches either a missing or a duplicate fold.
+        const applied = last.updates.get(ids.studio4)?.rowsApplied ?? 0;
+        assert.ok(applied >= 1 && applied <= 4_097, JSON.stringify({ applied }));
         appendDrainCount += 1;
       }
       if (last.state.caughtUp && last.state.lastSuccessfulUntil === last.until) break;
       for (const sessionId of last.result?.pendingSummarySessionIds ?? []) {
         const rows = sessionId === ids.studio4 ? 5_095 : rowCount(buffer, sessionId);
         const elapsedMs = elapsedBySession.get(sessionId) ?? 0;
-        assert.ok(pass <= drainBound(rows, elapsedMs),
-          JSON.stringify({ sessionId, pass, bound: drainBound(rows, elapsedMs), rows, elapsedMs,
+        const extraWork = sessionId === ids.studio4 ? 2 : 1;
+        assert.ok(pass <= drainBound(rows, elapsedMs) + extraWork,
+          JSON.stringify({ sessionId, pass, bound: drainBound(rows, elapsedMs) + extraWork, rows, elapsedMs,
             pending: last.result?.pendingSummaryReasons }));
       }
     }
@@ -331,15 +342,18 @@ async function main() {
     assert.equal(appendDrainCount, 1);
     assert.equal(accumulator(buffer, ids.studio4).scanBoundary, frozenBoundary);
     assert.equal(accumulator(buffer, ids.studio4).events, 5_095);
-    assert.equal(appliedBySession.get(ids.studio4), 5_095);
+    const repairedSegmentRows = (buffer.database.prepare(`select count(*) as count
+      from buffered_events where session_id = ? and rowid between 1 and 4096`)
+      .get(ids.studio4) as { count: number }).count;
+    assert.equal(appliedBySession.get(ids.studio4), repairedSegmentRows + 1,
+      "one bounded segment repair and one append are folded");
     completion.check("backdated_append_keeps_frozen_boundary_and_drains_once");
     completion.check("partial_passes_charge_rows_time_or_append_drain");
     for (const [sessionId, count] of [[ids.studio4, 5_095], [ids.studio5, 10_119], [ids.fiveSlices, 20_001]] as const) {
       // A nonfinal pass is charged to its 5,000-row cap, its 250 ms cap,
       // or the one pass needed to drain a post-boundary append.
       const elapsedMs = elapsedBySession.get(sessionId)!;
-      const bound = Math.ceil(count / SESSION_SUMMARY_DEFAULT_MAX_ROWS) +
-        Math.floor(elapsedMs / SESSION_SUMMARY_DEFAULT_MAX_MS) + 1;
+      const bound = drainBound(count, elapsedMs) + (sessionId === ids.studio4 ? 2 : 1);
       assert.ok((completedAt.get(sessionId) ?? Infinity) <= bound,
         JSON.stringify({ sessionId, passes: completedAt.get(sessionId), bound, elapsedMs }));
       const sentRow: unknown = last.sent.find((row) => row.session.id === sessionId);
@@ -354,12 +368,13 @@ async function main() {
     }
     completion.check("read_delay_exercises_time_cap_when_injected");
 
-    // A deletion after a partial historical slice changes the revision, so
-    // the next pass must rebuild and the erased row cannot reach the wire.
+    // A deletion during a partial repair changes its revision. The segment
+    // must be reread before the erased row can reach the wire.
     assert.equal(buffer.database.prepare("update buffered_events set input_tokens = 77 where id = ?")
       .run(rows.get(ids.studio4)![1]).changes, 1);
-    const beforeErasure = await daemonCycle(buffer);
+    const beforeErasure = await daemonCycle(buffer, false, 1_000);
     assert.ok(beforeErasure.result?.pendingSummarySessionIds.includes(ids.studio4));
+    assert.ok(!beforeErasure.sent.some((row) => row.session.id === ids.studio4));
     assert.equal(buffer.database.prepare("delete from buffered_events where id = ?")
       .run(rows.get(ids.studio4)![2]).changes, 1);
     const erased = await waitForInitialCatchUp(buffer);
@@ -368,25 +383,35 @@ async function main() {
       expectedWire(buffer, ids.studio4, erased.until));
     completion.check("erasure_during_rebuild_wins_and_horizon_recovers");
 
-    // A mutation every cycle can exceed rebuild throughput. The host cannot
-    // claim full catch-up, but each cycle still sends an unrelated session.
-    const beforeStorm = erased.state.lastSuccessfulUntil;
+    // A mutation every cycle repairs the same bounded segment. The control
+    // session still sends, and any sent busy-session snapshot is exact.
+    let stormHorizon = erased.state.lastSuccessfulUntil;
+    let lastStorm: Cycle | null = null;
     for (let pass = 0; pass < 4; pass += 1) {
       await ensureRowScanned(buffer, ids.studio4, rows.get(ids.studio4)![0]);
       insertEventRows(buffer, ids.control, 1);
+      clock.advancePast(new Date(Date.now() + 1_000).toISOString());
       assert.equal(buffer.database.prepare("update buffered_events set output_tokens = ? where id = ?")
         .run(20 + pass, rows.get(ids.studio4)![0]).changes, 1);
       const cycle = await daemonCycle(buffer);
-      assert.equal(cycle.state.lastSuccessfulUntil, beforeStorm);
-      assert.ok(cycle.result?.pendingSummarySessionIds.includes(ids.studio4));
+      lastStorm = cycle;
       assert.ok(cycle.sent.some((row) => row.session.id === ids.control));
-      assert.ok((cycle.result?.summaryStats.fullRecomputes ?? 0) >= 1,
-        JSON.stringify({ pass, update: cycle.updates.get(ids.studio4),
-          pending: cycle.result?.pendingSummaryReasons }));
-      assert.ok((cycle.result?.pendingSummaryReasons.ledger_mutation ?? 0) >= 1);
+      assert.deepEqual(cycle.sent.find((row) => row.session.id === ids.control),
+        expectedWire(buffer, ids.control, cycle.until));
+      assert.equal(cycle.result?.summaryStats.fullRecomputes, 0);
+      const busySent = cycle.sent.find((row) => row.session.id === ids.studio4);
+      if (busySent) {
+        assert.deepEqual(busySent, expectedWire(buffer, ids.studio4, cycle.until));
+        assert.equal(cycle.state.lastSuccessfulUntil, cycle.until);
+      } else {
+        assert.ok(cycle.result?.pendingSummarySessionIds.includes(ids.studio4));
+        assert.equal(cycle.state.lastSuccessfulUntil, stormHorizon);
+      }
+      stormHorizon = cycle.state.lastSuccessfulUntil;
     }
     completion.check("periodic_updates_visible_while_other_session_syncs");
-    const recovered = await waitForInitialCatchUp(buffer);
+    const recovered = lastStorm !== null && lastStorm.state.lastSuccessfulUntil === lastStorm.until
+      ? lastStorm : await waitForInitialCatchUp(buffer);
     assert.deepEqual(recovered.sent.find((row) => row.session.id === ids.studio4),
       expectedWire(buffer, ids.studio4, recovered.until));
     completion.check("periodic_update_storm_recovers_after_updates_stop");
@@ -398,6 +423,7 @@ async function main() {
   const upgraded = new LocalEventBuffer(path.join(root, "upgrade-0740.sqlite"), { workspaceId: tenantId });
   try {
     const inserted = insertEventRows(upgraded, ids.upgrade, 5_094);
+    clock.advancePast(new Date(Date.now() + 1_000).toISOString());
     old.ensureSessionSummarySchema(upgraded.database);
     const latestCreatedAt = (upgraded.database.prepare(`select max(created_at) as createdAt
       from buffered_events where session_id = ?`).get(ids.upgrade) as { createdAt: string }).createdAt;
@@ -416,7 +442,7 @@ async function main() {
     assert.equal(stateRow(upgraded, ids.upgrade).complete, 1);
     assert.equal(upgraded.database.prepare("update buffered_events set input_tokens = 99 where id = ?")
       .run(inserted[0]).changes, 1);
-    const cursors: number[] = [];
+    const legacyPasses: Array<{ highWater: number; rowsRead: number; events: number }> = [];
     for (let pass = 0; pass < 3; pass += 1) {
       const result = await old.updateSessionSummary(upgraded.database, ids.upgrade, clock.nextUntil(), {
         read: proofRead(upgraded, false), maxRows: 2_500,
@@ -424,13 +450,15 @@ async function main() {
       assert.equal(result.complete, false);
       assert.equal(result.fullRecompute, true);
       assert.equal(stateRow(upgraded, ids.upgrade).mode, "fallback");
+      assert.ok(result.highWater <= 2_500, "each published pass restarts before the row cap");
       const events = JSON.parse(stateRow(upgraded, ids.upgrade).accumulatorJson).events as number;
       assert.equal(events, result.rowsApplied,
         JSON.stringify({ pass, events, rowsApplied: result.rowsApplied,
           reason: "legacy_pass_must_restart_from_empty_accumulator" }));
-      cursors.push(events);
+      legacyPasses.push({ highWater: result.highWater, rowsRead: result.rowsRead, events });
     }
-    assert.ok(cursors.some((events) => events > 0), JSON.stringify(cursors));
+    assert.ok(legacyPasses.some(({ events }) => events > 0), JSON.stringify(legacyPasses));
+    console.log(JSON.stringify({ legacyPasses }));
     assert.ok(sessionSummaryCounters(upgraded.database).fallbackRecomputes >= 3);
     completion.check("published_0740_path_creates_repeating_partial_fallback");
     const recovered = await waitForInitialCatchUp(upgraded);
@@ -441,8 +469,7 @@ async function main() {
     completion.check("0740_stuck_ledger_recovers_without_manual_step");
 
     // The injected daemon clock crosses this row's creation time while a
-    // historical fallback is partial. No direct update or artificial until
-    // bypasses planDaemonSessionSync/runSessionSync.
+    // bounded segment repair is partial. The daemon plan and sync stay in use.
     // The injected clock advances once per daemon cycle. Leave enough fake
     // ticks for a bounded scan to observe the planted row even when a pass
     // consumes only one row under CPU contention.
@@ -453,27 +480,32 @@ async function main() {
     let beforeMaturity: Cycle;
     let preMaturityElapsedMs = 0;
     for (let pass = 1; ; pass += 1) {
-      beforeMaturity = await daemonCycle(upgraded, false, 2_000);
+      beforeMaturity = await daemonCycle(upgraded, false, 1_000);
       const update = beforeMaturity.updates.get(ids.upgrade);
       preMaturityElapsedMs += update?.durationMs ?? 0;
-      assert.ok(pass <= drainBound(inserted.length, preMaturityElapsedMs, 2_000),
-        JSON.stringify({ pass, bound: drainBound(inserted.length, preMaturityElapsedMs, 2_000), update }));
+      assert.ok(pass <= drainBound(inserted.length, preMaturityElapsedMs, 1_000) + 1,
+        JSON.stringify({ pass, bound: drainBound(inserted.length, preMaturityElapsedMs, 1_000) + 1, update }));
       assert.ok(Date.parse(beforeMaturity.until) < Date.parse(futureCreatedAt));
+      assert.equal(update?.fullRecompute, false);
       assert.equal(stateRow(upgraded, ids.upgrade).complete, 0);
       assert.ok(beforeMaturity.result?.pendingSummarySessionIds.includes(ids.upgrade));
       assert.ok(!beforeMaturity.sent.some((row) => row.session.id === ids.upgrade));
       assert.equal(beforeMaturity.state.lastSuccessfulUntil, recovered.until);
-      if (accumulator(upgraded, ids.upgrade).futureCreatedAt === futureCreatedAt) break;
+      // The future date enters the aggregate only when its segment commits.
+      // Stop at a progressing partial repair so maturity occurs mid-repair.
+      if ((update?.rowsRead ?? 0) > 0) break;
     }
-    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture + 1);
-    const stillBeforeMaturity = await daemonCycle(upgraded, false, 2_000);
+    assert.ok(upgraded.database.prepare(`select 1 from session_sync_summary_repairs
+      where session_id = ?`).get(ids.upgrade), "the changed future row needs a durable repair");
+    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture);
+    const stillBeforeMaturity = await daemonCycle(upgraded, false, 1_000);
     assert.ok(Date.parse(stillBeforeMaturity.until) < Date.parse(futureCreatedAt));
     assert.equal(stateRow(upgraded, ids.upgrade).complete, 0);
     assert.equal(stillBeforeMaturity.updates.get(ids.upgrade)?.fullRecompute, false);
-    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture + 1);
+    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture);
     assert.ok(!stillBeforeMaturity.sent.some((row) => row.session.id === ids.upgrade));
     assert.equal(stillBeforeMaturity.state.lastSuccessfulUntil, recovered.until);
-    completion.check("future_row_stays_unsent_while_pre_maturity_fallback_is_partial");
+    completion.check("future_row_stays_unsent_while_pre_maturity_repair_is_partial");
 
     clock.advancePast(futureCreatedAt);
     let maturityRebuilds = 0;
@@ -483,12 +515,11 @@ async function main() {
       matured = await daemonCycle(upgraded, false, 2_000);
       const update = matured.updates.get(ids.upgrade);
       maturityElapsedMs += update?.durationMs ?? 0;
-      assert.ok(pass <= drainBound(inserted.length, maturityElapsedMs, 2_000),
-        JSON.stringify({ pass, bound: drainBound(inserted.length, maturityElapsedMs, 2_000), update }));
+      assert.ok(pass <= drainBound(inserted.length, maturityElapsedMs, 2_000) + 2,
+        JSON.stringify({ pass, bound: drainBound(inserted.length, maturityElapsedMs, 2_000) + 2, update }));
       if (update?.fullRecompute) maturityRebuilds += 1;
       if (pass === 1) {
-        assert.ok(update?.fullRecompute);
-        assert.equal(update.fallbackReason, "future_horizon");
+        assert.equal(update?.fullRecompute, false);
         assert.equal(stateRow(upgraded, ids.upgrade).complete, 0);
       }
       if (stateRow(upgraded, ids.upgrade).complete === 0) {
@@ -497,8 +528,8 @@ async function main() {
       }
       if (matured.state.caughtUp && matured.state.lastSuccessfulUntil === matured.until) break;
     }
-    assert.equal(maturityRebuilds, 1);
-    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture + 2);
+    assert.equal(maturityRebuilds, 0);
+    assert.equal(sessionSummaryCounters(upgraded.database).fallbackRecomputes, recomputesBeforeFuture);
     assert.ok(matured?.state.caughtUp && matured.state.lastSuccessfulUntil === matured.until);
     assert.ok(Date.parse(matured.until) > Date.parse(futureCreatedAt));
     assert.deepEqual(matured.sent.find((row) => row.session.id === ids.upgrade),
