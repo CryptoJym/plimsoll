@@ -6,6 +6,7 @@ import { z } from "zod";
 import { accountAssertionContains, accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
 import type { CaptureBaselineFileObservation } from "./capture-baseline";
 import { resolveCollectorHome } from "./collector-home";
+import { codexRolloutIdFromFilename, verifiedCodexRolloutSessionId } from "./codex-rollout-identity";
 import { workClassSchema, workComplexityBandSchema } from "../../shared/src/schemas";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 export const namespacedWorkItemIdSchema=z.string().max(256).regex(
@@ -390,7 +391,6 @@ function codexHomeEvidence(home: string, sessions: string): "verified" | "missin
   const directoryLimit = 4096;
   let examinedFiles = 0;
   let visitedDirectories = 0;
-  const rolloutName = /^rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i;
   const datePart = [/^\d{4}$/, /^(0[1-9]|1[0-2])$/, /^(0[1-9]|[12]\d|3[01])$/];
   const scan = (directory: string, depth: number): "verified" | "missing" | "exhausted" => {
     if (++visitedDirectories > directoryLimit) return "exhausted";
@@ -410,7 +410,7 @@ function codexHomeEvidence(home: string, sessions: string): "verified" | "missin
       }
     }
     for (const entry of newestFirst) {
-      const id = entry.isFile() ? rolloutName.exec(entry.name)?.[1] : undefined;
+      const id = entry.isFile() ? codexRolloutIdFromFilename(entry.name) : undefined;
       if (!id) continue;
       const file = path.join(directory, entry.name);
       if (!physicalBelowHome(home, file)) continue;
@@ -421,11 +421,8 @@ function codexHomeEvidence(home: string, sessions: string): "verified" | "missin
         try {
           const bytes = Buffer.alloc(4096);
           const size = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
-          const row = JSON.parse(bytes.subarray(0, size).toString("utf8").split("\n", 1)[0]) as
-            { type?: unknown; timestamp?: unknown; payload?: { id?: unknown } };
-          if (row.type === "session_meta" && typeof row.timestamp === "string" &&
-              Number.isFinite(Date.parse(row.timestamp)) && typeof row.payload?.id === "string" &&
-              row.payload.id.toLowerCase() === id.toLowerCase()) return "verified";
+          const row = JSON.parse(bytes.subarray(0, size).toString("utf8").split("\n", 1)[0]) as unknown;
+          if (verifiedCodexRolloutSessionId(file, row) === id) return "verified";
         } finally { fs.closeSync(descriptor); }
       } catch { /* Another rollout may provide the evidence. */ }
     }

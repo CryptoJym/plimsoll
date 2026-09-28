@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
+import { codexRolloutIdFromFilename, isCodexUuid, verifiedCodexSessionMetaId } from "./codex-rollout-identity";
 import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import {
@@ -302,7 +303,7 @@ function validateRolloutParserState(value: unknown): RolloutParserState | undefi
   if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType].includes(null)) {
     return undefined;
   }
-  if (conversationId && !UUID_EXACT_RE.test(conversationId)) return undefined;
+  if (conversationId && !isCodexUuid(conversationId)) return undefined;
   if (value.git !== undefined && !validLegacyPersistedGit(value.git)) return undefined;
   if (value.activeRepoContextId !== undefined && !validRepoContextId(value.activeRepoContextId)) {
     return undefined;
@@ -357,15 +358,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]) {
   const names = new Set(allowed);
   return Object.keys(value).every((key) => names.has(key));
-}
-
-const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function conversationIdFromFilename(file: string) {
-  const base = path.basename(file).replace(/\.jsonl$/, "");
-  const match = base.match(UUID_RE);
-  return match ? match[0].toLowerCase() : undefined;
 }
 
 function baselineObservation(
@@ -1571,7 +1563,7 @@ export class RolloutTailer {
     return {
       parserKind: PARSER_KIND,
       checkpointVersion: CHECKPOINT_VERSION,
-      conversationId: conversationIdFromFilename(file),
+      conversationId: codexRolloutIdFromFilename(file),
       previous: { ...ZERO },
       tokenCountIndex: -1,
       contextOccurrenceIndex: -1,
@@ -1654,9 +1646,8 @@ export class RolloutTailer {
       const type = parsed.type;
       const payload = (parsed.payload ?? {}) as Record<string, unknown>;
       if (type === "session_meta") {
-        if (typeof payload.id === "string" && UUID_RE.test(payload.id)) {
-          state.conversationId = payload.id.toLowerCase();
-        }
+        const verifiedId = verifiedCodexSessionMetaId(parsed);
+        if (verifiedId) state.conversationId = verifiedId;
         if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
         else if (typeof payload.timestamp === "string") state.sessionStartedAt = payload.timestamp as string;
         activeRepoContext = observeContext("session_meta", payload.cwd);
