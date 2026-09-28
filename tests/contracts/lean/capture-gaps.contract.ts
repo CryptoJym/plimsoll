@@ -7,12 +7,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fn, loadSurface, openTempBuffer, pending } from "./_pending";
+import { fn, loadSurface, openTempBuffer } from "./_pending";
 
 const t = (hhmm: string) => Date.parse(`2026-09-25T${hhmm}:00.000Z`);
 const EPOCH_START = t("00:00"), LAST_WRITE = t("10:00"), FIRST_PARSE = t("11:00"), STAMPED = t("10:05");
 
-test("B22 C5: an unresolved file's gap is epoch_open from the epoch start with a null end; a period after its last write is not complete until it parses", pending("B22"), async () => {
+test("B22 C5: an unresolved file's gap is epoch_open from the epoch start with a null end; a period after its last write is not complete until it parses", async () => {
   const surface = await loadSurface("../../../packages/collector-cli/src/lean/capture-gaps.ts");
   const declare = fn(surface, "declareUnresolvedFileGap") as (db: unknown, input: Record<string, unknown>) => { gapId: string };
   const complete = fn(surface, "coverageCompleteForPeriod") as (db: unknown, period: { startMs: number; endMs: number }, throughMs: number) => boolean;

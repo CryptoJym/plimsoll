@@ -38,7 +38,7 @@ test("B2a: the fact, turn, session, day and rollup tables exist; day tables are 
   }
 }));
 
-test("B22: capture_gaps has an open-ended interval (nullable ended_at_ms, interval_basis epoch_open, resolved_at_ms) and capture_faults exists", pending("B22"), () => withBuffer((db) => {
+test("B22: capture_gaps has an open-ended interval (nullable ended_at_ms, interval_basis epoch_open, resolved_at_ms) and capture_faults exists", () => withBuffer((db) => {
   const sql = tableSql(db, "capture_gaps");
   assert.ok(sql, "capture_gaps exists");
   assert.ok(sql.includes("epoch_open") && sql.includes("fault_interval"), "interval_basis check names epoch_open and fault_interval");

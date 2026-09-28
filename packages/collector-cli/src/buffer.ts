@@ -2,6 +2,7 @@ import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallati
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
 import os from "node:os";
+import { ensureCaptureGapSchema } from "./lean/capture-gaps";
 import { performance } from "node:perf_hooks";
 
 import Database from "better-sqlite3";
@@ -475,6 +476,7 @@ export class LocalEventBuffer {
       ) without rowid;
     `);
     markOpenStep("ledger.core_schema");
+    ensureCaptureGapSchema(this.db);
     const retentionControlColumns = new Set(
       (this.db.pragma("table_info(raw_retention_control)") as Array<{ name: string }>)
         .map((column) => column.name),
