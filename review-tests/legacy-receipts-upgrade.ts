@@ -341,6 +341,9 @@ try {
       .run(liveDeliveryId, liveRowid, oldAt, liveGeneration,
         workspaceId, "legacy-live-epoch", Date.parse(oldAt),
         JSON.stringify({ intervalStart: oldAt }), "{}", liveDeliveryId);
+    // Model a fully projected row: a queued raw-insert repair would suppress
+    // retention for reasons unrelated to the terminal privacy receipt.
+    db.prepare("delete from dashboard_projection_repairs where raw_rowid=?").run(liveRowid);
     const independentDelete = new Database(ledgerPath);
     try {
       assert.equal(independentDelete.prepare("delete from buffered_events where rowid=?")
