@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { pathToFileURL } from "node:url";
 import { gunzipSync } from "node:zlib";
 
 import Database from "better-sqlite3";
@@ -136,6 +139,127 @@ function settle(buffer: LocalEventBuffer, now = NOW, maxSlices = 100) {
     receipts.push(buffer.projection.runMaintenance(now));
   }
   throw new Error(`projection did not settle: ${JSON.stringify(buffer.projection.status())}`);
+}
+
+/** Load the exact 0.7.44 projection reader from the committed release source.
+ * CI checks out full ancestry. Extracting its source in the disposable proof
+ * root keeps the compatibility test tied to the shipped reader, not a model
+ * of what that reader might do. */
+async function release044ProjectionReader(root: string) {
+  const release = "375f277b85f7d4ede7db77bf4359c371c0e8a4aa";
+  const oldRoot = path.join(root, "collector-0.7.44");
+  fs.mkdirSync(oldRoot);
+  const archive = spawnSync("git", ["archive", "--format=tar", release],
+    { cwd: process.cwd(), maxBuffer: 32 * 1024 * 1024 });
+  assert.equal(archive.status, 0, `0.7.44 source archive: ${archive.stderr.toString()}`);
+  const extract = spawnSync("tar", ["-xf", "-", "-C", oldRoot],
+    { input: archive.stdout, maxBuffer: 1024 * 1024 });
+  assert.equal(extract.status, 0, `0.7.44 source extraction: ${extract.stderr.toString()}`);
+  fs.symlinkSync(path.join(process.cwd(), "node_modules"), path.join(oldRoot, "node_modules"), "dir");
+  const source = path.join(oldRoot, "packages/collector-cli/src/dashboard-projection.ts");
+  const old = await import(pathToFileURL(source).href) as {
+    DASHBOARD_SCHEMA_VERSION: number;
+    DashboardProjectionStore: new (db: Database.Database, options?: {now?: Date}) =>
+      Pick<DashboardProjectionStore, "status" | "readSnapshot" | "runMaintenance">;
+  };
+  assert.equal(old.DASHBOARD_SCHEMA_VERSION, 2);
+  return old.DashboardProjectionStore;
+}
+
+async function prove044RollbackScanFence(root: string) {
+  const OldProjection = await release044ProjectionReader(root);
+  const file = path.join(root, "duplicate-scan-044-rollback.sqlite");
+  const buffer = new LocalEventBuffer(file);
+  const rows = Array.from({length:3}, () => event({source:"codex",model:"gpt-proof"}));
+  for (const row of rows) assert.equal(buffer.append(row), true);
+  settle(buffer);
+  buffer.close();
+
+  // Copy the green pre-upgrade ledger state. The duplicate change predates the
+  // trigger, so one raw row is excluded while its dashboard fact still exists.
+  const legacy = new Database(file);
+  legacy.exec(`drop trigger trg_dashboard_usage_duplicate_update;
+    drop table codex_duplicate_fact_scan;
+    update dashboard_projection_control set schema_version=2 where singleton=1;
+    update dashboard_snapshots set schema_version=2;`);
+  legacy.prepare(`update buffered_events set usage_duplicate_reason='codex_sse_event_span'
+    where id=?`).run(rows[0]!.id);
+  const preUpgrade = legacy.prepare(`select
+      (select count(*) from dashboard_event_facts) as facts,
+      (select count(*) from buffered_events where usage_duplicate_reason is null) as oracle,
+      (select count(*) from dashboard_projection_repairs) as repairs`).get() as
+      {facts:number;oracle:number;repairs:number};
+  assert.deepEqual(preUpgrade,{facts:3,oracle:2,repairs:0});
+  legacy.close();
+
+  let oldDb = new Database(file);
+  const oldBefore = new OldProjection(oldDb,{now:NOW});
+  const staleBefore = oldBefore.readSnapshot(30);
+  check("release_044_reader_sees_pre_upgrade_stale_snapshot",
+    staleBefore.kind === "ready" && staleBefore.snapshot.projection.parityReady &&
+      Number((staleBefore.snapshot.summary.totals as Record<string,number>).events) === 3,
+    {kind:staleBefore.kind,preUpgrade});
+  oldDb.close();
+
+  let upgraded = new LocalEventBuffer(file);
+  const pending = upgraded.projection.status();
+  const version = (upgraded.database.prepare(`select schema_version as version
+    from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
+  check("upgrade_fences_incomplete_duplicate_scan_without_rebuilding_facts",
+    !pending.backfill.duplicateFactScan.complete && !pending.parityReady &&
+      version === DASHBOARD_SCHEMA_VERSION &&
+      (upgraded.database.prepare(`select count(*) as n from dashboard_event_facts`)
+        .get() as {n:number}).n === preUpgrade.facts,
+    {version,pendingScan:pending.backfill.duplicateFactScan,preUpgrade});
+  upgraded.close();
+
+  oldDb = new Database(file);
+  const rolledBackPending = new OldProjection(oldDb,{now:NOW});
+  const refusedBefore = rolledBackPending.readSnapshot(30);
+  const oldTick = rolledBackPending.runMaintenance(NOW);
+  const oldStatus = rolledBackPending.status();
+  const persisted = oldDb.prepare(`select schema_version as version, parity_ready as parityReady,
+    degraded_reason as reason from dashboard_projection_control where singleton=1`).get() as
+    {version:number;parityReady:number;reason:string|null};
+  check("release_044_rollback_cannot_publish_while_duplicate_scan_pending",
+    refusedBefore.kind === "backfilling" && oldTick.ready === false &&
+      oldStatus.parityReady === false && oldStatus.degradedReason === "projection_schema_newer" &&
+      persisted.version > 2 && persisted.parityReady === 0 &&
+      persisted.reason === "projection_schema_newer",
+    {readKind:refusedBefore.kind,oldTick,oldStatus,persisted,preUpgrade});
+  oldDb.close();
+
+  upgraded = new LocalEventBuffer(file);
+  settle(upgraded);
+  const repaired = upgraded.projection.readSnapshot(30);
+  const repairedFacts = (upgraded.database.prepare(`select count(*) as n from dashboard_event_facts`)
+    .get() as {n:number}).n;
+  check("forward_upgrade_after_pending_rollback_drains_scan_and_restores_parity",
+    repaired.kind === "ready" && repaired.snapshot.projection.parityReady &&
+      upgraded.projection.status().backfill.duplicateFactScan.complete &&
+      repairedFacts === preUpgrade.oracle &&
+      Number((repaired.snapshot.summary.totals as Record<string,number>).events) === preUpgrade.oracle,
+    {kind:repaired.kind,repairedFacts,preUpgrade});
+  upgraded.close();
+
+  oldDb = new Database(file);
+  const rolledBackComplete = new OldProjection(oldDb,{now:NOW});
+  const refusedAfter = rolledBackComplete.readSnapshot(30);
+  const completeTick = rolledBackComplete.runMaintenance(NOW);
+  check("release_044_rollback_after_scan_complete_still_refuses_projection",
+    refusedAfter.kind === "backfilling" && completeTick.ready === false &&
+      rolledBackComplete.status().degradedReason === "projection_schema_newer",
+    {kind:refusedAfter.kind,completeTick});
+  oldDb.close();
+
+  upgraded = new LocalEventBuffer(file);
+  settle(upgraded);
+  const forwardAgain = upgraded.projection.readSnapshot(30);
+  check("reupgrade_after_complete_rollback_converges_without_rebuild",
+    forwardAgain.kind === "ready" && forwardAgain.snapshot.projection.parityReady &&
+      Number((forwardAgain.snapshot.summary.totals as Record<string,number>).events) === preUpgrade.oracle,
+    {kind:forwardAgain.kind,preUpgrade});
+  upgraded.close();
 }
 
 function proveDuplicateFactRepair(root: string) {
@@ -377,6 +501,38 @@ async function proveMillionFactScanCadence(root: string) {
   } finally {
     maintenance.close();
     buffer.close();
+  }
+}
+
+function proveMillionFactVersionFenceCost(root: string) {
+  // Reuse the completed million-fact scheduler fixture. This is the same
+  // control-row version transition an existing 0.7.44 ledger takes on upgrade.
+  const file = path.join(root, "million-fact-scan.sqlite");
+  const stateSql = `select backfill_cursor as backfillCursor, parity_cursor as parityCursor,
+    projection_rows_visited as rowsVisited, snapshot_builds as snapshotBuilds,
+    generation from dashboard_projection_control where singleton=1`;
+  const beforeDb = new Database(file);
+  const factCount = (beforeDb.prepare(`select count(*) as n from dashboard_event_facts`)
+    .get() as {n:number}).n;
+  beforeDb.prepare(`update dashboard_projection_control set schema_version=2 where singleton=1`).run();
+  const before = beforeDb.prepare(stateSql).get() as Record<string,number>;
+  beforeDb.close();
+  const started = performance.now();
+  const upgraded = new LocalEventBuffer(file);
+  const openMs = performance.now() - started;
+  try {
+    const after = upgraded.database.prepare(stateSql).get() as Record<string,number>;
+    const version = (upgraded.database.prepare(`select schema_version as version
+      from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
+    const factsAfter = (upgraded.database.prepare(`select count(*) as n from dashboard_event_facts`)
+      .get() as {n:number}).n;
+    check("million_fact_version_fence_is_control_row_update_without_rebuild",
+      factCount === 1_000_001 && factsAfter === factCount &&
+        version === DASHBOARD_SCHEMA_VERSION &&
+        JSON.stringify(after) === JSON.stringify(before),
+      {factCount,factsAfter,version,before,after,openMs});
+  } finally {
+    upgraded.close();
   }
 }
 
@@ -805,6 +961,11 @@ async function main() {
   ];
 
   try {
+    if (process.argv.includes("--rollback-only")) {
+      await prove044RollbackScanFence(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
     if (process.argv.includes("--million-duplicate-only")) {
       await proveMillionFactDuplicateRepairCadence(root);
       console.log(JSON.stringify({status:"pass",check:checks.at(-1)?.name,
@@ -821,8 +982,10 @@ async function main() {
     proveDuplicateFactRepair(root);
     await proveDuplicateScanUpgradeAndDrain(root);
     await proveMillionFactScanCadence(root);
+    proveMillionFactVersionFenceCost(root);
     const millionDuplicateReference = await proveMillionFactDuplicateRepairCadence(root);
     await proveMillionFactDuplicateRepairCadence(root, true, millionDuplicateReference);
+    await prove044RollbackScanFence(root);
     buffer.recordRepoLabel(repoA, "proof/repo-a");
     buffer.recordRepoLabel(repoB, "proof/repo-b");
     buffer.setPriorityRepo(repoA, URL_SENTINEL);
@@ -4622,6 +4785,8 @@ async function main() {
       evidence:{
         duplicateScanUpgrade:checks.find((entry)=>entry.name===
           "duplicate_scan_over_3000_facts_drains_during_startup")?.detail,
+        versionFenceCost:checks.find((entry)=>entry.name===
+          "million_fact_version_fence_is_control_row_update_without_rebuild")?.detail,
         millionScanCadence:checks.find((entry)=>entry.name===
           "million_fact_scan_uses_bounded_fast_ticks_and_preserves_capture_turns")?.detail,
         millionDuplicateScanCadence:checks.find((entry)=>entry.name===

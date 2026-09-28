@@ -32,15 +32,18 @@ import type { LedgerOpenTimingSink } from "./open-timing";
  * and left this at 1, so a collector rolled back below #360 opened a ledger
  * whose tables had gained a column, failed session materialization on every
  * maintenance tick, and went on serving the last session count it had — frozen
- * and green (bead eco-6hoxj.145). Version 2 is that migration.
+ * and green (bead eco-6hoxj.145). Version 2 is that migration. Version 3
+ * fences the Codex duplicate-fact scan: 0.7.44 cannot see its pending state,
+ * so it must refuse this projection even after the one-time scan completes.
  *
  * `DASHBOARD_SCHEMA_SHAPE_DIGEST` is the mechanical twin: the dashboard
  * projection proof fails when `dashboard_*` table shape moves without this
- * constant. Update both together. A loss-aware rebuild that can recover a
+ * constant. Version 3 changes compatibility but not table shape, so the
+ * canonical shape digest is unchanged. A loss-aware rebuild that can recover a
  * host stuck on `projection_schema_newer` without the newer binary is owed
  * work (`issues/0177-loss-aware-projection-rebuild.md`); this binary only
  * withholds. */
-export const DASHBOARD_SCHEMA_VERSION = 2;
+export const DASHBOARD_SCHEMA_VERSION = 3;
 /** Canonical digest of `dashboard_*` table_info at `DASHBOARD_SCHEMA_VERSION`.
  * Computed by `dashboardProjectionSchemaShapeDigest` on a freshly opened
  * ledger. The proof pins the pair so a shape change cannot ship at the
@@ -1151,6 +1154,9 @@ export class DashboardProjectionStore {
       newLedger ? 1 : 0,
       newLedger ? 0 : null,
     );
+    // Stamp the compatibility fence before admitting the one-time duplicate
+    // scan below. A crash between these writes leaves 0.7.44 refusing the
+    // ledger; the next forward open still creates the pending scan record.
     this.reconcileSchemaVersion(storedSchemaVersion);
     for (const days of INTERNAL_WINDOWS) {
       this.db.prepare(
