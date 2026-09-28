@@ -760,8 +760,12 @@ function joinOnlyReason(noDaemon: boolean): string | null {
   if (process.env.CI && !["0", "false", "no"].includes(process.env.CI.toLowerCase())) return "ci_home";
   if (process.env.GITHUB_ACTIONS === "true") return "ci_home";
   if (process.platform !== "darwin") return "macos_only";
-  const script = process.argv[1] ?? "";
-  if (!/\.(mjs|cjs|js)$/.test(script) || !fs.existsSync(script)) return "source_tree_cli";
+  // npm exposes the packaged CLI through a bin symlink named `plimsoll`.
+  // Inspect its target so the actual Setup-page command takes this path.
+  let script: string;
+  try { script = fs.realpathSync(process.argv[1] ?? ""); }
+  catch { return "source_tree_cli"; }
+  if (!/\.(mjs|cjs|js)$/.test(script)) return "source_tree_cli";
   return null;
 }
 

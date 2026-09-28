@@ -195,6 +195,8 @@ function fixture(name: string, port: number) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const bin = path.join(directory, "bin");
   stubLaunchctl(bin);
+  const installedCli = path.join(bin, "plimsoll");
+  fs.symlinkSync(cli, installedCli);
   const state = path.join(directory, "launchctl.state");
   const trace = path.join(directory, "launchctl.trace");
   const env: NodeJS.ProcessEnv = { ...process.env, ...isolation.env,
@@ -208,7 +210,7 @@ function fixture(name: string, port: number) {
     CI: "", GITHUB_ACTIONS: "",
   };
   isolation.restore();
-  return { home, env, state, trace, data: env.PLIMSOLL_HOME! };
+  return { home, env, state, trace, data: env.PLIMSOLL_HOME!, installedCli };
 }
 
 async function stopFixture(env: NodeJS.ProcessEnv, state: string) {
@@ -243,7 +245,8 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       check(`${name}_no_collector_installed_before_join`, !fs.existsSync(path.join(f.data, "collector.config.json")) &&
         !fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")));
     }
-    const joined = await command(f.env, ["join", "--token-stdin", "--url", `http://127.0.0.1:${remote.port}`], `${token}\n`);
+    const joined = await command(f.env, ["join", "--token-stdin", "--url", `http://127.0.0.1:${remote.port}`],
+      `${token}\n`, f.installedCli);
     const result = receipt(joined.stdout);
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8")));
     check(`${name}_registers_exactly_two_native_folders`, config.captureRoots?.length === 2 &&
@@ -304,7 +307,7 @@ async function joinOnlyScenario(name: string, option: "--no-daemon" | "ci") {
   try {
     if (option === "ci") f.env.CI = "true";
     const joined = await command(f.env, ["join", "--token-stdin", "--url", `http://127.0.0.1:${remote.port}`,
-      ...(option === "--no-daemon" ? ["--no-daemon"] : [])], `${token}\n`);
+      ...(option === "--no-daemon" ? ["--no-daemon"] : [])], `${token}\n`, f.installedCli);
     const result = receipt(joined.stdout);
     check(`${name}_join_only_keeps_daemon_absent`, joined.code === 0 && result.status === "joined" &&
       result.daemon?.setup === "skipped" && !fs.existsSync(f.state) &&
@@ -320,7 +323,7 @@ async function refusedScenario(name: string, network: boolean) {
   try {
     const before = fs.readdirSync(f.home);
     const joined = await command(f.env, ["join", "--token-stdin", "--url",
-      `http://127.0.0.1:${remote.port}`], `${token}\n`);
+      `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli);
     check(`${name}_refusal_changes_no_collector_state`, joined.code !== 0 &&
       !fs.existsSync(path.join(f.data, "collector.config.json")) &&
       !fs.existsSync(path.join(f.data, "work-ledger.sqlite")) &&
