@@ -284,6 +284,12 @@ function* claudeEvents(root: CaptureRoot, file: File,
 }
 
 type ScanResult = { plan: CaptureHistoryPlan; files: File[] };
+function sourceDigest(files: File[], since: string | undefined) {
+  if (files.some(file => !file.prefixHash)) refusal("prefix_hash_missing");
+  return crypto.createHash("sha256").update(JSON.stringify([since ?? null,
+    files.map(file => [file.file, file.limit, file.stamp, file.fencedAt, file.prefixHash])
+  ])).digest("hex");
+}
 async function scan(db: DB, root: CaptureRoot, options: Options,
   onMissing?: (candidate: Candidate) => Promise<void>, expectedFiles?: File[]): Promise<ScanResult> {
   if (options.since && !validIso(options.since)) refusal("since_invalid_iso");
@@ -445,7 +451,7 @@ function ensureImportSchema(db: DB) {
     singleton integer primary key check(singleton=1), root_id text not null,
     owner_pid integer not null, owner_start text not null);
     create table if not exists capture_history_import_runs (
-    root_id text primary key, root_digest text not null, source text not null,
+    root_id text primary key, root_digest text not null, source_digest text not null, source text not null,
     run_id text not null, imported_rows integer not null default 0,
     input_tokens integer not null default 0, cache_read_tokens integer not null default 0,
     cache_creation_tokens integer not null default 0, output_tokens integer not null default 0,
@@ -454,6 +460,9 @@ function ensureImportSchema(db: DB) {
       before insert on raw_retention_receipts
       when exists (select 1 from capture_history_import_lock where singleton=1)
       begin select raise(abort, 'capture_history_import_active'); end;`);
+  const columns = db.pragma("table_info(capture_history_import_runs)") as Array<{ name: string }>;
+  if (!columns.some(column => column.name === "source_digest"))
+    db.exec("alter table capture_history_import_runs add column source_digest text");
 }
 const active = new Set<string>();
 export async function applyCaptureHistory(buffer: LocalEventBuffer, root: CaptureRoot,
@@ -461,6 +470,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   if (active.size) refusal("another_import_in_process");
   const db = buffer.database;
   const first = await scan(db, root, options); // all refusal evidence before writing
+  const fencedSourceDigest = sourceDigest(first.files, options.since);
   maintenanceIdle(db);
   ensureImportSchema(db);
   const ownerStart = processStart(process.pid);
@@ -480,14 +490,18 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     if (held) db.prepare(`delete from capture_history_import_lock where singleton=1`).run();
     db.prepare(`insert into capture_history_import_lock values (1,?,?,?)`)
       .run(root.rootId, process.pid, ownerStart);
-    const prior = db.prepare(`select root_digest as digest, run_id as runId from capture_history_import_runs where root_id=?`)
-      .get(root.rootId) as { digest: string; runId: string } | undefined;
+    const prior = db.prepare(`select root_digest as digest,source_digest as sourceDigest,run_id as runId
+      from capture_history_import_runs where root_id=?`)
+      .get(root.rootId) as { digest: string; sourceDigest: string | null; runId: string } | undefined;
     const digest = captureRootDigest(root);
     if (prior && prior.digest !== digest) refusal("root_identity_changed_since_import");
+    if (prior && prior.sourceDigest !== fencedSourceDigest)
+      refusal("fenced_history_changed_since_import");
     runId = prior?.runId ?? crypto.randomUUID();
     if (!prior) db.prepare(`insert into capture_history_import_runs
-      (root_id,root_digest,source,run_id,started_at,updated_at) values (?,?,?,?,?,?)`)
-      .run(root.rootId, digest, root.source, runId, new Date().toISOString(), new Date().toISOString());
+      (root_id,root_digest,source_digest,source,run_id,started_at,updated_at) values (?,?,?,?,?,?,?)`)
+      .run(root.rootId, digest, fencedSourceDigest, root.source, runId,
+        new Date().toISOString(), new Date().toISOString());
   }).immediate();
   const priorAutoCheckpoint = db.pragma("wal_autocheckpoint", { simple: true }) as number;
   // SQLite's default auto-checkpoint runs synchronously at COMMIT and can

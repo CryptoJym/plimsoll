@@ -64,6 +64,12 @@ function seal(buffer: LocalEventBuffer, source: "codex" | "claude_code", files: 
   assert.equal(receipt.generationsSealed, files.length);
 }
 function sealExtra(buffer: LocalEventBuffer, source: "codex" | "claude_code", file: string) {
+  // Each staged scenario models a fresh root import against the accumulated
+  // capture ledger. The source generations grow only in this synthetic proof;
+  // a production retry is bound to the original fenced inventory.
+  if (buffer.database.prepare(`select 1 from sqlite_master
+    where type='table' and name='capture_history_import_runs'`).get())
+    buffer.database.prepare(`delete from capture_history_import_runs where source=?`).run(source);
   const stat = fs.statSync(file, { bigint: true });
   const receipt = sealCaptureBaselineGenerations(buffer.database, source, [{
     path: file, device: stat.dev, inode: stat.ino, size: stat.size, birthtimeNs: stat.birthtimeNs,
@@ -361,6 +367,19 @@ async function main() {
     check("injected_crash_after_committed_slice", crashed);
     buffer.database.prepare(`update capture_history_import_lock set owner_pid=999999
       where singleton=1`).run();
+    const originalCrashBytes = fs.readFileSync(crashFile);
+    const changedCrashBytes = originalCrashBytes.toString("utf8").replace('"input_tokens":290', '"input_tokens":291');
+    assert.notEqual(changedCrashBytes, originalCrashBytes.toString("utf8"));
+    fs.writeFileSync(crashFile, changedCrashBytes);
+    let changedSourceRefused = false;
+    try { await applyCaptureHistory(buffer, captureRoot); }
+    catch (error) { changedSourceRefused = String(error).includes("fenced_history_changed_since_import"); }
+    check("crash_retry_refuses_changed_fenced_bytes", changedSourceRefused);
+    fs.writeFileSync(crashFile, originalCrashBytes);
+    let changedWindowRefused = false;
+    try { await applyCaptureHistory(buffer, captureRoot, { since: "2026-01-02T00:00:05.000Z" }); }
+    catch (error) { changedWindowRefused = String(error).includes("fenced_history_changed_since_import"); }
+    check("crash_retry_refuses_changed_since_window", changedWindowRefused);
     const recovered = await applyCaptureHistory(buffer, captureRoot);
     const crashRows = (buffer.database.prepare(`select count(*) as n, sum(input_tokens) as input
       from buffered_events where session_id=?`).get(crash) as { n: number; input: number });
