@@ -710,17 +710,37 @@ export class TranscriptTailer {
             limitReached: false, yields: 0, lastYieldAt: null,
           };
       if (chunk.files.length > 0) {
-        const pending = stageAutomaticCaptureBaselinePending(
-          this.buffer.database,
-          "claude_code",
-          {
-            runId: attempt.runId,
-            observedAt: new Date().toISOString(),
-            observations: chunk.files.map((discovered) =>
-              baselineObservation(discovered.file, discovered.stat, discovered.precise)
-            ),
-          },
-        );
+        let pending: ReturnType<typeof stageAutomaticCaptureBaselinePending>;
+        try {
+          pending = this.buffer.transactionWithRepoContextHandoffs(() => {
+            const scope = rolloutGapScope(this.buffer.database);
+            for (const discovered of chunk.files) {
+              declareUnresolvedFileGap(this.buffer.database, {
+                ...scope, source: "claude_code",
+                fileKeyDigest: captureFileKeyDigest(jsonlScanStateKey(this.cursorKey(discovered.file))),
+                generationIdentity: `${discovered.precise.dev}:${discovered.precise.ino}:${discovered.precise.birthtimeNs}`,
+                reason: "tailer_unread", lastWriteAtMs: Math.max(0, Math.floor(discovered.stat.mtimeMs)),
+                unreadBytes: discovered.stat.size,
+              });
+            }
+            const receipt = stageAutomaticCaptureBaselinePending(this.buffer.database, "claude_code", {
+              runId: attempt.runId,
+              observedAt: new Date().toISOString(),
+              observations: chunk.files.map((discovered) =>
+                baselineObservation(discovered.file, discovered.stat, discovered.precise)),
+            });
+            this.persistSweepResume(attempt.discovery);
+            return receipt;
+          });
+        } catch {
+          attempt.discovery.close();
+          this.baselineAttempt = null;
+          result.readErrors += 1;
+          result.exhaustive = false;
+          result.deferredGenerations = Math.max(1, chunk.files.length);
+          result.automaticBudget = automatic.budget.status();
+          return result;
+        }
         attempt.filesDiscovered = pending.filesDiscovered;
         const acceptedFiles = chunk.files.filter((_, index) => pending.accepted[index]);
         if (pending.deferred.some(Boolean)) {
