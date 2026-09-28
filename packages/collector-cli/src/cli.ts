@@ -1480,6 +1480,10 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
               : Number((retentionStates as Record<string, unknown>).retained),
             pendingDelivery: (retentionStates as Record<string, unknown>).pendingDelivery === null ? null
               : Number((retentionStates as Record<string, unknown>).pendingDelivery),
+            heldForUpload: Number.isSafeInteger((retentionStates as Record<string, unknown>).heldForUpload) &&
+              Number((retentionStates as Record<string, unknown>).heldForUpload) >= 0
+                ? Number((retentionStates as Record<string, unknown>).heldForUpload)
+                : null,
             quarantined: (retentionStates as Record<string, unknown>).quarantined === null ? null
               : Number((retentionStates as Record<string, unknown>).quarantined),
             expired: Number((retentionStates as Record<string, unknown>).expired),
@@ -1492,6 +1496,11 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
             at: typeof (retentionLastPass as Record<string, unknown>).at === "string"
               ? (retentionLastPass as Record<string, unknown>).at as string
               : null,
+            heldForUploadExact: (retentionLastPass as Record<string, unknown>).heldForUploadExact === true,
+            heldForUploadAsOfCutoff:
+              typeof (retentionLastPass as Record<string, unknown>).heldForUploadAsOfCutoff === "string"
+                ? (retentionLastPass as Record<string, unknown>).heldForUploadAsOfCutoff as string
+                : null,
           },
         }
       : null;
@@ -5376,11 +5385,19 @@ async function main() {
             states: {
               retained: null,
               pendingDelivery: null,
+              heldForUpload: null,
               quarantined: null,
               expired: null,
               notInspected: 1,
             },
-            lastPass: null,
+            lastPass: {
+              rowsVisited: null,
+              rowsExpired: null,
+              hasMore: null,
+              at: null,
+              heldForUploadExact: false,
+              heldForUploadAsOfCutoff: null,
+            },
           },
           enrollment: {
             futureOnlyEnrollment: true,
