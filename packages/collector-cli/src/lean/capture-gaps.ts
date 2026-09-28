@@ -209,6 +209,39 @@ export function recordCountedGrokGap(db: Database.Database, input: {
   return gapId;
 }
 
+/** An acknowledged spool file is about to lose its last replayable copy.
+ * The stable file name is used only inside the opaque ID hash. The caller
+ * commits this before flushing the ledger and moving or unlinking the file. */
+export function recordSpoolLossGap(db: Database.Database, input: {
+  spool: "hook" | "otlp"; spoolId: string; atMs: number;
+  source: string; reason: "footprint_cap" | "contract_violation";
+  droppedRows: number | null; droppedUsageRows: number | null;
+}): string {
+  if (!safeMs(input.atMs) || !input.spoolId ||
+      (input.droppedRows !== null && (!safeMs(input.droppedRows) ||
+        (input.droppedUsageRows !== null &&
+          (!safeMs(input.droppedUsageRows) || input.droppedUsageRows > input.droppedRows)))) ||
+      (input.droppedRows === null && input.droppedUsageRows !== null)) {
+    throw new Error("invalid_spool_loss_gap");
+  }
+  const scope = rolloutGapScope(db);
+  const gapId = tupleHash(["plimsoll-spool-loss-v1", scope.installationEpochId,
+    input.spool, input.spoolId]);
+  const counted = input.droppedRows !== null;
+  const endedAtMs = counted ? Math.max(scope.epochStartMs + 1, input.atMs + 1) : null;
+  gapWrite(input.source, null, () => db.prepare(`insert or ignore into capture_gaps
+    (gap_id,workspace_id,installation_epoch_id,source,machine_hash,epoch_key,
+     started_at_ms,ended_at_ms,interval_basis,dropped_rows,dropped_usage_rows,
+     count_basis,reason)
+    values (@gapId,@workspaceId,@installationEpochId,@source,@machineHash,
+      @installationEpochId,@epochStartMs,@endedAtMs,@intervalBasis,
+      @droppedRows,@droppedUsageRows,@countBasis,@reason)`)
+    .run({ ...scope, ...input, gapId, machineHash: MACHINE_HASH,
+      endedAtMs, intervalBasis: counted ? "counted_interval" : "epoch_open",
+      countBasis: counted ? "counted" : "unknown" }));
+  return gapId;
+}
+
 /** Persist the conservative interval of a failed capture transaction. The
  * caller must do this in the same retry transaction as its source unit. */
 export function recordFaultIntervalGap(db: Database.Database, input: {

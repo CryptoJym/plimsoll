@@ -17,6 +17,7 @@ import { OTLP_DROP_REASONS, type OtlpAdmissionDrop } from "./otlp-admission";
 import { peekRepoContextSidecar } from "./repo-context";
 import { isSqliteContentionError } from "./sqlite-contention";
 import { recordSpoolLoss } from "./spool-losses";
+import { recordSpoolLossGap } from "./lean/capture-gaps";
 
 /**
  * Bead eco-6hoxj.163.17: OTLP requests the ledger could not take in time are
@@ -892,24 +893,49 @@ export class OtlpIntakeSpool {
     };
   }
 
+  /** A failed gap insert or ledger flush retains the last replayable file. */
+  private async persistLoss(buffer: LocalEventBuffer, file: PendingFile,
+    reason: "footprint_cap" | "contract_violation", knownCounts = true) {
+    try {
+      buffer.transactionWithRepoContextHandoffs(() => recordSpoolLossGap(buffer.database, {
+        spool: "otlp", spoolId: file.stem, atMs: file.receivedAtMs,
+        source: "unknown", reason,
+        droppedRows: knownCounts && file.events !== null && file.metricSamples !== null
+          ? file.events + file.metricSamples : null,
+        droppedUsageRows: null,
+      }));
+      await syncLedger(buffer.database);
+      return true;
+    } catch (error) {
+      this.warn({ warning: "otlp_spool_loss_gap_unavailable", code: errorCode(error) });
+      return false;
+    }
+  }
+
   /** Quarantine a file that must never be replayed, naming why. */
-  private async reject(file: PendingFile, reason: string) {
+  private async reject(buffer: LocalEventBuffer, file: PendingFile, reason: string) {
+    if (!await this.persistLoss(buffer, file, "contract_violation",
+      reason === "replay_failed")) return false;
     const directory = path.join(this.directory, OTLP_SPOOL_REJECTED_DIRECTORY);
     const source = path.join(this.directory, `${file.stem}.json`);
     const safeReason = /^[a-z0-9_]+$/.test(reason) ? reason : "spool_invalid";
-    // eco-6hoxj.163.18 (review S4): the claim reports this arrival as a gap.
-    recordSpoolLoss(this.directory, { atMs: file.receivedAtMs, reason: safeReason });
+    let removed = false;
     try {
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
       fs.chmodSync(directory, 0o700);
       await fs.promises.rename(source, path.join(directory, `${file.stem}.${safeReason}.json`));
+      removed = true;
     } catch {
       // An unmovable file must not block every later one behind it.
-      await fs.promises.unlink(source).catch(() => undefined);
+      try { await fs.promises.unlink(source); removed = true; }
+      catch (error) { removed = errorCode(error) === "ENOENT"; }
     }
+    if (!removed) return false;
+    recordSpoolLoss(this.directory, { atMs: file.receivedAtMs, reason: safeReason });
     this.unindex(file.stem);
     this.bump("rejected");
     this.warn({ warning: "otlp_spool_file_rejected", reason: safeReason });
+    return true;
   }
 
   /** Bound the quarantine by count and age, oldest first. */
@@ -939,10 +965,15 @@ export class OtlpIntakeSpool {
   }
 
   /** Delete acknowledged files past the age limit; runs even when the ledger is busy. */
-  private async expireOld(result: OtlpSpoolDrainPass) {
+  private async expireOld(buffer: LocalEventBuffer, result: OtlpSpoolDrainPass) {
     const cutoff = this.nowMs() - this.limits.maxAgeMs;
     for (const file of this.orderedPending()) {
       if (file.receivedAtMs >= cutoff) break;
+      if (!await this.persistLoss(buffer, file, "footprint_cap")) {
+        result.deferred = true;
+        this.bump("deferredPasses");
+        break;
+      }
       try {
         await fs.promises.unlink(path.join(this.directory, `${file.stem}.json`));
       } catch (error) {
@@ -999,8 +1030,8 @@ export class OtlpIntakeSpool {
     const read = await readEnvelope(target, file.stem);
     if (!read.ok) {
       if (read.reason === "spool_unreadable") return { kind: "deferred", chunks: 0 };
-      await this.reject(file, read.reason);
-      return { kind: "rejected" };
+      return await this.reject(buffer, file, read.reason)
+        ? { kind: "rejected" } : { kind: "deferred", chunks: 0 };
     }
     const { envelope } = read;
     file.events = envelope.batch.events.length;
@@ -1104,7 +1135,8 @@ export class OtlpIntakeSpool {
     this.draining = true;
     try {
       this.ticks += 1;
-      await this.expireOld(result);
+      await this.expireOld(buffer, result);
+      if (result.deferred) return result;
       const passDeadline = performance.now() + this.limits.maxPassMs;
       const completed: PendingFile[] = [];
       let attempted = 0;
@@ -1147,9 +1179,13 @@ export class OtlpIntakeSpool {
         result.failed += 1;
         this.warn({ warning: "otlp_spool_replay_failed", code: outcome.code, failures: file.failures });
         if (file.failures >= this.limits.replayFailureLimit) {
-          await this.reject(file, "replay_failed");
-          result.rejected += 1;
-          continue;
+          if (await this.reject(buffer, file, "replay_failed")) {
+            result.rejected += 1;
+            continue;
+          }
+          result.deferred = true;
+          this.bump("deferredPasses");
+          break;
         }
         break;
       }

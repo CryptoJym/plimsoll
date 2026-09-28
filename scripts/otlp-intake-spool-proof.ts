@@ -1287,6 +1287,55 @@ async function stageB22GapTransactions() {
   }
 }
 
+async function stageB22SpoolLoss() {
+  let clock = Date.now();
+  const expiry = await openFixture({ nowMs: () => clock });
+  const gapRows = (fixture: Fixture) => fixture.buffer.database.prepare(`select reason,
+    interval_basis as basis, count_basis as countBasis, dropped_rows as droppedRows
+    from capture_gaps order by rowid`).all() as Array<{
+      reason: string; basis: string; countBasis: string; droppedRows: number | null;
+    }>;
+  try {
+    const release = holdWriter(expiry.ledger);
+    try { await post(expiry.port, "/v1/logs", usageLogs("b22-expire", 2)); }
+    finally { release(); }
+    expiry.buffer.database.exec(`create trigger b22_expiry_gap_failure before insert on capture_gaps
+      begin select raise(abort, 'b22_expiry_gap_failure'); end`);
+    clock += 8 * 24 * 60 * 60 * 1000;
+    const failed = await expiry.spool!.drain(expiry.buffer);
+    check("b22_otlp_expiry_gap_failure_keeps_the_last_replayable_file",
+      failed.expired === 0 && spoolFiles(expiry.root).length === 1 && gapRows(expiry).length === 0,
+      { failed, files: spoolFiles(expiry.root), gaps: gapRows(expiry) });
+    expiry.buffer.database.exec("drop trigger b22_expiry_gap_failure");
+    const retry = await expiry.spool!.drain(expiry.buffer);
+    check("b22_otlp_expiry_retry_records_counted_loss_before_unlink",
+      retry.expired === 1 && spoolFiles(expiry.root).length === 0 &&
+        gapRows(expiry).some((row) => row.reason === "footprint_cap" && row.countBasis === "counted" && row.droppedRows === 2),
+      { retry, files: spoolFiles(expiry.root), gaps: gapRows(expiry) });
+  } finally { await expiry.close(); fs.rmSync(expiry.root, { recursive: true, force: true }); }
+
+  const quarantine = await openFixture();
+  try {
+    const release = holdWriter(quarantine.ledger);
+    try { await post(quarantine.port, "/v1/logs", usageLogs("b22-quarantine", 1)); }
+    finally { release(); }
+    const [file] = spoolFiles(quarantine.root);
+    fs.writeFileSync(path.join(quarantine.root, "otlp-spool", file!), "{bad");
+    quarantine.buffer.database.exec(`create trigger b22_quarantine_gap_failure before insert on capture_gaps
+      begin select raise(abort, 'b22_quarantine_gap_failure'); end`);
+    const failed = await quarantine.spool!.drain(quarantine.buffer);
+    check("b22_otlp_quarantine_gap_failure_keeps_the_last_replayable_file",
+      failed.rejected === 0 && spoolFiles(quarantine.root).length === 1 && gapRows(quarantine).length === 0,
+      { failed, files: spoolFiles(quarantine.root), gaps: gapRows(quarantine) });
+    quarantine.buffer.database.exec("drop trigger b22_quarantine_gap_failure");
+    const retry = await quarantine.spool!.drain(quarantine.buffer);
+    check("b22_otlp_quarantine_retry_records_unknown_loss_before_move",
+      retry.rejected === 1 && spoolFiles(quarantine.root).length === 0 &&
+        gapRows(quarantine).some((row) => row.reason === "contract_violation" && row.countBasis === "unknown" && row.droppedRows === null),
+      { retry, files: spoolFiles(quarantine.root), gaps: gapRows(quarantine) });
+  } finally { await quarantine.close(); fs.rmSync(quarantine.root, { recursive: true, force: true }); }
+}
+
 // ---------------------------------------------------------------------------
 // I. The real daemon arms the spool and its drain (isolated home and port).
 // ---------------------------------------------------------------------------
@@ -1489,6 +1538,7 @@ async function main() {
     ["bounds", stageBounds],
     ["failures", stageReplayFailures],
     ["b22-gaps", stageB22GapTransactions],
+    ["b22-loss", stageB22SpoolLoss],
     ["daemon", stageDaemon],
     ["measure", measure],
   ];

@@ -4934,6 +4934,29 @@ async function caseB22GapTransactions() {
       retry.recovered === 1 && listHookSpoolFiles(flushHome).length === 0 && rows() === 1,
       { retry, files: listHookSpoolFiles(flushHome).length, rows: rows() });
   } finally { await flushCollector.close(); }
+
+  const { home: lostHome } = fixtureHome("b22-spool-quarantine");
+  const lost = await startCollector(lostHome);
+  try {
+    const saved = writeHookSpoolFile({ home: lostHome, source: "claude_code", body: "{bad" });
+    const armed = trigger(lost);
+    const failed = await lost.drain.tick();
+    check("b22_hook_quarantine_gap_failure_keeps_the_last_replayable_file",
+      saved !== null && armed && failed.rejected === 0 && failed.deferred === 1 &&
+        listHookSpoolFiles(lostHome).length === 1 && gaps(lost) === 0,
+      { saved: saved !== null, failed, files: listHookSpoolFiles(lostHome).length, gaps: gaps(lost) });
+    if (armed) lost.buffer.database.exec("drop trigger b22_hook_gap_failure");
+    const retry = await lost.drain.tick();
+    const gap = hasGaps(lost) ? lost.buffer.database.prepare(`select interval_basis as basis,
+      count_basis as countBasis, dropped_rows as droppedRows from capture_gaps
+      where reason='contract_violation'`).get() as {
+        basis: string; countBasis: string; droppedRows: number | null;
+      } | undefined : undefined;
+    check("b22_hook_quarantine_retry_records_unknown_loss_before_move",
+      retry.rejected === 1 && listHookSpoolFiles(lostHome).length === 0 &&
+        gap?.basis === "epoch_open" && gap.countBasis === "unknown" && gap.droppedRows === null,
+      { retry, files: listHookSpoolFiles(lostHome).length, gap });
+  } finally { await lost.close(); }
 }
 
 async function main() {

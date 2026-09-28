@@ -7,6 +7,7 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
+import { recordSpoolLossGap } from "./lean/capture-gaps";
 import { currentDispatchCaptureRoots } from "./capture-root-inventory";
 import { countUnlinkableDispatchBindings } from "./dispatch-command";
 import { readJevAnalysis, type JevAnalysisSnapshot } from "./jev-analysis";
@@ -473,6 +474,28 @@ export function createHookSpoolDrain(
   let inFlight = false;
   let ticks = 0;
 
+  const rejectWithGap = async (file: Parameters<typeof rejectHookSpoolFile>[1],
+    reason: string, source = "unknown") => {
+    try {
+      buffer.transactionWithRepoContextHandoffs(() => recordSpoolLossGap(buffer.database, {
+        spool: "hook", spoolId: file.name, atMs: file.spooledAtMs,
+        source, reason: "contract_violation", droppedRows: null,
+        droppedUsageRows: null,
+      }));
+      await flushLedger();
+    } catch (error) {
+      warn({ warning: "hook_spool_loss_gap_unavailable", code: errorCodeOnly(error) });
+      return false;
+    }
+    try {
+      const moved = rejectHookSpoolFile(options.home, file, reason);
+      return moved !== null || !fs.existsSync(file.path);
+    } catch (error) {
+      warn({ warning: "hook_spool_remove_failed", code: errorCodeOnly(error) });
+      return false;
+    }
+  };
+
   const snapshot = (): HookSpoolStatus => ({ enabled, ...counters, ...pending });
 
   const tick = async (): Promise<HookSpoolDrainTick> => {
@@ -524,13 +547,21 @@ export function createHookSpoolDrain(
     for (const file of files) {
       result.attempted += 1;
       if (!directoryTrusted || !hookSpoolEntryTrusted(file.path, "file")) {
-        rejectHookSpoolFile(options.home, file, "spool_untrusted");
+        if (!await rejectWithGap(file, "spool_untrusted")) {
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
         result.rejected += 1;
         continue;
       }
       const read = readHookSpoolFile(file.path);
       if (!read.ok) {
-        rejectHookSpoolFile(options.home, file, read.reason);
+        if (!await rejectWithGap(file, read.reason)) {
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
         result.rejected += 1;
         continue;
       }
@@ -578,7 +609,14 @@ export function createHookSpoolDrain(
           result.deferredTick = true;
           break;
         }
-        rejectHookSpoolFile(options.home, file, failure.reason);
+        // A readable envelope does not prove its hook body was normalized.
+        // Contract rejection may happen while parsing it, so the loss count
+        // remains unknown unless an admitted row supplied an exact count.
+        if (!await rejectWithGap(file, failure.reason, read.envelope.source)) {
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
         result.rejected += 1;
       }
       // Yield between files: the drain shares this loop with /hooks/* and the
