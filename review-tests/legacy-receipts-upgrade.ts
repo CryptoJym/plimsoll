@@ -110,6 +110,17 @@ try {
   let upgraded = openUpgraded();
   try {
     let db = upgraded.database;
+    const rawDeleteTrigger = db.prepare(`select sql from sqlite_master
+      where type='trigger' and name='trg_dashboard_raw_delete'`).get() as { sql: string };
+    assert.doesNotMatch(rawDeleteTrigger.sql, /retention_delivery_id\(/,
+      "a persisted raw-delete trigger must work on independent SQLite connections");
+    const independentWriter = new Database(ledgerPath);
+    try {
+      assert.equal(independentWriter.prepare("delete from buffered_events where id=?")
+        .run("missing-upgrade-proof-row").changes, 0);
+    } finally {
+      independentWriter.close();
+    }
     const prebindPrivacySql = terminalPrivacyEligibilitySql(db, "buffered_events");
     assert.equal(Boolean(db.prepare(`select 1 from buffered_events
       where id=? and ${prebindPrivacySql}`).get(ids.privacy)), false,
@@ -300,6 +311,48 @@ try {
       "same rowid and timestamp with a different generation is not lineage");
     console.log(JSON.stringify({ phase: "recycled_generation_fence", recycledRowid,
       receiptBound: recycledReceipt.rawRowid !== null }));
+
+    // The dashboard's persisted raw-delete trigger runs on arbitrary SQLite
+    // connections. Its existing live delivery guard must still exclude an old
+    // terminal privacy receipt when the raw id was a non-UUID legacy id.
+    const liveId = "legacy-live-privacy-receipt";
+    const liveDeliveryId = ensureUuidEventId(liveId).id;
+    const liveGeneration = generation(3007);
+    const liveRow = db.prepare(`insert into buffered_events
+      (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+       workspace_id,device_id,privacy_generation)
+      values (?,'codex','usage_live','metadata',?,?,?,?,?,?)`)
+      .run(liveId, oldAt, validPayload(liveId), oldAt,
+        workspaceId, deviceId, liveGeneration);
+    const liveRowid = Number(liveRow.lastInsertRowid);
+    db.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?,'dead','local_privacy_violation','local',0,?,?)`)
+      .run(liveDeliveryId, oldAt, terminalAt);
+    db.prepare(`insert into raw_retention_receipts
+      (event_id,raw_rowid,raw_created_at,raw_generation,expired_at,reason)
+      values (?,?,?,?,?,'retention_window_elapsed')`)
+      .run(liveId, liveRowid, oldAt, liveGeneration, terminalAt);
+    db.prepare(`insert into dashboard_event_facts
+      (projection_id,raw_rowid,source,event_type,observed_at,raw_generation,
+       workspace_id,installation_epoch_id,observed_at_ms,
+       live_usage_json,live_usage_fact_json,live_delivery_id)
+      values (?,?,'codex','usage_live',?,?,?,?,?,?,?,?)`)
+      .run(liveDeliveryId, liveRowid, oldAt, liveGeneration,
+        workspaceId, "legacy-live-epoch", Date.parse(oldAt),
+        JSON.stringify({ intervalStart: oldAt }), "{}", liveDeliveryId);
+    const independentDelete = new Database(ledgerPath);
+    try {
+      assert.equal(independentDelete.prepare("delete from buffered_events where rowid=?")
+        .run(liveRowid).changes, 1);
+    } finally {
+      independentDelete.close();
+    }
+    assert.equal(Boolean(db.prepare(`select 1 from dashboard_live_usage_retained
+      where event_id=?`).get(liveId)), false,
+    "an old terminal privacy receipt must not become a retained dashboard fact");
+    console.log(JSON.stringify({ phase: "portable_raw_delete_privacy_guard",
+      liveDeliveryId, retained: false }));
   } finally {
     upgraded.close();
   }

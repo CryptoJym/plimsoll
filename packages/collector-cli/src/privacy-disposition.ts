@@ -51,6 +51,7 @@ function columns(db: Database.Database, table: string) {
 export function terminalPrivacyEligibilitySql(
   db: Database.Database,
   rawAlias = "buffered_events",
+  options: { includeUnboundLegacyReceipts?: boolean } = {},
 ) {
   const alias = safeAlias(rawAlias);
   const rawColumns = columns(db, "buffered_events");
@@ -75,7 +76,8 @@ export function terminalPrivacyEligibilitySql(
     const receiptColumns = columns(db, "upload_receipts");
     const receiptLineage = ["raw_rowid", "raw_id", "raw_created_at", "raw_generation"]
       .every((column) => receiptColumns.has(column)) && rawColumns.has("privacy_generation");
-    if (receiptLineage) registerRetentionDeliveryId(db);
+    const includeUnbound = options.includeUnboundLegacyReceipts !== false;
+    if (receiptLineage && includeUnbound) registerRetentionDeliveryId(db);
     terms.push(
       `not exists (
          select 1 from upload_receipts privacy_receipt
@@ -83,7 +85,7 @@ export function terminalPrivacyEligibilitySql(
            and privacy_receipt.raw_id = ${alias}.id
            and privacy_receipt.raw_created_at = ${alias}.created_at
            and privacy_receipt.raw_generation is ${alias}.privacy_generation)
-           or ${legacyNullLineageReceiptMatchSql(alias, "privacy_receipt")})` :
+           ${includeUnbound ? `or ${legacyNullLineageReceiptMatchSql(alias, "privacy_receipt")}` : ""})` :
            `privacy_receipt.delivery_id = ${alias}.id`}
            and privacy_receipt.reason in (${TERMINAL_REASONS_SQL})
        )`,
