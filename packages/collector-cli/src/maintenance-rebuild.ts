@@ -10,6 +10,7 @@ import { assertNoRebuildOpenTokens, assertRebuildWriterGateOpen, rebuildLockPath
   rebuildResumeClaimPath, openRebuildFencedDatabase, retireDeadRebuildOpenTokens } from "./rebuild-open-gate";
 import { currentRebuildWriterIdentity, rebuildWriterIdentityLiveness } from "./rebuild-writer-identity";
 import { withRebuildCoordination } from "./rebuild-coordination";
+import { refreshMaintenanceRebuildPauseHighWater } from "./maintenance-rebuild-pause-state";
 export { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 
 /** Static B13 inventory for coverage reporting. It is never a quiesce receipt. */
@@ -576,7 +577,10 @@ export async function rebuildLedger(input: RebuildRunInput) {
     fail("writer_not_quiesced");
   }
   let preflight: ReturnType<typeof preflightMaintenanceRebuild>;
-  try { preflight = preflightMaintenanceRebuild(input); }
+  try {
+    preflight = preflightMaintenanceRebuild(input);
+    refreshMaintenanceRebuildPauseHighWater(ledgerPath);
+  }
   catch (error) { await input.resume(); throw error; }
   let state: RebuildState | null = null;
   let resumeStarted = false;
