@@ -121,6 +121,7 @@
     "proof:session-summary-live-churn": "tsx scripts/run-proof.ts scripts/session-summary-live-churn-proof.ts",
     "proof:session-summary-reconciliation": "tsx scripts/run-proof.ts scripts/session-summary-reconciliation-proof.ts",
     "proof:session-summary-queued-append-repair": "tsx scripts/run-proof.ts scripts/session-summary-queued-append-repair-proof.ts",
+    "proof:session-summary-checkpoint-erasure": "tsx scripts/run-proof.ts scripts/session-summary-checkpoint-erasure-proof.ts",
     "proof:session-summary-historical-repair": "tsx scripts/run-proof.ts scripts/session-summary-historical-repair-proof.ts",
     "proof:session-summary-future-maturity": "tsx scripts/run-proof.ts scripts/session-summary-future-maturity-proof.ts",
     "proof:session-summary-legacy-rebuild": "tsx scripts/session-summary-legacy-rebuild-proof.ts",

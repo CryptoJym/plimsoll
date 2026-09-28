@@ -348,6 +348,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-queued-append-repair
 
+      - name: Prove terminal and historical checkpoint erasures stay bounded (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-erasure
+
       - name: Prove bounded historical edits and erasures (eco-6hoxj.163.114)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-historical-repair

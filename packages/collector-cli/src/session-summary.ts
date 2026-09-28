@@ -1117,11 +1117,35 @@ async function checkpointValid(
   read: SessionSummaryRead,
   maxMs?: number,
   cursorSegmentQueued = false,
+  highWaterSegmentQueued = false,
 ): Promise<boolean> {
   if (state.highWater === 0) return state.checkpointId === null &&
     accumulator.cursorRowid === 0 && accumulator.cursorObservedAt === null && accumulator.cursorId === null;
   if (state.checkpointId === null) return false;
-  const rows = await read<{ id: string; sessionId: string | null; observedAt: string }>(rowCheckpointQuery(state, maxMs));
+  let rows = await read<{ id: string; sessionId: string | null; observedAt: string }>(rowCheckpointQuery(state, maxMs));
+  if (rows.length === 0 && highWaterSegmentQueued && accumulator.scanComplete) {
+    // Erasure of the terminal raw row leaves a valid prefix but removes its
+    // identity checkpoint. Move the watermark to the prior live row before
+    // repairing the queued segment. An append that reuses the erased rowid
+    // will then remain above the watermark and drain from the append queue.
+    const erasedRowid = state.highWater;
+    const prior = await read<{ rowid: number; id: string; sessionId: string; observedAt: string }>([{
+      sql: `select rowid, id, session_id as sessionId, observed_at as observedAt
+        from buffered_events where rowid < @rowid and session_id = @sessionId
+        order by rowid desc limit 1`,
+      params: { rowid: erasedRowid, sessionId },
+      ...(maxMs === undefined ? {} : { maxMs }),
+    }]);
+    state.highWater = prior[0]?.rowid ?? 0;
+    state.checkpointId = prior[0]?.id ?? null;
+    if (accumulator.cursorRowid === erasedRowid || state.highWater === 0) {
+      accumulator.cursorRowid = 0;
+      accumulator.cursorId = null;
+      accumulator.cursorObservedAt = null;
+    }
+    if (state.highWater === 0) return true;
+    rows = prior;
+  }
   if (rows.length !== 1 || rows[0]?.id !== state.checkpointId || rows[0]?.sessionId !== sessionId) return false;
   if (accumulator.cursorRowid === 0) return accumulator.cursorObservedAt === null && accumulator.cursorId === null;
   if (accumulator.cursorObservedAt === null || accumulator.cursorId === null) return false;
@@ -1141,6 +1165,14 @@ async function checkpointValid(
     params: { rowid: accumulator.cursorRowid },
     ...(maxMs === undefined ? {} : { maxMs }),
   }]);
+  if (cursorRows.length === 0 && cursorSegmentQueued && accumulator.scanComplete) {
+    // The completed historical scan no longer seeks from this cursor. Its
+    // segment repair accounts for the erased row; discard the dead cursor.
+    accumulator.cursorRowid = 0;
+    accumulator.cursorId = null;
+    accumulator.cursorObservedAt = null;
+    return true;
+  }
   if (cursorRows.length !== 1 || cursorRows[0]?.id !== accumulator.cursorId ||
       cursorRows[0]?.sessionId !== sessionId) return false;
   if (cursorRows[0]?.observedAt === accumulator.cursorObservedAt) return true;
@@ -1472,6 +1504,8 @@ export async function updateSessionSummary(
   const pendingRepair = repairQueueRow(db, sessionId);
   const cursorSegmentQueued = Boolean(parsed?.scanComplete && parsed.cursorRowid > 0 &&
     repairQueueRow(db, sessionId, segmentOf(parsed.cursorRowid)) !== null);
+  const highWaterSegmentQueued = Boolean(parsed?.scanComplete && stored && stored.highWater > 0 &&
+    repairQueueRow(db, sessionId, segmentOf(stored.highWater)) !== null);
   // A completed queued repair may leave the dirty marker in place while a
   // future row in its segment matures. Its next due repair is still bounded
   // work, provided the durable state already records this ledger revision.
@@ -1482,7 +1516,7 @@ export async function updateSessionSummary(
   if (stored && parsed && validStoredState(stored, sessionId, until)) {
     try {
       checkpointOk = await checkpointValid(stored, parsed, sessionId, options.read, maxMs,
-        cursorSegmentQueued);
+        cursorSegmentQueued, highWaterSegmentQueued);
     } catch (error) {
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
       // A worker deadline says nothing about checkpoint integrity. Preserve
