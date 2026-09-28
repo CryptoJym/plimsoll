@@ -73,7 +73,7 @@ type FileGapInput = {
   installationEpochId: string;
   source: string;
   fileKeyDigest: string;
-  reason: "tailer_unread" | "record_exceeds_byte_budget" | "generation_rewrite_ambiguous";
+  reason: "tailer_unread" | "record_exceeds_byte_budget" | "generation_rewrite_ambiguous" | "contract_violation";
   epochStartMs: number;
   lastWriteAtMs: number;
   unreadBytes: number;
@@ -178,6 +178,35 @@ export function recordCountedJsonlGap(db: Database.Database, input: {
       : input.kind === "unknown" ? null : 0,
   }));
   return { gapId };
+}
+
+/** A parsed Grok turn or document was refused after its exact generation was
+ * read. The epoch-to-observation interval also covers timestamps clamped
+ * from the future at intake; the count is exact, never inferred from tokens. */
+export function recordCountedGrokGap(db: Database.Database, input: {
+  workspaceId: string; installationEpochId: string; epochStartMs: number;
+  fileKeyDigest: string; generationIdentity: string; unitKey: string;
+  recordedAtMs: number; droppedRows: number; droppedUsageRows: number | null;
+  reason: "generation_rewrite_ambiguous" | "contract_violation";
+}): string {
+  if (!safeMs(input.epochStartMs) || !safeMs(input.recordedAtMs) ||
+      !Number.isSafeInteger(input.droppedRows) || input.droppedRows < 1 ||
+      (input.droppedUsageRows !== null &&
+        (!Number.isSafeInteger(input.droppedUsageRows) || input.droppedUsageRows < 0))) {
+    throw new Error("invalid_grok_counted_gap");
+  }
+  const gapId = tupleHash(["plimsoll-grok-refusal-v1", input.installationEpochId,
+    input.fileKeyDigest, input.generationIdentity, input.unitKey, input.reason]);
+  const endedAtMs = Math.max(input.epochStartMs + 1, input.recordedAtMs + 1);
+  gapWrite("grok", input.fileKeyDigest, () => db.prepare(`insert or ignore into capture_gaps
+    (gap_id,workspace_id,installation_epoch_id,source,machine_hash,epoch_key,
+     started_at_ms,ended_at_ms,interval_basis,dropped_rows,dropped_usage_rows,
+     count_basis,reason,file_key_digest)
+    values (@gapId,@workspaceId,@installationEpochId,'grok',@machineHash,
+      @installationEpochId,@epochStartMs,@endedAtMs,'counted_interval',
+      @droppedRows,@droppedUsageRows,'counted',@reason,@fileKeyDigest)`)
+    .run({ ...input, gapId, endedAtMs, machineHash: MACHINE_HASH }));
+  return gapId;
 }
 
 /** Persist the conservative interval of a failed capture transaction. The
