@@ -65,12 +65,21 @@ keys, and capture-root configuration stay in place.
    files with carried cursors resume at their committed offsets.
 
    If the process stops after linking the archive but before the swap, the
-   active and archive paths refer to the same old inode. Keep both paths and
-   rerun `epoch-plan --archive` followed by `epoch-switch --archive`; the
-   command resumes that state. If the response is lost after the swap, inspect
-   the active ledger's `collector_replacement_ledger` row and archive inode
-   before retrying. Do not unlink, rename, or overwrite either ledger to
-   guess which step completed.
+   active and archive paths refer to the same old inode. Keep both paths. A
+   handled error removes its owned stage; rerun `epoch-plan --archive` and
+   `epoch-switch --archive`. A hard kill can leave
+   `work-ledger.sqlite.replacement-stage` and its sidecars. With the daemon
+   still stopped, first verify that the active ledger has **no** replacement
+   marker and the archive either does not exist or is the **same inode** as
+   active. Move the incomplete stage and its sidecars to unique retained
+   `incomplete-stage-<stamp>` names in the private archive directory; then
+   rerun plan. A killed mutation owner leaves a fenced lease for up to ten
+   minutes; wait for its recorded expiry before rerunning switch. Never move
+   the active ledger or its archive in this recovery. If the response is lost
+   after the swap, inspect the active
+   ledger's `collector_replacement_ledger` row and archive inode before
+   retrying. Do not unlink or overwrite either ledger to guess which step
+   completed.
 7. Start the 0.7.46 collector. Check readiness, queue/spool gates, session
    sync, all 23 roots, zero `epoch_mismatch`, Claude/Codex forward appends,
    Codex live producer authentication, and Grok's historical

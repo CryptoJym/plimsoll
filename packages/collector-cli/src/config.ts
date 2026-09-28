@@ -24,6 +24,7 @@ const RAW_CAPTURE_ENV = [
   "OTEL_LOG_TOOL_CONTENT",
   "OTEL_LOG_RAW_API_BODIES",
 ] as const;
+const installationEpochIdSchema = z.string().uuid();
 
 function envEnablesRawCapture(name: string, value: string | undefined) {
   if (value === undefined) return false;
@@ -69,6 +70,12 @@ export const collectorConfigSchema = z
       .default(1024 * 1024 * 1024),
     captureRoots: z.array(captureRootSchema).max(64).optional().superRefine((roots, ctx) => {
       if (!roots) return;
+      for (const [index, root] of roots.entries()) {
+        if (!installationEpochIdSchema.safeParse(root.installationEpochId).success) {
+          ctx.addIssue({ code: "custom", path: [index, "installationEpochId"],
+            message: "installation epoch ID must be a UUID" });
+        }
+      }
       try { validateCaptureRoots(roots); } catch { ctx.addIssue({ code: "custom", message: "Invalid or overlapping capture root inventory" }); }
     }),
     subscriptions: z

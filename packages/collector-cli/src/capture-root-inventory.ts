@@ -32,7 +32,7 @@ export const dispatchBindingSchema=z.object({
   arm: z.enum(["control","treatment"]).optional(),launchedBy: id.optional(),
 }).strict();
 export const captureRootSchema=z.object({
-  rootId: id,profileId: id,installationEpochId: z.string().uuid(),
+  rootId: id,profileId: id,installationEpochId: id,
   source: z.enum(["codex","claude_code"]),directory: z.string().min(1),
   /** Explicit enrollment attestation; no search of neighboring auth stores. */
   dispatch: z.array(dispatchBindingSchema).max(1000).optional(),

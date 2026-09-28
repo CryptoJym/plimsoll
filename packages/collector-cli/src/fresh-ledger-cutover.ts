@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import Database from "better-sqlite3";
+import { z } from "zod";
 
 import { LocalEventBuffer } from "./buffer";
 import { readAccountAssertionAdapterState, ACCOUNT_ASSERTION_STATE_KEY } from "./account-assertion";
@@ -256,7 +257,7 @@ function rootEpoch(input: CutoverInput): string | null {
   const epochs = new Set((input.config.captureRoots ?? []).map(root => root.installationEpochId));
   if (epochs.size !== 1) throw new Error(epochs.size ? "capture_root_epochs_conflict" : "capture_roots_required");
   const epoch = [...epochs][0]!;
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(epoch)) {
+  if (!z.string().uuid().safeParse(epoch).success) {
     throw new Error("installation_epoch_id_invalid");
   }
   return epoch;
