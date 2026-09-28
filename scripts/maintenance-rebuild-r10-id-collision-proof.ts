@@ -47,7 +47,9 @@ try {
   const earlier = appendForwardedHook(sameKind, { config, source: "claude_code", buffer });
   const earlierRowid = (buffer.database.prepare("select rowid from buffered_events where id=?")
     .get(earlier.event.id) as { rowid: number }).rowid;
-  const laterBody = JSON.stringify({ ...sameKind, prompt: "new refused event" });
+  // Prompt text is privacy-suppressed and is not part of payload_json. Change
+  // a persisted field as well so this really is a different normalized event.
+  const laterBody = JSON.stringify({ ...sameKind, session_id: randomUUID(), prompt: "new refused event" });
   markMaintenanceRebuildPause(home);
   recordMaintenanceRebuildRefusal(home, "hook", "claude_code", laterBody);
   finishMaintenanceRebuildPause(home);

@@ -425,6 +425,11 @@ jobs:
           pnpm proof:maintenance-rebuild-r10-uppercase
           pnpm proof:maintenance-rebuild-r10-id-collision
           pnpm proof:maintenance-rebuild-r10-terminal-journal
+          pnpm proof:maintenance-rebuild-r11-rowid-reuse
+          pnpm proof:maintenance-rebuild-r11-busy-writer
+          pnpm proof:maintenance-rebuild-r11-terminal-processes
+          pnpm proof:maintenance-rebuild-r11-mixed-case
+          pnpm proof:maintenance-rebuild-r11-digest
           pnpm proof:maintenance-rebuild-writers
           pnpm proof:maintenance-rebuild-contract
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)

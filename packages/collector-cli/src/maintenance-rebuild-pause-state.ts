@@ -2,8 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import { collectorConfigSchema, type CollectorConfig } from "./config";
+import { normalizeForwardedHook } from "./forwarder";
 import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 import { classifyEventType, isUuid } from "./normalizer";
+import { withRebuildCoordination } from "./rebuild-coordination";
 import { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 
 const MARKER = "maintenance-rebuild-pause.json";
@@ -13,8 +16,9 @@ type PauseMarker = { version: 1; at: string; pid?: number; endedAt?: string;
   ledgerName?: "work-ledger.sqlite" | "ledger.sqlite"; ledgerHighWater?: number | null };
 
 type RefusalRoute = "hook" | "otlp" | "live";
-type RefusalReceipt = { version: 1 | 2 | 3; route: RefusalRoute; at: string;
+type RefusalReceipt = { version: 1 | 2 | 3 | 4; route: RefusalRoute; at: string;
   source?: string; eventId?: string; kind?: string; ledgerHighWater?: number | null;
+  eventDigest?: string | null; receiveClockFallback?: boolean;
   spoolName?: string; unknownAt?: string };
 /** The client writes its retry immediately after the response; the spool's
  * ten-minute stale-pending diagnostic is our conservative missing-retry
@@ -33,6 +37,53 @@ function fsyncDirectory(directory: string) {
 function sameEventId(left: string, right: string) {
   return isUuid(left) && isUuid(right)
     ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+function stableJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([key, entry]) => [key, stableJson(entry)]));
+}
+/** The payload_json column is JSON.stringify(canonical.event). Canonicalize
+ * object order and UUID spelling before hashing, so older drain versions and
+ * mixed-case producer UUIDs compare the same normalized event. A hook with no
+ * usable time alias gets its observedAt from the receiver clock; that clock
+ * is the one field a retry cannot repeat. Its sentinel is part of the digest
+ * basis, while every caller-controlled normalized field remains exact. */
+function normalizedEventDigest(event: Record<string, unknown>, receiveClockFallback: boolean) {
+  const comparable = { ...event,
+    id: typeof event.id === "string" && isUuid(event.id) ? event.id.toLowerCase() : event.id,
+    ...(receiveClockFallback ? { observedAt: "<receive-clock>" } : {}) };
+  return createHash("sha256").update(JSON.stringify(stableJson(comparable))).digest("hex");
+}
+function hookReceiptIdentity(home: string, source: string, body: string | Buffer,
+  eventId: string, config?: CollectorConfig) {
+  try {
+    const payload: unknown = JSON.parse(String(body));
+    const storedConfig = config ?? (() => {
+      try {
+        return collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(home, "collector.config.json"), "utf8")));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return collectorConfigSchema.parse({});
+        throw error;
+      }
+    })();
+    const options = { config: storedConfig,
+      source: source as Parameters<typeof normalizeForwardedHook>[1]["source"],
+      producerEventId: eventId };
+    const atMs = Date.now();
+    const event = normalizeForwardedHook(payload, { ...options, now: () => atMs }).event;
+    const next = normalizeForwardedHook(payload, { ...options, now: () => atMs + 1_000 }).event;
+    const receiveClockFallback = event.observedAt !== next.observedAt;
+    return { kind: event.eventType,
+      eventDigest: normalizedEventDigest(event as Record<string, unknown>, receiveClockFallback),
+      receiveClockFallback };
+  } catch {
+    // Malformed or unnormalizable requests are still refused. Their receipt
+    // can settle only on the exact terminal outcome, never on a ledger guess.
+    return { kind: hookEventKind(body), eventDigest: null, receiveClockFallback: false };
+  }
 }
 function ledgerName(home: string): "work-ledger.sqlite" | "ledger.sqlite" {
   return fs.existsSync(path.join(home, "work-ledger.sqlite")) ? "work-ledger.sqlite" : "ledger.sqlite";
@@ -120,12 +171,19 @@ function readReceipt(file: string): RefusalReceipt {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) throw new Error("maintenance_refusal_unsafe");
   const value = JSON.parse(fs.readFileSync(file, "utf8")) as RefusalReceipt;
-  if (![1, 2, 3].includes(value.version) || !["hook", "otlp", "live"].includes(value.route) ||
+  if (![1, 2, 3, 4].includes(value.version) || !["hook", "otlp", "live"].includes(value.route) ||
     !Number.isFinite(Date.parse(value.at)) ||
     (value.source !== undefined && !/^[a-z_]{1,32}$/.test(value.source)) ||
     (value.eventId !== undefined && !isUuid(value.eventId)) ||
     (value.version === 3 && (value.route !== "hook" || !value.source || !value.eventId ||
       typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.ledgerHighWater === null ||
+        (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
+    (value.version === 4 && (value.route !== "hook" || !value.source || !value.eventId ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.eventDigest === null || (typeof value.eventDigest === "string" &&
+        /^[a-f0-9]{64}$/.test(value.eventDigest))) ||
+      typeof value.receiveClockFallback !== "boolean" ||
       !(value.ledgerHighWater === null ||
         (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
     (value.unknownAt !== undefined && !Number.isFinite(Date.parse(value.unknownAt))) ||
@@ -181,7 +239,8 @@ export function pendingMaintenanceHookEventId(home: string, source: string, body
 /** A 503 has no server spool, so its route and body identity must survive the
  * listener's exit. Repeated refusals of the same payload share one receipt. */
 export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRoute,
-  source: string, body: string | Buffer, options: { eventId?: string; spoolName?: string } = {}) {
+  source: string, body: string | Buffer,
+  options: { eventId?: string; spoolName?: string; config?: CollectorConfig } = {}) {
   const marker = readMaintenanceRebuildPause(home);
   if (!marker) throw new Error("maintenance_pause_marker_missing");
   const directory = refusalDirectory(home);
@@ -205,16 +264,19 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
       if (prior.eventId && !sameEventId(prior.eventId, eventId)) {
         throw new Error("maintenance_refusal_event_id_changed");
       }
-      const kind = hookEventKind(body);
-      if (prior.version === 3 && (prior.source !== source || prior.kind !== kind)) {
+      const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
+      if ((prior.version === 3 || prior.version === 4) &&
+        (prior.source !== source || prior.kind !== identity.kind ||
+          (prior.version === 4 && prior.eventDigest !== identity.eventDigest))) {
         throw new Error("maintenance_refusal_identity_changed");
       }
-      if (prior.version !== 3 || prior.source !== source || prior.eventId !== eventId ||
+      if (prior.version !== 4 || prior.source !== source || prior.eventId !== eventId ||
         (options.spoolName && prior.spoolName !== options.spoolName)) {
         withHookHighWater(home, marker, (highWater) => {
-          writeReceipt(file, { ...prior, version: 3, source,
-            eventId: prior.eventId ?? eventId, kind,
-            ledgerHighWater: prior.version === 3 ? prior.ledgerHighWater ?? null : highWater,
+          writeReceipt(file, { ...prior, version: 4, source,
+            eventId: prior.eventId ?? eventId, ...identity,
+            ledgerHighWater: prior.version === 3 || prior.version === 4
+              ? prior.ledgerHighWater ?? null : highWater,
             ...(options.spoolName ? { spoolName: options.spoolName } : {}) });
         });
       }
@@ -223,10 +285,11 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
   }
   try {
     if (route === "hook") {
+      const eventId = options.eventId ?? hookEventId(body) ?? randomUUID();
+      const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
       withHookHighWater(home, marker, (highWater) => {
-        const value: RefusalReceipt = { version: 3, route, source,
-          at: new Date().toISOString(), eventId: options.eventId ?? hookEventId(body) ?? randomUUID(),
-          kind: hookEventKind(body), ledgerHighWater: highWater,
+        const value: RefusalReceipt = { version: 4, route, source,
+          at: new Date().toISOString(), eventId, ...identity, ledgerHighWater: highWater,
           ...(options.spoolName ? { spoolName: options.spoolName } : {}) };
         fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
         fs.fsyncSync(descriptor);
@@ -241,12 +304,16 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
 }
 
 function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt) {
-  if (receipt.version !== 3 || !receipt.eventId || !receipt.source || !receipt.kind ||
-    !Number.isSafeInteger(receipt.ledgerHighWater) || (receipt.ledgerHighWater ?? -1) < 0) return false;
+  if (receipt.version !== 4 || !receipt.eventId || !receipt.source || !receipt.kind ||
+    !receipt.eventDigest) return false;
   const idPredicate = isUuid(receipt.eventId) ? "id = ? COLLATE NOCASE" : "id = ?";
-  return Boolean(db.prepare(`select 1 from buffered_events where rowid > ? and source = ?
-    and event_type = ? and ${idPredicate} limit 1`)
-    .get(receipt.ledgerHighWater, receipt.source, receipt.kind, receipt.eventId));
+  const rows = db.prepare(`select payload_json from buffered_events where source = ?
+    and event_type = ? and ${idPredicate}`)
+    .all(receipt.source, receipt.kind, receipt.eventId) as Array<{ payload_json: string }>;
+  return rows.some((row) => {
+    const event = JSON.parse(row.payload_json) as Record<string, unknown>;
+    return normalizedEventDigest(event, receipt.receiveClockFallback === true) === receipt.eventDigest;
+  });
 }
 
 function terminalTailStart(descriptor: number, size: number) {
@@ -266,10 +333,14 @@ function terminalTailStart(descriptor: number, size: number) {
  * note are durable before the new terminal outcome can retire a receipt. */
 function appendTerminalOutcome(home: string, value: Record<string, unknown>) {
   const file = path.join(home, TERMINAL);
-  const flags = fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_APPEND |
-    (fs.constants.O_NOFOLLOW ?? 0);
-  const descriptor = fs.openSync(file, flags, 0o600);
-  try {
+  // A permanent sibling SQLite lock file supplies an OS-released,
+  // process-shared exclusive lock, including after SIGKILL. Hold it from tail
+  // inspection through repair, append, fsync and directory publication.
+  withRebuildCoordination(file, () => {
+    const flags = fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_APPEND |
+      (fs.constants.O_NOFOLLOW ?? 0);
+    const descriptor = fs.openSync(file, flags, 0o600);
+    try {
     const stat = fs.fstatSync(descriptor);
     if (!stat.isFile()) throw new Error("maintenance_terminal_unsafe");
     fs.fchmodSync(descriptor, 0o600);
@@ -298,8 +369,9 @@ function appendTerminalOutcome(home: string, value: Record<string, unknown>) {
     }
     fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
     fs.fsyncSync(descriptor);
-  } finally { fs.closeSync(descriptor); }
-  fsyncDirectory(home);
+    } finally { fs.closeSync(descriptor); }
+    fsyncDirectory(home);
+  });
 }
 
 /** Only a matching retry whose normal route committed may retire this file. */

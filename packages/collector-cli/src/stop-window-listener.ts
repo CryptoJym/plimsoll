@@ -112,7 +112,7 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
           // spool. Key both the pending receipt and later drain to that body.
           recordMaintenanceRebuildRefusal(home, "hook", source,
             blankForbiddenRawContent(body.text)?.text ?? body.text,
-            { eventId: readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]) });
+            { eventId: readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]), config });
         }
         reply(response, 503, { status: "maintenance_rebuild_paused", source }, true, true);
         return;
