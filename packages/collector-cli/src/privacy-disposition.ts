@@ -34,8 +34,8 @@ function columns(db: Database.Database, table: string) {
 
 /**
  * One authoritative event-eligibility predicate for every local/read/export
- * lane. Schema checks are O(1) control reads; row evaluation uses the raw id,
- * receipt primary key, and the indexed outbox raw_rowid linkage.
+ * lane. Schema checks are O(1) control reads; row evaluation uses indexed
+ * receipt and outbox raw lineage where available.
  */
 export function terminalPrivacyEligibilitySql(
   db: Database.Database,
@@ -61,10 +61,17 @@ export function terminalPrivacyEligibilitySql(
   }
 
   if (tableExists(db, "upload_receipts")) {
+    const receiptColumns = columns(db, "upload_receipts");
+    const receiptLineage = ["raw_rowid", "raw_id", "raw_created_at", "raw_generation"]
+      .every((column) => receiptColumns.has(column)) && rawColumns.has("privacy_generation");
     terms.push(
       `not exists (
          select 1 from upload_receipts privacy_receipt
-         where privacy_receipt.delivery_id = ${alias}.id
+         where ${receiptLineage ? `privacy_receipt.raw_rowid = ${alias}.rowid
+           and privacy_receipt.raw_id = ${alias}.id
+           and privacy_receipt.raw_created_at = ${alias}.created_at
+           and privacy_receipt.raw_generation is ${alias}.privacy_generation` :
+           `privacy_receipt.delivery_id = ${alias}.id`}
            and privacy_receipt.reason in (${TERMINAL_REASONS_SQL})
        )`,
     );

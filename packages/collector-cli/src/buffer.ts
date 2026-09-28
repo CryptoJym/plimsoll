@@ -231,7 +231,7 @@ export class LocalEventBuffer {
   private insertEventStatement?: Database.Statement;
   private budgetAttemptedRows = 0;
   private retentionHoldCount: {
-    count: number; cutoffAt: string; measuredAt: number;
+    count: number; cutoffAt: string; measuredAtMonotonic: number;
     revision: number; generation: number; retentionDays: number;
   } | null = null;
   private retentionHoldTask: { worker: Worker; result: Promise<number> } | null = null;
@@ -3129,14 +3129,18 @@ export class LocalEventBuffer {
       select 1 from upload_outbox o where o.delivery_id = retention_delivery_id(e.id)
         and o.raw_rowid is null and o.raw_id is null
     ))`;
-    if (!this.delivery.isEnabled()) return `(${activeAudience} and ${activeOutbox})`;
-    return `(${activeAudience} and (${activeOutbox} or (
+    const outboxEligible = this.rawRetentionOutboxEligibleSql();
+    if (!this.delivery.isEnabled()) return `(${activeAudience} and ${outboxEligible} and ${activeOutbox})`;
+    return `(${activeAudience} and ((${outboxEligible} and ${activeOutbox}) or (
       e.data_mode = 'metadata'
       and e.privacy_disposition is null
       and e.usage_duplicate_reason is null
       and not exists (
         select 1 from upload_receipts local_receipt
-        where local_receipt.delivery_id = retention_delivery_id(e.id)
+        where local_receipt.raw_rowid = e.rowid
+          and local_receipt.raw_id = e.id
+          and local_receipt.raw_created_at = e.created_at
+          and local_receipt.raw_generation is e.privacy_generation
           and local_receipt.terminal_state = 'dead'
           and local_receipt.reason in (
             'local_evidence_quarantined', 'local_payload_unparseable',
@@ -3146,10 +3150,18 @@ export class LocalEventBuffer {
       )
       and (e.uploaded_at is null or exists (
         select 1 from upload_receipts unacknowledged
-        where unacknowledged.delivery_id = retention_delivery_id(e.id)
+        where unacknowledged.raw_rowid = e.rowid
+          and unacknowledged.raw_id = e.id
+          and unacknowledged.raw_created_at = e.created_at
+          and unacknowledged.raw_generation is e.privacy_generation
           and unacknowledged.terminal_state <> 'acknowledged'
       ))
     )))`;
+  }
+
+  private rawRetentionOutboxEligibleSql() {
+    return `(e.data_mode <> 'evidence' and e.privacy_disposition is null
+      and e.usage_duplicate_reason is null)`;
   }
 
   prune(
@@ -3176,6 +3188,9 @@ export class LocalEventBuffer {
         `select e.rowid as rawRowid, e.id as eventId,
            e.created_at as rawCreatedAt, e.privacy_generation as rawGeneration,
            e.source, e.workspace_id as workspaceId, e.device_id as deviceId,
+           e.data_mode as dataMode, e.privacy_disposition as privacyDisposition,
+           e.usage_duplicate_reason as usageDuplicateReason,
+           case when ${this.rawRetentionOutboxEligibleSql()} then 1 else 0 end as uploadEligible,
            e.installation_epoch_id as installationEpochId, e.observed_at as observedAt,
            ${deliveryProtection} as migrationProtected
          from buffered_events e indexed by idx_events_retention
@@ -3184,6 +3199,8 @@ export class LocalEventBuffer {
       ).all(cutoff,scan.at,scan.id,rawLimit) as Array<{
         rawRowid:number;eventId:string;rawCreatedAt:string;rawGeneration:string|null;migrationProtected:number;
         source:string;workspaceId:string|null;deviceId:string|null;
+        dataMode:string;privacyDisposition:string|null;usageDuplicateReason:string|null;
+        uploadEligible:number;
         installationEpochId:string|null;observedAt:string;
       }>;
       let migrationProtectedRows = 0;
@@ -3203,6 +3220,13 @@ export class LocalEventBuffer {
           // Close one linked delivery per visit. A raw row with more than one
           // legacy delivery is revisited by the bounded retention cursor.
           if (this.delivery.retirePriorAudienceRaw(row.rawRowid, row.eventId, now.toISOString())) {
+            retirementPending = true;
+            continue;
+          }
+        }
+        if (!row.uploadEligible) {
+          if (this.delivery.retireIneligibleRaw(row.rawRowid, row.eventId,
+            row.dataMode, row.privacyDisposition, row.usageDuplicateReason, now.toISOString())) {
             retirementPending = true;
             continue;
           }
@@ -3296,7 +3320,9 @@ export class LocalEventBuffer {
     const cached = this.retentionHoldCount;
     const fresh = cached && !this.retentionHoldCountDirty &&
       cached.revision === revision && cached.generation === generation &&
-      cached.retentionDays === retentionDays && Date.now() - cached.measuredAt < 60_000;
+      cached.retentionDays === retentionDays && cutoffAt >= cached.cutoffAt &&
+      performance.now() >= cached.measuredAtMonotonic &&
+      performance.now() - cached.measuredAtMonotonic < 60_000;
     let heldForUpload: number;
     let heldForUploadExact: boolean;
     if (fresh) {
@@ -3316,11 +3342,12 @@ export class LocalEventBuffer {
       heldForUploadExact = sample.length < 513 &&
         revision === this.retentionHoldRevision() && generation === this.retentionHoldGeneration;
       if (heldForUploadExact) {
-        this.retentionHoldCount = { count: heldForUpload, cutoffAt, measuredAt: Date.now(),
+        this.retentionHoldCount = { count: heldForUpload, cutoffAt, measuredAtMonotonic: performance.now(),
           revision, generation, retentionDays };
         this.retentionHoldCountDirty = false;
       } else {
-        if (cached?.retentionDays === retentionDays) heldForUpload = cached.count;
+        if (cached?.retentionDays === retentionDays && cutoffAt >= cached.cutoffAt)
+          heldForUpload = cached.count;
         if (!this.db.memory) {
           try { void this.refreshRetentionHoldCount(retentionDays, now).catch(() => undefined); }
           catch { /* retain the bounded observation for this refresh */ }
@@ -3336,7 +3363,7 @@ export class LocalEventBuffer {
         heldForUploadExact,
         heldForUploadAsOfCutoff: fresh ? cached.cutoffAt :
           heldForUploadExact ? cutoffAt :
-            cached?.retentionDays === retentionDays ? cached.cutoffAt : null,
+            cached?.retentionDays === retentionDays && cutoffAt >= cached.cutoffAt ? cached.cutoffAt : null,
         migrationProtectedRows:scan ? Number(JSON.parse(scan.value).migrationProtectedRows ?? 0) : 0},
     };
   }
@@ -3354,7 +3381,7 @@ export class LocalEventBuffer {
          where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
       ).get(cutoffAt) as { n: number }).n;
       if (revision === this.retentionHoldRevision() && generation === this.retentionHoldGeneration) {
-        this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now(),
+        this.retentionHoldCount = { count, cutoffAt, measuredAtMonotonic: performance.now(),
           revision, generation, retentionDays };
         this.retentionHoldCountDirty = false;
       }
@@ -3364,7 +3391,7 @@ export class LocalEventBuffer {
     const settled = result.then((count) => {
       if (!this.retentionHoldCountClosed && generation === this.retentionHoldGeneration &&
           revision === this.retentionHoldRevision()) {
-        this.retentionHoldCount = { count, cutoffAt, measuredAt: Date.now(),
+        this.retentionHoldCount = { count, cutoffAt, measuredAtMonotonic: performance.now(),
           revision, generation, retentionDays };
         this.retentionHoldCountDirty = false;
         this.retentionHoldCountChanged?.();

@@ -72,6 +72,20 @@ export function ensureUuidEventId(rawId: string): { id: string; derived: boolean
   return { id: deterministicEventId(["workspace-backfill", rawId]), derived: true };
 }
 
+/** Stable alternate namespace for a legacy ID whose default UUID is already owned. */
+export function collisionSafeDeliveryId(rawId: string, attempt: number): string {
+  return attempt === 0 ? ensureUuidEventId(rawId).id :
+    ensureUuidEventId(`workspace-backfill-collision|${rawId}|${attempt}`).id;
+}
+
+export function isCollisionSafeDeliveryId(rawId: string, deliveryId: string): boolean {
+  if (ensureUuidEventId(rawId).id === deliveryId) return true;
+  for (let attempt = 1; attempt < 32; attempt++) {
+    if (collisionSafeDeliveryId(rawId, attempt) === deliveryId) return true;
+  }
+  return false;
+}
+
 export type LedgerHistoryRow = {
   rowid: number;
   id: string;

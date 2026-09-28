@@ -59,6 +59,43 @@ try {
   console.log(JSON.stringify({ faultPoints: 2, rollbackChecksPerFault: 5,
     expired: result.events, receiptReason: (db.prepare("select reason from upload_receipts")
       .get() as { reason: string }).reason }));
+
+  const local = new LocalEventBuffer(path.join(root, "local-only.sqlite"), {
+    workspaceId: "local-workspace", deviceId: "review-device", delivery: { enabled: true },
+    enrollmentNow: () => new Date("2000-01-01T00:00:00.000Z"),
+  });
+  try {
+    const localDb = local.database;
+    const localRaw = aiInteractionEventSchema.parse({ ...raw,
+      id: "00000000-0000-4000-8000-000000000102",
+      sessionId: "00000000-0000-4000-8000-000000000102" });
+    assert.equal(local.append(localRaw), true);
+    localDb.prepare("update buffered_events set created_at=?,data_mode='evidence' where id=?")
+      .run("2000-01-01T00:00:00.000Z", localRaw.id);
+    local.delivery.configure({ enabled: false });
+    const localCount = (table: string) => (localDb.prepare(`select count(*) as n from ${table}`)
+      .get() as { n: number }).n;
+    for (const [label, table] of [
+      ["ineligible_outbox_delete", "upload_outbox"],
+      ["ineligible_raw_delete", "buffered_events"],
+    ] as const) {
+      localDb.exec(`create temp trigger review_fault before delete on ${table}
+        begin select raise(abort,'review_fault_${label}'); end;`);
+      assert.throws(() => local.prune(90, { maxRows: 10, now }),
+        new RegExp(`review_fault_${label}`));
+      localDb.exec("drop trigger review_fault");
+      assert.deepEqual([localCount("buffered_events"), localCount("upload_outbox"),
+        localCount("upload_receipts"), localCount("raw_retention_receipts")], [1, 1, 0, 0]);
+    }
+    assert.equal(local.prune(90, { maxRows: 10, now }).events, 1);
+    assert.deepEqual([localCount("buffered_events"), localCount("upload_outbox"),
+      localCount("upload_receipts"), localCount("raw_retention_receipts")], [0, 0, 1, 1]);
+    console.log(JSON.stringify({ ineligibleFaultPoints: 2,
+      receiptReason: (localDb.prepare("select reason from upload_receipts")
+        .get() as { reason: string }).reason }));
+  } finally {
+    local.close();
+  }
 } finally {
   buffer.close();
   fs.rmSync(root, { recursive: true, force: true });

@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 18);
+const completion = createProofCompletion("retention", 22);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -40,6 +40,15 @@ function event(): AiInteractionEvent {
 function prune(buffer: LocalEventBuffer, maxRows: number) {
   // Advance the supported prune clock; never mutate immutable raw/outbox lineage.
   return buffer.prune(0, { maxRows, now: new Date(Date.now() + 86_400_000) });
+}
+
+function receiptForRaw(db: Database.Database, rawId: string, deliveryId: string,
+  state: "acknowledged" | "dead", reason: string, statusClass: string, at: string) {
+  return db.prepare(`insert into upload_receipts
+    (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,
+     terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+    select ?,rowid,id,created_at,privacy_generation,?,?,?,1,?,?
+    from buffered_events where id=?`).run(deliveryId, state, reason, statusClass, at, at, rawId).changes;
 }
 
 async function main() {
@@ -190,7 +199,7 @@ try {
       select id,rowid,id,created_at,privacy_generation,workspace_id,device_id,
         '{}',2,'pending',created_at,created_at,created_at
       from buffered_events where id=?`).run(evidence.id);
-    heldStatus(buffer, 1);
+    heldStatus(buffer, 0);
     db.prepare("delete from upload_outbox where delivery_id=?").run(evidence.id);
     heldStatus(buffer, 0);
     buffer.close();
@@ -231,17 +240,14 @@ try {
         .run(new Date(now.getTime() + 120_000).toISOString(), inFlight.id);
       const remove = db.prepare("delete from upload_outbox where raw_id=?");
       const uploaded = db.prepare("update buffered_events set uploaded_at=? where id=?");
-      const receipt = db.prepare(`insert into upload_receipts
-        (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-        values (?,?,?,?,1,?,?)`);
       remove.run(acknowledged.id);
       uploaded.run(at, acknowledged.id);
-      receipt.run(acknowledged.id, "acknowledged", "remote_acknowledged", "success", at, at);
+      receiptForRaw(db, acknowledged.id, acknowledged.id, "acknowledged", "remote_acknowledged", "success", at);
       remove.run(remoteDead.id);
       uploaded.run(at, remoteDead.id);
-      receipt.run(remoteDead.id, "dead", "remote_validation_rejected", "remote", at, at);
+      receiptForRaw(db, remoteDead.id, remoteDead.id, "dead", "remote_validation_rejected", "remote", at);
       remove.run(localDead.id);
-      receipt.run(localDead.id, "dead", "local_schema_invalid", "local", at, at);
+      receiptForRaw(db, localDead.id, localDead.id, "dead", "local_schema_invalid", "local", at);
       uploaded.run(at, legacyUploaded.id);
     })();
     const priorOutbox = [pending.id, retry.id, inFlight.id];
@@ -458,11 +464,8 @@ try {
         from buffered_events where id=?`).run(pending.id);
       db.prepare("update buffered_events set uploaded_at = ? where id in (?,?)")
         .run(at, dead.id, acknowledged.id);
-      const receipt = db.prepare(`insert into upload_receipts
-        (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-        values (?,?,?,?,1,?,?)`);
-      receipt.run(dead.id, "dead", "remote_validation_rejected", "remote", at, at);
-      receipt.run(acknowledged.id, "acknowledged", "remote_acknowledged", "success", at, at);
+      receiptForRaw(db, dead.id, dead.id, "dead", "remote_validation_rejected", "remote", at);
+      receiptForRaw(db, acknowledged.id, acknowledged.id, "acknowledged", "remote_acknowledged", "success", at);
     })();
     const before = (db.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
     const start = performance.now();
@@ -515,10 +518,8 @@ try {
       .run(oldCreatedAt, receiptOnly.id, activeAfterAck.id);
     db.prepare("delete from upload_outbox where delivery_id=?").run(receiptOnly.id);
     db.prepare("update buffered_events set uploaded_at=? where id=?").run(at, activeAfterAck.id);
-    const receipt = db.prepare(`insert into upload_receipts
-      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-      values (?, 'acknowledged', 'remote_acknowledged', 'success', 1, ?, ?)`);
-    for (const row of [receiptOnly, activeAfterAck]) receipt.run(row.id, at, at);
+    for (const row of [receiptOnly, activeAfterAck])
+      receiptForRaw(db, row.id, row.id, "acknowledged", "remote_acknowledged", "success", at);
     assert.equal(prune(buffer, 10).events, 0,
       "a receipt without uploaded_at and an active outbox with an acknowledgement both hold");
     db.prepare("update buffered_events set uploaded_at=? where id=?").run(at, receiptOnly.id);
@@ -542,9 +543,7 @@ try {
     db.prepare("delete from upload_outbox where delivery_id=?").run(deliveryId);
     db.prepare("update buffered_events set created_at=?,uploaded_at=? where id=?")
       .run(oldCreatedAt, at, raw.id);
-    db.prepare(`insert into upload_receipts
-      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-      values (?, 'acknowledged', 'remote_acknowledged', 'success', 1, ?, ?)`).run(deliveryId, at, at);
+    receiptForRaw(db, raw.id, deliveryId, "acknowledged", "remote_acknowledged", "success", at);
     assert.equal(prune(buffer, 10).events, 1,
       "a legacy raw ID uses its acknowledged outbox delivery ID for retention");
     buffer.close();
@@ -625,17 +624,14 @@ try {
         .run(new Date(now.getTime() + 120_000).toISOString(), inFlight.id);
       const remove = db.prepare("delete from upload_outbox where raw_id=?");
       const markUploaded = db.prepare("update buffered_events set uploaded_at=? where id=?");
-      const receipt = db.prepare(`insert into upload_receipts
-        (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-        values (?,?,?,?,1,?,?)`);
       remove.run(acknowledged.id);
       markUploaded.run(at, acknowledged.id);
-      receipt.run(acknowledged.id, "acknowledged", "remote_acknowledged", "success", at, at);
+      receiptForRaw(db, acknowledged.id, acknowledged.id, "acknowledged", "remote_acknowledged", "success", at);
       remove.run(remoteDead.id);
       markUploaded.run(at, remoteDead.id);
-      receipt.run(remoteDead.id, "dead", "remote_validation_rejected", "remote", at, at);
+      receiptForRaw(db, remoteDead.id, remoteDead.id, "dead", "remote_validation_rejected", "remote", at);
       remove.run(localDead.id);
-      receipt.run(localDead.id, "dead", "local_schema_invalid", "local", at, at);
+      receiptForRaw(db, localDead.id, localDead.id, "dead", "local_schema_invalid", "local", at);
     })();
     const activeStates = db.prepare("select state,count(*) as n from upload_outbox group by state")
       .all() as Array<{ state: string; n: number }>;
@@ -738,7 +734,9 @@ try {
       workspaceId: "tenant-retention-proof", delivery: { enabled: true },
     });
     const db = buffer.database;
-    const now = new Date("2030-01-01T00:00:00.000Z");
+    // Keep the worker's cutoff at the live HTTP clock; a backward policy
+    // cutoff intentionally invalidates the cached count.
+    const now = new Date();
     const overdueRows = 110_000;
     const uuidId = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
     const acknowledgedId = uuidId(overdueRows - 2);
@@ -762,18 +760,12 @@ try {
     const at = now.toISOString();
     db.prepare("update buffered_events set uploaded_at=? where id in (?,?)")
       .run(at, legacyId, acknowledgedId);
-    db.prepare(`insert into upload_receipts
-      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-      values (?, ?, ?, ?, 1, ?, ?)`).run(
-        ensureUuidEventId(legacyId).id, "acknowledged", "remote_acknowledged", "success", at, at);
-    db.prepare(`insert into upload_receipts
-      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-      values (?, ?, ?, ?, 1, ?, ?)`).run(
-        acknowledgedId, "acknowledged", "remote_acknowledged", "success", at, at);
-    db.prepare(`insert into upload_receipts
-      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
-      values (?, ?, ?, ?, 1, ?, ?)`).run(
-        locallyRejectedId, "dead", "local_schema_invalid", "local", at, at);
+    receiptForRaw(db, legacyId, ensureUuidEventId(legacyId).id,
+      "acknowledged", "remote_acknowledged", "success", at);
+    receiptForRaw(db, acknowledgedId, acknowledgedId,
+      "acknowledged", "remote_acknowledged", "success", at);
+    receiptForRaw(db, locallyRejectedId, locallyRejectedId,
+      "dead", "local_schema_invalid", "local", at);
     const started = performance.now();
     const first = buffer.retentionProgressStatus(90, now);
     const refreshMs = performance.now() - started;
@@ -980,7 +972,16 @@ try {
   }
 
   completion.check("retention_status_contract");
-  console.log(JSON.stringify({ status: "pass", checks: 4 }));
+  for (const [name, proof] of [
+    ["review_receipt_collision", "../review-tests/retention-collision.ts"],
+    ["review_ineligible_outbox", "../review-tests/ineligible-outbox.ts"],
+    ["review_retention_atomicity", "../review-tests/retention-atomicity.ts"],
+    ["review_clock_rollback", "../review-tests/clock-rollback.ts"],
+  ] as const) {
+    await import(proof);
+    completion.check(name);
+  }
+  console.log(JSON.stringify({ status: "pass", checks: 22 }));
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

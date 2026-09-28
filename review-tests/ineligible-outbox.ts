@@ -25,6 +25,10 @@ try {
     .get(row.id) as { n: number }).n, 1);
   // Model an older/stale queued delivery whose raw row is now local-only.
   db.prepare("update buffered_events set data_mode='evidence' where id=?").run(row.id);
+  const eligible = aiInteractionEventSchema.parse({ ...row,
+    id: "00000000-0000-4000-8000-000000000202",
+    sessionId: "00000000-0000-4000-8000-000000000202" });
+  assert.equal(buffer.append(eligible), true);
   buffer.delivery.configure({ enabled: false });
   const pruneAt = new Date(now.getTime() + 86_400_000);
   const result = buffer.prune(0, { maxRows: 10, now: pruneAt });
@@ -32,6 +36,13 @@ try {
   console.log(JSON.stringify({ rawMode: "evidence", deliveryEnabled: false,
     linkedOutbox: true, expired: result.events, rawRemaining }));
   assert.equal(rawRemaining, false, "local-only evidence must expire after upload is disabled");
+  assert.equal((db.prepare("select count(*) as n from upload_outbox where raw_id=?")
+    .get(row.id) as { n: number }).n, 0, "stale linked delivery must retire with raw expiry");
+  assert.equal((db.prepare("select reason from upload_receipts where delivery_id=?")
+    .get(row.id) as { reason: string }).reason, "local_evidence_quarantined");
+  assert.equal(Boolean(db.prepare("select 1 from buffered_events where id=?").get(eligible.id)), true);
+  assert.equal((db.prepare("select count(*) as n from upload_outbox where raw_id=?")
+    .get(eligible.id) as { n: number }).n, 1, "eligible pending raw remains protected");
 } finally {
   buffer.close();
   fs.rmSync(root, { recursive: true, force: true });
