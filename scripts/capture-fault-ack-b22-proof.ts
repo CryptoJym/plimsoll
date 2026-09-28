@@ -56,13 +56,26 @@ try {
     .get(fault.faultId) as {atMs:number|null}).atMs, null);
   assert.ok(fs.existsSync(marker));
   buffer.captureDurability.acknowledgeGaps([{gapId,revision:gap.revision}]);
-  assert.ok((db.prepare("select resolved_at_ms as atMs from capture_faults where fault_id=?")
-    .get(fault.faultId) as {atMs:number|null}).atMs !== null);
+  assert.equal((db.prepare("select resolved_at_ms as atMs from capture_faults where fault_id=?")
+    .get(fault.faultId) as {atMs:number|null}).atMs, null,
+    "the fault stays live until the post-fault whole-root walk");
   assert.ok(fs.existsSync(marker), "a receipt alone cannot erase the marker before a fresh walk");
   assert.equal(buffer.captureDurability.status().faults.length, 1);
   console.log("PASS stale_receipt_ignored_and_ack_waits_for_walk");
 
   buffer.captureDurability.markFreshWalkComplete();
+  const resolved = db.prepare(`select f.resolved_at_ms as faultResolvedAt,
+    g.revision,g.resolved_at_ms as gapResolvedAt,g.ended_at_ms as gapEndedAt,
+    g.upload_state as uploadState from capture_faults f join capture_gaps g on g.gap_id=?
+    where f.fault_id=?`).get(gapId,fault.faultId) as {
+      faultResolvedAt:number|null;revision:number;gapResolvedAt:number|null;
+      gapEndedAt:number|null;uploadState:string;
+    };
+  assert.ok(resolved.faultResolvedAt !== null);
+  assert.equal(resolved.revision,gap.revision+1);
+  assert.equal(resolved.gapResolvedAt,null,"the historical fault interval remains declared loss");
+  assert.equal(resolved.gapEndedAt,gap.endMs);
+  assert.equal(resolved.uploadState,"pending","resolution is a new wire revision");
   assert.equal(fs.existsSync(marker), false);
   assert.equal(buffer.captureDurability.status().faults.length, 0);
   console.log("PASS fresh_walk_after_fault_gap_ack_clears_marker_and_memory");

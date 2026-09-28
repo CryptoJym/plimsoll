@@ -111,18 +111,21 @@ export async function publishAdvertisedCaptureUncertainty(input: {
       and upload_state!='acked' order by gap_id limit 100`)
     .all(scope.workspaceId,scope.installationEpochId) as GapRow[];
   if (rows.length===0) return;
-  const faultIds=new Map((db.prepare(`select fault_id as faultId from capture_faults`)
-    .all() as Array<{faultId:string}>).map(row=>[faultGapId(row.faultId),row.faultId]));
+  const faultIds=new Map((db.prepare(`select fault_id as faultId,resolved_at_ms as resolvedAtMs
+      from capture_faults`)
+    .all() as Array<{faultId:string;resolvedAtMs:number|null}>).map(row=>
+      [faultGapId(row.faultId),row]));
   const items=rows.map(row=>{
-    const faultId=faultIds.get(row.gapId)??null;
-    if (row.reason==="gap_record_unavailable" && faultId===null)
+    const fault=faultIds.get(row.gapId)??null;
+    if (row.reason==="gap_record_unavailable" && fault===null)
       throw new Error("activity_summary_v2_fault_link_missing");
+    const wireResolvedAt=fault?.resolvedAtMs??row.resolvedAtMs;
     return {kind:"capture_gap",gapId:row.gapId,revision:row.revision,
-      source:row.source,faultId,
+      source:row.source,faultId:fault?.faultId??null,
       ...(row.sessionId===null?{}:{sessionId:row.sessionId}),
       machineHash:row.machineHash,epochKey:row.epochKey,
       startedAtMs:row.startedAtMs,endedAtMs:row.endedAtMs,
-      resolvedAt:row.resolvedAtMs===null?null:new Date(row.resolvedAtMs).toISOString(),
+      resolvedAt:wireResolvedAt===null?null:new Date(wireResolvedAt).toISOString(),
       intervalBasis:row.intervalBasis,countBasis:row.countBasis,
       droppedRows:row.droppedRows,droppedUsageRows:row.droppedUsageRows,
       reason:row.reason,fileKeyDigest:row.fileKeyDigest,unreadBytes:row.unreadBytes};

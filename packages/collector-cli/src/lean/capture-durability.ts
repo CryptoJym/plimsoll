@@ -226,15 +226,33 @@ export class CaptureDurability {
     }
   }
 
+  /** Resolve the live failure only after its first gap revision is receipted
+   * and a post-fault whole-root walk completed. The historical gap remains a
+   * fixed declared loss; its new pending revision carries fault resolution. */
+  private resolveAcknowledgedFaultsInTransaction(): void {
+    if (!this.walkVerified) return;
+    const accepted = this.db.prepare(`select 1 from capture_gaps where gap_id=?
+      and reason='gap_record_unavailable' and upload_state='acked' limit 1`);
+    const resolve = this.db.prepare(`update capture_faults set resolved_at_ms=max(at_ms,?)
+      where fault_id=? and resolved_at_ms is null`);
+    const revise = this.db.prepare(`update capture_gaps set revision=revision+1,
+      upload_state='pending' where gap_id=? and reason='gap_record_unavailable'
+      and upload_state='acked'`);
+    const now = Date.now();
+    for (const fault of this.openFaults.values()) {
+      const gapId = faultGapId(fault.faultId);
+      if (!accepted.get(gapId)) continue;
+      if (resolve.run(now,fault.faultId).changes === 1 && revise.run(gapId).changes !== 1) {
+        throw new Error("capture_fault_resolution_gap_revision_failed");
+      }
+    }
+  }
+
   /** Only a receipt for the current revision proves remote possession. A
    * stale receipt cannot clear a fault whose gap was revised after upload. */
   acknowledgeGaps(receipts: readonly { gapId: string; revision: number }[]): number {
     const mark = this.db.prepare(`update capture_gaps set upload_state='acked'
       where gap_id=? and revision=? and upload_state in ('pending','in_flight')`);
-    const acceptedFaultGap = this.db.prepare(`select 1 from capture_gaps
-      where gap_id=? and reason='gap_record_unavailable' and upload_state='acked' limit 1`);
-    const resolve = this.db.prepare(`update capture_faults set resolved_at_ms=max(at_ms,?)
-      where fault_id=? and resolved_at_ms is null`);
     const changed = this.db.transaction(() => {
       let count = 0;
       for (const receipt of receipts) {
@@ -242,10 +260,7 @@ export class CaptureDurability {
             receipt.revision < 1) continue;
         count += mark.run(receipt.gapId, receipt.revision).changes;
       }
-      const now = Date.now();
-      for (const fault of this.openFaults.values()) {
-        if (acceptedFaultGap.get(faultGapId(fault.faultId))) resolve.run(now, fault.faultId);
-      }
+      this.resolveAcknowledgedFaultsInTransaction();
       return count;
     }).immediate();
     this.clearAcknowledgedFaults();
@@ -268,7 +283,7 @@ export class CaptureDurability {
       if (this.db.prepare(`select 1 from capture_faults where resolved_at_ms is null limit 1`).get()) return;
       const proof = this.db.prepare(`select 1 from capture_faults f join capture_gaps g
         on g.gap_id=? where f.fault_id=? and f.resolved_at_ms is not null
-          and g.reason='gap_record_unavailable' and g.upload_state='acked' limit 1`);
+          and g.reason='gap_record_unavailable' and g.revision>1 limit 1`);
       for (const fault of this.openFaults.values()) {
         if (!proof.get(faultGapId(fault.faultId), fault.faultId)) return;
       }
@@ -284,6 +299,8 @@ export class CaptureDurability {
   markFreshWalkComplete(): void {
     this.walkVerified = true;
     this.closeRestartGap();
+    try { this.db.transaction(() => this.resolveAcknowledgedFaultsInTransaction()).immediate(); }
+    catch { /* The fault and its marker remain live until a retry can commit. */ }
     this.clearAcknowledgedFaults();
     this.releaseRestartHold();
   }
