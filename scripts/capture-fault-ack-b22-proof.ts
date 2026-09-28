@@ -113,6 +113,46 @@ try {
   assert.ok(claim.gaps.some((item) => Date.parse(item.from) <= fault.atMs &&
     Date.parse(item.to) >= fault.atMs), "v1 carries the historical fault interval");
   console.log("PASS v1_later_claim_retains_closed_historical_fault_gap");
+
+  // If marker unlink fails after SQL resolution, a later failed gap write
+  // must get a fresh fault ID. Reusing the resolved row would lose the new
+  // unknown interval when its source cursor retries.
+  db.exec(`create trigger fail_b22_fault_gap_third before insert on capture_gaps
+    begin select raise(abort, 'gap write injected'); end`);
+  assert.throws(() => buffer.transactionWithRepoContextHandoffs(() =>
+    declareUnresolvedFileGap(db, {...file,generationIdentity:"gen-3"})),
+    /gap_record_unavailable/);
+  db.exec("drop trigger fail_b22_fault_gap_third");
+  const thirdFaultId=buffer.captureDurability.status().faults[0]!.faultId;
+  buffer.transactionWithRepoContextHandoffs(() =>
+    declareUnresolvedFileGap(db,{...file,generationIdentity:"gen-3"}));
+  const thirdGap=db.prepare("select revision from capture_gaps where gap_id=?")
+    .get(faultGapId(thirdFaultId)) as {revision:number};
+  buffer.captureDurability.markFreshWalkComplete();
+  const unlink=fs.unlinkSync;
+  (fs as {unlinkSync:typeof fs.unlinkSync}).unlinkSync=((filePath:fs.PathLike) => {
+    if (String(filePath)===marker) throw Object.assign(new Error("injected marker unlink"),{code:"EACCES"});
+    return unlink(filePath);
+  }) as typeof fs.unlinkSync;
+  try { buffer.captureDurability.acknowledgeGaps([{
+    gapId:faultGapId(thirdFaultId),revision:thirdGap.revision,
+  }]); }
+  finally { (fs as {unlinkSync:typeof fs.unlinkSync}).unlinkSync=unlink; }
+  assert.ok((db.prepare("select resolved_at_ms as atMs from capture_faults where fault_id=?")
+    .get(thirdFaultId) as {atMs:number|null}).atMs!==null);
+  assert.ok(fs.existsSync(marker));
+  db.exec(`create trigger fail_b22_fault_gap_fourth before insert on capture_gaps
+    begin select raise(abort, 'gap write injected again'); end`);
+  assert.throws(() => buffer.transactionWithRepoContextHandoffs(() =>
+    declareUnresolvedFileGap(db, {...file,generationIdentity:"gen-4"})),
+    /gap_record_unavailable/);
+  db.exec("drop trigger fail_b22_fault_gap_fourth");
+  const newFault=buffer.captureDurability.status().faults.find(item=>item.faultId!==thirdFaultId);
+  assert.ok(newFault,"a later failure reused a resolved fault ID");
+  assert.equal(JSON.parse(fs.readFileSync(marker,"utf8")).faultId,newFault.faultId);
+  assert.ok(db.prepare("select 1 from capture_faults where fault_id=? and resolved_at_ms is null")
+    .get(newFault.faultId));
+  console.log("PASS new_fault_after_failed_marker_unlink_gets_durable_identity");
 } finally {
   buffer.close();
   fs.rmSync(root, {recursive:true, force:true});

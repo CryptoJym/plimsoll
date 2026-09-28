@@ -206,7 +206,17 @@ export class CaptureDurability {
     this.coverageHold = this.coverageSnapshot();
     const cause = error.cause as { code?: unknown } | undefined;
     const kind: CaptureFault["kind"] = cause?.code === "SQLITE_FULL" ? "storage_full" : "gap_write_failed";
-    const fault = [...this.openFaults.values()][0] ?? {
+    // An unlink or directory fsync can leave a resolved fault in memory and
+    // in the marker. Reusing that ID would make a later failure look already
+    // repaired and let its retry advance without a new loss interval.
+    const reusable = [...this.openFaults.values()].find((candidate) => {
+      try {
+        const row = this.db.prepare(`select resolved_at_ms as resolvedAtMs from capture_faults
+          where fault_id=?`).get(candidate.faultId) as {resolvedAtMs:number|null}|undefined;
+        return !row || row.resolvedAtMs===null;
+      } catch { return true; /* Keep the earliest fault when SQLite is unreadable. */ }
+    });
+    const fault = reusable ?? {
       faultId: crypto.createHash("sha256").update(crypto.randomUUID()).digest("hex"),
       kind, atMs: Date.now(), source: error.source, fileKeyDigest: error.fileKeyDigest,
     };
