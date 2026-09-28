@@ -64,6 +64,7 @@ import {
   hookSpoolOperatorStatus,
   hookSpoolRejectedDirectory,
   listHookSpoolFiles,
+  readHookSpoolFile,
   readHookSpoolCounters,
   recordHookSpoolIntake,
   recordHookSpoolRefusal,
@@ -89,6 +90,7 @@ import {
 } from "../packages/shared/src/index";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { timestampIsNotFromTheFuture } from "../packages/collector-cli/src/normalizer";
+import { releaseStopWindowListener, runStopWindowListener } from "../packages/collector-cli/src/stop-window-listener";
 import {
   createCollectorServer,
   createHookSpoolDrain,
@@ -4406,6 +4408,447 @@ async function caseDeferredCountsAttempts() {
   }
 }
 
+/** Reproduce a process death after append committed and before spool unlink. */
+async function caseCrashAfterHookAdmission(producerEventId?: string) {
+  const { home } = fixtureHome(producerEventId ? "crash-header" : "crash-idless");
+  const collector = await startCollector(home);
+  const sessionId = crypto.randomUUID();
+  const lock = holdWriteLock(collector.ledgerPath);
+  let closed = false;
+  try {
+    let posted: Awaited<ReturnType<typeof postHookOverHttp>>;
+    try {
+      posted = await postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          ...(producerEventId ? { "x-plimsoll-event-id": producerEventId } : {}),
+        },
+        claudeHttpHookBody(sessionId, "crash fixture"),
+      );
+    } finally {
+      lock.release();
+    }
+    const pending = listHookSpoolFiles(home);
+    let intercepted = 0;
+    const originalUnlink = fs.unlinkSync;
+    try {
+      // The call is reached only after the synchronous ledger transaction
+      // returned. Refusing this exact unlink leaves the crash-on-disk state.
+      fs.unlinkSync = ((target: fs.PathLike) => {
+        if (pending.length === 1 && String(target) === pending[0]!.path) {
+          intercepted += 1;
+          throw Object.assign(new Error("injected_before_spool_unlink"), { code: "EIO" });
+        }
+        return originalUnlink(target);
+      }) as typeof fs.unlinkSync;
+      await collector.drain.tick();
+    } finally {
+      fs.unlinkSync = originalUnlink;
+    }
+    const firstIds = collector.buffer.database.prepare(
+      "select id from buffered_events where session_id = ? order by rowid",
+    ).all(sessionId) as Array<{ id: string }>;
+    const remained = listHookSpoolFiles(home).length;
+    await collector.close();
+    closed = true;
+
+    const restarted = new LocalEventBuffer(collector.ledgerPath);
+    let replayed: Awaited<ReturnType<HookSpoolDrain["tick"]>>;
+    let afterIds: Array<{ id: string }>;
+    try {
+      replayed = await createHookSpoolDrain(collectorConfigSchema.parse({}), restarted, { home }).tick();
+      afterIds = restarted.database.prepare(
+        "select id from buffered_events where session_id = ? order by rowid",
+      ).all(sessionId) as Array<{ id: string }>;
+    } finally {
+      restarted.close();
+    }
+    check(
+      producerEventId ? "crash_header_hook_replay_is_one_row" : "crash_idless_hook_replay_is_one_row",
+      posted.status === 202 && pending.length === 1 && intercepted === 1 &&
+        firstIds.length === 1 && remained === 1 && replayed.recovered === 1 &&
+        afterIds.length === 1 && listHookSpoolFiles(home).length === 0 &&
+        (!producerEventId || afterIds[0]?.id === producerEventId),
+      { status: posted.status, pending: pending.length, intercepted, firstIds,
+        remained, replayed, afterIds, pendingAfter: listHookSpoolFiles(home).length },
+    );
+  } finally {
+    lock.release();
+    if (!closed) await collector.close();
+  }
+}
+
+/** A future timestamp must keep the same eligibility after a committed drain crashes. */
+async function caseCrashReplayAtFutureSkewBoundary() {
+  const { home } = fixtureHome("crash-future-skew");
+  const ledgerPath = path.join(home, "work-ledger.sqlite");
+  const receivedAtMs = Date.now();
+  const receivedAt = new Date(receivedAtMs).toISOString();
+  const bodyTime = new Date(receivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs + 1).toISOString();
+  const sessionId = crypto.randomUUID();
+  const saved = writeHookSpoolFile({
+    home,
+    source: "claude_code",
+    nowMs: receivedAtMs,
+    body: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: sessionId, timestamp: bodyTime }),
+  });
+  if (!saved) throw new Error("future_skew_fixture_spool_write_failed");
+
+  const withClock = async <T>(nowMs: number, run: () => Promise<T>): Promise<T> => {
+    const originalNow = Date.now;
+    Date.now = () => nowMs;
+    try { return await run(); } finally { Date.now = originalNow; }
+  };
+  const rows = (buffer: LocalEventBuffer) => buffer.database.prepare(
+    "select id, observed_at as observedAt from buffered_events where session_id = ?",
+  ).all(sessionId) as Array<{ id: string; observedAt: string }>;
+
+  let intercepted = 0;
+  const first = new LocalEventBuffer(ledgerPath);
+  let firstRows: ReturnType<typeof rows>;
+  try {
+    const originalUnlink = fs.unlinkSync;
+    try {
+      fs.unlinkSync = ((target: fs.PathLike) => {
+        if (String(target) === saved.path) {
+          intercepted += 1;
+          throw Object.assign(new Error("injected_before_spool_unlink"), { code: "EIO" });
+        }
+        return originalUnlink(target);
+      }) as typeof fs.unlinkSync;
+      await withClock(receivedAtMs, () => createHookSpoolDrain(
+        collectorConfigSchema.parse({}), first, { home },
+      ).tick());
+    } finally {
+      fs.unlinkSync = originalUnlink;
+    }
+    firstRows = rows(first);
+  } finally {
+    first.close();
+  }
+
+  const pendingAfterCrash = listHookSpoolFiles(home).length;
+  const restarted = new LocalEventBuffer(ledgerPath);
+  let replayed: Awaited<ReturnType<HookSpoolDrain["tick"]>>;
+  let replayRows: ReturnType<typeof rows>;
+  let collisions: ReturnType<LocalEventBuffer["eventCollisionSummary"]>;
+  try {
+    // A single millisecond later the body's time reaches the allowed boundary.
+    replayed = await withClock(receivedAtMs + 1, () => createHookSpoolDrain(
+      collectorConfigSchema.parse({}), restarted, { home },
+    ).tick());
+    replayRows = rows(restarted);
+    collisions = restarted.eventCollisionSummary();
+  } finally {
+    restarted.close();
+  }
+
+  check("crash_future_skew_replay_dedupes_without_collision",
+    intercepted === 1 && pendingAfterCrash === 1 &&
+      firstRows.length === 1 && firstRows[0]?.observedAt === receivedAt &&
+      replayed.recovered === 1 && replayRows.length === 1 &&
+      replayRows[0]?.id === firstRows[0]?.id &&
+      collisions.totalConflicts === 0 && listHookSpoolFiles(home).length === 0,
+    { receivedAt, bodyTime, intercepted, pendingAfterCrash,
+      firstRows: firstRows.map(({ id, observedAt }) => ({ id, observedAt })),
+      replayed, replayRows: replayRows.map(({ id, observedAt }) => ({ id, observedAt })),
+      collisions, pendingAfterReplay: listHookSpoolFiles(home).length },
+  );
+}
+
+async function withFixedWallClock<T>(nowMs: number, run: () => Promise<T>): Promise<T> {
+  const originalNow = Date.now;
+  Date.now = () => nowMs;
+  try { return await run(); } finally { Date.now = originalNow; }
+}
+
+async function postThroughStopWindow(
+  home: string, producerEventId: string, bodies: string[], secondDelayMs: number,
+  receiveTimesMs?: number[],
+) {
+  const port = await freePort();
+  const config = collectorConfigSchema.parse({ port });
+  const auth = loadOrCreateLocalIngestAuth(home);
+  const headers = {
+    "content-type": "application/json",
+    "x-plimsoll-token": auth.claudeCodeProducer!,
+    "x-plimsoll-event-id": producerEventId,
+  };
+  const listener = runStopWindowListener(config, home);
+  void listener.catch(() => undefined);
+  const posts: Array<Awaited<ReturnType<typeof postHookOverHttp>>> = [];
+  let receivedAts: string[] = [];
+  try {
+    const readyBy = Date.now() + 5_000;
+    for (;;) {
+      try {
+        if ((await getJson(port, "/healthz", auth.managementRead)).mode === "stop_window") break;
+      } catch { /* the listener has not bound yet */ }
+      if (Date.now() >= readyBy) throw new Error("stop_window_fixture_not_ready");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    for (const [index, body] of bodies.entries()) {
+      if (index === 1) await new Promise((resolve) => setTimeout(resolve, secondDelayMs));
+      const post = () => postHookOverHttp(port, "/hooks/claude-code", headers, body);
+      posts.push(receiveTimesMs
+        ? await withFixedWallClock(receiveTimesMs[index]!, post)
+        : await post());
+    }
+    receivedAts = listHookSpoolFiles(home).map((file) => {
+      const read = readHookSpoolFile(file.path);
+      return read.ok ? read.envelope.receivedAt : "invalid";
+    });
+  } finally {
+    await releaseStopWindowListener(port, home);
+    await listener;
+  }
+  return { config, posts, receivedAts };
+}
+
+/** Two durable stop-window retries must share the first admission's time. */
+async function caseStopWindowProducerIdRetry() {
+  const { home } = fixtureHome("stop-window-producer-retry");
+  const producerEventId = "22222222-2222-4222-8222-222222222222";
+  const body = claudeHttpHookBody(crypto.randomUUID(), "first receipt");
+  const { config, posts, receivedAts } = await postThroughStopWindow(home, producerEventId, [body, body], 2_100);
+  const buffer = new LocalEventBuffer(path.join(home, "work-ledger.sqlite"));
+  try {
+    const drain = createHookSpoolDrain(config, buffer, { home, maxFilesPerTick: 2 });
+    const first = await drain.tick();
+    const firstRows = buffer.database.prepare(
+      "select id, observed_at as observedAt from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ id: string; observedAt: string }>;
+    const firstConflicts = buffer.eventCollisionSummary();
+    const pendingAfterRetry = listHookSpoolFiles(home).length;
+    check("stop_window_same_producer_id_retry_deduplicates_without_collision",
+      posts.every((post) => post.status === 202) && receivedAts.length === 2 &&
+        Date.parse(receivedAts[1]!) - Date.parse(receivedAts[0]!) >= 2_000 &&
+        first.recovered === 2 && firstRows.length === 1 &&
+        firstRows[0]?.observedAt === receivedAts[0] &&
+        firstConflicts.totalConflicts === 0 && pendingAfterRetry === 0,
+      { statuses: posts.map((post) => post.status), receivedAts, first,
+        firstRows, firstConflicts, pendingAfterRetry });
+  } finally {
+    buffer.close();
+  }
+}
+
+/** A different body with the same producer ID remains an integrity conflict. */
+async function caseStopWindowProducerIdCollision() {
+  const { home } = fixtureHome("stop-window-producer-collision");
+  const producerEventId = "44444444-4444-4444-8444-444444444444";
+  const firstBody = claudeHttpHookBody(crypto.randomUUID(), "collision fixture");
+  const changedBody = claudeHttpHookBody(crypto.randomUUID(), "collision fixture");
+  const { config, posts } = await postThroughStopWindow(
+    home, producerEventId, [firstBody, changedBody], 20,
+  );
+  const buffer = new LocalEventBuffer(path.join(home, "work-ledger.sqlite"));
+  try {
+    const drained = await createHookSpoolDrain(config, buffer, { home }).tick();
+    const rows = buffer.database.prepare(
+      "select id from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ id: string }>;
+    const conflicts = buffer.eventCollisionSummary();
+    check("stop_window_changed_content_with_same_producer_id_is_quarantined",
+      posts.every((post) => post.status === 202) && drained.recovered === 2 &&
+        rows.length === 1 && conflicts.totalConflicts === 1 &&
+        listHookSpoolFiles(home).length === 0,
+      { statuses: posts.map((post) => post.status), drained, rows, conflicts,
+        pending: listHookSpoolFiles(home).length });
+  } finally {
+    buffer.close();
+  }
+}
+
+/** A body-owned event time must not replace the receive clock for metadata. */
+async function caseTimestampedProducerIdRetry() {
+  const { home } = fixtureHome("timestamped-producer-retry");
+  const producerEventId = "55555555-5555-4555-8555-555555555555";
+  const firstReceivedAtMs = Date.now();
+  const bodyTime = new Date(firstReceivedAtMs - 24 * 60 * 60 * 1_000).toISOString();
+  const rateObservedAt = new Date(
+    firstReceivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs - 1_000,
+  ).toISOString();
+  const body = JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: crypto.randomUUID(),
+    timestamp: bodyTime,
+    rateObservedAt,
+  });
+  const firstFile = writeHookSpoolFile({
+    home, source: "claude_code", producerEventId, nowMs: firstReceivedAtMs, body,
+  });
+  const retryFile = writeHookSpoolFile({
+    home, source: "claude_code", producerEventId, nowMs: firstReceivedAtMs + 2_100, body,
+  });
+  const buffer = new LocalEventBuffer(path.join(home, "work-ledger.sqlite"));
+  try {
+    const drained = await createHookSpoolDrain(collectorConfigSchema.parse({}), buffer, { home }).tick();
+    const rows = buffer.database.prepare(
+      "select observed_at as observedAt, payload_json as payloadJson from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ observedAt: string; payloadJson: string }>;
+    const metadata = rows[0] ? (JSON.parse(rows[0].payloadJson) as { metadata?: Record<string, unknown> }).metadata : undefined;
+    const conflicts = buffer.eventCollisionSummary();
+    check("timestamped_producer_id_retry_keeps_receive_clock_for_metadata",
+      firstFile !== null && retryFile !== null && drained.recovered === 2 &&
+        rows.length === 1 && rows[0]?.observedAt === bodyTime &&
+        metadata?.rateObservedAt === rateObservedAt && conflicts.totalConflicts === 0,
+      { saved: [firstFile !== null, retryFile !== null], drained,
+        rows: rows.map((row) => ({ observedAt: row.observedAt })),
+        rateObservedAt: metadata?.rateObservedAt, conflicts });
+  } finally {
+    buffer.close();
+  }
+}
+
+/** A valid body time must not let a secondary time cross the skew boundary on retry. */
+async function caseTimestampedSecondarySkewStopWindow() {
+  const { home } = fixtureHome("timestamped-secondary-stop-window");
+  const producerEventId = "66666666-6666-4666-8666-666666666666";
+  const firstReceivedAtMs = Date.now();
+  const secondReceivedAtMs = firstReceivedAtMs + 2_100;
+  const bodyTime = new Date(firstReceivedAtMs - 24 * 60 * 60 * 1_000).toISOString();
+  const rateObservedAt = new Date(
+    firstReceivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs + 1,
+  ).toISOString();
+  const body = JSON.stringify({
+    hook_event_name: "UserPromptSubmit", session_id: crypto.randomUUID(),
+    timestamp: bodyTime, rateObservedAt,
+  });
+  const { config, posts, receivedAts } = await postThroughStopWindow(
+    home, producerEventId, [body, body], 0, [firstReceivedAtMs, secondReceivedAtMs],
+  );
+  const ledgerPath = path.join(home, "work-ledger.sqlite");
+  const firstBuffer = new LocalEventBuffer(ledgerPath);
+  let first: Awaited<ReturnType<HookSpoolDrain["tick"]>>;
+  try {
+    first = await withFixedWallClock(firstReceivedAtMs, () =>
+      createHookSpoolDrain(config, firstBuffer, { home, maxFilesPerTick: 1 }).tick());
+  } finally {
+    firstBuffer.close();
+  }
+  const restarted = new LocalEventBuffer(ledgerPath);
+  try {
+    const second = await withFixedWallClock(secondReceivedAtMs, () =>
+      createHookSpoolDrain(config, restarted, { home, maxFilesPerTick: 1 }).tick());
+    const rows = restarted.database.prepare(
+      "select observed_at as observedAt, payload_json as payloadJson from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ observedAt: string; payloadJson: string }>;
+    const metadata = rows[0]
+      ? (JSON.parse(rows[0].payloadJson) as { metadata?: Record<string, unknown> }).metadata
+      : undefined;
+    const conflicts = restarted.eventCollisionSummary();
+    check("timestamped_stop_window_secondary_skew_retry_deduplicates_after_restart",
+      posts.every((post) => post.status === 202) &&
+        receivedAts[0] === new Date(firstReceivedAtMs).toISOString() &&
+        receivedAts[1] === new Date(secondReceivedAtMs).toISOString() &&
+        first.recovered === 1 && second.recovered === 1 && rows.length === 1 &&
+        rows[0]?.observedAt === bodyTime && metadata?.rateObservedAt === undefined &&
+        conflicts.totalConflicts === 0 && listHookSpoolFiles(home).length === 0,
+      { statuses: posts.map((post) => post.status), receivedAts, first, second,
+        rows: rows.map(({ observedAt }) => ({ observedAt })),
+        rateObservedAt: metadata?.rateObservedAt, conflicts,
+        pending: listHookSpoolFiles(home).length });
+  } finally {
+    restarted.close();
+  }
+}
+
+/** Live retries must use that same first receipt clock for secondary metadata. */
+async function caseTimestampedSecondarySkewLive() {
+  const { home } = fixtureHome("timestamped-secondary-live");
+  const collector = await startCollector(home);
+  const producerEventId = "77777777-7777-4777-8777-777777777777";
+  const firstReceivedAtMs = Date.now();
+  const bodyTime = new Date(firstReceivedAtMs - 24 * 60 * 60 * 1_000).toISOString();
+  const rateObservedAt = new Date(
+    firstReceivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs + 1,
+  ).toISOString();
+  const sessionId = crypto.randomUUID();
+  const body = JSON.stringify({
+    hook_event_name: "UserPromptSubmit", session_id: sessionId,
+    timestamp: bodyTime, rateObservedAt,
+  });
+  const headers = {
+    "content-type": "application/json",
+    "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+    "x-plimsoll-event-id": producerEventId,
+  };
+  const post = (candidate: string) => postHookOverHttp(collector.port, "/hooks/claude-code", headers, candidate);
+  try {
+    const first = await withFixedWallClock(firstReceivedAtMs, () => post(body));
+    const second = await withFixedWallClock(firstReceivedAtMs + 2_100, () => post(body));
+    const rows = collector.buffer.database.prepare(
+      "select observed_at as observedAt, payload_json as payloadJson from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ observedAt: string; payloadJson: string }>;
+    const metadata = rows[0]
+      ? (JSON.parse(rows[0].payloadJson) as { metadata?: Record<string, unknown> }).metadata
+      : undefined;
+    const conflicts = collector.buffer.eventCollisionSummary();
+    check("timestamped_live_secondary_skew_retry_deduplicates",
+      first.status === 202 && second.status === 202 && second.json?.deduplicated === true &&
+        rows.length === 1 && rows[0]?.observedAt === bodyTime &&
+        metadata?.rateObservedAt === undefined && conflicts.totalConflicts === 0,
+      { statuses: [first.status, second.status], deduplicated: second.json?.deduplicated,
+        rows: rows.map(({ observedAt }) => ({ observedAt })),
+        rateObservedAt: metadata?.rateObservedAt, conflicts });
+
+    const changedBody = JSON.stringify({
+      hook_event_name: "UserPromptSubmit", session_id: crypto.randomUUID(),
+      timestamp: bodyTime, rateObservedAt,
+    });
+    const changed = await withFixedWallClock(firstReceivedAtMs + 4_200, () => post(changedBody));
+    check("timestamped_live_changed_content_still_quarantines",
+      changed.status === 202 && changed.json?.collisionQuarantined === true &&
+        collector.buffer.eventCollisionSummary().totalConflicts === 1,
+      { status: changed.status, collisionQuarantined: changed.json?.collisionQuarantined,
+        conflicts: collector.buffer.eventCollisionSummary() });
+  } finally {
+    await collector.close();
+  }
+}
+
+/** Live intake must give the same producer ID the same retry semantics. */
+async function caseLiveProducerIdRetry() {
+  const { home } = fixtureHome("live-producer-retry");
+  const collector = await startCollector(home);
+  const producerEventId = "33333333-3333-4333-8333-333333333333";
+  const body = claudeHttpHookBody(crypto.randomUUID(), "first receipt");
+  const headers = {
+    "content-type": "application/json",
+    "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+    "x-plimsoll-event-id": producerEventId,
+  };
+  try {
+    const first = await postHookOverHttp(collector.port, "/hooks/claude-code", headers, body);
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    const retry = await postHookOverHttp(collector.port, "/hooks/claude-code", headers, body);
+    const retryRows = collector.buffer.database.prepare(
+      "select id from buffered_events where id = ?",
+    ).all(producerEventId) as Array<{ id: string }>;
+    const retryConflicts = collector.buffer.eventCollisionSummary();
+    check("live_same_producer_id_retry_deduplicates_without_collision",
+      first.status === 202 && retry.status === 202 &&
+        retry.json?.deduplicated === true && retryRows.length === 1 &&
+        retryConflicts.totalConflicts === 0,
+      { firstStatus: first.status, retryStatus: retry.status,
+        retryDeduplicated: retry.json?.deduplicated, retryRows, retryConflicts });
+
+    const changed = await postHookOverHttp(collector.port, "/hooks/claude-code", headers,
+      claudeHttpHookBody(crypto.randomUUID(), "first receipt"));
+    check("live_changed_content_with_same_producer_id_is_quarantined",
+      changed.status === 202 && changed.json?.collisionQuarantined === true &&
+        collector.buffer.eventCollisionSummary().totalConflicts === 1,
+      { status: changed.status, collisionQuarantined: changed.json?.collisionQuarantined,
+        conflicts: collector.buffer.eventCollisionSummary() });
+  } finally {
+    await collector.close();
+  }
+}
+
 async function main() {
   // Stage markers on stderr: a hosted-runner hang has to name the case it hung
   // in without waiting for the final report.
@@ -4480,6 +4923,23 @@ async function main() {
     await caseTheIntakeBlanksAndSummarizes();
     stage("deferred_means_attempts");
     await caseDeferredCountsAttempts();
+    stage("crash_after_hook_admission");
+    await caseCrashAfterHookAdmission();
+    await caseCrashAfterHookAdmission("11111111-1111-4111-8111-111111111111");
+    stage("crash_future_skew_boundary");
+    await caseCrashReplayAtFutureSkewBoundary();
+    stage("stop_window_producer_id_retry");
+    await caseStopWindowProducerIdRetry();
+    stage("stop_window_producer_id_collision");
+    await caseStopWindowProducerIdCollision();
+    stage("timestamped_producer_id_retry");
+    await caseTimestampedProducerIdRetry();
+    stage("timestamped_secondary_skew_stop_window");
+    await caseTimestampedSecondarySkewStopWindow();
+    stage("timestamped_secondary_skew_live");
+    await caseTimestampedSecondarySkewLive();
+    stage("live_producer_id_retry");
+    await caseLiveProducerIdRetry();
     stage("report");
   } finally {
     for (const [key, value] of previousEnv) {
