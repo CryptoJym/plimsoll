@@ -15,6 +15,8 @@ import { TransportError } from "./http-transport";
 import { SyncStorageRetryController } from "./sqlite-contention";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
+import { observeActivitySummaryAdvertisement,
+  observeActivitySummaryAdvertisementAtPath } from "./lean/activity-summary-capability";
 import { deliveryItemId } from "./delivery-ack";
 import { pinnedUploadUrl } from "./http-transport";
 import { MAX_EVENT_UPLOAD_BATCH_SIZE } from "./upload";
@@ -1284,6 +1286,7 @@ export async function runSessionSync(
     );
   }
 
+  const capabilityLedgerPath = options.ledgerPath ?? (options.ledgerDb ? null : collectorBufferPath());
   let ledger = options.ledgerDb ?? null;
   let ownsLedger = false;
   if (!ledger) {
@@ -1574,6 +1577,16 @@ export async function runSessionSync(
           timeoutMs: requestTimeoutMs,
           retryDeadlineMs: sendBeforeMs,
           allowPartial: true,
+          onAuthenticatedAcknowledgement: (reply) => {
+            // Older synthetic ledgers used by local backfill have no capture
+            // maintenance table; only a collector ledger can carry the state.
+            if (!ledger!.prepare(`select 1 from sqlite_master where type='table' and name='maintenance_state'`).get()) return;
+            if (options.ledgerDb && !ledger!.readonly) {
+              observeActivitySummaryAdvertisement(ledger!,config.installKey,reply);
+            } else if (capabilityLedgerPath) {
+              observeActivitySummaryAdvertisementAtPath(capabilityLedgerPath,config.installKey,reply);
+            }
+          },
           onResponse: ({ status, body: reply }) => {
             if (status !== 409 || !reply || typeof reply !== "object" || Array.isArray(reply)) return;
             const body = reply as { error?: unknown; serverTime?: unknown };

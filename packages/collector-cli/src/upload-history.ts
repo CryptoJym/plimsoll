@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
 import { postDelivery } from "./delivery-post";
+import { observeActivitySummaryAdvertisementAtPath } from "./lean/activity-summary-capability";
 import { pinnedUploadUrl, TransportError } from "./http-transport";
 import {
   assertCollectorPrivacyMode,
@@ -608,6 +609,8 @@ export async function postHistoryBatch(input: {
   beforeSend?: () => boolean;
   /** Observe a fully read, byte-bounded non-success response. */
   onResponse?: (response: { status: number; body: unknown }) => void;
+  /** Called only after the exact delivery acknowledgement has validated. */
+  onAuthenticatedAcknowledgement?: (body: unknown) => void;
   log: (line: string) => void;
 }): Promise<{
   accepted: number;
@@ -636,6 +639,7 @@ export async function postHistoryBatch(input: {
       if (!acknowledgement) {
         throw new FatalUploadError("Workspace delivery deferred: invalid_acknowledgement. Resume state retained.");
       }
+      input.onAuthenticatedAcknowledgement?.(response.body);
       if (acknowledgement.rejectedIds.length > 0 && !input.allowPartial) {
         throw new FatalUploadError("Workspace delivery deferred: remote_rejected. Resume state retained.");
       }
@@ -902,6 +906,8 @@ export async function runWorkspaceHistoryUpload(
           sleep,
           maxAttempts,
           timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
+          onAuthenticatedAcknowledgement: (reply) =>
+            observeActivitySummaryAdvertisementAtPath(ledgerPath,config.installKey,reply),
           log,
         });
         batchesSent += 1;
@@ -1279,6 +1285,8 @@ export async function runAttributionRepair(
           sleep,
           maxAttempts,
           timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
+          onAuthenticatedAcknowledgement: (reply) =>
+            observeActivitySummaryAdvertisementAtPath(ledgerPath,config.installKey,reply),
           log,
         });
         batches += 1;

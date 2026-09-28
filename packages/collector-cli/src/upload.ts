@@ -17,6 +17,7 @@ import {
 import { sealOutboundEnvelope } from "./outbound-envelope";
 import { TransportError, pinnedUploadUrl, validatedTransportUrl } from "./http-transport";
 import { postDelivery } from "./delivery-post";
+import { observeActivitySummaryAdvertisement } from "./lean/activity-summary-capability";
 import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
 import { PLIMSOLL_VERSION } from "./version";
@@ -189,6 +190,7 @@ async function postItems(input: {
   now: () => Date;
   maxBytes: number;
   captureClaim?: DeliveryCaptureClaim | null;
+  onAuthenticatedAcknowledgement?: (body: unknown) => void;
 }): Promise<ProbeResult> {
   const { body, bytes } = bodyForItems(input.config, input.items, input.appVersion);
   if (bytes > input.maxBytes) {
@@ -219,6 +221,9 @@ async function postItems(input: {
       statusClass: localBudget ? "local_request_budget" : transient ? "network" : "remote_contract",
       summary: {}, requestBytes: bytes, acceptedItems: [], rejectedItems: [],
       networkCode: error instanceof TransportError ? error.networkCode ?? error.code : null };
+  }
+  if (response.ok && response.acknowledgement) {
+    input.onAuthenticatedAcknowledgement?.(response.body);
   }
   const responseDeviceId = response.ok && response.body && typeof response.body === "object" &&
     !Array.isArray(response.body)
@@ -326,6 +331,11 @@ async function uploadStateless(
     timeoutSeconds: config.delivery.requestTimeoutSeconds,
     now: options.now ?? (() => new Date()),
     maxBytes: maxRequestBytes,
+    onAuthenticatedAcknowledgement: (body) => {
+      observeActivitySummaryAdvertisement(buffer.database, config.installKey, body,
+        (options.now ?? (() => new Date()))().getTime());
+      options.onAuthenticatedAcknowledgement?.(body);
+    },
   });
   if (!result.ok) throw new DeliveryUploadError(failureForProbe(result), result.statusClass, result.retryAfterMs ?? 0, result.networkCode ?? null);
   return {
@@ -365,6 +375,8 @@ export type UploadOptions = {
   afterSiblingAcknowledgement?: () => void;
   /** Home of the hook and OTLP spools the capture claim reads; the collector home by default. */
   spoolHome?: string;
+  /** A validated ingest reply, used by join to stage the last grant/ack. */
+  onAuthenticatedAcknowledgement?: (body: unknown) => void;
 };
 
 let captureClaimFailureLogged = false;
@@ -475,6 +487,10 @@ export async function uploadBufferedEvents(
 
   await storage(() => buffer.delivery.configure({ enabled: true, limits: config.delivery }));
   const nowFn = options.now ?? (() => new Date());
+  const observeAcknowledgement = (body: unknown) => {
+    observeActivitySummaryAdvertisement(buffer.database, config.installKey, body, nowFn().getTime());
+    options.onAuthenticatedAcknowledgement?.(body);
+  };
   // One daemon upload cycle may run 20 batches while the HTTP listener is
   // serving OTLP. Keep each legacy migration writer turn well below the
   // listener's 750 ms busy retry budget; the cursor resumes next batch.
@@ -526,6 +542,7 @@ export async function uploadBufferedEvents(
       timeoutSeconds: config.delivery.requestTimeoutSeconds,
       now: nowFn,
       maxBytes: maxRequestBytes,
+      onAuthenticatedAcknowledgement: observeAcknowledgement,
     });
     options.afterRemote?.();
     if (witnessResult.ok) {
@@ -661,6 +678,7 @@ export async function uploadBufferedEvents(
       now: nowFn,
       maxBytes: maxRequestBytes,
       captureClaim,
+      onAuthenticatedAcknowledgement: observeAcknowledgement,
     });
     if (result.ok) {
       lastSummary = result.summary;
@@ -731,6 +749,7 @@ export async function uploadBufferedEvents(
                 timeoutSeconds: config.delivery.requestTimeoutSeconds,
                 now: nowFn,
                 maxBytes: maxRequestBytes,
+                onAuthenticatedAcknowledgement: observeAcknowledgement,
               });
               if (witnessResult.ok) {
                 validationWitnessProven = true;
@@ -814,6 +833,7 @@ export async function uploadBufferedEvents(
         timeoutSeconds: config.delivery.requestTimeoutSeconds,
         now: nowFn,
         maxBytes: maxRequestBytes,
+        onAuthenticatedAcknowledgement: observeAcknowledgement,
       });
       if (witnessResult.ok) {
         validationWitnessProven = true;
