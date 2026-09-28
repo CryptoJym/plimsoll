@@ -22,13 +22,14 @@ import {
 } from "./http-boundary";
 import { blankForbiddenRawContent, hookSpoolEnabled, isHookSpoolSource, writeHookSpoolEnvelope } from "./hook-spool";
 import { assertManagementCredential, assertProducerToken, readLiveProducerAuth } from "./local-auth";
-import { assertLiveRoute, authenticatePausedLiveProducer, selectsLiveUsage } from "./codex-live-usage-auth";
+import { assertLiveRoute, authenticatePausedLiveProducer, readLiveBody, selectsLiveUsage } from "./codex-live-usage-auth";
 import { hasLiveUsageClaim } from "./codex-live-usage-protocol";
 import { conflictingOtlpServiceSource, explodeOtlpPayload } from "./otlp";
 import { OtlpIntakeSpool } from "./otlp-spool";
 import { readProducerEventIdHeader, PRODUCER_EVENT_ID_HEADER } from "./producer-parity";
 import { markStopWindowProbe, STOP_WINDOW_PROBE_HEADER } from "./stop-window-probe";
-import { finishMaintenanceRebuildPause, markMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
+import { finishMaintenanceRebuildPause, markMaintenanceRebuildPause,
+  recordMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 export const STOP_WINDOW_RELEASE_PATH = "/api/stop-window/release";
 
@@ -77,12 +78,14 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         setImmediate(() => server.close());
         return;
       }
-      if (releasing) throw new HttpBoundaryRejection("internal_rejection", 503);
+      if (releasing && mode !== "maintenance_rebuild") throw new HttpBoundaryRejection("internal_rejection", 503);
       if (mode === "maintenance_rebuild" && selectsLiveUsage(request)) {
         const selected = assertLiveRoute(request);
         const auth = readLiveProducerAuth(home);
         if (!auth) throw new HttpBoundaryRejection("producer_token_invalid", 401);
         authenticatePausedLiveProducer(home, selected.producerId, selected.token, auth);
+        const body = await readLiveBody(request, createRequestBudget());
+        recordMaintenanceRebuildRefusal(home, "live", selected.producerId, body);
         reply(response, 503, { status: "maintenance_rebuild_paused", source: "codex" }, true, true);
         return;
       }
@@ -99,6 +102,12 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
       // A maintenance 503 is a rejection. The client owns the retry and its
       // spool; no server capture cursor, ack or spool file may advance here.
       if (mode === "maintenance_rebuild") {
+        if (isOtlpPath(request.url)) {
+          const budget = createRequestBudget();
+          const body = decodeBoundedRequestBody(request, await readBoundedRequestBody(request, budget));
+          recordMaintenanceRebuildRefusal(home, "otlp",
+            `${source}:${canonicalOtlpTransportPath(request.url)}`, body.text);
+        }
         reply(response, 503, { status: "maintenance_rebuild_paused", source }, true, true);
         return;
       }

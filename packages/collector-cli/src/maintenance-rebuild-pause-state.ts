@@ -1,8 +1,80 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 const MARKER = "maintenance-rebuild-pause.json";
+const REFUSALS = "maintenance-rebuild-refusals";
 type PauseMarker = { version: 1; at: string; pid?: number; endedAt?: string };
+
+type RefusalRoute = "otlp" | "live";
+function refusalDirectory(home: string) { return path.join(home, REFUSALS); }
+function refusalPath(home: string, route: RefusalRoute, source: string, body: string | Buffer) {
+  const digest = createHash("sha256").update(`${route}\0${source}\0`).update(body).digest("hex");
+  return path.join(refusalDirectory(home), `${digest}.receipt`);
+}
+function fsyncDirectory(directory: string) {
+  const descriptor = fs.openSync(directory, "r");
+  try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+}
+
+/** A 503 has no server spool, so its route and body identity must survive the
+ * listener's exit. Repeated refusals of the same payload share one receipt. */
+export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRoute,
+  source: string, body: string | Buffer) {
+  if (!readMaintenanceRebuildPause(home)) throw new Error("maintenance_pause_marker_missing");
+  const directory = refusalDirectory(home);
+  try {
+    fs.mkdirSync(directory, { mode: 0o700 });
+    fsyncDirectory(home);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const dirStat = fs.lstatSync(directory);
+  if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) throw new Error("maintenance_refusals_unsafe");
+  const file = refusalPath(home, route, source, body);
+  let descriptor: number;
+  try { descriptor = fs.openSync(file, "wx", 0o600); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_refusal_unsafe");
+    return;
+  }
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify({ version: 1, route, at: new Date().toISOString() })}\n`);
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
+  fsyncDirectory(directory);
+}
+
+/** Only a matching retry whose normal route committed may retire this file. */
+export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRoute,
+  source: string, body: string | Buffer) {
+  const file = refusalPath(home, route, source, body);
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_refusal_unsafe");
+    fs.unlinkSync(file);
+    fsyncDirectory(refusalDirectory(home));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+/** null means the receipt inventory is unsafe or unreadable: hold attestation. */
+export function countMaintenanceRebuildRefusals(home: string): number | null {
+  const directory = refusalDirectory(home);
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    if (entries.some((entry) => !/^[a-f0-9]{64}\.receipt$/.test(entry.name) || !entry.isFile() ||
+      entry.isSymbolicLink())) return null;
+    return entries.length;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? 0 : null;
+  }
+}
 
 function writeMarker(home: string, marker: PauseMarker) {
   const file = path.join(home, MARKER);

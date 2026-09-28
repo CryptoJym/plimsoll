@@ -552,16 +552,20 @@ export async function rebuildLedger(input: RebuildRunInput) {
     return { status: "rebuilt" as const, pauseMs: performance.now() - pausedAt,
       backupPath, quiesce: { ...receipt, fencedOwnership }, ...preflight };
   } catch (error) {
-    if (!resumeStarted && ownsLock) {
-      if (state && fs.existsSync(state.backupPath)) {
-        removeSqliteSidecars(ledgerPath);
-        if (fs.existsSync(ledgerPath)) removeIfExists(ledgerPath);
-        fs.renameSync(state.backupPath, ledgerPath);
-        fsyncDirectory(ledgerPath);
+    if (!resumeStarted) {
+      if (ownsLock) {
+        if (state && fs.existsSync(state.backupPath)) {
+          removeSqliteSidecars(ledgerPath);
+          if (fs.existsSync(ledgerPath)) removeIfExists(ledgerPath);
+          fs.renameSync(state.backupPath, ledgerPath);
+          fsyncDirectory(ledgerPath);
+        }
+        removeIfExists(targetPath(ledgerPath));
+        if (state) advance(ledgerPath, state, "failed", error instanceof Error ? error.message : "unknown");
+        removeIfExists(lockPath(ledgerPath));
       }
-      removeIfExists(targetPath(ledgerPath));
-      if (state) advance(ledgerPath, state, "failed", error instanceof Error ? error.message : "unknown");
-      removeIfExists(lockPath(ledgerPath));
+      // Quiesce has already unloaded the daemon even when a competing rebuild
+      // wins the lock race. Resume ours without touching that owner's lock.
       await input.resume();
     }
     throw error;

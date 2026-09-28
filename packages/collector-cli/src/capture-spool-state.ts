@@ -1,7 +1,8 @@
 import { hookSpoolDirectory, listHookSpoolArrivalDetails } from "./hook-spool";
 import { listOtlpSpoolArrivals, otlpSpoolDirectory } from "./otlp-spool";
 import { readSpoolLosses, type SpoolLoss } from "./spool-losses";
-import { clearMaintenanceRebuildPause, settleInterruptedMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
+import { clearMaintenanceRebuildPause, countMaintenanceRebuildRefusals,
+  settleInterruptedMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
 
 /**
  * What the hook and OTLP spools hold or lost, for the upload capture claim
@@ -27,21 +28,22 @@ export function captureSpoolState(home: string): CaptureSpoolState {
   const listings = [hookArrivals?.map((arrival) => arrival.atMs) ?? null, listOtlpSpoolArrivals(home)];
   const logs = [readSpoolLosses(hookSpoolDirectory(home)), readSpoolLosses(otlpSpoolDirectory(home))];
   const arrivals = listings.flatMap((listing) => listing ?? []);
-  const unreadable = [...listings, ...logs].some((value) => value === null);
+  const refused = countMaintenanceRebuildRefusals(home);
+  const unreadable = [...listings, ...logs, refused].some((value) => value === null);
   // A client may write its retry file after the listener stamps endedAt and
   // the empty marker is cleared. The filename's maintenance cause survives
   // that interval and keeps the capture claim unattested until drain.
   const taggedPending = hookArrivals?.some((arrival) => arrival.maintenanceRebuild) ?? false;
-  let maintenanceRebuildPending = taggedPending;
+  let maintenanceRebuildPending = taggedPending || refused === null || refused > 0;
   try {
     const marker = settleInterruptedMaintenanceRebuildPause(home);
     if (marker && !unreadable) {
       const start = Date.parse(marker.at);
       const end = marker.endedAt ? Date.parse(marker.endedAt) : Infinity;
-      maintenanceRebuildPending = taggedPending || arrivals.some((at) => at >= start && at <= end);
+      maintenanceRebuildPending = maintenanceRebuildPending || arrivals.some((at) => at >= start && at <= end);
       if (marker.endedAt && !maintenanceRebuildPending) clearMaintenanceRebuildPause(home);
-    } else if (marker) maintenanceRebuildPending = taggedPending || arrivals.length > 0;
-  } catch { maintenanceRebuildPending = taggedPending || arrivals.length > 0; }
+    } else if (marker) maintenanceRebuildPending = maintenanceRebuildPending || arrivals.length > 0;
+  } catch { maintenanceRebuildPending = true; }
   return {
     pendingFiles: arrivals.length,
     oldestPendingMs: arrivals.reduce<number | null>((oldest, at) => (oldest === null || at < oldest ? at : oldest), null),
