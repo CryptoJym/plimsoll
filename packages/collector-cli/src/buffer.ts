@@ -219,6 +219,7 @@ export class LocalEventBuffer {
   private readonly repoContextQueue: RepoContextRequest[] = [];
   private readonly queuedRepoContextIds = new Set<string>();
   private activeRepoContextCommitScope: RepoContextHandoffBatch | null = null;
+  private historyImportEpoch: string | null = null;
   private childRepoContextRun: ChildRepoContextRun | null = null;
   private repoContextPostCommitAmbiguous = 0;
   readonly delivery: DeliveryOutbox;
@@ -1006,10 +1007,25 @@ export class LocalEventBuffer {
           claimedInstallationEpochId !== trustedInstallationEpochId) return "epoch_mismatch";
       return null;
     }
-    if (Date.parse(observedAt as string) < Date.parse(binding.currentInstallationEpochStartedAt)) return "before_enrollment";
+    if (Date.parse(observedAt as string) < Date.parse(binding.currentInstallationEpochStartedAt) &&
+        !(this.historyImportEpoch && claimedInstallationEpochId === this.historyImportEpoch &&
+          this.historyImportEpoch === binding.currentInstallationEpochId)) return "before_enrollment";
     if (claimedInstallationEpochId !== undefined && claimedInstallationEpochId !== binding.currentInstallationEpochId)
       return "epoch_mismatch";
     return null;
+  }
+
+  /** Scoped exception for a verified, fenced historical file import. It never
+   * changes the persisted epoch or the capture frontier. Only the dedicated
+   * importer invokes this around one bounded SQLite transaction. */
+  withHistoryImportAdmission<T>(installationEpochId: string, action: () => T): T {
+    if (this.historyImportEpoch || this.db.inTransaction ||
+        this.workspaceBinding()?.currentInstallationEpochId !== installationEpochId) {
+      throw new Error("history_import_epoch_not_current");
+    }
+    this.historyImportEpoch = installationEpochId;
+    try { return action(); }
+    finally { this.historyImportEpoch = null; }
   }
 
   workspaceBinding() {
