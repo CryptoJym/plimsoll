@@ -1203,10 +1203,16 @@ async function checkpointValid(
     ? "valid" : "invalid";
   if (state.checkpointId === null) return "invalid";
   let rows = await read<{ id: string; sessionId: string | null; observedAt: string }>(rowCheckpointQuery(state, maxMs));
-  if ((rows.length === 0 || rows[0]?.id !== state.checkpointId ||
-       rows[0]?.sessionId !== sessionId) && highWaterSegmentQueued && accumulator.scanComplete) {
-    // Erasure, rowid reuse, and reattribution all remove this checkpoint from
-    // the old session. Search one bounded rowid window per pass. The cursor is
+  if (rows.length === 1 && rows[0]?.sessionId === sessionId &&
+      rows[0]?.id !== state.checkpointId && highWaterSegmentQueued && accumulator.scanComplete) {
+    // A raw ID rewrite or same-session rowid reuse changes the checkpoint's
+    // identity, not its position. Its queued segment will repair the totals.
+    state.checkpointId = rows[0].id;
+  }
+  if ((rows.length === 0 || rows[0]?.sessionId !== sessionId) &&
+      highWaterSegmentQueued && accumulator.scanComplete) {
+    // Erasure and reattribution remove this checkpoint from the old session.
+    // Search one bounded rowid window per pass. The cursor is
     // persisted before the next cycle, so a distant predecessor never forces
     // one unbounded sort or repeats the same window after a read deadline.
     const erasedRowid = state.highWater;
@@ -1242,7 +1248,10 @@ async function checkpointValid(
     ? "valid" : "invalid";
   if (accumulator.cursorObservedAt === null || accumulator.cursorId === null) return "invalid";
   if (accumulator.cursorRowid === state.highWater) {
-    if (rows[0]?.id !== accumulator.cursorId) return "invalid";
+    if (rows[0]?.id !== accumulator.cursorId) {
+      if (!cursorSegmentQueued || !accumulator.scanComplete) return "invalid";
+      accumulator.cursorId = rows[0].id;
+    }
     if (rows[0]?.observedAt === accumulator.cursorObservedAt) return "valid";
     if (!cursorSegmentQueued) return "invalid";
     // A completed historical scan no longer seeks by this timestamp. The
@@ -1257,7 +1266,8 @@ async function checkpointValid(
     params: { rowid: accumulator.cursorRowid },
     ...(maxMs === undefined ? {} : { maxMs }),
   }]);
-  if (cursorRows.length === 0 && cursorSegmentQueued && accumulator.scanComplete) {
+  if ((cursorRows.length === 0 || cursorRows[0]?.sessionId !== sessionId) &&
+      cursorSegmentQueued && accumulator.scanComplete) {
     // The completed historical scan no longer seeks from this cursor. Its
     // segment repair accounts for the erased row; discard the dead cursor.
     accumulator.cursorRowid = 0;
@@ -1265,8 +1275,11 @@ async function checkpointValid(
     accumulator.cursorObservedAt = null;
     return "valid";
   }
-  if (cursorRows.length !== 1 || cursorRows[0]?.id !== accumulator.cursorId ||
-      cursorRows[0]?.sessionId !== sessionId) return "invalid";
+  if (cursorRows.length !== 1 || cursorRows[0]?.sessionId !== sessionId) return "invalid";
+  if (cursorRows[0]?.id !== accumulator.cursorId) {
+    if (!cursorSegmentQueued || !accumulator.scanComplete) return "invalid";
+    accumulator.cursorId = cursorRows[0].id;
+  }
   if (cursorRows[0]?.observedAt === accumulator.cursorObservedAt) return "valid";
   if (!cursorSegmentQueued) return "invalid";
   accumulator.cursorObservedAt = cursorRows[0].observedAt;
