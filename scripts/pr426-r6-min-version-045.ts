@@ -46,8 +46,11 @@ async function main() {
       authorityRoot: path.join(fixture, "lifecycle-authority") });
     assert.throws(() => assertReplacementRuntimeCompatible(ledger, "0.7.45"),
       /replacement_ledger_requires_archive_restore_before_downgrade/);
+    assert.throws(() => assertReplacementRuntimeCompatible(ledger, "0.7.46-rc.1"),
+      /replacement_ledger_requires_archive_restore_before_downgrade/);
     assert.doesNotThrow(() => assertReplacementRuntimeCompatible(ledger, "0.7.46"));
-    console.log(JSON.stringify({ markerMinimum: "0.7.46", version045Refused: true }));
+    console.log(JSON.stringify({ markerMinimum: "0.7.46", version045Refused: true,
+      prerelease046Refused: true }));
   } finally {
     initialTailer?.close(); initial?.close();
     fs.rmSync(fixture, { recursive: true, force: true });

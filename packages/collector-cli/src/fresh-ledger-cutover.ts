@@ -907,10 +907,10 @@ export function restoreArchivedLedger(input: {
 export function assertReplacementRuntimeCompatible(ledgerPath: string, version: string): void {
   const marker = readReplacementLedgerMarker(ledgerPath);
   if (!marker) return;
-  const parsed = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
-  if (!parsed || Number(parsed[1]) < 0 ||
-      (Number(parsed[1]) === 0 && (Number(parsed[2]) < 7 ||
-        (Number(parsed[2]) === 7 && Number(parsed[3]) < 46)))) {
+  const parsed = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/.exec(version);
+  if (!parsed || (Number(parsed[1]) === 0 && (Number(parsed[2]) < 7 ||
+      (Number(parsed[2]) === 7 && (Number(parsed[3]) < 46 ||
+        (Number(parsed[3]) === 46 && parsed[4] !== undefined)))))) {
     throw new Error("replacement_ledger_requires_archive_restore_before_downgrade");
   }
 }
