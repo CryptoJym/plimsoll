@@ -326,6 +326,34 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       accumulator_json text not null,
       updated_at text not null
     );
+    -- Older collectors write only accumulator_json. Keep the small cursor
+    -- projection current on those state writes so the scanned-row event
+    -- triggers make the same decision after a downgrade. This never parses
+    -- JSON during a buffered_events mutation.
+    create trigger if not exists trg_session_sync_summary_state_cursor_insert
+    after insert on session_sync_summary_state
+    begin
+      update session_sync_summary_state set
+        scan_boundary = case when json_valid(new.accumulator_json)
+          then json_extract(new.accumulator_json, '$.scanBoundary') end,
+        cursor_observed_at = case when json_valid(new.accumulator_json)
+          then json_extract(new.accumulator_json, '$.cursorObservedAt') end,
+        cursor_rowid = case when json_valid(new.accumulator_json)
+          then json_extract(new.accumulator_json, '$.cursorRowid') end
+        where session_id = new.session_id;
+    end;
+    create trigger if not exists trg_session_sync_summary_state_cursor_update
+    after update of accumulator_json on session_sync_summary_state
+    begin
+      update session_sync_summary_state set
+        scan_boundary = case when json_valid(new.accumulator_json)
+          then json_extract(new.accumulator_json, '$.scanBoundary') end,
+        cursor_observed_at = case when json_valid(new.accumulator_json)
+          then json_extract(new.accumulator_json, '$.cursorObservedAt') end,
+        cursor_rowid = case when json_valid(new.accumulator_json)
+          then json_extract(new.accumulator_json, '$.cursorRowid') end
+        where session_id = new.session_id;
+    end;
     create table if not exists session_sync_summary_pending (
       session_id text primary key,
       reason text not null,
