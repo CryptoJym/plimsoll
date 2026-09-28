@@ -17,6 +17,7 @@ import { createHookSpoolDrain } from "../packages/collector-cli/src/server";
 async function main() {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "r9-hook-unknown-")));
   const ledger = path.join(home, "ledger.sqlite");
+  const horizonMs = Number.isFinite(MISSING_HOOK_RETRY_MS) ? MISSING_HOOK_RETRY_MS : 600_000;
   const enrolledAt = new Date(Date.now() - 60 * 60 * 1000);
   let buffer: LocalEventBuffer | null = null;
   try {
@@ -40,7 +41,7 @@ async function main() {
     const directory = path.join(home, "maintenance-rebuild-refusals");
     const receiptFile = path.join(directory, fs.readdirSync(directory)[0]!);
     const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8")) as Record<string, unknown>;
-    receipt.at = new Date(Date.now() - MISSING_HOOK_RETRY_MS - 1_000).toISOString();
+    receipt.at = new Date(Date.now() - horizonMs - 1_000).toISOString();
     fs.writeFileSync(receiptFile, `${JSON.stringify(receipt)}\n`);
     const unknown = captureSpoolState(home);
     const unknownClaim = buffer.delivery.captureClaim([], unknown);
@@ -76,7 +77,7 @@ async function main() {
     assert.match(fs.readFileSync(path.join(home, "maintenance-rebuild-terminal.jsonl"), "utf8"),
       /"outcome":"terminal"/, "terminal rejection is durable before retirement");
     assert.equal(captureSpoolState(home).maintenanceRebuildPending, false);
-    console.log(JSON.stringify({ check: "hook_retry_lost_known_unknown", horizonMs: MISSING_HOOK_RETRY_MS,
+    console.log(JSON.stringify({ check: "hook_retry_lost_known_unknown", horizonMs,
       before: before.maintenanceRebuildPending, gap: unknownClaim?.gaps,
       dead: unknownClaim?.dead, recovered: drain.recovered, resolved: resolved.losses.length }));
   } finally {
