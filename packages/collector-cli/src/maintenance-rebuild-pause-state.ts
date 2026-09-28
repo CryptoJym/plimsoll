@@ -197,11 +197,13 @@ export function reconcileMaintenanceRebuildRefusals(home: string,
     const terminal = new Set<string>();
     try {
       for (const line of fs.readFileSync(path.join(home, TERMINAL), "utf8").split("\n").filter(Boolean)) {
-        const value = JSON.parse(line) as { version?: number; receipt?: string; at?: string;
-          outcome?: string };
-        if (value.version === 1 && value.outcome === "terminal" &&
-          typeof value.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(value.receipt) &&
-          typeof value.at === "string") terminal.add(`${value.receipt}\0${value.at}`);
+        try {
+          const value = JSON.parse(line) as { version?: number; receipt?: string; at?: string;
+            outcome?: string };
+          if (value.version === 1 && value.outcome === "terminal" &&
+            typeof value.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(value.receipt) &&
+            typeof value.at === "string") terminal.add(`${value.receipt}\0${value.at}`);
+        } catch { /* A killed append leaves its receipt for exact retry or a visible unknown. */ }
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { count: null, lost: [] };
