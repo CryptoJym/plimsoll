@@ -279,9 +279,11 @@ import {
   planDaemonSessionSync,
   listLedgerSessionIdsOffThread,
   readLedgerOffThread,
+  recordSessionSyncSettlement,
   runSessionSync,
   saveDaemonSessionSyncStateWithRetry,
   sessionIdsFromBatches,
+  sessionSyncClockSkewStatus,
   shouldDeferDaemonSessionSync,
 } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
@@ -2897,7 +2899,8 @@ async function main() {
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
-      syncStatus: () => syncBackoff.status(syncInFlight),
+      syncStatus: () => ({ ...syncBackoff.status(syncInFlight),
+        sessionSync: sessionSyncClockSkewStatus(sessionSyncState) }),
       walCheckpointStatus: () => walCheckpoint.status(),
       budgetStatus: () => budgetSampler?.status() ?? { mode: "advisory", latest: null,
         p50: null, p95: null, hostClass: null, targets: null,
@@ -3077,6 +3080,8 @@ async function main() {
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
           if (!await persistSessionCarry()) return;
+          if (sessionSyncState.clockSkewRetryAt &&
+              Date.now() < Date.parse(sessionSyncState.clockSkewRetryAt)) return;
           if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
               ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
@@ -3084,6 +3089,9 @@ async function main() {
               until: sessionPlan.until,
               ledgerDb: buffer.database,
               incremental: true,
+              // A settled skew refusal must stop the next foreground chunk
+              // before this daemon sync cycle can enter the legacy rebuild.
+              concurrency: 1,
               log: () => undefined,
             });
             const summaryPending = sessionResult.pendingSummarySessionIds;
@@ -3134,6 +3142,9 @@ async function main() {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             }
+            for (const settlement of sessionResult.settlements) {
+              sessionSyncState = recordSessionSyncSettlement(sessionSyncState, settlement);
+            }
             if (!await persistSessionCarry()) return;
             if (sessionResult.ok && sessionResult.summaryComplete && sessionResult.sentSessions > 0) {
               console.log(
@@ -3164,10 +3175,20 @@ async function main() {
               );
             }
           }
+          // A foreground 409 can arm the gate during this pass. Do not let
+          // the historical rebuild send another batch in the same cycle.
+          if (sessionSyncState.clockSkewRetryAt &&
+              Date.now() < Date.parse(sessionSyncState.clockSkewRetryAt)) return;
           if (legacySummaryRebuild && legacySummaryRebuild.phase !== "done") {
             try {
               const step = await advanceLegacySessionSummaryRebuild(config, buffer.database);
               legacySummaryRebuild = step.state;
+              if (step.result?.settlements.length) {
+                for (const settlement of step.result.settlements) {
+                  sessionSyncState = recordSessionSyncSettlement(sessionSyncState, settlement);
+                }
+                if (!await persistSessionCarry()) return;
+              }
               const elapsedSeconds = step.state
                 ? Math.max(1, (Date.now() - Date.parse(step.state.startedAt)) / 1_000) : 0;
               const projectedSeconds = step.state && step.state.rowsRead > 0

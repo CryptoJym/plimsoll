@@ -380,6 +380,26 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
 
+      - name: Prove session sync late remote refusal and crash lease recovery (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-remote-deadline
+
+      - name: Prove session sync wire handoff and lease reuse across retries (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-lease-retry
+
+      - name: Prove legacy rebuild records clock-skew refusals (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-legacy-skew
+
+      - name: Prove clock-skew refusal stops foreground and legacy sends in one cycle (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-skew-cycle
+
+      - name: Prove session sync refusal reads stay byte-bounded (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-refusal-bound
+
       - name: Prove bounded legacy outbox writer turns and retryable busy refusals (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:studio0-writer-contention

@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("status-summary", 20);
+const completion = createProofCompletion("status-summary", 21);
 /**
  * eco-6hoxj.163.34: the daemon keeps a private status-summary.json that local
  * readers (the macOS menubar) read instead of running `plimsoll status`, and
@@ -56,6 +56,11 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const cliSource = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SUMMARY_KEYS = "collectorVersion,healthzKey,instanceId,port,schema,stats,updatedAt";
+const swiftSummarySource = fs.readFileSync(path.join(repoRoot, "packages/mac-menubar/Sources/PlimsollMenubarCore/StatusSummary.swift"), "utf8");
+const swiftKeysDeclaration = swiftSummarySource.match(/static let keys: Set<String> = \[([^\]]+)\]/)?.[1];
+if (!swiftKeysDeclaration) throw new Error("swift_status_summary_key_rule_missing");
+const swiftSummaryKeys = [...swiftKeysDeclaration.matchAll(/"([^"]+)"/g)]
+  .map((match) => match[1]).sort().join(",");
 const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/;
 /** Shared with the menubar tests (healthzProofMatchesTheCollectorsTestVector). */
 const TEST_VECTOR = {
@@ -744,6 +749,12 @@ async function daemonCheck(root: string) {
         UUID_V4.test(summary.instanceId) && health?.body.instanceId === summary.instanceId && proven &&
         (fs.lstatSync(path.join(home, STATUS_SUMMARY_FILE)).mode & 0o777) === 0o600,
       { active, port, summaryPort: summary?.port ?? null, sameRun: health?.body.instanceId === summary?.instanceId, proven },
+    );
+    check(
+      "daemon_summary_matches_swift_v1_key_rule",
+      summary !== null && Object.keys(summary).sort().join(",") === swiftSummaryKeys &&
+        swiftSummaryKeys === SUMMARY_KEYS,
+      { daemonKeys: summary ? Object.keys(summary).sort() : null, swiftKeys: swiftSummaryKeys },
     );
   } finally {
     child.kill("SIGTERM");
