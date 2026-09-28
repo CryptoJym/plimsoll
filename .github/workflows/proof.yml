@@ -384,6 +384,14 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-downgrade
 
+      - name: Prove real 0.7.44 writes keep summary cursors and wire exact (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-v44-downgrade
+
+      - name: Prove simultaneous summary schema upgrades both succeed (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-schema-upgrade-race
+
       - name: Prove a 0.7.39 ledger rebuilds its session summaries in bounded passes (eco-6hoxj.163.108)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-legacy-rebuild
