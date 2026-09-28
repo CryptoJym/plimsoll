@@ -3050,14 +3050,21 @@ export class LocalEventBuffer {
 
   /** Keep active and unacknowledged deliveries; old uploaded_at-only rows may expire. */
   private rawRetentionUploadHoldSql() {
+    // Lease uses this same durable audience. A previous audience cannot make
+    // progress after a binding change and must not hold raw retention open.
+    const activeAudience = `(e.workspace_id is (
+      select current_workspace_id from collector_workspace_binding where singleton = 1
+    ) and e.device_id is (
+      select current_device_id from collector_workspace_binding where singleton = 1
+    ))`;
     const activeOutbox = `(exists (
       select 1 from upload_outbox o
       where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
     ) or exists (
       select 1 from upload_outbox o where o.delivery_id = retention_delivery_id(e.id)
     ))`;
-    if (!this.delivery.isEnabled()) return activeOutbox;
-    return `(${activeOutbox} or (
+    if (!this.delivery.isEnabled()) return `(${activeAudience} and ${activeOutbox})`;
+    return `(${activeAudience} and (${activeOutbox} or (
       e.data_mode = 'metadata'
       and e.privacy_disposition is null
       and e.usage_duplicate_reason is null
@@ -3076,7 +3083,7 @@ export class LocalEventBuffer {
         where unacknowledged.delivery_id = retention_delivery_id(e.id)
           and unacknowledged.terminal_state <> 'acknowledged'
       ))
-    ))`;
+    )))`;
   }
 
   prune(
@@ -3102,14 +3109,16 @@ export class LocalEventBuffer {
       const candidates = rawLimit === 0 ? [] : this.db.prepare(
         `select e.rowid as rawRowid, e.id as eventId,
            e.created_at as rawCreatedAt, e.privacy_generation as rawGeneration,
-           e.source, e.workspace_id as workspaceId, e.installation_epoch_id as installationEpochId, e.observed_at as observedAt,
+           e.source, e.workspace_id as workspaceId, e.device_id as deviceId,
+           e.installation_epoch_id as installationEpochId, e.observed_at as observedAt,
            ${deliveryProtection} as migrationProtected
          from buffered_events e indexed by idx_events_retention
          where e.created_at < ? and (e.created_at,e.id) > (?,?)
          order by e.created_at,e.id limit ?`,
       ).all(cutoff,scan.at,scan.id,rawLimit) as Array<{
         rawRowid:number;eventId:string;rawCreatedAt:string;rawGeneration:string|null;migrationProtected:number;
-        source:string;workspaceId:string|null;installationEpochId:string|null;observedAt:string;
+        source:string;workspaceId:string|null;deviceId:string|null;
+        installationEpochId:string|null;observedAt:string;
       }>;
       let migrationProtectedRows = 0;
       const recordExpiry = this.db.prepare(
@@ -3120,8 +3129,18 @@ export class LocalEventBuffer {
       );
       const removeRaw = this.db.prepare(`delete from buffered_events where rowid = ?`);
       let events = 0;
+      let retirementPending = false;
+      const expiredCandidates: typeof candidates = [];
       for (const row of candidates) {
         if (row.migrationProtected) { migrationProtectedRows += 1; continue; }
+        if (row.workspaceId !== this.workspaceId || row.deviceId !== this.deviceId) {
+          // Close one linked delivery per visit. A raw row with more than one
+          // legacy delivery is revisited by the bounded retention cursor.
+          if (this.delivery.retirePriorAudienceRaw(row.rawRowid, row.eventId, now.toISOString())) {
+            retirementPending = true;
+            continue;
+          }
+        }
         recordExpiry.run({
           eventId: row.eventId,
           rawRowid: row.rawRowid,
@@ -3130,8 +3149,9 @@ export class LocalEventBuffer {
           expiredAt: now.toISOString(),
         });
         events += removeRaw.run(row.rawRowid).changes;
+        expiredCandidates.push(row);
       }
-      advanceFinanceRetentionWatermarks(this.db, candidates.filter(row => !row.migrationProtected) as FinanceCoverageMutationRow[], now.toISOString());
+      advanceFinanceRetentionWatermarks(this.db, expiredCandidates as FinanceCoverageMutationRow[], now.toISOString());
       const remainingBudget = Math.max(0, maxRows - candidates.length);
       const metricRows = remainingBudget === 0
         ? []
@@ -3144,7 +3164,7 @@ export class LocalEventBuffer {
       for (const row of metricRows) metricSamples += removeMetric.run(row.rowid).changes;
       // A full page is a conservative continuation, never an exact backlog count.
       const rawHasMore = rawLimit === 0 || candidates.length === rawLimit;
-      const hasMore = rawHasMore || (remainingBudget > 0 && metricRows.length === remainingBudget);
+      const hasMore = retirementPending || rawHasMore || (remainingBudget > 0 && metricRows.length === remainingBudget);
       const last = candidates.at(-1);
       const next = rawLimit === 0 ? scan : rawHasMore && last
         ? {at:last.rawCreatedAt,id:last.eventId,metricsFirst:scan.metricsFirst}

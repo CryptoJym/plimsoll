@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 10);
+const completion = createProofCompletion("retention", 12);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -44,6 +44,143 @@ function prune(buffer: LocalEventBuffer, maxRows: number) {
 
 async function main() {
 try {
+  for (const changed of ["workspace", "device"] as const) {
+    const firstWorkspace = `managed-prior-${changed}`;
+    const nextWorkspace = `managed-current-${changed}`;
+    const device = `device-${changed}`;
+    const buffer = new LocalEventBuffer(path.join(root, `prior-${changed}.sqlite`), {
+      workspaceId: firstWorkspace,
+      ...(changed === "workspace" ? { deviceId: device } : {}),
+      delivery: { enabled: true }, enrollmentNow: () => new Date(oldCreatedAt),
+    });
+    const db = buffer.database;
+    const now = new Date();
+    const [pending, retry, inFlight, acknowledged, remoteDead, localDead,
+      legacyUploaded, neverUploaded] = Array.from({ length: 8 }, event);
+    const priorRows = [pending, retry, inFlight, acknowledged, remoteDead,
+      localDead, legacyUploaded, neverUploaded];
+    buffer.delivery.configure({ enabled: false });
+    for (const row of priorRows) {
+      assert.equal(buffer.append(row), true);
+      db.prepare("update buffered_events set created_at=? where id=?")
+        .run(oldCreatedAt, row.id);
+    }
+    buffer.delivery.configure({ enabled: true });
+    for (const row of [pending, retry, inFlight, acknowledged, remoteDead, localDead]) {
+      assert.equal(buffer.delivery.repairRawById(row.id).enqueued, 1);
+    }
+    const at = now.toISOString();
+    db.transaction(() => {
+      db.prepare("update upload_outbox set state='retry',attempt_count=1 where raw_id=?")
+        .run(retry.id);
+      db.prepare(`update upload_outbox set state='in_flight',attempt_count=1,
+        lease_id='prior-audience-proof',lease_expires_at=? where raw_id=?`)
+        .run(new Date(now.getTime() + 120_000).toISOString(), inFlight.id);
+      const remove = db.prepare("delete from upload_outbox where raw_id=?");
+      const uploaded = db.prepare("update buffered_events set uploaded_at=? where id=?");
+      const receipt = db.prepare(`insert into upload_receipts
+        (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+        values (?,?,?,?,1,?,?)`);
+      remove.run(acknowledged.id);
+      uploaded.run(at, acknowledged.id);
+      receipt.run(acknowledged.id, "acknowledged", "remote_acknowledged", "success", at, at);
+      remove.run(remoteDead.id);
+      uploaded.run(at, remoteDead.id);
+      receipt.run(remoteDead.id, "dead", "remote_validation_rejected", "remote", at, at);
+      remove.run(localDead.id);
+      receipt.run(localDead.id, "dead", "local_schema_invalid", "local", at, at);
+      uploaded.run(at, legacyUploaded.id);
+    })();
+    const priorOutbox = [pending.id, retry.id, inFlight.id];
+    // Make the status path use its exact off-thread worker on this audience.
+    const extraPriorRows = 515;
+    const priorAudience = db.prepare(`select workspace_id as workspaceId,
+      device_id as deviceId from buffered_events where id=?`).get(pending.id) as
+      { workspaceId: string; deviceId: string | null };
+    const insert = db.prepare(`insert into buffered_events
+      (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+       workspace_id,device_id,privacy_generation)
+      values (?, 'codex', 'assistant_response', 'metadata', ?, '{}', ?, ?, ?, 'fixture-generation')`);
+    db.transaction(() => {
+      for (let n = 0; n < extraPriorRows; n++) {
+        insert.run(event().id, oldCreatedAt, oldCreatedAt,
+          priorAudience.workspaceId, priorAudience.deviceId);
+      }
+    })();
+    if (changed === "workspace") {
+      buffer.transitionWorkspace(firstWorkspace, nextWorkspace, device);
+    } else {
+      // Managed workspace device binding is future-only: null -> device.
+      buffer.useWorkspace(firstWorkspace, device);
+    }
+    const [activePending, activeUnmarked] = [event(), event()];
+    buffer.delivery.configure({ enabled: false });
+    for (const row of [activePending, activeUnmarked]) {
+      assert.equal(buffer.append(row), true);
+      db.prepare("update buffered_events set created_at=? where id=?")
+        .run(oldCreatedAt, row.id);
+    }
+    buffer.delivery.configure({ enabled: true });
+    assert.equal(buffer.delivery.repairRawById(activePending.id).enqueued, 1);
+    assert.equal(buffer.retentionStatus(90, now).states.heldForUpload, 2,
+      `${changed} prior audience cannot hold raw retention`);
+    const first = buffer.retentionProgressStatus(90, now);
+    assert.equal(first.lastPass.heldForUploadExact, false);
+    assert.equal(await buffer.refreshRetentionHoldCount(90, now), 2);
+    const afterWorker = buffer.retentionProgressStatus(90, now);
+    assert.equal(afterWorker.states.heldForUpload, 2);
+    assert.equal(afterWorker.lastPass.heldForUploadExact, true);
+    assert.equal(afterWorker.lastPass.heldForUploadAsOfCutoff, first.policy.cutoffAt);
+    for (let pass = 0; pass < 10 && !buffer.projection.status().ready; pass++) {
+      buffer.projection.runMaintenance(now);
+    }
+    assert.equal(buffer.projection.status().ready, true);
+    const server = createCollectorServer(collectorConfigSchema.parse({ retentionDays: 90 }), buffer);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/status`);
+      const body = await response.json() as { retention?: {
+        states?: { heldForUpload?: number };
+        lastPass?: { heldForUploadExact?: boolean; heldForUploadAsOfCutoff?: string | null };
+      } };
+      assert.equal(response.status, 200);
+      assert.equal(body.retention?.states?.heldForUpload, 2);
+      assert.equal(body.retention?.lastPass?.heldForUploadExact, true);
+      assert.equal(body.retention?.lastPass?.heldForUploadAsOfCutoff, first.policy.cutoffAt);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    const leaseBefore = buffer.delivery.lease({ maxRows: 100, now });
+    assert.equal(leaseBefore.items.some((item) => priorOutbox.includes(item.deliveryId)), false,
+      "the current audience must never lease prior deliveries");
+    const result = buffer.prune(90, { maxRows: 1_000, now });
+    assert.equal(result.events, priorRows.length + extraPriorRows,
+      "every overdue prior-audience raw row expires");
+    assert.equal(buffer.retentionStatus(90, now).states.heldForUpload, 2);
+    assert.equal((db.prepare("select count(*) as n from buffered_events").get() as { n: number }).n, 2);
+    for (const id of priorOutbox) {
+      assert.equal(db.prepare("select 1 from upload_outbox where delivery_id=?").get(id), undefined);
+      assert.equal((db.prepare("select reason from upload_receipts where delivery_id=?")
+        .get(id) as { reason: string }).reason, "local_privacy_violation");
+    }
+    if (changed === "workspace") {
+      // Even if the owner selects the old workspace later, closed deliveries
+      // have no active outbox row and cannot be leased again.
+      buffer.transitionWorkspace(nextWorkspace, firstWorkspace, device);
+      const leaseAgain = buffer.delivery.lease({ maxRows: 100, now });
+      assert.equal(leaseAgain.items.some((item) => priorOutbox.includes(item.deliveryId)), false);
+    }
+    console.log(JSON.stringify({ fixture: `prior_${changed}_audience`,
+      priorRaw: priorRows.length + extraPriorRows, expired: result.events,
+      heldForUpload: 2, workerHeld: afterWorker.states.heldForUpload,
+      priorOutboxClosed: priorOutbox.length }));
+    buffer.close();
+    completion.check(`prior_${changed}_audience_expires_and_active_audience_holds`);
+  }
+
   {
     const buffer = new LocalEventBuffer(path.join(root, "free-local.sqlite"));
     const first = event();
@@ -381,8 +518,10 @@ try {
     const locallyRejectedId = uuidId(overdueRows - 1);
     const expectedHeld = overdueRows - 2;
     const insert = db.prepare(`insert into buffered_events
-      (id,source,event_type,data_mode,observed_at,payload_json,created_at,privacy_generation)
-      values (?, 'codex', 'assistant_response', 'metadata', ?, '{}', ?, 'fixture-generation')`);
+      (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+       workspace_id,privacy_generation)
+      values (?, 'codex', 'assistant_response', 'metadata', ?, '{}', ?,
+        'tenant-retention-proof', 'fixture-generation')`);
     db.transaction(() => {
       for (let n = 0; n < overdueRows; n++) {
         insert.run(uuidId(n), oldCreatedAt, oldCreatedAt);

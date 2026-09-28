@@ -2443,6 +2443,19 @@ export class DeliveryOutbox {
     };
   }
 
+  /** Close one delivery tied to an expired prior-audience raw row.
+   * Called inside the prune transaction. The return value requests a later
+   * bounded visit if an old ledger has multiple deliveries for one raw row. */
+  retirePriorAudienceRaw(rawRowid: number, rawId: string, terminalAt: string): boolean {
+    const deliveries = this.db.prepare(`select delivery_id as id from upload_outbox
+      where (raw_rowid = ? and (raw_id is null or raw_id = ?))
+         or delivery_id = ?
+      order by delivery_id limit 2`).all(rawRowid, rawId, ensureUuidEventId(rawId).id) as Array<{ id: string }>;
+    if (deliveries.length === 0) return false;
+    this.deadActive(deliveries[0]!.id, "local_privacy_violation", terminalAt);
+    return deliveries.length > 1;
+  }
+
   private deadActive(
     deliveryId: string,
     reason: DeliveryReceiptReason,
