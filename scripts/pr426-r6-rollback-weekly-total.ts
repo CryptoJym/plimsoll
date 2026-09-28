@@ -80,10 +80,14 @@ async function main() {
     const result = await uploadCompletedToolStatsWeek(config, old.database,
       { now: () => dueAt, fetchImpl });
     const reportedAttempts = posted!.toolStats.cells.reduce((n, c) => n + c.attempts, 0);
+    const actualWeekAttempts = (old.database.prepare(`select count(*) as n from tool_attempt_facts
+      where started_at>=? and started_at<?`).get(week.toISOString(),
+        new Date(week.getTime() + 7 * 86_400_000).toISOString()) as { n: number }).n;
     console.log(JSON.stringify({ weekStart, result, replacementAttempts,
-      reportedAttempts, actualWeekAttempts: replacementAttempts + reportedAttempts,
+      reportedAttempts, actualWeekAttempts,
       archivePreserved: fs.existsSync(archivePath), freshAttemptPreserved: fs.existsSync(freshAttemptPath) }));
     assert.equal(result, "accepted");
+    assert.equal(actualWeekAttempts, 2, "restore must retain each week's two distinct attempts once");
     assert.equal(reportedAttempts, replacementAttempts + 1,
       "rollback must not publish a partial week after restoring the archive");
   } finally {
