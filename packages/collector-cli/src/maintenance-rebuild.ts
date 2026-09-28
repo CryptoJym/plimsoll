@@ -9,6 +9,7 @@ import { DashboardProjectionStore } from "./dashboard-projection";
 import { assertNoRebuildOpenTokens, assertRebuildWriterGateOpen, rebuildLockPath,
   rebuildResumeClaimPath, openRebuildFencedDatabase, retireDeadRebuildOpenTokens } from "./rebuild-open-gate";
 import { currentRebuildWriterIdentity, rebuildWriterIdentityLiveness } from "./rebuild-writer-identity";
+import { withRebuildCoordination } from "./rebuild-coordination";
 export { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 
 /** Static B13 inventory for coverage reporting. It is never a quiesce receipt. */
@@ -61,6 +62,8 @@ export type RebuildRunInput = RebuildInput & {
   afterFirstRename?: () => void | Promise<void>;
   /** Fault seam for a busy checkpoint refusal. */
   checkpoint?: (db: Database.Database) => Array<{ busy: number; log: number; checkpointed: number }>;
+  /** Copy-only seam after the coordination transaction publishes the fence. */
+  afterLockPublished?: () => void | Promise<void>;
 };
 type RebuildPhase = "paused" | "vacuum" | "verified" | "swapped" |
   "resume_started" | "complete" | "failed" | "recovered";
@@ -498,6 +501,9 @@ function removeSqliteSidecars(ledgerPath: string) {
 
 /** Only the paused, pre-resume state allows replacing the rebuilt file. */
 export function renameBackBeforeResume(ledgerPath: string) {
+  return withRebuildCoordination(ledgerPath, () => renameBackBeforeResumeLocked(ledgerPath));
+}
+function renameBackBeforeResumeLocked(ledgerPath: string) {
   const state = validatedRecoveryState(ledgerPath);
   if (!state || !["verified", "swapped"].includes(state.phase)) fail("forward_repair_only");
   const staleLock = staleRecoveryLock(ledgerPath);
@@ -516,6 +522,9 @@ export function renameBackBeforeResume(ledgerPath: string) {
 
 /** Recovery after SIGKILL before any writer resumed; never rewinds a resumed file. */
 export function recoverInterruptedRebuild(ledgerPath: string) {
+  return withRebuildCoordination(ledgerPath, () => recoverInterruptedRebuildLocked(ledgerPath));
+}
+function recoverInterruptedRebuildLocked(ledgerPath: string) {
   const state = validatedRecoveryState(ledgerPath);
   if (!fs.existsSync(lockPath(ledgerPath))) fail("forward_repair_only");
   const staleLock = staleRecoveryLock(ledgerPath);
@@ -577,7 +586,7 @@ export async function rebuildLedger(input: RebuildRunInput) {
     if (!ownedLock) return true;
     const observed = ownedLock;
     ownedLock = null; // A failed run must never make a second unlink attempt.
-    return removeOwnedRebuildLock(ledgerPath, observed);
+    return withRebuildCoordination(ledgerPath, () => removeOwnedRebuildLock(ledgerPath, observed));
   };
   try {
     const stagingLock = `${lockPath(ledgerPath)}.${randomUUID()}.tmp`;
@@ -591,11 +600,14 @@ export async function rebuildLedger(input: RebuildRunInput) {
       stagedLock = { raw: contents, dev: stat.dev, ino: stat.ino };
     } finally { fs.closeSync(descriptor); }
     try {
-      fs.linkSync(stagingLock, lockPath(ledgerPath));
-      ownsLock = true;
-      ownedLock = stagedLock;
-      fsyncDirectory(lockPath(ledgerPath));
+      withRebuildCoordination(ledgerPath, () => {
+        fs.linkSync(stagingLock, lockPath(ledgerPath));
+        ownsLock = true;
+        ownedLock = stagedLock;
+        fsyncDirectory(lockPath(ledgerPath));
+      });
     } finally { removeIfExists(stagingLock); }
+    await input.afterLockPublished?.();
     assertUnused(ledgerPath);
     const fencedOwnership = observeRebuildConnectionOwnership(ledgerPath);
     if (!connectionOwnershipClosed(fencedOwnership)) fail("writer_not_quiesced");

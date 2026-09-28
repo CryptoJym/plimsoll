@@ -62,6 +62,7 @@ function startChild(mode: "gap-child" | "complete-child", ledger: string) {
 }
 async function childRebuild(mode: "gap-child" | "complete-child", ledger: string) {
   const lock = `${ledger}.maintenance-rebuild.lock`;
+  let afterLockPublished: (() => void) | undefined;
   if (mode === "gap-child") {
     const ready = `${ledger}.r7-ready`;
     const release = `${ledger}.r7-release`;
@@ -72,18 +73,7 @@ async function childRebuild(mode: "gap-child" | "complete-child", ledger: string
       while (!fs.existsSync(release) && Date.now() < deadline) Atomics.wait(sleep, 0, 0, 20);
       if (!fs.existsSync(release)) throw new Error("gap_release_timeout");
     };
-    const originalOpen = fs.openSync;
-    (fs as typeof fs & { openSync: typeof fs.openSync }).openSync = ((file: fs.PathLike,
-      flags: string | number, permissions?: number) => {
-      const fd = originalOpen(file, flags, permissions);
-      if (String(file) === lock && flags === "wx") pause();
-      return fd;
-    }) as typeof fs.openSync;
-    const originalLink = fs.linkSync;
-    (fs as typeof fs & { linkSync: typeof fs.linkSync }).linkSync = ((source: fs.PathLike, target: fs.PathLike) => {
-      originalLink(source, target);
-      if (String(target) === lock) pause();
-    }) as typeof fs.linkSync;
+    afterLockPublished = pause;
   } else {
     const originalUnlink = fs.unlinkSync;
     (fs as typeof fs & { unlinkSync: typeof fs.unlinkSync }).unlinkSync = ((file: fs.PathLike) => {
@@ -96,7 +86,7 @@ async function childRebuild(mode: "gap-child" | "complete-child", ledger: string
     return { before: after, after, connectionsClosed: connectionOwnershipClosed(after) };
   };
   const rebuilt = await rebuildLedger({ ledgerPath: ledger, stage: "S10", walHighWaterBytes: 0,
-    copyDrill: true, quiesce, resume: async () => undefined });
+    copyDrill: true, quiesce, resume: async () => undefined, afterLockPublished });
   console.log(JSON.stringify({ check: "owner_swap_completed", pauseMs: rebuilt.pauseMs }));
 }
 async function liveGap() {
