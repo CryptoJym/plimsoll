@@ -12,7 +12,8 @@ import {
   resolveCaptureRootMachineLabel,
 } from "../packages/collector-cli/src/capture-root-inventory";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { installLaunchAgent, launchAgentOwnerEditedKeys } from "../packages/collector-cli/src/launch-agent";
+import { installLaunchAgent, inspectLaunchAgentOwnership, launchAgentOwnerEditedKeys } from
+  "../packages/collector-cli/src/launch-agent";
 
 const root = fs.mkdtempSync(path.join(process.cwd(), "pr428-review-"));
 const failures: string[] = [];
@@ -127,11 +128,34 @@ try {
   fs.mkdirSync(legacyHome, { recursive: true, mode: 0o700 });
   const legacyInstall = installLaunchAgent({ ...install, homeDir: legacyHome });
   fs.rmSync(`${legacyInstall.plistPath}.plimsoll-owned-template.json`, { force: true });
+  const legacyOriginal = fs.readFileSync(legacyInstall.plistPath, "utf8");
+  const trustedRuntime = { programArguments: install.programArguments,
+    workingDirectory: install.workingDirectory };
+  check("pre_template_uses_verified_runtime_without_false_edit",
+    inspectLaunchAgentOwnership({ homeDir: legacyHome, legacyRuntime: trustedRuntime }).ownerEditedKeys, []);
   fs.writeFileSync(legacyInstall.plistPath,
-    fs.readFileSync(legacyInstall.plistPath, "utf8").replace(`<string>${runtime}</string>`,
+    legacyOriginal.replace(`<string>${runtime}</string>`,
       `<string>${path.join(path.dirname(runtime), "custom-cli.mjs")}</string>`), { mode: 0o600 });
   check("pre_template_install_uses_runtime_path_not_edited_manifest_argument",
-    launchAgentOwnerEditedKeys({ homeDir: legacyHome }).includes("ProgramArguments"), true);
+    inspectLaunchAgentOwnership({ homeDir: legacyHome,
+      legacyRuntime: trustedRuntime }).ownerEditedKeys.includes("ProgramArguments"), true);
+  const movedDirectory = path.join(path.dirname(runtime), "alternate-runtime");
+  const movedManifest = legacyOriginal.replace(`<string>${runtime}</string>`,
+    `<string>${path.join(movedDirectory, "cli.mjs")}</string>`).replace(
+      `<key>WorkingDirectory</key>\n  <string>${path.dirname(runtime)}</string>`,
+      `<key>WorkingDirectory</key>\n  <string>${movedDirectory}</string>`);
+  fs.writeFileSync(legacyInstall.plistPath, movedManifest, { mode: 0o600 });
+  const movedKeys = inspectLaunchAgentOwnership({ homeDir: legacyHome,
+    legacyRuntime: trustedRuntime }).ownerEditedKeys;
+  check("pre_template_edited_working_directory_is_detected",
+    movedKeys.includes("ProgramArguments") && movedKeys.includes("WorkingDirectory"), true);
+  const editedNode = legacyOriginal.replace(`<string>${process.execPath}</string>`,
+    `<string>${path.join(path.dirname(process.execPath), "node-owner-edit")}</string>`);
+  if (editedNode === legacyOriginal) throw new Error("legacy node executable fixture edit did not apply");
+  fs.writeFileSync(legacyInstall.plistPath, editedNode, { mode: 0o600 });
+  check("pre_template_edited_node_executable_is_detected",
+    inspectLaunchAgentOwnership({ homeDir: legacyHome,
+      legacyRuntime: trustedRuntime }).ownerEditedKeys.includes("ProgramArguments"), true);
   // The packaged join proof checks local event and hosted unique-event totals
   // across the first-contact replay; this unit witness never fakes an append.
 } finally {

@@ -823,6 +823,22 @@ function joinMachineLabel(config: CollectorConfig, explicit?: string): string {
   throw new Error("Existing agent folders use an unknown machine label. Run join with --machine <fleet label>; no token was redeemed.");
 }
 
+function installedLegacyLaunchAgentRuntime(): {
+  programArguments: string[]; workingDirectory: string;
+} | undefined {
+  const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
+  if (pidRead.kind !== "current" || !processIdentityIsLive(pidRead.record)) return undefined;
+  const record = pidRead.record;
+  if (record.command.length !== 2 || record.command[1] !== "start" ||
+      !path.isAbsolute(record.command[0]!) || record.cwd !== path.dirname(record.command[0]!))
+    return undefined;
+  const observed = spawnSync("/bin/ps", ["-p", String(record.pid), "-o", "comm="],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  const executable = observed.status === 0 ? observed.stdout.trim() : "";
+  if (!path.isAbsolute(executable) || !processIdentityIsLive(record)) return undefined;
+  return { programArguments: [executable, ...record.command], workingDirectory: record.cwd };
+}
+
 function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false,
   explicitRoots: Array<{ source: CaptureRoot["source"]; directory: string }> = []): JoinRootPlan {
   const read = readCollectorConfig();
@@ -869,7 +885,9 @@ function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false
   const manifest = inspectLaunchAgentManifest();
   if (!manifest.ok && manifest.status !== "missing")
     throw new Error("The existing collector LaunchAgent is not owned by Plimsoll. No token was redeemed.");
-  const ownership = manifest.ok ? inspectLaunchAgentOwnership() :
+  const ownership = manifest.ok ? inspectLaunchAgentOwnership({
+    legacyRuntime: installedLegacyLaunchAgentRuntime(),
+  }) :
     { ownerEditedKeys: [], runtimeDriftKeys: [] };
   if (manifest.ok && !replaceLaunchAgent) {
     const differences = ownership.ownerEditedKeys;

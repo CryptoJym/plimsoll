@@ -1231,7 +1231,9 @@ export function inspectLaunchAgentManifest(options: { homeDir?: string } = {}) {
 }
 
 /** Compare owner edits with the last installed template, or a legacy runtime's fixed artifact path. */
-export function inspectLaunchAgentOwnership(options: { homeDir?: string } = {}): {
+export function inspectLaunchAgentOwnership(options: { homeDir?: string; legacyRuntime?: {
+  programArguments: string[]; workingDirectory: string;
+} } = {}): {
   ownerEditedKeys: string[]; runtimeDriftKeys: string[]; evidence: "owned_template" | "legacy_runtime";
 } {
   const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
@@ -1240,16 +1242,17 @@ export function inspectLaunchAgentOwnership(options: { homeDir?: string } = {}):
     if (!preimage.content) return { ownerEditedKeys: [], runtimeDriftKeys: [], evidence: "legacy_runtime" };
     const actual = validateOwnedManifest(preimage.content.toString("utf8"));
     assertStablePath(preimage.snapshot);
-    const workingDirectory = actual.WorkingDirectory as string;
-    const argumentsNow = strings(actual.ProgramArguments, "PLIST_ARGUMENTS_INVALID");
     const template = readOwnedTemplate(homeDir);
-    // A pre-template packaged install always runs its named artifact, even if
-    // an edited manifest still happens to point at some other valid .mjs.
-    const legacyArguments = argumentsNow.length === 3
-      ? [argumentsNow[0]!, path.join(workingDirectory, "cli.mjs"), "start"]
-      : argumentsNow;
-    const runtimeExpected = parsePlist(renderLaunchAgentPlist({ homeDir, repoRoot: workingDirectory,
-      workingDirectory, programArguments: legacyArguments }));
+    // A pre-template install has no saved manifest preimage. A verified live
+    // collector supplies its actual executable, script and cwd; a stopped
+    // install is judged against this CLI's own runtime and otherwise needs
+    // explicit replacement. No expected executable comes from the plist.
+    const ownScript = fs.realpathSync(process.argv[1] ?? "");
+    const runtime = options.legacyRuntime ?? { programArguments: [process.execPath, ownScript, "start"],
+      workingDirectory: path.dirname(ownScript) };
+    const runtimeExpected = parsePlist(renderLaunchAgentPlist({ homeDir,
+      repoRoot: runtime.workingDirectory, workingDirectory: runtime.workingDirectory,
+      programArguments: runtime.programArguments }));
     const expected = template ? parsePlist(template) : runtimeExpected;
     const differences: string[] = [];
     for (const key of Object.keys(expected)) {
