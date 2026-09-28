@@ -41,7 +41,7 @@ function command(env: NodeJS.ProcessEnv, args: string[], stdin = "", executable 
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
       reject(new Error(`Timed out: ${args[0]}`));
-    }, 90_000);
+    }, env.PLIMSOLL_PROOF_CLOCK_SKEW ? 27_000 : 90_000);
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
@@ -83,6 +83,7 @@ function stubLaunchctl(bin: string) {
     '    done',
     '    rm -f "$state"',
     '    printf "bootout %s\\n" "$pid" >> "$trace"',
+    '    if [ "${PLIMSOLL_PROOF_CRASH_AFTER_BOOTOUT:-}" = "1" ]; then kill -KILL "$PPID"; fi',
     '  fi',
     '  exit 0',
     'fi',
@@ -234,11 +235,23 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     const codex = path.join(f.home, ".codex", "sessions");
     const studio = path.join(f.home, ".clientai", "studio", "borg", "conductors", "primary", "profile", "sessions");
     const unrelated = path.join(f.home, ".clientai", "studio", "borg", "conductors", "primary", "cache", "sessions");
-    for (const directory of [codex, studio, unrelated]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const privateFolder = path.join(f.home, "Documents", "private-sessions");
+    for (const directory of [codex, unrelated, ...(name === "symlink_private" ? [privateFolder] : [studio])])
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    if (name === "symlink_private") {
+      fs.mkdirSync(path.dirname(studio), { recursive: true, mode: 0o700 });
+      fs.symlinkSync(privateFolder, studio);
+    }
+    if (name === "partial_roots") {
+      const claude = path.join(f.home, ".claude", "projects");
+      fs.mkdirSync(claude, { recursive: true, mode: 0o700 });
+      fs.symlinkSync(path.join(f.home, "missing-target"), path.join(claude, "ambiguous.jsonl"));
+    }
     fs.writeFileSync(path.join(studio, "rollout-prejoin.jsonl"), "{}\n", { mode: 0o600 });
     const candidates = discoverCaptureRootCandidates(f.home);
-    check(`${name}_named_studio_rule_only`, candidates.some((entry) => entry.shape === "studio_codex_conductor" &&
-      entry.directory === studio) && !candidates.some((entry) => entry.directory === unrelated));
+    if (name !== "symlink_private") check(`${name}_named_studio_rule_only`,
+      candidates.some((entry) => entry.shape === "studio_codex_conductor" && entry.directory === studio) &&
+      !candidates.some((entry) => entry.directory === unrelated));
     if (running) {
       fs.mkdirSync(f.data, { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(f.data, "collector.config.json"),
@@ -246,13 +259,34 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       const installed = await command(f.env, ["install-launch-agent", "--load"]);
       check(`${name}_fixture_collector_started_before_join`, installed.code === 0 && fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      if (name === "crash_after_bootout") f.env.PLIMSOLL_PROOF_CRASH_AFTER_BOOTOUT = "1";
+      if (name === "edited_manifest") {
+        const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+        const prior = fs.readFileSync(plist, "utf8");
+        const changed = prior.replace(/(<key>PATH<\/key>\s*<string>)([^<]*)(<\/string>)/,
+          (_match, open: string, value: string, close: string) => `${open}${value}:/opt/owner-custom-bin${close}`);
+        assert.notEqual(changed, prior);
+        fs.writeFileSync(plist, changed);
+      }
     } else {
       check(`${name}_no_collector_installed_before_join`, !fs.existsSync(path.join(f.data, "collector.config.json")) &&
         !fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")));
     }
+    if (name === "clock_skew") {
+      const preload = path.join(f.home, "freeze-join-clock.mjs");
+      fs.writeFileSync(preload, 'if (process.argv[2] === "join") { const native = Date.now; Date.now = () => new Error().stack?.includes("acknowledgeJoinedCollector") ? 0 : native(); }\n');
+      f.env.NODE_OPTIONS = `--import=${preload}`;
+      f.env.PLIMSOLL_PROOF_CLOCK_SKEW = "1";
+    }
     const prompt = name === "fresh";
-    const joined = await command(f.env, ["join", prompt ? "--token-prompt" : "--token-stdin", "--url",
-      `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli, prompt);
+    let joined: ChildResult;
+    try {
+      joined = await command(f.env, ["join", prompt ? "--token-prompt" : "--token-stdin", "--url",
+        `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli, prompt);
+    } catch (error) {
+      if (name === "clock_skew") throw new Error("clock_skew_no_ack_failed_to_exit_within_27_seconds", { cause: error });
+      throw error;
+    }
     if (prompt && (joined.code !== 0 || joined.stdout.includes(token) || joined.stderr.includes(token))) {
       throw new Error(`fresh_prompt_hides_token_and_exits: ${JSON.stringify({ code: joined.code,
         tokenEchoed: joined.stdout.includes(token) || joined.stderr.includes(token),
@@ -260,7 +294,29 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     }
     if (prompt) check("fresh_prompt_hides_token_and_exits", true);
     const result = receipt(joined.stdout);
+    if (name === "clock_skew") console.log(JSON.stringify({ scenario: name, joinCode: joined.code,
+      joinStatus: result.status, reason: result.reason ?? null }));
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8")));
+    if (name === "symlink_private") {
+      const enrolled = config.captureRoots?.some((entry) => entry.directory === privateFolder) ?? false;
+      console.log(JSON.stringify({ scenario: name, joinCode: joined.code, joinStatus: result.status,
+        privateFolderRegistered: enrolled }));
+      check("join_never_registers_symlinked_private_folder", !enrolled);
+      return;
+    }
+    if (name === "partial_roots") {
+      console.log(JSON.stringify({ scenario: name, joinStatus: result.status, joinCode: joined.code,
+        registeredRoots: config.captureRoots?.map((entry) => entry.directory) ?? [] }));
+      check("partial_registration_leaves_no_roots", config.captureRoots?.length === 0);
+      return;
+    }
+    if (name === "crash_after_bootout") {
+      console.log(JSON.stringify({ scenario: name, joinStatus: result.status, joinCode: joined.code,
+        collectorStateFileExists: fs.existsSync(f.state) }));
+      check("crashed_add_restores_running_collector", fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+      return;
+    }
     check(`${name}_registers_exactly_two_native_folders`, config.captureRoots?.length === 2 &&
       config.captureRoots.some((entry) => entry.directory === studio && entry.source === "codex") &&
       config.captureRoots.some((entry) => entry.directory === codex && entry.source === "codex") &&
@@ -296,6 +352,12 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
           setupProbeAcknowledged: probe?.uploadedAt === result.firstUploadAt,
           plainResultSeen: joined.stdout.includes("First upload acknowledged") }));
       check(`${name}_single_command_finishes_ready_and_acknowledged`, true);
+      if (name === "edited_manifest") {
+        const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+        const kept = fs.readFileSync(plist, "utf8").includes("/opt/owner-custom-bin");
+        console.log(JSON.stringify({ scenario: name, ownerPathPreserved: kept }));
+        check("join_preserves_valid_owner_edited_launchagent_path", kept);
+      }
       if (name === "fresh" && process.env.PLIMSOLL_PROOF_0744_CLI) {
         const old = await command(f.env, ["status", "--json"], "", process.env.PLIMSOLL_PROOF_0744_CLI);
         check("released_0744_cli_opens_head_joined_ledger", old.code === 0 &&
@@ -325,7 +387,7 @@ async function joinOnlyScenario(name: string, option: "--no-daemon" | "ci") {
       result.daemon?.setup === "skipped" && !fs.existsSync(f.state) &&
       !fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")) &&
       remote.uploads.length === 1);
-  } finally { await remote.close(); }
+  } finally { await stopFixture(f.env, f.state); await remote.close(); }
 }
 
 async function refusedScenario(name: string, network: boolean) {
@@ -346,6 +408,46 @@ async function refusedScenario(name: string, network: boolean) {
 async function main() {
   check("packaged_cli_exists", fs.statSync(cli).isFile());
   try {
+    if (process.env.PR428_REVIEW_SCENARIO === "fresh_only") {
+      await joinedScenario("fresh", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "running_only") {
+      await joinedScenario("running_0744_layout", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "no_daemon_only") {
+      await joinOnlyScenario("explicit_no_daemon", "--no-daemon");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "refused_only") {
+      await refusedScenario("refused_token", false);
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "missing_ack_only") {
+      await joinedScenario("missing_ack", false, "no_ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "clock_skew") {
+      await joinedScenario("clock_skew", false, "no_ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "edited_manifest") {
+      await joinedScenario("edited_manifest", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "symlink_private") {
+      await joinedScenario("symlink_private", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "partial_roots") {
+      await joinedScenario("partial_roots", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_after_bootout") {
+      await joinedScenario("crash_after_bootout", true, "ack");
+      return;
+    }
     await joinedScenario("fresh", false, "ack");
     await joinedScenario("running_0744_layout", true, "ack");
     await joinedScenario("missing_ack", false, "no_ack");
