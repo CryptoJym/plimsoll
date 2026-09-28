@@ -404,6 +404,9 @@ jobs:
           pnpm proof:maintenance-rebuild-pause
           pnpm proof:maintenance-rebuild-r2
           pnpm proof:maintenance-rebuild-r3
+          pnpm proof:maintenance-rebuild-r4-live
+          pnpm proof:maintenance-rebuild-r4-spool
+          pnpm proof:maintenance-rebuild-r4-lease
           pnpm proof:maintenance-rebuild-writers
           pnpm proof:maintenance-rebuild-contract
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)

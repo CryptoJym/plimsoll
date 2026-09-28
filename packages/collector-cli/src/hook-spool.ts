@@ -115,14 +115,16 @@ export const HOOK_SPOOL_LIMITS = Object.freeze({
 export type HookSpoolBounds = { maxFiles: number; maxBytes: number };
 
 /**
- * A spooled file name is `<utcMillis>-<pid>-<random6>.json`. The pattern is
+ * A spooled file name is `<utcMillis>-<pid>-<random6>.json`, optionally with
+ * `.maintenance_rebuild` before `.json` for a client-owned retry of a pause
+ * 503. The cause stays visible without reading the captured body. The pattern is
  * strict on purpose: it is the only thing that makes a pending file, and it
  * keeps `.counters.json`, a half-written `.tmp`, and the `rejected/`
  * subdirectory out of every listing by construction.
  */
-const SPOOL_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})\.json$/;
+const SPOOL_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})(?:\.(maintenance_rebuild))?\.json$/;
 /** A rejected file keeps its identity and gains `.<reason>` before `.json`. */
-const REJECTED_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})\.([a-z0-9_]+)\.json$/;
+const REJECTED_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})(?:\.maintenance_rebuild)?\.([a-z0-9_]+)\.json$/;
 /**
  * Every temporary this module writes (a spool file and the counters file both
  * land through `<name>.tmp`). They are invisible to `SPOOL_FILE_PATTERN` by
@@ -498,7 +500,9 @@ export type HookSpoolFile = {
  * (eco-6hoxj.163.18: the upload capture claim is bounded by what the spool
  * still holds). Null when the directory exists but cannot be listed.
  */
-export function listHookSpoolArrivals(home: string): number[] | null {
+export function listHookSpoolArrivalDetails(home: string): Array<{
+  atMs: number; maintenanceRebuild: boolean;
+}> | null {
   let names: string[];
   try {
     names = fs.readdirSync(hookSpoolDirectory(home));
@@ -508,7 +512,11 @@ export function listHookSpoolArrivals(home: string): number[] | null {
   return names
     .map((name) => SPOOL_FILE_PATTERN.exec(name))
     .filter((match): match is RegExpExecArray => match !== null)
-    .map((match) => Number(match[1]));
+    .map((match) => ({ atMs: Number(match[1]), maintenanceRebuild: match[4] === "maintenance_rebuild" }));
+}
+
+export function listHookSpoolArrivals(home: string): number[] | null {
+  return listHookSpoolArrivalDetails(home)?.map((arrival) => arrival.atMs) ?? null;
 }
 
 export function listHookSpoolFiles(home: string, limit = Number.POSITIVE_INFINITY) {
@@ -790,6 +798,8 @@ export function writeHookSpoolEnvelope(options: {
   /** Forbidden raw-content values the caller emptied before handing it over. */
   blanked?: number;
   nowMs?: number;
+  /** Client-owned retry of a maintenance 503; encoded in the pending file name. */
+  cause?: "maintenance_rebuild";
   limits?: Partial<HookSpoolBounds>;
 }): HookSpoolWriteResult {
   const maxFiles = options.limits?.maxFiles ?? HOOK_SPOOL_LIMITS.maxFiles;
@@ -821,7 +831,8 @@ export function writeHookSpoolEnvelope(options: {
     const usedBytes =
       existing.reduce((total, file) => total + file.bytes, 0) + temporaries.remainingBytes;
     if (usedBytes + contentBytes > maxBytes) return { ok: false, refused: "spool_bounds" };
-    const name = `${nowMs}-${process.pid}-${crypto.randomBytes(3).toString("hex")}.json`;
+    const name = `${nowMs}-${process.pid}-${crypto.randomBytes(3).toString("hex")}` +
+      `${options.cause === "maintenance_rebuild" ? ".maintenance_rebuild" : ""}.json`;
     target = path.join(directory, name);
     temporary = `${target}.tmp`;
     // Exclusive creation cannot truncate an existing temporary or follow a

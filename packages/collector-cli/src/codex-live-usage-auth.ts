@@ -179,8 +179,8 @@ export function currentLiveContext(buffer: LocalEventBuffer, config: CollectorCo
   return { binding, context, contextDigest,
     scopeDigest: liveSha256(canonicalJson([context, binding.credentialId])), root: structuredClone(effectiveRoot) };
 }
-export function authenticateLiveProducer(home: string, buffer: LocalEventBuffer, config: CollectorConfig,
-  producerId: string, token: string, ordinaryAuth?: LocalIngestAuth | null): LiveAuthenticatedBinding {
+function authenticatedRegistryBinding(home: string, producerId: string, token: string,
+  ordinaryAuth?: LocalIngestAuth | null): LiveProducerBinding {
   let registry: Registry;
   try { registry = readLiveProducerBindings(home); } catch { throw new HttpBoundaryRejection("producer_token_invalid", 401); }
   const binding = registry.bindings.find(b => b.producerId === producerId && b.enabled);
@@ -190,6 +190,19 @@ export function authenticateLiveProducer(home: string, buffer: LocalEventBuffer,
   if (!binding || !TOKEN.test(token) || !matches) throw new HttpBoundaryRejection("producer_token_invalid", 401);
   if (ordinaryAuth && Object.values(ordinaryAuth).some(v => typeof v === "string" && liveSha256(v) === suppliedDigest))
     throw new HttpBoundaryRejection("producer_token_invalid", 401);
+  return binding;
+}
+
+/** The pause listener cannot open the ledger. An enabled private-registry
+ * credential is sufficient to answer retryable 503; no event is admitted. */
+export function authenticatePausedLiveProducer(home: string, producerId: string, token: string,
+  ordinaryAuth?: LocalIngestAuth | null) {
+  return authenticatedRegistryBinding(home, producerId, token, ordinaryAuth);
+}
+
+export function authenticateLiveProducer(home: string, buffer: LocalEventBuffer, config: CollectorConfig,
+  producerId: string, token: string, ordinaryAuth?: LocalIngestAuth | null): LiveAuthenticatedBinding {
+  const binding = authenticatedRegistryBinding(home, producerId, token, ordinaryAuth);
   const row = buffer.database.prepare(`select b.token_sha256, b.context_digest, b.enrolled_at, b.revoked, p.credential_id, p.enabled
     from codex_live_bindings b join codex_live_producers p using(producer_id)
     where b.producer_id=? and b.credential_id=?`).get(producerId, binding.credentialId) as
@@ -204,7 +217,7 @@ export function authenticateLiveProducer(home: string, buffer: LocalEventBuffer,
   const authenticated = currentLiveContext(buffer, config, binding,
     adapterEnabled ? (assertionOption === undefined ? {} : { accountAssertion: assertionOption }) : { accountAssertion: null });
   if (!row || row.revoked || !row.enabled || row.credential_id !== binding.credentialId ||
-      row.context_digest !== authenticated.contextDigest || row.token_sha256 !== expected || row.enrolled_at !== binding.enrolledAt)
+      row.context_digest !== authenticated.contextDigest || row.token_sha256 !== binding.tokenSha256 || row.enrolled_at !== binding.enrolledAt)
     throw new HttpBoundaryRejection("source_not_allowed", 403);
   return freezeBinding(authenticated);
 }
