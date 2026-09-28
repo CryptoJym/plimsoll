@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 419,
+  "headSha": "621c0c63ce5ab7b1177a93e9c3a8fcb97bdfac7c",
+  "reviewedAt": "2026-09-28T21:08:16Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0e784-96b3-7f30-96ff-12156ed3643c",
+    "model": "gpt-6-sol",
+    "host": "studio1"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0e3f6-5a02-7163-b810-935bac99291c"
+    }
+  ],
+  "summary": "Independent Codex review lane (studio1, gpt-6-sol max, thread 01a0e784) of the final head 621c0c63, after four review rounds: F1-F4 reproducers red on their bases and green at head; the negative-total publication guard preserves prior generations and recovers; crash rollback and 0.7.44 downgrade pass; the million-fact production cadence stays under 750 ms per slice. Round 11 changed only the finance test fixture: no real path (retention or window change, rebuild, migration, workspace transition, 0.7.44 rollback) rewinds the expiry cutoff or cursor, and the new real A-B-A transition test fails under a one-line product epoch mutation. CI proof green on 621c0c63."
+}
