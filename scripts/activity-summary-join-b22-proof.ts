@@ -41,9 +41,16 @@ async function scenario(name: string, grantAd: boolean, ackAd: boolean) {
   console.log(`PASS ${name}`);
 }
 async function main() {
+  // This fixture supplies a different explicit home per join. The CI-wide
+  // PLIMSOLL_HOME override would otherwise collapse both into one home.
+  const previousCollectorHome = process.env.PLIMSOLL_HOME;
+  delete process.env.PLIMSOLL_HOME;
   try {
     await scenario("later_handshake_withdraws_grant_v2",true,false);
     await scenario("later_handshake_enables_v2",false,true);
-  } finally { fs.rmSync(root,{recursive:true,force:true}); }
+  } finally {
+    if (previousCollectorHome !== undefined) process.env.PLIMSOLL_HOME = previousCollectorHome;
+    fs.rmSync(root,{recursive:true,force:true});
+  }
 }
 main().catch((error)=>{console.error(error);process.exitCode=1;});

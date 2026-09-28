@@ -26,6 +26,13 @@ let seq = 0;
 let advertisement: number | undefined;
 const fetchImpl: typeof fetch = async (_input, init) => {
   const rawBody = String(init?.body ?? "");
+  if (JSON.parse(rawBody).kind === "activity_summary_v2") {
+    const claim = JSON.parse(new Headers(init?.headers).get("x-plimsoll-capture") ?? "null");
+    return new Response(JSON.stringify({ok:true,receipts:[],
+      capture:{status:"advanced",cursor:claim.cursor,state:"pending",acceptedThrough:null},
+      actorBindingVersion:7,deviceId:cloudDeviceId}),
+    {status:200,headers:{"content-type":"application/json"}});
+  }
   const expected = deliveryExpectation(rawBody,installKey);
   const body = {ok:true,accepted:expected.itemIds.length,
     ack:deliveryAcknowledgement(expected,expected.itemIds),
