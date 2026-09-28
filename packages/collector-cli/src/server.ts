@@ -125,7 +125,8 @@ import {
   scanProducerProcesses,
 } from "./producer-processes";
 import { healthzProof, isHealthzChallenge, summaryPendingStatus } from "./status-summary";
-import { reconcileMaintenanceRebuildRefusals, resolveMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
+import { pendingMaintenanceHookEventId, reconcileMaintenanceRebuildRefusals,
+  resolveMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -1808,7 +1809,10 @@ export function createCollectorServer(
         );
         maintenanceRetry = { route: "hook", source,
           body: blankForbiddenRawContent(body.text)?.text ?? body.text };
-        const producerEventId = readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]);
+        const producerEventId = readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]) ??
+          (maintenanceRefusalHome
+            ? pendingMaintenanceHookEventId(maintenanceRefusalHome, source, maintenanceRetry.body) ?? undefined
+            : undefined);
         let normalized: Awaited<ReturnType<typeof admitHookBody>>;
         try {
           normalized = await admitHookBody(body.text, source, {

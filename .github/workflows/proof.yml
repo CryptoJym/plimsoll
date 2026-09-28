@@ -419,6 +419,7 @@ jobs:
           pnpm proof:maintenance-rebuild-r8-same-day
           pnpm proof:maintenance-rebuild-r8-clock-skew
           pnpm proof:maintenance-rebuild-r9-downgrade-receipt
+          pnpm proof:maintenance-rebuild-r9-direct-idless
           pnpm proof:maintenance-rebuild-r9-hook-unknown
           pnpm proof:maintenance-rebuild-r9-stale-lock
           pnpm proof:maintenance-rebuild-writers

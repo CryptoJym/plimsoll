@@ -82,6 +82,20 @@ export function prepareMaintenanceHookSpoolBody(home: string, source: string, bo
   return { body: stableBody, receiptBody: receipt ? body : stableBody, eventId };
 }
 
+/** An authenticated direct hook may retry the exact body without a client
+ * spool or its own ID. Bind only that ID-less body's pending receipt to the
+ * normalizer; ordinary posts retain their existing ID selection. */
+export function pendingMaintenanceHookEventId(home: string, source: string, body: string) {
+  if (hookEventId(body)) return null;
+  try {
+    const receipt = readReceipt(refusalPath(home, "hook", source, body));
+    return receipt.route === "hook" && receipt.source === source ? receipt.eventId ?? null : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 /** A 503 has no server spool, so its route and body identity must survive the
  * listener's exit. Repeated refusals of the same payload share one receipt. */
 export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRoute,
