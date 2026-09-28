@@ -334,7 +334,8 @@ async function s4SpooledPushEvents() {
   for (const directory of [hookSpoolDirectory(home), otlpDirectory]) fs.rmSync(directory, { recursive: true, force: true });
   const claim = requests[0]?.claim ?? null;
   const expected = {
-    through: iso(waitingAt - HOUR),
+    // B22-DESIGN.md withdraws complete coverage after durable spool loss.
+    through: null,
     gaps: [
       { from: iso(epochStartMs), to: iso(expiredAt) },
       { from: iso(rejectedAt - HOUR), to: iso(rejectedAt) },
