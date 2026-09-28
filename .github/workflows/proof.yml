@@ -67,6 +67,7 @@ jobs:
           node ./node_modules/tsx/dist/cli.mjs scripts/activity-summary-ack-b22-proof.ts
           node ./node_modules/tsx/dist/cli.mjs scripts/activity-summary-capability-b22-proof.ts
           node ./node_modules/tsx/dist/cli.mjs scripts/activity-summary-join-b22-proof.ts
+          node ./node_modules/tsx/dist/cli.mjs scripts/activity-summary-session-sync-b22-proof.ts
           node ./node_modules/tsx/dist/cli.mjs scripts/activity-summary-v2-b22-proof.ts
           node ./node_modules/tsx/dist/cli.mjs scripts/capture-fault-ack-b22-proof.ts
           node ./node_modules/tsx/dist/cli.mjs scripts/capture-frontier-b22-proof.ts
