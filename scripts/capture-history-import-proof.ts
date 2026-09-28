@@ -8,7 +8,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline,
   sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
 import { captureFrontier, ensureCaptureFrontierSchema, CAPTURE_FRONTIER_SOURCES } from "../packages/collector-cli/src/capture-frontier";
-import { captureRootDigest, deriveCaptureRootIdentity, type CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
+import { captureRootDigest, captureRootObservationPayloadDigest, deriveCaptureRootIdentity, type CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { planCaptureHistory, applyCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
@@ -79,6 +79,11 @@ function priorTailerRow(buffer: LocalEventBuffer, session: string) {
       '2026-01-02T00:00:03.000Z', ?, 100, 10, '2026-01-02T00:00:04.000Z')`).run(id, session);
   buffer.database.prepare(`insert into session_usage_authority values ('codex', ?, 'tailer', '2026-01-02T00:00:03.000Z')`).run(session);
 }
+function codexSightingDigest(session: string, id: string) {
+  return captureRootObservationPayloadDigest({ source: "codex", id, sessionId: session,
+    observedAt: "2026-01-02T00:00:02.000Z", inputTokens: 100, outputTokens: 10,
+    cacheReadTokens: 0 });
+}
 async function main() {
   const home = path.join(root, "home");
   const directory = path.join(home, ".codex-profiles", "missed", "sessions");
@@ -107,9 +112,13 @@ async function main() {
     check("dry_run_writes_nothing", Number((buffer.database.prepare(`select count(*) as n from buffered_events`).get() as { n: number }).n) === before &&
       !buffer.database.prepare(`select 1 from sqlite_master where name='capture_history_import_runs'`).get());
     const applied = await applyCaptureHistory(buffer, captureRoot);
+    const sessionTotals = (session: string) => buffer.database.prepare(`select sum(input_tokens) as input,
+      sum(output_tokens) as output from buffered_events where session_id=?`).get(session) as
+        { input: number; output: number };
     check("partial_tailer_session_imports_only_missing_usage", applied.importedRows === 3 &&
-      (buffer.database.prepare(`select sum(input_tokens) as input, sum(output_tokens) as output from buffered_events where session_id=?`).get(partial) as {input:number;output:number}).input === 150);
-    check("never_captured_session_imports_once", (buffer.database.prepare(`select sum(input_tokens) as input, sum(output_tokens) as output from buffered_events where session_id=?`).get(missing) as {input:number;output:number}).input === 150);
+      sessionTotals(partial).input === 150 && sessionTotals(partial).output === 15);
+    check("never_captured_session_imports_once", sessionTotals(missing).input === 150 &&
+      sessionTotals(missing).output === 15);
     check("otlp_only_session_is_skipped", !buffer.database.prepare(`select 1 from buffered_events where session_id=?`).get(live));
     const rerun = await applyCaptureHistory(buffer, captureRoot);
     check("rerun_imports_zero", rerun.importedRows === 0);
@@ -147,6 +156,11 @@ async function main() {
     try { await applyCaptureHistory(buffer, captureRoot); }
     catch (error) { concurrentRefused = String(error).includes("another_import_holds_ledger"); }
     check("concurrent_import_refuses_ledger", concurrentRefused);
+    buffer.database.prepare(`update capture_history_import_lock set owner_pid=0 where singleton=1`).run();
+    let unknownHolderRefused = false;
+    try { await applyCaptureHistory(buffer, captureRoot); }
+    catch (error) { unknownHolderRefused = String(error).includes("import_holder_identity_unknown"); }
+    check("unknown_lock_holder_fails_closed", unknownHolderRefused);
     buffer.database.prepare(`delete from capture_history_import_lock`).run();
     buffer.database.prepare(`insert into maintenance_state(key,value,updated_at)
       values ('session_summary_legacy_rebuild_v1','{"phase":"running"}',?)`).run(BASELINE);
@@ -197,7 +211,8 @@ async function main() {
     // receipt. Add it after proving the receipt-only compatibility path.
     buffer.database.prepare(`insert into capture_root_observations
       (root_digest,event_id,payload_digest,observed_at,state) values (?,?,?,?,?)`)
-      .run(captureRootDigest(captureRoot), prunedId, "fixture_digest", "2026-01-02T00:00:02.000Z", "admitted");
+      .run(captureRootDigest(captureRoot), prunedId, codexSightingDigest(pruned, prunedId),
+        "2026-01-02T00:00:02.000Z", "admitted");
 
     const uncertain = "019d0000-0000-7000-8000-000000000005";
     const uncertainFile = codexFile(directory, uncertain, [[100, 10], [150, 15]]);
@@ -231,7 +246,8 @@ async function main() {
     const observedId = deterministicEventId(["codex-rollout", observedOnly, "1"]);
     buffer.database.prepare(`insert into capture_root_observations
       (root_digest,event_id,payload_digest,observed_at,state) values (?,?,?,?,?)`)
-      .run(captureRootDigest(captureRoot), observedId, "fixture_digest", "2026-01-02T00:00:02.000Z", "admitted");
+      .run(captureRootDigest(captureRoot), observedId, codexSightingDigest(observedOnly, observedId),
+        "2026-01-02T00:00:02.000Z", "admitted");
     const outboxId = deterministicEventId(["codex-rollout", outboxOnly, "1"]);
     buffer.database.prepare(`insert into upload_outbox
       (delivery_id,base_envelope_json,base_bytes,state,next_attempt_at,created_at,updated_at)
@@ -252,6 +268,22 @@ async function main() {
       return row.n === 1 && row.input === 50;
     });
     check("observed_outbox_and_upload_receipts_dedupe", deliveryApply.importedRows === 5 && onlySecond);
+    buffer.database.prepare(`update capture_root_observations set state='conflict' where event_id=?`)
+      .run(observedId);
+    let sightingConflictRefused = false;
+    try { await planCaptureHistory(buffer.database, captureRoot); }
+    catch (error) { sightingConflictRefused = String(error).includes("prior_root_observation_conflict"); }
+    check("conflicted_source_receipt_refuses_root", sightingConflictRefused);
+    buffer.database.prepare(`update capture_root_observations set state='admitted' where event_id=?`)
+      .run(observedId);
+    buffer.database.prepare(`update capture_root_observations set payload_digest='wrong' where event_id=?`)
+      .run(observedId);
+    let sightingDigestRefused = false;
+    try { await planCaptureHistory(buffer.database, captureRoot); }
+    catch (error) { sightingDigestRefused = String(error).includes("prior_root_observation_conflict"); }
+    check("mismatched_source_receipt_refuses_root", sightingDigestRefused);
+    buffer.database.prepare(`update capture_root_observations set payload_digest=? where event_id=?`)
+      .run(codexSightingDigest(observedOnly, observedId), observedId);
     buffer.database.prepare(`insert into raw_retention_receipts
       (event_id,raw_rowid,raw_created_at,raw_generation,expired_at,reason)
       values (?, 987656, ?, 'fixture', ?, 'retention_window_elapsed')`)
@@ -342,10 +374,14 @@ async function main() {
       installKey: "fixture-import-upload", uploadUrl: "http://127.0.0.1:49600/ingest",
       captureRoots: [captureRoot], delivery: { maxOldestAgeDays: 3650 } });
     const deliveries = new Map<string, string>();
+    const deliveryCounts = new Map<string, number>();
     const fetchImpl = acknowledgingFetch(async (_url, init) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as { events?: Array<{ event?: { id?: string; observedAt?: string } }> };
       for (const row of body.events ?? []) {
-        if (row.event?.id && row.event.observedAt) deliveries.set(row.event.id, row.event.observedAt);
+        if (row.event?.id && row.event.observedAt) {
+          deliveries.set(row.event.id, row.event.observedAt);
+          deliveryCounts.set(row.event.id, (deliveryCounts.get(row.event.id) ?? 0) + 1);
+        }
       }
       return new Response(JSON.stringify({ accepted: body.events?.length ?? 0 }),
         { status: 200, headers: { "content-type": "application/json" } });
@@ -354,11 +390,13 @@ async function main() {
       const sent = await uploadBufferedEvents(cfg, buffer, { fetchImpl });
       if (sent.remainingDelivery === 0) break;
     }
-    const uploadedOnce = deliveries.get(deterministicEventId(["codex-rollout", missing, "2"]));
+    const importedDeliveryId = deterministicEventId(["codex-rollout", missing, "2"]);
+    const uploadedOnce = deliveries.get(importedDeliveryId);
     check("imported_row_uploads_with_original_time", uploadedOnce === "2026-01-02T00:00:03.000Z");
-    const sentCount = deliveries.size;
+    const sentCount = [...deliveryCounts.values()].reduce((sum, count) => sum + count, 0);
     await uploadBufferedEvents(cfg, buffer, { fetchImpl });
-    check("imported_row_uploads_once", deliveries.size === sentCount);
+    check("imported_row_uploads_once", deliveryCounts.get(importedDeliveryId) === 1 &&
+      [...deliveryCounts.values()].reduce((sum, count) => sum + count, 0) === sentCount);
 
     fs.writeFileSync(path.join(fixture.env.PLIMSOLL_HOME, "collector.config.json"),
       `${JSON.stringify(collectorConfigSchema.parse({ tenantId: WORKSPACE, deviceId: DEVICE,

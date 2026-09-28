@@ -263,6 +263,14 @@ function ensureRootObservationSchema(database: import("better-sqlite3").Database
   if(!database.inTransaction)
     initializedObservationDatabases.add(database);
 }
+export function captureRootObservationPayloadDigest(value: Pick<import("../../shared/src/schemas").AiInteractionEvent,
+  "source" | "id" | "sessionId" | "observedAt" | "model" | "inputTokens" | "outputTokens" |
+  "cacheReadTokens" | "cacheCreationTokens" | "costUsd">) {
+  return crypto.createHash("sha256").update(JSON.stringify([
+    value.source,value.id,value.sessionId,value.observedAt,value.model,value.inputTokens??null,value.outputTokens??null,
+    value.cacheReadTokens??null,value.cacheCreationTokens??null,value.costUsd??null,
+  ])).digest("hex");
+}
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
 export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined): boolean {
   const parsedAccount = root?.account ? accountAssertionV1Schema.safeParse(root.account) : null;
@@ -274,10 +282,7 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
     return buffer.append(event,[]);
   const database=buffer.database;
   ensureRootObservationSchema(database);
-  const nativeSignature=(value: typeof event) => crypto.createHash("sha256").update(JSON.stringify([
-    value.source,value.id,value.sessionId,value.observedAt,value.model,value.inputTokens??null,value.outputTokens??null,
-    value.cacheReadTokens??null,value.cacheCreationTokens??null,value.costUsd??null,
-  ])).digest("hex");
+  const nativeSignature=captureRootObservationPayloadDigest;
   const payloadDigest=nativeSignature(event),rootDigest=captureRootDigest(root);
   const existing=database.prepare("select payload_json as payload from buffered_events where id=?").get(event.id) as {
     payload: string;

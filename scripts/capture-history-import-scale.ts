@@ -136,16 +136,16 @@ async function main() {
     const ledgerRows = (buffer.database.prepare(`select count(*) as n from buffered_events
       where event_type='usage_rollout'`).get() as { n: number }).n;
     const probeRows = (buffer.database.prepare(`select count(*) as n from history_import_probe`).get() as { n: number }).n;
-    assert.equal(imported, USAGE_ROWS);
-    assert.equal(ledgerRows, USAGE_ROWS);
-    assert.equal(probeRows, probeReceipt.count);
-    assert.equal(probeReceipt.errors, 0);
     console.log(JSON.stringify({ schema: "capture_history_scale_v1", roots: ROOTS,
       historyRows: HISTORY_ROWS, usageRows: USAGE_ROWS,
       sourceBytes, importSeconds, totalSeconds: (performance.now() - started) / 1000,
       peakRssBytes: Math.max(peakRss, process.resourceUsage().maxRSS * 1024),
       maxWriterSliceMs, maxWriterWorkMs, maxWriterRowMs, overBudgetSlices,
       intake: probeReceipt, ledgerRows }, null, 2));
+    assert.equal(imported, USAGE_ROWS);
+    assert.equal(ledgerRows, USAGE_ROWS);
+    assert.equal(probeRows, probeReceipt.count);
+    assert.equal(probeReceipt.errors, 0);
     assert.ok(maxWriterSliceMs < 750 && overBudgetSlices === 0);
     assert.ok(probeReceipt.maxMs < 750);
   } finally {

@@ -9,7 +9,7 @@ import { aiInteractionEventSchema, estimateCostUsd, type AiInteractionEvent } fr
 import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import { captureBaselineExcludedReceipt, captureBaselineStatus } from "./capture-baseline";
-import { appendRootObservation, captureRootDigest, inspectCaptureRoots,
+import { appendRootObservation, captureRootDigest, captureRootObservationPayloadDigest, inspectCaptureRoots,
   rootEventMetadata, validateCaptureRoots, type CaptureRoot } from "./capture-root-inventory";
 import { deterministicEventId } from "./normalizer";
 
@@ -299,7 +299,10 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   const receiptCount = table(db, "raw_retention_receipts")
     ? (db.prepare(table(db, "capture_root_observations")
         ? `select count(*) as n from raw_retention_receipts r where not exists
-            (select 1 from capture_root_observations o where o.event_id=r.event_id)`
+            (select 1 from capture_root_observations o where o.event_id=r.event_id
+              and o.state in ('admitted','duplicate'))
+            or exists (select 1 from capture_root_observations o where o.event_id=r.event_id
+              and o.state='conflict')`
         : `select count(*) as n from raw_retention_receipts`).get() as { n: number }).n : 0;
   const prior = db.prepare(`select source,session_id as sessionId,event_type as eventType,
     observed_at as observedAt,model,input_tokens as inputTokens,output_tokens as outputTokens,
@@ -308,7 +311,8 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   const retained = table(db, "raw_retention_receipts")
     ? db.prepare(`select 1 from raw_retention_receipts where event_id=? limit 1`) : null;
   const observed = table(db, "capture_root_observations")
-    ? db.prepare(`select 1 from capture_root_observations where event_id=? limit 1`) : null;
+    ? db.prepare(`select payload_digest as digest,state
+        from capture_root_observations where event_id=?`) : null;
   // Imported source IDs are UUID delivery IDs. The delivery_id primary key is
   // indexed; an OR against raw_id would full-scan a large outbox per event.
   const outbox = table(db, "upload_outbox")
@@ -350,7 +354,11 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       if (previous && previous !== digest) refusal("source_event_conflict");
       if (previous) continue;
       seen.set(candidate.sourceId, digest);
-      if (retained?.get(candidate.sourceId) && !observed?.get(candidate.sourceId))
+      const sightings = (observed?.all(candidate.sourceId) ?? []) as Array<{ digest: string; state: string }>;
+      if (sightings.some(row => row.state === "conflict" ||
+          row.digest !== captureRootObservationPayloadDigest(e)))
+        refusal("prior_root_observation_conflict");
+      if (retained?.get(candidate.sourceId) && sightings.length === 0)
         matchedReceipts.add(candidate.sourceId);
       const existing = prior.get(candidate.sourceId) as {
         source: string; sessionId: string | null; eventType: string; observedAt: string;
@@ -364,7 +372,7 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
           (existing.cacheReadTokens ?? 0) !== (e.cacheReadTokens ?? 0) ||
           (existing.cacheCreationTokens ?? 0) !== (e.cacheCreationTokens ?? 0)))
         refusal("existing_event_conflict");
-      if (existing || retained?.get(candidate.sourceId) || observed?.get(candidate.sourceId) ||
+      if (existing || retained?.get(candidate.sourceId) || sightings.length > 0 ||
           outbox?.get(candidate.sourceId) || uploaded?.get(candidate.sourceId)) {
         plan.existingRows += 1;
         continue;
@@ -401,18 +409,28 @@ export async function planCaptureHistory(db: DB, root: CaptureRoot, options: Pic
     const held = db.prepare(`select owner_pid as pid,owner_start as started
       from capture_history_import_lock where singleton=1`).get() as
         { pid: number; started: string } | undefined;
-    if (held && processStart(held.pid) === held.started) refusal("another_import_holds_ledger");
+    if (held) {
+      const holder = processStart(held.pid);
+      if (holder === "unknown") refusal("import_holder_identity_unknown");
+      if (holder === held.started) refusal("another_import_holds_ledger");
+    }
   }
   return (await scan(db, root, options)).plan;
 }
 
-function processStart(pid: number): string | null {
+function processStart(pid: number): string | "unknown" | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "unknown";
+  try { process.kill(pid, 0); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return null;
+    return "unknown";
+  }
   try {
     const value = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="],
       { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
         env: { ...process.env, TZ: "UTC", LC_ALL: "C" } }).trim();
-    return value || null;
-  } catch { return null; }
+    return value || "unknown";
+  } catch { return "unknown"; }
 }
 function maintenanceIdle(db: DB) {
   const row = db.prepare(`select value from maintenance_state where key='session_summary_legacy_rebuild_v1'`)
@@ -446,15 +464,19 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   maintenanceIdle(db);
   ensureImportSchema(db);
   const ownerStart = processStart(process.pid);
-  if (!ownerStart) refusal("process_identity_unavailable");
+  if (!ownerStart || ownerStart === "unknown") refusal("process_identity_unavailable");
   let runId = "";
   db.transaction(() => {
     maintenanceIdle(db);
     const held = db.prepare(`select root_id as rootId, owner_pid as pid, owner_start as started
       from capture_history_import_lock where singleton=1`).get() as
         { rootId: string; pid: number; started: string } | undefined;
-    if (held && (held.pid !== process.pid || held.started !== ownerStart || held.rootId !== root.rootId) &&
-        processStart(held.pid) === held.started) refusal("another_import_holds_ledger");
+    if (held) {
+      const holder = processStart(held.pid);
+      if (holder === "unknown") refusal("import_holder_identity_unknown");
+      if ((held.pid !== process.pid || held.started !== ownerStart || held.rootId !== root.rootId) &&
+          holder === held.started) refusal("another_import_holds_ledger");
+    }
     if (held) db.prepare(`delete from capture_history_import_lock where singleton=1`).run();
     db.prepare(`insert into capture_history_import_lock values (1,?,?,?)`)
       .run(root.rootId, process.pid, ownerStart);
