@@ -140,10 +140,57 @@ export function rootCursorKey(roots: readonly CaptureRoot[],file: string): strin
   const root=rootForFile(roots,file);
   return root? `${file}\u0000${captureRootDigest(root)}`:file;
 }
+type IndexedBinding = {
+  root: CaptureRoot;
+  binding: DispatchBinding;
+  from: number;
+  until: number;
+  signature: string;
+};
+export type DispatchBindingSnapshot = {
+  roots: readonly CaptureRoot[];
+  byRootId: ReadonlyMap<string, CaptureRoot>;
+  bySession: ReadonlyMap<string, readonly IndexedBinding[]>;
+  rootDigests: ReadonlyMap<string,string>;
+  claudeRootDigests: ReadonlySet<string>;
+};
+const dispatchIndexes = new WeakMap<readonly CaptureRoot[], DispatchBindingSnapshot>();
+function dispatchIndex(roots: readonly CaptureRoot[]): DispatchBindingSnapshot {
+  const cached = dispatchIndexes.get(roots);
+  if (cached) return cached;
+  const byRootId = new Map<string, CaptureRoot>();
+  const bySession = new Map<string, IndexedBinding[]>();
+  const rootDigests = new Map<string,string>();
+  const claudeRootDigests = new Set<string>();
+  for (const root of roots) {
+    byRootId.set(root.rootId, root);
+    const digest=captureRootDigest(root);
+    rootDigests.set(root.rootId,digest);
+    if(root.source==="claude_code") claudeRootDigests.add(digest);
+    for (const binding of root.dispatch ?? []) {
+      const key = `${root.source}\0${binding.sessionId}`;
+      const entries = bySession.get(key) ?? [];
+      entries.push({ root, binding, from: Date.parse(binding.validFrom),
+        until: binding.validUntil ? Date.parse(binding.validUntil) : Infinity,
+        signature: JSON.stringify(binding) });
+      bySession.set(key, entries);
+    }
+  }
+  const snapshot = { roots, byRootId, bySession, rootDigests, claudeRootDigests };
+  dispatchIndexes.set(roots, snapshot);
+  return snapshot;
+}
+
 /** The CLI publishes config atomically; the daemon observes its new inode without a restart. */
 let dispatchConfigCache: { file: string; stamp: string; roots: CaptureRoot[] } | null = null;
+let seenConfigFile: string | null = null;
+const seenClaudeSessionRoots = new Map<string, Set<string>>();
 export function currentDispatchCaptureRoots(): CaptureRoot[] {
   const file=path.join(resolveCollectorHome().home,"collector.config.json");
+  if (seenConfigFile !== file) {
+    seenConfigFile = file;
+    seenClaudeSessionRoots.clear();
+  }
   try {
     const stat=fs.statSync(file);
     const stamp=`${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
@@ -151,6 +198,7 @@ export function currentDispatchCaptureRoots(): CaptureRoot[] {
       return dispatchConfigCache.roots;
     const parsed=JSON.parse(fs.readFileSync(file,"utf8")) as { captureRoots?: unknown };
     const roots=validateCaptureRoots(parsed.captureRoots??[]);
+    dispatchIndex(roots);
     dispatchConfigCache={file,stamp,roots};
     return roots;
   } catch {
@@ -158,24 +206,65 @@ export function currentDispatchCaptureRoots(): CaptureRoot[] {
     return [];
   }
 }
-export function currentDispatchRoot(root: CaptureRoot): CaptureRoot {
-  const roots=currentDispatchCaptureRoots();
-  const configured=roots.find(candidate => candidate.rootId===root.rootId&&captureRootDigest(candidate)===captureRootDigest(root));
-  return configured ? { ...root,dispatch: configured.dispatch??[] }:root;
+export function currentDispatchBindingSnapshot(): DispatchBindingSnapshot {
+  return dispatchIndex(currentDispatchCaptureRoots());
 }
-function bindingAt(bindings: readonly DispatchBinding[],sessionId: string,observedAt: string) {
+export function currentDispatchRoot(root: CaptureRoot,snapshot=currentDispatchBindingSnapshot()): CaptureRoot {
+  const candidate=snapshot.byRootId.get(root.rootId);
+  const configured=candidate&&candidate.source===root.source&&candidate.profileId===root.profileId&&
+    candidate.installationEpochId===root.installationEpochId&&candidate.directory===root.directory ? candidate : null;
+  return configured ? { ...root,dispatch: configured.dispatch }:root;
+}
+function activeIndexedBindings(snapshot: DispatchBindingSnapshot,source: CaptureRoot["source"],
+  sessionId: string,observedAt: string): readonly IndexedBinding[] {
   const at=Date.parse(observedAt);
-  const matches=bindings.filter(binding => binding.sessionId===sessionId&&at>=Date.parse(binding.validFrom)&&
-    (!binding.validUntil||at<Date.parse(binding.validUntil)));
-  return { binding: matches.length===1 ? matches[0]:null, conflict: matches.length>1 };
+  return snapshot.bySession.get(`${source}\0${sessionId}`)?.filter(entry => at>=entry.from&&at<entry.until) ?? [];
 }
 export function dispatchBindingForSession(source: CaptureRoot["source"],sessionId: string,observedAt: string,
   roots: readonly CaptureRoot[]=currentDispatchCaptureRoots()): DispatchBinding|null {
-  const matches=roots.filter(root => root.source===source)
-    .map(root => bindingAt(root.dispatch??[],sessionId,observedAt)).filter(result => result.binding||result.conflict);
-  if(matches.some(result => result.conflict)) return null;
-  const bindings=[...new Map(matches.map(result => [JSON.stringify(result.binding),result.binding])).values()];
-  return bindings.length===1 ? bindings[0] : null;
+  const entries=activeIndexedBindings(dispatchIndex(roots),source,sessionId,observedAt);
+  if (entries.length === 0) return null;
+  const byRoot=new Set(entries.map(entry => entry.root.rootId));
+  const signatures=new Set(entries.map(entry => entry.signature));
+  return byRoot.size===entries.length&&signatures.size===1 ? entries[0].binding : null;
+}
+/** A known-root transcript sighting is authoritative; hook/OTLP paths are not. */
+export function observeClaudeRootSession(root: CaptureRoot,sessionId: string) {
+  if(root.source!=="claude_code") return;
+  const roots=seenClaudeSessionRoots.get(sessionId)??new Set<string>();
+  roots.add(captureRootDigest(root));
+  seenClaudeSessionRoots.set(sessionId,roots);
+}
+export function claudeSessionRootSightings(sessionId: string): ReadonlySet<string> {
+  return seenClaudeSessionRoots.get(sessionId)??new Set<string>();
+}
+const claudeDispatchSkips={ conflictingBindings:0,otherRootSeen:0,ambiguousRoot:0 };
+export function claudeDispatchSkipStatus() {
+  return { ...claudeDispatchSkips,total:Object.values(claudeDispatchSkips).reduce((a,b)=>a+b,0) };
+}
+/** Rootless transports may use only a binding whose owning root is unambiguous. */
+export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
+  snapshot=currentDispatchBindingSnapshot(),durableSightings?: ReadonlySet<string>): DispatchBinding|null {
+  const entries=activeIndexedBindings(snapshot,"claude_code",sessionId,observedAt);
+  if(entries.length===0) return null;
+  const byRoot=new Set(entries.map(entry => entry.root.rootId));
+  const signatures=new Set(entries.map(entry => entry.signature));
+  if(byRoot.size!==entries.length||signatures.size!==1) {
+    claudeDispatchSkips.conflictingBindings++;
+    return null;
+  }
+  if(entries.length!==1) {
+    claudeDispatchSkips.ambiguousRoot++;
+    return null;
+  }
+  const seen=new Set([...claudeSessionRootSightings(sessionId),...(durableSightings??[])]);
+  const configuredSeen=[...seen].filter(digest => snapshot.claudeRootDigests.has(digest));
+  const bindingDigest=snapshot.rootDigests.get(entries[0].root.rootId);
+  if(configuredSeen.some(digest => digest!==bindingDigest)) {
+    claudeDispatchSkips.otherRootSeen++;
+    return null;
+  }
+  return entries[0].binding;
 }
 export function dispatchBindingMetadata(binding: DispatchBinding): Record<string,unknown> {
   return {
@@ -195,10 +284,11 @@ export function dispatchBindingMetadata(binding: DispatchBinding): Record<string
   };
 }
 export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: string,observedAt: string,sessionId?: string,
-  accountAttributionEnabled=true): Record<string, unknown> {
+  accountAttributionEnabled=true,snapshot=currentDispatchBindingSnapshot()): Record<string, unknown> {
   if(!root)
     return {};
-  root=currentDispatchRoot(root);
+  root=currentDispatchRoot(root,snapshot);
+  if(root.source==="claude_code"&&sessionId) observeClaudeRootSession(root,sessionId);
   const at=Date.parse(observedAt);
   const accountCandidates = accountAttributionEnabled ? [...new Map(
     [ ...(root.accountAssertions ?? []), ...(root.account ? [root.account] : []) ]
@@ -209,13 +299,19 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
   const accountEpochs = account ? (root.accountAssertionEpochs ?? []).filter(epoch =>
     epoch.actorHash===account.actorHash&&epoch.validFrom===account.validFrom&&epoch.evidenceRef===account.evidenceRef) : [];
   const installationEpochId = accountEpochs.length===1 ? accountEpochs[0].installationEpochId : root.installationEpochId;
-  const localBinding=bindingAt(root.dispatch??[],sessionId??"",observedAt);
-  const claudeRoots=root.source==="claude_code" ? currentDispatchCaptureRoots()
-    .filter(candidate => candidate.source==="claude_code") : [];
-  // A transcript belongs to one root, but dispatch binds every Claude root.
-  // Apply the same cross-root conflict rule as hook and OTLP intake.
-  const binding=claudeRoots.length && sessionId
-    ? dispatchBindingForSession("claude_code",sessionId,observedAt,claudeRoots)
+  const localIndex=snapshot.byRootId.get(root.rootId)?.dispatch===root.dispatch
+    ? snapshot : dispatchIndex([root]);
+  const localMatches=activeIndexedBindings(localIndex,root.source,sessionId??"",observedAt)
+    .filter(entry => entry.root.rootId===root.rootId);
+  const localBinding={ binding: localMatches.length===1 ? localMatches[0].binding:null,
+    conflict: localMatches.length>1 };
+  // The known transcript root must supply its own binding. Other roots can
+  // veto on a conflict; they can never lend their binding to this root.
+  const sharedBinding=root.source==="claude_code"&&sessionId
+    ? dispatchBindingForSession("claude_code",sessionId,observedAt,snapshot.roots) : null;
+  const binding=root.source==="claude_code"
+    ? localBinding.binding&&sharedBinding&&JSON.stringify(localBinding.binding)===JSON.stringify(sharedBinding)
+      ? localBinding.binding : null
     : localBinding.binding;
   const conflict=localBinding.conflict;
   return {
@@ -254,6 +350,7 @@ export function bindCaptureInventory(database: import("better-sqlite3").Database
   return true;
 }
 const initializedObservationDatabases=new WeakSet<object>();
+const sessionSightingCaches=new WeakMap<object,{version:number;sessions:Map<string,Set<string>>}>();
 const captureRootEpochCapabilities=new WeakMap<object,string>();
 /** Read-only sidecar used by LocalEventBuffer; JSON cannot mint this capability. */
 export function captureRootEventInstallationEpoch(event: object) {
@@ -266,10 +363,41 @@ function ensureRootObservationSchema(database: import("better-sqlite3").Database
     root_digest text not null,event_id text not null,payload_digest text not null,
     observed_at text not null,state text not null check(state in ('admitted','duplicate','conflict')),
     primary key(root_digest,event_id));
-    create index if not exists idx_capture_root_event on capture_root_observations(event_id)`);
+    create index if not exists idx_capture_root_event on capture_root_observations(event_id);
+    create table if not exists capture_root_session_sightings (
+      source text not null,session_id text not null,root_digest text not null,
+      first_seen_at text not null,primary key(source,session_id,root_digest)
+    )`);
   // A rolled-back transaction must not leave a cached schema assertion.
   if(!database.inTransaction)
     initializedObservationDatabases.add(database);
+}
+/** Session-to-root evidence is durable even after the ordinary raw row expires. */
+export function durableClaudeRootSessionSightings(database: import("better-sqlite3").Database,
+  sessionId: string): ReadonlySet<string> {
+  const version=database.pragma("data_version",{simple:true}) as number;
+  let cache=sessionSightingCaches.get(database);
+  if(!cache||cache.version!==version) {
+    cache={version,sessions:new Map()};sessionSightingCaches.set(database,cache);
+  }
+  const prior=cache.sessions.get(sessionId);
+  if(prior) return prior;
+  const roots=new Set<string>();
+  const hasTable=(name: string) => Boolean(database.prepare(
+    "select 1 from sqlite_master where type='table' and name=?").get(name));
+  if(hasTable("capture_root_session_sightings")) for(const row of database.prepare(
+    "select root_digest as digest from capture_root_session_sightings where source='claude_code' and session_id=?"
+  ).all(sessionId) as Array<{digest:string}>) roots.add(row.digest);
+  // The existing observation table is the migration source for rows captured
+  // before this compact session index existed. The session index bounds it.
+  if(hasTable("capture_root_observations")) for(const row of database.prepare(`
+    select distinct seen.root_digest as digest from buffered_events as raw
+    join capture_root_observations as seen on seen.event_id=raw.id
+    where raw.source='claude_code' and raw.session_id=?`).all(sessionId) as Array<{digest:string}>)
+    roots.add(row.digest);
+  if(cache.sessions.size>=4096) cache.sessions.clear();
+  cache.sessions.set(sessionId,roots);
+  return roots;
 }
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
 export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined): boolean {
@@ -321,6 +449,13 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
   database.prepare(`insert into capture_root_observations values(?,?,?,?,?)
     on conflict(root_digest,event_id) do update set state=case when payload_digest<>excluded.payload_digest then 'conflict' else state end`)
     .run(rootDigest,event.id,payloadDigest,event.observedAt,state);
+  if(root.source==="claude_code"&&event.sessionId) {
+    database.prepare(`insert into capture_root_session_sightings(source,session_id,root_digest,first_seen_at)
+      values('claude_code',?,?,?) on conflict do nothing`).run(event.sessionId,rootDigest,event.observedAt);
+    const cached=sessionSightingCaches.get(database)?.sessions.get(event.sessionId);
+    cached?.add(rootDigest);
+    observeClaudeRootSession(root,event.sessionId);
+  }
   if(state==="conflict")
     throw new Error("capture_logical_source_conflict");
   return inserted;

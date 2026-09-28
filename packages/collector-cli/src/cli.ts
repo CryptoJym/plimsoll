@@ -1343,6 +1343,7 @@ async function readDaemonState(
   hookSpool: HookSpoolDaemonReading;
   sync: DaemonSyncReading;
   httpAdmission: RejectionDiagnosticsCounters | "invalid" | null;
+  claudeDispatchSkips: { total:number;conflictingBindings:number;otherRootSeen:number;ambiguousRoot:number } | null;
 }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
@@ -1360,18 +1361,29 @@ async function readDaemonState(
     } catch {
       // Not a Plimsoll-ready service's answer.
     }
+    const skips=body?.claudeDispatchSkips;
+    const skipRecord=skips&&typeof skips==="object"&&!Array.isArray(skips)
+      ? skips as Record<string,unknown> : null;
+    const skipKeys=["total","conflictingBindings","otherRootSeen","ambiguousRoot"] as const;
+    const claudeDispatchSkips=skipRecord&&skipKeys.every(key => Number.isSafeInteger(skipRecord[key])&&
+      (skipRecord[key] as number)>=0)
+      ? Object.fromEntries(skipKeys.map(key => [key,skipRecord[key]])) as {
+          total:number;conflictingBindings:number;otherRootSeen:number;ambiguousRoot:number }
+      : null;
     return {
       hookSpool: hookSpoolReadingFromStatusBody(body, response.ok),
       sync: syncReadingFromStatusBody(body, response.ok),
       // Every row is checked here (review r1 F2): a malformed row is labelled
       // invalid admission, never trusted as counters.
       httpAdmission: response.ok ? readRejectionAdmission(body?.httpAdmission) : null,
+      claudeDispatchSkips: response.ok ? claudeDispatchSkips : null,
     };
   } catch {
     return {
       hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE,
       sync: SYNC_COLLECTOR_UNREACHABLE,
       httpAdmission: null,
+      claudeDispatchSkips: null,
     };
   } finally {
     clearTimeout(timeout);
@@ -3903,6 +3915,7 @@ async function main() {
           sessionAttribution: sessionContextIndexStatus(buffer.database),
           summaryPending: summaryPendingStatus(buffer.database),
           unlinkableBindCount: countUnlinkableDispatchBindings(config.captureRoots ?? []),
+          claudeDispatchSkips: daemonState.claudeDispatchSkips,
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
           learningFacts: buffer.learningFacts.statusWithWindow(),

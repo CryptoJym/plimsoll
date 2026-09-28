@@ -1,11 +1,13 @@
 /** Bound Claude capture through the production hook, OTLP and transcript paths. */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { currentDispatchCaptureRoots, dispatchBindingMetadata, type DispatchBinding } from "../packages/collector-cli/src/capture-root-inventory";
+import { appendRootObservation, currentDispatchCaptureRoots, dispatchBindingMetadata,
+  rootEventMetadata, type DispatchBinding } from "../packages/collector-cli/src/capture-root-inventory";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { bindDispatch, restampDispatch } from "../packages/collector-cli/src/dispatch-command";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
@@ -13,6 +15,7 @@ import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createProofCompletion } from "./lib/proof-completion";
+import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const proof = createProofCompletion("claude-dispatch-stamping");
 const home = process.env.HOME!;
@@ -91,7 +94,7 @@ async function main() {
   const codex = path.join(home, ".codex", "sessions");
   for (const directory of [claudeA, claudeB, codex, plimsoll]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const base = collectorConfigSchema.parse({ deviceId: "dev_claude-dispatch-fixture",
-    uploadUrl: "http://127.0.0.1:1/unused" });
+    port: 49873, uploadUrl: "http://127.0.0.1:1/unused" });
   const buffer = new LocalEventBuffer(path.join(plimsoll, "work-ledger.sqlite"), {
     workspaceId: base.tenantId, deviceId: base.deviceId,
     enrollmentNow: () => new Date(atMs - 3_600_000), delivery: { enabled: true },
@@ -110,6 +113,15 @@ async function main() {
     "--attempt-id", attempt, "--valid-from", at(-10), "--valid-until", at(10),
   ]);
   assert.equal(bind(sessionId, attemptId).roots, 3);
+  const rooted = (session: string, eventType: "session_start" | "tool_use") => {
+    const id = crypto.randomUUID();
+    const observedAt=at(0);
+    const event=aiInteractionEventSchema.parse({ id,sessionId:session,source:"claude_code",
+      dataMode:"metadata",eventType,observedAt,
+      metadata:rootEventMetadata(roots[0],id,observedAt,session) });
+    assert.equal(appendRootObservation(buffer,event,roots[0]),true);
+    return id;
+  };
   const binding = currentDispatchCaptureRoots()[0].dispatch?.find(row => row.sessionId === sessionId);
   assert.ok(binding);
   proof.check("bind_records_the_synthetic_session_in_every_capture_root");
@@ -132,6 +144,9 @@ async function main() {
   stamped(buffer, transcriptIds[1], transcriptBinding);
   unstamped(buffer, transcriptIds[2]);
   proof.check("transcript_usage_obeys_the_binding_window_and_queues_work_ref");
+  // Hook/OTLP have no root credential. A captured, known-root event makes A
+  // the sole observed Claude root for this session before their intake.
+  rooted(sessionId,"session_start");
 
   const auth = loadOrCreateLocalIngestAuth(plimsoll);
   const server = createCollectorServer(base, buffer, { localAuth: auth });
@@ -154,6 +169,37 @@ async function main() {
         timestamp: at(offset), prompt: "SENSITIVE_CLAUDE_FIXTURE_PAYLOAD" });
       return id;
     };
+    // `dispatch bind` fans out to every configured root. Source-level hook
+    // credentials cannot identify one of two bound roots, even after A is seen.
+    const ambiguousId = await hook(sessionId, "AssistantResponse", 0);
+    unstamped(buffer, ambiguousId);
+    const statusResponse = await fetch("http://127.0.0.1:49873/status", {
+      headers: { "x-plimsoll-token": auth.managementRead },
+    });
+    assert.equal(statusResponse.status, 200);
+    const status = await statusResponse.json() as { claudeDispatchSkips?: { ambiguousRoot?: number } };
+    assert.ok((status.claudeDispatchSkips?.ambiguousRoot ?? 0) >= 1);
+    const statusCli = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--import", path.join(process.cwd(),
+        "node_modules/tsx/dist/loader.mjs"), "packages/collector-cli/src/cli.ts", "status"], {
+        cwd: process.cwd(), env: process.env,
+      });
+      let stdout = "", stderr = "";
+      child.stdout.setEncoding("utf8").on("data", data => { stdout += data; });
+      child.stderr.setEncoding("utf8").on("data", data => { stderr += data; });
+      child.once("error", reject);
+      child.once("close", code => code === 0 ? resolve(stdout) : reject(new Error(
+        `synthetic plimsoll status exited ${code}: ${stderr}`)));
+    });
+    const cliStatus = JSON.parse(statusCli) as { claudeDispatchSkips?: { ambiguousRoot?: number } };
+    assert.ok((cliStatus.claudeDispatchSkips?.ambiguousRoot ?? 0) >= 1);
+    proof.check("anonymous_intake_skips_multi_root_binding_and_status_counts_it");
+    // Model a later root B that was not present when A's dispatch was bound.
+    // Only A retains this session's binding for the ordinary hook/OTLP cases.
+    const uniquelyBound = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    uniquelyBound.captureRoots![1].dispatch = uniquelyBound.captureRoots![1].dispatch
+      ?.filter(row => row.sessionId !== sessionId);
+    fs.writeFileSync(configPath, JSON.stringify(uniquelyBound) + "\n");
     const kinds = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "AssistantResponse",
       "Stop", "SessionStart", "Notification"];
     const hookIds = [];
@@ -257,15 +303,18 @@ async function main() {
     assert.equal(lateUsage.length, 1);
     unstamped(buffer, lateHook);
     unstamped(buffer, lateUsage[0]);
+    const rootedLate=[rooted(lateSession,"session_start"),rooted(lateSession,"tool_use")];
+    for(const id of rootedLate) unstamped(buffer,id);
     const lateAttempt = "99999999-9999-4999-8999-999999999999";
     bind(lateSession, lateAttempt);
     const result = restampDispatch(["--attempt-id", lateAttempt], buffer, currentDispatchCaptureRoots());
     assert.equal(result.restamped, 2);
     const lateBinding = currentDispatchCaptureRoots()[0].dispatch?.find(row => row.sessionId === lateSession);
     assert.ok(lateBinding);
-    stamped(buffer, lateHook, lateBinding);
-    stamped(buffer, lateUsage[0], lateBinding);
-    proof.check("restamp_corrects_unsent_claude_hook_and_usage_rows_and_outbox");
+    for(const id of rootedLate) stamped(buffer,id,lateBinding);
+    unstamped(buffer,lateHook);
+    unstamped(buffer,lateUsage[0]);
+    proof.check("restamp_corrects_only_known_root_claude_rows_and_outbox");
   } finally {
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     buffer.close();

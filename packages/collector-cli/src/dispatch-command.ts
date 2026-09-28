@@ -160,27 +160,29 @@ export function closeDispatch(args: string[], now = new Date()) {
 export function restampDispatch(args: string[],buffer: LocalEventBuffer,roots: readonly CaptureRoot[]) {
   const value=options(args,RESTAMP_FLAGS);
   const attemptId=dispatchBindingSchema.shape.attemptId.parse(required(value("--attempt-id"),"--attempt-id"));
-  const bySession=new Map<string,{ binding: DispatchBinding;source: CaptureRoot["source"] }>();
+  const bySession=new Map<string,{ binding: DispatchBinding;source: CaptureRoot["source"];rootId: string|null }>();
   for(const root of roots) for(const binding of root.dispatch??[]) {
     if(binding.attemptId!==attemptId) continue;
-    const key=`${root.source}\u0000${binding.sessionId}`;
+    const rootId=root.source==="claude_code" ? root.rootId : null;
+    const key=`${root.source}\u0000${binding.sessionId}\u0000${rootId??""}`;
     const prior=bySession.get(key);
     if(prior&&JSON.stringify(prior.binding)!==JSON.stringify(binding)) throw new Error("dispatch_restamp_binding_conflict");
-    bySession.set(key,{binding,source:root.source});
+    bySession.set(key,{binding,source:root.source,rootId});
   }
   if(!bySession.size) throw new Error("dispatch_attempt_not_found");
   let scanned=0,restamped=0,skipped=0,truncated=false;
-  for(const {binding,source} of bySession.values()) {
+  for(const {binding,source,rootId} of bySession.values()) {
     const expectedBinding=JSON.stringify(binding);
     const rows=buffer.database.prepare(`select raw.id,raw.payload_json as payloadJson,raw.observed_at as observedAt
       from buffered_events as raw where raw.source=? and raw.session_id=? and raw.observed_at>=?
         and (? is null or raw.observed_at<?) and json_valid(raw.payload_json)=1
         and json_extract(raw.payload_json,'$.metadata.workItemId') is null
+        and (? is null or json_extract(raw.payload_json,'$.metadata.captureRootId')=?)
         and raw.uploaded_at is null and raw.privacy_disposition is null
         and not exists (select 1 from upload_outbox as queued where queued.raw_rowid=raw.rowid
           and (queued.attempt_count>0 or queued.sealed_envelope_json is not null or queued.state<>'pending'))
       order by raw.rowid limit 5001`).all(source,binding.sessionId,binding.validFrom,
-        binding.validUntil,binding.validUntil) as Array<{ id:string;payloadJson:string;observedAt:string }>;
+        binding.validUntil,binding.validUntil,rootId,rootId) as Array<{ id:string;payloadJson:string;observedAt:string }>;
     if(rows.length>5000) truncated=true;
     for(const row of rows.slice(0,5000)) {
       scanned++;

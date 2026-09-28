@@ -7,7 +7,9 @@ import {
 } from "../../shared/src/index";
 import { sealOutboundEvent } from "./outbound-envelope";
 import { attachRepoContextSidecar, extractRepoContextCwd } from "./repo-context";
-import { dispatchBindingForSession, dispatchBindingMetadata } from "./capture-root-inventory";
+import { claudeBindingForUnrootedEvent, currentDispatchBindingSnapshot,
+  dispatchBindingMetadata, durableClaudeRootSessionSightings,
+  type DispatchBindingSnapshot } from "./capture-root-inventory";
 
 type ForwardedHookOptions = {
   config: CollectorConfig;
@@ -18,6 +20,8 @@ type ForwardedHookOptions = {
   firstReceivedAt?: string;
   producerEventId?: string;
   fallbackEventId?: string;
+  buffer?: LocalEventBuffer;
+  dispatchSnapshot?: DispatchBindingSnapshot;
 };
 
 export function appendForwardedHook(
@@ -45,8 +49,9 @@ export function normalizeForwardedHook(payload: unknown, options: ForwardedHookO
     fallbackEventId: options.fallbackEventId,
   });
   if (options.source === "claude_code" && normalized.event.sessionId) {
-    const binding = dispatchBindingForSession("claude_code", normalized.event.sessionId,
-      normalized.event.observedAt);
+    const binding = claudeBindingForUnrootedEvent(normalized.event.sessionId,
+      normalized.event.observedAt,options.dispatchSnapshot??currentDispatchBindingSnapshot(),
+      options.buffer ? durableClaudeRootSessionSightings(options.buffer.database,normalized.event.sessionId) : undefined);
     if (binding) normalized.event.metadata = {
       ...normalized.event.metadata, ...dispatchBindingMetadata(binding),
     };

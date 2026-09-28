@@ -207,6 +207,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-dispatch-stamping
 
+      - name: Prove Claude dispatch root safety and indexed intake (PR #429 review)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:claude-dispatch-review
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability
