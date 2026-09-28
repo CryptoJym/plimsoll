@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 22);
+const completion = createProofCompletion("retention", 27);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -990,7 +990,13 @@ try {
     await import(proof);
     completion.check(name);
   }
-  console.log(JSON.stringify({ status: "pass", checks: 22 }));
+  await import("../review-tests/legacy-receipts-upgrade.ts");
+  completion.check("legacy_null_receipt_l1_expires");
+  completion.check("legacy_null_receipt_l2_stays_held");
+  completion.check("legacy_null_receipt_l3_stays_private");
+  completion.check("legacy_null_receipt_collision_stays_held");
+  completion.check("legacy_null_receipt_late_collision_stays_unbound");
+  console.log(JSON.stringify({ status: "pass", checks: 27 }));
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

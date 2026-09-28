@@ -27,7 +27,7 @@ import {
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
-import { ensureUuidEventId } from "./upload-history";
+import { ensureUuidEventId, registerRetentionDeliveryId } from "./delivery-id";
 import { countRetentionHoldsOffThread } from "./retention-hold-count";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -36,7 +36,7 @@ import { promoteRuntimeLearningFacts } from "./runtime-facts";
 import { ensureWeeklyToolStatsSchema } from "./weekly-tool-stats";
 import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFinancePublicationDirty,
   advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
-import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import { legacyNullLineageReceiptMatchSql, terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
 import {
   canonicalRepoContextCwd,
@@ -277,8 +277,7 @@ export class LocalEventBuffer {
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
     this.db = new Database(path, { timeout });
-    this.db.function("retention_delivery_id", { deterministic: true },
-      (rawId: string) => ensureUuidEventId(rawId).id);
+    registerRetentionDeliveryId(this.db);
     this.db.pragma("journal_mode = WAL");
     this.deviceId = options.deviceId?.trim() || null;
     const newLedger = !this.db
@@ -863,6 +862,10 @@ export class LocalEventBuffer {
         : undefined,
     });
     markOpenStep("ledger.projection_schema");
+    // Small upgrades finish at open; large ledgers advance in bounded upload
+    // and retention turns, independently of the completed raw cursor.
+    this.delivery.backfillLegacyReceiptLineage({ maxRows: 16, maxWriterMs: 50 });
+    markOpenStep("ledger.receipt_lineage_slice");
   }
 
   /**
@@ -3155,6 +3158,14 @@ export class LocalEventBuffer {
           and unacknowledged.raw_created_at = e.created_at
           and unacknowledged.raw_generation is e.privacy_generation
           and unacknowledged.terminal_state <> 'acknowledged'
+      ) or exists (
+        -- Until the bounded lineage repair proves an owner, a legacy remote
+        -- rejection can only add a hold. It must never waive one.
+        select 1 from upload_receipts legacy_unacknowledged
+        where ${legacyNullLineageReceiptMatchSql("e", "legacy_unacknowledged")}
+          and legacy_unacknowledged.terminal_state = 'dead'
+          and legacy_unacknowledged.reason in
+            ('remote_validation_rejected', 'remote_rejected_exhausted')
       ))
     )))`;
   }
@@ -3172,6 +3183,7 @@ export class LocalEventBuffer {
     const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
     const now = options.now ?? new Date();
     const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1_000).toISOString();
+    this.delivery.backfillLegacyReceiptLineage({ maxRows: Math.min(maxRows, 256), maxWriterMs: 100 });
     // Seek through a bounded raw candidate page BEFORE checking migration.
     // A protected prefix must neither cause a full scan nor hide later rows.
     const scanKey = "raw_retention_scan_v1";

@@ -1,5 +1,7 @@
 import type Database from "better-sqlite3";
 
+import { registerRetentionDeliveryId } from "./delivery-id";
+
 export type TerminalPrivacyReason =
   | "local_evidence_quarantined"
   | "local_privacy_violation";
@@ -12,6 +14,15 @@ function safeAlias(alias: string) {
     throw new Error("Privacy eligibility requires a simple SQL alias.");
   }
   return alias;
+}
+
+/** A NULL-lineage receipt is a candidate, never proof of ownership. */
+export function legacyNullLineageReceiptMatchSql(rawAlias: string, receiptAlias: string) {
+  const raw = safeAlias(rawAlias);
+  const receipt = safeAlias(receiptAlias);
+  return `(${receipt}.raw_rowid is null and ${receipt}.raw_id is null
+    and ${receipt}.raw_created_at is null and ${receipt}.raw_generation is null
+    and ${receipt}.delivery_id = retention_delivery_id(${raw}.id))`;
 }
 
 function tableExists(db: Database.Database, table: string) {
@@ -64,13 +75,15 @@ export function terminalPrivacyEligibilitySql(
     const receiptColumns = columns(db, "upload_receipts");
     const receiptLineage = ["raw_rowid", "raw_id", "raw_created_at", "raw_generation"]
       .every((column) => receiptColumns.has(column)) && rawColumns.has("privacy_generation");
+    if (receiptLineage) registerRetentionDeliveryId(db);
     terms.push(
       `not exists (
          select 1 from upload_receipts privacy_receipt
-         where ${receiptLineage ? `privacy_receipt.raw_rowid = ${alias}.rowid
+         where ${receiptLineage ? `((privacy_receipt.raw_rowid = ${alias}.rowid
            and privacy_receipt.raw_id = ${alias}.id
            and privacy_receipt.raw_created_at = ${alias}.created_at
-           and privacy_receipt.raw_generation is ${alias}.privacy_generation` :
+           and privacy_receipt.raw_generation is ${alias}.privacy_generation)
+           or ${legacyNullLineageReceiptMatchSql(alias, "privacy_receipt")})` :
            `privacy_receipt.delivery_id = ${alias}.id`}
            and privacy_receipt.reason in (${TERMINAL_REASONS_SQL})
        )`,

@@ -11,7 +11,8 @@ import {
   collectorBufferPath,
   collectorLogPath,
 } from "./config";
-import { deterministicEventId } from "./normalizer";
+import { ensureUuidEventId } from "./delivery-id";
+export { ensureUuidEventId, POSTGRES_UUID_RE } from "./delivery-id";
 import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -49,28 +50,6 @@ import {
  * - Honest numbers: unpriced events stay unpriced in the audit; cost is only
  *   summed over events that carry a real costUsd.
  */
-
-/**
- * Postgres accepts any RFC-shaped hex UUID for a uuid column regardless of
- * version bits, and the daemon uploads ledger ids verbatim — so passthrough
- * must accept exactly what Postgres accepts. Re-deriving an id the daemon
- * could upload as-is would split one ledger row into two cloud rows.
- */
-export const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * Deterministic UUID for ledger ids the cloud's uuid column would reject
- * (e.g. pre-normalizer hook ids). Same ledger id → same UUID on every run, so
- * the cloud ingest dedupes re-sends; the raw local id is never exported.
- * Reuses the repo's deterministicEventId (sha256 → version-5/variant-9 shape)
- * with a fixed namespace part.
- */
-export function ensureUuidEventId(rawId: string): { id: string; derived: boolean } {
-  if (POSTGRES_UUID_RE.test(rawId)) {
-    return { id: rawId, derived: false };
-  }
-  return { id: deterministicEventId(["workspace-backfill", rawId]), derived: true };
-}
 
 /** Stable alternate namespace for a legacy ID whose default UUID is already owned. */
 export function collisionSafeDeliveryId(rawId: string, attempt: number): string {
