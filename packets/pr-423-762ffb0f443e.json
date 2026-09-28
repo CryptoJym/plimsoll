@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 423,
+  "headSha": "762ffb0f443ea112a8887eb4aa43ecf01832cb28",
+  "reviewedAt": "2026-09-28T03:40:36Z",
+  "reviewer": {
+    "runtime": "claude-code",
+    "session": "f4023139-6838-412e-a325-7fdbdcf61a0a",
+    "model": "claude-opus-5-5",
+    "host": "studio0"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0e417-562b-7be2-9628-367dd344c487"
+    }
+  ],
+  "summary": "Lead review of the final head: the session-summary proofs judge behavior, not host speed. Removed wall-clock assertions reappear as contract bounds (drainBound per rows and elapsed time) or behavior checks (rows visible, revision and dirty state, fallback counts, completion); the live-churn schedule is exact (2 appends per 3 s) and a scanned-row correction must trigger the ledger_mutation fallback. The one product change is a proof-only read deadline gated by PLIMSOLL_PROOF_ROOT; production keeps 250 ms. CI proof green on 762ffb0f; Codex review of this head clean."
+}
