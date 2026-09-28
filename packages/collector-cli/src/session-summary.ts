@@ -179,17 +179,20 @@ function columnNames(db: Database.Database, table: string): Set<string> {
  */
 function unscannedRowSql(sessionId: string, rowid: string, observedAt: string): string {
   return `exists (select 1 from session_sync_summary_state s
-    where s.session_id = ${sessionId} and json_valid(s.accumulator_json)
+    where s.session_id = ${sessionId} and s.scan_boundary is not null
       and (
         ((s.complete = 1 or s.mode = 'incremental') and ${rowid} > s.high_water)
-        or (s.complete = 0 and s.mode != 'incremental' and
-          ((${rowid} > json_extract(s.accumulator_json, '$.scanBoundary') and ${rowid} > s.high_water)
-           or (${rowid} <= json_extract(s.accumulator_json, '$.scanBoundary') and
-             (json_extract(s.accumulator_json, '$.cursorObservedAt') is null
-              or ${observedAt} > json_extract(s.accumulator_json, '$.cursorObservedAt')
-              or (${observedAt} = json_extract(s.accumulator_json, '$.cursorObservedAt') and
-                  ${rowid} > json_extract(s.accumulator_json, '$.cursorRowid')))))
-      )))`;
+        or (
+          s.complete = 0 and s.mode != 'incremental' and (
+            (${rowid} > s.scan_boundary and ${rowid} > s.high_water)
+            or (${rowid} <= s.scan_boundary and (
+              s.cursor_observed_at is null
+              or ${observedAt} > s.cursor_observed_at
+              or (${observedAt} = s.cursor_observed_at and ${rowid} > s.cursor_rowid)
+            ))
+          )
+        )
+      ))`;
 }
 
 function outboxLineageMismatchSql(outbox: string, event: string): string {
@@ -254,6 +257,29 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   // must restore its own revision marks on downgrade. Remove those old-name
   // triggers on re-upgrade; the scanned-aware triggers have distinct names.
   db.transaction(() => {
+    if (tableExists(db, "session_sync_summary_state") &&
+        !columnNames(db, "session_sync_summary_state").has("scan_boundary")) {
+      // One pass over the small state table replaces parsing the growing JSON
+      // on every event mutation. No buffered_events scan or index build occurs.
+      db.exec(`alter table session_sync_summary_state add column scan_boundary integer;
+        alter table session_sync_summary_state add column cursor_observed_at text;
+        alter table session_sync_summary_state add column cursor_rowid integer;
+        update session_sync_summary_state set
+          scan_boundary = case when json_valid(accumulator_json)
+            then json_extract(accumulator_json, '$.scanBoundary') end,
+          cursor_observed_at = case when json_valid(accumulator_json)
+            then json_extract(accumulator_json, '$.cursorObservedAt') end,
+          cursor_rowid = case when json_valid(accumulator_json)
+            then json_extract(accumulator_json, '$.cursorRowid') end;`);
+    }
+    // IF NOT EXISTS would otherwise leave old JSON-parsing triggers active.
+    const jsonTriggers = db.prepare(`select name from sqlite_master
+      where type = 'trigger' and name like 'trg_session_summary_%'
+        and sql like '%accumulator_json%'`).all() as Array<{ name: string }>;
+    for (const { name } of jsonTriggers) {
+      if (!/^trg_session_summary_[a-z0-9_]+$/.test(name)) throw new Error("invalid_summary_trigger_name");
+      db.exec(`drop trigger ${name}`);
+    }
     // Existing 0.7.40 ledgers have this trigger. An append is outside the
     // leased snapshot; only edits and erasures of existing rows need a fence.
     for (const trigger of leaseTriggers) {
@@ -262,8 +288,8 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
         db.exec(`drop trigger ${trigger.name}`);
       }
     }
-    if (rawInsertTrigger && !rawInsertTrigger.sql.includes("scanBoundary")) {
-      db.exec("drop trigger trg_session_summary_raw_insert");
+    if (rawInsertTrigger && !rawInsertTrigger.sql.includes("scan_boundary")) {
+      db.exec("drop trigger if exists trg_session_summary_raw_insert");
     }
     const legacySummaryTriggers = db.prepare(`select name from sqlite_master where type='trigger'
       and name in ('trg_session_summary_raw_update', 'trg_session_summary_raw_delete',
@@ -284,6 +310,9 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     create table if not exists session_sync_summary_state (
       session_id text primary key,
       state_generation integer not null default 0 check (state_generation >= 0),
+      scan_boundary integer,
+      cursor_observed_at text,
+      cursor_rowid integer,
       schema_version integer not null,
       high_water integer not null check (high_water >= 0),
       checkpoint_id text,
@@ -431,8 +460,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           where session_id = new.session_id and
             (high_water >= new.rowid or
              (complete = 0 and mode != 'incremental' and
-              (case when json_valid(accumulator_json)
-                then json_extract(accumulator_json, '$.scanBoundary') end) >= new.rowid)))
+              scan_boundary >= new.rowid)))
         on conflict(session_id) do update set
           reason = excluded.reason, updated_at = excluded.updated_at;
     end;
@@ -463,8 +491,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           select 1 from session_sync_summary_state s where s.session_id = new.session_id
             and new.rowid > s.high_water
             and (s.complete = 1 or s.mode = 'incremental' or
-                 (json_valid(s.accumulator_json) and
-                  new.rowid > json_extract(s.accumulator_json, '$.scanBoundary')))
+                 new.rowid > s.scan_boundary)
         )
         on conflict(raw_rowid) do update set
           session_id = excluded.session_id, created_at = excluded.created_at;
@@ -1332,12 +1359,17 @@ function writeState(db: Database.Database, state: SummaryState): void {
   const nextGeneration = state.stateGeneration + 1;
   db.prepare(
     `insert into session_sync_summary_state
-       (session_id, state_generation, schema_version, high_water, checkpoint_id, covered_until, complete,
+       (session_id, state_generation, scan_boundary, cursor_observed_at, cursor_rowid,
+        schema_version, high_water, checkpoint_id, covered_until, complete,
         mutation_revision, mode, accumulator_json, updated_at)
-     values (@sessionId, @stateGeneration, @schemaVersion, @highWater, @checkpointId, @coveredUntil, @complete,
+     values (@sessionId, @stateGeneration, @scanBoundary, @cursorObservedAt, @cursorRowid,
+       @schemaVersion, @highWater, @checkpointId, @coveredUntil, @complete,
        @mutationRevision, @mode, @accumulatorJson, @updatedAt)
      on conflict(session_id) do update set
        state_generation=excluded.state_generation,
+       scan_boundary=excluded.scan_boundary,
+       cursor_observed_at=excluded.cursor_observed_at,
+       cursor_rowid=excluded.cursor_rowid,
        schema_version=excluded.schema_version, high_water=excluded.high_water,
        checkpoint_id=excluded.checkpoint_id, covered_until=excluded.covered_until,
        complete=excluded.complete, mutation_revision=excluded.mutation_revision,
@@ -1346,6 +1378,9 @@ function writeState(db: Database.Database, state: SummaryState): void {
   ).run({
     sessionId: state.sessionId,
     stateGeneration: nextGeneration,
+    scanBoundary: state.accumulator.scanBoundary,
+    cursorObservedAt: state.accumulator.cursorObservedAt,
+    cursorRowid: state.accumulator.cursorRowid,
     schemaVersion: state.schemaVersion,
     highWater: state.highWater,
     checkpointId: state.checkpointId,

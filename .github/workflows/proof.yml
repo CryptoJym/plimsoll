@@ -356,6 +356,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-checkpoint-window
 
+      - name: Prove long-session trigger writes fit the 750 ms writer budget (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-trigger-writer-burst
+
       - name: Prove an append during segment repair enters the wire once (eco-6hoxj.163.106)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-queued-append-repair
