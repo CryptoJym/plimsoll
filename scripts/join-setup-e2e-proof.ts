@@ -92,10 +92,12 @@ function stubLaunchctl(bin: string) {
     'fi',
     'if [ "$1" = "bootstrap" ] || [ "$1" = "kickstart" ]; then',
     '  if [ -f "$state" ] && kill -0 "$(cat "$state")" 2>/dev/null; then exit 70; fi',
-    '  "$PLIMSOLL_PROOF_NODE" "$PLIMSOLL_PROOF_CLI" start >> "$PLIMSOLL_PROOF_DAEMON_LOG" 2>&1 </dev/null &',
+    '  plist="${3:-$HOME/Library/LaunchAgents/com.plimsoll.collector.plist}"',
+    '  cli="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$plist")" || exit 68',
+    '  "$PLIMSOLL_PROOF_NODE" "$cli" start >> "$PLIMSOLL_PROOF_DAEMON_LOG" 2>&1 </dev/null &',
     '  pid=$!',
     '  printf "%s\\n" "$pid" > "$state"',
-    '  printf "bootstrap %s\\n" "$pid" >> "$trace"',
+    '  printf "bootstrap %s %s\\n" "$pid" "$cli" >> "$trace"',
     '  exit 0',
     'fi',
     'exit 64',
@@ -254,13 +256,14 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       fs.mkdirSync(path.dirname(studio), { recursive: true, mode: 0o700 });
       fs.symlinkSync(privateFolder, studio);
     }
-    if (name === "partial_roots") {
+    if (name === "partial_roots" || name === "mixed_roots") {
       const claude = path.join(f.home, ".claude", "projects");
       fs.mkdirSync(claude, { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(path.dirname(claude), "settings.json"), '{"permissions":{}}\n', { mode: 0o600 });
       fs.writeFileSync(path.join(claude, `${studioSession}.jsonl`), '{"type":"user","message":{}}\n',
         { mode: 0o600 });
-      fs.symlinkSync(path.join(f.home, "missing-target"), path.join(claude, "ambiguous.jsonl"));
+      if (name === "partial_roots")
+        fs.symlinkSync(path.join(f.home, "missing-target"), path.join(claude, "ambiguous.jsonl"));
     }
     fs.writeFileSync(path.join(path.dirname(studio), "config.toml"),
       'model = "gpt-6-sol"\n', { mode: 0o600 });
@@ -281,7 +284,9 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         `${JSON.stringify(collectorConfigSchema.parse({ port: Number(f.env.PLIMSOLL_PROOF_JOIN_PORT),
           ...(fleetRoot.length ? { captureRoots: fleetRoot,
             enrollmentMachineLabel: "fleet-label-not-hostname" } : {}) }), null, 2)}\n`, { mode: 0o600 });
-      const installed = await command(f.env, ["install-launch-agent", "--load"]);
+      const installed = await command(f.env, ["install-launch-agent", "--load"], "",
+        name === "running_0744_layout" && process.env.PLIMSOLL_PROOF_0744_CLI
+          ? process.env.PLIMSOLL_PROOF_0744_CLI : f.installedCli);
       check(`${name}_fixture_collector_started_before_join`, installed.code === 0 && fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
       if (name === "crash_after_bootout") f.env.PLIMSOLL_PROOF_CRASH_AFTER_BOOTOUT = "1";
@@ -369,16 +374,27 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
       return;
     }
-    check(`${name}_registers_exactly_two_native_folders`, config.captureRoots?.length === 2 &&
+    const expectedRoots = name === "mixed_roots" ? 3 : 2;
+    check(`${name}_registers_native_folders_together`, config.captureRoots?.length === expectedRoots &&
       config.captureRoots.some((entry) => entry.directory === studio && entry.source === "codex") &&
       config.captureRoots.some((entry) => entry.directory === codex && entry.source === "codex") &&
+      (name !== "mixed_roots" || config.captureRoots.some((entry) =>
+        entry.directory === path.join(f.home, ".claude", "projects") && entry.source === "claude_code")) &&
       !config.captureRoots.some((entry) => entry.directory === unrelated));
+    if (name === "mixed_roots") {
+      const receipts = fs.readdirSync(path.join(f.data, "receipts"))
+        .filter((file) => file.startsWith("capture-roots-add-") && file.endsWith(".json"));
+      const batch = receipts.length === 1 ? JSON.parse(fs.readFileSync(
+        path.join(f.data, "receipts", receipts[0]!), "utf8")) as { addedRoots?: unknown[] } : null;
+      check("mixed_sources_commit_in_one_root_add_receipt", receipts.length === 1 &&
+        batch?.addedRoots?.length === 3);
+    }
     if (name === "fleet_label") check("join_reuses_persisted_nonhostname_fleet_label",
       config.enrollmentMachineLabel === "fleet-label-not-hostname" &&
       config.captureRoots?.some((entry) => entry.rootId ===
         deriveCaptureRootIdentity("fleet-label-not-hostname", "codex", studio).rootId));
-    check(`${name}_announces_folders_before_capture`, joined.stdout.indexOf("Will record 2 agent folders") >= 0 &&
-      joined.stdout.indexOf("Will record 2 agent folders") < joined.stdout.indexOf('"status":'));
+    check(`${name}_announces_folders_before_capture`, joined.stdout.indexOf(`Will record ${expectedRoots} agent folders`) >= 0 &&
+      joined.stdout.indexOf(`Will record ${expectedRoots} agent folders`) < joined.stdout.indexOf('"status":'));
     check(`${name}_joined_forward_only`, result.enrollment?.mode === "future_only" &&
       result.enrollment?.quarantinedHistoryRows === 0 &&
       !remote.uploads.some((body) => body.includes("rollout-prejoin")));
@@ -390,12 +406,25 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     const trace = fs.readFileSync(f.trace, "utf8").trim().split("\n");
     check(`${name}_never_bootstraps_two_live_daemons`, trace.filter((line) => line.startsWith("bootstrap")).length >= 1 &&
       trace.every((line, index) => !line.startsWith("bootstrap") || index === 0 || trace[index - 1]?.startsWith("bootout")));
+    if (name === "running_0744_layout" && process.env.PLIMSOLL_PROOF_0744_CLI && mode === "ack") {
+      console.log(JSON.stringify({ scenario: "running_actual_0744", trace }));
+      check("running_0744_daemon_is_replaced_by_head_daemon",
+        trace[0]?.includes(fs.realpathSync(process.env.PLIMSOLL_PROOF_0744_CLI)) &&
+        trace.at(-1)?.includes(cli) && trace.filter((line) => line.startsWith("bootout")).length === 2);
+    }
     if (mode === "ack") {
       const ledger = new Database(path.join(f.data, "work-ledger.sqlite"), { readonly: true, fileMustExist: true });
-      const localEvents = dashboardSummary(ledger).totals.events;
+      const totals = dashboardSummary(ledger).totals;
+      const localEvents = totals.events;
       const setupRows = (ledger.prepare("select count(*) as n from buffered_events where id like 'join-setup-%'")
         .get() as { n: number }).n;
       ledger.close();
+      const uploadedIds = remote.uploads.flatMap((body) =>
+        (JSON.parse(body) as { events?: Array<{ event: { id: string } }> }).events?.map((row) => row.event.id) ?? []);
+      check(`${name}_contact_adds_no_local_event_or_usage`, localEvents === 0 &&
+        totals.inputTokens === 0 && totals.outputTokens === 0 && totals.costUsd === 0 && setupRows === 0);
+      check(`${name}_contact_reuses_acknowledged_cloud_event_id`, uploadedIds.length >= 2 &&
+        new Set(uploadedIds).size === 1 && remote.uniqueEvents.size === 1);
       const finished = joined.code === 0 && result.status === "joined" &&
         result.daemon?.running === true && result.daemon?.readinessVerified === true &&
         result.daemon?.syncArmed === true && result.firstContactKind === "handshake_replay" &&
@@ -426,18 +455,24 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
   }
 }
 
-async function joinOnlyScenario(name: string, option: "--no-daemon" | "ci") {
+async function joinOnlyScenario(name: string, option: "--no-daemon" | "ci" | "positional") {
   const remote = await cloud("ack");
   const f = fixture(name, await collectorPort(remote.port));
   try {
     if (option === "ci") f.env.CI = "true";
-    const joined = await command(f.env, ["join", "--token-stdin", "--url", `http://127.0.0.1:${remote.port}`,
-      ...(option === "--no-daemon" ? ["--no-daemon"] : [])], `${token}\n`, f.installedCli);
+    const joined = option === "positional"
+      ? await command(f.env, ["join", `http://127.0.0.1:${remote.port}#${token}`, "--no-daemon"],
+        "", f.installedCli)
+      : await command(f.env, ["join", "--token-stdin", "--url", `http://127.0.0.1:${remote.port}`,
+        ...(option === "--no-daemon" ? ["--no-daemon"] : [])], `${token}\n`, f.installedCli);
     const result = receipt(joined.stdout);
     check(`${name}_join_only_keeps_daemon_absent`, joined.code === 0 && result.status === "joined" &&
       result.daemon?.setup === "skipped" && !fs.existsSync(f.state) &&
       !fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")) &&
       remote.uploads.length === 1);
+    if (option === "positional") check("positional_join_warns_to_use_token_prompt",
+      joined.stderr.includes("Use --token-prompt") &&
+      !joined.stderr.includes(token) && !joined.stdout.includes(token));
   } finally { await stopFixture(f.env, f.state); await remote.close(); }
 }
 
@@ -458,6 +493,9 @@ async function refusedScenario(name: string, network: boolean) {
 
 async function main() {
   check("packaged_cli_exists", fs.statSync(cli).isFile());
+  const help = await command(process.env, ["--help"]);
+  check("join_help_omits_positional_token_form", help.code === 0 &&
+    help.stdout.includes("join --token-prompt --url") && !help.stdout.includes("#<token>"));
   try {
     if (process.env.PR428_REVIEW_SCENARIO === "fresh_only") {
       await joinedScenario("fresh", false, "ack");
@@ -491,6 +529,10 @@ async function main() {
       await joinedScenario("fleet_label", true, "ack");
       return;
     }
+    if (process.env.PR428_REVIEW_SCENARIO === "mixed_roots") {
+      await joinedScenario("mixed_roots", false, "ack");
+      return;
+    }
     if (process.env.PR428_REVIEW_SCENARIO === "symlink_private") {
       await joinedScenario("symlink_private", false, "ack");
       return;
@@ -505,8 +547,10 @@ async function main() {
     }
     await joinedScenario("fresh", false, "ack");
     await joinedScenario("running_0744_layout", true, "ack");
+    await joinedScenario("mixed_roots", false, "ack");
     await joinedScenario("missing_ack", false, "no_ack");
     await joinOnlyScenario("explicit_no_daemon", "--no-daemon");
+    await joinOnlyScenario("positional_compatibility", "positional");
     await joinOnlyScenario("ci_home", "ci");
     await refusedScenario("refused_token", false);
     await refusedScenario("network_failure", true);
