@@ -4,6 +4,8 @@ import type Database from "better-sqlite3";
 
 import { jsonlScanStateKey } from "./jsonl-byte-tailer";
 import { captureRecordLossGaps } from "./capture-record-loss";
+import { CaptureGapWriteError, captureFileKeyDigest, declareUnresolvedFileGap, fileGapId,
+  resolveCaptureGap } from "./lean/capture-gaps";
 
 /**
  * Capture watermark v1 (eco-6hoxj.163.18) — the capture half.
@@ -103,6 +105,11 @@ export type CaptureCoverageFile = {
   progress: number;
   /** The tailer has read everything the file holds now. */
   fullyRead: boolean;
+  /** The exact tailer generation, when the walk could stat or read it. */
+  generationIdentity?: string;
+  unresolvedKind?: string | null;
+  /** Bytes still outside the durable cursor; whole-file tailers supply size. */
+  unreadBytes?: number;
   /**
    * A symlink the tailer does not follow: never read, so never covered. Its
    * `key` is never a file's, and `mtimeMs` is the time the walk saw it (the
@@ -568,11 +575,12 @@ type JsonlCoverageCursorRow = {
   deferredBytes: number | null;
   workRemaining: number | null;
   unresolvedKind: string | null;
+  fileIdentity: string | null;
 };
 
 const JSONL_COVERAGE_CURSOR_COLUMNS = `size, committed_offset as committedOffset,
   deferred_bytes as deferredBytes, work_remaining as workRemaining,
-  unresolved_kind as unresolvedKind`;
+  unresolved_kind as unresolvedKind, file_identity as fileIdentity`;
 
 function jsonlCursorComplete(row: JsonlCoverageCursorRow, extent: number) {
   return (row.committedOffset ?? row.size) >= extent &&
@@ -584,6 +592,9 @@ function missingJsonlCoverageFile(key: string, row: JsonlCoverageCursorRow | und
     key, mtimeMs: Date.now(), birthtimeMs: 0, extent: Math.max(1, row?.size ?? 1),
     progress: row ? row.committedOffset ?? row.size : -1,
     fullyRead: row !== undefined && jsonlCursorComplete(row, row.size),
+    generationIdentity: row?.fileIdentity ?? undefined,
+    unresolvedKind: row?.unresolvedKind,
+    unreadBytes: Math.max(0, (row?.size ?? 1) - (row?.committedOffset ?? 0)),
   };
 }
 
@@ -591,7 +602,7 @@ export function jsonlCoverageCheck(database: Database.Database) {
   const cursor = database.prepare(
     `select ${JSONL_COVERAGE_CURSOR_COLUMNS} from rollout_scan_state where file = ?`,
   );
-  return (cursorKey: string, stat: fs.Stats | null): CaptureCoverageFile | null => {
+  return (cursorKey: string, stat: fs.Stats | null, generationIdentity?: string): CaptureCoverageFile | null => {
     // The tailers never read a symlinked JSONL file or descend through a
     // symlinked directory (review r4, S1).
     if (stat?.isSymbolicLink()) return linkCoverageFile(jsonlScanStateKey(`${cursorKey}\0symlink`), stat.birthtimeMs);
@@ -612,9 +623,25 @@ export function jsonlCoverageCheck(database: Database.Database) {
       birthtimeMs: stat.birthtimeMs,
       extent: stat.size,
       progress: committed,
-      fullyRead: row !== undefined && jsonlCursorComplete(row, stat.size),
+      fullyRead: row !== undefined && jsonlCursorComplete(row, stat.size) &&
+        (row.fileIdentity === null || row.fileIdentity === generationIdentity),
+      generationIdentity,
+      unresolvedKind: row?.unresolvedKind,
+      unreadBytes: Math.max(0, stat.size - Math.max(0, committed)),
     };
   };
+}
+
+/** Match the tailer's precise inode/birth-time identity without following a link. */
+export function jsonlCoverageIdentity(file: string, normal: fs.Stats | null): string | undefined {
+  if (!normal?.isFile()) return undefined;
+  let precise: fs.BigIntStats;
+  try { precise = fs.lstatSync(file, { bigint: true }); }
+  catch { return undefined; }
+  if (!precise.isFile() || BigInt(normal.dev) !== precise.dev ||
+      BigInt(normal.ino) !== precise.ino || BigInt(normal.size) !== precise.size ||
+      Math.abs(normal.birthtimeMs - Number(precise.birthtimeNs) / 1_000_000) > 1) return undefined;
+  return `${precise.dev}:${precise.ino}:${precise.birthtimeNs}`;
 }
 
 /**
@@ -712,9 +739,14 @@ export function ensureCaptureFrontierSchema(database: Database.Database): void {
       last_write_at text not null,
       seen_extent real not null,
       seen_at text not null,
+      gap_id text,
       primary key (workspace_id, installation_epoch_id, source, file_key)
     ) without rowid;
   `);
+  const columns = database.pragma("table_info(capture_uncovered_files)") as Array<{name:string}>;
+  if (!columns.some((column) => column.name === "gap_id")) {
+    database.exec("alter table capture_uncovered_files add column gap_id text");
+  }
 }
 
 function tableExists(database: Database.Database, name: string) {
@@ -817,7 +849,8 @@ export function applyCaptureCoverage(
   const run = database.transaction(() => {
     if (!stillCurrent(database, check)) return;
     const read = database.prepare(
-      `select uncovered_since as since, last_write_at as lastWriteAt, seen_extent as seenExtent, seen_at as seenAt
+      `select uncovered_since as since, last_write_at as lastWriteAt, seen_extent as seenExtent,
+         seen_at as seenAt, gap_id as gapId
        from capture_uncovered_files
        where workspace_id = ? and installation_epoch_id = ? and source = ? and file_key = ?`,
     );
@@ -827,15 +860,34 @@ export function applyCaptureCoverage(
     );
     const upsert = database.prepare(
       `insert into capture_uncovered_files
-         (workspace_id, installation_epoch_id, source, file_key, uncovered_since, last_write_at, seen_extent, seen_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?)
+         (workspace_id, installation_epoch_id, source, file_key, uncovered_since, last_write_at,
+          seen_extent, seen_at, gap_id)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?)
        on conflict (workspace_id, installation_epoch_id, source, file_key) do update set
          uncovered_since = excluded.uncovered_since, last_write_at = excluded.last_write_at,
-         seen_extent = excluded.seen_extent, seen_at = excluded.seen_at`,
+         seen_extent = excluded.seen_extent, seen_at = excluded.seen_at,
+         gap_id = excluded.gap_id`,
     );
+    const gapIdFor = (file: CaptureCoverageFile) => fileGapId({
+      installationEpochId: check.installationEpochId, source: check.source,
+      fileKeyDigest: captureFileKeyDigest(file.key), generationIdentity: file.generationIdentity,
+    });
+    const declare = (file: CaptureCoverageFile) => {
+      const reason = file.unresolvedKind === "record_exceeds_byte_budget" ||
+        file.unresolvedKind === "generation_rewrite_ambiguous"
+        ? file.unresolvedKind : "tailer_unread";
+      return declareUnresolvedFileGap(database, {
+        workspaceId: check.workspaceId, installationEpochId: check.installationEpochId,
+        epochStartMs: check.epochStartMs, source: check.source,
+        fileKeyDigest: captureFileKeyDigest(file.key), generationIdentity: file.generationIdentity,
+        reason, lastWriteAtMs: Math.max(0, Math.trunc(file.mtimeMs)),
+        unreadBytes: Math.max(0, Math.trunc(file.unreadBytes ??
+          (check.source === "grok" ? 0 : file.extent - Math.max(0, file.progress)))),
+      }).gapId;
+    };
     for (const file of files) {
       const row = read.get(...scope, file.key) as
-        | { since: string; lastWriteAt: string; seenExtent: number; seenAt: string }
+        | { since: string; lastWriteAt: string; seenExtent: number; seenAt: string; gapId: string | null }
         | undefined;
       if (file.link) {
         // Nothing behind a link is read: uncovered from its creation, within
@@ -844,10 +896,15 @@ export function applyCaptureCoverage(
         const linkBorn = Number.isFinite(file.birthtimeMs) && file.birthtimeMs > 0 ? file.birthtimeMs : check.epochStartMs;
         const since = row ? row.since : isoMs(Math.min(check.startedMs, Math.max(check.epochStartMs, linkBorn)));
         const seenMs = Math.max(file.mtimeMs, row ? Date.parse(row.lastWriteAt) : 0);
-        upsert.run(...scope, file.key, since, isoMs(seenMs), -1, check.startedAt);
+        const gapId = declare(file);
+        upsert.run(...scope, file.key, since, isoMs(seenMs), -1, check.startedAt, gapId);
         continue;
       }
-      if (file.fullyRead || file.mtimeMs < check.epochStartMs) {
+      // An old mtime does not prove that the file lacks in-epoch event stamps.
+      if (file.fullyRead) {
+        if (row?.gapId && row.gapId === gapIdFor(file)) {
+          resolveCaptureGap(database, row.gapId, check.startedMs);
+        }
         if (row) remove.run(...scope, file.key);
         continue;
       }
@@ -869,7 +926,9 @@ export function applyCaptureCoverage(
         sinceMs = Math.max(check.epochStartMs, born ?? check.epochStartMs);
       }
       const lastWriteMs = Math.max(file.mtimeMs, row ? Date.parse(row.lastWriteAt) : 0);
-      upsert.run(...scope, file.key, isoMs(sinceMs), isoMs(lastWriteMs), file.extent, check.startedAt);
+      const gapId = declare(file);
+      upsert.run(...scope, file.key, isoMs(sinceMs), isoMs(lastWriteMs), file.extent,
+        check.startedAt, gapId);
     }
   });
   run.immediate();
@@ -887,6 +946,13 @@ export function finishCaptureCoverage(database: Database.Database, check: Captur
     const state = frontierState(database, check);
     const previous = state?.completeThrough ?? null;
     if (!stillCurrent(database, check) || (state && !(check.startedMs > Date.parse(state.checkedAt)))) return previous;
+    const missingGap = database.prepare(`select 1 from capture_uncovered_files u
+      left join capture_gaps g on g.gap_id=u.gap_id
+      where u.workspace_id=? and u.installation_epoch_id=? and u.source=?
+        and (u.gap_id is null or g.gap_id is null or g.resolved_at_ms is not null)
+      limit 1`).get(check.workspaceId, check.installationEpochId, check.source);
+    if (missingGap) throw new CaptureGapWriteError(check.source, null,
+      new Error("capture_coverage_gap_proof_missing"));
     const hold = database
       .prepare(
         `select min(uncovered_since) as since from capture_uncovered_files

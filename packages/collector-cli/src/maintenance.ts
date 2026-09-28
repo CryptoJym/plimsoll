@@ -874,8 +874,9 @@ export class CollectorMaintenance {
         }
         this.coverageWalks = null;
       }
-    } catch {
+    } catch (error) {
       // A failed check leaves the frontier where it was; capture goes on.
+      this.buffer.captureDurability.reportGapFailure(error);
       this.coverageWalks?.forEach(({ walk }) => walk.close());
       this.coverageWalks = null;
     }

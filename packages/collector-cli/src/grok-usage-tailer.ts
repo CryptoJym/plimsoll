@@ -915,6 +915,8 @@ export class GrokUsageTailer {
           extent: mtimeMs,
           progress: committed ? row.mtimeMs : -1,
           fullyRead: committed && sameIdentity(row, stat),
+          generationIdentity: [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":"),
+          unreadBytes: committed && sameIdentity(row, stat) ? 0 : Number(stat.size),
         };
       },
       checkLink: (link) => {

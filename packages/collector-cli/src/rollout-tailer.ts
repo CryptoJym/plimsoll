@@ -50,7 +50,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, jsonlCoverageIdentity, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import { CaptureRevisitQueue } from "./capture-revisit-queue";
 import { recordCaptureRecordLoss } from "./capture-record-loss";
 import { captureFileKeyDigest, declareUnresolvedFileGap, fileGapId,
@@ -465,7 +465,7 @@ export class RolloutTailer {
       }, this.coverageDirectoryCache, depth),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
-        const checked = verdict(this.cursorKey(file), stat);
+        const checked = verdict(this.cursorKey(file), stat, jsonlCoverageIdentity(file, stat));
         if (checked && stat?.isFile() && !checked.fullyRead) {
           const baselineSize = baselineComplete
             ? captureBaselineExcludedSize(this.buffer.database, "codex", baselineObservation(file, stat)) : null;

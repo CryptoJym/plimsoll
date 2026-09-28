@@ -116,8 +116,9 @@ export function declareUnresolvedFileGap(db: Database.Database, input: FileGapIn
       'unknown',@reason,@fileKeyDigest,@unreadBytes)
     on conflict(gap_id) do update set
       reason=excluded.reason, unread_bytes=excluded.unread_bytes,
+      ended_at_ms=null, resolved_at_ms=null,
       revision=capture_gaps.revision+1, upload_state='pending'
-    where capture_gaps.resolved_at_ms is null and
+    where capture_gaps.resolved_at_ms is not null or
       (capture_gaps.reason is not excluded.reason or
        capture_gaps.unread_bytes is not excluded.unread_bytes)`).run({
     ...input, gapId, machineHash: input.machineHash ?? MACHINE_HASH,
