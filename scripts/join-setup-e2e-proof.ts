@@ -340,6 +340,8 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
           ? fs.readFileSync(f.env.PLIMSOLL_PROOF_DAEMON_LOG!, "utf8").slice(-1200) : null,
       })}`);
       check(`${name}_fixture_collector_started_before_join`, true);
+      if (name === "corrupt_obligation_loaded")
+        fs.writeFileSync(path.join(f.data, "join.restart-obligation.json"), "", { mode: 0o600 });
       if (name === "crash_after_config_commit") {
         const buffer = new LocalEventBuffer(path.join(f.data, "work-ledger.sqlite"));
         try {
@@ -423,7 +425,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         'import fs from "node:fs";',
         'const tracked = new Set();',
         'const nativeOpen = fs.openSync, nativeFsync = fs.fsyncSync;',
-        'fs.openSync = (...args) => { const fd = nativeOpen(...args); if (process.argv[2] === "join" && String(args[0]).endsWith("/join.restart-obligation.json")) { tracked.add(fd); if (' + String(atOpen) + ') process.kill(process.pid, "SIGKILL"); } return fd; };',
+        'fs.openSync = (...args) => { const fd = nativeOpen(...args); if (process.argv[2] === "join" && String(args[0]).includes("/join.restart-obligation.json")) { tracked.add(fd); if (' + String(atOpen) + ') process.kill(process.pid, "SIGKILL"); } return fd; };',
         'fs.fsyncSync = (fd) => { nativeFsync(fd); if (process.argv[2] === "join" && tracked.has(fd)) process.kill(process.pid, "SIGKILL"); };',
       ].join("\n") + "\n", { mode: 0o600 });
       f.env.NODE_OPTIONS = `--import=${preload}`;
@@ -465,11 +467,15 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli);
       const retryResult = receipt(retry.stdout);
       const running = fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      const ownedTemplate = `${plist}.plimsoll-owned-template.json`;
+      const identityCount = fs.readdirSync(f.data).filter((entry) =>
+        /^launch-agent-template-[0-9a-f]{64}\.identity\.json$/.test(entry)).length;
+      const ownershipRepaired = fs.existsSync(ownedTemplate) && identityCount === 1;
       console.log(JSON.stringify({ scenario: name, firstExit: joined.code, plistLinks: stats?.nlink ?? null,
         retryExit: retry.code, retryStatus: retryResult.status, retryMessage: retryResult.message,
-        collectorRunningAfterRetry: running }));
+        collectorRunningAfterRetry: running, ownershipRepaired }));
       check("manifest_publish_crash_retry_recovers_and_serves", joined.code === null && retry.code === 0 &&
-        retryResult.status === "joined" && running);
+        retryResult.status === "joined" && running && ownershipRepaired);
       return;
     }
     if (name.startsWith("crash_obligation_")) {
@@ -574,6 +580,20 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     }
     if (prompt) check("fresh_prompt_hides_token_and_exits", true);
     const result = receipt(joined.stdout);
+    if (name === "corrupt_obligation_loaded") {
+      const notes = fs.readdirSync(f.data).filter((entry) =>
+        entry.startsWith("join.restart-obligation.recovery-") && entry.endsWith(".json"));
+      const aside = fs.readdirSync(f.data).filter((entry) =>
+        entry.startsWith("join.restart-obligation.json.unreadable-"));
+      const runningAfter = fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      console.log(JSON.stringify({ scenario: name, joinCode: joined.code, joinStatus: result.status,
+        recoveryNotes: notes.length, asideFiles: aside.length, runningAfter }));
+      check("unreadable_preunload_obligation_is_set_aside_only_with_verified_service",
+        joined.code === 0 && result.status === "joined" && notes.length === 1 &&
+        aside.length === 1 && runningAfter);
+      return;
+    }
     if (name === "fresh" && process.env.PLIMSOLL_PROOF_TRANSCRIPT === "1") {
       console.log(JSON.stringify({ scenario: "fresh_transcript", lines: joined.stdout.split("\n")
         .filter((line) => line.startsWith("Will record ") ||
@@ -865,6 +885,10 @@ async function main() {
     if (process.env.PR428_REVIEW_SCENARIO === "crash_obligation_open" ||
         process.env.PR428_REVIEW_SCENARIO === "crash_obligation_fsync") {
       await joinedScenario(process.env.PR428_REVIEW_SCENARIO, false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "corrupt_obligation_loaded") {
+      await joinedScenario("corrupt_obligation_loaded", true, "ack");
       return;
     }
     if (process.env.PR428_REVIEW_SCENARIO === "delayed_restart") {

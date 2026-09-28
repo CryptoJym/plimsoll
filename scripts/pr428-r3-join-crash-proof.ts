@@ -4,7 +4,7 @@ import path from "node:path";
 
 const cases: Record<string, string[]> = {
   "r3-1": ["crash_manifest_link", "crash_manifest_link_running"],
-  "r3-2": ["crash_obligation_open", "crash_obligation_fsync"],
+  "r3-2": ["crash_obligation_open", "crash_obligation_fsync", "corrupt_obligation_loaded"],
   "r3-7": ["crash_after_bootstrap"],
 };
 const selected = process.argv[2] ?? "";
