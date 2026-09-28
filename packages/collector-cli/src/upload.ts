@@ -17,7 +17,7 @@ import {
 import { sealOutboundEnvelope } from "./outbound-envelope";
 import { TransportError, pinnedUploadUrl, validatedTransportUrl } from "./http-transport";
 import { postDelivery } from "./delivery-post";
-import { observeActivitySummaryAdvertisement } from "./lean/activity-summary-capability";
+import { observeActivitySummaryAdvertisement, readActivitySummaryAdvertisement } from "./lean/activity-summary-capability";
 import { publishAdvertisedCaptureUncertainty } from "./lean/activity-summary-v2";
 import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
@@ -493,13 +493,15 @@ export async function uploadBufferedEvents(
     options.onAuthenticatedAcknowledgement?.(body);
   };
   // Withdraw a stale complete claim before any witness or raw event request.
-  // This is a no-op until this install has an authenticated v2 advertisement.
-  await publishAdvertisedCaptureUncertainty({config,buffer,url,
-    spoolHome:options.spoolHome ?? collectorHome(),
-    ingestKey:options.ingestKey ?? config.ingestKey,
-    signingSecret:options.signingSecret ?? config.uploadSigningSecret,
-    fetchImpl:options.fetchImpl ?? fetch,
-    timeoutMs:config.delivery.requestTimeoutSeconds*1_000,now:nowFn});
+  // Keep the unadvertised path identical to v1, including no home resolution.
+  if (readActivitySummaryAdvertisement(buffer.database, config.installKey).enabled) {
+    await publishAdvertisedCaptureUncertainty({config,buffer,url,
+      spoolHome:options.spoolHome ?? collectorHome(),
+      ingestKey:options.ingestKey ?? config.ingestKey,
+      signingSecret:options.signingSecret ?? config.uploadSigningSecret,
+      fetchImpl:options.fetchImpl ?? fetch,
+      timeoutMs:config.delivery.requestTimeoutSeconds*1_000,now:nowFn});
+  }
   // One daemon upload cycle may run 20 batches while the HTTP listener is
   // serving OTLP. Keep each legacy migration writer turn well below the
   // listener's 750 ms busy retry budget; the cursor resumes next batch.
