@@ -12,6 +12,7 @@ import {
   resolveCaptureRootMachineLabel,
 } from "../packages/collector-cli/src/capture-root-inventory";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { installLaunchAgent, launchAgentOwnerEditedKeys } from "../packages/collector-cli/src/launch-agent";
 
 const root = fs.mkdtempSync(path.join(process.cwd(), "pr428-review-"));
 const failures: string[] = [];
@@ -68,6 +69,69 @@ try {
   check("join_can_recover_existing_nonhostname_machine_label",
     resolveCaptureRootMachineLabel(roots, [persisted.enrollmentMachineLabel ?? ""]) === machine &&
       captureRootsDeriveFrom(roots, persisted.enrollmentMachineLabel ?? ""), true);
+
+  const rolloutId = "12345678-1234-4234-8234-123456789abc";
+  const rolloutName = `rollout-2026-09-28T00-00-00-${rolloutId}.jsonl`;
+  const rollout = `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-28T00:00:00Z",
+    payload: { id: rolloutId } })}\n`;
+  const withoutConfig = path.join(root, "codex-without-optional-config");
+  const currentDay = path.join(withoutConfig, ".codex/sessions/2026/09/28");
+  fs.mkdirSync(currentDay, { recursive: true });
+  fs.writeFileSync(path.join(currentDay, rolloutName), rollout);
+  check("valid_codex_rollout_without_optional_config_enrolls",
+    discoverCaptureRootCandidates(withoutConfig).find((entry) => entry.shape === "codex_home")?.autoEnroll, true);
+
+  const manyDates = path.join(root, "codex-many-dates");
+  const sessions = path.join(manyDates, ".codex/sessions");
+  for (let month = 1; month <= 5; month += 1) {
+    for (let day = 1; day <= 30; day += 1) {
+      fs.mkdirSync(path.join(sessions, "2026", String(month).padStart(2, "0"),
+        String(day).padStart(2, "0")), { recursive: true });
+    }
+  }
+  fs.writeFileSync(path.join(sessions, "2026/05/30", rolloutName), rollout);
+  check("newest_valid_rollout_survives_many_date_directories",
+    discoverCaptureRootCandidates(manyDates).find((entry) => entry.shape === "codex_home")?.autoEnroll, true);
+
+  const exhaustedHome = path.join(root, "codex-exhausted");
+  const exhaustedDay = path.join(exhaustedHome, ".codex/sessions/2026/09/28");
+  fs.mkdirSync(exhaustedDay, { recursive: true });
+  for (let index = 0; index < 130; index += 1) {
+    const id = `12345678-1234-4234-8234-${String(index).padStart(12, "0")}`;
+    fs.writeFileSync(path.join(exhaustedDay, `rollout-2026-09-28T00-00-00-${id}.jsonl`), "{}\n");
+  }
+  check("exhausted_rollout_search_is_preview_not_absence",
+    discoverCaptureRootCandidates(exhaustedHome).find((entry) => entry.shape === "codex_home")?.reason,
+    "codex_evidence_exhausted");
+
+  const agentHome = path.join(root, "launch-agent-home");
+  fs.mkdirSync(agentHome, { recursive: true, mode: 0o700 });
+  const runtime = path.join(process.cwd(), "packages/collector-cli/dist/cli.mjs");
+  const install = { homeDir: agentHome, repoRoot: path.dirname(runtime),
+    workingDirectory: path.dirname(runtime), programArguments: [process.execPath, runtime, "start"] };
+  const installed = installLaunchAgent(install);
+  const priorPath = process.env.PATH;
+  try {
+    process.env.PATH = `${priorPath}:/opt/new-toolchain`;
+    check("shell_path_drift_does_not_look_like_owner_edit",
+      launchAgentOwnerEditedKeys({ homeDir: agentHome }), []);
+  } finally { process.env.PATH = priorPath; }
+  const before = fs.readFileSync(installed.plistPath, "utf8");
+  const edited = before.replace(`<string>${runtime}</string>`,
+    `<string>${path.join(path.dirname(runtime), "custom-cli.mjs")}</string>`);
+  if (edited === before) throw new Error("launch agent program fixture edit did not apply");
+  fs.writeFileSync(installed.plistPath, edited, { mode: 0o600 });
+  check("owner_edited_program_argument_is_detected",
+    launchAgentOwnerEditedKeys({ homeDir: agentHome }).includes("ProgramArguments"), true);
+  const legacyHome = path.join(root, "pre-template-launch-agent-home");
+  fs.mkdirSync(legacyHome, { recursive: true, mode: 0o700 });
+  const legacyInstall = installLaunchAgent({ ...install, homeDir: legacyHome });
+  fs.rmSync(`${legacyInstall.plistPath}.plimsoll-owned-template.json`, { force: true });
+  fs.writeFileSync(legacyInstall.plistPath,
+    fs.readFileSync(legacyInstall.plistPath, "utf8").replace(`<string>${runtime}</string>`,
+      `<string>${path.join(path.dirname(runtime), "custom-cli.mjs")}</string>`), { mode: 0o600 });
+  check("pre_template_install_uses_runtime_path_not_edited_manifest_argument",
+    launchAgentOwnerEditedKeys({ homeDir: legacyHome }).includes("ProgramArguments"), true);
   // The packaged join proof checks local event and hosted unique-event totals
   // across the first-contact replay; this unit witness never fakes an append.
 } finally {

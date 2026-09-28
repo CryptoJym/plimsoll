@@ -352,7 +352,8 @@ export type CaptureRootCandidate = {
   relativeDirectory: string;
   /** Automatic enrollment requires a physical path and source evidence. */
   autoEnroll: boolean;
-  reason?: "symlink_component" | "codex_evidence_missing" | "claude_evidence_missing";
+  reason?: "symlink_component" | "codex_evidence_missing" | "codex_evidence_exhausted" |
+    "claude_evidence_missing";
 };
 
 export type CaptureRootDiscoveryEntry = {
@@ -384,50 +385,53 @@ export function physicalBelowHome(home: string, entry: string): boolean {
 }
 
 /** A bounded first-line check, with no rollout body or path exposed in a receipt. */
-function codexHomeEvidence(home: string, sessions: string): boolean {
-  const profile = path.dirname(sessions);
-  const marker = path.join(profile, "config.toml");
-  if (!physicalBelowHome(home, marker)) return false;
-  try {
-    const stat = fs.lstatSync(marker);
-    if (!stat.isFile() || stat.size === 0 || stat.size > 1_048_576) return false;
-    const config = parseToml(fs.readFileSync(marker, "utf8")) as Record<string, unknown>;
-    const codexMarker = typeof config.model === "string" && config.model.length > 0 ||
-      typeof config.model_provider === "string" && config.model_provider.length > 0 ||
-      typeof config.model_providers === "object" && config.model_providers !== null ||
-      typeof config.hooks === "object" && config.hooks !== null;
-    if (!codexMarker) return false;
-    const pending = [{ directory: sessions, depth: 0 }];
-    let inspected = 0;
-    while (pending.length && inspected < 128) {
-      const current = pending.shift()!;
-      const entries = fs.readdirSync(current.directory, { withFileTypes: true });
-      for (const entry of entries) {
-      inspected += 1;
-      if (entry.isDirectory() && current.depth < 3) {
-        pending.push({ directory: path.join(current.directory, entry.name), depth: current.depth + 1 });
-        continue;
+function codexHomeEvidence(home: string, sessions: string): "verified" | "missing" | "exhausted" {
+  const fileLimit = 128;
+  const directoryLimit = 4096;
+  let examinedFiles = 0;
+  let visitedDirectories = 0;
+  const rolloutName = /^rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i;
+  const datePart = [/^\d{4}$/, /^(0[1-9]|1[0-2])$/, /^(0[1-9]|[12]\d|3[01])$/];
+  const scan = (directory: string, depth: number): "verified" | "missing" | "exhausted" => {
+    if (++visitedDirectories > directoryLimit) return "exhausted";
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); }
+    catch { return "exhausted"; }
+    // Descend the newest year/month/day first. Directory entries never consume
+    // the rollout-file budget, so a long-lived home reaches its recent files.
+    const newestFirst = entries.sort((left, right) => right.name.localeCompare(left.name));
+    if (depth < datePart.length) {
+      for (const entry of newestFirst) {
+        if (!entry.isDirectory() || !datePart[depth]!.test(entry.name)) continue;
+        const child = path.join(directory, entry.name);
+        if (!physicalBelowHome(home, child)) continue;
+        const found = scan(child, depth + 1);
+        if (found !== "missing") return found;
       }
-      if (!entry.isFile() || !/^rollout-.*-([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i.test(entry.name)) continue;
-      const file = path.join(current.directory, entry.name);
+    }
+    for (const entry of newestFirst) {
+      const id = entry.isFile() ? rolloutName.exec(entry.name)?.[1] : undefined;
+      if (!id) continue;
+      const file = path.join(directory, entry.name);
       if (!physicalBelowHome(home, file)) continue;
+      if (examinedFiles >= fileLimit) return "exhausted";
+      examinedFiles += 1;
       try {
         const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
         try {
-        const bytes = Buffer.alloc(4096);
-        const size = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
-        const firstLine = bytes.subarray(0, size).toString("utf8").split("\n", 1)[0];
-        const row = JSON.parse(firstLine) as { type?: unknown; timestamp?: unknown; payload?: { id?: unknown } };
-        const id = /([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i.exec(entry.name)?.[1];
-        if (row.type === "session_meta" && typeof row.timestamp === "string" &&
-          Number.isFinite(Date.parse(row.timestamp)) && typeof row.payload?.id === "string" &&
-          row.payload.id.toLowerCase() === id?.toLowerCase()) return true;
+          const bytes = Buffer.alloc(4096);
+          const size = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+          const row = JSON.parse(bytes.subarray(0, size).toString("utf8").split("\n", 1)[0]) as
+            { type?: unknown; timestamp?: unknown; payload?: { id?: unknown } };
+          if (row.type === "session_meta" && typeof row.timestamp === "string" &&
+              Number.isFinite(Date.parse(row.timestamp)) && typeof row.payload?.id === "string" &&
+              row.payload.id.toLowerCase() === id.toLowerCase()) return "verified";
         } finally { fs.closeSync(descriptor); }
-      } catch { /* another rollout may provide the evidence */ }
-      }
+      } catch { /* Another rollout may provide the evidence. */ }
     }
-  } catch { return false; }
-  return false;
+    return "missing";
+  };
+  return scan(sessions, 0);
 }
 
 function claudeHomeEvidence(home: string, projects: string): boolean {
@@ -647,11 +651,14 @@ export function discoverCaptureRootCandidates(home: string): CaptureRootCandidat
     const physical = physicalBelowHome(resolvedHome, entry);
     if (!physical && !fs.existsSync(entry)) return;
     if (physical && !fs.statSync(entry).isDirectory()) return;
-    const evidence = physical && (source === "codex"
-      ? codexHomeEvidence(resolvedHome, entry) : claudeHomeEvidence(resolvedHome, entry));
+    const codexEvidence = physical && source === "codex"
+      ? codexHomeEvidence(resolvedHome, entry) : null;
+    const evidence = source === "codex" ? codexEvidence === "verified" :
+      physical && claudeHomeEvidence(resolvedHome, entry);
     found.push({ shape, source, directory: entry, relativeDirectory,
       autoEnroll: evidence, ...(!physical ? { reason: "symlink_component" as const } :
-        !evidence ? { reason: source === "codex" ? "codex_evidence_missing" as const :
+        !evidence ? { reason: source === "codex" ?
+          codexEvidence === "exhausted" ? "codex_evidence_exhausted" as const : "codex_evidence_missing" as const :
           "claude_evidence_missing" as const } : {}) });
   };
   for (const shape of CAPTURE_ROOT_SHAPES) {

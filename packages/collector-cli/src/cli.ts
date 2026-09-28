@@ -92,7 +92,7 @@ import { enrollCodexLiveProducer } from "./codex-live-usage-auth";
 import {
   installLaunchAgent,
   inspectLaunchAgentManifest,
-  launchAgentOwnerEditedKeys,
+  inspectLaunchAgentOwnership,
   LAUNCH_AGENT_LABEL,
   LAUNCH_AGENT_SYSTEM_PATHS,
   launchAgentPlistPath,
@@ -777,7 +777,7 @@ function joinOnlyReason(noDaemon: boolean): string | null {
 
 type JoinRootPlan = { machine: string; entries: ReturnType<typeof discoverCaptureRoots>;
   candidates: Array<{ source: CaptureRoot["source"]; directory: string }>;
-  manifestDigest: string | null };
+  manifestDigest: string | null; launchAgentRuntimeDriftKeys: string[] };
 
 function joinMachineLabel(config: CollectorConfig, explicit?: string): string {
   const roots = config.captureRoots ?? [];
@@ -832,12 +832,15 @@ function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false
   const manifest = inspectLaunchAgentManifest();
   if (!manifest.ok && manifest.status !== "missing")
     throw new Error("The existing collector LaunchAgent is not owned by Plimsoll. No token was redeemed.");
+  const ownership = manifest.ok ? inspectLaunchAgentOwnership() :
+    { ownerEditedKeys: [], runtimeDriftKeys: [] };
   if (manifest.ok && !replaceLaunchAgent) {
-    const differences = launchAgentOwnerEditedKeys();
+    const differences = ownership.ownerEditedKeys;
     if (differences.length) throw new Error(`The existing LaunchAgent has owner edits in ${
       differences.join(", ")}. Use --replace-launch-agent to replace it; no token was redeemed.`);
   }
-  return { machine, entries, candidates, manifestDigest: manifest.ok ? manifest.manifestDigest : null };
+  return { machine, entries, candidates, manifestDigest: manifest.ok ? manifest.manifestDigest : null,
+    launchAgentRuntimeDriftKeys: ownership.runtimeDriftKeys };
 }
 
 function addJoinedCaptureRoots(plan: JoinRootPlan) {
@@ -989,6 +992,7 @@ async function finishJoinedCollectorSetupCore(
   }
   const firstContactAt = await acknowledgeJoinedCollector(config, result.contactReplayBatch);
   return { recording, added, firstContactAt, firstContactKind: "handshake_replay" as const,
+    launchAgent: { runtimeDriftKeys: plan.launchAgentRuntimeDriftKeys },
     daemon: { installed: true, running: true,
     readinessVerified: true, runtimeIdentityVerified: true, syncArmed: true }, enrollment: result.enrollment };
 }

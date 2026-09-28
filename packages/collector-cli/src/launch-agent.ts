@@ -955,6 +955,62 @@ function installReceipt(
   };
 }
 
+export function launchAgentOwnedTemplatePath(homeDir = os.homedir()) {
+  return `${launchAgentPlistPath(homeDir)}.plimsoll-owned-template.json`;
+}
+
+function readOwnedTemplate(homeDir: string): string | null {
+  const file = launchAgentOwnedTemplatePath(homeDir);
+  let stat: fs.Stats;
+  try { stat = fs.lstatSync(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
+      permissionMode(stat.mode) !== MANIFEST_MODE || stat.size > MAX_MANIFEST_BYTES * 2)
+    fail("OWNED_TEMPLATE_INVALID");
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const bound = fs.fstatSync(descriptor);
+    if (!bound.isFile() || bound.dev !== stat.dev || bound.ino !== stat.ino ||
+        bound.nlink !== 1 || permissionMode(bound.mode) !== MANIFEST_MODE) fail("OWNED_TEMPLATE_CHANGED");
+    const value = JSON.parse(fs.readFileSync(descriptor, "utf8")) as Record<string, unknown>;
+    if (value.schema !== "plimsoll.launch-agent-owned-template/v1" ||
+        typeof value.manifest !== "string" || typeof value.manifestDigest !== "string" ||
+        digest(value.manifest) !== value.manifestDigest) fail("OWNED_TEMPLATE_INVALID");
+    validateOwnedManifest(value.manifest);
+    return value.manifest;
+  } catch (error) {
+    if (error instanceof LaunchAgentTransactionError) throw error;
+    fail("OWNED_TEMPLATE_INVALID");
+  } finally { fs.closeSync(descriptor); }
+}
+
+function writeOwnedTemplate(homeDir: string, source: Buffer) {
+  const file = launchAgentOwnedTemplatePath(homeDir);
+  const existing = (() => {
+    try { return fs.lstatSync(file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  })();
+  if (existing && (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1 ||
+      permissionMode(existing.mode) !== MANIFEST_MODE)) fail("OWNED_TEMPLATE_INVALID");
+  const prepared = `${file}.prepared-${randomUUID()}`;
+  const descriptor = fs.openSync(prepared, "wx", MANIFEST_MODE);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify({ schema: "plimsoll.launch-agent-owned-template/v1",
+      manifestDigest: digest(source), manifest: source.toString("utf8") })}\n`);
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
+  try {
+    fs.renameSync(prepared, file);
+    fsyncDirectory(path.dirname(file));
+  } finally { fs.rmSync(prepared, { force: true }); }
+}
+
 export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInstallResult {
   const normalized = normalizedOptions(options);
   const homeDir = ensureHomeRoot(normalized.homeDir ?? os.homedir());
@@ -1105,6 +1161,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
         assertVisibleContent(snapshot, visible.leaf, desired);
       }
       published = undefined;
+      writeOwnedTemplate(homeDir, desired);
       return {
         plistPath,
         receipt: installReceipt("installed", digest(desired), rollback, initial),
@@ -1145,33 +1202,55 @@ export function inspectLaunchAgentManifest(options: { homeDir?: string } = {}) {
   }
 }
 
-/** Compare an installed manifest with the owned template for its existing runtime. */
-export function launchAgentOwnerEditedKeys(options: { homeDir?: string } = {}): string[] {
+/** Compare owner edits with the last installed template, or a legacy runtime's fixed artifact path. */
+export function inspectLaunchAgentOwnership(options: { homeDir?: string } = {}): {
+  ownerEditedKeys: string[]; runtimeDriftKeys: string[]; evidence: "owned_template" | "legacy_runtime";
+} {
   const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
   const preimage = readPreimage(launchAgentPlistPath(homeDir));
   try {
-    if (!preimage.content) return [];
+    if (!preimage.content) return { ownerEditedKeys: [], runtimeDriftKeys: [], evidence: "legacy_runtime" };
     const actual = validateOwnedManifest(preimage.content.toString("utf8"));
     assertStablePath(preimage.snapshot);
     const workingDirectory = actual.WorkingDirectory as string;
-    const expected = parsePlist(renderLaunchAgentPlist({ homeDir, repoRoot: workingDirectory,
-      workingDirectory, programArguments: strings(actual.ProgramArguments, "PLIST_ARGUMENTS_INVALID") }));
+    const argumentsNow = strings(actual.ProgramArguments, "PLIST_ARGUMENTS_INVALID");
+    const template = readOwnedTemplate(homeDir);
+    // A pre-template packaged install always runs its named artifact, even if
+    // an edited manifest still happens to point at some other valid .mjs.
+    const legacyArguments = argumentsNow.length === 3
+      ? [argumentsNow[0]!, path.join(workingDirectory, "cli.mjs"), "start"]
+      : argumentsNow;
+    const runtimeExpected = parsePlist(renderLaunchAgentPlist({ homeDir, repoRoot: workingDirectory,
+      workingDirectory, programArguments: legacyArguments }));
+    const expected = template ? parsePlist(template) : runtimeExpected;
     const differences: string[] = [];
     for (const key of Object.keys(expected)) {
       if (key === "EnvironmentVariables") {
         const actualEnv = record(actual[key], "PLIST_ENVIRONMENT_INVALID");
         const expectedEnv = record(expected[key], "PLIST_ENVIRONMENT_INVALID");
         for (const envKey of Object.keys(expectedEnv)) {
+          // Without an owned template, PATH has no trustworthy prior value:
+          // a changed shell must not be mistaken for a manifest owner edit.
+          if (envKey === "PATH" && !template) continue;
           if (!isDeepStrictEqual(actualEnv[envKey], expectedEnv[envKey]))
             differences.push(`EnvironmentVariables.${envKey}`);
         }
       } else if (!isDeepStrictEqual(actual[key], expected[key])) differences.push(key);
     }
-    if (Object.hasOwn(actual, "ProcessType")) differences.push("ProcessType");
-    return differences;
+    if (Object.hasOwn(actual, "ProcessType") && !Object.hasOwn(expected, "ProcessType"))
+      differences.push("ProcessType");
+    const actualPath = record(actual.EnvironmentVariables, "PLIST_ENVIRONMENT_INVALID").PATH;
+    const runtimePath = record(runtimeExpected.EnvironmentVariables, "PLIST_ENVIRONMENT_INVALID").PATH;
+    const runtimeDriftKeys = isDeepStrictEqual(actualPath, runtimePath) ? [] : ["EnvironmentVariables.PATH"];
+    return { ownerEditedKeys: differences, runtimeDriftKeys,
+      evidence: template ? "owned_template" : "legacy_runtime" };
   } finally {
     if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);
   }
+}
+
+export function launchAgentOwnerEditedKeys(options: { homeDir?: string } = {}): string[] {
+  return inspectLaunchAgentOwnership(options).ownerEditedKeys;
 }
 
 /**
