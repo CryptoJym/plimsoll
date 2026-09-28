@@ -7,7 +7,8 @@ import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import { assertNoRebuildOpenTokens, assertRebuildWriterGateOpen, rebuildLockPath,
-  rebuildResumeClaimPath } from "./rebuild-open-gate";
+  rebuildResumeClaimPath, openRebuildFencedDatabase, retireDeadRebuildOpenTokens } from "./rebuild-open-gate";
+import { currentRebuildWriterIdentity, rebuildWriterIdentityLiveness } from "./rebuild-writer-identity";
 export { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 
 /** Static B13 inventory for coverage reporting. It is never a quiesce receipt. */
@@ -160,7 +161,8 @@ export function acquireRebuildWriterLeases(db: Database.Database, ledgerPath: st
   assertRebuildWriterGateOpen(ledgerPath);
   const nonce = randomUUID();
   db.prepare(`insert into maintenance_state(key,value,updated_at) values (?,?,?)`)
-    .run(`rebuild_writer_lease:${nonce}`, JSON.stringify({ pid: process.pid, owner: "local_event_buffer" }),
+    .run(`rebuild_writer_lease:${nonce}`, JSON.stringify({ ...currentRebuildWriterIdentity(),
+      owner: "local_event_buffer" }),
       new Date().toISOString());
   return nonce;
 }
@@ -175,7 +177,29 @@ export function readActiveRebuildWriterLeases(db: Database.Database) {
   if (!hasTable(db, "maintenance_state")) return [];
   const rows = db.prepare("select value from maintenance_state where key like 'rebuild_writer_lease:%' order by key")
     .all() as Array<{ value: string }>;
-  return rows.map((row) => JSON.parse(row.value) as { pid: number; owner: string });
+  return rows.map((row) => {
+    const value = JSON.parse(row.value) as { pid: number; owner: string };
+    return { pid: value.pid, owner: value.owner };
+  });
+}
+
+/** Delete only identity-confirmed dead rows, with a value comparison so a
+ * concurrent replacement can never be retired by a stale observation. */
+export function retireDeadRebuildWriterLeases(ledgerPath: string) {
+  const db = openRebuildFencedDatabase(ledgerPath, { fileMustExist: true, timeout: 0 });
+  try {
+    if (!hasTable(db, "maintenance_state")) return 0;
+    const rows = db.prepare(`select key,value from maintenance_state
+      where key like 'rebuild_writer_lease:%' order by key`).all() as Array<{ key: string; value: string }>;
+    const stale = rows.filter((row) => {
+      try { return rebuildWriterIdentityLiveness(JSON.parse(row.value)) === "stale"; }
+      catch { return false; }
+    });
+    if (stale.length === 0) return 0;
+    const remove = db.prepare("delete from maintenance_state where key=? and value=?");
+    return db.transaction(() => stale.reduce((count, row) =>
+      count + remove.run(row.key, row.value).changes, 0))();
+  } finally { db.close(); }
 }
 /** Native observation, captured before and after daemon unload and again
  * under the rebuild fence. No inventory name is presented as an open handle. */
@@ -451,6 +475,8 @@ export function recoverInterruptedRebuild(ledgerPath: string) {
 export async function rebuildLedger(input: RebuildRunInput) {
   preflightMaintenanceRebuild(input);
   const ledgerPath = input.ledgerPath;
+  retireDeadRebuildOpenTokens(ledgerPath);
+  retireDeadRebuildWriterLeases(ledgerPath);
   const pausedAt = performance.now();
   const receipt = await input.quiesce();
   if (!receipt.connectionsClosed || !connectionOwnershipClosed(receipt.after)) {

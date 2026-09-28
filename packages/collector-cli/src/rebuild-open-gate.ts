@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { processIdentityIsLive, UTC_PROCESS_START_ALGORITHM } from "./runtime-ownership";
+import { currentRebuildWriterIdentity, rebuildWriterIdentityLiveness } from "./rebuild-writer-identity";
 
 export function rebuildOpenLeaseDirectory(ledgerPath: string) { return `${ledgerPath}.rebuild-open-leases`; }
 export function rebuildLockPath(ledgerPath: string) { return `${ledgerPath}.maintenance-rebuild.lock`; }
@@ -95,6 +96,7 @@ export function assertRebuildWriterGateOpen(ledgerPath: string) {
 export function acquireRebuildOpenToken(ledgerPath: string) {
   if (ledgerPath === ":memory:") return null;
   const canonical = canonicalGatePath(ledgerPath);
+  const identity = currentRebuildWriterIdentity();
   const directory = rebuildOpenLeaseDirectory(canonical);
   const token = path.join(directory, `${process.pid}.${randomUUID()}.lease`);
   let descriptor: number | null = null;
@@ -112,7 +114,7 @@ export function acquireRebuildOpenToken(ledgerPath: string) {
     }
   }
   if (descriptor === null) throw new Error("writer_lease_directory_unavailable");
-  try { fs.writeFileSync(descriptor, `${process.pid}\n`); fs.fsyncSync(descriptor); }
+  try { fs.writeFileSync(descriptor, `${JSON.stringify(identity)}\n`); fs.fsyncSync(descriptor); }
   finally { fs.closeSync(descriptor); }
   try { assertRebuildWriterGateOpen(canonical); }
   catch (error) { fs.unlinkSync(token); throw error; }
@@ -127,6 +129,57 @@ export function releaseRebuildOpenToken(token: string | null) {
   catch (error) {
     if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
   }
+}
+
+/** A killed writer cannot unlink its opener token. Retire only a token whose
+ * PID and UTC process-start identity prove that its owner is gone. */
+export function retireDeadRebuildOpenTokens(ledgerPath: string) {
+  const directory = rebuildOpenLeaseDirectory(canonicalGatePath(ledgerPath));
+  let entries: string[];
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("writer_lease_directory_invalid");
+    entries = fs.readdirSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  let retired = 0;
+  for (const entry of entries.filter((name) => name.endsWith(".lease"))) {
+    const match = /^(\d+)\.[0-9a-f-]{36}\.lease$/.exec(entry);
+    const pid = Number(match?.[1]);
+    if (!match || !Number.isSafeInteger(pid) || pid <= 0) continue;
+    const file = path.join(directory, entry);
+    let original: string;
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink()) continue;
+      original = fs.readFileSync(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    let identity: unknown;
+    try { identity = /^\d+\n$/.test(original) ? { pid: Number(original.trim()) } : JSON.parse(original); }
+    catch { identity = null; }
+    if (!identity || typeof identity !== "object" || (identity as { pid?: unknown }).pid !== pid ||
+        rebuildWriterIdentityLiveness(identity) !== "stale") continue;
+    try {
+      const current = fs.lstatSync(file);
+      if (current.ino !== stat.ino || current.dev !== stat.dev ||
+          fs.readFileSync(file, "utf8") !== original) continue;
+      fs.unlinkSync(file);
+      retired += 1;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  try { fs.rmdirSync(directory); }
+  catch (error) {
+    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  }
+  return retired;
 }
 
 export function assertNoRebuildOpenTokens(ledgerPath: string) {
