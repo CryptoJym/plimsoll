@@ -143,6 +143,7 @@
     "proof:capture-roots-add": "tsx scripts/capture-roots-add-proof.ts",
     "proof:capture-history-import": "tsx scripts/capture-history-import-proof.ts",
     "proof:capture-history-import-slices": "tsx scripts/capture-history-import-slices-proof.ts",
+    "proof:capture-history-import-writer-handoff": "tsx scripts/capture-history-import-writer-handoff-proof.ts",
     "proof:dispatch-binding": "tsx scripts/run-proof.ts scripts/dispatch-binding-proof.ts",
     "proof:dispatch-bind-linkability": "tsx scripts/run-proof.ts scripts/dispatch-bind-linkability-proof.ts",
     "proof:dispatch-pairing-integration": "tsx scripts/run-proof.ts scripts/dispatch-pairing-integration-proof.ts",

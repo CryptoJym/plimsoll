@@ -207,6 +207,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-slices
 
+      - name: Prove history writer handoff to concurrent intake (eco-6hoxj.163.89 r3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-writer-handoff
+
       - name: Prove dispatch binding and stamped capture paths (eco-6hoxj.165.3)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding

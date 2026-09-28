@@ -634,11 +634,15 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     importedTokens.cacheCreation += receipt.counts.cacheCreation;
     slices += 1;
     if (options.stopAfterSlices === slices) throw new Error("capture_history_injected_crash");
-    if (slices % 512 === 0) db.pragma("wal_checkpoint(PASSIVE)");
-    // setTimeout gives hook/OTLP/tailer callbacks and other SQLite writers a
-    // real turn; recent writer contention receives a longer backoff.
+    // Checkpoint outside the writer transaction before this root's WAL grows
+    // large. A root may finish before 512 slices, so that old cadence never
+    // ran during the scale import.
+    if (slices % 8 === 0) db.pragma("wal_checkpoint(PASSIVE)");
+    // SQLite's busy handler can miss a narrow unlock window and repeatedly
+    // lose to the next import slice. Leave a full writer handoff interval for
+    // hook, OTLP and tailer writers; observed import contention gets longer.
     const writerWaitMs = writerStarted - waitingStarted;
-    await new Promise<void>(resolve => setTimeout(resolve, writerWaitMs > 5 ? 25 : 5));
+    await new Promise<void>(resolve => setTimeout(resolve, writerWaitMs > 5 ? 500 : 250));
   };
   try {
     // Verify every prefix before the first ledger mutation. Suffix growth is
