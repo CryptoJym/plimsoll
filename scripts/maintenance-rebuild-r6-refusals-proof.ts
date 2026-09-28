@@ -7,6 +7,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { advanceCaptureFrontier, CAPTURE_WRITE_LAG_MS } from "../packages/collector-cli/src/capture-frontier";
 import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
 import { provisionLiveProducer } from "../packages/collector-cli/src/codex-live-usage-auth";
+import { canonicalJson } from "../packages/collector-cli/src/codex-live-usage-protocol";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { listHookSpoolFiles } from "../packages/collector-cli/src/hook-spool";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
@@ -48,8 +49,8 @@ function completeFrontier(buffer: LocalEventBuffer) {
   }
 }
 
-async function scenario(route: "otlp" | "live") {
-  const home = path.join(root, route);
+async function scenario(route: "otlp" | "live", terminal: "malformed" | "enrollment" | null = null) {
+  const home = path.join(root, terminal ? `terminal-${terminal}` : route);
   fs.mkdirSync(home, { mode: 0o700 });
   const auth = loadOrCreateLocalIngestAuth(home);
   const ledger = path.join(home, "ledger.sqlite");
@@ -71,7 +72,8 @@ async function scenario(route: "otlp" | "live") {
     const first = golden.vectors[0]!;
     const enrolled = provisionLiveProducer({ home, buffer: initial, config, producerId: first.packet.producerId,
       credentialId: first.packet.credentialId, captureRootId: captureRoot.rootId, enrolledAt });
-    body = first.canonicalUtf8;
+    body = terminal === "malformed" ? "{invalid live JSON" : terminal === "enrollment"
+      ? canonicalJson({ ...first.packet, credentialId: "unbound-credential" }) : first.canonicalUtf8;
     url = "/hooks/codex";
     headers = { "content-type": "application/json", "x-plimsoll-producer-id": first.packet.producerId,
       "x-plimsoll-token": fs.readFileSync(enrolled.credentialFile, "utf8") };
@@ -124,6 +126,23 @@ async function scenario(route: "otlp" | "live") {
         "an absent producer retry keeps the durable refusal unresolved");
       await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
       const normalPort = (server.address() as { port: number }).port;
+      if (terminal) {
+        const rejected = await fetch(`http://127.0.0.1:${normalPort}${url}`, {
+          method: "POST", headers, body,
+        });
+        assert.equal(rejected.status, terminal === "malformed" ? 400 : 403,
+          "the retry is terminally rejected");
+        assert.equal(fs.readdirSync(refusalDir).length, 0,
+          "the exact refused payload's terminal rejection retires its receipt");
+        assert.equal(captureSpoolState(home).maintenanceRebuildPending, false);
+        const afterTerminal = claim(buffer, home);
+        assert.equal(afterTerminal?.unattested, undefined);
+        assert.notEqual(afterTerminal?.through, null);
+        console.log(JSON.stringify({ check: `r7_live_${terminal}_terminal_retirement`,
+          paused: paused.status, rejected: rejected.status, before: before?.unattested,
+          after: afterTerminal?.through }));
+        return;
+      }
       const differentBody = route === "otlp" ? body.replace("handle_responses", "different_responses") : "{}";
       const different = await fetch(`http://127.0.0.1:${normalPort}${url}`, {
         method: "POST", headers, body: differentBody,
@@ -166,6 +185,8 @@ async function main() {
   try {
     if (selected === "all" || selected === "otlp") await scenario("otlp");
     if (selected === "all" || selected === "live") await scenario("live");
+    if (selected === "terminal-live" || selected === "terminal-all") await scenario("live", "malformed");
+    if (selected === "terminal-enrollment" || selected === "terminal-all") await scenario("live", "enrollment");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 

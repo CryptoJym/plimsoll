@@ -1317,13 +1317,21 @@ export function createCollectorServer(
         const bytes = await readLiveBody(request, budget);
         let packet: ReturnType<typeof parseLivePacket>;
         try { packet = parseLivePacket(bytes); }
-        catch { throw new HttpBoundaryRejection("invalid_json", 400); }
+        catch {
+          // The pause listener intentionally returns 503 before parsing. If
+          // the producer retries an invalid payload, this 400 is terminal:
+          // retire only that exact refused body after authentication.
+          if (maintenanceRefusalHome) {
+            resolveMaintenanceRebuildRefusal(maintenanceRefusalHome, "live", selected.producerId, bytes);
+          }
+          throw new HttpBoundaryRejection("invalid_json", 400);
+        }
         const digest = liveSha256(bytes);
         // Body identity never selects a dedupe scope. Echo failure has no ledger lookup.
         const result = packet.producerId !== binding.binding.producerId || packet.credentialId !== binding.binding.credentialId
           ? liveReceipt(packet, digest, "enrollment_rejected", false, null)
           : ingestLiveUsage(buffer, packet, digest, authenticate);
-        if (result.committed && maintenanceRefusalHome) {
+        if (result.disposition !== "retryable" && maintenanceRefusalHome) {
           resolveMaintenanceRebuildRefusal(maintenanceRefusalHome, "live", selected.producerId, bytes);
         }
         response.writeHead(result.disposition === "retryable" ? 503 : result.disposition === "enrollment_rejected" ? 403 : 200,

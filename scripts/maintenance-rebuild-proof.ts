@@ -149,14 +149,21 @@ async function main() {
   const manual = path.join(root, "manual-rename.sqlite");
   fixture(manual);
   const manualBefore = fs.readFileSync(manual);
+  let liveOwnerRefused = false;
   await assert.rejects(() => rebuildLedger({ ...base, ledgerPath: manual,
     quiesce: () => quiesce(manual),
-    reopen: (file) => { renameBackBeforeResume(file); throw new Error("manual_rename_back_complete"); },
+    reopen: (file) => {
+      assert.throws(() => renameBackBeforeResume(file), /rebuild_owner_active/);
+      liveOwnerRefused = true;
+      throw new Error("manual_rename_back_refused");
+    },
     resume: async () => undefined,
-  }), /manual_rename_back_complete/);
+  }), /manual_rename_back_refused/);
+  assert.equal(liveOwnerRefused, true);
   assert.deepEqual(fs.readFileSync(manual), manualBefore);
   assert.equal(fs.existsSync(`${manual}.maintenance-rebuild.lock`), false);
-  console.log(JSON.stringify({ check: "manual_rename_back_before_resume", restored: true }));
+  console.log(JSON.stringify({ check: "manual_rename_back_live_owner_refused_and_rolled_back",
+    refused: true, restored: true }));
 
   const busy = path.join(root, "busy-wal.sqlite");
   fixture(busy);
@@ -177,9 +184,17 @@ async function main() {
     resume: async () => undefined,
     afterVacuum: () => { throw new Error("forced_vacuum_interrupt"); },
   }), /forced_vacuum_interrupt/);
-  const recovered = recoverInterruptedRebuild(interrupted);
-  assert.equal(recovered.status, "recovered_untouched_source");
-  console.log(JSON.stringify({ check: "interrupted_vacuum_recovery", recovered }));
+  assert.equal(fs.existsSync(`${interrupted}.maintenance-rebuild.lock`), false);
+  assert.equal(fs.existsSync(`${interrupted}.rebuild`), false);
+  assert.equal(JSON.parse(fs.readFileSync(`${interrupted}.maintenance-rebuild.json`, "utf8")).phase, "failed");
+  const restored = new Database(interrupted, { readonly: true, fileMustExist: true });
+  try {
+    assert.equal(restored.pragma("integrity_check", { simple: true }), "ok");
+    assert.equal((restored.prepare("select count(*) as n from buffered_events").get() as { n: number }).n, 1);
+  } finally { restored.close(); }
+  assert.throws(() => recoverInterruptedRebuild(interrupted), /forward_repair_only/,
+    "a failure already rolled back by the live owner needs no recovery");
+  console.log(JSON.stringify({ check: "interrupted_vacuum_automatic_rollback", restored: true }));
 }
 
 main().finally(() => fs.rmSync(root, { recursive: true, force: true })).catch((error) => {

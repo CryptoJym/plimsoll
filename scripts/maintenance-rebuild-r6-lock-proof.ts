@@ -31,16 +31,23 @@ async function main() {
   let resumeCalls = 0;
   let raced = false;
   const originalOpen = fs.openSync;
+  const originalLink = fs.linkSync;
+  const compete = () => {
+    raced = true;
+    const other = originalOpen(lock, "wx", 0o600);
+    try { fs.writeFileSync(other, otherOwner); fs.fsyncSync(other); }
+    finally { fs.closeSync(other); }
+  };
   (fs as typeof fs & { openSync: typeof fs.openSync }).openSync = ((file: fs.PathLike, flags: string | number,
     mode?: number) => {
-    if (String(file) === lock && flags === "wx" && !raced) {
-      raced = true;
-      const other = originalOpen(file, "wx", 0o600);
-      try { fs.writeFileSync(other, otherOwner); fs.fsyncSync(other); }
-      finally { fs.closeSync(other); }
-    }
+    if (String(file) === lock && flags === "wx" && !raced) compete();
     return originalOpen(file, flags, mode);
   }) as typeof fs.openSync;
+  (fs as typeof fs & { linkSync: typeof fs.linkSync }).linkSync = ((source: fs.PathLike,
+    target: fs.PathLike) => {
+    if (String(target) === lock && !raced) compete();
+    return originalLink(source, target);
+  }) as typeof fs.linkSync;
   try {
     await assert.rejects(() => rebuildLedger({ ledgerPath: ledger, stage: "S10", walHighWaterBytes: 0,
       copyDrill: true,
@@ -58,7 +65,10 @@ async function main() {
         daemonReady = true;
       },
     }), /EEXIST/);
-  } finally { (fs as typeof fs & { openSync: typeof fs.openSync }).openSync = originalOpen; }
+  } finally {
+    (fs as typeof fs & { openSync: typeof fs.openSync }).openSync = originalOpen;
+    (fs as typeof fs & { linkSync: typeof fs.linkSync }).linkSync = originalLink;
+  }
   assert.equal(raced, true, "the other rebuild must acquire the lock after final preflight");
   assert.equal(resumeCalls, 1, "a pre-lock failure resumes the collector once");
   assert.equal(launchAgentLoaded, true, "the launch agent is loaded after failure");
