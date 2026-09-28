@@ -337,6 +337,10 @@ export const CAPTURE_ROOT_SHAPES = [
   { shape: "claude_seat", source: "claude_code" as const, parent: ".claude-seats", leaf: "projects" },
   { shape: "codex_home", source: "codex" as const, segments: [".codex", "sessions"] },
   { shape: "codex_profile", source: "codex" as const, parent: ".codex-profiles", leaf: "sessions" },
+  // Studio stores Codex rollouts beneath each conductor's own profile. The
+  // exact leaf keeps neighboring runtime, cache and other session trees out.
+  { shape: "studio_codex_conductor", source: "codex" as const,
+    parent: ".clientai/studio/borg/conductors", leaf: "profile/sessions" },
 ] as const;
 
 export type CaptureRootCandidate = {
