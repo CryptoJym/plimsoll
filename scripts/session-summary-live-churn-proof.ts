@@ -64,9 +64,10 @@ function dirty(buffer: LocalEventBuffer, session: string): string | null {
 }
 
 function state(buffer: LocalEventBuffer, session: string) {
-  return buffer.database.prepare(`select complete, mode, accumulator_json as accumulatorJson
+  return buffer.database.prepare(`select complete, mode, high_water as highWater,
+    accumulator_json as accumulatorJson
     from session_sync_summary_state where session_id = ?`).get(session) as {
-      complete: number; mode: string; accumulatorJson: string;
+      complete: number; mode: string; highWater: number; accumulatorJson: string;
     };
 }
 
@@ -103,7 +104,7 @@ class ChurnSchedule {
   readonly startedAt = performance.now();
   marks = 0;
   appends = 0;
-  guardAppends = 0;
+  readonly scannedCorrections: number[] = [];
   private lastId = "";
 
   constructor(private readonly buffer: LocalEventBuffer, private readonly session: string,
@@ -112,28 +113,43 @@ class ChurnSchedule {
   private applyThrough(ticks: number) {
     for (let tick = this.marks + 1; tick <= ticks; tick += 1) {
       const scheduledAppend = (tick - 1) % 3 === 0;
-      const latestRowid = this.lastId
-        ? (this.buffer.database.prepare("select rowid from buffered_events where id = ?")
-          .get(this.lastId) as { rowid: number }).rowid : 0;
-      const highWater = (this.buffer.database.prepare(`select high_water as highWater
-        from session_sync_summary_state where session_id = ?`)
-        .get(this.session) as { highWater: number }).highWater;
-      // If a retry just scanned the marked row, add a fresh response before
-      // the next correction. The two-per-three-tick append cadence is a floor.
-      if (scheduledAppend || latestRowid <= highWater) {
+      if (scheduledAppend) {
         this.lastId = append(this.buffer, this.session, 2)[1]!;
         this.appends += 2;
-        if (!scheduledAppend) this.guardAppends += 2;
       }
+      const row = this.buffer.database.prepare(`select rowid, observed_at as observedAt
+        from buffered_events where id = ?`).get(this.lastId) as {
+          rowid: number; observedAt: string;
+        } | undefined;
+      assert.ok(row, `tick ${tick} must correct the last scheduled response`);
+      const summary = state(this.buffer, this.session);
+      const cursor = JSON.parse(summary.accumulatorJson) as {
+        scanBoundary: number; cursorObservedAt: string | null; cursorRowid: number;
+      };
+      const unscanned = summary.complete === 1 || summary.mode === "incremental"
+        ? row.rowid > summary.highWater
+        : (row.rowid > cursor.scanBoundary && row.rowid > summary.highWater) ||
+          (row.rowid <= cursor.scanBoundary &&
+            (cursor.cursorObservedAt === null || row.observedAt > cursor.cursorObservedAt ||
+              (row.observedAt === cursor.cursorObservedAt && row.rowid > cursor.cursorRowid)));
       const beforeRevision = revision(this.buffer, this.session);
+      const beforeDirty = dirty(this.buffer, this.session);
       assert.equal(this.buffer.database.prepare(`update buffered_events set cost_usd = ? where id = ?`)
         .run(tick / 10_000, this.lastId).changes, 1);
-      assert.equal(revision(this.buffer, this.session), beforeRevision,
-        `unscanned ${this.size}-row edit must not invalidate the durable prefix`);
-      assert.equal(dirty(this.buffer, this.session), null);
+      if (unscanned) {
+        assert.equal(revision(this.buffer, this.session), beforeRevision,
+          `unscanned ${this.size}-row edit must not invalidate the durable prefix`);
+        assert.equal(dirty(this.buffer, this.session), beforeDirty);
+      } else {
+        assert.ok(revision(this.buffer, this.session) > beforeRevision,
+          `scanned ${this.size}-row edit must invalidate the durable prefix`);
+        assert.equal(dirty(this.buffer, this.session), "raw_update");
+        this.scannedCorrections.push(tick);
+      }
       this.marks = tick;
+      assert.equal(this.appends, 2 * Math.ceil(this.marks / 3),
+        `tick ${tick} must keep the exact 40-appends-per-minute schedule`);
     }
-    assert.ok(this.appends >= 2 * Math.ceil(this.marks / 3));
   }
 
   applyDue() {
@@ -216,6 +232,7 @@ async function daemonCycle(buffer: LocalEventBuffer, summaryMaxRows?: number) {
 
 async function initialCatchUp(buffer: LocalEventBuffer, churn?: ChurnSchedule) {
   let elapsedMs = 0;
+  const updates: SessionSummaryUpdateResult[] = [];
   const marksBefore = churn?.marks ?? 0;
   let marksAtPreviousPass = marksBefore;
   for (let pass = 1; ; pass += 1) {
@@ -231,6 +248,7 @@ async function initialCatchUp(buffer: LocalEventBuffer, churn?: ChurnSchedule) {
     // Make the active workload exercise a retry even on an unloaded host.
     // Later passes retain the production 5,000-row summary cap.
     const cycle = await daemonCycle(buffer, churn && pass === 1 ? 1 : undefined);
+    updates.push(...cycle.updates.values());
     elapsedMs += [...cycle.updates.values()].reduce((sum, update) => sum + update.durationMs, 0);
     const rows = rowCount(buffer);
     const bound = drainBound(rows, elapsedMs) + (churn ? 1 : 0);
@@ -238,7 +256,7 @@ async function initialCatchUp(buffer: LocalEventBuffer, churn?: ChurnSchedule) {
       JSON.stringify({ pass, bound, rows, marks: churn?.marks,
         pending: cycle.result?.pendingSummaryReasons }));
     if (cycle.state.caughtUp && cycle.state.lastSuccessfulUntil === cycle.until) {
-      return { passes: pass, cycle, retryMarks: (churn?.marks ?? 0) - marksBefore };
+      return { passes: pass, cycle, updates, retryMarks: (churn?.marks ?? 0) - marksBefore };
     }
   }
 }
@@ -255,11 +273,26 @@ async function proveBusySession(size: number, ordinal: number) {
     let previousHorizon = loadDaemonSessionSyncState(buffer.database).lastSuccessfulUntil;
     const activePasses: number[] = [];
     const retryMarks: number[] = [];
+    const fallbackPasses: number[] = [];
+    let priorScannedCorrections = 0;
     for (const checkpoint of [3, 6]) {
       while (churn.marks < checkpoint) await churn.waitForTick(churn.marks + 1);
-      const { cycle, passes, retryMarks: duringRetries } = await initialCatchUp(buffer, churn);
+      const beforeFallbacks = sessionSummaryCounters(buffer.database).fallbackRecomputes;
+      const { cycle, passes, updates, retryMarks: duringRetries } = await initialCatchUp(buffer, churn);
+      const fallbacks = updates.filter((update) => update.fullRecompute);
+      const scannedSinceLastCycle = churn.scannedCorrections.length - priorScannedCorrections;
+      assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes - beforeFallbacks,
+        fallbacks.length);
+      if (scannedSinceLastCycle > 0) {
+        assert.ok(fallbacks.length > 0, "a scanned correction must restart the durable prefix");
+        for (const fallback of fallbacks) assert.equal(fallback.fallbackReason, "ledger_mutation");
+      } else {
+        assert.equal(fallbacks.length, 0, "unscanned corrections must remain incremental");
+      }
+      priorScannedCorrections = churn.scannedCorrections.length;
       activePasses.push(passes);
       retryMarks.push(duringRetries);
+      fallbackPasses.push(fallbacks.length);
       assert.ok(passes >= 2 && duringRetries >= 1,
         JSON.stringify({ size, checkpoint, passes, duringRetries }));
       assert.ok(cycle.result?.ok && cycle.result.summaryComplete,
@@ -269,7 +302,6 @@ async function proveBusySession(size: number, ordinal: number) {
       assert.notEqual(cycle.until, previousHorizon);
       assert.deepEqual(cycle.sent.find((row) => row.session.id === session),
         expectedWire(buffer, session, cycle.until));
-      assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes, baseRecomputes);
       previousHorizon = cycle.until;
     }
     // Include ticks due during the final pass, then drain that finite tail.
@@ -279,17 +311,31 @@ async function proveBusySession(size: number, ordinal: number) {
     if (churn.marks > marksBeforeStop) {
       const cleanup = await initialCatchUp(buffer);
       cleanupPasses = cleanup.passes;
+      const cleanupFallbacks = cleanup.updates.filter((update) => update.fullRecompute);
+      const scannedDuringStop = churn.scannedCorrections.length - priorScannedCorrections;
+      if (scannedDuringStop > 0) {
+        assert.ok(cleanupFallbacks.length > 0, "the stopped tail must rebuild a scanned correction");
+        for (const fallback of cleanupFallbacks) assert.equal(fallback.fallbackReason, "ledger_mutation");
+      } else {
+        assert.equal(cleanupFallbacks.length, 0);
+      }
+      fallbackPasses.push(cleanupFallbacks.length);
       assert.ok(cleanup.cycle.result?.ok && cleanup.cycle.result.summaryComplete);
       assert.deepEqual(cleanup.cycle.sent.find((row) => row.session.id === session),
         expectedWire(buffer, session, cleanup.cycle.until));
     }
-    assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes, baseRecomputes);
+    assert.ok(churn.scannedCorrections.length > 0,
+      "the fixed schedule must correct a previously scanned row");
+    assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes - baseRecomputes,
+      fallbackPasses.reduce((sum, count) => sum + count, 0));
     assert.ok(activeElapsedMs >= 6_000);
     assert.ok(churn.marks >= 6 && churn.appends >= 4);
+    assert.equal(churn.appends, 2 * Math.ceil(churn.marks / 3));
     completion.check(`daemon_${size}_rows_1_mark_per_second_40_appends_per_minute`);
     console.log(JSON.stringify({ size, initialPasses, activeCycles: 2, activePasses, retryMarks,
-      marks: churn.marks, appends: churn.appends, guardAppends: churn.guardAppends, activeElapsedMs,
-      cleanupPasses, horizon: previousHorizon }));
+      fallbackPasses, scannedCorrections: churn.scannedCorrections,
+      marks: churn.marks, appends: churn.appends, activeElapsedMs, cleanupPasses,
+      horizon: previousHorizon }));
   } finally { buffer.close(); }
 }
 
