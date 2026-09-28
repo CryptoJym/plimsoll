@@ -127,6 +127,18 @@ try {
     const openSliceMs = sliceEnd > 0 ?
       openSteps[sliceEnd]!.elapsedMs - openSteps[sliceEnd - 1]!.elapsedMs : null;
     const remaining = () => (buffer.database.prepare("select count(*) as n from upload_receipts where terminal_state='dead' and raw_rowid is null and raw_id is null and raw_created_at is null and raw_generation is null and rowid>(select cursor_rowid from upload_receipt_lineage_backfill where singleton=1)").get() as { n: number }).n;
+    // The daemon starts retention immediately, then follows hasMore every
+    // five seconds. This fixture's raws are only 30 days old, so hasMore can
+    // only come from receipt repair, not an overdue raw candidate page.
+    const firstPruneStarted = performance.now();
+    const firstPrune = buffer.prune(90, { maxRows: 128 });
+    const firstPruneMs = performance.now() - firstPruneStarted;
+    assert.equal(firstPrune.eventRowsVisited, 0);
+    assert.ok(firstPrune.hasMore && remaining() > 0,
+      "retention cadence must schedule receipt repair before the first upload timer");
+    const scheduledFollowupBoundMs = Math.ceil(remaining() / 256) * 5_000;
+    assert.ok(scheduledFollowupBoundMs < 60_000,
+      "five-second retention followups must be sufficient for this fixture");
     const turns: Array<{ number: number; ms: number; enqueued: number;
       visited: number; cursor: number; paused: string | null; remaining: number }> = [];
     for (let n = 1; n <= 64 && remaining() > 0; n++) {
@@ -148,12 +160,13 @@ try {
     const privacyPlan = (buffer.database.prepare("explain query plan select 1 from buffered_events e where e.id=? and " +
       terminalPrivacyEligibilitySql(buffer.database, "e")).all(uuid(1009)) as Array<{ detail: string }>)
       .map((row) => row.detail);
-    const maxTurnMs = Math.max(openSliceMs ?? 0, ...turns.map((turn) => turn.ms));
+    const maxTurnMs = Math.max(openSliceMs ?? 0, firstPruneMs, ...turns.map((turn) => turn.ms));
     const projection = Math.ceil((count - 16) / 256);
     console.log(JSON.stringify({ phase: "upgrade_measurement", openMs, openSliceMs,
       lineageElapsedMs: elapsedFromOpenMs, remaining: remaining(), linkedDead,
       acknowledgementsNull, collision, ambiguousReceipt, expired, backlogEnqueued,
-      rawCursorAtOpen, earlyCollisionDelivery,
+      rawCursorAtOpen, earlyCollisionDelivery, firstPruneMs,
+      firstPruneHasMore: firstPrune.hasMore, scheduledFollowupBoundMs,
       maxWriterSliceMs: maxTurnMs, turns, round12ProjectedUploadTurns: projection,
       finalBytes: diskBytes(), privacyPlan }));
     assert.equal(remaining(), 0, "receipt-side repair must finish");

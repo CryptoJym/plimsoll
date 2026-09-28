@@ -3183,7 +3183,10 @@ export class LocalEventBuffer {
     const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
     const now = options.now ?? new Date();
     const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1_000).toISOString();
-    this.delivery.backfillLegacyReceiptLineage({ maxRows: Math.min(maxRows, 256), maxWriterMs: 100 });
+    // The ordinary retention cadence starts immediately and follows hasMore.
+    // Keep repairing dead receipts between upload intervals without extending
+    // any one writer turn beyond its existing 100 ms limit.
+    const lineageRepair = this.delivery.backfillLegacyReceiptLineage({ maxRows: 256, maxWriterMs: 100 });
     // Seek through a bounded raw candidate page BEFORE checking migration.
     // A protected prefix must neither cause a full scan nor hide later rows.
     const scanKey = "raw_retention_scan_v1";
@@ -3266,7 +3269,8 @@ export class LocalEventBuffer {
       for (const row of metricRows) metricSamples += removeMetric.run(row.rowid).changes;
       // A full page is a conservative continuation, never an exact backlog count.
       const rawHasMore = rawLimit === 0 || candidates.length === rawLimit;
-      const hasMore = retirementPending || rawHasMore || (remainingBudget > 0 && metricRows.length === remainingBudget);
+      const hasMore = !lineageRepair.complete || retirementPending || rawHasMore ||
+        (remainingBudget > 0 && metricRows.length === remainingBudget);
       const last = candidates.at(-1);
       const next = rawLimit === 0 ? scan : rawHasMore && last
         ? {at:last.rawCreatedAt,id:last.eventId,metricsFirst:scan.metricsFirst}
