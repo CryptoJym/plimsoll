@@ -1236,7 +1236,8 @@ function dueSegment(accumulator: SummaryAccumulator, until: string): number | nu
 }
 
 function repairRowsQuery(
-  db: Database.Database, sessionId: string, repair: SummaryRepair, limit: number, maxMs: number,
+  db: Database.Database, sessionId: string, repair: SummaryRepair, highWater: number,
+  limit: number, maxMs: number,
 ): SessionReadQuery {
   const eligible = terminalPrivacyEligibilitySql(db, "e");
   return {
@@ -1252,7 +1253,7 @@ function repairRowsQuery(
      where e.rowid > @cursorRowid and e.rowid <= @upperRowid and e.session_id = @sessionId
      order by e.rowid limit @limit`,
     params: { sessionId, cursorRowid: repair.cursorRowid,
-      upperRowid: (repair.segment + 1) * SESSION_SUMMARY_SEGMENT_ROWS, limit },
+      upperRowid: Math.min(highWater, (repair.segment + 1) * SESSION_SUMMARY_SEGMENT_ROWS), limit },
     maxMs,
   };
 }
@@ -1693,7 +1694,7 @@ export async function updateSessionSummary(
       const limit = maxRows - rowsRead;
       try {
         const repairRows = await options.read<RawSummaryRow>([
-          repairRowsQuery(db, sessionId, repair, limit,
+          repairRowsQuery(db, sessionId, repair, state.highWater, limit,
             Math.max(1, maxMs - (performance.now() - started))),
         ]);
         let processedRepairRows = 0;
@@ -1759,10 +1760,10 @@ export async function updateSessionSummary(
     state.complete = finalComplete;
     state.mode = complete ? "incremental" : needsFallback ? "fallback" : state.mode;
     writeState(db, state);
-    // The historical dirty cause is discharged once that scan is stable.
-    // A post-boundary append remains in the durable queue and resumes in
-    // incremental mode next cycle, even if its observed time sorts earlier.
-    if (finalComplete) {
+    // A repaired edit is discharged once its segment and revision are stable.
+    // A concurrent append can still block this pass; it remains in the queue
+    // and must not force a full recompute on the next pass.
+    if (complete && revisionStable && activityStable && !repairsRemaining) {
       db.prepare(`delete from session_sync_summary_dirty where session_id = ?`).run(sessionId);
     }
     if (finalComplete) {
