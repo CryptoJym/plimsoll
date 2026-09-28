@@ -35,6 +35,7 @@ import {
   captureBaselineExcludedSize,
   captureBaselinePostEnrollmentOffset,
   carriedCaptureCursorMatches,
+  carriedCaptureCursorOffset,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -417,6 +418,7 @@ export class RolloutTailer {
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
+  private activeCarriedBytes = false;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
   private eligibleDirectories: string[] | null = null;
@@ -1175,6 +1177,7 @@ export class RolloutTailer {
           }
           const before = resultMutationSnapshot(result);
           const activeRootBefore = this.activeCaptureRoot;
+          const carriedBytesBefore = this.activeCarriedBytes;
           let parseFailure = false;
           let committed = false;
           let validationDeferred = false;
@@ -1190,6 +1193,12 @@ export class RolloutTailer {
               throw new Error("maintenance_progress_budget_exhausted");
             }
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
+            const carriedOffset = carriedCaptureCursorOffset(this.buffer.database, "codex",
+              jsonlScanStateKey(this.cursorKey(candidate.file)),
+              baselineObservation(candidate.file, candidate.stat));
+            this.activeCarriedBytes = carriedOffset !== null && !read.reset &&
+              cursor?.checkpointStatus === "valid" && cursor.committedOffset !== null &&
+              cursor.committedOffset >= carriedOffset && cursor.fileIdentity === read.fileIdentity;
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
             this.buffer.transactionWithRepoContextHandoffs(() => {
@@ -1268,6 +1277,7 @@ export class RolloutTailer {
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch {
             this.activeCaptureRoot = activeRootBefore;
+            this.activeCarriedBytes = carriedBytesBefore;
             const parseErrors = result.parseErrors - before.parseErrors;
             restoreResultMutationSnapshot(result, before);
             if (parseFailure) {
@@ -1767,7 +1777,8 @@ export class RolloutTailer {
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.
       if (this.buffer.eventAdmissionReason(observedAt, activeCaptureRoot?.installationEpochId,
-          activeCaptureRoot?.account && "schema" in activeCaptureRoot.account ? activeCaptureRoot.installationEpochId : undefined)) {
+          this.activeCarriedBytes || activeCaptureRoot?.account && "schema" in activeCaptureRoot.account
+            ? activeCaptureRoot?.installationEpochId : undefined)) {
         result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
         continue;
       }
@@ -1835,7 +1846,7 @@ export class RolloutTailer {
       if (repoContextId && !attachRepoContextId(event, repoContextId)) {
         throw new Error("rollout_repo_context_binding_failed");
       }
-      const inserted = appendRootObservation(this.buffer, event, activeCaptureRoot);
+      const inserted = appendRootObservation(this.buffer, event, activeCaptureRoot, this.activeCarriedBytes);
       if (inserted) {
         result.eventsAppended += 1;
         result.tokensAppended.input += marginal.input;

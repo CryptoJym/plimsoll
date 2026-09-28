@@ -386,7 +386,7 @@ Commands:
   capture-roots discover [--json]
                         List native capture roots under $HOME with their state
                         (registered | candidate | missing); read-only
-  capture-roots epoch-plan [--archive ABSOLUTE-PATH] [--json]
+  capture-roots epoch-plan [--archive ABSOLUTE-PATH] [--sizes] [--json]
                         Inspect epoch, cursor, weekly and live cutover state; read-only
   capture-roots epoch-switch --archive ABSOLUTE-PATH
                         Hold the old ledger exclusively, archive it and bind a replacement
@@ -5434,6 +5434,11 @@ async function main() {
 
     if (action === "epoch-plan" || action === "epoch-switch") {
       const archivePath = optionValue("--archive");
+      const sizesOnly = action === "epoch-plan" && process.argv.includes("--sizes");
+      if (sizesOnly && !archivePath) {
+        refuse("archive_path_required_for_sizes");
+        return;
+      }
       if (action === "epoch-switch" && !archivePath) {
         refuse("archive_path_required");
         return;
@@ -5447,7 +5452,7 @@ async function main() {
           authorityRoot: defaultLifecycleAuthorityRoot() };
         const plan = planFreshLedgerCutover(input);
         if (action === "epoch-plan" || plan.status !== "ready") {
-          console.log(JSON.stringify({ ...plan, status: plan.status === "ready"
+          console.log(JSON.stringify({ ...plan, sizesOnly, status: plan.status === "ready"
             ? "capture_roots_epoch_plan" : "capture_roots_epoch_plan_refused" }, null, 2));
           if (plan.status !== "ready") process.exitCode = 1;
           return;

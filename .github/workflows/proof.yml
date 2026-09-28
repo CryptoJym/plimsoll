@@ -50,6 +50,19 @@ jobs:
         # Run through the isolated proof wrapper, not pnpm, so pnpm config cannot skip the gate.
         run: node ./node_modules/tsx/dist/cli.mjs scripts/run-proof.ts scripts/ci-coverage-proof.ts
 
+      - name: Prove Studio0 replacement ledger cutover safety (PR 426 round 6)
+        run: |
+          pnpm proof:pr426-r6-cutover-append-race
+          pnpm proof:pr426-r6-archive-permissions
+          pnpm proof:pr426-r6-min-version-045
+          pnpm proof:pr426-r6-older-week-backlog
+          pnpm proof:pr426-r6-unseen-file-clock-skew
+          pnpm proof:pr426-r6-rollback-weekly-total
+          pnpm proof:pr426-r6-read-only-preflight-sidecars
+          pnpm proof:pr426-r6-archive-query-plans
+          pnpm proof:pr426-r6-carry-budget
+          pnpm proof:pr426-r6-crash-mid-carry
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit

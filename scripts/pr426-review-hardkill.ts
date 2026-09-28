@@ -52,14 +52,9 @@ try {
   assert.equal(fs.existsSync(archivePath), false);
   const stage = `${ledger}.replacement-stage`;
   assert.equal(fs.existsSync(stage), true);
-  assert.equal(planFreshLedgerCutover({ ledgerPath: ledger, archivePath, config }).reason,
-    "staging_artifact_exists");
-  for (const suffix of ["", "-wal", "-shm"]) {
-    if (fs.existsSync(`${stage}${suffix}`)) {
-      fs.renameSync(`${stage}${suffix}`, path.join(archiveDir, `incomplete-stage.sqlite${suffix}`));
-    }
-  }
-  assert.equal(planFreshLedgerCutover({ ledgerPath: ledger, archivePath, config }).status, "ready");
+  const recoveredPlan = planFreshLedgerCutover({ ledgerPath: ledger, archivePath, config });
+  assert.equal(recoveredPlan.status, "ready");
+  assert.equal(recoveredPlan.recoveryStagePresent, true);
   const authority = new LifecycleMutationAuthority(authorityRoot).observe();
   assert.equal(authority.kind, "held", "a killed owner retains its fenced lease until expiry");
   assert.throws(() => switchFreshLedger({ ledgerPath: ledger, archivePath, config,
@@ -72,8 +67,9 @@ try {
   } finally { Date.now = actualNow; }
   assert.ok(readReplacementLedgerMarker(ledger));
   assert.equal(fs.existsSync(archivePath), true);
+  assert.equal(fs.existsSync(stage), false);
   console.log(JSON.stringify({ killedAt: "stage_bound", oldLedgerSurvived: true,
-    incompleteStageRetained: true, planAfterRetention: "ready", leaseWaitRequired: true,
+    incompleteStageRecoveredAutomatically: true, planAfterKill: "ready", leaseWaitRequired: true,
     resumedSwitch: "complete" }));
 } finally {
   fs.rmSync(fixture, { recursive: true, force: true });

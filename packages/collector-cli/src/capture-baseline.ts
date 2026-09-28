@@ -13,6 +13,7 @@ const STATE_TABLE = "automatic_capture_baseline_state";
 const GENERATION_TABLE = "automatic_capture_baseline_generations";
 const PENDING_GENERATION_TABLE = "automatic_capture_baseline_pending_generations";
 const ERROR_TABLE = "automatic_capture_baseline_observation_errors";
+const REPLACEMENT_FENCE_TABLE = "replacement_unseen_file_fences";
 const SCHEMA_VERSION = 2;
 const initializedDatabases = new WeakSet<object>();
 
@@ -1655,6 +1656,7 @@ export function classifyCaptureBaselineFile(
       historyInvalidated: false,
     };
   }
+  const replacementFence = replacementUnseenFileFence(database, source, normalized);
 
   // Classification is the per-file hot path. Read the two keyed state rows
   // directly; aggregate COUNT/SUM status is reserved for public snapshots and
@@ -1686,6 +1688,17 @@ export function classifyCaptureBaselineFile(
       matchedExcludedGeneration: false,
       observedGrowth: false,
       historyInvalidated: false,
+    };
+  }
+  if (options.mode === "automatic" && replacementFence !== null) {
+    if (unresolvedError || normalized.size < replacementFence) return {
+      decision: "block", reason: CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+      matchedExcludedGeneration: true, observedGrowth: false, historyInvalidated: false,
+    };
+    return {
+      decision: "exclude", reason: "preexisting_generation",
+      matchedExcludedGeneration: true, baselineSize: replacementFence,
+      observedGrowth: normalized.size > replacementFence, historyInvalidated: false,
     };
   }
 
@@ -1834,6 +1847,10 @@ export function captureBaselineExcludedSize(
     where type='table' and name in (?,?,?)`).get(STATE_TABLE, GENERATION_TABLE, ERROR_TABLE) as {n:number};
   if (schema.n !== 3) return null;
   const normalized = normalizeObservation(observation);
+  if (normalized) {
+    const replacementFence = replacementUnseenFileFence(database, source, normalized);
+    if (replacementFence !== null) return replacementFence;
+  }
   const state = stateRow(database, source);
   if (!normalized || !state || !stateIsValid(state) || state.status !== "complete") return null;
   if (database.prepare(`select 1 from ${ERROR_TABLE} where source=? and path_key=? and resolved_at is null limit 1`)
@@ -1857,6 +1874,7 @@ export function captureBaselinePostEnrollmentOffset(
 }
 
 const carriedCursorTablePresent = new WeakMap<object, boolean>();
+const replacementFenceTablePresent = new WeakMap<object, boolean>();
 
 /** An archive cursor is allowed through the replacement's baseline only for
  * the exact file generation that committed it. New generations retain the
@@ -1867,16 +1885,68 @@ export function carriedCaptureCursorMatches(
   fileKey: string,
   observation: CaptureBaselineFileObservation,
 ): boolean {
+  return carriedCaptureCursorOffset(database, source, fileKey, observation) !== null;
+}
+
+/** The immutable archive byte boundary for this exact file generation. */
+export function carriedCaptureCursorOffset(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  fileKey: string,
+  observation: CaptureBaselineFileObservation,
+): number | null {
   let present = carriedCursorTablePresent.get(database);
   if (present === undefined) {
     present = Boolean(database.prepare(`select 1 from sqlite_master
       where type='table' and name='replacement_capture_cursors'`).get());
     carriedCursorTablePresent.set(database, present);
   }
-  if (!present) return false;
+  if (!present) return null;
   const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
-  return Boolean(database.prepare(`select 1 from replacement_capture_cursors
-    where source=? and file_key=? and file_identity=?`).get(source, fileKey, identity));
+  const row = database.prepare(`select committed_offset as committedOffset from replacement_capture_cursors
+    where source=? and file_key=? and file_identity=?`).get(source, fileKey, identity) as
+    { committedOffset: number } | undefined;
+  return row?.committedOffset ?? null;
+}
+
+/** Stat-only switch snapshot. A file absent from the archive cursor set is
+ * excluded through its observed byte size, regardless of host clock or birth
+ * timestamp. The row is keyed by opaque path and generation digests. */
+export function recordReplacementUnseenFileFences(database: Database.Database,
+  source: HistoryCoverageSource, observations: readonly CaptureBaselineFileObservation[]): number {
+  database.exec(`create table if not exists ${REPLACEMENT_FENCE_TABLE} (
+    source text not null, path_key text not null, generation_key text not null,
+    baseline_size integer not null check(baseline_size>=0),
+    primary key(source,path_key,generation_key)
+  ) without rowid`);
+  replacementFenceTablePresent.set(database, true);
+  const insert = database.prepare(`insert into ${REPLACEMENT_FENCE_TABLE}
+    (source,path_key,generation_key,baseline_size) values(?,?,?,?)
+    on conflict(source,path_key,generation_key) do update set
+    baseline_size=max(baseline_size,excluded.baseline_size)`);
+  let count = 0;
+  for (const observation of observations) {
+    const normalized = normalizeObservation(observation);
+    if (!normalized) throw new Error("replacement_unseen_file_stat_ambiguous");
+    insert.run(source, normalized.pathKey, normalized.generationKey, normalized.size);
+    count += 1;
+  }
+  return count;
+}
+
+function replacementUnseenFileFence(database: Database.Database, source: HistoryCoverageSource,
+  observation: NormalizedObservation): number | null {
+  let present = replacementFenceTablePresent.get(database);
+  if (present === undefined) {
+    present = Boolean(database.prepare(`select 1 from sqlite_master where type='table' and name=?`)
+      .get(REPLACEMENT_FENCE_TABLE));
+    replacementFenceTablePresent.set(database, present);
+  }
+  if (!present) return null;
+  const row = database.prepare(`select baseline_size as baselineSize from ${REPLACEMENT_FENCE_TABLE}
+    where source=? and path_key=? and generation_key=?`).get(source, observation.pathKey,
+      observation.generationKey) as { baselineSize: number } | undefined;
+  return row?.baselineSize ?? null;
 }
 
 /**

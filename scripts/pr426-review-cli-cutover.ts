@@ -47,6 +47,14 @@ try {
   assert.equal(plan.status, "capture_roots_epoch_plan");
   assert.equal(plan.installationEpochId, epoch);
   assert.equal(plan.rootCount, 1);
+  const filesBeforeSizes = fs.readdirSync(data).sort();
+  const sizes = invoke("epoch-plan", "--archive", archive, "--sizes");
+  assert.equal(sizes.status, "capture_roots_epoch_plan");
+  assert.equal(sizes.sizesOnly, true);
+  assert.equal(typeof sizes.totalCarriedBytes, "number");
+  assert.equal(sizes.sidecarsMayAppear, false);
+  assert.deepEqual(fs.readdirSync(data).sort(), filesBeforeSizes,
+    "closed-ledger sizes preflight must create no sidecars");
   const switched = invoke("epoch-switch", "--archive", archive);
   assert.equal(switched.status, "capture_roots_epoch_switched");
   assert.equal(readReplacementLedgerMarker(ledger)?.archivePath, archive);

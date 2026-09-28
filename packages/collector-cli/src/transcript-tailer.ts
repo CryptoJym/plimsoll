@@ -36,6 +36,7 @@ import {
   captureBaselineExcludedSize,
   captureBaselinePostEnrollmentOffset,
   carriedCaptureCursorMatches,
+  carriedCaptureCursorOffset,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -354,6 +355,7 @@ export class TranscriptTailer {
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
+  private activeCarriedBytes = false;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
   private eligibleDirectories: string[] | null = null;
@@ -1129,6 +1131,7 @@ export class TranscriptTailer {
           }
           const before = resultMutationSnapshot(result);
           const activeRootBefore = this.activeCaptureRoot;
+          const carriedBytesBefore = this.activeCarriedBytes;
           let parseFailure = false;
           let committed = false;
           let validationDeferred = false;
@@ -1144,6 +1147,12 @@ export class TranscriptTailer {
               throw new Error("maintenance_progress_budget_exhausted");
             }
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
+            const carriedOffset = carriedCaptureCursorOffset(this.buffer.database, "claude_code",
+              jsonlScanStateKey(this.cursorKey(candidate.file)),
+              baselineObservation(candidate.file, candidate.stat));
+            this.activeCarriedBytes = carriedOffset !== null && !read.reset &&
+              cursor?.checkpointStatus === "valid" && cursor.committedOffset !== null &&
+              cursor.committedOffset >= carriedOffset && cursor.fileIdentity === read.fileIdentity;
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
             this.buffer.transactionWithRepoContextHandoffs(() => {
@@ -1216,6 +1225,7 @@ export class TranscriptTailer {
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch {
             this.activeCaptureRoot = activeRootBefore;
+            this.activeCarriedBytes = carriedBytesBefore;
             const parseErrors = result.parseErrors - before.parseErrors;
             restoreResultMutationSnapshot(result, before);
             if (parseFailure) {
@@ -1676,7 +1686,8 @@ export class TranscriptTailer {
     const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
     // Preserve the local revision counter above, but never synthesize a
     // managed event timestamp from mtime or from the time the file arrived.
-    if (this.buffer.eventAdmissionReason(clamped.observedAt, this.activeCaptureRoot?.installationEpochId)) {
+    if (this.buffer.eventAdmissionReason(clamped.observedAt, this.activeCaptureRoot?.installationEpochId,
+      this.activeCarriedBytes ? this.activeCaptureRoot?.installationEpochId : undefined)) {
       result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
       return;
     }
@@ -1732,7 +1743,7 @@ export class TranscriptTailer {
     if (repoContextId && !attachRepoContextId(event, repoContextId)) {
       throw new Error("transcript_repo_context_binding_failed");
     }
-    const inserted = appendRootObservation(this.buffer, event, this.activeCaptureRoot);
+    const inserted = appendRootObservation(this.buffer, event, this.activeCaptureRoot, this.activeCarriedBytes);
     if (inserted) {
       result.eventsAppended += 1;
       result.tokensAppended.input += delta.input;

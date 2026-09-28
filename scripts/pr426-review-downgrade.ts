@@ -74,7 +74,7 @@ async function main() {
     } });
     const marker = readReplacementLedgerMarker(ledger);
     assert.ok(marker);
-    assert.equal(marker.minCollectorVersion, "0.7.45");
+    assert.equal(marker.minCollectorVersion, "0.7.46");
     assert.throws(() => assertReplacementRuntimeCompatible(ledger, "0.7.44"),
       /replacement_ledger_requires_archive_restore_before_downgrade/);
     await assert.rejects(runLifecycleCommand({ argv: ["rollback", "--artifact", "self",
@@ -84,7 +84,9 @@ async function main() {
         nodeMajor: 22, sha256: `sha256:${"0".repeat(64)}`, sourcePath: ledger }),
       beforeRuntimeSwitch: artifact => assertReplacementRuntimeCompatible(ledger, artifact.version),
     }), /replacement_ledger_requires_archive_restore_before_downgrade/);
-    assert.doesNotThrow(() => assertReplacementRuntimeCompatible(ledger, "0.7.45"));
+    assert.throws(() => assertReplacementRuntimeCompatible(ledger, "0.7.45"),
+      /replacement_ledger_requires_archive_restore_before_downgrade/);
+    assert.doesNotThrow(() => assertReplacementRuntimeCompatible(ledger, "0.7.46"));
 
     const replacement = new LocalEventBuffer(ledger, { workspaceId: workspace,
       deviceId: device, freshCaptureRootEpoch: epoch });

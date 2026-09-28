@@ -1,23 +1,33 @@
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
 
 import { LocalEventBuffer } from "./buffer";
+import { carriedCaptureCursorMatches, recordReplacementUnseenFileFences,
+  type CaptureBaselineFileObservation } from "./capture-baseline";
+import { captureRootBaselineFiles, captureRootBaselineObservations,
+  rootCursorKey } from "./capture-root-inventory";
 import { readAccountAssertionAdapterState, ACCOUNT_ASSERTION_STATE_KEY } from "./account-assertion";
 import { readLiveProducerBindings, LIVE_BINDINGS_FILE } from "./codex-live-usage-auth";
 import type { CollectorConfig } from "./config";
-import { loadJsonlScanCursorByKey, ensureJsonlScanState } from "./jsonl-byte-tailer";
+import { loadJsonlScanCursorByKey, ensureJsonlScanState,
+  jsonlScanStateKey } from "./jsonl-byte-tailer";
 import { otherProcessesWithFilesOpen } from "./lifecycle-adapters";
 import { LifecycleMutationAuthority } from "./lifecycle-authority";
 import { validateRolloutParserState } from "./rollout-tailer";
 import { validateTranscriptParserState } from "./transcript-tailer";
 import { utcWeekStart } from "./weekly-tool-stats";
 
-const MIN_REPLACEMENT_VERSION = "0.7.45";
+const MIN_REPLACEMENT_VERSION = "0.7.46";
+/** Includes only copied SQLite value payloads, not the 88 GB archive. A 3 MB
+ * fixture took 3.5 s to copy; 32 MiB leaves more than 2x margin inside 90 s. */
+const MAX_CARRIED_VALUE_BYTES = 32 * 1024 * 1024;
 const CURSOR_KEY = /^[a-f0-9]{64}$/;
 const CURSOR_IDENTITY = /^\d+:\d+:\d+$/;
 const LIVE_TABLES = [
@@ -53,6 +63,14 @@ export type FreshLedgerCutoverPlan = {
   archiveLatestRecordedAt: string | null;
   cursorRows: number;
   carriedRows: Record<string, number>;
+  carriedBytes: Record<string, number>;
+  totalCarriedBytes: number;
+  carryBudgetBytes: number;
+  untrackedFileFences: number;
+  dueWeeksWithoutAcknowledgement: string[];
+  recoveryStagePresent: boolean;
+  sidecarsMayAppear: boolean;
+  operatorAction: string | null;
   unacknowledgedWeeklyReports: number;
   currentUtcWeekToolAttempts: number;
   priorUtcWeekToolAttempts: number;
@@ -78,7 +96,15 @@ type CutoverInput = {
   authorityRoot?: string;
   /** Fault-injection seam; never used by the CLI. */
   onStep?: (step: "old_locked" | "stage_bound" | "archive_linked" | "switched") => void;
+  /** Fault-injection seam for a process kill during a carried-table copy. */
+  onCopyRow?: (table: string, copied: number) => void;
 };
+
+function valueBytes(row: Record<string, unknown>): number {
+  return Object.values(row).reduce<number>((total, value) => total +
+    (typeof value === "string" ? Buffer.byteLength(value) : Buffer.isBuffer(value)
+      ? value.byteLength : typeof value === "number" || typeof value === "bigint" ? 8 : 0), 0);
+}
 
 function hasTable(db: Database.Database, table: string): boolean {
   return Boolean(db.prepare("select 1 from sqlite_master where type='table' and name=?").get(table));
@@ -121,7 +147,7 @@ function latestRecordedTime(db: Database.Database, cursorLatest: string | null):
 }
 
 function inspectCursors(db: Database.Database) {
-  if (!hasTable(db, "rollout_scan_state")) return { rows: 0, latest: null as string | null };
+  if (!hasTable(db, "rollout_scan_state")) return { rows: 0, bytes: 0, latest: null as string | null };
   const required = [
     "file", "size", "scanned_at", "committed_offset", "deferred_bytes",
     "file_identity", "head_hash", "head_bytes", "continuity_hash", "continuity_bytes",
@@ -133,17 +159,18 @@ function inspectCursors(db: Database.Database) {
     throw new Error("archive_cursor_schema_unreadable");
   }
   let rows = 0;
+  let bytes = 0;
   let latest: string | null = null;
-  for (const row of db.prepare("select file,scanned_at as scannedAt,parser_kind as parserKind,checkpoint_version as checkpointVersion from rollout_scan_state").iterate() as Iterable<{
-    file: unknown; scannedAt: unknown; parserKind: unknown; checkpointVersion: unknown;
-  }>) {
+  for (const row of db.prepare("select * from rollout_scan_state").iterate() as Iterable<Record<string, unknown>>) {
+    const scannedAt = row.scanned_at, parserKind = row.parser_kind,
+      checkpointVersion = row.checkpoint_version;
     if (typeof row.file !== "string" || !CURSOR_KEY.test(row.file) ||
-        typeof row.scannedAt !== "string" || !Number.isFinite(Date.parse(row.scannedAt))) {
+        typeof scannedAt !== "string" || !Number.isFinite(Date.parse(scannedAt))) {
       throw new Error("archive_cursor_state_inconsistent");
     }
-    const cursor = row.parserKind === "codex-rollout-v2" && row.checkpointVersion === 2
+    const cursor = parserKind === "codex-rollout-v2" && checkpointVersion === 2
       ? loadJsonlScanCursorByKey(db, row.file, "codex-rollout-v2", 2, validateRolloutParserState)
-      : row.parserKind === "claude-transcript-v3" && row.checkpointVersion === 3
+      : parserKind === "claude-transcript-v3" && checkpointVersion === 3
         ? loadJsonlScanCursorByKey(db, row.file, "claude-transcript-v3", 3, validateTranscriptParserState)
         : undefined;
     if (!cursor || cursor.checkpointStatus !== "valid" || !cursor.fileIdentity ||
@@ -151,9 +178,10 @@ function inspectCursors(db: Database.Database) {
       throw new Error("archive_cursor_state_inconsistent");
     }
     rows += 1;
-    if (!latest || Date.parse(row.scannedAt) > Date.parse(latest)) latest = row.scannedAt;
+    bytes += valueBytes(row);
+    if (!latest || Date.parse(scannedAt) > Date.parse(latest)) latest = scannedAt;
   }
-  return { rows, latest };
+  return { rows, bytes, latest };
 }
 
 function inspectLiveState(db: Database.Database, home: string) {
@@ -180,26 +208,34 @@ function inspectLiveState(db: Database.Database, home: string) {
     }
   }
   const carriedRows: Record<string, number> = {};
+  const carriedBytes: Record<string, number> = {};
   try {
     for (const table of CARRIED_TABLES) {
-      if (!hasTable(db, table)) { carriedRows[table] = 0; continue; }
+      if (!hasTable(db, table)) { carriedRows[table] = 0; carriedBytes[table] = 0; continue; }
       const available = columns(db, table);
       if (CARRIED_COLUMNS[table].some(column => !available.includes(column))) {
         throw new Error("archive_live_authorization_unreadable");
       }
       let rows = 0;
+      let bytes = 0;
       // Read every carried row now, not just the B-tree count. A damaged
       // authorization row must refuse the read-only plan, not fail at switch.
-      for (const _row of db.prepare(`select ${CARRIED_COLUMNS[table].join(",")}
-        from ${table}`).iterate()) rows += 1;
+      for (const row of db.prepare(`select * from ${table}`).iterate() as Iterable<Record<string, unknown>>) {
+        rows += 1;
+        bytes += valueBytes(row);
+      }
       carriedRows[table] = rows;
+      carriedBytes[table] = bytes;
     }
   } catch {
     throw new Error("archive_live_authorization_unreadable");
   }
-  carriedRows[ACCOUNT_ASSERTION_STATE_KEY] = hasTable(db, "maintenance_state")
-    ? Number(Boolean(db.prepare("select 1 from maintenance_state where key=?").get(ACCOUNT_ASSERTION_STATE_KEY))) : 0;
-  return carriedRows;
+  const assertion = hasTable(db, "maintenance_state")
+    ? db.prepare("select * from maintenance_state where key=?").get(ACCOUNT_ASSERTION_STATE_KEY) as
+      Record<string, unknown> | undefined : undefined;
+  carriedRows[ACCOUNT_ASSERTION_STATE_KEY] = Number(Boolean(assertion));
+  carriedBytes[ACCOUNT_ASSERTION_STATE_KEY] = assertion ? valueBytes(assertion) : 0;
+  return { carriedRows, carriedBytes };
 }
 
 function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.Stats) {
@@ -212,8 +248,12 @@ function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.
   if (!binding || binding.workspaceId !== input.config.tenantId ||
       binding.deviceId !== input.config.deviceId) throw new Error("archive_identity_mismatch");
   if (binding.epochId !== rootEpoch(input)) throw new Error("archive_epoch_mismatch");
+  if (hasTable(db, "collector_replacement_ledger")) throw new Error("replacement_ledger_already_active");
   const cursors = inspectCursors(db);
-  const carriedRows = inspectLiveState(db, path.dirname(input.ledgerPath));
+  const live = inspectLiveState(db, path.dirname(input.ledgerPath));
+  const carriedRows = { rollout_scan_state: cursors.rows, ...live.carriedRows };
+  const carriedBytes = { rollout_scan_state: cursors.bytes, ...live.carriedBytes };
+  const totalCarriedBytes = Object.values(carriedBytes).reduce((sum, bytes) => sum + bytes, 0);
   const latest = latestRecordedTime(db, cursors.latest);
   const now = (input.now ?? (() => new Date()))();
   if (!Number.isFinite(now.getTime())) throw new Error("cutover_clock_invalid");
@@ -235,11 +275,36 @@ function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.
   const priorAcknowledged = priorAttempts === 0 || (hasTable(db, "weekly_tool_stats_uploads") &&
     Boolean(db.prepare(`select 1 from weekly_tool_stats_uploads
       where week_start=? and delivered=1 limit 1`).get(priorWeek)));
+  const dueWeeksWithoutAcknowledgement: string[] = [];
+  const first = hasTable(db, "weekly_tool_stats_control")
+    ? db.prepare(`select first_week as firstWeek from weekly_tool_stats_control
+        where workspace_id=? and device_id=?`).get(input.config.tenantId, input.config.deviceId) as
+        { firstWeek: string } | undefined : undefined;
+  if (first) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(first.firstWeek) ||
+        utcWeekStart(new Date(`${first.firstWeek}T00:00:00.000Z`)) !== first.firstWeek) {
+      throw new Error("weekly_first_week_invalid");
+    }
+    const weekCursor = new Date(`${first.firstWeek}T00:00:00.000Z`);
+    const count = db.prepare(`select count(*) as n from tool_attempt_facts
+      where started_at>=? and started_at<?`);
+    const acknowledged = hasTable(db, "weekly_tool_stats_uploads")
+      ? db.prepare(`select 1 from weekly_tool_stats_uploads where week_start=? and delivered=1 limit 1`)
+      : null;
+    while (weekCursor.toISOString().slice(0, 10) < week) {
+      const day = weekCursor.toISOString().slice(0, 10);
+      weekCursor.setUTCDate(weekCursor.getUTCDate() + 7);
+      if ((count.get(`${day}T00:00:00.000Z`, weekCursor.toISOString()) as { n: number }).n > 0 &&
+          !acknowledged?.get(day)) dueWeeksWithoutAcknowledgement.push(day);
+    }
+  }
   const archiveIdentity = fileIdentityDigest(input.ledgerPath, oldStat,
     input.config.tenantId, input.config.deviceId, path.resolve(input.archivePath));
-  return { archiveIdentity, latest, cursorRows: cursors.rows, carriedRows,
+  return { archiveIdentity, latest, cursorRows: cursors.rows, carriedRows, carriedBytes,
+    totalCarriedBytes, dueWeeksWithoutAcknowledgement,
     pending, attempts, priorAttempts, priorAcknowledged,
-    nextSafeWindowAt: attempts ? next : pending || !priorAcknowledged ? now.toISOString() : null };
+    nextSafeWindowAt: attempts ? next : pending || !priorAcknowledged || dueWeeksWithoutAcknowledgement.length
+      ? now.toISOString() : null };
 }
 
 function fileIdentityDigest(file: string, stat: fs.Stats, workspace: string,
@@ -263,6 +328,40 @@ function rootEpoch(input: CutoverInput): string | null {
   return epoch;
 }
 
+function assertPrivateDirectory(directory: string, reason: string): fs.Stats {
+  const absolute = path.resolve(directory);
+  let current = path.parse(absolute).root;
+  for (const part of absolute.slice(current.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    const stat = fs.lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink() ||
+        (stat.uid !== process.getuid?.() && stat.uid !== 0) ||
+        (stat.mode & 0o022) !== 0) throw new Error(`${reason}:unsafe_path_component:${current}`);
+  }
+  const leaf = fs.lstatSync(absolute);
+  if (leaf.uid !== process.getuid?.() || (leaf.mode & 0o777) !== 0o700) {
+    throw new Error(`${reason}:directory_must_be_owned_0700:${absolute}`);
+  }
+  return leaf;
+}
+
+function stageArtifactPresent(stage: string): boolean {
+  const artifacts = [stage, `${stage}-wal`, `${stage}-shm`].filter(file => {
+    try { fs.lstatSync(file); return true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  });
+  for (const artifact of artifacts) {
+    const stat = fs.lstatSync(artifact);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.()) {
+      throw new Error("staging_artifact_unsafe");
+    }
+  }
+  return artifacts.length > 0;
+}
+
 function assertPaths(input: CutoverInput) {
   const ledger = path.resolve(input.ledgerPath), archive = path.resolve(input.archivePath);
   if (!path.isAbsolute(input.ledgerPath) || !path.isAbsolute(input.archivePath) ||
@@ -271,8 +370,9 @@ function assertPaths(input: CutoverInput) {
   }
   const old = fs.lstatSync(ledger);
   if (!old.isFile() || old.isSymbolicLink()) throw new Error("ledger_not_regular");
-  const directory = fs.lstatSync(path.dirname(archive));
-  if (!directory.isDirectory() || directory.isSymbolicLink() || directory.dev !== old.dev ||
+  assertPrivateDirectory(path.dirname(ledger), "ledger_directory_unsafe");
+  const directory = assertPrivateDirectory(path.dirname(archive), "archive_directory_unsafe");
+  if (directory.dev !== old.dev ||
       fs.realpathSync(path.dirname(archive)) !== path.dirname(archive)) {
     throw new Error("archive_directory_unsafe");
   }
@@ -290,11 +390,71 @@ function assertPaths(input: CutoverInput) {
       fs.statSync(`${archive}-wal`).size > 32) {
     throw new Error("archive_sidecar_nonempty");
   }
-  if ([`${ledger}${STAGE_SUFFIX}`, `${ledger}${STAGE_SUFFIX}-wal`,
-    `${ledger}${STAGE_SUFFIX}-shm`].some(file => fs.existsSync(file))) {
-    throw new Error("staging_artifact_exists");
-  }
+  // A killed copy leaves a partial stage. Plan observes it without changing
+  // any file; switch removes only these owned artifacts under the lease and
+  // SQLite exclusive lock, after proving the active inode is still the old one.
+  stageArtifactPresent(`${ledger}${STAGE_SUFFIX}`);
   return old;
+}
+
+function untrackedRootFiles(db: Database.Database, input: CutoverInput): Array<{
+  source: "codex" | "claude_code"; observation: CaptureBaselineFileObservation;
+}> {
+  const result: Array<{ source: "codex" | "claude_code";
+    observation: CaptureBaselineFileObservation }> = [];
+  const cursor = hasTable(db, "rollout_scan_state")
+    ? db.prepare("select file_identity as fileIdentity from rollout_scan_state where file=?") : null;
+  const roots = input.config.captureRoots ?? [];
+  for (const root of roots) {
+    const files = captureRootBaselineFiles(root.source, root.directory);
+    if (files.errors) throw new Error("capture_root_file_inventory_unreadable");
+    const observed = captureRootBaselineObservations(files.files);
+    if (observed.errors) throw new Error("capture_root_file_stat_unreadable");
+    for (const observation of observed.observations) {
+      const key = jsonlScanStateKey(rootCursorKey(roots, observation.path));
+      const row = cursor?.get(key) as { fileIdentity: string } | undefined;
+      const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+      if (row?.fileIdentity !== identity) result.push({ source: root.source, observation });
+    }
+  }
+  return result;
+}
+
+function openReadOnlyPlanDatabase(ledgerPath: string): {
+  db: Database.Database; sidecarsMayAppear: boolean;
+} {
+  const files = [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`].filter(fs.existsSync);
+  const check = spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...files], {
+    encoding: "utf8", timeout: 60_000,
+    env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  const provenClosed = !check.error && check.status === 1 &&
+    !(check.stdout ?? "").trim() && !(check.stderr ?? "").trim();
+  if (provenClosed) {
+    if (fs.existsSync(`${ledgerPath}-wal`) && fs.statSync(`${ledgerPath}-wal`).size > 32) {
+      throw new Error("closed_ledger_wal_requires_checkpoint_before_immutable_plan");
+    }
+    // better-sqlite3 does not enable SQLITE_OPEN_URI. Node's built-in SQLite
+    // does, allowing an immutable read of a closed, checkpointed WAL ledger
+    // without creating WAL/SHM sidecars.
+    const SQLite = createRequire(import.meta.url)("node:sqlite") as {
+      DatabaseSync: new (file: string, options: { readOnly: boolean }) => {
+        prepare(sql: string): { all(...params: unknown[]): unknown[];
+          get(...params: unknown[]): unknown; iterate(...params: unknown[]): Iterable<unknown> };
+        close(): void;
+      };
+    };
+    const native = new SQLite.DatabaseSync(`${pathToFileURL(ledgerPath).href}?immutable=1`,
+      { readOnly: true });
+    const db = {
+      prepare: (sql: string) => native.prepare(sql),
+      pragma: (sql: string) => native.prepare(`pragma ${sql}`).all(),
+      close: () => native.close(),
+    } as unknown as Database.Database;
+    return { db, sidecarsMayAppear: false };
+  }
+  return { db: new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 }),
+    sidecarsMayAppear: true };
 }
 
 /** Read-only preflight. The switch repeats every check while holding the
@@ -305,6 +465,10 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
     readOnly: true as const, rootCount: roots.length, installationEpochId: null as string | null,
     archiveIdentity: null as string | null, archiveLatestRecordedAt: null as string | null,
     cursorRows: 0, carriedRows: {} as Record<string, number>,
+    carriedBytes: {} as Record<string, number>, totalCarriedBytes: 0,
+    carryBudgetBytes: MAX_CARRIED_VALUE_BYTES, untrackedFileFences: 0,
+    dueWeeksWithoutAcknowledgement: [] as string[], recoveryStagePresent: false,
+    sidecarsMayAppear: false, operatorAction: null as string | null,
     unacknowledgedWeeklyReports: 0, currentUtcWeekToolAttempts: 0,
     priorUtcWeekToolAttempts: 0, priorWeekReportAcknowledged: true,
     nextSafeWindowAt: null as string | null, requiresReportAcknowledgement: false,
@@ -312,22 +476,39 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
   try {
     const epoch = rootEpoch(input);
     const old = assertPaths(input);
-    const db = new Database(input.ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+    const { db, sidecarsMayAppear } = openReadOnlyPlanDatabase(input.ledgerPath);
     try {
-      db.pragma("query_only = ON");
+      if (sidecarsMayAppear) db.pragma("query_only = ON");
       const inspection = inspectArchive(db, input, old);
+      const untracked = untrackedRootFiles(db, input);
       const fields = { ...base, installationEpochId: epoch,
         archiveIdentity: inspection.archiveIdentity, archiveLatestRecordedAt: inspection.latest,
         cursorRows: inspection.cursorRows, carriedRows: inspection.carriedRows,
+        carriedBytes: inspection.carriedBytes, totalCarriedBytes: inspection.totalCarriedBytes,
+        untrackedFileFences: untracked.length,
+        dueWeeksWithoutAcknowledgement: inspection.dueWeeksWithoutAcknowledgement,
+        recoveryStagePresent: stageArtifactPresent(`${input.ledgerPath}${STAGE_SUFFIX}`),
+        sidecarsMayAppear,
         unacknowledgedWeeklyReports: inspection.pending,
         currentUtcWeekToolAttempts: inspection.attempts,
         priorUtcWeekToolAttempts: inspection.priorAttempts,
         priorWeekReportAcknowledged: inspection.priorAcknowledged,
         nextSafeWindowAt: inspection.nextSafeWindowAt,
-        requiresReportAcknowledgement: inspection.pending > 0 || !inspection.priorAcknowledged };
+        requiresReportAcknowledgement: inspection.pending > 0 || !inspection.priorAcknowledged ||
+          inspection.dueWeeksWithoutAcknowledgement.length > 0 };
+      if (inspection.totalCarriedBytes > MAX_CARRIED_VALUE_BYTES) return {
+        ...fields, status: "refused", reason: "carried_state_exceeds_32_mib_budget",
+        operatorAction: "Reduce carried authorization/cursor state before scheduling the 90-second window.",
+      };
       if (inspection.pending) return { ...fields, status: "refused", reason: "weekly_report_unacknowledged" };
       if (inspection.attempts) return { ...fields, status: "refused", reason: "current_utc_week_tool_attempts" };
-      if (!inspection.priorAcknowledged) return { ...fields, status: "refused", reason: "prior_week_report_not_acknowledged" };
+      if (!inspection.priorAcknowledged) return { ...fields, status: "refused",
+        reason: "prior_week_report_not_acknowledged",
+        operatorAction: `Run the weekly tool-stats upload first for ${inspection.dueWeeksWithoutAcknowledgement.join(", ") || "the prior UTC week"}.` };
+      if (inspection.dueWeeksWithoutAcknowledgement.length) return {
+        ...fields, status: "refused", reason: "due_week_reports_unacknowledged",
+        operatorAction: `Run the weekly tool-stats upload first for ${inspection.dueWeeksWithoutAcknowledgement.join(", ")}; cut over early in a later UTC week after acknowledgement.`,
+      };
       return { ...fields, status: "ready", reason: null };
     } finally { db.close(); }
   } catch (error) {
@@ -336,7 +517,7 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
 }
 
 function copyTable(source: Database.Database, target: Database.Database, table: string,
-  heartbeat: () => void): number {
+  heartbeat: () => void, onCopyRow?: CutoverInput["onCopyRow"]): number {
   if (!hasTable(source, table)) return 0;
   const targetColumns = columns(target, table);
   if (targetColumns.some(column => !columns(source, table).includes(column))) {
@@ -348,8 +529,10 @@ function copyTable(source: Database.Database, target: Database.Database, table: 
   for (const row of source.prepare(`select ${names} from ${table}`).iterate() as Iterable<Record<string, unknown>>) {
     insert.run(...targetColumns.map(column => row[column]));
     copied += 1;
-    if (copied % 1000 === 0) heartbeat();
+    onCopyRow?.(table, copied);
+    if (copied % 128 === 0) heartbeat();
   }
+  heartbeat();
   return copied;
 }
 
@@ -400,6 +583,9 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     // swap. Changing journal mode here would briefly release SQLite's lock.
     old.exec("BEGIN EXCLUSIVE");
     input.onStep?.("old_locked");
+    // A SIGKILL during the previous carry may have left only our incomplete
+    // stage. The active old inode and lifecycle lease are now proved stable.
+    if (stageArtifactPresent(stage)) removeOwnedStage(stage);
     const epoch = rootEpoch(input)!;
     const stat = assertPaths(input);
     // One checked time is both the admission fence and the marker time.
@@ -407,9 +593,16 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     // replacement's cutoff behind the archive.
     const switchNow = (input.now ?? (() => new Date()))();
     const inspection = inspectArchive(old, { ...input, now: () => switchNow }, stat);
+    const untracked = untrackedRootFiles(old, input);
+    if (inspection.totalCarriedBytes > MAX_CARRIED_VALUE_BYTES) {
+      throw new Error("carried_state_exceeds_32_mib_budget");
+    }
     if (inspection.pending) throw new Error("weekly_report_unacknowledged");
     if (inspection.attempts) throw new Error("current_utc_week_tool_attempts");
     if (!inspection.priorAcknowledged) throw new Error("prior_week_report_not_acknowledged");
+    if (inspection.dueWeeksWithoutAcknowledgement.length) {
+      throw new Error(`due_week_reports_unacknowledged:${inspection.dueWeeksWithoutAcknowledgement.join(",")}`);
+    }
     heartbeat();
     staged = new LocalEventBuffer(stage, { workspaceId: input.config.tenantId,
       deviceId: input.config.deviceId, freshCaptureRootEpoch: epoch, enrollmentNow: () => switchNow });
@@ -432,14 +625,24 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
           values (${cursorColumns.map(() => "?").join(",")})`);
         const mark = target.prepare(`insert into replacement_capture_cursors
           (file_key,source,file_identity,committed_offset) values (?,?,?,?)`);
+        let copied = 0;
         for (const row of old!.prepare(`select ${names} from rollout_scan_state`).iterate() as
           Iterable<Record<string, unknown>>) {
           insert.run(...cursorColumns.map(column => row[column]));
           mark.run(row.file, row.parser_kind === "codex-rollout-v2" ? "codex" : "claude_code",
             row.file_identity, row.committed_offset);
+          copied += 1;
+          input.onCopyRow?.("rollout_scan_state", copied);
+          if (copied % 128 === 0) heartbeat();
         }
+        heartbeat();
       }
-      for (const table of CARRIED_TABLES) copyTable(old!, target, table, heartbeat);
+      for (const table of CARRIED_TABLES) copyTable(old!, target, table, heartbeat, input.onCopyRow);
+      for (const source of ["codex", "claude_code"] as const) {
+        recordReplacementUnseenFileFences(target, source,
+          untracked.filter(row => row.source === source).map(row => row.observation));
+        heartbeat();
+      }
       if (hasTable(old!, "maintenance_state")) {
         const row = old!.prepare("select key,value,updated_at from maintenance_state where key=?")
           .get(ACCOUNT_ASSERTION_STATE_KEY) as { key: string; value: string; updated_at: string } | undefined;
@@ -454,6 +657,7 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     target.pragma("wal_checkpoint(TRUNCATE)");
     target.pragma("journal_mode = DELETE");
     staged.close(); staged = null;
+    fs.chmodSync(stage, 0o600);
     for (const sidecar of [`${stage}-wal`, `${stage}-shm`]) {
       if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar);
     }
@@ -464,10 +668,16 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     heartbeat();
     // The old WAL is checkpointed; any empty sidecars follow its inode to
     // the archive. The new inode remains locked until the old one closes.
+    // chmod is on the old inode: a retained hard link can never expose the
+    // pre-cutover 0644 SQLite mode, including across a crash after link.
+    fs.chmodSync(input.ledgerPath, 0o600);
     if (!fs.existsSync(input.archivePath)) fs.linkSync(input.ledgerPath, input.archivePath);
     for (const suffix of ["-wal", "-shm"] as const) {
       const source = `${input.ledgerPath}${suffix}`;
-      if (fs.existsSync(source)) fs.renameSync(source, `${input.archivePath}${suffix}`);
+      if (fs.existsSync(source)) {
+        fs.chmodSync(source, 0o600);
+        fs.renameSync(source, `${input.archivePath}${suffix}`);
+      }
     }
     fsyncDirectory(path.dirname(input.archivePath));
     input.onStep?.("archive_linked");
@@ -477,7 +687,7 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     switched = true;
     input.onStep?.("switched");
     return { ...first, archiveIdentity: inspection.archiveIdentity,
-      archiveLatestRecordedAt: inspection.latest };
+      archiveLatestRecordedAt: inspection.latest, untrackedFileFences: untracked.length };
   } finally {
     staged?.close();
     if (old?.inTransaction) old.exec("COMMIT");
@@ -507,6 +717,53 @@ export function readReplacementLedgerMarker(ledgerPath: string): ReplacementLedg
   } finally { db.close(); }
 }
 
+function foldReplacementWeeklyFacts(replacement: Database.Database, restored: Database.Database,
+  switchedAt: string, heartbeat: () => void): number {
+  const firstWeek = `${utcWeekStart(new Date(switchedAt))}T00:00:00.000Z`;
+  const pending = replacement.prepare(`select week_start as weekStart
+    from weekly_tool_stats_uploads where week_start>=? limit 1`).get(firstWeek.slice(0, 10)) as
+    { weekStart: string } | undefined;
+  // A frozen upload may already have reached the cloud. Refuse before the
+  // pathname swap rather than publish a partial week after restore.
+  if (pending) throw new Error(`restore_weekly_report_reconcile_required:${pending.weekStart}`);
+  const copy = (table: string, where: string, params: unknown[]) => {
+    const names = columns(restored, table).map(name => `"${name.replaceAll('"', '""')}"`).join(",");
+    const targetColumns = columns(restored, table);
+    if (targetColumns.some(name => !columns(replacement, table).includes(name))) {
+      throw new Error(`restore_${table}_schema_mismatch`);
+    }
+    const insert = restored.prepare(`insert or ignore into ${table} (${names})
+      values (${targetColumns.map(() => "?").join(",")})`);
+    const existing = restored.prepare(`select ${names} from ${table} where ${table === "buffered_events"
+      ? "id=?" : "operation_id=?"}`);
+    let count = 0;
+    for (const row of replacement.prepare(`select ${names} from ${table} where ${where}`)
+      .iterate(...params) as Iterable<Record<string, unknown>>) {
+      const values = targetColumns.map(name => row[name]);
+      const inserted = insert.run(...values);
+      if (!inserted.changes) {
+        const prior = existing.get(row[table === "buffered_events" ? "id" : "operation_id"]) as
+          Record<string, unknown> | undefined;
+        if (!prior || JSON.stringify(prior) !== JSON.stringify(row)) {
+          throw new Error(`restore_${table}_identity_conflict`);
+        }
+      }
+      count += 1;
+      if (count % 128 === 0) heartbeat();
+    }
+    heartbeat();
+    return count;
+  };
+  const events = copy("buffered_events", `observed_at>=? or id in (
+    select d.event_id from tool_stat_attempt_dimensions d
+    join tool_attempt_facts a on a.operation_id=d.operation_id where a.started_at>=?)`,
+    [firstWeek, firstWeek]);
+  copy("tool_attempt_facts", "started_at>=?", [firstWeek]);
+  copy("tool_stat_attempt_dimensions", `operation_id in (
+    select operation_id from tool_attempt_facts where started_at>=?)`, [firstWeek]);
+  return events;
+}
+
 /** Restore the archived image by an APFS clone while retaining both originals.
  * The active pathname is replaced atomically, so even a mistakenly started old
  * runtime can only see a complete, original ledger after this command returns. */
@@ -525,6 +782,8 @@ export function restoreArchivedLedger(input: {
   const archiveStat = fs.lstatSync(input.archivePath);
   const currentStat = fs.lstatSync(input.ledgerPath);
   const attemptDirectory = fs.lstatSync(path.dirname(input.freshAttemptPath));
+  assertPrivateDirectory(path.dirname(input.archivePath), "archive_directory_unsafe");
+  assertPrivateDirectory(path.dirname(input.freshAttemptPath), "fresh_attempt_directory_unsafe");
   if (!archiveStat.isFile() || archiveStat.isSymbolicLink() ||
       !currentStat.isFile() || currentStat.isSymbolicLink() ||
       !attemptDirectory.isDirectory() || attemptDirectory.isSymbolicLink() ||
@@ -585,11 +844,36 @@ export function restoreArchivedLedger(input: {
     restoredLock = new Database(stage, { fileMustExist: true, timeout: 0 });
     restoredLock.pragma("locking_mode = EXCLUSIVE");
     restoredLock.exec("BEGIN EXCLUSIVE");
-    if (!lease.renew().ok) throw new Error("restore_lifecycle_authority_lost");
+    const heartbeat = () => {
+      if (!lease.renew().ok) throw new Error("restore_lifecycle_authority_lost");
+    };
+    foldReplacementWeeklyFacts(replacement, restoredLock, marker.switchedAt, heartbeat);
+    // The restored image must contain its committed weekly fold before it
+    // becomes active. No uploader can see the clone until the atomic rename.
+    restoredLock.exec("COMMIT");
+    if (restoredLock.pragma("journal_mode", { simple: true }) === "wal") {
+      const [checkpoint] = restoredLock.pragma("wal_checkpoint(TRUNCATE)") as
+        Array<{ busy: number; log: number }>;
+      if (!checkpoint || checkpoint.busy || checkpoint.log) throw new Error("restore_fold_not_checkpointed");
+    }
+    restoredLock.pragma("journal_mode = DELETE");
+    restoredLock.close(); restoredLock = null;
+    for (const sidecar of [`${stage}-wal`, `${stage}-shm`]) {
+      if (fs.existsSync(sidecar)) fs.unlinkSync(sidecar);
+    }
+    fs.chmodSync(stage, 0o600);
+    restoredLock = new Database(stage, { fileMustExist: true, timeout: 0 });
+    restoredLock.pragma("locking_mode = EXCLUSIVE");
+    restoredLock.exec("BEGIN EXCLUSIVE");
+    heartbeat();
+    fs.chmodSync(input.ledgerPath, 0o600);
     fs.linkSync(input.ledgerPath, input.freshAttemptPath);
     for (const suffix of ["-wal", "-shm"] as const) {
       const source = `${input.ledgerPath}${suffix}`;
-      if (fs.existsSync(source)) fs.renameSync(source, `${input.freshAttemptPath}${suffix}`);
+      if (fs.existsSync(source)) {
+        fs.chmodSync(source, 0o600);
+        fs.renameSync(source, `${input.freshAttemptPath}${suffix}`);
+      }
     }
     fsyncDirectory(path.dirname(input.freshAttemptPath));
     fs.renameSync(stage, input.ledgerPath);
@@ -614,7 +898,7 @@ export function assertReplacementRuntimeCompatible(ledgerPath: string, version: 
   const parsed = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
   if (!parsed || Number(parsed[1]) < 0 ||
       (Number(parsed[1]) === 0 && (Number(parsed[2]) < 7 ||
-        (Number(parsed[2]) === 7 && Number(parsed[3]) < 45)))) {
+        (Number(parsed[2]) === 7 && Number(parsed[3]) < 46)))) {
     throw new Error("replacement_ledger_requires_archive_restore_before_downgrade");
   }
 }

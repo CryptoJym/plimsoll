@@ -13,13 +13,14 @@ keys, and capture-root configuration stay in place.
    the primary key. Confirm that contract has applied **before any replacement
    ledger window**. An expanded-only schema still has the four-column primary
    key, so it rejects the second same-epoch ledger watermark row.
-2. Schedule this cutover early in a UTC week. Wait until the preceding UTC
-   week's tool-stats report is acknowledged, and before this UTC week has any
-   tool attempt. `epoch-plan --archive` refuses an unacknowledged report or a
-   current-week attempt. It reports `nextSafeWindowAt` and whether an
-   acknowledgement is still required. A current-week attempt means waiting
-   until the next Monday 00:00 UTC **and** for that week's report to be
-   acknowledged. Do not migrate a partial weekly aggregate.
+2. Schedule this cutover early in a UTC week. Run the weekly tool-stats upload
+   first and verify acknowledgement for **every due week with attempts**, from
+   `first_week` through the last completed UTC week. There must be no current
+   week tool attempt and no unacknowledged report row. `epoch-plan --archive`
+   lists `dueWeeksWithoutAcknowledgement` and an `operatorAction` on refusal.
+   A current-week attempt means waiting until the next Monday 00:00 UTC and
+   for that week's report to be acknowledged. No weekly aggregate is carried
+   into the replacement.
 3. Drain delivery and hook/OTLP spools using the rollout plan's three stable
    zero readings. Stop the collector using the plan's supported unload. Check
    its outbox, receipt, session-sync and spool gates with the old ledger still
@@ -30,8 +31,11 @@ keys, and capture-root configuration stay in place.
 4. Run the lifecycle update to the 0.7.46 cutover build **while the old ledger
    is still in place**. Keep the snapshot and its receipts. Leave the daemon
    stopped. This preserves the B2 rollback ordering.
-5. Create a private (0700) archive directory on the same volume, outside the
-   collector home. Choose a unique absolute path inside it, for example
+5. Create an archive directory **owned by the collector user, mode 0700** on
+   the same volume, outside the collector home. Every ancestor must be owned
+   by that user or root, and must not be writable by group or others. The
+   command enforces these conditions before any link and sets retained ledger
+   files to 0600. Choose a unique absolute path inside it, for example
    `/absolute/Plimsoll-archive/old-ledger.sqlite`. With the old ledger still
    at its normal pathname, run:
 
@@ -39,13 +43,25 @@ keys, and capture-root configuration stay in place.
    plimsoll capture-roots epoch-plan --archive "$archive" --json
    ```
 
-   Require `status: capture_roots_epoch_plan`, the configured root count and
-   epoch, a nonzero `cursorRows` when cursors exist, and the listed
-   `carriedRows` for Codex live authorization. The plan checks the archived
+   Before scheduling the 90-second window, run the same read-only command
+   with `--sizes` on a private Studio0 **ledger and root copy**. Require
+   `totalCarriedBytes <= carryBudgetBytes` (32 MiB). The plan reports exact
+   row counts and SQLite value-payload bytes per carried table; the budget
+   includes cursor and authorization rows, not the 88.7 GB archive. A 3 MiB
+   fixture copied in 3.5 seconds, so 32 MiB leaves more than twice that rate's
+   margin within 90 seconds. A refused budget requires a new plan, not an
+   override. On the final stopped collector, require
+   `status: capture_roots_epoch_plan`, `sidecarsMayAppear: false`, the root
+   count and epoch, the listed `carriedRows` and `carriedBytes`, and the count
+   of `untrackedFileFences`. The plan checks the archived
    binding against the configured tenant, device and root epoch.
+   A closed ledger uses an immutable SQLite read and leaves no new files. If
+   the ledger is open or closure cannot be proved, the result explicitly says
+   `sidecarsMayAppear: true`; stop the owner and rerun. Never delete sidecars.
    The plan reads the old ledger; it does not write a replacement. It refuses
    invalid or mixed root epochs, malformed or unreadable archive cursors/live
-   rows, a regressed host clock, and the weekly conditions above. Resolve the
+   rows, an unsafe archive path, a regressed host clock, unreadable root
+   inventory, and the weekly conditions above. Resolve the
    stated refusal before proceeding. Do not edit `collector.config.json`.
 6. The rollout tool's exact cutover action is:
 
@@ -60,21 +76,22 @@ keys, and capture-root configuration stay in place.
    rows. It creates a hard link for the archive and atomically swaps the
    already-bound stage into the active pathname. The archive is never
    deleted. The replacement's durable marker records the archive identity,
-   archive path, and minimum collector version 0.7.45. Its capture baseline
-   still applies to files absent from the archive's cursor set; preexisting
-   files with carried cursors resume at their committed offsets.
+   archive path, and minimum collector version 0.7.46. Files with carried
+   cursors resume at their committed byte offsets, even when appended records
+   have timestamps before the switch. Every physically present file without
+   a carried cursor is fenced at its observed switch size, independently of
+   host or filesystem clocks; later growth starts at that byte boundary.
 
    If the process stops after linking the archive but before the swap, the
    active and archive paths refer to the same old inode. Keep both paths. A
    handled error removes its owned stage; rerun `epoch-plan --archive` and
    `epoch-switch --archive`. A hard kill can leave
-   `work-ledger.sqlite.replacement-stage` and its sidecars. With the daemon
-   still stopped, first verify that the active ledger has **no** replacement
-   marker and the archive either does not exist or is the **same inode** as
-   active. Move the incomplete stage and its sidecars to unique retained
-   `incomplete-stage-<stamp>` names in the private archive directory; then
-   rerun plan. A killed mutation owner leaves a fenced lease for up to ten
-   minutes; wait for its recorded expiry before rerunning switch. Never move
+   `work-ledger.sqlite.replacement-stage` and its sidecars. Plan recognizes
+   this as `recoveryStagePresent: true` while the active old ledger remains
+   valid. Rerun switch after the killed owner's fenced lease expires (up to
+   ten minutes); switch removes only its owned incomplete stage under the
+   mutation lease and exclusive old-ledger lock. No manual stage move is
+   needed. Never move
    the active ledger or its archive in this recovery. If the response is lost
    after the swap, inspect the active
    ledger's `collector_replacement_ledger` row and archive inode before
@@ -90,12 +107,13 @@ keys, and capture-root configuration stay in place.
 
 ## Rollback or downgrade
 
-Stop the 0.7.46 collector first. **Never start 0.7.44 or an older runtime on
-the replacement ledger**, even to inspect it. The supported 0.7.45+ lifecycle
+Stop the 0.7.46 collector first. **Never start 0.7.45 or an older runtime on
+the replacement ledger**, even to inspect it. The supported 0.7.46 lifecycle
 update/rollback path checks the marker under the same mutation authority and
-refuses a runtime below 0.7.45 until the old ledger is restored.
+refuses a runtime below 0.7.46 until the old ledger is restored.
 
-Choose a new absolute `freshAttempt` path in the private archive directory,
+Choose a new absolute `freshAttempt` path in a collector-owned 0700 directory
+whose ancestors meet the same path rule as the archive,
 and run this with the 0.7.46 cutover CLI while the daemon is stopped:
 
 ```sh
@@ -103,9 +121,15 @@ plimsoll capture-roots epoch-restore --archive "$archive" --save-fresh "$freshAt
 ```
 
 The command checks the marker and archive identity, clones the archived old
-ledger into an atomic restore stage, retains the replacement at `freshAttempt`,
-and swaps the old image into the active pathname. The archive and fresh
-attempt are both retained. Confirm the active ledger has the old epoch and no
+ledger into a restore stage, and folds the replacement's weekly event, tool
+attempt, and dimension rows from the cutover UTC week onward in one SQLite
+transaction. It commits and checkpoints that fold before atomically swapping
+the clone into the active pathname. The replacement is retained at
+`freshAttempt`; the archive is unchanged. If a replacement weekly report is
+already frozen, restore refuses with `restore_weekly_report_reconcile_required`
+and leaves the replacement active, so the archived image cannot publish a
+partial week. Reconcile that report with the rollout lead before retrying
+restore. Confirm the active ledger has the old epoch and no
 replacement marker. **Only then** run the rollout's pinned `lifecycle
 rollback` to its pre-update runtime, keeping snapshots/receipts, and start
 that runtime. Its snapshot may restore the old ledger again; it must never
