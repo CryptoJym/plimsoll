@@ -161,7 +161,7 @@ async function main() {
 
   const stale = path.join(root, "stale-lock.sqlite");
   fixture(stale);
-  fs.writeFileSync(`${stale}.maintenance-rebuild.lock`, `${process.pid}\n`);
+  fs.writeFileSync(`${stale}.maintenance-rebuild.lock`, "2147483647\n");
   assert.deepEqual(recoverInterruptedRebuild(stale), { status: "recovered_stale_lock" });
   assert.equal(fs.existsSync(`${stale}.maintenance-rebuild.lock`), false);
   assert.deepEqual(rows(stale), [{ id: "before" }]);

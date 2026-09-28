@@ -87,7 +87,7 @@ function recoveryFixture(file: string) {
   fs.writeFileSync(`${file}.maintenance-rebuild.json`, `${JSON.stringify({ version: 1, nonce: randomUUID(),
     phase: "verified", stage: "S10", backupPath: backup, targetPath: `${file}.rebuild`,
     startedAt: now, updatedAt: now })}\n`);
-  fs.writeFileSync(`${file}.maintenance-rebuild.lock`, "fixture\n");
+  fs.writeFileSync(`${file}.maintenance-rebuild.lock`, "2147483647\n");
   fs.renameSync(file, backup);
   return backup;
 }

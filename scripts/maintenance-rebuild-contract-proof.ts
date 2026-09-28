@@ -82,7 +82,7 @@ function missingMainCli() {
   fs.writeFileSync(`${file}.maintenance-rebuild.json`, JSON.stringify({ version: 1, nonce: randomUUID(),
     phase: "verified", stage: "S10", backupPath, targetPath: `${file}.rebuild`,
     startedAt: now, updatedAt: now }));
-  fs.writeFileSync(`${file}.maintenance-rebuild.lock`, "fixture\n");
+  fs.writeFileSync(`${file}.maintenance-rebuild.lock`, "2147483647\n");
   fs.renameSync(file, backupPath);
   const cli = path.resolve("packages/collector-cli/src/cli.ts");
   const result = spawnSync(process.execPath, ["--import", "tsx", cli, "maintenance", "rebuild",
@@ -109,7 +109,7 @@ function observedLease() {
 function lockWithoutState() {
   const file = path.join(root, "stale.sqlite");
   fixture(file);
-  fs.writeFileSync(`${file}.maintenance-rebuild.lock`, "fixture\n");
+  fs.writeFileSync(`${file}.maintenance-rebuild.lock`, "2147483647\n");
   assert.deepEqual(recoverInterruptedRebuild(file), { status: "recovered_stale_lock" });
   console.log(JSON.stringify({ check: "LOW_lock_without_state_recovery" }));
 }
