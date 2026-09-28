@@ -359,7 +359,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       if (name === "delayed_restart") f.env.PLIMSOLL_PROOF_DELAY_RESTART = "1";
       if (name === "path_drift") f.env.PATH = `${f.env.PATH}:/opt/new-toolchain`;
       if (name === "crash_after_config_commit") f.env.PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT = "1";
-      if (name === "crash_after_config_commit") {
+      if (name === "crash_after_config_commit" || name === "crash_fresh_after_config_commit") {
         const preload = path.join(f.home, "kill-after-config-commit.mjs");
         fs.writeFileSync(preload, [
           'import fs from "node:fs";',
@@ -392,6 +392,19 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       check(`${name}_no_collector_installed_before_join`, !fs.existsSync(path.join(f.data, "collector.config.json")) &&
         !fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")));
     }
+    if (name === "crash_fresh_after_config_commit") {
+      const preload = path.join(f.home, "kill-after-config-commit.mjs");
+      fs.writeFileSync(preload, [
+        'import fs from "node:fs";',
+        'const original = fs.renameSync;',
+        'fs.renameSync = (...args) => {',
+        '  original(...args);',
+        '  if (process.argv.includes("--join-setup-child") && String(args[1]).endsWith("/collector.config.json"))',
+        '    process.kill(process.pid, "SIGKILL");',
+        '};',
+      ].join("\n") + "\n", { mode: 0o600 });
+      f.env.NODE_OPTIONS = `--import=${preload}`;
+    }
     if (name === "clock_skew") {
       const preload = path.join(f.home, "freeze-join-clock.mjs");
       fs.writeFileSync(preload, 'if (process.argv[2] === "join") { const native = Date.now; Date.now = () => new Error().stack?.includes("acknowledgeJoinedCollector") ? 0 : native(); }\n');
@@ -408,6 +421,22 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     } catch (error) {
       if (name === "clock_skew") throw new Error("clock_skew_no_ack_failed_to_exit_within_27_seconds", { cause: error });
       throw error;
+    }
+    if (name === "crash_fresh_after_config_commit") {
+      const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(
+        path.join(f.data, "collector.config.json"), "utf8")));
+      const result = receipt(joined.stdout);
+      const runningAfterRecovery = fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      console.log(JSON.stringify({ scenario: name, joinExit: joined.code, status: result.status,
+        rootCount: config.captureRoots?.length ?? 0, runningAfterRecovery,
+        obligationPresent: fs.existsSync(path.join(f.data, "join.restart-obligation.json")) }));
+      check("fresh_child_crash_recovers_first_launch_agent_and_collector",
+        joined.code !== 0 && result.status === "joined_setup_incomplete" &&
+        (config.captureRoots?.length ?? 0) === 0 && runningAfterRecovery &&
+        !fs.existsSync(path.join(f.data, "join.restart-obligation.json")) &&
+        fs.existsSync(path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist")));
+      return;
     }
     if (name === "crash_parent_after_bootout") {
       const obligation = path.join(f.data, "join.restart-obligation.json");
@@ -752,6 +781,10 @@ async function main() {
       await joinedScenario("crash_after_config_commit", true, "ack");
       return;
     }
+    if (process.env.PR428_REVIEW_SCENARIO === "crash_fresh_after_config_commit") {
+      await joinedScenario("crash_fresh_after_config_commit", false, "ack");
+      return;
+    }
     if (process.env.PR428_REVIEW_SCENARIO === "delayed_restart") {
       await joinedScenario("delayed_restart", true, "ack");
       return;
@@ -793,6 +826,7 @@ async function main() {
     await joinedScenario("crash_after_bootout", true, "ack");
     await joinedScenario("crash_parent_after_bootout", true, "ack");
     await joinedScenario("crash_after_config_commit", true, "ack");
+    await joinedScenario("crash_fresh_after_config_commit", false, "ack");
     await joinedScenario("delayed_restart", true, "ack");
     await joinedScenario("path_drift", true, "ack");
     await joinedScenario("program_edit", true, "ack");

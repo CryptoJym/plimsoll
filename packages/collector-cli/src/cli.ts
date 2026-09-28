@@ -1064,6 +1064,12 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
     throw new Error("The pending root journal does not match the prior collector config.");
 
   const stopForRecovery = async () => {
+    const manifest = inspectLaunchAgentManifest();
+    if (!manifest.ok && manifest.status === "missing") {
+      const serving = await verifyPostBootstrapReadiness(obligation.port, { timeoutMs: 0 });
+      if (serving.verified) throw new Error("A collector is serving without its LaunchAgent during join recovery.");
+      return;
+    }
     const stopped = await executeLaunchAgentUnload(obligation.port, launchAgentMutationAuthority());
     if (!stopped.unloaded)
       throw new Error(`Could not stop the collector safely for join recovery (${stopped.reason ?? stopped.status}).`);
@@ -1110,7 +1116,18 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
     if (!visible.ok || visible.manifestDigest !== obligation.priorManifestDigest)
       throw new Error("The prior LaunchAgent could not be restored exactly.");
   } else if (!visible.ok) {
-    throw new Error("No LaunchAgent is available to restore the collector after join.");
+    // A fresh home has no prior plist. A child can die after its root commit
+    // and before the first install; completing that install is the only way
+    // to discharge the restart obligation with a serving collector.
+    const script = fs.realpathSync(process.argv[1] ?? "");
+    const install = installLaunchAgent({ repoRoot: path.dirname(script),
+      programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script),
+      mutationAuthority: launchAgentMutationAuthority() });
+    if (install.receipt.manifestDigest !== obligation.replacementManifestDigest)
+      throw new Error("The fresh collector LaunchAgent differed from the journaled install.");
+    visible = inspectLaunchAgentManifest();
+    if (!visible.ok || visible.manifestDigest !== obligation.replacementManifestDigest)
+      throw new Error("The fresh collector LaunchAgent did not pass recovery readback.");
   }
   await restorePriorJoinedCollector(obligation.port, visible);
   clearJoinRestartObligation(home);
