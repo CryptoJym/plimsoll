@@ -1181,7 +1181,12 @@ export class DashboardProjectionStore {
       singleton integer primary key check (singleton = 1),
       cursor_raw_rowid integer not null default 0,
       complete integer not null default 0
-    )`);
+    );
+    create table if not exists projection_expiry_schedule (
+      singleton integer primary key check (singleton = 1),
+      next_window_index integer not null default 0
+    );
+    insert or ignore into projection_expiry_schedule (singleton) values (1)`);
     // Track scan debt apart from capture's general repair queue. Capture may
     // replace a repair's reason without satisfying the scanned duplicate.
     const hadScanRepairReceipts = Boolean(this.db.prepare(`select 1 from sqlite_master
@@ -1192,6 +1197,16 @@ export class DashboardProjectionStore {
     create trigger if not exists trg_codex_duplicate_scan_repair_done
     after delete on dashboard_projection_repairs begin
       delete from codex_duplicate_fact_scan_repairs where raw_rowid=old.raw_rowid;
+    end;
+    -- A 0.7.44 writer opened before the v3 stamp retains its in-memory
+    -- acceptance. SQLite must refuse its later parity publication while the
+    -- historical duplicate scan is pending, even across processes.
+    create trigger if not exists trg_dashboard_pending_duplicate_scan_fence
+    before update of parity_ready,dirty on dashboard_projection_control
+    when (new.parity_ready!=0 or new.dirty=0) and exists (
+      select 1 from codex_duplicate_fact_scan where singleton=1 and complete=0
+    ) begin
+      select raise(abort, 'pending_duplicate_fact_scan');
     end`);
     // A preexisting green snapshot may still contain a fact for a row later
     // marked duplicate. Withhold parity immediately on upgrade, before the
@@ -3098,7 +3113,7 @@ export class DashboardProjectionStore {
     maxActiveMs?: number;
     /** Monotonic clock and row cost hook for deterministic slow-host proofs. */
     clock?: () => number;
-    onWorkRowForProof?: (phase: "scan" | "repair" | "backfill" | "metric" | "parity") => void;
+    onWorkRowForProof?: (phase: "scan" | "repair" | "backfill" | "metric" | "parity" | "expiry") => void;
     onPhaseForProof?: (phase: "scan" | "pre_repair" | "repair" | "finish" | "commit",
       durationMs: number) => void;
   } = {}): ProjectionMaintenanceReceipt {
@@ -3132,10 +3147,12 @@ export class DashboardProjectionStore {
     const deadline = options.maxActiveMs === undefined ? Infinity :
       clock() + Math.max(1, options.maxActiveMs);
     const hasActiveTime = () => clock() < deadline;
-    // Migration can use the whole allowance in bounded batches. Repairs and
-    // expiry keep their smaller deadline-sensitive admission units.
+    // Migration and expiry can use the whole allowance in bounded batches.
+    // Repairs retain their smaller deadline-sensitive admission units.
     const migrationBatchRows = options.maxActiveMs === undefined ?
       BACKFILL_ROWS : TIMED_BACKFILL_BATCH_ROWS;
+    const expiryBatchRows = options.maxActiveMs === undefined ?
+      REPAIR_ROWS : TIMED_BACKFILL_BATCH_ROWS;
     const phaseRows = options.maxActiveMs === undefined ? BACKFILL_ROWS : TIMED_REPAIR_BATCH_ROWS;
     let phaseStarted = options.onPhaseForProof ? performance.now() : 0;
     const markPhase = (phase: "scan" | "pre_repair" | "repair" | "finish" | "commit") => {
@@ -3152,6 +3169,14 @@ export class DashboardProjectionStore {
     );
     const repairPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "b");
     this.db.transaction(() => {
+      // Repair a green control row before any phase writes if another process
+      // left one behind. The durable trigger then rejects attempts to set it
+      // green again until the scan itself completes.
+      this.db.prepare(`update dashboard_projection_control set parity_ready=0,dirty=1,
+        degraded_reason=coalesce(degraded_reason,'projection_repair_backlog')
+        where singleton=1 and exists (select 1 from codex_duplicate_fact_scan
+          where singleton=1 and complete=0)
+          and (parity_ready!=0 or dirty!=1 or degraded_reason is null)`).run();
       const current = this.control();
       if (current.backfillHighWater === null) {
         const high = this.db.prepare(
@@ -3270,8 +3295,8 @@ export class DashboardProjectionStore {
       if (hasActiveTime()) this.drainCompactMutations(
         options.maxActiveMs === undefined ? REPAIR_ROWS : TIMED_REPAIR_BATCH_ROWS);
       markPhase("pre_repair");
-      const repairs = hasActiveTime() ? this.db.prepare(
-        `select r.raw_rowid as repairRawRowid,r.reason,
+      type RepairRow=RawProjectionRow&{repairRawRowid:number;reason:string;id:string|null};
+      const repairColumns=`r.raw_rowid as repairRawRowid,r.reason,
           b.rowid as rawRowid,b.id,b.source,b.event_type as eventType,b.observed_at as observedAt,
           case when ${repairPrivacyEligible} then 1 else 0 end as privacyEligible,
           b.session_id as sessionId,b.action_class as actionClass,b.model,
@@ -3282,13 +3307,29 @@ export class DashboardProjectionStore {
           b.suppressed_fields_json as suppressedFieldsJson,
           b.privacy_generation as privacyGeneration, b.workspace_id as workspaceId,
           b.installation_epoch_id as installationEpochId, b.project_key as projectKey,
-          case when b.event_type='usage_live' then b.payload_json else '{}' end as payloadJson, b.created_at as createdAt, b.cost_kind as costKind
+          case when b.event_type='usage_live' then b.payload_json else '{}' end as payloadJson,
+          b.created_at as createdAt,b.cost_kind as costKind`;
+      const repairEligible=`(r.reason!='raw_update' or not exists (
+        select 1 from dashboard_compact_mutations m where m.raw_rowid=r.raw_rowid))`;
+      // Scan receipts have their own durable rowid order. A transient future
+      // queued_at cannot strand one behind continuously captured repairs.
+      // Start from the receipt primary key rather than sorting the whole
+      // repair queue on every tick of a duplicate-heavy upgrade.
+      const scanRepairs=hasActiveTime()?this.db.prepare(
+        `select ${repairColumns}
+         from codex_duplicate_fact_scan_repairs scan
+         join dashboard_projection_repairs r on r.raw_rowid=scan.raw_rowid
+         left join buffered_events b on b.rowid=r.raw_rowid
+         where ${repairEligible} order by scan.raw_rowid limit ?`,
+      ).all(REPAIR_ROWS) as RepairRow[]:[];
+      const ordinaryRepairs=hasActiveTime()&&scanRepairs.length<REPAIR_ROWS?this.db.prepare(
+        `select ${repairColumns}
          from dashboard_projection_repairs r left join buffered_events b on b.rowid=r.raw_rowid
-         where r.reason!='raw_update' or not exists (
-           select 1 from dashboard_compact_mutations m where m.raw_rowid=r.raw_rowid
-         )
+         where ${repairEligible} and not exists (
+           select 1 from codex_duplicate_fact_scan_repairs scan where scan.raw_rowid=r.raw_rowid)
          order by r.queued_at,r.raw_rowid limit ?`,
-      ).all(REPAIR_ROWS) as Array<RawProjectionRow&{repairRawRowid:number;reason:string;id:string|null}> : [];
+      ).all(REPAIR_ROWS-scanRepairs.length) as RepairRow[]:[];
+      const repairs=[...scanRepairs,...ordinaryRepairs];
       const removeRepair=this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`);
       // Apply and acknowledge only complete batches. A timed production pass
       // checks the same active deadline between small batches; an unbudgeted
@@ -3340,7 +3381,8 @@ export class DashboardProjectionStore {
       // that cutoff has left the flat totals, then compare unlike windows.
       // An already-started parity scan keeps its existing cutoff: expiry's
       // own cursor guard yields until that scan completes.
-      if (hasActiveTime()) expiryFacts = this.advanceExpiry(now, phaseRows);
+      if (hasActiveTime()) expiryFacts = this.advanceExpiry(
+        now,BACKFILL_ROWS,hasActiveTime,expiryBatchRows,options.onWorkRowForProof);
       // Legacy privacy migration queues rows that have not entered flat totals.
       // Admit them before parity scans, or later repairs count them twice.
       const parityControl = this.control();
@@ -3392,7 +3434,8 @@ export class DashboardProjectionStore {
           // the new target drains on following passes. Only use the otherwise
           // idle expiry allowance here, preserving the per-pass row bound.
           if(published&&expiryFacts===0&&hasActiveTime()){
-            expiryFacts+=this.advanceExpiry(now,phaseRows);
+            expiryFacts+=this.advanceExpiry(
+              now,BACKFILL_ROWS,hasActiveTime,expiryBatchRows,options.onWorkRowForProof);
             const postPublishBacklog=this.backlog();
             if(Object.values(postPublishBacklog).some((value)=>value>0)||this.control().dirty){
               this.db.prepare(
@@ -3533,7 +3576,9 @@ export class DashboardProjectionStore {
     return windows.some(window => window.cutoffAt < sinceIso(window.days, now));
   }
 
-  private advanceExpiry(now: Date, limit=BACKFILL_ROWS) {
+  private advanceExpiry(now: Date, limit=BACKFILL_ROWS,
+    hasActiveTime=()=>true,batchRows=REPAIR_ROWS,
+    onWorkRowForProof?: (phase:"expiry")=>void) {
     const parity = this.control();
     if (parity.backfillComplete && !parity.parityComplete && parity.parityCursor > 0) return 0;
     let visited = 0;
@@ -3545,8 +3590,19 @@ export class DashboardProjectionStore {
     // slice; restart only when the job still has an older cutoff (or has not
     // been created yet).
     const expiryRepairRestart = new Map<string, boolean>();
-    for (const days of INTERNAL_WINDOWS) {
-      if (visited >= limit) break;
+    const schedule=this.db.prepare(`select next_window_index as nextIndex
+      from projection_expiry_schedule where singleton=1`).get() as {nextIndex:number};
+    let nextWindowIndex=Math.max(0,schedule.nextIndex)%INTERNAL_WINDOWS.length;
+    // Persist the next starting window. If a slow host spends its allowance
+    // on one batch, the next transaction admits a different window first.
+    // Within a turn, visit each window once before giving any one a second
+    // batch. The 1,000-row ceiling is a total, not a fixed eight-row slice.
+    while(visited<limit&&hasActiveTime()){
+      let progressed=false;
+      for(let step=0;step<INTERNAL_WINDOWS.length&&visited<limit;step++){
+      if(!hasActiveTime())break;
+      const days=INTERNAL_WINDOWS[nextWindowIndex]!;
+      nextWindowIndex=(nextWindowIndex+1)%INTERNAL_WINDOWS.length;
       const row = this.db.prepare(
         `select cutoff_at as cutoffAt,target_cutoff_at as targetCutoffAt,
           expiry_cursor_at as cursorAt,expiry_cursor_id as cursorId,
@@ -3585,8 +3641,9 @@ export class DashboardProjectionStore {
             compact_expiry_high_water=?,compact_expiry_cursor_segment=0,compact_expiry_cursor_offset=0
            where days=?`,
         ).run(target, row.cutoffAt, compactHighWater,days);
+        progressed=true;
       }
-      const factLimit=Math.min(REPAIR_ROWS,limit-visited);
+      const factLimit=Math.min(batchRows,limit-visited);
       const expired = this.db.prepare(
         `select projection_id as projectionId, raw_rowid as rawRowid, source,
           event_type as eventType, observed_at as observedAt, session_hash as sessionHash,
@@ -3603,6 +3660,7 @@ export class DashboardProjectionStore {
       for (const raw of expired) {
         const fact = factFromDb(raw);
         this.applyFlatDelta(days, fact, -1);
+        onWorkRowForProof?.("expiry");
         const reference=this.control();
         const table=reference.backfillHighWater!==null?(fact.rawRowid>reference.backfillHighWater
           ?"dashboard_post_highwater_window":reference.parityCursor>=fact.rawRowid?"dashboard_parity_window":null):null;
@@ -3622,6 +3680,7 @@ export class DashboardProjectionStore {
         }
       }
       visited += expired.length;
+      if(expired.length>0)progressed=true;
       const factsDone=expired.length<factLimit;
       if(!factsDone){
         const last = factFromDb(expired.at(-1)!);
@@ -3632,25 +3691,33 @@ export class DashboardProjectionStore {
       }
       const compact=this.expireCompactSlice(days,row.cutoffAt,activeTarget,compactHighWater??0,
         row.targetCutoffAt?(row.compactCursorSegment??0):0,
-        row.targetCutoffAt?(row.compactCursorOffset??0):0,limit-visited);
+        row.targetCutoffAt?(row.compactCursorOffset??0):0,
+        Math.min(batchRows,limit-visited));
       visited+=compact.rowsVisited;
+      if(onWorkRowForProof)for(let n=0;n<compact.rowsVisited;n++)onWorkRowForProof("expiry");
+      if(compact.rowsVisited>0)progressed=true;
       if(compact.done){
         this.db.prepare(
           `update dashboard_window_control set cutoff_at=?,target_cutoff_at=null,
             expiry_cursor_at=null,expiry_cursor_id=null,compact_expiry_high_water=null,
             compact_expiry_cursor_segment=null,compact_expiry_cursor_offset=null where days=?`,
         ).run(activeTarget,days);
+        progressed=true;
       }else{
         this.db.prepare(
           `update dashboard_window_control set compact_expiry_cursor_segment=?,
             compact_expiry_cursor_offset=? where days=?`,
         ).run(compact.cursorSegment,compact.cursorOffset,days);
       }
+      }
+      if(!progressed)break;
     }
     this.db.prepare(
       `update dashboard_projection_control set expiry_facts=expiry_facts+?,
         dirty=case when ? then 1 else dirty end where singleton=1`,
-    ).run(visited, visited>0 ? 1 : 0);
+    ).run(visited,visited>0 ? 1 : 0);
+    this.db.prepare(`update projection_expiry_schedule set next_window_index=?
+      where singleton=1`).run(nextWindowIndex);
     if (!rollback) {
       this.db.prepare(
         `update dashboard_projection_control set degraded_reason=null
@@ -4277,13 +4344,21 @@ export class DashboardProjectionStore {
       complete, (select coalesce(max(raw_rowid),0) from dashboard_event_facts) as highWater
       from codex_duplicate_fact_scan where singleton=1`).get() as
       {cursor:number;complete:number;highWater:number};
+    // A pre-opened 0.7.44 writer may have read schema v2 into memory before
+    // the upgrade. The database trigger prevents it from publishing parity,
+    // but reads must independently distrust a pending scan even if control
+    // flags were left green by a damaged or older writer.
+    const scanPending=!duplicateFactScan.complete;
+    const effectiveControl=scanPending ? {...c,parityReady:0,dirty:1,
+      degradedReason:c.degradedReason??"projection_repair_backlog"} : c;
     // Open-refusal reasons are sticky in the control row (triggers, compact
     // migration, and apply-failure all preserve them). In-process status still
     // derives the served reason from the open-time flag so a rolled-back host
     // cannot lose the line that says why counts are withheld.
-    const degradedReason=this.openRefusalReason()??c.degradedReason;
+    const degradedReason=this.openRefusalReason()??effectiveControl.degradedReason;
     return {schemaVersion:DASHBOARD_SCHEMA_VERSION,generation:c.generation,
-      ready:Boolean(c.ready),parityReady:Boolean(c.parityReady),dirty:Boolean(c.dirty),
+      ready:Boolean(c.ready),parityReady:Boolean(effectiveControl.parityReady),
+      dirty:Boolean(effectiveControl.dirty),
       degraded:Boolean(degradedReason),degradedReason,
       lastSuccessAt:c.lastSuccessAt,lastErrorAt:c.lastErrorAt,
       backfill:{highWater:c.backfillHighWater,cursor:c.backfillCursor,complete:Boolean(c.backfillComplete),
@@ -4293,8 +4368,8 @@ export class DashboardProjectionStore {
         duplicateFactScan:{cursor:duplicateFactScan.cursor,highWater:duplicateFactScan.highWater,
           complete:Boolean(duplicateFactScan.complete),sliceRows:DUPLICATE_FACT_SCAN_ROWS},
         progressMode:"bounded_rowid_watermark_no_exact_remaining",sliceRows:BACKFILL_ROWS},
-      backlog,snapshotLag:this.snapshotLag(c,backlog),counters:this.workCounters(),retention:{rawTtlActivation:"bounded_active",
-        projectionParityReady:Boolean(c.parityReady)}};
+      backlog,snapshotLag:this.snapshotLag(effectiveControl,backlog),counters:this.workCounters(),retention:{rawTtlActivation:"bounded_active",
+        projectionParityReady:Boolean(effectiveControl.parityReady)}};
   }
 
   readSnapshot(days:number,subscriptions:SubscriptionConfig[]=[]):SnapshotRead {
@@ -4308,7 +4383,7 @@ export class DashboardProjectionStore {
     const current = this.status();
     // Only completed maintenance can attest a later, equivalent window for
     // this generation. Pending work keeps the published historical cutoff.
-    if (control.parityReady && !control.dirty && !control.degradedReason &&
+    if (current.parityReady && !current.dirty && !current.degradedReason &&
         row.generation === control.generation && Object.values(current.backlog).every(n => n === 0)) {
       const verifiedWindow = this.db.prepare(`select w.cutoff_at as cutoffAt
         from dashboard_window_control w join dashboard_projection_control c on c.singleton=1
@@ -4322,8 +4397,8 @@ export class DashboardProjectionStore {
       }
     }
     const validity = projectionValidity({
-      ready: Boolean(control.ready), parityReady: Boolean(control.parityReady),
-      dirty: Boolean(control.dirty), degradedReason: control.degradedReason,
+      ready: Boolean(control.ready), parityReady: current.parityReady,
+      dirty: current.dirty, degradedReason: current.degradedReason,
       lastSuccessAt: control.lastSuccessAt,
     });
     Object.assign(snapshot.projection, validity);
@@ -4333,7 +4408,7 @@ export class DashboardProjectionStore {
     snapshot.status.health = this.buildHealth(days, new Date(Date.now()),
       // A scan receipt can dirty the snapshot without changing completed
       // session counts; it must not defer a genuine zero-token red.
-      Boolean(control.parityReady&&!control.degradedReason&&
+      Boolean(current.parityReady&&!current.degradedReason&&
         control.backfillComplete&&control.parityComplete&&control.metricBackfillComplete&&
         Object.values(current.backlog).every((pending)=>pending===0)));
     const settings=(this.db.prepare(`select settings_version as version from dashboard_projection_control where singleton=1`).get() as {version:number}).version;

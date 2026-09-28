@@ -71,8 +71,19 @@ try {
 
   // A 0.7.44 process opened before upgrade retains its in-memory acceptance.
   // It can run after 0.7.45 stamps version 3 and before the scan repairs facts.
-  oldReader.runMaintenance(now);
+  let oldWriterRefused = false;
+  try {
+    oldReader.runMaintenance(now);
+  } catch (error) {
+    oldWriterRefused = error instanceof Error && error.message.includes("pending_duplicate_fact_scan");
+    if (!oldWriterRefused) throw error;
+  }
+  assert.equal(oldWriterRefused, true,
+    "the database must refuse a pre-opened 0.7.44 writer during an unfinished scan");
   const after = upgraded.status();
+  const durable = newDb.prepare(`select parity_ready as parityReady,dirty
+    from dashboard_projection_control where singleton=1`).get() as
+    {parityReady:number;dirty:number};
   const snapshot = upgraded.readSnapshot(30);
   const events = snapshot.kind === "ready"
     ? Number((snapshot.snapshot.summary.totals as Record<string, number>).events) : null;
@@ -80,11 +91,33 @@ try {
     scanComplete: before.backfill.duplicateFactScan.complete },
     after: { parityReady: after.parityReady, dirty: after.dirty,
       degradedReason: after.degradedReason, scanComplete: after.backfill.duplicateFactScan.complete },
-    snapshot: { kind: snapshot.kind,
+    durable, snapshot: { kind: snapshot.kind,
       status: snapshot.kind === "ready" ? snapshot.snapshot.projection.status : null,
       events }, oracleEvents: 0 }));
   assert.equal(after.parityReady, false,
     "an unscanned duplicate fact must never regain trusted parity during a live rollback overlap");
+  assert.deepEqual(durable,{parityReady:0,dirty:1},
+    "the pre-opened old writer must not restore parity in the database");
+
+  // Independently exercise the reader veto with corrupted legacy control
+  // flags. Savepoint rollback restores the durable write fence afterward.
+  newDb.exec(`savepoint reader_veto;
+    drop trigger trg_dashboard_pending_duplicate_scan_fence;
+    update dashboard_projection_control set parity_ready=1, dirty=0,
+      degraded_reason=null where singleton=1;`);
+  try {
+    const guardedStatus = upgraded.status();
+    const guardedRead = upgraded.readSnapshot(30);
+    assert.equal(guardedStatus.parityReady, false);
+    assert.equal(guardedStatus.dirty, true);
+    assert.equal(guardedRead.kind, "ready");
+    if (guardedRead.kind === "ready") {
+      assert.equal(guardedRead.snapshot.projection.status, "stale",
+        "the read path must veto green status while the duplicate scan is pending");
+    }
+  } finally {
+    newDb.exec(`rollback to reader_veto; release reader_veto`);
+  }
 } finally {
   newDb?.close();
   oldDb?.close();

@@ -1016,7 +1016,7 @@ async function proveMillionFactDuplicateRepairCadence(root: string, slow = false
       ...options,
       ...(slow ? {
         clock: () => simulatedClock,
-        onWorkRowForProof: (phase: "scan" | "repair" | "backfill" | "metric" | "parity") => {
+        onWorkRowForProof: (phase: "scan" | "repair" | "backfill" | "metric" | "parity" | "expiry") => {
           if (phase === "scan") simulatedClock += injectedScanRowMs;
           if (phase === "repair") simulatedClock += injectedRepairRowMs;
         },
