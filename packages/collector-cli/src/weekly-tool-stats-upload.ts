@@ -31,7 +31,8 @@ function reportBody(input: { tenantId: string; deviceId: string; reportSequence:
 
 type Pending = { weekStart: string; reportSequence: number; digest: string; bodyJson: string; delivered: number };
 type Receipt = { schema?: unknown; deviceId?: unknown; reportSequence?: unknown;
-  disposition?: unknown; nextReportSequence?: unknown; toolStatsDigest?: unknown };
+  disposition?: unknown; nextReportSequence?: unknown; toolStatsDigest?: unknown;
+  storedToolStatsReport?: unknown };
 
 /** One frozen report per completed week; a lost response retries identical bytes and sequence. */
 export async function uploadCompletedToolStatsWeek(
@@ -98,18 +99,32 @@ export async function uploadCompletedToolStatsWeek(
   const receipt = response.body as Receipt | null;
   if (!response.ok || !receipt || receipt.schema !== "fleet-device-report-receipt/v1" ||
     receipt.deviceId !== config.cloudDeviceId || receipt.reportSequence !== pending.reportSequence) return "retry";
-  // A fresh ledger restarts its local report sequence. The server may call an
-  // old sequence a replay and echo this request's digest even when it stored
-  // no report for the week. Only the server's current next sequence can prove
-  // that a matching replay names an already-stored week.
-  if (receipt.disposition === "accepted" && receipt.toolStatsDigest === pending.digest ||
-    receipt.disposition === "replay_ignored" && receipt.nextReportSequence === pending.reportSequence &&
-      receipt.toolStatsDigest === pending.digest) {
+  // The old cloud can echo the proposed digest on a replay without having
+  // stored this week. Its next sequence also cannot distinguish a lost
+  // response at N from a fresh ledger whose new week reused N. The additive
+  // stored-row identity is the only safe replay acknowledgement or rebase
+  // signal. Until the cloud supplies it, keep an ambiguous report pending.
+  const hasStoredSignal = Object.prototype.hasOwnProperty.call(receipt, "storedToolStatsReport");
+  const rawStored = receipt.storedToolStatsReport;
+  const stored = rawStored && typeof rawStored === "object"
+    ? rawStored as { weekStart?: unknown; reportSequence?: unknown; digest?: unknown } : null;
+  const validStored = stored && stored.weekStart === pending.weekStart &&
+    typeof stored.reportSequence === "number" && Number.isSafeInteger(stored.reportSequence) &&
+    stored.reportSequence > 0 && typeof stored.digest === "string";
+  if (hasStoredSignal && rawStored !== null && !validStored) return "retry";
+  if (validStored && stored.digest !== pending.digest) return "conflict";
+  const storedReplay = validStored && receipt.toolStatsDigest === stored.digest &&
+    (receipt.disposition === "accepted" || receipt.disposition === "replay_ignored" ||
+      receipt.disposition === "sequence_gap_ignored" || receipt.disposition === "future_skew_quarantined");
+  const legacyAccepted = !hasStoredSignal && receipt.disposition === "accepted" &&
+    receipt.toolStatsDigest === pending.digest;
+  if (storedReplay || legacyAccepted) {
     db.prepare(`update weekly_tool_stats_uploads set delivered=1 where workspace_id=? and device_id=? and week_start=?
       and report_sequence=? and digest=?`).run(config.tenantId, config.deviceId, pending.weekStart,
         pending.reportSequence, pending.digest);
     return "accepted";
   }
+  if (!hasStoredSignal || rawStored !== null || receipt.disposition === "accepted") return "retry";
   if (typeof receipt.toolStatsDigest === "string" && receipt.toolStatsDigest !== pending.digest) return "conflict";
   if ((receipt.disposition === "sequence_gap_ignored" || receipt.disposition === "replay_ignored" ||
     receipt.disposition === "future_skew_quarantined") &&

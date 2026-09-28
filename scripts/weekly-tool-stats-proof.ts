@@ -52,31 +52,38 @@ const config = collectorConfigSchema.parse({ tenantId:'tenant-1', deviceId:'devi
   uploadUrl:'http://127.0.0.1:61777/api/work-intelligence/ingest' });
 const bodies:string[] = [];
 let requests = 0;
+const storedWeeks = new Map<string, { reportSequence:number; digest:string }>();
 const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
   bodies.push(String(init?.body ?? ''));
   requests += 1;
-  if (requests === 1) throw new Error('lost response');
-  const request = JSON.parse(bodies.at(-1)!) as { reportSequence:number; deviceId:string };
+  const request = JSON.parse(bodies.at(-1)!) as { reportSequence:number; deviceId:string;
+    toolStats:{ weekStart:string } };
   const stored = db.prepare(`select digest from weekly_tool_stats_uploads where week_start='2026-09-21'`).get() as { digest:string };
+  if (requests === 1) {
+    storedWeeks.set(request.toolStats.weekStart, { reportSequence:request.reportSequence, digest:stored.digest });
+    throw new Error('lost response after cloud commit');
+  }
+  const cloudRow = storedWeeks.get(request.toolStats.weekStart);
+  assert.ok(cloudRow, 'the retry must be a replay of the week actually stored');
   return new Response(JSON.stringify({ schema:'fleet-device-report-receipt/v1', deviceId:request.deviceId,
-    reportSequence:request.reportSequence, disposition:'replay_ignored', nextReportSequence:requests === 2 ? 2 : request.reportSequence,
-    toolStatsDigest:stored.digest }), { status:200, headers:{'content-type':'application/json'} });
+    reportSequence:request.reportSequence, disposition:'replay_ignored', nextReportSequence:2,
+    toolStatsDigest:cloudRow.digest,
+    storedToolStatsReport:{ weekStart:request.toolStats.weekStart,
+      reportSequence:cloudRow.reportSequence, digest:cloudRow.digest } }),
+  { status:200, headers:{'content-type':'application/json'} });
 }) as typeof fetch;
 await assert.rejects(uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:05:00.000Z'), fetchImpl }));
-assert.equal(await uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:06:00.000Z'), fetchImpl }), 'retry');
-assert.equal(await uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:07:00.000Z'), fetchImpl }), 'accepted');
-assert.equal(bodies.length, 3);
+assert.equal(await uploadCompletedToolStatsWeek(config, db, { now:() => new Date('2026-09-28T00:06:00.000Z'), fetchImpl }), 'accepted');
+assert.equal(bodies.length, 2);
 assert.equal(bodies[0], bodies[1], 'an ambiguous send retries the same body and sequence');
-assert.equal((JSON.parse(bodies[2]!) as { reportSequence:number }).reportSequence, 2,
-  'a stored-week replay first resynchronizes its sequence, then acknowledges the matching digest');
+assert.equal(storedWeeks.size, 1, 'the lost-response retry did not store a second report');
 assert.doesNotMatch(bodies.join(''), /PRIVATE_|other-tenant|metadata|path|prompt|output/i);
 assert.equal((db.prepare(`select delivered from weekly_tool_stats_uploads where week_start='2026-09-21'`).get() as {delivered:number}).delivered, 1);
 db.close();
 
 // A replacement ledger begins its first completed week at sequence 1 while
-// this device's cloud high water can be much higher. The cloud's current
-// service echoes the proposed digest for a replay even when that week has no
-// stored row; the collector must repair the sequence before claiming delivery.
+// this device's cloud high water can be far ahead of the new local sequence.
+// The explicit absence rebases the pending report without losing its week.
 const freshDb = new Database(":memory:");
 new LearningFactStore(freshDb);
 freshDb.exec(`create table buffered_events (
@@ -87,13 +94,27 @@ ensureWeeklyToolStatsSchema(freshDb);
 freshDb.prepare(`insert into weekly_tool_stats_control(workspace_id,device_id,first_week)
   values('tenant-1','device-1','2026-09-28')`).run();
 const freshBodies: Array<{ reportSequence:number }> = [];
+const freshCloudWeeks = new Map<string, { reportSequence:number; digest:string }>([
+  ['2026-09-21', { reportSequence:41, digest:'prior-week-digest' }],
+]);
 const freshFetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
-  const request = JSON.parse(String(init?.body ?? '')) as { reportSequence:number; deviceId:string };
+  const request = JSON.parse(String(init?.body ?? '')) as { reportSequence:number; deviceId:string;
+    toolStats:{ weekStart:string } };
   freshBodies.push(request);
   const pending = freshDb.prepare(`select digest from weekly_tool_stats_uploads where week_start='2026-09-28'`).get() as { digest:string };
+  const existing = freshCloudWeeks.get(request.toolStats.weekStart) ?? null;
+  const disposition = request.reportSequence === 1 ? 'replay_ignored' : 'accepted';
+  if (disposition === 'accepted' && !existing) {
+    freshCloudWeeks.set(request.toolStats.weekStart,
+      { reportSequence:request.reportSequence, digest:pending.digest });
+  }
   return new Response(JSON.stringify({ schema:'fleet-device-report-receipt/v1', deviceId:request.deviceId,
-    reportSequence:request.reportSequence, disposition:freshBodies.length === 1 ? 'replay_ignored' : 'accepted',
-    nextReportSequence:freshBodies.length === 1 ? 42 : 43, toolStatsDigest:pending.digest }),
+    reportSequence:request.reportSequence, disposition,
+    nextReportSequence:request.reportSequence === 1 ? 42 : 43, toolStatsDigest:pending.digest,
+    storedToolStatsReport:existing ? { weekStart:request.toolStats.weekStart,
+      reportSequence:existing.reportSequence, digest:existing.digest } :
+      disposition === 'accepted' ? { weekStart:request.toolStats.weekStart,
+        reportSequence:request.reportSequence, digest:pending.digest } : null }),
   { status:200, headers:{'content-type':'application/json'} });
 }) as typeof fetch;
 assert.equal(await uploadCompletedToolStatsWeek(config, freshDb,
@@ -102,9 +123,62 @@ assert.equal((freshDb.prepare(`select delivered from weekly_tool_stats_uploads w
 assert.equal(await uploadCompletedToolStatsWeek(config, freshDb,
   { now:() => new Date('2026-10-05T00:06:00.000Z'), fetchImpl:freshFetch }), 'accepted');
 assert.deepEqual(freshBodies.map(body => body.reportSequence), [1, 42]);
+assert.equal(freshCloudWeeks.size, 2);
+assert.deepEqual(freshCloudWeeks.get('2026-09-28'), { reportSequence:42,
+  digest:(freshDb.prepare(`select digest from weekly_tool_stats_uploads where week_start='2026-09-28'`).get() as {digest:string}).digest });
 assert.equal((freshDb.prepare(`select delivered from weekly_tool_stats_uploads where week_start='2026-09-28'`).get() as {delivered:number}).delivered, 1);
 freshDb.close();
-console.log('weekly tool statistics: 3/3 pass');
+
+// A collector deployed before the cloud receipt extension may see a replay
+// whose echoed digest and next sequence match either case. It keeps the same
+// pending bytes until the cloud can say whether this week was stored. This
+// also checks the one-prior-report edge where next equals proposed plus one.
+const legacyDb = new Database(":memory:");
+new LearningFactStore(legacyDb);
+legacyDb.exec(`create table buffered_events (
+  id text primary key, source text, session_id text, event_type text, observed_at text,
+  workspace_id text, device_id text, data_mode text, metadata text
+);`);
+ensureWeeklyToolStatsSchema(legacyDb);
+legacyDb.prepare(`insert into weekly_tool_stats_control(workspace_id,device_id,first_week)
+  values('tenant-1','device-1','2026-09-28')`).run();
+const legacyBodies: string[] = [];
+let legacyRequests = 0;
+const legacyCloudWeeks = new Map<string, number>([['2026-09-21', 1]]);
+const legacyFetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+  const body = String(init?.body ?? '');
+  legacyBodies.push(body);
+  legacyRequests += 1;
+  const request = JSON.parse(body) as { reportSequence:number; deviceId:string;
+    toolStats:{ weekStart:string } };
+  const pending = legacyDb.prepare(`select digest from weekly_tool_stats_uploads where week_start='2026-09-28'`)
+    .get() as { digest:string };
+  const oldCloud = legacyRequests <= 2;
+  const accepted = request.reportSequence === 2;
+  if (accepted) legacyCloudWeeks.set(request.toolStats.weekStart, 2);
+  return new Response(JSON.stringify({ schema:'fleet-device-report-receipt/v1', deviceId:request.deviceId,
+    reportSequence:request.reportSequence, disposition:accepted ? 'accepted' : 'replay_ignored',
+    nextReportSequence:accepted ? 3 : 2, toolStatsDigest:pending.digest,
+    ...(!oldCloud ? { storedToolStatsReport:accepted
+      ? { weekStart:request.toolStats.weekStart, reportSequence:2, digest:pending.digest } : null } : {}) }),
+  { status:200, headers:{'content-type':'application/json'} });
+}) as typeof fetch;
+for (let retry = 0; retry < 3; retry += 1) {
+  assert.equal(await uploadCompletedToolStatsWeek(config, legacyDb,
+    { now:() => new Date('2026-10-05T00:05:00.000Z'), fetchImpl:legacyFetch }), 'retry');
+  assert.equal(legacyCloudWeeks.size, 1);
+  assert.equal((legacyDb.prepare(`select report_sequence as seq, delivered from weekly_tool_stats_uploads
+    where week_start='2026-09-28'`).get() as {seq:number; delivered:number}).delivered, 0);
+}
+assert.deepEqual(legacyBodies.slice(0, 3), [legacyBodies[0], legacyBodies[0], legacyBodies[0]]);
+assert.equal(await uploadCompletedToolStatsWeek(config, legacyDb,
+  { now:() => new Date('2026-10-05T00:06:00.000Z'), fetchImpl:legacyFetch }), 'accepted');
+assert.deepEqual(legacyBodies.map(body => (JSON.parse(body) as {reportSequence:number}).reportSequence),
+  [1, 1, 1, 2]);
+assert.equal(legacyCloudWeeks.size, 2);
+assert.equal(legacyCloudWeeks.get('2026-09-28'), 2);
+legacyDb.close();
+console.log('weekly tool statistics: 4/4 pass');
 }
 
 void main().catch((error) => { console.error(error); process.exitCode = 1; });
