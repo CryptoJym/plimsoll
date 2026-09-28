@@ -15,6 +15,13 @@ cycles. A changed segment revision during a partial repair restarts only that
 segment. No partial aggregate is sent; the daemon horizon advances only after
 all queued repairs and append rows are reflected in an exact snapshot.
 
+On a v3 to v4 upgrade, a complete v3 state with a valid checkpoint, no
+unreconciled historical change, and no future rows retains its vetted totals
+as one legacy prefix. This conversion reads no source rows; already queued
+appends drain in the next bounded pass. A later repair that overlaps the
+legacy prefix triggers one full rebuild because its individual segment totals
+were not stored by v3. Incomplete or invalid v3 states also use that rebuild.
+
 For a stable session with `N` eligible and skipped rows to scan, `R` segment
 repair scans, `A` append-drain allowances, and `P` deliberate smaller proof
 slices, the cycle proof uses this load-aware pass bound:

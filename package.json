@@ -129,6 +129,7 @@
     "proof:session-summary-checkpoint-retarget": "tsx scripts/run-proof.ts scripts/session-summary-checkpoint-retarget-review-proof.ts",
     "proof:session-summary-checkpoint-window": "tsx scripts/run-proof.ts scripts/session-summary-checkpoint-window-proof.ts",
     "proof:session-summary-trigger-writer-burst": "tsx scripts/run-proof.ts scripts/session-summary-trigger-writer-burst-proof.ts",
+    "proof:session-summary-v3-upgrade-gate": "tsx scripts/run-proof.ts scripts/session-summary-v3-upgrade-gate-proof.ts",
     "proof:session-summary-queued-append-repair": "tsx scripts/run-proof.ts scripts/session-summary-queued-append-repair-proof.ts",
     "proof:session-summary-checkpoint-erasure": "tsx scripts/run-proof.ts scripts/session-summary-checkpoint-erasure-proof.ts",
     "proof:session-summary-historical-repair": "tsx scripts/run-proof.ts scripts/session-summary-historical-repair-proof.ts",

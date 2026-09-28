@@ -84,6 +84,9 @@ type SummaryAccumulator = SummaryAggregate & {
   checkpointSearchRowid: number | null;
   /** A bounded rowid segment is replaced after a scanned edit or maturity. */
   segments: Record<string, SummaryAggregate>;
+  /** Complete v3 totals retained until a repair touches their old prefix. */
+  legacyAggregate: SummaryAggregate | null;
+  legacyHighWater: number;
   scanComplete: boolean;
   activeRepair: SummaryRepair | null;
 };
@@ -903,7 +906,8 @@ function emptyAccumulator(sessionId: string): SummaryAccumulator {
     ...emptyAggregate(), sessionId, scanBoundary: 0,
     cursorObservedAt: null, cursorRowid: 0, cursorId: null,
     checkpointSearchRowid: null,
-    segments: {}, scanComplete: false, activeRepair: null,
+    segments: {}, legacyAggregate: null, legacyHighWater: 0,
+    scanComplete: false, activeRepair: null,
   };
 }
 
@@ -1017,7 +1021,26 @@ function combineSegments(segments: Record<string, SummaryAggregate>): SummaryAgg
 }
 
 function refreshAggregate(accumulator: SummaryAccumulator): void {
-  Object.assign(accumulator, combineSegments(accumulator.segments));
+  const combined = emptyAggregate();
+  if (accumulator.legacyAggregate !== null) mergeAggregate(combined, accumulator.legacyAggregate);
+  mergeAggregate(combined, combineSegments(accumulator.segments));
+  Object.assign(accumulator, combined);
+}
+
+function aggregateFromLegacy(accumulator: SummaryAccumulator): SummaryAggregate {
+  return {
+    futureRows: accumulator.futureRows, futureCreatedAt: accumulator.futureCreatedAt,
+    sourceMax: accumulator.sourceMax, startedAt: accumulator.startedAt, endedAt: accumulator.endedAt,
+    events: accumulator.events, inputTokens: accumulator.inputTokens,
+    outputTokens: accumulator.outputTokens, cacheReadTokens: accumulator.cacheReadTokens,
+    cacheCreationTokens: accumulator.cacheCreationTokens, pricedEvents: accumulator.pricedEvents,
+    costUsd: accumulator.costUsd, costCompensation: accumulator.costCompensation,
+    repoNonNull: accumulator.repoNonNull, repoValue: accumulator.repoValue,
+    repoMixed: accumulator.repoMixed, branchNonNull: accumulator.branchNonNull,
+    branchValue: accumulator.branchValue, branchMixed: accumulator.branchMixed,
+    accountNonNull: accumulator.accountNonNull, accountValue: accumulator.accountValue,
+    accountMixed: accumulator.accountMixed,
+  };
 }
 
 function snapshot(accumulator: SummaryAccumulator): SessionSnapshot | null {
@@ -1080,6 +1103,10 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
     if (!validAggregate(candidate)) return null;
     if (typeof candidate.scanComplete !== "boolean") return null;
     if (!candidate.segments || typeof candidate.segments !== "object" || Array.isArray(candidate.segments)) return null;
+    if (!Number.isSafeInteger(candidate.legacyHighWater) || candidate.legacyHighWater < 0) return null;
+    if (candidate.legacyAggregate !== null &&
+        (candidate.legacyHighWater === 0 || !validAggregate(candidate.legacyAggregate))) return null;
+    if (candidate.legacyAggregate === null && candidate.legacyHighWater !== 0) return null;
     for (const [key, aggregate] of Object.entries(candidate.segments)) {
       const segment = Number(key);
       if (!Number.isSafeInteger(segment) || segment < 0 || !aggregate || !validAggregate(aggregate)) return null;
@@ -1142,7 +1169,7 @@ function queuedSummaryHighWater(db: Database.Database, sessionId: string): numbe
 function validStoredState(state: StoredSummaryState, sessionId: string, until: string): boolean {
   return state.sessionId === sessionId &&
     Number.isSafeInteger(state.stateGeneration) && state.stateGeneration >= 0 &&
-    state.schemaVersion === SESSION_SUMMARY_SCHEMA_VERSION &&
+    (state.schemaVersion === SESSION_SUMMARY_SCHEMA_VERSION || state.schemaVersion === 3) &&
     Number.isSafeInteger(state.highWater) && state.highWater >= 0 &&
     (typeof state.checkpointId === "string" || state.checkpointId === null) &&
     typeof state.coveredUntil === "string" &&
@@ -1424,10 +1451,12 @@ function fallbackReason(
   checkpointOk: boolean,
   dirtyReason: string | null,
   repairAvailable: boolean,
+  legacyRepair: boolean,
 ): string | null {
   if (!stored) return null;
   if (!parsed) return "accumulator_corrupt";
   if (stored.schemaVersion !== SESSION_SUMMARY_SCHEMA_VERSION) return "schema_version";
+  if (legacyRepair) return "legacy_segment_repair";
   if (!Number.isSafeInteger(stored.highWater) || stored.highWater < 0) return "high_water_invalid";
   if (Number.isNaN(Date.parse(stored.coveredUntil))) return "covered_until_invalid";
   if (Date.parse(stored.coveredUntil) > Date.parse(until)) return "until_rollback";
@@ -1653,8 +1682,59 @@ async function updateSessionSummaryAttempt(
     });
   }
   const checkpointOk = checkpointStatus === "valid";
+  // A complete v3 summary already has a vetted aggregate. Preserve it as a
+  // single frozen prefix, rather than rescanning a million rows during the
+  // release upgrade. Only states with no future rows or pending changes can
+  // use this path; the first repair of that prefix takes the normal fallback.
+  if (stored?.schemaVersion === 3 && parsed && stored.complete && checkpointOk &&
+      !parsed.futureRows && parsed.futureCreatedAt === null &&
+      Object.keys(parsed.segments).length === 0 && parsed.activeRepair === null &&
+      dirtyReason === null && pendingRepair === null &&
+      currentRevision === stored.mutationRevision &&
+      Date.parse(stored.coveredUntil) <= Date.parse(until) && stored.highWater > 0) {
+    const accumulator = emptyAccumulator(sessionId);
+    accumulator.scanBoundary = parsed.scanBoundary;
+    accumulator.cursorObservedAt = parsed.cursorObservedAt;
+    accumulator.cursorRowid = parsed.cursorRowid;
+    accumulator.cursorId = parsed.cursorId;
+    accumulator.legacyAggregate = aggregateFromLegacy(parsed);
+    accumulator.legacyHighWater = stored.highWater;
+    accumulator.scanComplete = true;
+    refreshAggregate(accumulator);
+    const converted = await writeRetry.run(() => db.transaction(() => {
+      if (currentStateGeneration(db, sessionId) !== stateGenerationAtStart ||
+          sessionActivityRevision(db, sessionId) !== activityAtStart ||
+          sessionRevision(db, sessionId) !== currentRevision ||
+          repairQueueRow(db, sessionId) !== null ||
+          db.prepare("select 1 from session_sync_summary_dirty where session_id = ?").get(sessionId) ||
+          db.prepare(`select 1 from session_sync_summary_rows
+            where session_id = ? and raw_rowid <= ? limit 1`).get(sessionId, stored.highWater)) {
+        return null;
+      }
+      const state = stateFromStored(stored, accumulator);
+      state.schemaVersion = SESSION_SUMMARY_SCHEMA_VERSION;
+      state.coveredUntil = until;
+      state.mode = "incremental";
+      state.complete = !queuedRowsAfter(db, sessionId, stored.highWater, until);
+      writeState(db, state);
+      return state.complete;
+    }).immediate());
+    if (converted === null) return retryFromLatest(0);
+    return finish({
+      snapshot: converted ? snapshot(accumulator) : null,
+      complete: converted, rowsRead: 0, rowsApplied: 0,
+      durationMs: Math.round(performance.now() - started), highWater: stored.highWater,
+      mode: "incremental", fullRecompute: false,
+      fallbackReason: converted ? null : "append_queue",
+      mutationRevision: currentRevision,
+    });
+  }
+  const due = parsed ? dueSegment(parsed, until) : null;
+  const legacyRepair = Boolean(parsed?.legacyAggregate && parsed.legacyHighWater > 0 &&
+    [pendingRepair?.segment, parsed.activeRepair?.segment, due].some((segment) =>
+      segment !== null && segment !== undefined && segment <= segmentOf(parsed.legacyHighWater)));
   const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk,
-    dirtyReason, repairAvailable);
+    dirtyReason, repairAvailable, legacyRepair);
   const resumableFallback = stored?.mode === "fallback" &&
     !stored.complete && (stored.mutationRevision === currentRevision || pendingRepair !== null) &&
     parsed !== null && checkpointOk && (reason === null || reason === "dirty_marker") &&

@@ -360,6 +360,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-trigger-writer-burst
 
+      - name: Prove v3 upgrade drains beside a million-row session (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-v3-upgrade-gate
+
       - name: Prove an append during segment repair enters the wire once (eco-6hoxj.163.106)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-queued-append-repair
