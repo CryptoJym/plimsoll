@@ -89,6 +89,17 @@ try {
     entry.shape === "studio_codex_conductor");
   check("valid_compact_codex_rollout_remains_auto_enrollable",
     compactCandidate?.autoEnroll === true, compactCandidate);
+  const untimedHome = path.join(root, "untimed-valid-studio");
+  const untimedId = "22345678-1234-4234-8234-123456789abc";
+  const untimed = path.join(untimedHome,
+    ".clientai/studio/borg/conductors/primary/profile/sessions/2026/09/28");
+  fs.mkdirSync(untimed, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(untimed, `rollout-${untimedId}.jsonl`),
+    `${JSON.stringify({ type: "session_meta", payload: { id: untimedId } })}\n`);
+  const untimedCandidate = discoverCaptureRootCandidates(untimedHome).find((entry) =>
+    entry.shape === "studio_codex_conductor");
+  check("valid_untimed_codex_rollout_keeps_tailers_existing_identity_rule",
+    untimedCandidate?.autoEnroll === true, untimedCandidate);
   }
 
   if (active("r3-4")) {

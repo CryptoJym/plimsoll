@@ -23,8 +23,11 @@ export function verifiedCodexSessionMetaId(row: unknown): string | undefined {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
   const id = (payload as Record<string, unknown>).id;
   const timestamp = record.timestamp ?? (payload as Record<string, unknown>).timestamp;
+  // Codex rollouts can omit the timestamp on session_meta. The tailer has
+  // always accepted those records, so enrollment must use the same rule.
   if (!isCodexUuid(id) ||
-      typeof timestamp !== "string" || !Number.isFinite(Date.parse(timestamp))) return undefined;
+      (timestamp !== undefined &&
+        (typeof timestamp !== "string" || !Number.isFinite(Date.parse(timestamp))))) return undefined;
   return id.toLowerCase();
 }
 
