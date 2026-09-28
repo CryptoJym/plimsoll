@@ -44,6 +44,7 @@ try {
   assert.ok(final);
   assert.ok(final.complete && passes <= bound,
     `restart loop: ${JSON.stringify({ size, passes, bound, restarts, rowsRead })}`);
+  assert.equal(restarts, 0, "scanned reconciliation must repair without a full restart");
   const elapsedMs = Math.round(performance.now() - started);
   assert.ok(elapsedMs < 300_000, `local repair exceeded rollout pass bound: ${elapsedMs} ms`);
   completion.check("bounded_passes_under_reconciliation");
