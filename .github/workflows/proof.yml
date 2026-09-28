@@ -62,6 +62,7 @@ jobs:
           pnpm proof:pr426-r6-archive-query-plans
           pnpm proof:pr426-r6-carry-budget
           pnpm proof:pr426-r6-crash-mid-carry
+          pnpm proof:pr426-r6-stale-generation-growth
 
       - name: Typecheck
         id: typecheck

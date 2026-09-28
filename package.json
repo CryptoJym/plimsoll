@@ -146,6 +146,7 @@
     "proof:pr426-r6-archive-query-plans": "tsx scripts/pr426-r6-archive-query-plans.ts",
     "proof:pr426-r6-carry-budget": "tsx scripts/pr426-r6-carry-budget.ts",
     "proof:pr426-r6-crash-mid-carry": "tsx scripts/pr426-r6-crash-mid-carry.ts",
+    "proof:pr426-r6-stale-generation-growth": "tsx scripts/pr426-r6-stale-generation-growth.ts",
     "proof:dispatch-binding": "tsx scripts/run-proof.ts scripts/dispatch-binding-proof.ts",
     "proof:dispatch-bind-linkability": "tsx scripts/run-proof.ts scripts/dispatch-bind-linkability-proof.ts",
     "proof:dispatch-pairing-integration": "tsx scripts/run-proof.ts scripts/dispatch-pairing-integration-proof.ts",

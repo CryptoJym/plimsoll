@@ -72,8 +72,9 @@ keys, and capture-root configuration stay in place.
    The command rechecks the plan under the lifecycle mutation authority,
    takes SQLite exclusive ownership of the old inode, checkpoints its WAL,
    creates and binds a staged replacement to the agreed root epoch, and
-   carries every valid per-file committed cursor plus Codex live authorization
-   rows. It creates a hard link for the archive and atomically swaps the
+   carries each valid per-file committed cursor whose file generation still
+   matches, plus Codex live authorization rows. It creates a hard link for
+   the archive and atomically swaps the
    already-bound stage into the active pathname. The archive is never
    deleted. The replacement's durable marker records the archive identity,
    archive path, and minimum collector version 0.7.46. Files with carried
@@ -81,6 +82,8 @@ keys, and capture-root configuration stay in place.
    have timestamps before the switch. Every physically present file without
    a carried cursor is fenced at its observed switch size, independently of
    host or filesystem clocks; later growth starts at that byte boundary.
+   A new file generation at an old pathname is treated as a file without a
+   carried cursor: its obsolete archive cursor is validated but not copied.
 
    If the process stops after linking the archive but before the swap, the
    active and archive paths refer to the same old inode. Keep both paths. A

@@ -146,7 +146,7 @@ function latestRecordedTime(db: Database.Database, cursorLatest: string | null):
     Date.parse(at) > Date.parse(latest) ? at : latest) : null;
 }
 
-function inspectCursors(db: Database.Database) {
+function inspectCursors(db: Database.Database, staleFileKeys: ReadonlySet<string>) {
   if (!hasTable(db, "rollout_scan_state")) return { rows: 0, bytes: 0, latest: null as string | null };
   const required = [
     "file", "size", "scanned_at", "committed_offset", "deferred_bytes",
@@ -177,9 +177,11 @@ function inspectCursors(db: Database.Database) {
         !CURSOR_IDENTITY.test(cursor.fileIdentity) || cursor.committedOffset === null) {
       throw new Error("archive_cursor_state_inconsistent");
     }
-    rows += 1;
-    bytes += valueBytes(row);
     if (!latest || Date.parse(scannedAt) > Date.parse(latest)) latest = scannedAt;
+    if (!staleFileKeys.has(row.file)) {
+      rows += 1;
+      bytes += valueBytes(row);
+    }
   }
   return { rows, bytes, latest };
 }
@@ -238,7 +240,8 @@ function inspectLiveState(db: Database.Database, home: string) {
   return { carriedRows, carriedBytes };
 }
 
-function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.Stats) {
+function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.Stats,
+  staleFileKeys: ReadonlySet<string>) {
   const binding = hasTable(db, "collector_workspace_binding")
     ? db.prepare(`select current_workspace_id as workspaceId,current_device_id as deviceId,
         current_installation_epoch_id as epochId
@@ -249,7 +252,7 @@ function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.
       binding.deviceId !== input.config.deviceId) throw new Error("archive_identity_mismatch");
   if (binding.epochId !== rootEpoch(input)) throw new Error("archive_epoch_mismatch");
   if (hasTable(db, "collector_replacement_ledger")) throw new Error("replacement_ledger_already_active");
-  const cursors = inspectCursors(db);
+  const cursors = inspectCursors(db, staleFileKeys);
   const live = inspectLiveState(db, path.dirname(input.ledgerPath));
   const carriedRows = { rollout_scan_state: cursors.rows, ...live.carriedRows };
   const carriedBytes = { rollout_scan_state: cursors.bytes, ...live.carriedBytes };
@@ -398,10 +401,11 @@ function assertPaths(input: CutoverInput) {
 }
 
 function untrackedRootFiles(db: Database.Database, input: CutoverInput): Array<{
-  source: "codex" | "claude_code"; observation: CaptureBaselineFileObservation;
+  source: "codex" | "claude_code"; fileKey: string;
+  observation: CaptureBaselineFileObservation;
 }> {
   const result: Array<{ source: "codex" | "claude_code";
-    observation: CaptureBaselineFileObservation }> = [];
+    fileKey: string; observation: CaptureBaselineFileObservation }> = [];
   const cursor = hasTable(db, "rollout_scan_state")
     ? db.prepare("select file_identity as fileIdentity from rollout_scan_state where file=?") : null;
   const roots = input.config.captureRoots ?? [];
@@ -414,7 +418,8 @@ function untrackedRootFiles(db: Database.Database, input: CutoverInput): Array<{
       const key = jsonlScanStateKey(rootCursorKey(roots, observation.path));
       const row = cursor?.get(key) as { fileIdentity: string } | undefined;
       const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
-      if (row?.fileIdentity !== identity) result.push({ source: root.source, observation });
+      if (row?.fileIdentity !== identity) result.push({ source: root.source,
+        fileKey: key, observation });
     }
   }
   return result;
@@ -479,8 +484,9 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
     const { db, sidecarsMayAppear } = openReadOnlyPlanDatabase(input.ledgerPath);
     try {
       if (sidecarsMayAppear) db.pragma("query_only = ON");
-      const inspection = inspectArchive(db, input, old);
       const untracked = untrackedRootFiles(db, input);
+      const inspection = inspectArchive(db, input, old,
+        new Set(untracked.map(row => row.fileKey)));
       const fields = { ...base, installationEpochId: epoch,
         archiveIdentity: inspection.archiveIdentity, archiveLatestRecordedAt: inspection.latest,
         cursorRows: inspection.cursorRows, carriedRows: inspection.carriedRows,
@@ -592,8 +598,10 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     // A clock adjustment between inspection and first open cannot move the
     // replacement's cutoff behind the archive.
     const switchNow = (input.now ?? (() => new Date()))();
-    const inspection = inspectArchive(old, { ...input, now: () => switchNow }, stat);
     const untracked = untrackedRootFiles(old, input);
+    const staleFileKeys = new Set(untracked.map(row => row.fileKey));
+    const inspection = inspectArchive(old, { ...input, now: () => switchNow }, stat,
+      staleFileKeys);
     if (inspection.totalCarriedBytes > MAX_CARRIED_VALUE_BYTES) {
       throw new Error("carried_state_exceeds_32_mib_budget");
     }
@@ -628,6 +636,10 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
         let copied = 0;
         for (const row of old!.prepare(`select ${names} from rollout_scan_state`).iterate() as
           Iterable<Record<string, unknown>>) {
+          // A path can now point at a different inode. Its archive cursor is
+          // still validated above, but carrying it would prevent the new
+          // generation's fenced growth from starting at the switch size.
+          if (staleFileKeys.has(row.file as string)) continue;
           insert.run(...cursorColumns.map(column => row[column]));
           mark.run(row.file, row.parser_kind === "codex-rollout-v2" ? "codex" : "claude_code",
             row.file_identity, row.committed_offset);
