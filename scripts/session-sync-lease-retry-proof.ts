@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { runSessionSync } from "../packages/collector-cli/src/session-sync";
+import { postHistoryBatch } from "../packages/collector-cli/src/upload-history";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
@@ -56,7 +57,7 @@ async function closeServer(endpoint: http.Server) {
 }
 
 async function main() {
-  const completion = createProofCompletion("session-sync-lease-retry", 8);
+  const completion = createProofCompletion("session-sync-lease-retry", 11);
   const lockedPath = path.join(root, "real-cli-busy-timeout.sqlite");
   const locked = new LocalEventBuffer(lockedPath, { workspaceId: tenantId });
   const lockedSession = "11111111-1111-4111-8111-111111111618";
@@ -123,11 +124,11 @@ async function main() {
   const retryBuffer = new LocalEventBuffer(retryPath, { workspaceId: tenantId });
   const retrySession = "22222222-2222-4222-8222-222222222618";
   addRow(retryBuffer, retrySession, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbb618");
-  const attempts: Array<{ raw: string; token: string | undefined }> = [];
+  const attempts: Array<{ raw: string; token: string | undefined; at: number }> = [];
   const committed = new Set<string>();
   let commitCount = 0;
   const retryServer = await server((raw, response) => {
-    attempts.push({ raw, token: leaseToken(retryBuffer, retrySession) });
+    attempts.push({ raw, token: leaseToken(retryBuffer, retrySession), at: Date.now() });
     if (attempts.length === 1) {
       response.writeHead(503, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "try_again" }));
@@ -143,13 +144,15 @@ async function main() {
   try {
     const result = await runSessionSync(config(retryServer.port, 5), {
       ledgerDb: retryBuffer.database, sessionIds: [retrySession], until,
-      incremental: true, maxAttemptsPerBatch: 2, delayMs: 0, sleep: async () => undefined,
+      incremental: true, maxAttemptsPerBatch: 2, delayMs: 0,
       log: () => undefined,
     });
     console.log(JSON.stringify({ case: "503_then_success", requests: attempts.length,
       distinctTokens: new Set(attempts.map((attempt) => attempt.token)).size,
       acceptedSessions: result.acceptedSessions, commits: commitCount }));
     assert.equal(attempts.length, 2, "configured retry reaches transport twice");
+    assert.ok(attempts[1]!.at - attempts[0]!.at >= 950,
+      "the retry must observe the production one-second backoff");
     assert.equal(attempts[0]?.raw, attempts[1]?.raw, "retry sends the identical signed batch body");
     assert.ok(attempts[0]?.token);
     assert.equal(attempts[0]?.token, attempts[1]?.token, "one batch retains its lease token");
@@ -164,6 +167,81 @@ async function main() {
     retryBuffer.close();
     await closeServer(retryServer.endpoint);
   }
+
+  for (const [index, status, retryAfter] of [[5, 503, null], [6, 429, "2"]] as const) {
+    const short = new LocalEventBuffer(path.join(root, `short-retry-${status}.sqlite`), { workspaceId: tenantId });
+    const sessionId = `${index}${index}${index}${index}${index}${index}${index}${index}-5555-4555-8555-555555555618`;
+    const eventId = `${index}${index}${index}${index}${index}${index}${index}${index}-aaaa-4aaa-8aaa-aaaaaaaaa618`;
+    addRow(short, sessionId, eventId);
+    let requests = 0;
+    const sleeps: number[] = [];
+    const endpoint = await server((_raw, response) => {
+      requests += 1;
+      response.writeHead(status, { "content-type": "application/json",
+        ...(retryAfter ? { "retry-after": retryAfter } : {}) });
+      response.end(JSON.stringify({ error: "try_again" }));
+    });
+    try {
+      const result = await runSessionSync(config(endpoint.port, 1), {
+        ledgerDb: short.database, sessionIds: [sessionId], until,
+        incremental: true, maxAttemptsPerBatch: 2, delayMs: 0,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          await new Promise((resolve) => setTimeout(resolve, ms));
+        },
+        log: () => undefined,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(requests, 1, "the first transient response reached the endpoint");
+      assert.deepEqual(sleeps, [], "a retry that cannot reach transport must not sleep");
+      assert.match(result.reason ?? "", /retry_deadline_exceeded/);
+      assert.ok(leaseToken(short, sessionId), "the uncertain first attempt keeps its finite lease");
+      completion.check(`one_second_${status}_skips_unsendable_backoff`);
+    } finally {
+      short.close();
+      await closeServer(endpoint.endpoint);
+    }
+  }
+
+  const realNow = Date.now;
+  try {
+    // Run the uploader's production backoff against a clock that advances by
+    // the actual requested sleep for every valid configured timeout.
+    for (let timeoutSeconds = 1; timeoutSeconds <= 300; timeoutSeconds += 1) {
+      let clockMs = realNow();
+      Date.now = () => clockMs;
+      const cutoffMs = clockMs + Math.min(timeoutSeconds, 120) * 1_000;
+      const handoffs: number[] = [];
+      const sleeps: number[] = [];
+      let failure = "";
+      try {
+        const result = await postHistoryBatch({
+          url: "http://127.0.0.1:48318/ingest", body: attempts[0]!.raw,
+          installKey, signingSecret: "lease-retry-fixture-secret",
+          fetchImpl: (async () => {
+            handoffs.push(clockMs);
+            return handoffs.length === 1
+              ? new Response(JSON.stringify({ error: "try_again" }), { status: 503 })
+              : new Response(JSON.stringify(acceptedFixtureDelivery(attempts[0]!.raw, installKey)), { status: 200 });
+          }) as typeof fetch,
+          sleep: async (ms) => { sleeps.push(ms); clockMs += ms; },
+          maxAttempts: 2, timeoutMs: Math.min(timeoutSeconds, 120) * 1_000,
+          retryDeadlineMs: cutoffMs, allowPartial: true, log: () => undefined,
+        });
+        assert.equal(result.accepted, 1);
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+      }
+      assert.equal(handoffs.length, timeoutSeconds === 1 ? 1 : 2, `timeout ${timeoutSeconds}s handoffs`);
+      assert.deepEqual(sleeps, timeoutSeconds === 1 ? [] : [1_000], `timeout ${timeoutSeconds}s sleeps`);
+      assert.ok(handoffs.every((at) => at < cutoffMs), `timeout ${timeoutSeconds}s handoff precedes cloud cutoff`);
+      if (timeoutSeconds === 1) assert.match(failure, /retry_deadline_exceeded/);
+      else assert.equal(failure, "");
+    }
+  } finally {
+    Date.now = realNow;
+  }
+  completion.check("production_backoff_fits_all_valid_timeout_values_and_cap");
 
   const occupied = new LocalEventBuffer(path.join(root, "occupied.sqlite"), { workspaceId: tenantId });
   const occupiedSession = "33333333-3333-4333-8333-333333333618";

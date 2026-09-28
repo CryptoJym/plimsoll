@@ -3172,6 +3172,10 @@ async function main() {
               );
             }
           }
+          // A foreground 409 can arm the gate during this pass. Do not let
+          // the historical rebuild send another batch in the same cycle.
+          if (sessionSyncState.clockSkewRetryAt &&
+              Date.now() < Date.parse(sessionSyncState.clockSkewRetryAt)) return;
           if (legacySummaryRebuild && legacySummaryRebuild.phase !== "done") {
             try {
               const step = await advanceLegacySessionSummaryRebuild(config, buffer.database);

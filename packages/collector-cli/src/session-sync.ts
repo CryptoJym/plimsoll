@@ -1297,7 +1297,10 @@ export async function runSessionSync(
     throw new Error(`--until must be an ISO timestamp, got: ${until}`);
   }
   const batchSize = Math.max(1, Math.min(options.batchSize ?? 500, 500));
-  const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, 8));
+  // Incremental batches share durable lease and skew state. Serialize them
+  // so a settled refusal stops the next chunk before handoff. Read-only
+  // full walks retain their configured concurrency.
+  const concurrency = options.incremental ? 1 : Math.max(1, Math.min(options.concurrency ?? 2, 8));
   const delayMs = Math.max(0, options.delayMs ?? 100);
   const maxAttempts = Math.max(1, Math.min(options.maxAttemptsPerBatch ?? 5, 10));
   const appVersion = options.appVersion ?? "0.1.0";
@@ -1534,6 +1537,7 @@ export async function runSessionSync(
         })();
         leaseHeld = Boolean(leaseToken);
         const { sentAt, expiresAt } = wireTime;
+        const sendBeforeMs = Date.parse(expiresAt) - 10_000;
         const body = JSON.stringify(aiWorkSessionSyncBatchSchema.parse({
           kind: "session_sync", tenantId: config.tenantId, installKey: config.installKey,
           appVersion, sentAt, expiresAt, sessions: rows,
@@ -1543,7 +1547,7 @@ export async function runSessionSync(
         const fencedFetch: typeof fetch = options.incremental ? async (request, init) => {
           // No transport retry may replace this batch's token. A missing or
           // elapsed lease makes its original body ineligible for another send.
-          if (!leaseHeld || Date.now() >= Date.parse(expiresAt) - 10_000 ||
+          if (!leaseHeld || Date.now() >= sendBeforeMs ||
               rows.some((row) => (ownedLease!.get(
                 snapshotVersions.get(row.session.id)!.rawSessionId) as { token: string } | undefined)?.token !== leaseToken)) {
             throw new TransportError("deadline_exceeded");
@@ -1563,6 +1567,7 @@ export async function runSessionSync(
           sleep,
           maxAttempts,
           timeoutMs: requestTimeoutMs,
+          retryDeadlineMs: sendBeforeMs,
           allowPartial: true,
           onResponse: ({ status, body: reply }) => {
             if (status !== 409 || !reply || typeof reply !== "object" || Array.isArray(reply)) return;

@@ -599,6 +599,8 @@ export async function postHistoryBatch(input: {
   sleep: (ms: number) => Promise<void>;
   maxAttempts: number;
   timeoutMs?: number;
+  /** Do not sleep for a retry that cannot reach its transport handoff in time. */
+  retryDeadlineMs?: number;
   /** Session snapshots can receive an explicit accepted/rejected partition.
    * History/outcome callers keep the strict all-accepted behavior. */
   allowPartial?: boolean;
@@ -660,6 +662,9 @@ export async function postHistoryBatch(input: {
       const retryAfterSeconds = Number(response?.headers.get("retry-after") ?? "");
       const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
         ? Math.min(120_000, retryAfterSeconds * 1000) : Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+      if (input.retryDeadlineMs !== undefined && Date.now() + backoffMs >= input.retryDeadlineMs) {
+        throw new FatalUploadError("Workspace delivery deferred: retry_deadline_exceeded. Resume state retained.");
+      }
       input.log(JSON.stringify({ status: "workspace_backfill_retry", attempt, backoffMs, error: lastError }));
       await input.sleep(backoffMs);
     }
