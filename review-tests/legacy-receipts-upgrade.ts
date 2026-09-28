@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { terminalPrivacyEligibilitySql } from "../packages/collector-cli/src/privacy-disposition";
 import { readLedgerOffThread } from "../packages/collector-cli/src/session-sync";
-import { ensureUuidEventId } from "../packages/collector-cli/src/upload-history";
+import { collisionSafeDeliveryId, ensureUuidEventId } from "../packages/collector-cli/src/upload-history";
 
 // Recreate the exact 0.7.44 upload_receipts columns while retaining the
 // collector's other 0.7.44-compatible tables. The old table had no raw lineage.
@@ -121,6 +121,15 @@ try {
     }]);
     assert.equal(workerVisible.length, 0,
       "session read worker must exclude an unbound old privacy receipt");
+    const exportReader = new Database(ledgerPath, { readonly: true });
+    try {
+      const exportEligible = terminalPrivacyEligibilitySql(exportReader, "buffered_events");
+      assert.equal(Boolean(exportReader.prepare(`select 1 from buffered_events
+        where id=? and ${exportEligible}`).get(ids.privacy)), false,
+      "independent export reader must exclude the present privacy-rejected raw");
+    } finally {
+      exportReader.close();
+    }
     const holdSql = (upgraded as unknown as { rawRetentionUploadHoldSql: () => string })
       .rawRetentionUploadHoldSql();
     assert.equal((db.prepare(`select case when ${holdSql} then 1 else 0 end as held
@@ -190,14 +199,14 @@ try {
     assert.equal(after, 4);
     assert.equal(upgraded.list(20).some((row) => row.id === ids.privacy), false);
     assert.equal(upgraded.listUnuploaded({ maxRows: 20 }).some((row) => row.id === ids.privacy), false);
-    const exportReader = new Database(ledgerPath, { readonly: true });
-    try {
-      const exportEligible = terminalPrivacyEligibilitySql(exportReader, "buffered_events");
-      assert.equal(Boolean(exportReader.prepare(`select 1 from buffered_events
-        where id=? and ${exportEligible}`).get(ids.privacy)), false);
-    } finally {
-      exportReader.close();
-    }
+    const collisionRepair = upgraded.delivery.migrateLegacy({ maxRows: 100 });
+    const collisionDelivery = db.prepare(`select delivery_id as id from upload_outbox
+      where raw_id=?`).get(ids.collisionLegacy) as { id: string } | undefined;
+    assert.equal(collisionDelivery?.id,
+      collisionSafeDeliveryId(ids.collisionLegacy, 1),
+      "a completed old raw cursor must reopen and choose a collision-safe ID");
+    console.log(JSON.stringify({ phase: "collision_safe_repair",
+      visited: collisionRepair.visited, deliveryId: collisionDelivery?.id }));
 
     // A raw appended between the completed scan and the bind can take the
     // same literal UUID as a legacy raw's derived delivery ID. The bind must
@@ -234,6 +243,63 @@ try {
     assert.equal(lateReceipt.rawRowid, null, "two current owners make the old receipt ambiguous");
     console.log(JSON.stringify({ phase: "late_collision_fence", scanRows,
       receiptBound: lateReceipt.rawRowid !== null, resumed: completed }));
+
+    // Deleting the highest rowid permits SQLite to reuse that rowid. A
+    // watermark alone cannot notice the new literal-UUID competitor.
+    const reusedLegacyId = "reused-rowid-receipt-collision";
+    const reusedDeliveryId = ensureUuidEventId(reusedLegacyId).id;
+    addLateRaw.run(reusedLegacyId, oldAt, validPayload(reusedLegacyId), oldAt,
+      workspaceId, deviceId, generation(3003));
+    const filler = addLateRaw.run("receipt-backfill-tail-filler", oldAt,
+      validPayload("receipt-backfill-tail-filler"), oldAt,
+      workspaceId, deviceId, generation(3004));
+    db.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?,'dead','local_schema_invalid','local',0,?,?)`)
+      .run(reusedDeliveryId, oldAt, terminalAt);
+    const reuseScanRows = (db.prepare("select count(*) as n from buffered_events").get() as
+      { n: number }).n;
+    assert.equal(backfillFor().backfillLegacyReceiptLineage!({
+      maxRows: reuseScanRows, maxWriterMs: 500,
+    }).visited, reuseScanRows);
+    assert.equal((db.prepare(`select phase from upload_receipt_lineage_backfill
+      where singleton=1`).get() as { phase: string }).phase, "bind");
+    const tailRowid = Number(filler.lastInsertRowid);
+    db.prepare("delete from buffered_events where rowid=?").run(tailRowid);
+    const replacement = addLateRaw.run(reusedDeliveryId, oldAt,
+      validPayload(reusedDeliveryId), oldAt, workspaceId, deviceId, generation(3005));
+    assert.equal(Number(replacement.lastInsertRowid), tailRowid);
+    assert.equal(backfillFor().backfillLegacyReceiptLineage!({
+      maxRows: 10, maxWriterMs: 500,
+    }).complete, true);
+    const reusedReceipt = db.prepare(`select raw_rowid as rawRowid from upload_receipts
+      where delivery_id=?`).get(reusedDeliveryId) as { rawRowid: number | null };
+    assert.equal(reusedReceipt.rawRowid, null,
+      "a reused rowid must not hide a new literal-UUID owner");
+    console.log(JSON.stringify({ phase: "reused_rowid_collision_fence", tailRowid,
+      receiptBound: reusedReceipt.rawRowid !== null }));
+
+    const recycledId = "00000000-0000-4000-8000-000000003006";
+    const recycled = addLateRaw.run(recycledId, oldAt, validPayload(recycledId), oldAt,
+      workspaceId, deviceId, generation(3006));
+    const recycledRowid = Number(recycled.lastInsertRowid);
+    db.prepare(`insert into raw_retention_receipts
+      (event_id,raw_rowid,raw_created_at,raw_generation,expired_at,reason)
+      values (?,?,?,?,?,'retention_window_elapsed')`)
+      .run(recycledId, recycledRowid, oldAt, generation(9999), terminalAt);
+    db.prepare(`insert into upload_receipts
+      (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+      values (?,'dead','local_schema_invalid','local',0,?,?)`)
+      .run(recycledId, oldAt, terminalAt);
+    assert.equal(backfillFor().backfillLegacyReceiptLineage!({
+      maxRows: 100, maxWriterMs: 500,
+    }).complete, true);
+    const recycledReceipt = db.prepare(`select raw_rowid as rawRowid from upload_receipts
+      where delivery_id=?`).get(recycledId) as { rawRowid: number | null };
+    assert.equal(recycledReceipt.rawRowid, null,
+      "same rowid and timestamp with a different generation is not lineage");
+    console.log(JSON.stringify({ phase: "recycled_generation_fence", recycledRowid,
+      receiptBound: recycledReceipt.rawRowid !== null }));
   } finally {
     upgraded.close();
   }

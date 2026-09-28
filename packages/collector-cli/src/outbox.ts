@@ -1189,9 +1189,13 @@ export class DeliveryOutbox {
             and exists (select 1 from buffered_events b where b.rowid=@rawRowid
               and b.id=@rawId and b.created_at=@rawCreatedAt
               and b.privacy_generation is @rawGeneration)
+            and not exists (select 1 from buffered_events competing_raw
+              where competing_raw.id=@deliveryId and competing_raw.rowid<>@rawRowid)
             and not exists (select 1 from raw_retention_receipts old_raw
               where old_raw.event_id in (@rawId,@deliveryId)
-                and old_raw.raw_rowid<>@rawRowid)
+                and (old_raw.raw_rowid is not @rawRowid
+                  or old_raw.raw_created_at is not @rawCreatedAt
+                  or old_raw.raw_generation is not @rawGeneration))
             and not exists (select 1 from upload_outbox o
               where o.delivery_id=@deliveryId and
                 (o.raw_rowid is not @rawRowid or o.raw_id is not @rawId
@@ -1235,6 +1239,19 @@ export class DeliveryOutbox {
           this.db.prepare(`update upload_receipt_lineage_backfill set
             bind_cursor_delivery_id=?,phase=?,updated_at=? where singleton=1`)
             .run(lastId, finished ? "complete" : "bind", this.clock().toISOString());
+          if (finished) {
+            // A completed 0.7.44 raw cursor will never revisit ambiguous old
+            // receipts. Reopen it at the first unbound candidate so the
+            // existing bounded migration can choose a collision-safe ID.
+            const firstUnbound = this.db.prepare(`select raw_rowid as n
+              from upload_receipt_lineage_candidates where generation=?
+              order by raw_rowid limit 1`).get(current.generation) as { n: number } | undefined;
+            if (firstUnbound) this.db.prepare(`update upload_control set
+              migration_cursor_rowid=min(migration_cursor_rowid,?),
+              migration_complete=0,migration_paused_reason=null,updated_at=?
+              where singleton=1 and migration_cursor_rowid>=?`)
+              .run(firstUnbound.n - 1, this.clock().toISOString(), firstUnbound.n);
+          }
           if (written && this.db.prepare(`select 1 from sqlite_master
             where type='table' and name='retention_hold_revision'`).get()) {
             this.db.prepare(`update retention_hold_revision set revision=revision+1

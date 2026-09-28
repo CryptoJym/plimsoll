@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 27);
+const completion = createProofCompletion("retention", 30);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -996,7 +996,10 @@ try {
   completion.check("legacy_null_receipt_l3_stays_private");
   completion.check("legacy_null_receipt_collision_stays_held");
   completion.check("legacy_null_receipt_late_collision_stays_unbound");
-  console.log(JSON.stringify({ status: "pass", checks: 27 }));
+  completion.check("legacy_null_receipt_reused_rowid_stays_unbound");
+  completion.check("legacy_null_receipt_collision_safe_repair");
+  completion.check("legacy_null_receipt_recycled_generation_stays_unbound");
+  console.log(JSON.stringify({ status: "pass", checks: 30 }));
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
