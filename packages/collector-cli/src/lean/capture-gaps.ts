@@ -245,12 +245,16 @@ export function recordSpoolLossGap(db: Database.Database, input: {
 
 /** Persist the conservative interval of a failed capture transaction. The
  * caller must do this in the same retry transaction as its source unit. */
+export function faultGapId(faultId: string): string {
+  return tupleHash(["plimsoll-capture-fault-v1", faultId]);
+}
+
 export function recordFaultIntervalGap(db: Database.Database, input: {
   faultId: string; source: string | null; fileKeyDigest: string | null;
   atMs: number; repairedAtMs: number;
 }): string {
   const scope = rolloutGapScope(db);
-  const gapId = tupleHash(["plimsoll-capture-fault-v1", input.faultId]);
+  const gapId = faultGapId(input.faultId);
   const startedAtMs = Math.max(scope.epochStartMs, input.atMs - CAPTURE_WRITE_LAG_MS);
   const endedAtMs = Math.max(startedAtMs, input.repairedAtMs);
   gapWrite(input.source ?? "unknown", input.fileKeyDigest, () => db.prepare(`

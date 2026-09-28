@@ -6,6 +6,7 @@ import { jsonlScanStateKey } from "./jsonl-byte-tailer";
 import { captureRecordLossGaps } from "./capture-record-loss";
 import { CaptureGapWriteError, captureFileKeyDigest, declareUnresolvedFileGap, fileGapId,
   resolveCaptureGap } from "./lean/capture-gaps";
+import { captureDurabilityFor } from "./lean/capture-durability";
 
 /**
  * Capture watermark v1 (eco-6hoxj.163.18) — the capture half.
@@ -848,6 +849,7 @@ export function applyCaptureCoverage(
   const scope = [check.workspaceId, check.installationEpochId, check.source] as const;
   const run = database.transaction(() => {
     if (!stillCurrent(database, check)) return;
+    captureDurabilityFor(database)?.repairInTransaction();
     const read = database.prepare(
       `select uncovered_since as since, last_write_at as lastWriteAt, seen_extent as seenExtent,
          seen_at as seenAt, gap_id as gapId
@@ -946,6 +948,7 @@ export function finishCaptureCoverage(database: Database.Database, check: Captur
     const state = frontierState(database, check);
     const previous = state?.completeThrough ?? null;
     if (!stillCurrent(database, check) || (state && !(check.startedMs > Date.parse(state.checkedAt)))) return previous;
+    captureDurabilityFor(database)?.repairInTransaction();
     const missingGap = database.prepare(`select 1 from capture_uncovered_files u
       left join capture_gaps g on g.gap_id=u.gap_id
       where u.workspace_id=? and u.installation_epoch_id=? and u.source=?

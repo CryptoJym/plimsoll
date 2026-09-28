@@ -591,8 +591,19 @@ export class DeliveryOutbox {
       const lost = this.deadLetterSummary(epochStartedAt, epochStartMs);
       const spoolLosses = (spool?.losses ?? []).filter((loss) => loss.toMs >= epochStartMs);
       const hasOpenGap = Boolean(this.db.prepare(`select 1 from capture_gaps
-        where workspace_id=? and installation_epoch_id=? and resolved_at_ms is null limit 1`)
+        where workspace_id=? and installation_epoch_id=? and ended_at_ms is null
+          and resolved_at_ms is null limit 1`)
         .get(frontier.workspaceId, frontier.installationEpochId));
+      // A repaired fault is a permanent historical loss, but no longer an
+      // open hold. Keep it in the existing v1 gaps array after v2 receipts
+      // allow the fault marker to clear. One row per UTC day bounds the claim.
+      const historicalGaps = this.db.prepare(`select min(started_at_ms) as fromMs,
+          max(ended_at_ms) as toMs from capture_gaps
+        where workspace_id=? and installation_epoch_id=? and ended_at_ms is not null
+          and resolved_at_ms is null
+        group by cast(started_at_ms / 86400000 as integer)`).all(
+        frontier.workspaceId, frontier.installationEpochId,
+      ) as Array<{fromMs:number;toMs:number}>;
       const hasFault = durability?.status().faults.length || Boolean(this.db.prepare(
         `select 1 from capture_faults where resolved_at_ms is null limit 1`).get());
       const durabilityUnknown = hasOpenGap || hasFault || Boolean(durability &&
@@ -617,6 +628,7 @@ export class DeliveryOutbox {
       const gaps = mergeCaptureGaps([
         ...frontier.gaps,
         ...lost.gaps,
+        ...historicalGaps,
         ...spoolLosses.map((loss) => ({
           fromMs: Math.max(epochStartMs, loss.fromMs - CAPTURE_WRITE_LAG_MS),
           toMs: loss.toMs,

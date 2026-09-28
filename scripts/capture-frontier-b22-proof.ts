@@ -27,7 +27,10 @@ const unread = {
 const count = (table: string) => (db.prepare(`select count(*) as n from ${table}`).get() as {n:number}).n;
 try {
   db.exec(`create trigger fail_b22_gap before insert on capture_gaps begin select raise(abort, 'gap write injected'); end`);
-  assert.throws(() => applyCaptureCoverage(db, check, [unread]), /gap_record_unavailable/);
+  let failure: unknown;
+  try { applyCaptureCoverage(db, check, [unread]); }
+  catch (error) { failure = error; buffer.captureDurability.reportGapFailure(error); }
+  assert.match(String(failure), /gap_record_unavailable/);
   assert.equal(count("capture_uncovered_files"), 0);
   assert.equal(count("capture_gaps"), 0);
   assert.equal(count("capture_coverage_state"), 0);
@@ -46,6 +49,8 @@ try {
   assert.deepEqual(gap, { basis:"epoch_open", startMs:check.epochStartMs,
     endMs:null, countBasis:"unknown", unreadBytes:90, resolvedAtMs:null });
   assert.equal(count("capture_uncovered_files"), 1);
+  assert.equal((db.prepare(`select count(*) as n from capture_gaps
+    where reason='gap_record_unavailable'`).get() as {n:number}).n, 1);
   console.log("PASS frontier_retry_commits_open_gap_and_uncovered_cursor");
 
   db.prepare("delete from capture_gaps where gap_id=?").run(id);

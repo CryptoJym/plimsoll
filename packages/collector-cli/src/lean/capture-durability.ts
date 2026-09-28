@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 
 import Database from "better-sqlite3";
-import { CaptureGapWriteError, captureFileKeyDigest, recordFaultIntervalGap, rolloutGapScope } from "./capture-gaps";
+import { CaptureGapWriteError, faultGapId,
+  recordFaultIntervalGap, rolloutGapScope } from "./capture-gaps";
 
 export type CaptureFault = {
   faultId: string;
@@ -30,7 +31,9 @@ const byDatabase = new WeakMap<Database.Database, CaptureDurability>();
 const markerName = "capture-fault.json";
 const cleanName = "capture-clean-shutdown";
 const SHA256 = /^[0-9a-f]{64}$/;
-const MACHINE_HASH = `sha256:${captureFileKeyDigest(os.hostname())}`;
+const MACHINE_HASH = `sha256:${crypto.createHash("sha256").update(os.hostname()).digest("hex")}`;
+const restartGapId = (epoch: string) => crypto.createHash("sha256")
+  .update(JSON.stringify(["plimsoll-restart-unverified-v1", epoch])).digest("hex");
 
 function faultFromJson(value: unknown): CaptureFault | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -104,19 +107,33 @@ export class CaptureDurability {
   private recordRestartGap(): void {
     try {
       const scope = rolloutGapScope(this.db);
-      const gapId = crypto.createHash("sha256")
-        .update(JSON.stringify(["plimsoll-restart-unverified-v1", scope.installationEpochId]))
-        .digest("hex");
-      this.db.prepare(`insert or ignore into capture_gaps
+      const gapId = restartGapId(scope.installationEpochId);
+      this.db.prepare(`insert into capture_gaps
         (gap_id,workspace_id,installation_epoch_id,source,machine_hash,epoch_key,started_at_ms,ended_at_ms,
          interval_basis,count_basis,reason)
-        values (?,?,?,?,?,?,?,null,'fault_interval','unknown','restart_unverified')`)
+        values (?,?,?,?,?,?,?,null,'fault_interval','unknown','restart_unverified')
+        on conflict(gap_id) do update set ended_at_ms=null,revision=capture_gaps.revision+1,
+          upload_state='pending' where capture_gaps.ended_at_ms is not null`)
         .run(gapId, scope.workspaceId, scope.installationEpochId, "collector", MACHINE_HASH,
           scope.installationEpochId, scope.epochStartMs);
+      this.restartGapPersisted = true;
     } catch {
       this.restartGapPersisted = false;
       // The process bit still withdraws claims until SQLite recovers.
     }
+  }
+
+  private closeRestartGap(): void {
+    if (!this.restartUnverified) return;
+    if (!this.restartGapPersisted) this.recordRestartGap();
+    if (!this.restartGapPersisted) return;
+    try {
+      const scope = rolloutGapScope(this.db);
+      this.db.prepare(`update capture_gaps set ended_at_ms=max(started_at_ms,?),
+        revision=revision+1,upload_state='pending'
+        where gap_id=? and ended_at_ms is null`)
+        .run(Date.now(), restartGapId(scope.installationEpochId));
+    } catch { this.restartGapPersisted = false; }
   }
 
   /** Refreshes another process's marker before opening the claim transaction. */
@@ -209,15 +226,66 @@ export class CaptureDurability {
     }
   }
 
-  /** Called only after every configured root completed a fresh coverage walk. */
-  markFreshWalkComplete(): void {
-    this.walkVerified = true;
-    if (!this.restartGapPersisted || this.openFaults.size) return;
+  /** Only a receipt for the current revision proves remote possession. A
+   * stale receipt cannot clear a fault whose gap was revised after upload. */
+  acknowledgeGaps(receipts: readonly { gapId: string; revision: number }[]): number {
+    const mark = this.db.prepare(`update capture_gaps set upload_state='acked'
+      where gap_id=? and revision=? and upload_state in ('pending','in_flight')`);
+    const acceptedFaultGap = this.db.prepare(`select 1 from capture_gaps
+      where gap_id=? and reason='gap_record_unavailable' and upload_state='acked' limit 1`);
+    const resolve = this.db.prepare(`update capture_faults set resolved_at_ms=max(at_ms,?)
+      where fault_id=? and resolved_at_ms is null`);
+    const changed = this.db.transaction(() => {
+      let count = 0;
+      for (const receipt of receipts) {
+        if (!SHA256.test(receipt.gapId) || !Number.isSafeInteger(receipt.revision) ||
+            receipt.revision < 1) continue;
+        count += mark.run(receipt.gapId, receipt.revision).changes;
+      }
+      const now = Date.now();
+      for (const fault of this.openFaults.values()) {
+        if (acceptedFaultGap.get(faultGapId(fault.faultId))) resolve.run(now, fault.faultId);
+      }
+      return count;
+    }).immediate();
+    this.clearAcknowledgedFaults();
+    this.releaseRestartHold();
+    return changed;
+  }
+
+  private releaseRestartHold(): void {
+    if (!this.walkVerified || !this.restartGapPersisted || this.openFaults.size) return;
     try {
       if (!this.db.prepare(`select 1 from capture_faults where resolved_at_ms is null limit 1`).get()) {
         this.restartUnverified = false;
       }
-    } catch { /* Keep the restart hold when the mirror cannot be checked. */ }
+    } catch { /* Keep the restart hold while SQLite cannot prove recovery. */ }
+  }
+
+  private clearAcknowledgedFaults(): void {
+    if (!this.walkVerified || !this.restartGapPersisted || this.openFaults.size === 0) return;
+    try {
+      if (this.db.prepare(`select 1 from capture_faults where resolved_at_ms is null limit 1`).get()) return;
+      const proof = this.db.prepare(`select 1 from capture_faults f join capture_gaps g
+        on g.gap_id=? where f.fault_id=? and f.resolved_at_ms is not null
+          and g.reason='gap_record_unavailable' and g.upload_state='acked' limit 1`);
+      for (const fault of this.openFaults.values()) {
+        if (!proof.get(faultGapId(fault.faultId), fault.faultId)) return;
+      }
+      try { fs.unlinkSync(this.markerPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      fsyncDirectory(path.dirname(this.markerPath));
+      this.openFaults.clear();
+      this.markerPersisted = null;
+    } catch { /* Keep process fault and restart hold if any proof or fsync fails. */ }
+  }
+
+  /** Called only after every configured root completed a fresh coverage walk. */
+  markFreshWalkComplete(): void {
+    this.walkVerified = true;
+    this.closeRestartGap();
+    this.clearAcknowledgedFaults();
+    this.releaseRestartHold();
   }
 
   status(): CaptureDurabilityStatus {
