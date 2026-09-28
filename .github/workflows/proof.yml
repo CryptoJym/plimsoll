@@ -199,6 +199,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-roots-add
 
+      - name: Prove fenced pre-enrollment history import (eco-6hoxj.163.89)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import
+
       - name: Prove dispatch binding and stamped capture paths (eco-6hoxj.165.3)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding

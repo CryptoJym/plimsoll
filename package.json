@@ -141,6 +141,7 @@
     "proof:codex-profiles-apply": "tsx scripts/codex-profiles-apply-proof.ts",
     "proof:managed-config-reconcile": "tsx scripts/managed-config-reconcile-proof.ts",
     "proof:capture-roots-add": "tsx scripts/capture-roots-add-proof.ts",
+    "proof:capture-history-import": "tsx scripts/capture-history-import-proof.ts",
     "proof:dispatch-binding": "tsx scripts/run-proof.ts scripts/dispatch-binding-proof.ts",
     "proof:dispatch-bind-linkability": "tsx scripts/run-proof.ts scripts/dispatch-bind-linkability-proof.ts",
     "proof:dispatch-pairing-integration": "tsx scripts/run-proof.ts scripts/dispatch-pairing-integration-proof.ts",
