@@ -3120,11 +3120,14 @@ export class LocalEventBuffer {
     ) and e.device_id is (
       select current_device_id from collector_workspace_binding where singleton = 1
     ))`;
+    // Pre-raw_id rows retain raw_rowid; only fully unlinked legacy rows use
+    // the derived delivery id. A linked row can share that id with another raw.
     const activeOutbox = `(exists (
       select 1 from upload_outbox o
       where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
     ) or exists (
       select 1 from upload_outbox o where o.delivery_id = retention_delivery_id(e.id)
+        and o.raw_rowid is null and o.raw_id is null
     ))`;
     if (!this.delivery.isEnabled()) return `(${activeAudience} and ${activeOutbox})`;
     return `(${activeAudience} and (${activeOutbox} or (

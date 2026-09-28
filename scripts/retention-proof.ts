@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("retention", 17);
+const completion = createProofCompletion("retention", 18);
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -332,6 +332,80 @@ try {
       priorOutboxClosed: priorOutbox.length }));
     buffer.close();
     completion.check(`prior_${changed}_audience_expires_and_active_audience_holds`);
+  }
+
+  {
+    // A caller-controlled legacy id derives the literal UUID of a different
+    // row. The linked delivery belongs only to that other row; an outbox row
+    // with both lineage columns null still uses the legacy id fallback.
+    const priorWorkspace = "collision-prior";
+    const currentWorkspace = "collision-current";
+    const deviceId = "collision-device";
+    const buffer = new LocalEventBuffer(path.join(root, "delivery-id-collision.sqlite"), {
+      workspaceId: priorWorkspace, deviceId, delivery: { enabled: false },
+      enrollmentNow: () => new Date(oldCreatedAt),
+    });
+    const db = buffer.database;
+    const now = new Date();
+    const legacyId = `legacy-collision-${nextId++}`;
+    const literalId = ensureUuidEventId(legacyId).id;
+    const unlinkedId = `legacy-unlinked-${nextId++}`;
+    const unlinkedDeliveryId = ensureUuidEventId(unlinkedId).id;
+    const withId = (id: string) => aiInteractionEventSchema.parse({
+      ...event(), id, sessionId: id,
+    });
+    assert.notEqual(legacyId, literalId);
+    assert.equal(buffer.append(withId(legacyId)), true);
+    assert.equal(buffer.append(withId(unlinkedId)), true);
+    db.prepare("update buffered_events set created_at=? where id in (?,?)")
+      .run(oldCreatedAt, legacyId, unlinkedId);
+    db.prepare("update buffered_events set uploaded_at=? where id=?")
+      .run(now.toISOString(), legacyId);
+    db.prepare(`insert into upload_outbox
+      (delivery_id,raw_rowid,raw_id,workspace_id,device_id,base_envelope_json,
+       base_bytes,state,next_attempt_at,created_at,updated_at)
+      values (?,null,null,?,?,'{}',2,'pending',?,?,?)`).run(
+        unlinkedDeliveryId, priorWorkspace, deviceId,
+        oldCreatedAt, oldCreatedAt, oldCreatedAt);
+
+    buffer.transitionWorkspace(priorWorkspace, currentWorkspace, deviceId);
+    buffer.delivery.configure({ enabled: true });
+    assert.equal(buffer.append(withId(literalId)), true);
+    const linked = db.prepare(`select raw_rowid as rawRowid,raw_id as rawId
+      from upload_outbox where delivery_id=?`).get(literalId) as
+      { rawRowid: number; rawId: string } | undefined;
+    const literalRaw = db.prepare("select rowid as rawRowid from buffered_events where id=?")
+      .get(literalId) as { rawRowid: number };
+    assert.equal(linked?.rawRowid, literalRaw.rawRowid);
+    assert.equal(linked?.rawId, literalId);
+
+    // While the old workspace is selected, only its genuinely unlinked
+    // outbox row holds retention. The linked UUID delivery is another row's.
+    buffer.transitionWorkspace(currentWorkspace, priorWorkspace, deviceId);
+    buffer.delivery.configure({ enabled: false });
+    assert.equal(buffer.retentionStatus(90, now).states.heldForUpload, 1);
+    buffer.delivery.configure({ enabled: true });
+    buffer.transitionWorkspace(priorWorkspace, currentWorkspace, deviceId);
+
+    assert.equal(buffer.prune(90, { maxRows: 10, now }).events, 2);
+    assert.equal(db.prepare("select 1 from buffered_events where id=?").get(legacyId), undefined);
+    assert.equal(db.prepare("select 1 from buffered_events where id=?").get(unlinkedId), undefined);
+    assert.equal(db.prepare("select 1 from upload_outbox where delivery_id=?").get(unlinkedDeliveryId), undefined);
+    assert.equal((db.prepare("select reason from upload_receipts where delivery_id=?")
+      .get(unlinkedDeliveryId) as { reason: string }).reason, "local_privacy_violation");
+    assert.equal(db.prepare("select 1 from upload_receipts where delivery_id=?").get(literalId), undefined);
+    assert.equal((db.prepare("select privacy_disposition as disposition from buffered_events where id=?")
+      .get(literalId) as { disposition: string | null }).disposition, null);
+    assert.equal(db.prepare("select 1 from upload_outbox where delivery_id=?").get(literalId) !== undefined, true);
+    const leaseAt = new Date(now.getTime() + 5_000);
+    const lease = buffer.delivery.lease({ now: leaseAt });
+    assert.deepEqual(lease.items.map((item) => item.deliveryId), [literalId]);
+    assert.equal(buffer.delivery.acknowledge(lease.leaseId, [literalId], leaseAt).acknowledged, 1);
+    console.log(JSON.stringify({ fixture: "delivery_id_lineage_collision",
+      priorRowsExpired: 2, unrelatedDeliveryAcknowledged: true,
+      unlinkedLegacyRetired: true }));
+    buffer.close();
+    completion.check("prior_audience_delivery_id_collision_preserves_linked_delivery");
   }
 
   {
