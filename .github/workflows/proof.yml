@@ -73,6 +73,14 @@ jobs:
           pnpm proof:pr426-r7-plan-open-refusal-sidecars
           pnpm proof:pr426-r7-restore-rerun
 
+      - name: Prove post-swap fence and restore stage provenance (PR 426 round 8)
+        run: |
+          pnpm proof:pr426-r8-swap-replacement-race
+          pnpm proof:pr426-r8-same-generation-append
+          pnpm proof:pr426-r8-foreign-restore-stage
+          pnpm proof:pr426-r8-restore-sidecar-inventory
+          pnpm proof:pr426-r8-restore-sidecar-checkpoint
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit

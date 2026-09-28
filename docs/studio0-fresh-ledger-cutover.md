@@ -91,6 +91,15 @@ keys, and capture-root configuration stay in place.
    host or filesystem clocks; later growth starts at that byte boundary.
    A new file generation at an old pathname is treated as a file without a
    carried cursor: its obsolete archive cursor is validated but not copied.
+   After the rename, while the switch lease is still held and before starting
+   the collector, the command re-stats every carried-cursor file. Any changed
+   generation is fenced at the size observed then, in one transaction in the
+   active ledger. A same-generation append remains eligible at the carried
+   offset. Bytes written into a replaced generation between the rename and
+   this final re-stat are fenced. This short window is bounded by the final
+   re-stat, with the collector stopped; do not treat those bytes as captured.
+   The replacement remains marked pending until that transaction commits, and
+   the 0.7.46 collector refuses to open a pending ledger.
 
    If the process stops after linking the archive but before the swap, the
    active and archive paths refer to the same old inode. Keep both paths. A
@@ -106,7 +115,9 @@ keys, and capture-root configuration stay in place.
    after the swap, inspect the active
    ledger's `collector_replacement_ledger` row and archive inode before
    retrying. Do not unlink or overwrite either ledger to guess which step
-   completed.
+   completed. If a crash occurs after the swap but before the final file
+   fences commit, keep the collector stopped and restore the archive with the
+   command below before attempting another cutover.
 7. Start the 0.7.46 collector. Check readiness, queue/spool gates, session
    sync, all 23 roots, zero `epoch_mismatch`, Claude/Codex forward appends,
    Codex live producer authentication, and Grok's historical
@@ -155,7 +166,14 @@ same three paths. A pre-rename stage is recovered and folded again under the
 mutation lease; a post-rename rerun confirms the active archived image and
 durably syncs its directory. Wait for the killed lease's fencing deadline if
 the command reports it busy. Keep the archive, retained fresh attempt, and
-all sidecars; no manual cleanup is required.
+all sidecars; no manual cleanup is required. Restore writes a durable stage
+identity journal with the archive identity and the clone's device, inode and
+original size. A rerun accepts only that recorded stage; before publication it
+checks the staged ledger has the archived binding and no replacement marker.
+An unrelated or unverifiable stage is refused and retained for inspection.
+Before reopening a leftover stage, restore APFS-clones its WAL, shared-memory
+and rollback-journal sidecars into private `.recovered-*` artifacts, then lets
+SQLite replay the original sidecars. It never deletes those retained artifacts.
 
 If the restore command refuses, keep the daemon stopped and inspect its reason
 and the three paths. Do not hand the replacement pathname to an old runtime.

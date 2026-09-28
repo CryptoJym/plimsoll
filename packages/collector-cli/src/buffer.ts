@@ -275,6 +275,25 @@ export class LocalEventBuffer {
       throw new Error("fresh_ledger_capture_root_epochs_conflict");
     }
     this.db = new Database(path, { timeout });
+    // An interrupted rename must not admit a first scan before the post-swap
+    // file-generation fences are durable. Restore can still open it directly.
+    try {
+      const replacement = this.db.prepare(`select 1 from sqlite_master
+        where type='table' and name='collector_replacement_ledger'`).get();
+      if (replacement) {
+        const columns = this.db.pragma("table_info(collector_replacement_ledger)") as
+          Array<{ name: string }>;
+        const pending = columns.some(column => column.name === "post_switch_fence_pending")
+          ? this.db.prepare(`select post_switch_fence_pending as pending
+            from collector_replacement_ledger where singleton=1`).get() as
+              { pending: number } | undefined
+          : undefined;
+        if (pending?.pending !== 0) throw new Error("replacement_post_switch_fence_pending");
+      }
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
     this.db.pragma("journal_mode = WAL");
     this.deviceId = options.deviceId?.trim() || null;
     const newLedger = !this.db

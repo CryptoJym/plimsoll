@@ -54,6 +54,7 @@ const CARRIED_COLUMNS: Record<(typeof CARRIED_TABLES)[number], readonly string[]
 };
 const STAGE_SUFFIX = ".replacement-stage";
 const RESTORE_LEASE_MS = 60_000;
+const RESTORE_STAGE_JOURNAL_VERSION = 1;
 
 export type FreshLedgerCutoverPlan = {
   status: "ready" | "refused";
@@ -438,7 +439,10 @@ function untrackedRootFiles(db: Database.Database, input: CutoverInput) {
  * This runs under the old-ledger lock and lifecycle lease immediately before
  * the active pathname is replaced. A stale cursor cannot suppress growth. */
 function finalizeReplacementFileFences(stage: Database.Database, input: CutoverInput,
-  heartbeat: () => void): { cursorRows: number; fencedFiles: number } {
+  heartbeat: () => void): { cursorRows: number; fencedFiles: number; carriedPaths: Array<{
+    fileKey: string; source: "codex" | "claude_code"; path: string;
+    fileIdentity: string; committedOffset: number;
+  }> } {
   const observations = observedRootFiles(input, heartbeat);
   const byKey = new Map<string, (typeof observations)[number]>();
   for (const entry of observations) {
@@ -453,12 +457,17 @@ function finalizeReplacementFileFences(stage: Database.Database, input: CutoverI
   const dropMark = stage.prepare("delete from replacement_capture_cursors where file_key=?");
   const dropCursor = stage.prepare("delete from rollout_scan_state where file=?");
   const validKeys = new Set<string>();
+  const carriedPaths: Array<{ fileKey: string; source: "codex" | "claude_code";
+    path: string; fileIdentity: string; committedOffset: number }> = [];
   for (const row of carried) {
     const current = byKey.get(row.fileKey);
     const identity = current &&
       `${current.observation.device}:${current.observation.inode}:${current.observation.birthtimeNs}`;
     if (current?.source === row.source && identity === row.fileIdentity &&
-        row.committedOffset <= current.observation.size) validKeys.add(row.fileKey);
+        row.committedOffset <= current.observation.size) {
+      validKeys.add(row.fileKey);
+      carriedPaths.push({ ...row, path: current.observation.path });
+    }
     else {
       dropMark.run(row.fileKey);
       dropCursor.run(row.fileKey);
@@ -473,7 +482,55 @@ function finalizeReplacementFileFences(stage: Database.Database, input: CutoverI
   }
   stage.prepare("update collector_replacement_ledger set cursor_rows=? where singleton=1")
     .run(validKeys.size);
-  return { cursorRows: validKeys.size, fencedFiles: untracked.length };
+  return { cursorRows: validKeys.size, fencedFiles: untracked.length, carriedPaths };
+}
+
+/** The stage observation precedes the rename. Re-stat only its carried paths
+ * after the active name has changed; a same-generation append keeps its old
+ * committed offset, while a new generation receives its size at this point. */
+function reconcilePostRenameCarriedFences(active: Database.Database,
+  carriedPaths: ReturnType<typeof finalizeReplacementFileFences>["carriedPaths"],
+  heartbeat: () => void): { cursorRows: number; fencedFiles: number } {
+  const changed: Array<{ fileKey: string; source: "codex" | "claude_code";
+    observation: CaptureBaselineFileObservation | null }> = [];
+  for (const row of carriedPaths) {
+    let observation: CaptureBaselineFileObservation | null = null;
+    try {
+      const current = fs.lstatSync(row.path, { bigint: true });
+      if (!current.isFile() || current.isSymbolicLink()) {
+        throw new Error("post_switch_file_not_regular");
+      }
+      observation = { path: row.path, device: current.dev, inode: current.ino,
+        size: current.size, birthtimeNs: current.birthtimeNs };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error("post_switch_file_stat_unreadable");
+      }
+    }
+    const identity = observation &&
+      `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+    if (identity !== row.fileIdentity || (observation &&
+        BigInt(row.committedOffset) > observation.size)) {
+      changed.push({ fileKey: row.fileKey, source: row.source, observation });
+    }
+    heartbeat();
+  }
+  active.transaction(() => {
+    const dropMark = active.prepare("delete from replacement_capture_cursors where file_key=?");
+    const dropCursor = active.prepare("delete from rollout_scan_state where file=?");
+    for (const row of changed) {
+      dropMark.run(row.fileKey);
+      dropCursor.run(row.fileKey);
+      if (row.observation) recordReplacementUnseenFileFences(active, row.source, [row.observation]);
+      heartbeat();
+    }
+    const cursorRows = (active.prepare("select count(*) as n from replacement_capture_cursors")
+      .get() as { n: number }).n;
+    active.prepare(`update collector_replacement_ledger
+      set cursor_rows=?, post_switch_fence_pending=0 where singleton=1`).run(cursorRows);
+  }).immediate();
+  return { cursorRows: carriedPaths.length - changed.length,
+    fencedFiles: changed.filter(row => row.observation !== null).length };
 }
 
 function openReadOnlyPlanDatabase(ledgerPath: string): {
@@ -620,6 +677,133 @@ function retainRestoreStageSidecars(stage: string, freshAttemptPath: string) {
   }
 }
 
+type RestoreStageJournal = {
+  schemaVersion: typeof RESTORE_STAGE_JOURNAL_VERSION;
+  archiveIdentity: string;
+  stageDevice: string;
+  stageInode: string;
+  cloneSize: string;
+  nonce: string;
+};
+
+function restoreStageJournalPath(stage: string) {
+  return `${stage}.identity.json`;
+}
+
+function createRestoreStageJournal(stage: string, archiveIdentity: string,
+  archiveSize: number): RestoreStageJournal {
+  const stat = fs.lstatSync(stage, { bigint: true });
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== BigInt(process.getuid?.() ?? -1) ||
+      stat.size !== BigInt(archiveSize) || (stat.mode & 0o777n) !== 0o600n) {
+    throw new Error("restore_stage_unsafe");
+  }
+  const journal: RestoreStageJournal = {
+    schemaVersion: RESTORE_STAGE_JOURNAL_VERSION, archiveIdentity,
+    stageDevice: String(stat.dev), stageInode: String(stat.ino),
+    cloneSize: String(stat.size), nonce: crypto.randomUUID(),
+  };
+  const file = restoreStageJournalPath(stage);
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT |
+    fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(journal));
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+  fsyncDirectory(path.dirname(file));
+  return journal;
+}
+
+function readRestoreStageJournal(stage: string, archiveIdentity: string,
+  archiveSize: number): RestoreStageJournal {
+  const file = restoreStageJournalPath(stage);
+  let raw: string;
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() ||
+        (stat.mode & 0o777) !== 0o600 || stat.size > 4096) {
+      throw new Error("restore_stage_journal_unsafe");
+    }
+    raw = fs.readFileSync(file, "utf8");
+  } catch { throw new Error("restore_stage_journal_unverified"); }
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  catch { throw new Error("restore_stage_journal_unverified"); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("restore_stage_journal_unverified");
+  }
+  const row = value as Partial<RestoreStageJournal>;
+  if (Object.keys(row).sort().join("|") !==
+      "archiveIdentity|cloneSize|nonce|schemaVersion|stageDevice|stageInode" ||
+      row.schemaVersion !== RESTORE_STAGE_JOURNAL_VERSION ||
+      row.archiveIdentity !== archiveIdentity ||
+      typeof row.stageDevice !== "string" || !/^\d+$/.test(row.stageDevice) ||
+      typeof row.stageInode !== "string" || !/^\d+$/.test(row.stageInode) ||
+      typeof row.cloneSize !== "string" || row.cloneSize !== String(archiveSize) ||
+      typeof row.nonce !== "string" || !/^[0-9a-f-]{36}$/.test(row.nonce)) {
+    throw new Error("restore_stage_journal_unverified");
+  }
+  const stageStat = fs.lstatSync(stage, { bigint: true });
+  // SQLite may grow the main file at WAL checkpoint. The journal records the
+  // clone's exact size; the stage nonce below attests subsequent growth.
+  if (!stageStat.isFile() || stageStat.isSymbolicLink() ||
+      stageStat.uid !== BigInt(process.getuid?.() ?? -1) ||
+      String(stageStat.dev) !== row.stageDevice || String(stageStat.ino) !== row.stageInode ||
+      stageStat.size < BigInt(row.cloneSize)) {
+    throw new Error("restore_stage_identity_changed");
+  }
+  return row as RestoreStageJournal;
+}
+
+function assertRestoreStageImage(stage: Database.Database, journal: RestoreStageJournal,
+  expected: { workspaceId: string; deviceId: string; epochId: string | null }) {
+  if (!hasTable(stage, "collector_restore_stage") || hasTable(stage, "collector_replacement_ledger")) {
+    throw new Error("restore_stage_not_archive_clone");
+  }
+  const row = stage.prepare(`select archive_identity as archiveIdentity, stage_nonce as nonce,
+    clone_size as cloneSize from collector_restore_stage where singleton=1`).get() as
+    { archiveIdentity: string; nonce: string; cloneSize: string } | undefined;
+  const binding = stage.prepare(`select current_workspace_id as workspaceId,
+    current_device_id as deviceId, current_installation_epoch_id as epochId
+    from collector_workspace_binding where singleton=1`).get() as
+    { workspaceId: string; deviceId: string | null; epochId: string | null } | undefined;
+  if (!row || row.archiveIdentity !== journal.archiveIdentity ||
+      row.nonce !== journal.nonce || row.cloneSize !== journal.cloneSize ||
+      binding?.workspaceId !== expected.workspaceId ||
+      binding.deviceId !== expected.deviceId || binding.epochId !== expected.epochId) {
+    throw new Error("restore_stage_not_archive_clone");
+  }
+}
+
+function retainRestoreJournal(stage: string, freshAttemptPath: string) {
+  const source = restoreStageJournalPath(stage);
+  if (!fs.existsSync(source)) return;
+  const base = `${freshAttemptPath}.restore-stage-identity.recovered-`;
+  let ordinal = 1;
+  while (fs.existsSync(`${base}${ordinal}`)) ordinal++;
+  fs.renameSync(source, `${base}${ordinal}`);
+  fsyncDirectory(path.dirname(freshAttemptPath));
+}
+
+function preserveLeftoverStageSidecars(stage: string, freshAttemptPath: string) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const source = `${stage}${suffix}`;
+    if (!fs.existsSync(source)) continue;
+    const stat = fs.lstatSync(source);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.()) {
+      throw new Error("restore_stage_sidecar_unsafe");
+    }
+    const destination = `${freshAttemptPath}.restore-stage${suffix}.recovered-${Date.now()}-${crypto.randomUUID()}`;
+    const clone = spawnSync("/bin/cp", ["-c", source, destination], {
+      stdio: "ignore", timeout: 300_000,
+    });
+    if (clone.error || clone.status !== 0) throw new Error("restore_stage_sidecar_clone_unavailable");
+    fs.chmodSync(destination, 0o600);
+    const fd = fs.openSync(destination, "r");
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fsyncDirectory(path.dirname(destination));
+  }
+}
+
 /** Prepare a fully bound replacement beside the old ledger, then atomically
  * replace the active pathname. A hard link preserves the quiesced old inode
  * at the archive path without copying the 88 GB history. */
@@ -634,6 +818,7 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
   let old: Database.Database | null = null;
   let staged: LocalEventBuffer | null = null;
   let replacementLock: Database.Database | null = null;
+  let activeLock: Database.Database | null = null;
   const stage = `${input.ledgerPath}${STAGE_SUFFIX}`;
   let switched = false;
   const heartbeat = () => {
@@ -690,7 +875,8 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     create table collector_replacement_ledger (
       singleton integer primary key check(singleton=1), archive_identity text not null,
       archive_path text not null, min_version text not null, switched_at text not null,
-      cursor_rows integer not null
+      cursor_rows integer not null, post_switch_fence_pending integer not null default 1
+        check(post_switch_fence_pending in (0,1))
     );`);
     target.transaction(() => {
       if (hasTable(old!, "rollout_scan_state")) {
@@ -759,16 +945,23 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     fs.renameSync(stage, input.ledgerPath);
     fsyncDirectory(path.dirname(input.ledgerPath));
     switched = true;
+    replacementLock.exec("COMMIT");
+    replacementLock.close(); replacementLock = null;
+    activeLock = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
+    activeLock.pragma("locking_mode = EXCLUSIVE");
+    const afterSwap = reconcilePostRenameCarriedFences(activeLock, finalFiles.carriedPaths, heartbeat);
+    activeLock.close(); activeLock = null;
     input.onStep?.("switched");
     return { ...first, archiveIdentity: inspection.archiveIdentity,
-      archiveLatestRecordedAt: inspection.latest, cursorRows: finalFiles.cursorRows,
-      untrackedFileFences: finalFiles.fencedFiles };
+      archiveLatestRecordedAt: inspection.latest, cursorRows: afterSwap.cursorRows,
+      untrackedFileFences: finalFiles.fencedFiles + afterSwap.fencedFiles };
   } finally {
     staged?.close();
     if (old?.inTransaction) old.exec("COMMIT");
     old?.close();
     if (replacementLock?.inTransaction) replacementLock.exec("COMMIT");
     replacementLock?.close();
+    activeLock?.close();
     if (!switched) removeOwnedStage(stage);
     lease.release();
   }
@@ -891,14 +1084,18 @@ export function restoreArchivedLedger(input: {
     throw new Error("restore_paths_unsafe");
   }
   const archived = new Database(input.archivePath, { readonly: true, fileMustExist: true, timeout: 0 });
+  let archiveBinding: { workspaceId: string; deviceId: string; epochId: string | null };
   try {
     const binding = archived.prepare(`select current_workspace_id as workspaceId,
-      current_device_id as deviceId from collector_workspace_binding where singleton=1`).get() as
-      { workspaceId: string; deviceId: string | null } | undefined;
+      current_device_id as deviceId, current_installation_epoch_id as epochId
+      from collector_workspace_binding where singleton=1`).get() as
+      { workspaceId: string; deviceId: string | null; epochId: string | null } | undefined;
     if (!binding?.deviceId || fileIdentityDigest(input.archivePath, archiveStat,
       binding.workspaceId, binding.deviceId, path.resolve(input.archivePath)) !== marker.archiveIdentity) {
       throw new Error("replacement_archive_identity_changed");
     }
+    archiveBinding = { workspaceId: binding.workspaceId, deviceId: binding.deviceId,
+      epochId: binding.epochId };
   } finally { archived.close(); }
   const stage = `${input.ledgerPath}.restore-stage`;
   const stageExists = stageArtifactPresent(stage);
@@ -909,6 +1106,7 @@ export function restoreArchivedLedger(input: {
     // directory fsync leaves a complete restored ledger and retained fresh
     // attempt; a rerun only needs to durably publish the directory entry.
     fsyncDirectory(path.dirname(input.ledgerPath));
+    retainRestoreJournal(stage, input.freshAttemptPath);
     return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
       archivePreserved: true };
   }
@@ -939,6 +1137,7 @@ export function restoreArchivedLedger(input: {
         throw new Error("restore_completion_ambiguous");
       }
       fsyncDirectory(path.dirname(input.ledgerPath));
+      retainRestoreJournal(stage, input.freshAttemptPath);
       lease.release();
       return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
         archivePreserved: true };
@@ -951,6 +1150,10 @@ export function restoreArchivedLedger(input: {
     if (freshExistsNow && fs.lstatSync(input.freshAttemptPath).ino !==
         fs.lstatSync(input.ledgerPath).ino) {
       throw new Error("restore_fresh_attempt_changed");
+    }
+    if (stageExistsNow) readRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
+    else if (fs.existsSync(restoreStageJournalPath(stage))) {
+      throw new Error("restore_stage_journal_without_stage");
     }
   } catch (error) {
     lease.release();
@@ -978,6 +1181,7 @@ export function restoreArchivedLedger(input: {
       if (!checkpoint || checkpoint.busy || checkpoint.log) throw new Error("replacement_wal_not_checkpointed");
     }
     replacement.exec("BEGIN EXCLUSIVE");
+    let stageJournal: RestoreStageJournal;
     if (!stageExistsNow) {
       // The archive inode is never handed to the old runtime. A killed clone
       // leaves a stage which SQLite can recover and fold on the next attempt.
@@ -985,10 +1189,27 @@ export function restoreArchivedLedger(input: {
         stdio: "ignore", timeout: 300_000,
       });
       if (clone.error || clone.status !== 0) throw new Error("archive_clone_unavailable");
+      const stageFd = fs.openSync(stage, "r");
+      try { fs.fsyncSync(stageFd); } finally { fs.closeSync(stageFd); }
+      fsyncDirectory(path.dirname(stage));
+      stageJournal = createRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
+    } else {
+      stageJournal = readRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
+      preserveLeftoverStageSidecars(stage, input.freshAttemptPath);
     }
     restoredLock = new Database(stage, { fileMustExist: true, timeout: 0 });
     restoredLock.pragma("locking_mode = EXCLUSIVE");
+    if (!stageExistsNow) {
+      restoredLock.exec(`create table collector_restore_stage (
+        singleton integer primary key check(singleton=1), archive_identity text not null,
+        stage_nonce text not null, clone_size text not null
+      )`);
+      restoredLock.prepare(`insert into collector_restore_stage
+        (singleton,archive_identity,stage_nonce,clone_size) values(1,?,?,?)`)
+        .run(stageJournal.archiveIdentity, stageJournal.nonce, stageJournal.cloneSize);
+    }
     restoredLock.exec("BEGIN EXCLUSIVE");
+    assertRestoreStageImage(restoredLock, stageJournal, archiveBinding);
     const heartbeat = () => {
       if (!lease.renew().ok) throw new Error("restore_lifecycle_authority_lost");
     };
@@ -1011,6 +1232,8 @@ export function restoreArchivedLedger(input: {
     restoredLock = new Database(stage, { fileMustExist: true, timeout: 0 });
     restoredLock.pragma("locking_mode = EXCLUSIVE");
     restoredLock.exec("BEGIN EXCLUSIVE");
+    readRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
+    assertRestoreStageImage(restoredLock, stageJournal, archiveBinding);
     heartbeat();
     fs.chmodSync(input.ledgerPath, 0o600);
     if (!freshExistsNow) fs.linkSync(input.ledgerPath, input.freshAttemptPath);
@@ -1031,6 +1254,7 @@ export function restoreArchivedLedger(input: {
     fsyncDirectory(path.dirname(input.freshAttemptPath));
     fs.renameSync(stage, input.ledgerPath);
     fsyncDirectory(path.dirname(input.ledgerPath));
+    retainRestoreJournal(stage, input.freshAttemptPath);
     return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
       archivePreserved: true };
   } finally {
