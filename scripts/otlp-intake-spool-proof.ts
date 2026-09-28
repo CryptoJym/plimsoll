@@ -1218,6 +1218,75 @@ async function stageReplayFailures() {
   }
 }
 
+// B22: a refused row's counted gap is part of the live or replay chunk, not
+// an asynchronous diagnostic. Force that one SQL insert to fail in both paths.
+async function stageB22GapTransactions() {
+  const changedUsage = (tag: string) => {
+    // Span identity is trace/span/time, while its usage attributes are data.
+    // Rewriting the latter under the former is a genuine refused collision.
+    const payload = usageSpans(tag, 1, 0);
+    const attributes = payload.resourceSpans[0]!.scopeSpans[0]!.spans[0]!.attributes;
+    const input = attributes.find((attribute) => attribute.key === "gen_ai.usage.input_tokens")!;
+    (input.value as { intValue: string }).intValue = "999";
+    return payload;
+  };
+  const hasGapTable = (fixture: Fixture) => Boolean(fixture.buffer.database.prepare(
+    "select 1 from sqlite_master where type='table' and name='capture_gaps'").get());
+  const gapCount = (fixture: Fixture) => hasGapTable(fixture) ? count(fixture.buffer.database,
+    "select count(*) as n from capture_gaps where reason='contract_violation'") : 0;
+  const trigger = (fixture: Fixture) => {
+    if (!hasGapTable(fixture)) return false;
+    fixture.buffer.database.exec(`create trigger b22_otlp_gap_failure before insert on capture_gaps
+      begin select raise(abort, 'b22_otlp_gap_failure'); end`);
+    return true;
+  };
+
+  const live = await openFixture();
+  try {
+    const original = await post(live.port, "/v1/traces", usageSpans("b22-live", 1, 0));
+    const armed = trigger(live);
+    const failed = await post(live.port, "/v1/traces", changedUsage("b22-live"));
+    check("b22_otlp_live_gap_failure_answers_503_and_keeps_admission_and_gap_unchanged",
+      armed && original.status === 202 && failed.status === 503 && failed.retryAfter === "1" &&
+        eventRows(live.buffer) === 1 && gapCount(live) === 0 && spoolFiles(live.root).length === 0,
+      { original, failed, events: eventRows(live.buffer), gaps: gapCount(live) });
+    if (armed) live.buffer.database.exec("drop trigger b22_otlp_gap_failure");
+    const retry = await post(live.port, "/v1/traces", changedUsage("b22-live"));
+    check("b22_otlp_live_retry_commits_counted_gap_with_refusal",
+      retry.status === 202 && retry.body.collisionQuarantined === 1 &&
+        eventRows(live.buffer) === 1 && gapCount(live) === 1,
+      { retry, events: eventRows(live.buffer), gaps: gapCount(live) });
+  } finally {
+    await live.close();
+    fs.rmSync(live.root, { recursive: true, force: true });
+  }
+
+  const replay = await openFixture();
+  try {
+    const original = await post(replay.port, "/v1/traces", usageSpans("b22-replay", 1, 0));
+    const release = holdWriter(replay.ledger);
+    let spooled: Answer;
+    try { spooled = await post(replay.port, "/v1/traces", changedUsage("b22-replay")); }
+    finally { release(); }
+    const armed = trigger(replay);
+    const failed = await replay.spool!.drain(replay.buffer);
+    check("b22_otlp_replay_gap_failure_keeps_file_cursor_and_gap_unchanged",
+      armed && original.status === 202 && spooled.status === 202 && spooled.body.status === "otlp_spooled" &&
+        failed.replayed === 0 && spoolFiles(replay.root).length === 1 &&
+        cursorRows(replay.buffer).length === 0 && gapCount(replay) === 0,
+      { original, spooled, failed, files: spoolFiles(replay.root), cursors: cursorRows(replay.buffer), gaps: gapCount(replay) });
+    if (armed) replay.buffer.database.exec("drop trigger b22_otlp_gap_failure");
+    const retry = await replay.spool!.drain(replay.buffer);
+    check("b22_otlp_replay_retry_commits_counted_gap_before_unlink",
+      retry.replayed === 1 && spoolFiles(replay.root).length === 0 &&
+        cursorRows(replay.buffer).length === 0 && gapCount(replay) === 1,
+      { retry, files: spoolFiles(replay.root), cursors: cursorRows(replay.buffer), gaps: gapCount(replay) });
+  } finally {
+    await replay.close();
+    fs.rmSync(replay.root, { recursive: true, force: true });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // I. The real daemon arms the spool and its drain (isolated home and port).
 // ---------------------------------------------------------------------------
@@ -1419,6 +1488,7 @@ async function main() {
     ["privacy", stagePrivacy],
     ["bounds", stageBounds],
     ["failures", stageReplayFailures],
+    ["b22-gaps", stageB22GapTransactions],
     ["daemon", stageDaemon],
     ["measure", measure],
   ];
