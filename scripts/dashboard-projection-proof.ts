@@ -982,6 +982,24 @@ async function proveMillionFactDuplicateRepairCadence(root: string, slow = false
   assert.equal(seededDuplicates, duplicateCount);
   assert.equal(seededFacts, factCount);
   assert.equal((db.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n, 0);
+  // The bulk loader bypasses the projection triggers. Seed the matching
+  // aggregates too: a duplicate repair must subtract from a fact that was
+  // counted, rather than manufacturing a negative total in this fixture.
+  db.transaction(()=>{
+    const day=NOW.toISOString().slice(0,10);
+    for(const days of [7,...DASHBOARD_WINDOWS]){
+      db.prepare(`update dashboard_window_totals set events=? where days=?`).run(factCount,days);
+      db.prepare(`insert into dashboard_source_window (days,source,events)
+        values (?,'codex',?)`).run(days,factCount);
+      db.prepare(`insert into dashboard_daily_window (days,day,events)
+        values (?,?,?)`).run(days,day,factCount);
+    }
+    for(const days of DASHBOARD_WINDOWS)db.prepare(
+      `update dashboard_parity_window set events=? where days=?`).run(factCount,days);
+    db.prepare(`update dashboard_lifetime_totals set events=?,
+      oldest_observed_at=?,newest_observed_at=? where singleton=1`)
+      .run(factCount,NOW.toISOString(),NOW.toISOString());
+  })();
   db.exec(`update codex_duplicate_fact_scan set cursor_raw_rowid=0,complete=0 where singleton=1;
     update dashboard_projection_control set
       backfill_high_water=1000000,backfill_cursor=1000000,backfill_complete=1,
@@ -1226,6 +1244,143 @@ function dropProjectionState(db:Database.Database){
   for(const object of objects.filter((row)=>row.type==="table"))db.exec(`drop table if exists ${object.name}`);
 }
 
+function proveMixedFactAndCompactExpiry(root:string,compactRows:number,timed:boolean){
+  const name=`mixed-expiry-${compactRows}-${timed?"timed":"unbounded"}`;
+  const file=path.join(root,`${name}.sqlite`);
+  new LocalEventBuffer(file).close();
+  const seed=new Database(file);
+  dropProjectionState(seed);
+  const observedAt=new Date(NOW.getTime()-29*DAY_MS).toISOString();
+  const insert=seed.prepare(`insert into buffered_events
+    (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at)
+    values (?,?,?,?,?,?,?,?)`);
+  seed.transaction(()=>{
+    for(let index=0;index<compactRows;index++)insert.run(
+      `${name}-${index}`,"codex","otel_span","metadata",observedAt,"{}","[]",NOW.toISOString());
+  })();
+  seed.close();
+  const buffer=new LocalEventBuffer(file);
+  try{
+    assert.equal(buffer.append(event({sessionId:name,model:"gpt-mixed-expiry",
+      observedAt,inputTokens:2,outputTokens:3})),true);
+    settle(buffer,NOW,30);
+    const compactSegments=(buffer.database.prepare(`select count(*) as n
+      from dashboard_compact_segments`).get() as {n:number}).n;
+    const ordinaryFacts=(buffer.database.prepare(`select count(*) as n
+      from dashboard_event_facts`).get() as {n:number}).n;
+    assert(compactSegments>0);
+    assert.equal(ordinaryFacts,1);
+    const advanced=new Date(NOW.getTime()+2*DAY_MS);
+    const receipts=[];
+    for(let tick=0;tick<12;tick++){
+      let activeRows=0;
+      receipts.push(timed?buffer.projection.runMaintenance(advanced,{
+        maxActiveMs:25,clock:()=>activeRows,
+        onWorkRowForProof:phase=>{if(phase==="expiry")activeRows++;},
+      }):buffer.projection.runMaintenance(advanced));
+      if(buffer.projection.status().backlog.expiryWindows===0)break;
+    }
+    settle(buffer,advanced,30);
+    const snapshot=readySnapshot(buffer,30);
+    const totals=snapshot.summary.totals as Record<string,number>;
+    const model=buffer.database.prepare(`select calls,input_tokens as inputTokens
+      from dashboard_model_window where days=30 and model='gpt-mixed-expiry'`)
+      .get() as {calls:number;inputTokens:number}|undefined;
+    const visited=receipts.reduce((sum,receipt)=>sum+receipt.expiryFacts,0);
+    check(`mixed_fact_and_compact_expiry_${timed?"timed":"unbounded"}_does_not_repeat_fact`,
+      visited===compactRows+1&&totals.events===0&&totals.inputTokens===0&&
+      (model?.calls??0)===0&&(model?.inputTokens??0)===0&&buffer.projection.status().parityReady,
+      {compactRows,compactSegments,ordinaryFacts,visited,events:totals.events,
+        inputTokens:totals.inputTokens,model,parityReady:buffer.projection.status().parityReady,
+        ticks:receipts.length});
+  }finally{buffer.close();}
+}
+
+function proveNegativeTotalPublicationGuard(root:string){
+  for(const field of ["events","input_tokens","model_calls","model_input_tokens"] as const){
+    const file=path.join(root,`negative-publication-${field}.sqlite`);
+    const buffer=new LocalEventBuffer(file);
+    try{
+      assert.equal(buffer.append(event({sessionId:`negative-${field}`,model:"gpt-guard",
+        inputTokens:4,outputTokens:5})),true);
+      settle(buffer,NOW);
+      const before=readySnapshot(buffer,30);
+      const table=field.startsWith("model_")?"dashboard_model_window":"dashboard_window_totals";
+      const column=field==="model_calls"?"calls":field==="model_input_tokens"?"input_tokens":field;
+      buffer.database.prepare(`update ${table} set ${column}=-1 where days=30`).run();
+      buffer.database.exec(`update dashboard_projection_control set dirty=1,
+        parity_ready=0 where singleton=1`);
+      buffer.projection.runMaintenance(NOW);
+      const status=buffer.projection.status();
+      const after=buffer.projection.readSnapshot(30);
+      const stored=buffer.database.prepare(`select generation,payload_json as payload
+        from dashboard_snapshots where days=30`).get() as {generation:number;payload:string};
+      const storedTotals=(JSON.parse(stored.payload) as {summary:{totals:{events:number;inputTokens:number}}})
+        .summary.totals;
+      check(`negative_${field}_total_refuses_parity_publication`,
+        !status.parityReady&&status.dirty&&status.degradedReason==="projection_negative_total"&&
+        status.lastErrorAt!==null&&stored.generation===before.generation&&
+        storedTotals.events>=0&&storedTotals.inputTokens>=0&&
+        after.kind==="ready"&&after.snapshot.projection.status==="stale",
+        {field,generationBefore:before.generation,generationAfter:stored.generation,
+          status:status.degradedReason,parityReady:status.parityReady,dirty:status.dirty,
+          storedTotals,readKind:after.kind});
+      buffer.database.prepare(`update ${table} set ${column}=? where days=30`)
+        .run(field==="events"||field==="model_calls"?1:4);
+      buffer.projection.runMaintenance(NOW);
+      const recovered=buffer.projection.status();
+      check(`corrected_${field}_total_republishes_parity`,
+        recovered.parityReady&&!recovered.dirty&&recovered.degradedReason===null&&
+        recovered.generation===before.generation+1,
+        {field,parityReady:recovered.parityReady,dirty:recovered.dirty,
+          reason:recovered.degradedReason,generation:recovered.generation});
+    }finally{buffer.close();}
+  }
+  const file=path.join(root,"negative-stored-generation.sqlite");
+  const seeded=new LocalEventBuffer(file);
+  assert.equal(seeded.append(event({sessionId:"negative-stored",model:"gpt-guard"})),true);
+  settle(seeded,NOW);
+  seeded.close();
+  const db=new Database(file);
+  const stored=db.prepare(`select payload_json as payload from dashboard_snapshots
+    where days=30`).get() as {payload:string};
+  const payload=JSON.parse(stored.payload) as {summary:{totals:{events:number}}};
+  payload.summary.totals.events=-1;
+  db.prepare(`update dashboard_snapshots set payload_json=? where days=30`)
+    .run(JSON.stringify(payload));
+  db.close();
+  const reopened=new LocalEventBuffer(file);
+  try{
+    const status=reopened.projection.status();
+    const read=reopened.projection.readSnapshot(30);
+    check("preexisting_negative_snapshot_is_quarantined_on_open",
+      !status.parityReady&&status.dirty&&status.degradedReason==="projection_negative_total"&&
+      status.lastErrorAt!==null&&read.kind==="backfilling",
+      {parityReady:status.parityReady,dirty:status.dirty,reason:status.degradedReason,
+        readKind:read.kind});
+    reopened.database.exec(`savepoint corrupted_control;
+      update dashboard_projection_control set parity_ready=1,dirty=0,
+        degraded_reason=null where singleton=1`);
+    try{
+      const corruptRead=reopened.projection.readSnapshot(30);
+      check("negative_snapshot_read_veto_survives_corrupted_green_control",
+        corruptRead.kind==="backfilling"&&
+        !corruptRead.status.parityReady&&
+        corruptRead.status.degradedReason==="projection_negative_total",
+        {readKind:corruptRead.kind,status:corruptRead.kind==="backfilling"
+          ?corruptRead.status.degradedReason:null});
+    }finally{reopened.database.exec(`rollback to corrupted_control; release corrupted_control`);}
+    reopened.projection.runMaintenance(NOW);
+    const repaired=reopened.projection.readSnapshot(30);
+    check("valid_aggregate_replaces_quarantined_negative_generation",
+      reopened.projection.status().parityReady&&repaired.kind==="ready"&&
+      repaired.snapshot.summary.totals!==undefined&&
+      (repaired.snapshot.summary.totals as {events:number}).events===1,
+      {parityReady:reopened.projection.status().parityReady,
+        readKind:repaired.kind});
+  }finally{reopened.close();}
+}
+
 function downgradeCompactProjectionToC0(db:Database.Database){
   const triggers=db.prepare(
     `select name from sqlite_master where type='trigger' and name like 'trg_dashboard_%'`,
@@ -1365,6 +1520,18 @@ async function main() {
   ];
 
   try {
+    if (process.argv.includes("--r10-guard-only")) {
+      proveNegativeTotalPublicationGuard(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    if (process.argv.includes("--r10-only")) {
+      proveMixedFactAndCompactExpiry(root,300,false);
+      proveMixedFactAndCompactExpiry(root,100,true);
+      proveNegativeTotalPublicationGuard(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
     if (process.argv.includes("--pr419-duplicate-only")) {
       proveDuplicateFactRepair(root);
       console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
@@ -1787,6 +1954,10 @@ async function main() {
       {receipts:compactExpiryReceipts.map((receipt)=>({expiry:receipt.expiryFacts,backlog:receipt.backlog.expiryWindows})),
         finalGeneration:compactExpiryAfter.generation});
     compactExpiry.close();
+
+    proveMixedFactAndCompactExpiry(root,300,false);
+    proveMixedFactAndCompactExpiry(root,100,true);
+    proveNegativeTotalPublicationGuard(root);
 
     // Generic sessionless zero-value spans dominate the live raw history. They
     // must backfill into compressed segments, not one six-index fact per span.

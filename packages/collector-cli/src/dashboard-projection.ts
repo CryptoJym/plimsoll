@@ -473,6 +473,34 @@ type SnapshotCore = {
   status: Record<string, unknown>;
 };
 
+/** Check every count and token total that can be emitted in a snapshot. */
+function negativeSnapshotTotal(snapshot:SnapshotCore):string|null {
+  const summary=snapshot.summary;
+  const measures=new Set(["events","tokenEvents","inputTokens","outputTokens",
+    "cacheReadTokens","cacheCreationTokens","tokens","calls","unpricedCalls",
+    "sessions","sessionsWithTokens","n"]);
+  const groups:[string,unknown][]=[
+    ["summary.totals",summary.totals],
+    ["summary.bySource",summary.bySource],
+    ["summary.daily",summary.daily],
+    ["summary.byModel",summary.byModel],
+    ["summary.actionMix",summary.actionMix],
+    ["sessions",snapshot.sessions],
+    ["repos",snapshot.repos],
+    ["accounts",snapshot.accounts.accounts],
+  ];
+  for(const [group,value] of groups){
+    const rows=Array.isArray(value)?value:[value];
+    for(const row of rows){
+      if(!row||typeof row!=="object")continue;
+      for(const [key,amount] of Object.entries(row)){
+        if(measures.has(key)&&typeof amount==="number"&&amount<0)return `${group}.${key}`;
+      }
+    }
+  }
+  return null;
+}
+
 export type SnapshotRead =
   | { kind: "unsupported"; supportedDays: readonly number[] }
   | { kind: "backfilling"; status: ReturnType<DashboardProjectionStore["status"]> }
@@ -713,6 +741,7 @@ export class DashboardProjectionStore {
     ensureFinanceProvenanceSchema(this.db);
     markOpenStep("projection.finance_schema");
     this.createSchema(now, Boolean(options.newLedger), markOpenStep);
+    if(!options.newLedger&&!this.openRefusalReason())this.quarantineNegativeSnapshots(now);
     if (options.newLedger) {
       this.publishSnapshots(now);
       markOpenStep("projection.initial_snapshots");
@@ -3452,7 +3481,9 @@ export class DashboardProjectionStore {
               where singleton=1`).run();
           }
           if (!published) this.db.prepare(`update dashboard_projection_control
-            set parity_ready=0,degraded_reason='projection_repair_backlog'
+            set parity_ready=0,degraded_reason=case
+              when degraded_reason='projection_negative_total' then degraded_reason
+              else 'projection_repair_backlog' end
             where singleton=1`).run();
         }
         else {
@@ -3468,6 +3499,7 @@ export class DashboardProjectionStore {
             degraded_reason=case
               when degraded_reason in (${OPEN_REFUSAL_REASONS_SQL}) then degraded_reason
               when degraded_reason='projection_clock_rollback' then degraded_reason
+              when degraded_reason='projection_negative_total' then degraded_reason
               when backfill_complete=0 or metric_backfill_complete=0 then 'projection_backfilling'
               else 'projection_repair_backlog' end where singleton=1`,
         ).run();
@@ -3682,11 +3714,17 @@ export class DashboardProjectionStore {
       visited += expired.length;
       if(expired.length>0)progressed=true;
       const factsDone=expired.length<factLimit;
-      if(!factsDone){
+      // The fact cursor must be durable before compact expiry starts. A
+      // compact segment can require several slices even when the fact query
+      // returned fewer than factLimit rows; otherwise each slice subtracts
+      // those same facts again.
+      if(expired.length>0){
         const last = factFromDb(expired.at(-1)!);
         this.db.prepare(
           `update dashboard_window_control set expiry_cursor_at=?,expiry_cursor_id=? where days=?`,
         ).run(last.observedAt, last.projectionId, days);
+      }
+      if(!factsDone){
         continue;
       }
       const compact=this.expireCompactSlice(days,row.cutoffAt,activeTarget,compactHighWater??0,
@@ -3939,11 +3977,32 @@ export class DashboardProjectionStore {
     if (!control.parityComplete || backlog.repairs || backlog.compactMutations ||
         backlog.compactGcDays || backlog.dirtySessions || backlog.accountInvalidations ||
         backlog.expiryWindows || control.degradedReason === "projection_clock_rollback") return false;
+    // A negative model row with calls <= 0 is filtered out of byModel, so
+    // inspect the persisted aggregate as well as the candidate payloads.
+    const negativeWindow=this.db.prepare(`select days from dashboard_window_totals
+      where events<0 or token_events<0 or input_tokens<0 or output_tokens<0
+        or cache_read_tokens<0 or cache_creation_tokens<0 limit 1`).get();
+    const negativeModel=this.db.prepare(`select days,model from dashboard_model_window
+      where calls<0 or unpriced_calls<0 or input_tokens<0 or output_tokens<0
+        or cache_read_tokens<0 or cache_creation_tokens<0 limit 1`).get();
+    if(negativeWindow||negativeModel){
+      this.refuseNegativeTotal(now);
+      return false;
+    }
     const generation = control.generation + 1;
     let rowsVisited = 0;
+    const candidates=[] as Array<{days:number;built:ReturnType<DashboardProjectionStore["buildSnapshot"]>}>;
     for (const days of DASHBOARD_WINDOWS) {
       const built = this.buildSnapshot(days, generation, now);
+      if(negativeSnapshotTotal(built.snapshot)){
+        this.refuseNegativeTotal(now);
+        return false;
+      }
       rowsVisited += built.rowsVisited;
+      candidates.push({days,built});
+    }
+    // Validate every window before replacing the first durable generation.
+    for(const {days,built} of candidates){
       this.db.prepare(
         `insert into dashboard_snapshots
          (days,schema_version,generation,since_at,payload_json,created_at)
@@ -3960,6 +4019,20 @@ export class DashboardProjectionStore {
        where singleton=1`,
     ).run(generation, now.toISOString(), rowsVisited);
     return true;
+  }
+
+  private refuseNegativeTotal(now:Date){
+    this.db.prepare(`update dashboard_projection_control set dirty=1,
+      parity_ready=0,degraded_reason='projection_negative_total',last_error_at=?
+      where singleton=1`).run(now.toISOString());
+  }
+
+  private quarantineNegativeSnapshots(now:Date){
+    const rows=this.db.prepare(`select payload_json as payloadJson
+      from dashboard_snapshots`).all() as Array<{payloadJson:string}>;
+    if(rows.some(row=>negativeSnapshotTotal(json<SnapshotCore>(row.payloadJson)))){
+      this.refuseNegativeTotal(now);
+    }
   }
 
   private buildSnapshot(days: number, generation: number, now: Date) {
@@ -4380,6 +4453,11 @@ export class DashboardProjectionStore {
     ).get(days) as {payloadJson:string;generation:number}|undefined;
     if(!row||!control.ready)return {kind:"backfilling",status:this.status()};
     const snapshot=json<SnapshotCore>(row.payloadJson);
+    // A prior binary may already have published an invalid generation. Even
+    // if a stale writer restores green control flags, never serve its totals.
+    if(negativeSnapshotTotal(snapshot))return {kind:"backfilling",status:{
+      ...this.status(),parityReady:false,dirty:true,degraded:true,
+      degradedReason:"projection_negative_total"}};
     const current = this.status();
     // Only completed maintenance can attest a later, equivalent window for
     // this generation. Pending work keeps the published historical cutoff.
