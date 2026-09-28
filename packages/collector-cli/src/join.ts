@@ -149,7 +149,17 @@ export type JoinResult =
     };
 
 function readConfigWithoutCreating(configPath: string): CollectorConfig {
-  if (!fs.existsSync(configPath)) return collectorConfigSchema.parse({});
+  if (!fs.existsSync(configPath)) {
+    // Fixture proofs must never bind the operator's live default port. This
+    // override is unavailable unless the home is inside the declared proof
+    // root, and it has no effect on an installed or configured collector.
+    const fixtureRoot = process.env.PLIMSOLL_FIXTURE_ROOT;
+    const fixturePort = Number(process.env.PLIMSOLL_PROOF_JOIN_PORT);
+    const home = os.homedir();
+    const insideFixture = fixtureRoot && path.resolve(home).startsWith(path.resolve(fixtureRoot) + path.sep);
+    return collectorConfigSchema.parse(insideFixture && Number.isSafeInteger(fixturePort) &&
+      fixturePort >= 49300 && fixturePort <= 49399 ? { port: fixturePort } : {});
+  }
   return collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
 }
 
@@ -254,6 +264,11 @@ function processIsLive(pid: number) {
 
 function acquireJoinLock(homeDir: string) {
   const directory = path.dirname(collectorConfigPath(homeDir));
+  const createdDirectories: string[] = [];
+  for (let current = directory; !fs.existsSync(current); current = path.dirname(current)) {
+    createdDirectories.push(current);
+    if (path.dirname(current) === current) break;
+  }
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const lockFile = path.join(directory, "join.lock");
   const nonce = crypto.randomUUID();
@@ -316,6 +331,15 @@ function acquireJoinLock(homeDir: string) {
       if (owner.nonce === nonce) fs.rmSync(lockFile, { force: true });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    // A refused token or unreachable cloud must leave a previously empty
+    // home byte-for-byte absent. Remove only directories this join created,
+    // and only while each is still empty; another writer's state wins.
+    for (const created of createdDirectories) {
+      try { fs.rmdirSync(created); }
+      catch (error) {
+        if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      }
     }
   };
 }

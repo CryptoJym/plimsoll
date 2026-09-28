@@ -10,6 +10,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
+import { aiInteractionEventSchema } from "../../shared/src/index";
 
 const privatePathReceipt = (value: string) =>
   `sha256:${createHash("sha256").update(path.resolve(value)).digest("hex")}`;
@@ -485,6 +486,9 @@ Commands:
 Config tools:
   join "<join-url>#<token>" | join --token-prompt --url <cloud-base-url> | join --token-stdin --url <cloud-base-url> | join --token-fd FD --url <cloud-base-url> | join --resume
       Add --reassign only after reviewing the explicit A → B boundary.
+      On macOS, packaged join registers discovered agent folders, installs or safely restarts
+      the collector, verifies readiness and waits for its first acknowledged upload.
+      Add --no-daemon to keep join-only behavior; CI and source-tree runs are join-only.
       Prefer --token-prompt, --token-stdin, --token-fd, or join - so the single-use secret never enters
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
@@ -747,6 +751,153 @@ function readSecretFromFd(value: string) {
     throw new Error("join --token-fd requires a non-negative file descriptor.");
   }
   return fs.readFileSync(fd, "utf8");
+}
+
+const JOIN_FIRST_UPLOAD_WAIT_MS = 20_000;
+
+function joinOnlyReason(noDaemon: boolean): string | null {
+  if (noDaemon) return "no_daemon_requested";
+  if (process.env.CI && !["0", "false", "no"].includes(process.env.CI.toLowerCase())) return "ci_home";
+  if (process.env.GITHUB_ACTIONS === "true") return "ci_home";
+  if (process.platform !== "darwin") return "macos_only";
+  const script = process.argv[1] ?? "";
+  if (!/\.(mjs|cjs|js)$/.test(script) || !fs.existsSync(script)) return "source_tree_cli";
+  return null;
+}
+
+function joinMachineLabel(roots: readonly CaptureRoot[]): string {
+  const host = os.hostname();
+  const candidates = [...new Set([host, host.split(".")[0] ?? "", host.toLowerCase(),
+    (host.split(".")[0] ?? "").toLowerCase()])].filter(Boolean);
+  if (!roots.length) return candidates[0] ?? "local";
+  const recovered = resolveCaptureRootMachineLabel(roots, candidates);
+  if (!recovered) throw new Error("Agent folders need a machine label matching the existing capture inventory.");
+  return recovered;
+}
+
+function addJoinedCaptureRoots(config: CollectorConfig, entries: ReturnType<typeof discoverCaptureRoots>) {
+  const candidates = entries.filter((entry) =>
+    (entry.state === "candidate" || entry.state === "live_covered") && entry.directory !== null);
+  if (!candidates.length) return 0;
+  const machine = joinMachineLabel(config.captureRoots ?? []);
+  const cli = process.argv[1] ?? "";
+  let added = 0;
+  for (const source of ["codex", "claude_code"] as const) {
+    const directories = candidates.filter((entry) => entry.source === source)
+      .map((entry) => path.join(resolveDiscoveryHome(os.homedir()), entry.directory!));
+    if (!directories.length) continue;
+    const child = spawnSync(process.execPath, [...process.execArgv, cli,
+      "capture-roots", "add", "--source", source, "--machine", machine,
+      ...directories.flatMap((directory) => ["--directory", directory]), "--json"], {
+      encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let receipt: Record<string, unknown> | null = null;
+    try { receipt = JSON.parse(child.stdout) as Record<string, unknown>; } catch { /* named below */ }
+    if (child.status !== 0 || receipt?.status !== "capture_roots_added") {
+      const restart = receipt?.restart as { failedStep?: unknown; unload?: { status?: unknown };
+        load?: { status?: unknown }; daemon?: { reachable?: unknown } } | undefined;
+      const failure = receipt?.failure as { step?: unknown; error?: unknown } | undefined;
+      throw new Error(`Agent folder registration failed (${source}: ${String(receipt?.reason ?? receipt?.status ??
+        (child.error as NodeJS.ErrnoException | undefined)?.code ?? "no_receipt")}, ` +
+        `step=${String(failure?.step ?? restart?.failedStep ?? "unknown")}, ` +
+        `detail=${String(failure?.error ?? restart?.load?.status ?? restart?.unload?.status ?? "none")}).`);
+    }
+    added += Array.isArray(receipt.addedRoots) ? receipt.addedRoots.length : 0;
+  }
+  return added;
+}
+
+async function acknowledgeJoinedCollector(config: CollectorConfig): Promise<string> {
+  const buffer = openBuffer(config);
+  const id = `join-setup-${randomUUID()}`;
+  try {
+    const appended = buffer.append(aiInteractionEventSchema.parse({
+      id, tenantId: config.tenantId, source: "codex", dataMode: "metadata",
+      eventType: "unknown", observedAt: new Date().toISOString(),
+      metadata: { collectorSetupProbe: true },
+    }));
+    if (!appended) throw new Error("The local setup probe was not admitted.");
+    const deadline = Date.now() + JOIN_FIRST_UPLOAD_WAIT_MS;
+    const boundedConfig = { ...config, delivery: { ...config.delivery,
+      requestTimeoutSeconds: Math.min(config.delivery.requestTimeoutSeconds, 3) } };
+    const acknowledgedAt = () => (buffer.database.prepare(
+      "select uploaded_at as uploadedAt from buffered_events where id = ?",
+    ).get(id) as { uploadedAt: string | null } | undefined)?.uploadedAt ?? null;
+    while (Date.now() < deadline) {
+      const existing = acknowledgedAt();
+      if (existing) return existing;
+      try {
+        await uploadBufferedEvents(boundedConfig, buffer, {
+          limit: 500, includeLegacyRemainingUnuploaded: false,
+        });
+      } catch {
+        // The durable outbox retains the probe. A running daemon may also
+        // own its lease, so observe the ledger until the bounded deadline.
+      }
+      const accepted = acknowledgedAt();
+      if (accepted) return accepted;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+    }
+    throw new Error(`No first upload acknowledgement arrived within ${JOIN_FIRST_UPLOAD_WAIT_MS / 1000} seconds.`);
+  } finally {
+    buffer.close();
+  }
+}
+
+async function finishJoinedCollectorSetup(result: Extract<Awaited<ReturnType<typeof performJoin>>, { joined: true }>) {
+  const read = readCollectorConfig();
+  if (read.status !== "valid") throw new Error("Joined collector config could not be read back.");
+  let config = read.config;
+  const entries = discoverCaptureRoots(os.homedir(), config.captureRoots ?? [], config.port);
+  const recording = entries.filter((entry) => entry.state !== "missing" && entry.directory !== null)
+    .map((entry) => ({ source: entry.source, directory: entry.directory!, shape: entry.shape,
+      alreadyRegistered: entry.state === "registered" }));
+  console.log(`Will record ${recording.length} agent folder${recording.length === 1 ? "" : "s"}: ` +
+    (recording.length ? recording.map((entry) => entry.directory).join(", ") : "none found yet") + ".");
+  const added = addJoinedCaptureRoots(config, entries);
+  const updated = readCollectorConfig();
+  if (updated.status !== "valid") throw new Error("Agent folder config could not be read back.");
+  config = updated.config;
+
+  const script = fs.realpathSync(process.argv[1] ?? "");
+  const manifest = inspectLaunchAgentManifest();
+  if (!manifest.ok && manifest.status !== "missing") throw new Error("The existing collector LaunchAgent is not owned by Plimsoll.");
+  if (manifest.ok) {
+    const unload = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
+    if (!unload.unloaded) throw new Error(`Collector restart was not proven safe (${unload.reason ?? unload.status}).`);
+  }
+  const installed = installLaunchAgent({
+    repoRoot: path.dirname(script), programArguments: [process.execPath, script, "start"],
+    workingDirectory: path.dirname(script), mutationAuthority: launchAgentMutationAuthority(),
+  });
+  const visible = inspectLaunchAgentManifest();
+  if (!visible.ok || visible.manifestDigest !== installed.receipt.manifestDigest) {
+    throw new Error("Collector LaunchAgent install did not pass readback.");
+  }
+  await releaseStopWindowListener(config.port, resolveCollectorHome().home);
+  const load = await loadVisibleLaunchAgent(installed.plistPath, config.port, false, launchAgentMutationAuthority());
+  const readiness = await verifyPostBootstrapReadiness(config.port, { timeoutMs: 15_000 });
+  const connectivity = await checkCollectorConnectivity(config.port,
+    readLocalIngestAuth(collectorHome())?.managementRead);
+  const daemonState = await readDaemonState(config.port,
+    readLocalIngestAuth(collectorHome())?.managementRead);
+  const syncArmed = daemonState.sync.source === "collector" &&
+    (typeof daemonState.sync.scheduler?.nextAttemptAt === "string" ||
+      daemonState.sync.scheduler?.inFlight === true);
+  const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
+  const pidRecord = pidRead.kind === "current" ? pidRead.record : null;
+  if (!load.loaded || !readiness.verified || !connectivity.reachable || !syncArmed || !pidRecord ||
+      !processIdentityIsLive(pidRecord) || !runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity) ||
+      connectivity.homeIdentityHash !== collectorHomeIdentityHash(collectorHome())) {
+    throw new Error(`Collector was installed but readiness could not be verified (load=${load.status}, ` +
+      `listener=${readiness.listenerState}, reachable=${connectivity.reachable}, pid=${pidRead.kind}).`);
+  }
+  const firstUploadAt = await acknowledgeJoinedCollector(config);
+  recordDeviceUpload(undefined, new Date(firstUploadAt));
+  return { recording, added, firstUploadAt, firstUploadKind: "setup_probe" as const,
+    daemon: { installed: true, running: true,
+    readinessVerified: true, runtimeIdentityVerified: true, syncArmed: true }, enrollment: result.enrollment };
 }
 
 function runLaunchctl(args: string[], setExitCode = true) {
@@ -2355,11 +2506,15 @@ async function main() {
       );
     }
     const rawJoinArguments = process.argv.slice(3);
+    const noDaemon = rawJoinArguments.includes("--no-daemon");
+    if (rawJoinArguments.filter((argument) => argument === "--no-daemon").length > 1) {
+      throw new Error("join --no-daemon may be provided only once.");
+    }
     const reassign = rawJoinArguments.includes("--reassign");
     if (rawJoinArguments.filter((argument) => argument === "--reassign").length > 1) {
       throw new Error("join --reassign may be provided only once.");
     }
-    const joinArguments = rawJoinArguments.filter((argument) => argument !== "--reassign");
+    const joinArguments = rawJoinArguments.filter((argument) => argument !== "--reassign" && argument !== "--no-daemon");
     const targetArgument = joinArguments[0];
     const resume = targetArgument === "--resume";
     if (resume && (joinArguments.length !== 1 || reassign)) {
@@ -2418,12 +2573,14 @@ async function main() {
       index += 1;
     }
 
-    // Only a fully validated, real join/resume may scavenge stale handshake
-    // state. Unsupported preview/options must be observably read-only.
-    cleanupStaleJoinHandshakeDirectories();
-    const result = resume
-      ? await resumePendingJoin()
-      : await (async () => {
+    // The join handshake cleans its own temporary state after redemption.
+    // Before the cloud answers, even an unrelated stale temporary directory
+    // stays untouched on a refused token or network failure.
+    let result: Awaited<ReturnType<typeof performJoin>>;
+    try {
+      result = resume
+        ? await resumePendingJoin()
+        : await (async () => {
           const target = tokenFromStdin
             ? (await readStdin()).trim()
             : tokenFromPrompt
@@ -2436,13 +2593,22 @@ async function main() {
               'Usage: plimsoll join --token-prompt --url <cloud-base-url>  |  plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
             );
           }
-          return performJoin({
-            target,
-            baseUrl: joinBaseUrl ?? process.env.PLIMSOLL_CLOUD_URL,
-            reassign,
-          });
-        })();
+            return performJoin({
+              target,
+              baseUrl: joinBaseUrl ?? process.env.PLIMSOLL_CLOUD_URL,
+              reassign,
+            });
+          })();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Join failed before activation.";
+      console.error(`Could not connect to the workspace: ${message}`);
+      console.log(JSON.stringify({ status: "join_failed", message,
+        configTouched: false }, null, 2));
+      process.exitCode = 1;
+      return;
+    }
     if (!result.joined) {
+      console.error(`Connection refused: ${result.message}`);
       console.error(
         JSON.stringify(
           {
@@ -2459,34 +2625,48 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    console.log(
-      JSON.stringify(
-        {
-          status: "joined",
-          configPath: result.configPath,
-          tenantId: result.tenantId,
-          deviceId: result.deviceId,
-          keyId: result.keyId,
-          policyVersion: result.policyVersion,
-          deviceStatus: result.status,
-          installCredentialsConfigured: true,
-          uploadUrl: result.uploadUrl,
-          uploadSigningConfigured: result.uploadSigningConfigured,
-          workspaceBoundary: result.workspaceBoundary,
-          enrollment: result.enrollment,
-          syncConfigured: true,
-          privacyMode: "metadata_only",
-          handshake: result.handshake,
-          accountSaltSynced: result.accountSaltSynced ?? false,
-          nextSteps: [
-            "plimsoll status   # syncConfigured: true; existing history was not part of the handshake",
-            "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
-          ],
-        },
-        null,
-        2,
-      ),
-    );
+    const baseReceipt = {
+      configPath: result.configPath,
+      tenantId: result.tenantId,
+      deviceId: result.deviceId,
+      keyId: result.keyId,
+      policyVersion: result.policyVersion,
+      deviceStatus: result.status,
+      installCredentialsConfigured: true,
+      uploadUrl: result.uploadUrl,
+      uploadSigningConfigured: result.uploadSigningConfigured,
+      workspaceBoundary: result.workspaceBoundary,
+      enrollment: result.enrollment,
+      syncConfigured: true,
+      privacyMode: "metadata_only" as const,
+      handshake: result.handshake,
+      accountSaltSynced: result.accountSaltSynced ?? false,
+    };
+    const skip = joinOnlyReason(noDaemon);
+    if (skip) {
+      console.log("Connected to workspace. Background collector setup was skipped.");
+      console.log(JSON.stringify({ status: "joined", ...baseReceipt,
+        daemon: { setup: "skipped", reason: skip } }, null, 2));
+      return;
+    }
+    try {
+      const setup = await finishJoinedCollectorSetup(result);
+      console.log(`Connected to workspace. Recording ${setup.recording.length} agent folder${
+        setup.recording.length === 1 ? "" : "s"}. First upload acknowledged at ${
+        new Date(setup.firstUploadAt).toLocaleTimeString()}.`);
+      console.log(JSON.stringify({ status: "joined", ...baseReceipt, ...setup }, null, 2));
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Collector setup failed.";
+      const read = readCollectorConfig();
+      const readiness = read.status === "valid"
+        ? await verifyPostBootstrapReadiness(read.config.port, { timeoutMs: 0 }) : null;
+      const running = readiness?.verified === true;
+      console.error(`Joined workspace, but setup is incomplete: ${reason} ` +
+        (running ? "Collector remains running." : "Collector readiness is not verified."));
+      console.log(JSON.stringify({ status: "joined_setup_incomplete", ...baseReceipt,
+        reason, daemon: { running, readinessVerified: running }, collectorHome: collectorHome() }, null, 2));
+      process.exitCode = 1;
+    }
     return;
   }
 
