@@ -742,11 +742,16 @@ const PROJECTION_CADENCE_SECONDS=60;
 function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projection"]["status"]>){
   const high=status.backfill.highWater??0;
   const metricHigh=status.backfill.metricHighWater??0;
-  return Math.max(0,high-status.backfill.cursor)+
+  const migrationRows = Math.max(0,high-status.backfill.cursor)+
     Math.max(0,high-status.backfill.parityCursor)+
     Math.max(0,metricHigh-status.backfill.metricCursor)+
     (status.backfill.duplicateFactScan.complete ? 0 : Math.max(1,
       status.backfill.duplicateFactScan.highWater-status.backfill.duplicateFactScan.cursor));
+  // After the scan cursor reaches its high water, its session and snapshot
+  // follow-through still needs a drain. Do not inflate an already pending
+  // rowid migration estimate with that final readiness unit.
+  return migrationRows || (status.parityReady && !status.dirty ? 0 : Math.max(1,
+    Object.values(status.backlog).reduce((sum, count) => sum + count, 0)));
 }
 
 /**
@@ -766,9 +771,9 @@ export async function drainProjectionMigration(
   while(slices<maxSlices && !options.signal?.aborted && (options.budget?.canStart(5) ?? true)){
     if(slices>0){await new Promise<void>((resolve)=>setImmediate(resolve));yields++;}
     const started=performance.now();
-    // The outer active-time limit controls the whole drain. Pass the remaining
-    // allowance into the synchronous transaction as well, capped at 25 ms so
-    // a slow host cannot hold the writer for an entire multi-slice drain.
+    // The outer active-time limit controls the whole drain. Each synchronous
+    // transaction admits phases for at most 25 ms of that allowance; an
+    // already-admitted bounded unit is allowed to finish before yielding.
     receipt=projection.runMaintenance(undefined, {maxActiveMs:Math.min(25,
       Math.max(1,maxActiveMs-activeMs))});
     activeMs+=performance.now()-started;
@@ -776,8 +781,9 @@ export async function drainProjectionMigration(
     migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+
       receipt.metricRowsVisited+receipt.duplicateFactScanRowsVisited;
     const status=projection.status();
-    const stillMigrating=!status.backfill.complete||!status.backfill.parityComplete||
-      !status.backfill.metricComplete||!status.backfill.duplicateFactScan.complete;
+    const stillMigrating=!status.parityReady||status.dirty||!status.backfill.complete||
+      !status.backfill.parityComplete||!status.backfill.metricComplete||
+      !status.backfill.duplicateFactScan.complete;
     if(!stillMigrating||activeMs>=maxActiveMs)break;
   }
   const status=projection.status(),remainingRowidUpperBound=projectionMigrationRemaining(status);
@@ -785,8 +791,9 @@ export async function drainProjectionMigration(
   return {receipt:receipt!,drain:{slices,yields,migrationRowsVisited,
     activeMs:Number(activeMs.toFixed(3)),maxSlices,maxActiveMs,cadenceSeconds,remainingRowidUpperBound,
     estimatedMinutesUpperBound:Math.ceil(remainingRowidUpperBound/capacityPerCadence*cadenceSeconds/60),
-    stillMigrating:!status.backfill.complete||!status.backfill.parityComplete||
-      !status.backfill.metricComplete||!status.backfill.duplicateFactScan.complete} satisfies ProjectionDrainResult};
+    stillMigrating:!status.parityReady||status.dirty||!status.backfill.complete||
+      !status.backfill.parityComplete||!status.backfill.metricComplete||
+      !status.backfill.duplicateFactScan.complete} satisfies ProjectionDrainResult};
 }
 
 export class CollectorMaintenance {

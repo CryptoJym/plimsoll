@@ -1390,7 +1390,9 @@ async function proveProjectionDutyCycle(){
         parityRowsVisited:cursor>=highWater&&parityCursor>0?1_000:0,
         metricRowsVisited:0,duplicateFactScanRowsVisited:0};
     },
-    status(){return {backfill:{highWater,cursor,complete:cursor>=highWater,parityCursor,
+    status(){return {parityReady:false,dirty:true,backlog:{repairs:0,compactMutations:0,
+      compactGcDays:0,dirtySessions:0,accountInvalidations:0,expiryWindows:0},
+      backfill:{highWater,cursor,complete:cursor>=highWater,parityCursor,
       parityComplete:parityCursor>=highWater,metricHighWater:0,metricCursor:0,metricComplete:true,
       duplicateFactScan:{cursor:0,highWater:0,complete:true,sliceRows:1_000}}};},
   };
