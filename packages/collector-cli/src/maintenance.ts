@@ -766,7 +766,11 @@ export async function drainProjectionMigration(
   while(slices<maxSlices && !options.signal?.aborted && (options.budget?.canStart(5) ?? true)){
     if(slices>0){await new Promise<void>((resolve)=>setImmediate(resolve));yields++;}
     const started=performance.now();
-    receipt=projection.runMaintenance();
+    // The outer active-time limit controls the whole drain. Pass the remaining
+    // allowance into the synchronous transaction as well, capped at 25 ms so
+    // a slow host cannot hold the writer for an entire multi-slice drain.
+    receipt=projection.runMaintenance(undefined, {maxActiveMs:Math.min(25,
+      Math.max(1,maxActiveMs-activeMs))});
     activeMs+=performance.now()-started;
     slices++;
     migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+
@@ -1465,7 +1469,10 @@ export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOu
 
 export const AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS = 5_000;
 export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
-export const AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS = 2_000;
+// A slow host may need several 25 ms writer-safe slices to drain one former
+// 250-row repair batch. Keep upgrade parity within an hour without extending
+// any individual writer transaction.
+export const AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS = 250;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS = 1_000;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS = 5_000;
 const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;

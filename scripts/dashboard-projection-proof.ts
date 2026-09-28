@@ -380,12 +380,15 @@ async function proveMillionFactScanCadence(root: string) {
   }
 }
 
-async function proveMillionFactDuplicateRepairCadence(root: string) {
-  const buffer = new LocalEventBuffer(path.join(root, "million-duplicate-fact-scan.sqlite"));
+type MillionFactRowCosts = {scanMsPerRow:number;repairMsPerRow:number};
+async function proveMillionFactDuplicateRepairCadence(root: string, slow = false,
+  reference?: MillionFactRowCosts): Promise<MillionFactRowCosts> {
+  const prefix = slow ? "slow-" : "";
+  const buffer = new LocalEventBuffer(path.join(root, `${prefix}million-duplicate-fact-scan.sqlite`));
   const factCount = 1_000_001;
   const duplicateCount = 300_000;
-  const codexRoot = path.join(root, "million-duplicate-fact-codex");
-  const claudeRoot = path.join(root, "million-duplicate-fact-claude");
+  const codexRoot = path.join(root, `${prefix}million-duplicate-fact-codex`);
+  const claudeRoot = path.join(root, `${prefix}million-duplicate-fact-claude`);
   fs.mkdirSync(codexRoot);
   fs.mkdirSync(claudeRoot);
   const db = buffer.database;
@@ -432,10 +435,52 @@ async function proveMillionFactDuplicateRepairCadence(root: string) {
     new TranscriptTailer(buffer, claudeRoot));
   const runProjectionSlice = buffer.projection.runMaintenance.bind(buffer.projection);
   let maxProjectionSliceMs = 0;
-  buffer.projection.runMaintenance = (now) => {
+  let maxSimulatedSliceMs = 0;
+  let simulatedClock = 0;
+  let observedScanMs = 0;
+  let observedScanRows = 0;
+  let observedRepairMs = 0;
+  let observedRepairRows = 0;
+  const injectedScanRowMs = slow ? Math.max(0.004, 2*(reference?.scanMsPerRow ?? 0.002)) : 0;
+  const injectedRepairRowMs = slow ? Math.max(0.25, 2*(reference?.repairMsPerRow ?? 0.125)) : 0;
+  let slowestSlicePhases: Record<string, number> = {};
+  let slowestSliceRows = {scan:0,repair:0};
+  buffer.projection.runMaintenance = (now, options) => {
+    assert.equal(options?.maxActiveMs, 25, "scheduled projection uses the production 25 ms admission");
     const started = performance.now();
-    const receipt = runProjectionSlice(now);
-    maxProjectionSliceMs = Math.max(maxProjectionSliceMs, performance.now() - started);
+    const simulatedStarted = simulatedClock;
+    const phases: Record<string, number> = {};
+    // The full proof calibrates row cost on this host's preceding production
+    // scheduler run, then advances the injected monotonic clock by at least
+    // twice that cost per admitted row. Actual transaction wall is checked too.
+    const receipt = runProjectionSlice(now, {
+      ...options,
+      ...(slow ? {
+        clock: () => simulatedClock,
+        onWorkRowForProof: (phase: "scan" | "repair") => {
+          simulatedClock += phase === "scan" ? injectedScanRowMs : injectedRepairRowMs;
+        },
+      } : {}),
+      onPhaseForProof: (phase, durationMs) => { phases[phase] = durationMs; },
+    });
+    const elapsed = performance.now() - started;
+    if (elapsed > maxProjectionSliceMs) {
+      maxProjectionSliceMs = elapsed;
+      slowestSlicePhases = phases;
+      slowestSliceRows = {scan:receipt.duplicateFactScanRowsVisited,
+        repair:receipt.repairRowsVisited};
+    }
+    maxSimulatedSliceMs = Math.max(maxSimulatedSliceMs, simulatedClock-simulatedStarted);
+    if (!slow) {
+      if (receipt.duplicateFactScanRowsVisited > 0) {
+        observedScanMs += phases.scan ?? 0;
+        observedScanRows += receipt.duplicateFactScanRowsVisited;
+      }
+      if (receipt.repairRowsVisited > 0) {
+        observedRepairMs += phases.repair ?? 0;
+        observedRepairRows += receipt.repairRowsVisited;
+      }
+    }
     assert.ok(receipt.repairRowsVisited <= 250);
     return receipt;
   };
@@ -479,7 +524,7 @@ async function proveMillionFactDuplicateRepairCadence(root: string) {
       }});
     cadence.start();
     const startedAt = syntheticNow;
-    while (!buffer.projection.status().parityReady && ticks < 4_000) {
+    while (!buffer.projection.status().parityReady && ticks < 14_400) {
       const due = nextTimer as {at:number;callback:()=>void}|null;
       assert.ok(due, "duplicate-heavy scan cadence lost its pending timer");
       nextTimer = null;
@@ -517,22 +562,33 @@ async function proveMillionFactDuplicateRepairCadence(root: string) {
     const staleFacts = (db.prepare(`select count(*) as n from dashboard_event_facts f
       join buffered_events b on b.rowid=f.raw_rowid
       where b.usage_duplicate_reason is not null`).get() as {n:number}).n;
-    check("million_duplicate_fact_scan_drains_repairs_on_fast_production_cadence",
-      projection.parityReady && !projection.dirty && projection.backfill.duplicateFactScan.complete &&
+    const common = projection.parityReady && !projection.dirty &&
+      projection.backfill.duplicateFactScan.complete &&
       projection.backlog.repairs === 0 && scanRowsVisited === factCount &&
       repairRowsVisited === duplicateCount && finalFacts === factCount-duplicateCount &&
       staleFacts === 0 && scanEndTick === 1_001 && backlogAtScanEnd >= 40_000 &&
-      fastWhileDraining && ticks <= 1_250 && elapsedMs < 60*60_000 &&
-      maxProjectionSliceMs < 750 && otherStages.every(stage => service.stages[stage].completed >= 150) &&
+      fastWhileDraining && maxProjectionSliceMs < 750 &&
+      otherStages.every(stage => service.stages[stage].completed >= 150) &&
       maxOtherStageGap <= 32 && Object.values(service.stages).every(stage => stage.failures === 0) &&
       scheduler.status().maxConcurrentJobs === 1 && scheduler.status().overlappingJobs === 0 &&
-      scheduler.status().failedRuns === 0 && finalCadence.retryClass === "normal",
+      scheduler.status().failedRuns === 0 && finalCadence.retryClass === "normal";
+    check(slow ? "million_duplicate_slow_rows_obey_active_budget_on_production_scheduler" :
+        "million_duplicate_fact_scan_drains_repairs_on_fast_production_cadence",
+      common && (slow
+        ? ticks <= 14_100 && elapsedMs < 60*60_000 &&
+          maxSimulatedSliceMs <= 25 + 8*injectedRepairRowMs + 1
+        : ticks <= 14_100 && elapsedMs < 60*60_000),
       {factCount,duplicateCount,seededDuplicates,seededFacts,ticks,scanEndTick,
         backlogAtScanEnd,scanRowsVisited,repairRowsVisited,finalFacts,staleFacts,
-        fastWhileDraining,maxProjectionSliceMs,maxOtherStageGap,
+        fastWhileDraining,maxProjectionSliceMs,maxSimulatedSliceMs,
+        reference,observedScanMs,observedScanRows,observedRepairMs,observedRepairRows,
+        injectedScanRowMs,injectedRepairRowMs,
+        slowestSlicePhases,slowestSliceRows,maxOtherStageGap,
         otherStageCompleted:Object.fromEntries(otherStages.map(stage=>[stage,service.stages[stage].completed])),
         parityReady:projection.parityReady,repairBacklog:projection.backlog.repairs,
         elapsedMs,elapsedMinutes:elapsedMs/60_000,retryClass:finalCadence.retryClass});
+    return {scanMsPerRow:observedScanMs/Math.max(1,observedScanRows),
+      repairMsPerRow:observedRepairMs/Math.max(1,observedRepairRows)};
   } finally {
     maintenance.close();
     buffer.close();
@@ -755,10 +811,18 @@ async function main() {
         detail:checks.at(-1)?.detail},null,2));
       return;
     }
+    if (process.argv.includes("--million-duplicate-slow-only")) {
+      const reference = await proveMillionFactDuplicateRepairCadence(root);
+      await proveMillionFactDuplicateRepairCadence(root, true, reference);
+      console.log(JSON.stringify({status:"pass",check:checks.at(-1)?.name,
+        detail:checks.at(-1)?.detail},null,2));
+      return;
+    }
     proveDuplicateFactRepair(root);
     await proveDuplicateScanUpgradeAndDrain(root);
     await proveMillionFactScanCadence(root);
-    await proveMillionFactDuplicateRepairCadence(root);
+    const millionDuplicateReference = await proveMillionFactDuplicateRepairCadence(root);
+    await proveMillionFactDuplicateRepairCadence(root, true, millionDuplicateReference);
     buffer.recordRepoLabel(repoA, "proof/repo-a");
     buffer.recordRepoLabel(repoB, "proof/repo-b");
     buffer.setPriorityRepo(repoA, URL_SENTINEL);
@@ -4562,6 +4626,8 @@ async function main() {
           "million_fact_scan_uses_bounded_fast_ticks_and_preserves_capture_turns")?.detail,
         millionDuplicateScanCadence:checks.find((entry)=>entry.name===
           "million_duplicate_fact_scan_drains_repairs_on_fast_production_cadence")?.detail,
+        millionDuplicateSlowCadence:checks.find((entry)=>entry.name===
+          "million_duplicate_slow_rows_obey_active_budget_on_production_scheduler")?.detail,
         idleRestartReads:restartReads,
         missedClaude:missedClaudeEvidence,
         compactStorage:checks.find((entry)=>entry.name==="generic_zero_value_spans_use_bounded_compressed_projection_storage")?.detail,
