@@ -5,6 +5,7 @@
  * packages/collector-cli/src/lean/capture-gaps.ts.
  */
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 
 import { fn, loadSurface, openTempBuffer } from "./_pending";
@@ -30,5 +31,37 @@ test("B22 C5: an unresolved file's gap is epoch_open from the epoch start with a
     assert.equal((db.prepare("select ended_at_ms as ended from capture_gaps where gap_id=?").get(gapId) as { ended: number }).ended,
       FIRST_PARSE, "a resolved gap has a known end for the strict v2 receiver");
     assert.equal(complete(db, { startMs: t("10:01"), endMs: FIRST_PARSE }, FIRST_PARSE), true, "parsed to its end: resolved");
+  } finally { close(); }
+});
+
+test("B22 C5: a metadata-only baseline cannot arm without a gap for every staged generation", async () => {
+  const baseline = await loadSurface("../../../packages/collector-cli/src/capture-baseline.ts");
+  const gaps = await loadSurface("../../../packages/collector-cli/src/lean/capture-gaps.ts");
+  const begin = fn(baseline, "beginAutomaticCaptureBaseline") as (db: unknown, source: string, input: Record<string, unknown>) => { status: string };
+  const stage = fn(baseline, "stageAutomaticCaptureBaselineObservation") as (db: unknown, source: string, input: Record<string, unknown>) => boolean;
+  const complete = fn(baseline, "completeAutomaticCaptureBaseline") as (db: unknown, source: string, input: Record<string, unknown>) => { status: string };
+  const declare = fn(gaps, "declareUnresolvedFileGap") as (db: unknown, input: Record<string, unknown>) => { gapId: string };
+  const scope = fn(gaps, "rolloutGapScope") as (db: unknown) => { workspaceId: string; installationEpochId: string; epochStartMs: number };
+  const { buffer, close } = openTempBuffer({ workspaceId: "tenant-lean-contract" });
+  try {
+    const db = buffer.database;
+    const source = "codex", runId = "b22-baseline-arm";
+    const observedAt = new Date(Math.max(Date.now(), scope(db).epochStartMs + 1000)).toISOString();
+    const observation = { path: path.resolve("b22-baseline-contract.jsonl"), device: 1n,
+      inode: 2n, size: 16n, birthtimeNs: 3n };
+    assert.equal(begin(db, source, { runId, startedAt: observedAt, filesDiscovered: 0 }).status, "in_progress");
+    assert.equal(stage(db, source, { runId, observedAt, observation, filesDiscovered: 1, filesValidated: 1 }), true);
+    assert.notEqual(complete(db, source, { runId, completedAt: observedAt, requireGapProof: true }).status,
+      "complete", "stat-only metadata must not arm a complete claim");
+    assert.equal(begin(db, source, { runId, startedAt: observedAt, filesDiscovered: 0 }).status, "in_progress");
+    const { gapId } = declare(db, { ...scope(db), source, fileKeyDigest: "f".repeat(64),
+      generationIdentity: "1:2:3", reason: "tailer_unread", lastWriteAtMs: Date.parse(observedAt), unreadBytes: 16 });
+    const prove = fn(baseline, "recordAutomaticCaptureBaselineGapProof") as
+      (db: unknown, source: string, runId: string, observation: Record<string, unknown>, gapId: string) => void;
+    prove(db, source, runId, observation, gapId);
+    assert.equal(complete(db, source, { runId, completedAt: observedAt, requireGapProof: true }).status,
+      "complete", "the same staged generation can arm after its open gap is recorded");
+    assert.equal((db.prepare("select resolved_at_ms as resolved from capture_gaps where gap_id=?").get(gapId) as { resolved: number | null }).resolved,
+      null, "the metadata baseline does not close the capture gap");
   } finally { close(); }
 });
