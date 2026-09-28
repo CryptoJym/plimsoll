@@ -30,6 +30,27 @@ import {
 } from "./device-identity";
 import { assertNoRedirect, fetchCollectorUrl, postJson, validatedTransportUrl } from "./http-transport";
 import { syncAccountActorSalt } from "./account-salt";
+import { observeActivitySummaryAdvertisement } from "./lean/activity-summary-capability";
+
+const advertisementSchema = z.object({
+  activitySummaryContractVersion: z.number().int().nonnegative().optional(),
+  actorBindingVersion: z.number().int().nonnegative().optional(),
+  deviceId: z.string().uuid().optional(),
+}).strict();
+type AdvertisementBody = z.infer<typeof advertisementSchema>;
+function advertisementBody(body: unknown): AdvertisementBody {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  const value = body as Record<string, unknown>;
+  return advertisementSchema.parse({
+    ...(Number.isSafeInteger(value.activitySummaryContractVersion) &&
+      Number(value.activitySummaryContractVersion) >= 0
+      ? {activitySummaryContractVersion:value.activitySummaryContractVersion} : {}),
+    ...(Number.isSafeInteger(value.actorBindingVersion) && Number(value.actorBindingVersion) >= 0
+      ? {actorBindingVersion:value.actorBindingVersion} : {}),
+    ...(typeof value.deviceId === "string" && z.string().uuid().safeParse(value.deviceId).success
+      ? {deviceId:value.deviceId} : {}),
+  });
+}
 
 /**
  * Fleet join is transactional: redeem into memory, prove only a fresh
@@ -91,6 +112,8 @@ const pendingJoinSchema = z.object({
   handshakeEventId: z.string().trim().min(1).optional(),
   stagedConfig: collectorConfigSchema,
   accountActorSaltEndpoint: z.string().url().optional(),
+  grantAdvertisement: z.object({body:advertisementSchema,atMs:z.number().int().nonnegative()}).optional(),
+  handshakeAdvertisement: z.object({body:advertisementSchema,atMs:z.number().int().nonnegative()}).optional(),
 });
 type PendingJoin = z.infer<typeof pendingJoinSchema>;
 
@@ -533,6 +556,7 @@ async function activatePendingJoin(
   let selfTestEventId = "";
   let handshakeAcknowledged = false;
   let activeConfigActivated = false;
+  let handshakeAdvertisement: PendingJoin["handshakeAdvertisement"];
   try {
     buffer = new LocalEventBuffer(temporaryLedgerPath, {
       workspaceId: pending.stagedConfig.tenantId,
@@ -562,6 +586,9 @@ async function activatePendingJoin(
     const uploaded = await uploadBufferedEvents(pending.stagedConfig, buffer, {
       appVersion: pending.appVersion,
       fetchImpl: handshakeFetch,
+      onAuthenticatedAcknowledgement: (body) => {
+        handshakeAdvertisement = {body:advertisementBody(body),atMs:Date.now()};
+      },
     });
     const uploadedEvent = uploaded.batch?.events[0]?.event.id;
     const accepted =
@@ -577,7 +604,8 @@ async function activatePendingJoin(
       throw new Error("Join handshake did not explicitly acknowledge exactly its one synthetic probe.");
     }
     handshakeAcknowledged = true;
-    pending = pendingJoinSchema.parse({ ...pending, handshakeEventId: selfTestEventId });
+    pending = pendingJoinSchema.parse({ ...pending, handshakeEventId: selfTestEventId,
+      ...(handshakeAdvertisement ? {handshakeAdvertisement} : {}) });
     replacePendingJoin(pending, options.pendingFile);
 
     cleanupTemporaryState();
@@ -632,6 +660,9 @@ async function activatePendingJoin(
             `before=${JSON.stringify(beforeCensus)} after=${JSON.stringify(afterCensus)}`,
         );
       }
+      const advertisement = pending.handshakeAdvertisement ?? pending.grantAdvertisement;
+      if (advertisement) observeActivitySummaryAdvertisement(activeBuffer.database,
+        pending.stagedConfig.installKey, advertisement.body, advertisement.atMs);
       // The census above is a strict refinement of the earlier
       // quarantined-count comparison (#163 rework): every relabel or release
       // of any row — bound or unbound — changes some census bucket, while a
@@ -872,6 +903,7 @@ export async function performJoin(options: {
       probeSourceId: crypto.randomUUID(),
       installationEpochId: crypto.randomUUID(),
       stagedConfig,
+      grantAdvertisement: {body:advertisementBody(body),atMs:Date.now()},
       ...(grant.accountActorSaltEndpoint ? { accountActorSaltEndpoint: grant.accountActorSaltEndpoint } : {}),
     });
     writePendingJoin(pending, pendingFile);

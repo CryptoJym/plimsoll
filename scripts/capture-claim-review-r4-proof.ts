@@ -209,9 +209,12 @@ async function r3s4() {
     .get(`%${session}-2%`) as { n: number }).n;
   cadences.close();
   buffer.close();
+  // B22: old mtime alone cannot rule out an in-epoch event stamp; the open
+  // gap now starts at enrollment rather than at the last stat-only check.
   check("R3_S4_append_to_pre_enrollment_file_is_uncovered_from_the_last_check",
-    captured === 0 && lastCheck !== null && row?.since === lastCheck && !attests(claim, appendAt) &&
-      !claim.gaps.some((gap) => gap.from === iso(epochStartMs)),
+    captured === 0 && lastCheck !== null && row?.since === iso(epochStartMs) &&
+      !attests(claim, appendAt) && claim.through === null &&
+      claim.gaps.some((gap) => gap.from === iso(epochStartMs)),
     { epochStartedAt: iso(epochStartMs), lastCompleteCheckBeforeAppend: lastCheck, appendAt, uncoveredSince: row?.since ?? null,
       appendedLineCaptured: captured > 0, claim });
 }
@@ -356,7 +359,9 @@ async function r3n4() {
     if (frontier?.capturedThrough) break;
   }
   const rows = uncoveredRows();
-  const unreadFiles = 2 * Math.floor(perSource / 2) + grokSessions;
+  // B22: a pre-enrollment mtime is no EOF proof. All files without tailer
+  // rows, including the old half, receive durable open gaps.
+  const unreadFiles = 2 * perSource + grokSessions;
   const maxTurnMs = Math.max(...turns);
   // One coverage turn steps each source's walk once (maintenance.ts
   // checkCaptureCoverage), each capped at the release's RELEASE_MAX_WORK_PER_TURN.
@@ -414,8 +419,9 @@ async function grokCoverage() {
   clockShiftMs = 0;
   checks.close();
   buffer.close();
+  // B22's open gap withdraws through until this exact usage generation is read.
   check("Grok_usage_file_not_yet_read_is_never_attested",
-    !attests(unread, endedAt) && unread.through !== null && unread.through > endedAt && inGap(unread, endedAt) &&
+    !attests(unread, endedAt) && unread.through === null && inGap(unread, endedAt) &&
       grokEvents > 0 && !inGap(read, endedAt),
     { endedAt, unread, grokEvents, afterRead: read });
 }

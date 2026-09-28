@@ -36,6 +36,7 @@ import {
   captureBaselinePostEnrollmentOffset,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
+  recordAutomaticCaptureBaselineGapProof,
   recordAutomaticCaptureBaselineProgress,
   resolveAutomaticCaptureBaselinePending,
   stageAutomaticCaptureBaselineObservation,
@@ -49,9 +50,11 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, jsonlCoverageIdentity, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import { CaptureRevisitQueue } from "./capture-revisit-queue";
 import { recordCaptureRecordLoss } from "./capture-record-loss";
+import { captureFileKeyDigest, declareUnresolvedFileGap, fileGapId,
+  recordCountedJsonlGap, resolveCaptureGap, rolloutGapScope } from "./lean/capture-gaps";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -462,7 +465,7 @@ export class RolloutTailer {
       }, this.coverageDirectoryCache, depth),
       check: (file) => {
         const stat = lstatIfPresent((target) => this.io.lstat(target), file);
-        const checked = verdict(this.cursorKey(file), stat);
+        const checked = verdict(this.cursorKey(file), stat, jsonlCoverageIdentity(file, stat));
         if (checked && stat?.isFile() && !checked.fullyRead) {
           const baselineSize = baselineComplete
             ? captureBaselineExcludedSize(this.buffer.database, "codex", baselineObservation(file, stat)) : null;
@@ -757,17 +760,41 @@ export class RolloutTailer {
             limitReached: false, yields: 0, lastYieldAt: null,
           };
       if (chunk.files.length > 0) {
-        const pending = stageAutomaticCaptureBaselinePending(
-          this.buffer.database,
-          "codex",
-          {
-            runId: attempt.runId,
-            observedAt: new Date().toISOString(),
-            observations: chunk.files.map((discovered) =>
-              baselineObservation(discovered.file, discovered.stat, discovered.precise)
-            ),
-          },
-        );
+        let pending: ReturnType<typeof stageAutomaticCaptureBaselinePending>;
+        try {
+          pending = this.buffer.transactionWithRepoContextHandoffs(() => {
+            const scope = rolloutGapScope(this.buffer.database);
+            for (const discovered of chunk.files) {
+              const { gapId } = declareUnresolvedFileGap(this.buffer.database, {
+                ...scope, source: "codex",
+                fileKeyDigest: captureFileKeyDigest(jsonlScanStateKey(this.cursorKey(discovered.file))),
+                generationIdentity: `${discovered.precise.dev}:${discovered.precise.ino}:${discovered.precise.birthtimeNs}`,
+                reason: "tailer_unread", lastWriteAtMs: Math.max(0, Math.floor(discovered.stat.mtimeMs)),
+                unreadBytes: discovered.stat.size,
+              });
+              recordAutomaticCaptureBaselineGapProof(this.buffer.database, "codex", attempt.runId,
+                baselineObservation(discovered.file, discovered.stat, discovered.precise), gapId);
+            }
+            const receipt = stageAutomaticCaptureBaselinePending(this.buffer.database, "codex", {
+              runId: attempt.runId,
+              observedAt: new Date().toISOString(),
+              observations: chunk.files.map((discovered) =>
+                baselineObservation(discovered.file, discovered.stat, discovered.precise)),
+            });
+            this.persistSweepResume(attempt.discovery);
+            return receipt;
+          });
+        } catch {
+          // The in-memory discovery already visited this chunk. Discard it so
+          // the next cadence restarts from the last committed resume point.
+          attempt.discovery.close();
+          this.baselineAttempt = null;
+          result.readErrors += 1;
+          result.exhaustive = false;
+          result.deferredGenerations = Math.max(1, chunk.files.length);
+          result.automaticBudget = automatic.budget.status();
+          return result;
+        }
         attempt.filesDiscovered = pending.filesDiscovered;
         const acceptedFiles = chunk.files.filter((_, index) => pending.accepted[index]);
         if (pending.deferred.some(Boolean)) {
@@ -896,6 +923,7 @@ export class RolloutTailer {
       const completed = completeAutomaticCaptureBaseline(this.buffer.database, "codex", {
         runId: attempt.runId,
         completedAt: new Date().toISOString(),
+        requireGapProof: true,
       });
       this.persistSweepResume(attempt.discovery);
       this.retire(attempt.discovery);
@@ -1183,6 +1211,7 @@ export class RolloutTailer {
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            const fileKeyDigest = captureFileKeyDigest(jsonlScanStateKey(this.cursorKey(candidate.file)));
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();
@@ -1191,7 +1220,15 @@ export class RolloutTailer {
               // Deletion and provider writes share this transaction. Failure
               // restores the envelope as well as cursor/events/outbox/handoffs.
               read.continuation?.remove();
+              const gapScope = rolloutGapScope(this.buffer.database);
               if (read.unresolvedRecord) {
+                declareUnresolvedFileGap(this.buffer.database, {
+                  ...gapScope, source: "codex", fileKeyDigest,
+                  generationIdentity: read.fileIdentity,
+                  reason: read.unresolvedRecord.reason,
+                  lastWriteAtMs: Math.max(0, Math.floor(read.mtimeMs)),
+                  unreadBytes: Math.max(0, read.observedSize - read.committedOffset),
+                });
                 rememberJsonlScanCursor(
                   this.buffer.database,
                   this.cursorKey(candidate.file),
@@ -1206,6 +1243,12 @@ export class RolloutTailer {
               if (read.skippedRecord) {
                 recordCaptureRecordLoss(this.buffer.database, {
                   source: "codex", fileKey: jsonlScanStateKey(this.cursorKey(candidate.file)), record: read.skippedRecord,
+                });
+                recordCountedJsonlGap(this.buffer.database, {
+                  ...gapScope, source: "codex", fileKeyDigest,
+                  offset: read.skippedRecord.offset, fingerprint: read.skippedRecord.fingerprint,
+                  kind: read.skippedRecord.kind,
+                  atMs: Math.max(gapScope.epochStartMs, Date.now()),
                 });
                 if (read.skippedRecord.usagePossible) {
                   initialState.counterUncertain = true;
@@ -1222,6 +1265,12 @@ export class RolloutTailer {
               if (result.parseErrors !== parseErrorsBefore) {
                 parseFailure = true;
                 throw new Error("rollout_slice_parse_failed");
+              }
+              if (!read.workRemaining && read.deferredBytes === 0) {
+                resolveCaptureGap(this.buffer.database, fileGapId({
+                  ...gapScope, source: "codex", fileKeyDigest,
+                  generationIdentity: read.fileIdentity,
+                }), Math.max(gapScope.epochStartMs, Date.now()));
               }
               rememberJsonlScanCursor(
                 this.buffer.database,

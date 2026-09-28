@@ -12,6 +12,7 @@ import {
 const STATE_TABLE = "automatic_capture_baseline_state";
 const GENERATION_TABLE = "automatic_capture_baseline_generations";
 const PENDING_GENERATION_TABLE = "automatic_capture_baseline_pending_generations";
+const GAP_PROOF_TABLE = "automatic_capture_baseline_gap_proofs";
 const ERROR_TABLE = "automatic_capture_baseline_observation_errors";
 const SCHEMA_VERSION = 2;
 const initializedDatabases = new WeakSet<object>();
@@ -463,6 +464,8 @@ export type CompleteCaptureBaselineInput = {
   observations?: CaptureBaselineFileObservation[];
   discoveryErrors?: number;
   statErrors?: number;
+  /** Production tailers require a durable gap or admission for every generation. */
+  requireGapProof?: boolean;
 };
 
 export type StageCaptureBaselineObservationInput = {
@@ -741,6 +744,13 @@ export function ensureCaptureBaselineSchema(database: Database.Database): void {
     );
     create index if not exists idx_capture_baseline_pending_run
       on ${PENDING_GENERATION_TABLE} (source, run_id);
+    create table if not exists ${GAP_PROOF_TABLE} (
+      source text not null check (source in ('codex', 'claude_code')),
+      run_id text not null,
+      generation_key text not null,
+      gap_id text not null,
+      primary key (source, run_id, generation_key, gap_id)
+    );
     create table if not exists ${ERROR_TABLE} (
       source text not null check (source in ('codex', 'claude_code')),
       path_key text not null,
@@ -1160,6 +1170,9 @@ export function beginAutomaticCaptureBaseline(
       database
         .prepare(`delete from ${PENDING_GENERATION_TABLE} where source = ? and run_id = ?`)
         .run(source, prior.runId);
+      database
+        .prepare(`delete from ${GAP_PROOF_TABLE} where source = ? and run_id = ?`)
+        .run(source, prior.runId);
     }
     database.prepare(
       `insert into ${STATE_TABLE} (
@@ -1356,6 +1369,25 @@ export function stageAutomaticCaptureBaselinePending(
     ).run(input.observedAt, filesDiscovered, source, input.runId);
   }).immediate();
   return { filesDiscovered, pendingMetadata, newlyPending, accepted, deferred };
+}
+
+/** The caller inserts the matching capture gap and this receipt in the same
+ * transaction as its bounded discovery resume. Only opaque keys are stored. */
+export function recordAutomaticCaptureBaselineGapProof(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  runId: string,
+  observation: CaptureBaselineFileObservation,
+  gapId: string,
+): void {
+  ensureCaptureBaselineSchema(database);
+  const normalized = normalizeObservation(observation);
+  if (!validRunId(runId) || !normalized || !/^[a-f0-9]{64}$/.test(gapId)) {
+    throw new Error("capture_baseline_invalid_gap_proof");
+  }
+  database.prepare(`insert or ignore into ${GAP_PROOF_TABLE}
+    (source,run_id,generation_key,gap_id) values (?,?,?,?)`)
+    .run(source, runId, normalized.generationKey, gapId);
 }
 
 export function resolveAutomaticCaptureBaselinePending(
@@ -1576,12 +1608,26 @@ export function completeAutomaticCaptureBaseline(
     if (current.status !== "in_progress") return;
 
     const pendingMetadata = pendingGenerationCount(database, source, input.runId);
+    const missingGapProof = input.requireGapProof === true && Boolean(database.prepare(`
+      select 1 from ${GENERATION_TABLE} as generation
+      where generation.source = ? and generation.run_id = ?
+        and not exists (
+          select 1 from ${GAP_PROOF_TABLE} as proof
+          join capture_gaps as gap on gap.gap_id = proof.gap_id
+          where proof.source = generation.source and proof.run_id = generation.run_id
+            and proof.generation_key = generation.generation_key
+            and gap.source = generation.source
+            and gap.installation_epoch_id = coalesce((
+              select current_installation_epoch_id from collector_workspace_binding where singleton = 1
+            ), 'unbound')
+        ) limit 1
+    `).get(source, input.runId));
     const discoveryMismatch =
       discoveryErrors > 0 ||
       current.filesValidated !== current.filesDiscovered ||
-      pendingMetadata > 0;
+      pendingMetadata > 0 || missingGapProof;
     const failureReason = discoveryMismatch
-      ? pendingMetadata > 0
+      ? pendingMetadata > 0 || missingGapProof
         ? CAPTURE_BASELINE_GENERATION_AMBIGUOUS
         : CAPTURE_BASELINE_DISCOVERY_AMBIGUOUS
       : statErrors > 0

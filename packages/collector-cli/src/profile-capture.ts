@@ -60,7 +60,8 @@ export function createProfileCapture(buffer: LocalEventBuffer,config: Pick<Colle
         continue;
       const at=new Date().toISOString();
       const began=beginAutomaticCaptureBaseline(buffer.database,source,{ startedAt: at,filesDiscovered: 0 });
-      completeAutomaticCaptureBaseline(buffer.database,source,{ runId: began.latestRun!.runId,completedAt: at });
+      completeAutomaticCaptureBaseline(buffer.database,source,{ runId: began.latestRun!.runId,completedAt: at,
+        requireGapProof: true });
     }
   }
   const rollout = new RolloutTailer(buffer, undefined, codex ? () => [] : undefined, undefined, codex,

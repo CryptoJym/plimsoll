@@ -18,6 +18,8 @@ import {
 } from "./history-coverage";
 import type { CaptureBudgetStatus, CaptureWorkBudget } from "./capture-work-budget";
 import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, linkCaptureCoverageDirectory, linkCoverageFile, openCaptureCoverageDirectory } from "./capture-frontier";
+import { captureFileKeyDigest, declareUnresolvedFileGap, fileGapId,
+  recordCountedGrokGap, resolveCaptureGap, rolloutGapScope } from "./lean/capture-gaps";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import { attachRepoContextId, canonicalRepoContextCwd } from "./repo-context";
 
@@ -913,6 +915,8 @@ export class GrokUsageTailer {
           extent: mtimeMs,
           progress: committed ? row.mtimeMs : -1,
           fullyRead: committed && sameIdentity(row, stat),
+          generationIdentity: [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":"),
+          unreadBytes: committed && sameIdentity(row, stat) ? 0 : Number(stat.size),
         };
       },
       checkLink: (link) => {
@@ -1104,7 +1108,7 @@ export class GrokUsageTailer {
           pass.recentMs * 2 < wallMs) {
           const stepsBefore = pass.steps;
           const recentStarted = performance.now();
-          this.recentStep(root, pass, nowMs);
+          this.recentStep(root, pass, nowMs, result);
           pass.recentSteps += pass.steps - stepsBefore;
           pass.recentMs += performance.now() - recentStarted;
         } else {
@@ -1148,7 +1152,7 @@ export class GrokUsageTailer {
    * of these sessions. Its only durable state is when it last started, so a
    * replaced worker does not start it again before `recentRefreshMs`.
    */
-  private recentStep(root: string, pass: WalkPass, nowMs: number) {
+  private recentStep(root: string, pass: WalkPass, nowMs: number, result: GrokUsageScanResult) {
     const sweep = this.sweep!;
     const lane = sweep.recent;
     const finish = () => {
@@ -1238,8 +1242,15 @@ export class GrokUsageTailer {
     if (stat.isSymbolicLink() || !stat.isFile() || Number(stat.mtimeMs) < nowMs - this.limits.recentWindowMs) return;
     const fileKey = grokUsageFileKey(file);
     if (this.pendingKeys.has(fileKey) || this.unchanged(fileKey, stat)) return;
-    this.enqueue({ file, fileKey, groupName, sessionName: entry.name,
-      sessionDirectory: path.dirname(file), identity: identityOf(stat) });
+    const candidate = { file, fileKey, groupName, sessionName: entry.name,
+      sessionDirectory: path.dirname(file), identity: identityOf(stat) };
+    try {
+      this.buffer.transactionWithRepoContextHandoffs(() => this.openFileGap(candidate, "tailer_unread"));
+    } catch (error) {
+      this.reportFileGapFailure(error, result);
+      return;
+    }
+    this.enqueue(candidate);
     this.sweep!.counters.recentFiles += 1;
   }
 
@@ -1376,10 +1387,31 @@ export class GrokUsageTailer {
     const session = group.sessions[group.next]!;
     group.next += 1;
     pass.steps += 1;
-    this.advance(sweep, pass, group.hash, session.hash);
-    if (!realDirectory(path.join(root, group.name, session.name))) return;
+    if (!realDirectory(path.join(root, group.name, session.name))) {
+      this.advance(sweep, pass, group.hash, session.hash);
+      return;
+    }
     pass.observedByGroup.set(group.hash, observed + 1);
-    this.observeSession(root, group.name, session.name, result);
+    const candidate = this.observeSession(root, group.name, session.name, result);
+    if (candidate) {
+      try {
+        this.buffer.transactionWithRepoContextHandoffs(() => {
+          this.openFileGap(candidate, "tailer_unread");
+          writeWalkRound(this.buffer.database, {
+            round: sweep.round, startedAtMs: sweep.startedAtMs,
+            recentAtMs: sweep.recentAtMs, unclean: sweep.unclean,
+            cursor: { group: group.hash, session: session.hash },
+          });
+        });
+      } catch (error) {
+        group.next -= 1;
+        pass.stalled = true;
+        this.reportFileGapFailure(error, result);
+        return;
+      }
+      this.enqueue(candidate);
+    }
+    this.advance(sweep, pass, group.hash, session.hash);
   }
 
   private discoveryError(result: GrokUsageScanResult) {
@@ -1400,7 +1432,51 @@ export class GrokUsageTailer {
     this.pendingKeys.add(candidate.fileKey);
   }
 
-  private observeSession(root: string, groupName: string, sessionName: string, result: GrokUsageScanResult) {
+  private gapIdentity(candidate: Candidate) {
+    const { device, inode, size, mtimeNs, ctimeNs } = candidate.identity;
+    return [device, inode, size, mtimeNs, ctimeNs].join(":");
+  }
+
+  private openFileGap(candidate: Candidate,
+    reason: "tailer_unread" | "record_exceeds_byte_budget" | "contract_violation") {
+    const scope = rolloutGapScope(this.buffer.database);
+    declareUnresolvedFileGap(this.buffer.database, {
+      ...scope, source: "grok", fileKeyDigest: captureFileKeyDigest(candidate.fileKey),
+      generationIdentity: this.gapIdentity(candidate), reason,
+      lastWriteAtMs: candidate.identity.mtimeMs, unreadBytes: candidate.identity.size,
+    });
+  }
+
+  private resolveFileGap(candidate: Candidate) {
+    const scope = rolloutGapScope(this.buffer.database);
+    resolveCaptureGap(this.buffer.database, fileGapId({
+      installationEpochId: scope.installationEpochId, source: "grok",
+      fileKeyDigest: captureFileKeyDigest(candidate.fileKey),
+      generationIdentity: this.gapIdentity(candidate),
+    }), this.now());
+  }
+
+  private commitFileState(candidate: Candidate, digest: string | null,
+    status: "committed" | "parse_error" | "oversized",
+    facts?: { turns: number; tokenBearing: boolean; sessionOnlyTokens: number }) {
+    this.buffer.transactionWithRepoContextHandoffs(() => {
+      if (status === "committed") this.resolveFileGap(candidate);
+      else this.openFileGap(candidate,
+        status === "oversized" ? "record_exceeds_byte_budget" : "contract_violation");
+      this.recordFileState(candidate, digest, status, facts);
+    });
+  }
+
+  private reportFileGapFailure(error: unknown, result: GrokUsageScanResult) {
+    this.buffer.captureDurability.reportGapFailure(error);
+    this.sweep!.unclean = true;
+    this.sweep!.stateChanged = true;
+    this.sweep!.counters.readErrors += 1;
+    result.readErrors += 1;
+  }
+
+  private observeSession(root: string, groupName: string, sessionName: string,
+    result: GrokUsageScanResult): Candidate | null {
     const counters = this.sweep!.counters;
     const sessionDirectory = path.join(root, groupName, sessionName);
     const file = path.join(sessionDirectory, GROK_USAGE_FILE_NAME);
@@ -1410,29 +1486,29 @@ export class GrokUsageTailer {
       // directories; the read re-validates every ancestor before opening.
       stat = fs.lstatSync(file, { bigint: true });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // no usage yet
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; // no usage yet
       counters.statErrors += 1;
       result.statErrors += 1;
-      return;
+      return null;
     }
     if (stat.isSymbolicLink() || !stat.isFile()) {
       counters.statErrors += 1;
       result.statErrors += 1;
-      return;
+      return null;
     }
     counters.filesSeen += 1;
     result.filesSeen += 1;
     const fileKey = grokUsageFileKey(file);
     // Queued by the recent lane and not yet read: it is this sweep's already.
-    if (this.pendingKeys.has(fileKey)) return;
+    if (this.pendingKeys.has(fileKey)) return null;
     const state = this.unchanged(fileKey, stat);
     if (state) {
       counters.filesUnchanged += 1;
       result.filesUnchanged += 1;
       if (state.status !== "committed") counters.filesUnresolved += 1;
-      return;
+      return null;
     }
-    this.enqueue({ file, fileKey, groupName, sessionName, sessionDirectory, identity: identityOf(stat) });
+    return { file, fileKey, groupName, sessionName, sessionDirectory, identity: identityOf(stat) };
   }
 
   private async drainPending(budget: CaptureWorkBudget, result: GrokUsageScanResult, signal?: AbortSignal) {
@@ -1473,7 +1549,8 @@ export class GrokUsageTailer {
       result.filesOversized += 1;
       result.unresolvedRecords += 1;
       result.bytesDeferred += size;
-      this.recordFileState(candidate, null, "oversized");
+      try { this.commitFileState(candidate, null, "oversized"); }
+      catch (error) { this.reportFileGapFailure(error, result); }
       return "done";
     }
     const slice = budget.remainingSlice(true);
@@ -1511,11 +1588,16 @@ export class GrokUsageTailer {
     } | undefined;
     if (previous?.digest === digest && previous.status === "committed") {
       // The same bytes under a new mtime: nothing to parse.
-      this.recordFileState(candidate, digest, "committed", {
-        turns: previous.turns,
-        tokenBearing: previous.tokenBearing === 1,
-        sessionOnlyTokens: previous.sessionOnlyTokens,
-      });
+      try {
+        this.commitFileState(candidate, digest, "committed", {
+          turns: previous.turns,
+          tokenBearing: previous.tokenBearing === 1,
+          sessionOnlyTokens: previous.sessionOnlyTokens,
+        });
+      } catch (error) {
+        this.reportFileGapFailure(error, result);
+        return "done";
+      }
       budget.recordSlice({ bytesRead: bytes.length, recordsParsed: 0, eventsAppended: 0 });
       counters.filesParsed += 1;
       result.filesParsed += 1;
@@ -1531,7 +1613,8 @@ export class GrokUsageTailer {
       counters.parseErrors += 1;
       counters.filesUnresolved += 1;
       result.parseErrors += 1;
-      this.recordFileState(candidate, digest, "parse_error");
+      try { this.commitFileState(candidate, digest, "parse_error"); }
+      catch (error) { this.reportFileGapFailure(error, result); }
       budget.recordSlice({ bytesRead: bytes.length, recordsParsed: 0, eventsAppended: 0 });
       return "done";
     }
@@ -1539,14 +1622,13 @@ export class GrokUsageTailer {
     let applied: ReturnType<GrokUsageTailer["applyDocument"]>;
     try {
       applied = this.applyDocument(candidate, document, digest, slice.maxRecords, budget, result);
-    } catch {
+    } catch (error) {
       // The transaction rolled back. Like the JSONL tailers, contain the
       // failure to this document: its state did not advance, so a later
       // sweep retries it, and the other sources keep their cadence.
       restoreMutationSnapshot(result, counters, before);
-      counters.readErrors += 1;
+      this.reportFileGapFailure(error, result);
       counters.filesUnresolved += 1;
-      result.readErrors += 1;
       budget.recordSlice({ bytesRead: bytes.length, recordsParsed: 0, eventsAppended: 0 });
       return "done";
     }
@@ -1627,6 +1709,15 @@ export class GrokUsageTailer {
          updated_at = excluded.updated_at`,
     );
     const receivedAtMs = this.now();
+    const gapScope = rolloutGapScope(database);
+    const countedGap = (unitKey: string, droppedRows: number,
+      droppedUsageRows: number | null, reason: "generation_rewrite_ambiguous" | "contract_violation") =>
+      recordCountedGrokGap(database, {
+        ...gapScope,
+        fileKeyDigest: captureFileKeyDigest(candidate.fileKey),
+        generationIdentity: this.gapIdentity(candidate), unitKey,
+        recordedAtMs: receivedAtMs, droppedRows, droppedUsageRows, reason,
+      });
     const fallback = clampFutureObservedAt(
       document.updatedAt ?? new Date(candidate.identity.mtimeMs).toISOString(),
       receivedAtMs,
@@ -1636,6 +1727,7 @@ export class GrokUsageTailer {
         // Live usage already owns this session (first writer wins, as for
         // the Codex and Claude tailers); file rows would only be suppressed.
         result.sessionsSkippedLiveCovered += 1;
+        this.resolveFileGap(candidate);
         this.recordFileState(candidate, digest, "committed", facts);
         return;
       }
@@ -1654,6 +1746,7 @@ export class GrokUsageTailer {
             };
           } catch {
             // An unreadable record cannot prove what was counted; refuse.
+            countedGap(`turn:${turn.turnNumber}:stored-state`, 1, 1, "contract_violation");
             result.turnRewritesRefused += 1;
             continue;
           }
@@ -1665,6 +1758,7 @@ export class GrokUsageTailer {
           // A rewrite that lowers a counted number, or a per-model turn
           // rewritten without per-model rows, cannot be mapped onto what was
           // counted. The earlier count stands and the refusal is reported.
+          countedGap(`turn:${turn.turnNumber}`, 1, 1, "generation_rewrite_ambiguous");
           result.turnRewritesRefused += 1;
           continue;
         }
@@ -1714,6 +1808,12 @@ export class GrokUsageTailer {
         });
         result.recordsCommitted += 1;
       }
+      if (document.invalidTurns > 0) {
+        countedGap("invalid-turns", document.invalidTurns, null, "contract_violation");
+      }
+      if (!complete) this.openFileGap(candidate, "tailer_unread");
+      else if (document.invalidTurns > 0) this.openFileGap(candidate, "contract_violation");
+      else this.resolveFileGap(candidate);
       this.recordFileState(
         candidate,
         complete ? digest : null,

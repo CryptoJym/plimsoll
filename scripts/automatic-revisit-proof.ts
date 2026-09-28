@@ -106,6 +106,29 @@ async function prove(source: CaptureRoot["source"]) {
   const continuation = (file: string) => buffer.database.prepare('select envelope_json from jsonl_continuations where provider=? and file_key=?')
     .get(source === 'codex' ? 'codex' : 'claude', createHash('sha256').update(file).digest('hex')) as { envelope_json: string } | undefined;
   try {
+    buffer.database.exec(`create trigger b22_baseline_gap_failure before insert on capture_gaps
+      when new.source = '${source}'
+      begin select raise(abort, 'b22_baseline_gap_failure'); end`);
+    let failedBaseline: Awaited<ReturnType<typeof run>> | null = null;
+    for (let cadence = 0; cadence < 8; cadence++) {
+      const observed = await run("baseline_gap_failure");
+      if (observed.readErrors > 0) { failedBaseline = observed; break; }
+    }
+    const baselineLedger = () => ({
+      gaps: (buffer.database.prepare("select count(*) as n from capture_gaps where source = ?").get(source) as { n: number }).n,
+      pending: (buffer.database.prepare("select count(*) as n from automatic_capture_baseline_pending_generations where source = ?").get(source) as { n: number }).n,
+      resumes: (buffer.database.prepare("select count(*) as n from maintenance_state where key = ?").get(`capture_sweep_resume:${source}`) as { n: number }).n,
+    });
+    check("B22 baseline gap write failure leaves pending metadata gap and resume unchanged",
+      failedBaseline !== null && Object.values(baselineLedger()).every(n => n === 0));
+    buffer.database.exec("drop trigger b22_baseline_gap_failure");
+    for (let cadence = 0; cadence < 8; cadence++) {
+      await run("baseline_gap_retry");
+      if (baselineLedger().gaps > 0 && baselineLedger().resumes > 0) break;
+    }
+    check("B22 baseline retry commits pending metadata open gap and resume together",
+      baselineLedger().gaps > 0 && baselineLedger().resumes > 0 &&
+        (buffer.database.prepare("select count(*) as n from capture_gaps where source = ? and interval_basis='epoch_open' and resolved_at_ms is null").get(source) as { n: number }).n > 0);
     for (let turn = 0; turn < 64 && captureBaselineStatus(buffer.database).status !== "complete"; turn++) await run("baseline");
     check("both real filesystem baselines complete", captureBaselineStatus(buffer.database).status === "complete");
     check("248 historical generations excluded without body reads", captureBaselineStatus(buffer.database).sources.reduce((n, s) => n + s.excludedGenerations, 0) === 248 && bodyReads === 0);

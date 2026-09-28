@@ -75,6 +75,7 @@ export const HTTP_REJECTION_NEXT_ACTIONS: Record<HttpBoundaryReason, string> = {
   compressed_body_too_large: "reduce_request_body_bytes",
   compression_ratio_too_large: "reduce_request_body_bytes",
   decoded_body_too_large: "reduce_request_body_bytes",
+  gap_record_unavailable: "retry_after_backoff",
   host_not_allowed: "send_loopback_host_header",
   internal_rejection: "inspect_collector_log",
   invalid_compressed_body: "fix_payload_encoding",

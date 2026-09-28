@@ -15,6 +15,7 @@ import { TransportError } from "./http-transport";
 import { SyncStorageRetryController } from "./sqlite-contention";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
+import { observeActivitySummaryAdvertisement } from "./lean/activity-summary-capability";
 import { deliveryItemId } from "./delivery-ack";
 import { pinnedUploadUrl } from "./http-transport";
 import { MAX_EVENT_UPLOAD_BATCH_SIZE } from "./upload";
@@ -1284,6 +1285,9 @@ export async function runSessionSync(
     );
   }
 
+  const capabilityLedgerPath = options.ledgerPath ?? (options.ledgerDb
+    ? options.ledgerDb.name === ":memory:" ? null : options.ledgerDb.name
+    : collectorBufferPath());
   let ledger = options.ledgerDb ?? null;
   let ownsLedger = false;
   if (!ledger) {
@@ -1437,6 +1441,10 @@ export async function runSessionSync(
   let abortReason: string | null = null;
   const settlements: SessionSyncResult["settlements"] = [];
   let staleReason: string | null = null;
+  // Preserve authenticated response order across concurrent batches. The
+  // transport callback cannot take a writer lock while another connection
+  // owns the session lease; flush after all leases have settled.
+  const authenticatedReplies: Array<{body:unknown;atMs:number}> = [];
 
   const snapshotFresh = (sessionId: string): boolean => {
     if (!options.incremental) return true;
@@ -1574,6 +1582,9 @@ export async function runSessionSync(
           timeoutMs: requestTimeoutMs,
           retryDeadlineMs: sendBeforeMs,
           allowPartial: true,
+          onAuthenticatedAcknowledgement: (reply) => {
+            authenticatedReplies.push({body:reply,atMs:Date.now()});
+          },
           onResponse: ({ status, body: reply }) => {
             if (status !== 409 || !reply || typeof reply !== "object" || Array.isArray(reply)) return;
             const body = reply as { error?: unknown; serverTime?: unknown };
@@ -1675,6 +1686,32 @@ export async function runSessionSync(
   }
 
   await Promise.allSettled([...inFlight]);
+  if (authenticatedReplies.length > 0) {
+    try {
+      const writer = options.ledgerDb && !ledger.readonly ? ledger
+        : capabilityLedgerPath ? new Database(capabilityLedgerPath,
+          {fileMustExist:true,timeout:5000}) : null;
+      if (writer) {
+        try {
+          const retry = new SyncStorageRetryController({
+            budgetMs: SESSION_SYNC_LEASE_ACQUISITION_BUDGET_MS, sleep,
+          });
+          await retry.run(() => writer.transaction(() => {
+            // Older synthetic ledgers used by local backfill have no capture
+            // maintenance table; only a collector ledger carries this state.
+            if (!writer.prepare(`select 1 from sqlite_master where type='table' and name='maintenance_state'`).get()) return;
+            for (const reply of authenticatedReplies) {
+              observeActivitySummaryAdvertisement(writer,config.installKey,reply.body,reply.atMs);
+            }
+          }).immediate());
+        } finally {
+          if (writer !== ledger) writer.close();
+        }
+      }
+    } catch (error) {
+      abortReason ??= error instanceof Error ? error.message : String(error);
+    }
+  }
   abortReason ??= staleReason;
 
   const durationMs = Date.now() - startedAt;

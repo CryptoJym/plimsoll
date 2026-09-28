@@ -42,7 +42,7 @@ import { resolveMaintenanceRepoContexts } from "../packages/collector-cli/src/ma
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema, aiWorkIngestBatchSchema } from "../packages/shared/src/index";
 
-const EXPECTED_CHECKS = 41;
+const EXPECTED_CHECKS = 44;
 const completion = createProofCompletion("grok-usage", EXPECTED_CHECKS);
 const SENTINEL = "PLIMSOLL_GROK_CONTENT_SENTINEL_5c1e";
 const TICKS_PER_USD = 10_000_000_000;
@@ -668,6 +668,16 @@ async function main() {
     loweredPass.eventsAppended === 0 && loweredPass.turnRewritesRefused === 1 &&
       sameSums(ledgerSums(grokRows(incBuffer)), before),
     { refused: loweredPass.turnRewritesRefused });
+  const refusedGap = incBuffer.database.prepare(`select interval_basis as basis,
+    count_basis as countBasis, dropped_rows as droppedRows,
+    dropped_usage_rows as droppedUsageRows from capture_gaps
+    where source='grok' and reason='generation_rewrite_ambiguous'`).get() as {
+      basis: string; countBasis: string; droppedRows: number; droppedUsageRows: number;
+    } | undefined;
+  check("b22_grok_refused_rewrite_commits_a_counted_gap_with_the_file_state",
+    refusedGap?.basis === "counted_interval" && refusedGap.countBasis === "counted" &&
+      refusedGap.droppedRows === 1 && refusedGap.droppedUsageRows === 1,
+    { gap: refusedGap });
   tailer.close();
   tailer = new GrokUsageTailer(incBuffer, incHome);
   fs.writeFileSync(incFile, JSON.stringify(grokUsageDocument(raised)));
@@ -770,6 +780,46 @@ async function main() {
     { oversized: bigPass.filesOversized });
   bigTailer.close();
   bigBuffer.close();
+
+  // B22: discovery and an oversized-file state cannot advance past a failed
+  // gap insert. Retrying the same generation commits the open gap and state.
+  const gapHome = unitHome("b22-gap-failure");
+  const gapBuffer = unitBuffer("b22-gap-failure");
+  const gapFile = writeSession(path.join(gapHome, "sessions"), rootGroup, {
+    sessionId: uuid(402), updatedAt: at(100), shape: "modern",
+    turns: Array.from({ length: 12 }, (_, index) => ({ turnNumber: index + 1,
+      endedAt: at(101), models: [usage("grok-4.7-build", index + 1)] })),
+  }, { content: false }).file;
+  const gapTailer = new GrokUsageTailer(gapBuffer, gapHome,
+    { ...GROK_USAGE_LIMITS, maxFileBytes: fs.statSync(smallDoc.file).size + 16 });
+  gapBuffer.database.exec(`create trigger b22_grok_gap_fail before insert on capture_gaps
+    begin select raise(abort, 'b22_grok_gap_fail'); end`);
+  try { await gapTailer.scan({ budget: budget() }); } catch { /* The state check below is the contract. */ }
+  const failedFileState = gapBuffer.database.prepare(
+    "select count(*) as n from grok_usage_file_state").get() as { n: number };
+  const failedGapState = gapBuffer.database.prepare(
+    "select count(*) as n from capture_gaps where source='grok'").get() as { n: number };
+  const failedWalk = JSON.parse(maintenanceState(gapBuffer, "grok_usage_walk_round_v1") ?? "null") as
+    { cursor?: unknown; round?: number } | null;
+  check("b22_grok_gap_write_failure_keeps_file_state_gap_and_discovery_cursor_unadvanced",
+    failedFileState.n === 0 && failedGapState.n === 0 && failedWalk?.cursor === null && failedWalk.round === 1,
+    { fileState: failedFileState.n, gaps: failedGapState.n, walk: failedWalk });
+  gapBuffer.database.exec("drop trigger b22_grok_gap_fail");
+  for (let attempt = 0; attempt < 4; attempt += 1) await gapTailer.scan({ budget: budget() });
+  const recoveredFile = gapBuffer.database.prepare(
+    "select status from grok_usage_file_state").get() as { status: string } | undefined;
+  const recoveredGap = gapBuffer.database.prepare(`select interval_basis as basis,
+    started_at_ms as startMs, ended_at_ms as endMs, resolved_at_ms as resolvedAt
+    from capture_gaps where source='grok'`).get() as {
+      basis: string; startMs: number; endMs: number | null; resolvedAt: number | null;
+    } | undefined;
+  check("b22_grok_retry_commits_oversized_file_state_and_epoch_open_gap",
+    fs.statSync(gapFile).size > fs.statSync(smallDoc.file).size + 16 &&
+      recoveredFile?.status === "oversized" && recoveredGap?.basis === "epoch_open" &&
+      recoveredGap.endMs === null && recoveredGap.resolvedAt === null,
+    { file: recoveredFile, gap: recoveredGap });
+  gapTailer.close();
+  gapBuffer.close();
 
   const longHome = unitHome("long");
   const longBuffer = unitBuffer("long");

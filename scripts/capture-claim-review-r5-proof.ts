@@ -185,8 +185,9 @@ async function grokSessionsDirectory() {
   const claim = await laterClaim(scene);
   const grokEvents = (scene.buffer.database.prepare(`select count(*) as n from buffered_events where source = 'grok'`).get() as { n: number }).n;
   scene.close();
+  // B22 keeps a symlink's unknown gap open, so the v1 withdrawal has no through.
   check("R4_S1_symlinked_grok_sessions_directory_is_never_attested",
-    grokEvents === 0 && claim.through !== null && claim.through > endedAt && inGap(claim, endedAt),
+    grokEvents === 0 && claim.through === null && inGap(claim, endedAt),
     { endedAt, grokFilesSeen: scan.filesSeen, grokEvents, attested: attests(claim, endedAt), claim });
 }
 
@@ -203,7 +204,7 @@ async function claudeProjectDirectory() {
   const events = captured(scene.buffer, session);
   scene.close();
   check("R4_S1_symlinked_claude_project_directory_is_never_attested",
-    events === 0 && claim.through !== null && claim.through > usedAt && inGap(claim, usedAt),
+    events === 0 && claim.through === null && inGap(claim, usedAt),
     { usedAt, captured: events, attested: attests(claim, usedAt), claim });
 }
 
@@ -221,7 +222,7 @@ async function claudeTranscriptFile() {
   const events = captured(scene.buffer, session);
   scene.close();
   check("R4_S1_symlinked_claude_transcript_is_never_attested",
-    events === 0 && claim.through !== null && claim.through > usedAt && inGap(claim, usedAt),
+    events === 0 && claim.through === null && inGap(claim, usedAt),
     { usedAt, captured: events, attested: attests(claim, usedAt), claim });
 }
 
@@ -247,7 +248,7 @@ async function codexDayFolder() {
   const events = captured(scene.buffer, session);
   scene.close();
   check("R4_S1_symlinked_codex_day_folder_is_never_attested",
-    events === 0 && claim.through !== null && claim.through > usedAt && inGap(claim, usedAt),
+    events === 0 && claim.through === null && inGap(claim, usedAt),
     { usedAt, captured: events, attested: attests(claim, usedAt), claim });
 }
 

@@ -7,6 +7,7 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
+import { recordSpoolLossGap } from "./lean/capture-gaps";
 import { currentDispatchCaptureRoots } from "./capture-root-inventory";
 import { countUnlinkableDispatchBindings } from "./dispatch-command";
 import { readJevAnalysis, type JevAnalysisSnapshot } from "./jev-analysis";
@@ -36,6 +37,7 @@ import {
   otlpBatchRemainder,
   otlpChunk,
   otlpChunkCount,
+  syncLedger,
   type OtlpIntakeBatch,
   type OtlpIntakeSpool,
   type OtlpSpoolCause,
@@ -455,6 +457,8 @@ export function createHookSpoolDrain(
     maxFilesPerTick?: number;
     nowMs?: () => number;
     onWarning?: (line: Record<string, unknown>) => void;
+    /** Fixture seam for the required WAL flush before spool-file removal. */
+    flushLedger?: () => Promise<void>;
   },
 ): HookSpoolDrain {
   const env = options.env ?? process.env;
@@ -462,12 +466,35 @@ export function createHookSpoolDrain(
   const intervalMs = options.intervalMs ?? HOOK_SPOOL_LIMITS.drainIntervalMs;
   const maxFilesPerTick = options.maxFilesPerTick ?? HOOK_SPOOL_LIMITS.maxFilesPerTick;
   const warn = options.onWarning ?? ((line) => console.warn(JSON.stringify(line)));
+  const flushLedger = options.flushLedger ?? (() => syncLedger(buffer.database));
   const enabled = hookSpoolEnabled(env);
   let counters = readHookSpoolCounters(options.home);
   let pending = hookSpoolPending(options.home, nowMs());
   let timer: NodeJS.Timeout | undefined;
   let inFlight = false;
   let ticks = 0;
+
+  const rejectWithGap = async (file: Parameters<typeof rejectHookSpoolFile>[1],
+    reason: string, source = "unknown") => {
+    try {
+      buffer.transactionWithRepoContextHandoffs(() => recordSpoolLossGap(buffer.database, {
+        spool: "hook", spoolId: file.name, atMs: file.spooledAtMs,
+        source, reason: "contract_violation", droppedRows: null,
+        droppedUsageRows: null,
+      }));
+      await flushLedger();
+    } catch (error) {
+      warn({ warning: "hook_spool_loss_gap_unavailable", code: errorCodeOnly(error) });
+      return false;
+    }
+    try {
+      const moved = rejectHookSpoolFile(options.home, file, reason);
+      return moved !== null || !fs.existsSync(file.path);
+    } catch (error) {
+      warn({ warning: "hook_spool_remove_failed", code: errorCodeOnly(error) });
+      return false;
+    }
+  };
 
   const snapshot = (): HookSpoolStatus => ({ enabled, ...counters, ...pending });
 
@@ -520,13 +547,21 @@ export function createHookSpoolDrain(
     for (const file of files) {
       result.attempted += 1;
       if (!directoryTrusted || !hookSpoolEntryTrusted(file.path, "file")) {
-        rejectHookSpoolFile(options.home, file, "spool_untrusted");
+        if (!await rejectWithGap(file, "spool_untrusted")) {
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
         result.rejected += 1;
         continue;
       }
       const read = readHookSpoolFile(file.path);
       if (!read.ok) {
-        rejectHookSpoolFile(options.home, file, read.reason);
+        if (!await rejectWithGap(file, read.reason)) {
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
         result.rejected += 1;
         continue;
       }
@@ -547,9 +582,24 @@ export function createHookSpoolDrain(
           },
         );
         try {
+          await flushLedger();
+        } catch (error) {
+          // Admission committed, but the stronger spool durability must not
+          // be discarded until the WAL (or checkpointed DB) reaches disk.
+          warn({ warning: "hook_spool_ledger_flush_failed", code: errorCodeOnly(error) });
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
+        try {
           fs.unlinkSync(file.path);
-        } catch {
-          /* already gone; the counter still reflects the applied event */
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            warn({ warning: "hook_spool_remove_failed", code: errorCodeOnly(error) });
+            result.deferred += 1;
+            result.deferredTick = true;
+            break;
+          }
         }
         result.recovered += 1;
       } catch (error) {
@@ -559,7 +609,14 @@ export function createHookSpoolDrain(
           result.deferredTick = true;
           break;
         }
-        rejectHookSpoolFile(options.home, file, failure.reason);
+        // A readable envelope does not prove its hook body was normalized.
+        // Contract rejection may happen while parsing it, so the loss count
+        // remains unknown unless an admitted row supplied an exact count.
+        if (!await rejectWithGap(file, failure.reason, read.envelope.source)) {
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
         result.rejected += 1;
       }
       // Yield between files: the drain shares this loop with /hooks/* and the
@@ -1197,6 +1254,7 @@ export function createCollectorServer(
       captureHealth: status.health ?? null,
       historyCoverage,
       captureBaseline: refreshControl ? captureBaselineStatus(buffer.database) : cachedControl?.captureBaseline ?? null,
+      captureDurability: refreshControl ? buffer.captureDurability.status() : cachedControl?.captureDurability ?? null,
       accountAssertions,
       accountAssertionAdapters: refreshControl ? accountAssertions : cachedControl?.accountAssertionAdapters ?? null,
       accountAssertionStatusLine: refreshControl ? formatAccountAssertionStatusLine(buffer.database)
@@ -1283,6 +1341,7 @@ export function createCollectorServer(
       maintenance: options.maintenanceStatus?.() ?? null,
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
+      captureDurability: buffer.captureDurability.status(),
       accountAssertions,
       accountAssertionAdapters: accountAssertions,
       accountAssertionStatusLine: formatAccountAssertionStatusLine(buffer.database),
@@ -1459,6 +1518,7 @@ export function createCollectorServer(
             maintenance: options.maintenanceStatus?.() ?? null,
             historyCoverage: null,
             captureBaseline: null,
+            captureDurability: lastCoherentStatus?.body.captureDurability ?? buffer.captureDurability.status(),
             accountAssertions: defaultAccountAssertionStatus(),
             accountAssertionAdapters: defaultAccountAssertionStatus(),
             accountAssertionStatusLine: formatAccountAssertionStatusRows(defaultAccountAssertionStatus()),
@@ -2156,7 +2216,8 @@ export function createCollectorServer(
           // A deadline refusal the OTLP intake spool could not hold is a 503
           // for the same reason (bead eco-6hoxj.163.17).
           ...(failure.status === 503 &&
-            (failure.reason === "storage_busy_retry" || failure.reason === "request_deadline_exceeded")
+            (failure.reason === "storage_busy_retry" || failure.reason === "request_deadline_exceeded" ||
+              failure.reason === "gap_record_unavailable")
             ? { "retry-after": "1" }
             : {}),
         });
