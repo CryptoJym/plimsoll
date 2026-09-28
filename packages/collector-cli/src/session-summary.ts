@@ -80,6 +80,8 @@ type SummaryAccumulator = SummaryAggregate & {
   cursorObservedAt: string | null;
   cursorRowid: number;
   cursorId: string | null;
+  /** Next upper rowid for a bounded predecessor search after checkpoint loss. */
+  checkpointSearchRowid: number | null;
   /** A bounded rowid segment is replaced after a scanned edit or maturity. */
   segments: Record<string, SummaryAggregate>;
   scanComplete: boolean;
@@ -873,6 +875,7 @@ function emptyAccumulator(sessionId: string): SummaryAccumulator {
   return {
     ...emptyAggregate(), sessionId, scanBoundary: 0,
     cursorObservedAt: null, cursorRowid: 0, cursorId: null,
+    checkpointSearchRowid: null,
     segments: {}, scanComplete: false, activeRepair: null,
   };
 }
@@ -1045,6 +1048,8 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
     if (typeof candidate.cursorObservedAt !== "string" && candidate.cursorObservedAt !== null) return null;
     if (!Number.isSafeInteger(candidate.cursorRowid) || candidate.cursorRowid < 0) return null;
     if (typeof candidate.cursorId !== "string" && candidate.cursorId !== null) return null;
+    if (candidate.checkpointSearchRowid !== null &&
+        (!Number.isSafeInteger(candidate.checkpointSearchRowid) || candidate.checkpointSearchRowid < 0)) return null;
     if (!validAggregate(candidate)) return null;
     if (typeof candidate.scanComplete !== "boolean") return null;
     if (!candidate.segments || typeof candidate.segments !== "object" || Array.isArray(candidate.segments)) return null;
@@ -1138,24 +1143,35 @@ async function checkpointValid(
   maxMs?: number,
   cursorSegmentQueued = false,
   highWaterSegmentQueued = false,
-): Promise<boolean> {
+): Promise<"valid" | "invalid" | "search_pending"> {
   if (state.highWater === 0) return state.checkpointId === null &&
-    accumulator.cursorRowid === 0 && accumulator.cursorObservedAt === null && accumulator.cursorId === null;
-  if (state.checkpointId === null) return false;
+    accumulator.cursorRowid === 0 && accumulator.cursorObservedAt === null && accumulator.cursorId === null
+    ? "valid" : "invalid";
+  if (state.checkpointId === null) return "invalid";
   let rows = await read<{ id: string; sessionId: string | null; observedAt: string }>(rowCheckpointQuery(state, maxMs));
-  if (rows.length === 0 && highWaterSegmentQueued && accumulator.scanComplete) {
-    // Erasure of the terminal raw row leaves a valid prefix but removes its
-    // identity checkpoint. Move the watermark to the prior live row before
-    // repairing the queued segment. An append that reuses the erased rowid
-    // will then remain above the watermark and drain from the append queue.
+  if ((rows.length === 0 || rows[0]?.id !== state.checkpointId ||
+       rows[0]?.sessionId !== sessionId) && highWaterSegmentQueued && accumulator.scanComplete) {
+    // Erasure, rowid reuse, and reattribution all remove this checkpoint from
+    // the old session. Search one bounded rowid window per pass. The cursor is
+    // persisted before the next cycle, so a distant predecessor never forces
+    // one unbounded sort or repeats the same window after a read deadline.
     const erasedRowid = state.highWater;
-    const prior = await read<{ rowid: number; id: string; sessionId: string; observedAt: string }>([{
-      sql: `select rowid, id, session_id as sessionId, observed_at as observedAt
-        from buffered_events where rowid < @rowid and session_id = @sessionId
-        order by rowid desc limit 1`,
-      params: { rowid: erasedRowid, sessionId },
-      ...(maxMs === undefined ? {} : { maxMs }),
-    }]);
+    const upperRowid = accumulator.checkpointSearchRowid ?? erasedRowid - 1;
+    const lowerRowid = Math.max(1, upperRowid - SESSION_SUMMARY_SEGMENT_ROWS + 1);
+    const prior = upperRowid > 0
+      ? await read<{ rowid: number; id: string; sessionId: string; observedAt: string }>([{
+        sql: `select rowid, id, session_id as sessionId, observed_at as observedAt
+          from buffered_events not indexed
+          where rowid >= @lowerRowid and rowid <= @upperRowid and session_id = @sessionId
+          order by rowid desc limit 1`,
+        params: { lowerRowid, upperRowid, sessionId },
+        ...(maxMs === undefined ? {} : { maxMs }),
+      }]) : [];
+    if (prior.length === 0 && lowerRowid > 1) {
+      accumulator.checkpointSearchRowid = lowerRowid - 1;
+      return "search_pending";
+    }
+    accumulator.checkpointSearchRowid = null;
     state.highWater = prior[0]?.rowid ?? 0;
     state.checkpointId = prior[0]?.id ?? null;
     if (accumulator.cursorRowid === erasedRowid || state.highWater === 0) {
@@ -1163,21 +1179,23 @@ async function checkpointValid(
       accumulator.cursorId = null;
       accumulator.cursorObservedAt = null;
     }
-    if (state.highWater === 0) return true;
+    if (state.highWater === 0) return "valid";
     rows = prior;
   }
-  if (rows.length !== 1 || rows[0]?.id !== state.checkpointId || rows[0]?.sessionId !== sessionId) return false;
-  if (accumulator.cursorRowid === 0) return accumulator.cursorObservedAt === null && accumulator.cursorId === null;
-  if (accumulator.cursorObservedAt === null || accumulator.cursorId === null) return false;
+  if (rows.length !== 1 || rows[0]?.id !== state.checkpointId || rows[0]?.sessionId !== sessionId) return "invalid";
+  accumulator.checkpointSearchRowid = null;
+  if (accumulator.cursorRowid === 0) return accumulator.cursorObservedAt === null && accumulator.cursorId === null
+    ? "valid" : "invalid";
+  if (accumulator.cursorObservedAt === null || accumulator.cursorId === null) return "invalid";
   if (accumulator.cursorRowid === state.highWater) {
-    if (rows[0]?.id !== accumulator.cursorId) return false;
-    if (rows[0]?.observedAt === accumulator.cursorObservedAt) return true;
-    if (!cursorSegmentQueued) return false;
+    if (rows[0]?.id !== accumulator.cursorId) return "invalid";
+    if (rows[0]?.observedAt === accumulator.cursorObservedAt) return "valid";
+    if (!cursorSegmentQueued) return "invalid";
     // A completed historical scan no longer seeks by this timestamp. The
     // trigger queued its segment, so repair that row and persist the new
     // checkpoint timestamp instead of discarding the whole prefix.
     accumulator.cursorObservedAt = rows[0].observedAt;
-    return true;
+    return "valid";
   }
   const cursorRows = await read<{ id: string; sessionId: string | null; observedAt: string }>([{
     sql: `select id, session_id as sessionId, observed_at as observedAt
@@ -1191,14 +1209,14 @@ async function checkpointValid(
     accumulator.cursorRowid = 0;
     accumulator.cursorId = null;
     accumulator.cursorObservedAt = null;
-    return true;
+    return "valid";
   }
   if (cursorRows.length !== 1 || cursorRows[0]?.id !== accumulator.cursorId ||
-      cursorRows[0]?.sessionId !== sessionId) return false;
-  if (cursorRows[0]?.observedAt === accumulator.cursorObservedAt) return true;
-  if (!cursorSegmentQueued) return false;
+      cursorRows[0]?.sessionId !== sessionId) return "invalid";
+  if (cursorRows[0]?.observedAt === accumulator.cursorObservedAt) return "valid";
+  if (!cursorSegmentQueued) return "invalid";
   accumulator.cursorObservedAt = cursorRows[0].observedAt;
-  return true;
+  return "valid";
 }
 
 function summaryRowsQuery(
@@ -1564,10 +1582,10 @@ async function updateSessionSummaryAttempt(
   const repairAvailable = pendingRepair !== null || Boolean(stored && parsed &&
     stored.mutationRevision === currentRevision &&
     (parsed.activeRepair !== null || dueSegment(parsed, until) !== null));
-  let checkpointOk = false;
+  let checkpointStatus: "valid" | "invalid" | "search_pending" = "invalid";
   if (stored && parsed && validStoredState(stored, sessionId, until)) {
     try {
-      checkpointOk = await checkpointValid(stored, parsed, sessionId, options.read, maxMs,
+      checkpointStatus = await checkpointValid(stored, parsed, sessionId, options.read, maxMs,
         cursorSegmentQueued, highWaterSegmentQueued);
     } catch (error) {
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
@@ -1581,6 +1599,25 @@ async function updateSessionSummaryAttempt(
       });
     }
   }
+  if (checkpointStatus === "search_pending" && stored && parsed) {
+    const saved = await writeRetry.run(() => db.transaction(() => {
+      if (currentStateGeneration(db, sessionId) !== stateGenerationAtStart ||
+          sessionActivityRevision(db, sessionId) !== activityAtStart ||
+          sessionRevision(db, sessionId) !== currentRevision) return false;
+      const searching = stateFromStored(stored, parsed);
+      searching.complete = false;
+      writeState(db, searching);
+      return true;
+    }).immediate());
+    if (!saved) return retryFromLatest(0);
+    return finish({
+      snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
+      durationMs: Math.round(performance.now() - started), highWater: stored.highWater,
+      mode: stored.mode, fullRecompute: false,
+      fallbackReason: "checkpoint_search_in_progress", mutationRevision: stored.mutationRevision,
+    });
+  }
+  const checkpointOk = checkpointStatus === "valid";
   const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk,
     dirtyReason, repairAvailable);
   const resumableFallback = stored?.mode === "fallback" &&

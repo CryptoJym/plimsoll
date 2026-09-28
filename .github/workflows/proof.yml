@@ -344,6 +344,18 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-reconciliation
 
+      - name: Prove two collectors cannot commit a stale segment repair (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-concurrent-repair
+
+      - name: Prove retargeted checkpoints repair both sessions (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-retarget
+
+      - name: Prove distant checkpoint predecessors use bounded durable windows (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-window
+
       - name: Prove an append during segment repair enters the wire once (eco-6hoxj.163.106)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-queued-append-repair
