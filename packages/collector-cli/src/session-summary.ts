@@ -605,14 +605,14 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
         on conflict(session_id, segment) do update set revision = revision + 1;
     end;
     `);
+    // Check after taking the writer lock. A second collector upgrading this
+    // ledger must see the first one's ALTER instead of attempting it again.
+    // Existing v4 states gain the fence without rereading buffered_events.
+    if (!columnNames(db, "session_sync_summary_state").has("state_generation")) {
+      db.exec(`alter table session_sync_summary_state
+        add column state_generation integer not null default 0 check (state_generation >= 0)`);
+    }
   }).immediate();
-
-  // Existing v4 states gain a constant-size conflict fence without reading
-  // buffered_events or rebuilding their summary.
-  if (!columnNames(db, "session_sync_summary_state").has("state_generation")) {
-    db.exec(`alter table session_sync_summary_state
-      add column state_generation integer not null default 0 check (state_generation >= 0)`);
-  }
 
   // The previous schema stored the global revision in each state. Preserve
   // that baseline once, then let dirty-marker triggers advance only the
