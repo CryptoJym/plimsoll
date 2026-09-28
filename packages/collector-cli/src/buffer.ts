@@ -264,6 +264,10 @@ export class LocalEventBuffer {
     };
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
+    if (options.freshCaptureRootEpoch !== undefined && options.freshCaptureRootEpoch !== null &&
+        !installationEpochIdSchema.safeParse(options.freshCaptureRootEpoch).success) {
+      throw new Error("installation_epoch_id_invalid");
+    }
     // A mixed-root replacement must not leave an empty SQLite file or WAL
     // sidecar behind. An existing bound ledger decides from its durable epoch
     // inside useWorkspace's transaction, regardless of stale root config.

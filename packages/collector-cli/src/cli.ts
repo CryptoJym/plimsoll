@@ -51,6 +51,8 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
+import { planFreshLedgerCutover, switchFreshLedger,
+  restoreArchivedLedger, assertReplacementRuntimeCompatible } from "./fresh-ledger-cutover";
 import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
@@ -384,9 +386,12 @@ Commands:
   capture-roots discover [--json]
                         List native capture roots under $HOME with their state
                         (registered | candidate | missing); read-only
-  capture-roots epoch-plan [--json]
-                        Refuse unless the ledger is absent and configured roots
-                        agree on the epoch a fresh ledger will adopt; read-only
+  capture-roots epoch-plan [--archive ABSOLUTE-PATH] [--json]
+                        Inspect epoch, cursor, weekly and live cutover state; read-only
+  capture-roots epoch-switch --archive ABSOLUTE-PATH
+                        Hold the old ledger exclusively, archive it and bind a replacement
+  capture-roots epoch-restore --archive ABSOLUTE-PATH --save-fresh ABSOLUTE-PATH
+                        Restore the archive before any older runtime is selected
   capture-roots add --source codex|claude_code --directory DIR [--directory DIR]
                         [--machine LABEL] [--allow-scan-errors] [--dry-run] [--json]
                         Append a newly discovered capture root: derives the
@@ -5400,8 +5405,8 @@ async function main() {
   // change an existing root, epoch or enrollment field.
   if (command === "capture-roots") {
     const action = process.argv[3] ?? "";
-    if (!["discover", "epoch-plan", "add"].includes(action)) {
-      throw new Error("Expected capture-roots discover|epoch-plan|add");
+    if (!["discover", "epoch-plan", "epoch-switch", "epoch-restore", "add"].includes(action)) {
+      throw new Error("Expected capture-roots discover|epoch-plan|epoch-switch|epoch-restore|add");
     }
     const home = os.homedir();
     const configuredRoots = configRead?.status === "valid" ? config.captureRoots ?? [] : [];
@@ -5410,7 +5415,52 @@ async function main() {
       process.exitCode = 1;
     };
 
-    if (action === "epoch-plan") {
+    if (action === "epoch-restore") {
+      const archivePath = optionValue("--archive");
+      const freshAttemptPath = optionValue("--save-fresh");
+      if (!archivePath || !freshAttemptPath) {
+        refuse("archive_and_save_fresh_paths_required");
+        return;
+      }
+      try {
+        const receipt = restoreArchivedLedger({ ledgerPath: collectorBufferPath(),
+          archivePath, freshAttemptPath, authorityRoot: defaultLifecycleAuthorityRoot() });
+        console.log(JSON.stringify({ status: "capture_roots_epoch_restored", ...receipt }, null, 2));
+      } catch (error) {
+        refuse(error instanceof Error ? error.message : "restore_failed");
+      }
+      return;
+    }
+
+    if (action === "epoch-plan" || action === "epoch-switch") {
+      const archivePath = optionValue("--archive");
+      if (action === "epoch-switch" && !archivePath) {
+        refuse("archive_path_required");
+        return;
+      }
+      if (archivePath) {
+        if (configRead?.status !== "valid" || config.installKey === "local-dev" || !config.deviceId) {
+          refuse(configRead?.status !== "valid" ? "config_not_valid" : "joined_identity_required");
+          return;
+        }
+        const input = { ledgerPath: collectorBufferPath(), archivePath, config,
+          authorityRoot: defaultLifecycleAuthorityRoot() };
+        const plan = planFreshLedgerCutover(input);
+        if (action === "epoch-plan" || plan.status !== "ready") {
+          console.log(JSON.stringify({ ...plan, status: plan.status === "ready"
+            ? "capture_roots_epoch_plan" : "capture_roots_epoch_plan_refused" }, null, 2));
+          if (plan.status !== "ready") process.exitCode = 1;
+          return;
+        }
+        try {
+          const switched = switchFreshLedger(input);
+          console.log(JSON.stringify({ ...switched, status: "capture_roots_epoch_switched",
+            readOnly: false }, null, 2));
+        } catch (error) {
+          refuse(error instanceof Error ? error.message : "cutover_failed");
+        }
+        return;
+      }
       const ledgerPath = collectorBufferPath();
       const epochs = new Set(configuredRoots.map((root) => root.installationEpochId));
       const reason = configRead?.status !== "valid" ? "config_not_valid"
@@ -6647,6 +6697,8 @@ async function main() {
         argv: [action, ...process.argv.slice(4)],
         adapter: composeLifecycleAdapter({ keepAll }),
         resolveArtifact,
+        beforeRuntimeSwitch: artifact =>
+          assertReplacementRuntimeCompatible(collectorBufferPath(), artifact.version),
         ...(action === "update" ? { pairingIndexes: buildPairingIndexesAfterUpdate } : {}),
         ...(optionValue("--readiness-timeout-ms") !== undefined && Number.isFinite(readinessTimeoutOption)
           ? { readinessTimeoutMs: readinessTimeoutOption }

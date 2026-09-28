@@ -1856,6 +1856,29 @@ export function captureBaselinePostEnrollmentOffset(
   return size !== null && observation.size > size ? size : null;
 }
 
+const carriedCursorTablePresent = new WeakMap<object, boolean>();
+
+/** An archive cursor is allowed through the replacement's baseline only for
+ * the exact file generation that committed it. New generations retain the
+ * ordinary baseline rule. The marker contains no source path. */
+export function carriedCaptureCursorMatches(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  fileKey: string,
+  observation: CaptureBaselineFileObservation,
+): boolean {
+  let present = carriedCursorTablePresent.get(database);
+  if (present === undefined) {
+    present = Boolean(database.prepare(`select 1 from sqlite_master
+      where type='table' and name='replacement_capture_cursors'`).get());
+    carriedCursorTablePresent.set(database, present);
+  }
+  if (!present) return false;
+  const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+  return Boolean(database.prepare(`select 1 from replacement_capture_cursors
+    where source=? and file_key=? and file_identity=?`).get(source, fileKey, identity));
+}
+
 /**
  * Advance growth watermarks after an exhaustive explicit scan. The rows stay
  * present: explicit history repair acknowledges coverage but never clears an

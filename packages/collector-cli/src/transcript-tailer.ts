@@ -35,6 +35,7 @@ import {
   captureBaselineStatus,
   captureBaselineExcludedSize,
   captureBaselinePostEnrollmentOffset,
+  carriedCaptureCursorMatches,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -204,7 +205,7 @@ export type TranscriptScanOptions = {
   deferredBeforeIo?: boolean;
 };
 
-function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
+export function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
   if (!isRecord(value)) return undefined;
   if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git", "pending", "usageRevisions"])) {
     return undefined;
@@ -404,7 +405,11 @@ export class TranscriptTailer {
         if (checked && stat?.isFile() && !checked.fullyRead) {
           const baselineSize = baselineComplete
             ? captureBaselineExcludedSize(this.buffer.database, "claude_code", baselineObservation(file, stat)) : null;
-          if (baselineSize === null || stat.size > baselineSize) this.revisit.offer(file);
+          if (baselineSize === null || stat.size > baselineSize ||
+              carriedCaptureCursorMatches(this.buffer.database, "claude_code",
+                jsonlScanStateKey(this.cursorKey(file)), baselineObservation(file, stat))) {
+            this.revisit.offer(file);
+          }
           else this.revisit.remove(file);
         } else this.revisit.remove(file);
         if (checked) known.checked(checked.key);
@@ -948,7 +953,9 @@ export class TranscriptTailer {
           observation,
           { mode: "automatic", observedAt: scanNow.toISOString() },
         );
-        if (decision.decision === "exclude") {
+        if (decision.decision === "exclude" &&
+            !carriedCaptureCursorMatches(this.buffer.database, "claude_code",
+              jsonlScanStateKey(this.cursorKey(file)), observation)) {
           if (stat.size <= decision.baselineSize) {
             result.excludedGenerations += 1;
             result.excludedBytes += stat.size;
@@ -1077,8 +1084,10 @@ export class TranscriptTailer {
                 const observation = baselineObservation(candidate.file, fresh);
                 const decision = classifyCaptureBaselineFile(this.buffer.database, "claude_code", observation,
                   {mode:"automatic", observedAt:scanNow.toISOString()});
-                return decision.decision === "capture" || decision.decision === "exclude" &&
-                  captureBaselinePostEnrollmentOffset(this.buffer.database, "claude_code", observation) !== null;
+                return decision.decision === "capture" || decision.decision === "exclude" && (
+                  captureBaselinePostEnrollmentOffset(this.buffer.database, "claude_code", observation) !== null ||
+                  carriedCaptureCursorMatches(this.buffer.database, "claude_code",
+                    jsonlScanStateKey(this.cursorKey(candidate.file)), observation));
               },
             });
             if (!next) {

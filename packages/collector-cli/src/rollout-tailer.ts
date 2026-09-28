@@ -34,6 +34,7 @@ import {
   captureBaselineStatus,
   captureBaselineExcludedSize,
   captureBaselinePostEnrollmentOffset,
+  carriedCaptureCursorMatches,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -247,7 +248,7 @@ function diff(current: TokenTotals, previous: TokenTotals): TokenTotals {
   };
 }
 
-function validateRolloutParserState(value: unknown): RolloutParserState | undefined {
+export function validateRolloutParserState(value: unknown): RolloutParserState | undefined {
   if (!isRecord(value)) return undefined;
   if (
     !hasOnlyKeys(value, [
@@ -466,7 +467,11 @@ export class RolloutTailer {
         if (checked && stat?.isFile() && !checked.fullyRead) {
           const baselineSize = baselineComplete
             ? captureBaselineExcludedSize(this.buffer.database, "codex", baselineObservation(file, stat)) : null;
-          if (baselineSize === null || stat.size > baselineSize) this.revisit.offer(file);
+          if (baselineSize === null || stat.size > baselineSize ||
+              carriedCaptureCursorMatches(this.buffer.database, "codex",
+                jsonlScanStateKey(this.cursorKey(file)), baselineObservation(file, stat))) {
+            this.revisit.offer(file);
+          }
           else this.revisit.remove(file);
         } else this.revisit.remove(file);
         if (checked) known.checked(checked.key);
@@ -993,7 +998,9 @@ export class RolloutTailer {
           observation,
           { mode: "automatic", observedAt: scanNow.toISOString() },
         );
-        if (decision.decision === "exclude") {
+        if (decision.decision === "exclude" &&
+            !carriedCaptureCursorMatches(this.buffer.database, "codex",
+              jsonlScanStateKey(this.cursorKey(file)), observation)) {
           if (stat.size <= decision.baselineSize) {
             result.excludedGenerations += 1;
             result.excludedBytes += stat.size;
@@ -1119,8 +1126,10 @@ export class RolloutTailer {
                 const observation = baselineObservation(candidate.file, fresh);
                 const decision = classifyCaptureBaselineFile(this.buffer.database, "codex", observation,
                   {mode:"automatic", observedAt:scanNow.toISOString()});
-                return decision.decision === "capture" || decision.decision === "exclude" &&
-                  captureBaselinePostEnrollmentOffset(this.buffer.database, "codex", observation) !== null;
+                return decision.decision === "capture" || decision.decision === "exclude" && (
+                  captureBaselinePostEnrollmentOffset(this.buffer.database, "codex", observation) !== null ||
+                  carriedCaptureCursorMatches(this.buffer.database, "codex",
+                    jsonlScanStateKey(this.cursorKey(candidate.file)), observation));
               },
             });
             if (!next) {

@@ -257,6 +257,18 @@ export function loadJsonlScanCursor<T>(
   checkpointVersion: number,
   validateParserState: ParserStateValidator<T>,
 ): JsonlScanCursor<T> | undefined {
+  return loadJsonlScanCursorByKey(database, jsonlScanStateKey(file), parserKind,
+    checkpointVersion, validateParserState);
+}
+
+/** Read a pre-hashed cursor key when validating an archived ledger. */
+export function loadJsonlScanCursorByKey<T>(
+  database: Database.Database,
+  fileKey: string,
+  parserKind: string,
+  checkpointVersion: number,
+  validateParserState: ParserStateValidator<T>,
+): JsonlScanCursor<T> | undefined {
   const row = database
     .prepare(
       `select size,
@@ -280,7 +292,7 @@ export function loadJsonlScanCursor<T>(
          parser_state_json as parserStateJson
        from ${STATE_TABLE} where file = ?`,
     )
-    .get(jsonlScanStateKey(file)) as RawCursorRow | undefined;
+    .get(fileKey) as RawCursorRow | undefined;
   if (!row) return undefined;
 
   const legacy =
