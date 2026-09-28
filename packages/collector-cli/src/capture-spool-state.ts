@@ -1,7 +1,7 @@
 import { hookSpoolDirectory, listHookSpoolArrivalDetails } from "./hook-spool";
 import { listOtlpSpoolArrivals, otlpSpoolDirectory } from "./otlp-spool";
 import { readSpoolLosses, type SpoolLoss } from "./spool-losses";
-import { clearMaintenanceRebuildPause, countMaintenanceRebuildRefusals,
+import { clearMaintenanceRebuildPause, reconcileMaintenanceRebuildRefusals,
   settleInterruptedMaintenanceRebuildPause } from "./maintenance-rebuild-pause-state";
 
 /**
@@ -28,7 +28,8 @@ export function captureSpoolState(home: string): CaptureSpoolState {
   const listings = [hookArrivals?.map((arrival) => arrival.atMs) ?? null, listOtlpSpoolArrivals(home)];
   const logs = [readSpoolLosses(hookSpoolDirectory(home)), readSpoolLosses(otlpSpoolDirectory(home))];
   const arrivals = listings.flatMap((listing) => listing ?? []);
-  const refused = countMaintenanceRebuildRefusals(home);
+  const refusalState = reconcileMaintenanceRebuildRefusals(home);
+  const refused = refusalState.count;
   const unreadable = [...listings, ...logs, refused].some((value) => value === null);
   // Current client retries use the 0.7.44-compatible filename and a durable
   // refusal receipt until drain. Recognize previously tagged files as well.
@@ -46,7 +47,10 @@ export function captureSpoolState(home: string): CaptureSpoolState {
   return {
     pendingFiles: arrivals.length,
     oldestPendingMs: arrivals.reduce<number | null>((oldest, at) => (oldest === null || at < oldest ? at : oldest), null),
-    losses: logs.flatMap((log) => log ?? []),
+    // A missing client retry past the spool's stale threshold is a durable
+    // known unknown, carried by its retained receipt and visible as a claim
+    // gap/dead count. A later exact ledger match retires that gap.
+    losses: [...logs.flatMap((log) => log ?? []), ...refusalState.lost],
     unreadable,
     maintenanceRebuildPending,
   };

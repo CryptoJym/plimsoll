@@ -125,7 +125,7 @@ import {
   scanProducerProcesses,
 } from "./producer-processes";
 import { healthzProof, isHealthzChallenge, summaryPendingStatus } from "./status-summary";
-import { resolveMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
+import { reconcileMaintenanceRebuildRefusals, resolveMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -430,6 +430,8 @@ export function createHookSpoolDrain(
   const maxFilesPerTick = options.maxFilesPerTick ?? HOOK_SPOOL_LIMITS.maxFilesPerTick;
   const warn = options.onWarning ?? ((line) => console.warn(JSON.stringify(line)));
   const enabled = hookSpoolEnabled(env);
+  // Reconcile receipts left by an older, compatible drain at daemon start.
+  if (enabled) reconcileMaintenanceRebuildRefusals(options.home);
   let counters = readHookSpoolCounters(options.home);
   let pending = hookSpoolPending(options.home, nowMs());
   let timer: NodeJS.Timeout | undefined;
@@ -479,6 +481,7 @@ export function createHookSpoolDrain(
         refused: intakeOwned.refused,
       };
       pending = hookSpoolPending(options.home, nowMs());
+      reconcileMaintenanceRebuildRefusals(options.home);
       return result;
     }
     // The trust boundary is the directory first: a spool directory this uid
@@ -499,7 +502,7 @@ export function createHookSpoolDrain(
       }
       try {
         // The hook's own time, not the drain's (review r2, F1).
-        await admitHookBody(
+        const admitted = await admitHookBody(
           spooledBodyWithHookTime(read.envelope.body, read.envelope.receivedAt),
           read.envelope.source,
           { config, buffer, budget: createRequestBudget(), probe: read.envelope.probe },
@@ -515,7 +518,8 @@ export function createHookSpoolDrain(
         }
         if (removed) {
           try {
-            resolveMaintenanceRebuildRefusal(options.home, "hook", read.envelope.source, read.envelope.body);
+            resolveMaintenanceRebuildRefusal(options.home, "hook", read.envelope.source, read.envelope.body,
+              { acceptedEventId: admitted.event.id, ledger: buffer.database, spoolName: file.name });
           } catch (error) {
             warn({ warning: "maintenance_refusal_retirement_failed", code: errorCodeOnly(error) });
           }
@@ -531,7 +535,8 @@ export function createHookSpoolDrain(
         rejectHookSpoolFile(options.home, file, failure.reason);
         if (!fs.existsSync(file.path)) {
           try {
-            resolveMaintenanceRebuildRefusal(options.home, "hook", read.envelope.source, read.envelope.body);
+            resolveMaintenanceRebuildRefusal(options.home, "hook", read.envelope.source, read.envelope.body,
+              { outcome: "terminal", spoolName: file.name });
           } catch (retireError) {
             warn({ warning: "maintenance_refusal_retirement_failed", code: errorCodeOnly(retireError) });
           }
@@ -581,6 +586,7 @@ export function createHookSpoolDrain(
         }),
       );
     }
+    reconcileMaintenanceRebuildRefusals(options.home);
     return result;
   };
 
@@ -1325,10 +1331,12 @@ export function createCollectorServer(
     // One request, one handler invocation, so this cannot cross requests.
     let intakeSpoolDiagnostic: Record<string, unknown> | undefined;
     let maintenanceRetry: { route: "hook" | "otlp"; source: string; body: string } | undefined;
-    const retireMaintenanceRetry = () => {
+    const retireMaintenanceRetry = (options: { outcome?: "accepted" | "terminal";
+      acceptedEventId?: string } = {}) => {
       if (maintenanceRefusalHome && maintenanceRetry) {
         resolveMaintenanceRebuildRefusal(maintenanceRefusalHome,
-          maintenanceRetry.route, maintenanceRetry.source, maintenanceRetry.body);
+          maintenanceRetry.route, maintenanceRetry.source, maintenanceRetry.body,
+          { ...options, ledger: buffer.database });
       }
     };
     try {
@@ -1347,7 +1355,8 @@ export function createCollectorServer(
           // the producer retries an invalid payload, this 400 is terminal:
           // retire only that exact refused body after authentication.
           if (maintenanceRefusalHome) {
-            resolveMaintenanceRebuildRefusal(maintenanceRefusalHome, "live", selected.producerId, bytes);
+            resolveMaintenanceRebuildRefusal(maintenanceRefusalHome, "live", selected.producerId, bytes,
+              { outcome: "terminal" });
           }
           throw new HttpBoundaryRejection("invalid_json", 400);
         }
@@ -1357,7 +1366,8 @@ export function createCollectorServer(
           ? liveReceipt(packet, digest, "enrollment_rejected", false, null)
           : ingestLiveUsage(buffer, packet, digest, authenticate);
         if (result.disposition !== "retryable" && maintenanceRefusalHome) {
-          resolveMaintenanceRebuildRefusal(maintenanceRefusalHome, "live", selected.producerId, bytes);
+          resolveMaintenanceRebuildRefusal(maintenanceRefusalHome, "live", selected.producerId, bytes,
+            { outcome: result.disposition === "enrollment_rejected" ? "terminal" : "accepted" });
         }
         response.writeHead(result.disposition === "retryable" ? 503 : result.disposition === "enrollment_rejected" ? 403 : 200,
           { "content-type": "application/json", "cache-control": "no-store" });
@@ -1845,7 +1855,8 @@ export function createCollectorServer(
           if (!spooled?.ok) throw error;
           observeIntakeSpool(spooled.source, classifyRejectionClient(request));
           recordHookObservation(source, "202", producerEventId);
-          retireMaintenanceRetry();
+          // The server accepted a durable spool, not a ledger row. Its
+          // refusal stays until the drain proves a matching ledger ID.
           // 202 only after the file and directory flushes returned. The event
           // is private and blanked; the drain uses this same admission callable.
           response.writeHead(202, { "content-type": "application/json" });
@@ -1854,7 +1865,7 @@ export function createCollectorServer(
         }
         rejectionDiagnostics.recordAccepted(source);
         recordHookObservation(source, "202", producerEventId ?? normalized.event.id);
-        retireMaintenanceRetry();
+        retireMaintenanceRetry({ acceptedEventId: normalized.event.id });
         if (normalized.futureTimestampClampedEvents) {
           console.log(JSON.stringify({
             status: "hook_capture",
@@ -2075,7 +2086,7 @@ export function createCollectorServer(
       // before normal ingestion reaches its accepted-result retirement path.
       // Keep the receipt for deadline, rate-limit and server-side retry cases.
       if (maintenanceRetry && failure.status >= 400 && failure.status < 500 &&
-        failure.status !== 408 && failure.status !== 429) retireMaintenanceRetry();
+        failure.status !== 408 && failure.status !== 429) retireMaintenanceRetry({ outcome: "terminal" });
       const hookSource = request.url?.startsWith("/hooks/") ? hookSourceFromPath(request.url) : undefined;
       if (hookSource) {
         recordHookObservation(

@@ -111,7 +111,8 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
           // The client writes the privacy-blanked body into its compatible
           // spool. Key both the pending receipt and later drain to that body.
           recordMaintenanceRebuildRefusal(home, "hook", source,
-            blankForbiddenRawContent(body.text)?.text ?? body.text);
+            blankForbiddenRawContent(body.text)?.text ?? body.text,
+            { eventId: readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]) });
         }
         reply(response, 503, { status: "maintenance_rebuild_paused", source }, true, true);
         return;

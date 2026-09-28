@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { maintenanceRebuildPauseSeen, recordMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
+import { maintenanceRebuildPauseSeen, MISSING_HOOK_RETRY_MS, prepareMaintenanceHookSpoolBody,
+  recordMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 import { recordSpoolLoss } from "./spool-losses";
 
@@ -110,7 +111,7 @@ export const HOOK_SPOOL_LIMITS = Object.freeze({
    */
   temporaryOrphanMs: 60_000,
   /** Doctor says so plainly once pending files are this old. */
-  stalePendingSeconds: 600,
+  stalePendingSeconds: MISSING_HOOK_RETRY_MS / 1000,
 });
 
 export type HookSpoolBounds = { maxFiles: number; maxBytes: number };
@@ -806,13 +807,17 @@ export function writeHookSpoolEnvelope(options: {
   const maxFiles = options.limits?.maxFiles ?? HOOK_SPOOL_LIMITS.maxFiles;
   const maxBytes = options.limits?.maxBytes ?? HOOK_SPOOL_LIMITS.maxBytes;
   const nowMs = options.nowMs ?? Date.now();
+  const maintenance = options.cause === "maintenance_rebuild" && maintenanceRebuildPauseSeen(options.home);
+  const prepared = maintenance
+    ? prepareMaintenanceHookSpoolBody(options.home, options.source, options.body)
+    : { body: options.body, receiptBody: options.body, eventId: undefined };
   const envelope: HookSpoolEnvelope = {
     v: 1,
     source: options.source,
     ...(options.probe ? { probe: true } : {}),
     receivedAt: new Date(nowMs).toISOString(),
     blanked: options.blanked ?? 0,
-    body: options.body,
+    body: prepared.body,
   };
   const content = JSON.stringify(envelope);
   const contentBytes = Buffer.byteLength(content);
@@ -857,8 +862,9 @@ export function writeHookSpoolEnvelope(options: {
     syncHookSpoolDirectory(directory);
     // The filename stays readable by 0.7.44. A private metadata receipt
     // carries the maintenance cause until this file reaches a final outcome.
-    if (options.cause === "maintenance_rebuild" && maintenanceRebuildPauseSeen(options.home)) {
-      recordMaintenanceRebuildRefusal(options.home, "hook", options.source, options.body);
+    if (maintenance) {
+      recordMaintenanceRebuildRefusal(options.home, "hook", options.source, prepared.receiptBody,
+        { eventId: prepared.eventId, spoolName: path.basename(target) });
     }
     return { ok: true, path: target };
   } catch {
