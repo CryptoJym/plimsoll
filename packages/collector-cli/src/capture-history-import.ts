@@ -16,8 +16,10 @@ import { deterministicEventId } from "./normalizer";
 const UUID_AT_END = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const READ_BYTES = 128 * 1024;
-const WRITER_ROWS = 8;
-const WRITER_BUDGET_MS = 750;
+const WRITER_INITIAL_ROWS = 8;
+const WRITER_MAX_ROWS = 128;
+const WRITER_TARGET_MS = 100;
+const WRITER_HARD_MS = 250;
 type DB = Database.Database;
 type File = { file: string; limit: number; stamp: string; fencedAt: string; prefixHash?: string };
 type Amounts = { input: number; cacheRead: number; cacheCreation: number; output: number };
@@ -31,7 +33,8 @@ export type CaptureHistoryPlan = {
 export type CaptureHistoryApplyReceipt = Omit<CaptureHistoryPlan, "status" | "dryRun"> & {
   status: "capture_roots_history_imported"; importedRows: number; importedTokens: Amounts;
   totalImportedRows: number; maxWriterSliceMs: number; overBudgetSlices: number;
-  maxWriterWorkMs: number; maxWriterRowMs: number; runId: string;
+  maxWriterWorkMs: number; maxWriterRowMs: number; writerSliceHistogram: Record<string, number>;
+  writerSlices: number; timeBudgetStops: number; runId: string;
 };
 type Options = { since?: string; stopAfterSlices?: number };
 
@@ -290,8 +293,15 @@ function sourceDigest(files: File[], since: string | undefined) {
     files.map(file => [file.file, file.limit, file.stamp, file.fencedAt, file.prefixHash])
   ])).digest("hex");
 }
+type ResumePoint = { index: number; digest: string | null };
+function candidateDigest(candidate: Candidate, index: number) {
+  return crypto.createHash("sha256").update(JSON.stringify([
+    index, candidate.sourceId, captureRootObservationPayloadDigest(candidate.event),
+  ])).digest("hex");
+}
 async function scan(db: DB, root: CaptureRoot, options: Options,
-  onMissing?: (candidate: Candidate) => Promise<void>, expectedFiles?: File[]): Promise<ScanResult> {
+  onMissing?: (candidate: Candidate, index: number, digest: string) => Promise<void>,
+  expectedFiles?: File[], resume?: ResumePoint): Promise<ScanResult> {
   if (options.since && !validIso(options.since)) refusal("since_invalid_iso");
   const files = candidateFiles(db, root);
   if (expectedFiles && (files.length !== expectedFiles.length || files.some((file, index) =>
@@ -335,6 +345,8 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   const seen = new Map<string, string>();
   const matchedReceipts = new Set<string>();
   const revisions = new Map<string, Map<string, Amounts>>();
+  let candidateIndex = 0;
+  let resumeVerified = !resume?.index;
   const plan: CaptureHistoryPlan = { status: "capture_roots_history_plan", rootId: root.rootId,
     source: root.source, dryRun: true, files: files.length, sessions: 0, skippedLiveSessions: 0,
     existingRows: 0, missingRows: 0, firstObservedAt: null, lastObservedAt: null,
@@ -343,6 +355,12 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   for (const file of files) {
     const events = root.source === "codex" ? codexEvents(root, file) : claudeEvents(root, file, revisions);
     for (const candidate of events) {
+      candidateIndex += 1;
+      if (resume && candidateIndex === resume.index) {
+        if (candidateDigest(candidate, candidateIndex) !== resume.digest)
+          refusal("resume_cursor_digest_changed");
+        resumeVerified = true;
+      }
       const e = candidate.event;
       const session = e.sessionId!;
       if (options.since && e.observedAt < options.since) continue;
@@ -388,11 +406,15 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       plan.tokens.output += e.outputTokens ?? 0;
       plan.tokens.cacheRead += e.cacheReadTokens ?? 0;
       plan.tokens.cacheCreation += e.cacheCreationTokens ?? 0;
-      if (onMissing) await onMissing(candidate);
+      if (onMissing) {
+        if (resume && candidateIndex <= resume.index) refusal("resume_cursor_evidence_lost");
+        await onMissing(candidate, candidateIndex, candidateDigest(candidate, candidateIndex));
+      }
       if (plan.missingRows % 4096 === 0) await new Promise<void>(resolve => setImmediate(resolve));
     }
   }
   plan.sessions = sessions.size;
+  if (!resumeVerified) refusal("resume_cursor_missing");
   plan.skippedLiveSessions = skippedLive.size;
   // A legacy pruned row's receipt has no session or source. It could be an
   // earlier OTLP/hook capture of any still-missing session, so refuse.
@@ -455,7 +477,8 @@ function ensureImportSchema(db: DB) {
     run_id text not null, imported_rows integer not null default 0,
     input_tokens integer not null default 0, cache_read_tokens integer not null default 0,
     cache_creation_tokens integer not null default 0, output_tokens integer not null default 0,
-    started_at text not null, updated_at text not null, completed_at text);
+    started_at text not null, updated_at text not null, completed_at text,
+    resume_candidate_index integer not null default 0, resume_candidate_digest text);
     create trigger if not exists capture_history_import_block_prune
       before insert on raw_retention_receipts
       when exists (select 1 from capture_history_import_lock where singleton=1)
@@ -463,6 +486,10 @@ function ensureImportSchema(db: DB) {
   const columns = db.pragma("table_info(capture_history_import_runs)") as Array<{ name: string }>;
   if (!columns.some(column => column.name === "source_digest"))
     db.exec("alter table capture_history_import_runs add column source_digest text");
+  if (!columns.some(column => column.name === "resume_candidate_index"))
+    db.exec("alter table capture_history_import_runs add column resume_candidate_index integer not null default 0");
+  if (!columns.some(column => column.name === "resume_candidate_digest"))
+    db.exec("alter table capture_history_import_runs add column resume_candidate_digest text");
 }
 const active = new Set<string>();
 export async function applyCaptureHistory(buffer: LocalEventBuffer, root: CaptureRoot,
@@ -476,6 +503,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   const ownerStart = processStart(process.pid);
   if (!ownerStart || ownerStart === "unknown") refusal("process_identity_unavailable");
   let runId = "";
+  let resume: ResumePoint = { index: 0, digest: null };
   db.transaction(() => {
     maintenanceIdle(db);
     const held = db.prepare(`select root_id as rootId, owner_pid as pid, owner_start as started
@@ -490,14 +518,20 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     if (held) db.prepare(`delete from capture_history_import_lock where singleton=1`).run();
     db.prepare(`insert into capture_history_import_lock values (1,?,?,?)`)
       .run(root.rootId, process.pid, ownerStart);
-    const prior = db.prepare(`select root_digest as digest,source_digest as sourceDigest,run_id as runId
+    const prior = db.prepare(`select root_digest as digest,source_digest as sourceDigest,run_id as runId,
+      resume_candidate_index as resumeIndex,resume_candidate_digest as resumeDigest
       from capture_history_import_runs where root_id=?`)
-      .get(root.rootId) as { digest: string; sourceDigest: string | null; runId: string } | undefined;
+      .get(root.rootId) as { digest: string; sourceDigest: string | null; runId: string;
+        resumeIndex: number; resumeDigest: string | null } | undefined;
     const digest = captureRootDigest(root);
     if (prior && prior.digest !== digest) refusal("root_identity_changed_since_import");
     if (prior && prior.sourceDigest !== fencedSourceDigest)
       refusal("fenced_history_changed_since_import");
+    if (prior && (!Number.isSafeInteger(prior.resumeIndex) || prior.resumeIndex < 0 ||
+        (prior.resumeIndex === 0) !== (prior.resumeDigest === null)))
+      refusal("resume_cursor_invalid");
     runId = prior?.runId ?? crypto.randomUUID();
+    resume = { index: prior?.resumeIndex ?? 0, digest: prior?.resumeDigest ?? null };
     if (!prior) db.prepare(`insert into capture_history_import_runs
       (root_id,root_digest,source_digest,source,run_id,started_at,updated_at) values (?,?,?,?,?,?,?)`)
       .run(root.rootId, digest, fencedSourceDigest, root.source, runId,
@@ -515,16 +549,24 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   let maxWriterWorkMs = 0;
   let maxWriterRowMs = 0;
   let slices = 0;
+  let nextRows = WRITER_INITIAL_ROWS;
+  let timeBudgetStops = 0;
+  const writerSliceHistogram: Record<string, number> = {
+    "under25ms": 0, "25to50ms": 0, "50to100ms": 0, "100to250ms": 0, "250to750ms": 0, "750msOrMore": 0,
+  };
   const importedTokens: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
-  let pending: Candidate[] = [];
+  let pending: Array<{ candidate: Candidate; index: number; digest: string }> = [];
   const flush = async () => {
     if (!pending.length) return;
-    const batch = pending;
-    pending = [];
+    const batch = pending.slice(0, nextRows);
+    pending = pending.slice(batch.length);
     maintenanceIdle(db);
     let writerStarted = 0;
     let writerWorkEnded = 0;
     let writerRowMs = 0;
+    let stoppedForTime = false;
+    let processed = 0;
+    const waitingStarted = performance.now();
     const receipt = buffer.withHistoryImportAdmission(root.installationEpochId, () =>
       buffer.transactionWithRepoContextHandoffs(() => {
         // The IMMEDIATE transaction acquired the writer before this callback.
@@ -538,36 +580,53 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         maintenanceIdle(db);
         const counts: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
         let rows = 0;
-        for (const candidate of batch) {
+        for (const item of batch) {
           const rowStarted = performance.now();
-          const e = candidate.event;
+          const e = item.candidate.event;
           // A concurrent live writer may have won the session while files
           // were read; session authority is checked again under the writer.
           const authority = db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
             .get(root.source, e.sessionId) as { authority: string } | undefined;
-          if (authority?.authority === "live") continue;
-          if (db.prepare(`select 1 from raw_retention_receipts where event_id=?`).get(e.id)) continue;
-          if (!appendRootObservation(buffer, e, root)) continue;
-          rows += 1;
-          counts.input += e.inputTokens ?? 0;
-          counts.output += e.outputTokens ?? 0;
-          counts.cacheRead += e.cacheReadTokens ?? 0;
-          counts.cacheCreation += e.cacheCreationTokens ?? 0;
+          if (authority?.authority !== "live" && appendRootObservation(buffer, e, root)) {
+            rows += 1;
+            counts.input += e.inputTokens ?? 0;
+            counts.output += e.outputTokens ?? 0;
+            counts.cacheRead += e.cacheReadTokens ?? 0;
+            counts.cacheCreation += e.cacheCreationTokens ?? 0;
+          }
+          processed += 1;
           writerRowMs = Math.max(writerRowMs, performance.now() - rowStarted);
+          if (performance.now() - writerStarted >= WRITER_TARGET_MS && processed < batch.length) {
+            stoppedForTime = true;
+            break;
+          }
         }
         db.prepare(`update capture_history_import_runs set imported_rows=imported_rows+?,
           input_tokens=input_tokens+?,cache_read_tokens=cache_read_tokens+?,
-          cache_creation_tokens=cache_creation_tokens+?,output_tokens=output_tokens+?,updated_at=?
+          cache_creation_tokens=cache_creation_tokens+?,output_tokens=output_tokens+?,updated_at=?,
+          resume_candidate_index=?,resume_candidate_digest=?
           where root_id=?`).run(rows, counts.input, counts.cacheRead, counts.cacheCreation,
-            counts.output, new Date().toISOString(), root.rootId);
+            counts.output, new Date().toISOString(), batch[processed - 1]!.index,
+            batch[processed - 1]!.digest, root.rootId);
         writerWorkEnded = performance.now();
         return { rows, counts };
       }));
+    if (processed < batch.length) pending = batch.slice(processed).concat(pending);
+    resume = { index: batch[processed - 1]!.index, digest: batch[processed - 1]!.digest };
     const elapsed = performance.now() - writerStarted;
     maxWriterSliceMs = Math.max(maxWriterSliceMs, elapsed);
     maxWriterWorkMs = Math.max(maxWriterWorkMs, writerWorkEnded - writerStarted);
     maxWriterRowMs = Math.max(maxWriterRowMs, writerRowMs);
-    if (elapsed >= WRITER_BUDGET_MS) overBudgetSlices += 1;
+    if (elapsed >= WRITER_HARD_MS) overBudgetSlices += 1;
+    const histogramBucket = elapsed < 25 ? "under25ms" : elapsed < 50 ? "25to50ms" :
+      elapsed < 100 ? "50to100ms" : elapsed < 250 ? "100to250ms" :
+      elapsed < 750 ? "250to750ms" : "750msOrMore";
+    writerSliceHistogram[histogramBucket]! += 1;
+    if (stoppedForTime) timeBudgetStops += 1;
+    // Use the committed cost to size the next row cap. A single expensive row
+    // keeps the next slice at one row until the ledger becomes responsive.
+    nextRows = Math.max(1, Math.min(WRITER_MAX_ROWS,
+      Math.floor(processed * WRITER_TARGET_MS / Math.max(elapsed, 1) * 0.8)));
     importedRows += receipt.rows;
     importedTokens.input += receipt.counts.input;
     importedTokens.output += receipt.counts.output;
@@ -576,17 +635,20 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     slices += 1;
     if (options.stopAfterSlices === slices) throw new Error("capture_history_injected_crash");
     if (slices % 512 === 0) db.pragma("wal_checkpoint(PASSIVE)");
-    await new Promise<void>(resolve => setImmediate(resolve));
+    // setTimeout gives hook/OTLP/tailer callbacks and other SQLite writers a
+    // real turn; recent writer contention receives a longer backoff.
+    const writerWaitMs = writerStarted - waitingStarted;
+    await new Promise<void>(resolve => setTimeout(resolve, writerWaitMs > 5 ? 25 : 5));
   };
   try {
     // Verify every prefix before the first ledger mutation. Suffix growth is
     // allowed, but a rewrite of any fenced byte aborts the entire preflight.
     for (const file of first.files) verifyFencedPrefix(file);
-    await scan(db, root, options, async candidate => {
-      pending.push(candidate);
-      if (pending.length >= WRITER_ROWS) await flush();
-    }, first.files);
-    await flush();
+    await scan(db, root, options, async (candidate, index, digest) => {
+      pending.push({ candidate, index, digest });
+      while (pending.length >= nextRows) await flush();
+    }, first.files, resume);
+    while (pending.length) await flush();
     db.transaction(() => {
       const lock = db.prepare(`select root_id as rootId,owner_pid as pid,owner_start as started
         from capture_history_import_lock where singleton=1`).get() as
@@ -606,5 +668,6 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   const { status: _status, dryRun: _dryRun, ...plan } = first.plan;
   return { ...plan, status: "capture_roots_history_imported", importedRows,
     importedTokens, totalImportedRows: total.rows, maxWriterSliceMs,
-    overBudgetSlices, maxWriterWorkMs, maxWriterRowMs, runId };
+    overBudgetSlices, maxWriterWorkMs, maxWriterRowMs, writerSliceHistogram,
+    writerSlices: slices, timeBudgetStops, runId };
 }

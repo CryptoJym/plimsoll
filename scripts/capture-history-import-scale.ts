@@ -67,6 +67,9 @@ async function main() {
   let maxWriterWorkMs = 0;
   let maxWriterRowMs = 0;
   let overBudgetSlices = 0;
+  let writerSlices = 0;
+  let timeBudgetStops = 0;
+  const writerSliceHistogram: Record<string, number> = {};
   let peakRss = process.memoryUsage().rss;
   let probe: ReturnType<typeof spawn> | null = null;
   try {
@@ -123,6 +126,10 @@ async function main() {
       maxWriterWorkMs = Math.max(maxWriterWorkMs, receipt.maxWriterWorkMs);
       maxWriterRowMs = Math.max(maxWriterRowMs, receipt.maxWriterRowMs);
       overBudgetSlices += receipt.overBudgetSlices;
+      writerSlices += receipt.writerSlices;
+      timeBudgetStops += receipt.timeBudgetStops;
+      for (const [bucket, count] of Object.entries(receipt.writerSliceHistogram))
+        writerSliceHistogram[bucket] = (writerSliceHistogram[bucket] ?? 0) + count;
       peakRss = Math.max(peakRss, process.memoryUsage().rss);
       console.error(JSON.stringify({ root: index + 1, importedRows: receipt.importedRows,
         elapsedSeconds: Math.round((performance.now() - importStarted) / 1000),
@@ -141,10 +148,15 @@ async function main() {
       sourceBytes, importSeconds, totalSeconds: (performance.now() - started) / 1000,
       peakRssBytes: Math.max(peakRss, process.resourceUsage().maxRSS * 1024),
       maxWriterSliceMs, maxWriterWorkMs, maxWriterRowMs, overBudgetSlices,
+      writerSlices, timeBudgetStops, writerSliceHistogram,
       intake: probeReceipt, ledgerRows }, null, 2));
     assert.equal(imported, USAGE_ROWS);
     assert.equal(ledgerRows, USAGE_ROWS);
     assert.equal(probeRows, probeReceipt.count);
+    assert.equal(Object.values(writerSliceHistogram).reduce((sum, count) => sum + count, 0), writerSlices);
+    // A million-row host must exercise the deadline, not merely the row cap.
+    // Removing the deadline makes this scale proof fail even on a fast host.
+    assert.ok(timeBudgetStops > 0, "writer deadline was not exercised");
     assert.equal(probeReceipt.errors, 0);
     assert.ok(maxWriterSliceMs < 750 && overBudgetSlices === 0);
     assert.ok(probeReceipt.maxMs < 750);

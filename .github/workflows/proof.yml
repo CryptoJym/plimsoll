@@ -203,6 +203,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import
 
+      - name: Prove bounded and resumable history writer slices (eco-6hoxj.163.89 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-slices
+
       - name: Prove dispatch binding and stamped capture paths (eco-6hoxj.165.3)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding
