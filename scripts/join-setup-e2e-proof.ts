@@ -567,6 +567,12 @@ async function main() {
     await joinedScenario("fresh", false, "ack");
     await joinedScenario("running_0744_layout", true, "ack");
     await joinedScenario("mixed_roots", false, "ack");
+    await joinedScenario("fleet_label", true, "ack");
+    await joinedScenario("symlink_private", false, "ack");
+    await joinedScenario("partial_roots", false, "ack");
+    await joinedScenario("crash_after_bootout", true, "ack");
+    await joinedScenario("edited_manifest", true, "ack");
+    await joinedScenario("clock_skew", false, "no_ack");
     await joinedScenario("missing_ack", false, "no_ack");
     await joinOnlyScenario("explicit_no_daemon", "--no-daemon");
     await joinOnlyScenario("positional_compatibility", "positional");
