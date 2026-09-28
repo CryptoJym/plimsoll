@@ -211,6 +211,22 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-dispatch-review
 
+      - name: Prove Claude fanout window copies agree (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-window-divergence
+
+      - name: Prove Claude raw row and root sighting commit atomically (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-sighting-atomicity
+
+      - name: Prove Claude restamp requires full root identity (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-restamp-root-reuse
+
+      - name: Prove Claude fanout edge controls (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-edge-controls
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability

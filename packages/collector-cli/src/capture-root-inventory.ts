@@ -222,11 +222,18 @@ function activeIndexedBindings(snapshot: DispatchBindingSnapshot,source: Capture
 }
 export function dispatchBindingForSession(source: CaptureRoot["source"],sessionId: string,observedAt: string,
   roots: readonly CaptureRoot[]=currentDispatchCaptureRoots()): DispatchBinding|null {
-  const entries=activeIndexedBindings(dispatchIndex(roots),source,sessionId,observedAt);
+  const snapshot=dispatchIndex(roots);
+  // Claude copies are distributed to every configured root. A stale copy is
+  // still evidence of disagreement, even after its own window has closed.
+  const entries=source==="claude_code"
+    ? snapshot.bySession.get(`${source}\0${sessionId}`)??[]
+    : activeIndexedBindings(snapshot,source,sessionId,observedAt);
   if (entries.length === 0) return null;
   const byRoot=new Set(entries.map(entry => entry.root.rootId));
   const signatures=new Set(entries.map(entry => entry.signature));
-  return byRoot.size===entries.length&&signatures.size===1 ? entries[0].binding : null;
+  const at=Date.parse(observedAt);
+  return byRoot.size===entries.length&&signatures.size===1&&at>=entries[0].from&&at<entries[0].until
+    ? entries[0].binding : null;
 }
 /** A known-root transcript sighting is authoritative; hook/OTLP paths are not. */
 export function observeClaudeRootSession(root: CaptureRoot,sessionId: string) {
@@ -245,7 +252,7 @@ export function claudeDispatchSkipStatus() {
 /** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
   snapshot=currentDispatchBindingSnapshot(),durableSightings?: ReadonlySet<string>): DispatchBinding|null {
-  const entries=activeIndexedBindings(snapshot,"claude_code",sessionId,observedAt);
+  const entries=snapshot.bySession.get(`claude_code\0${sessionId}`)??[];
   if(entries.length===0) return null;
   const byRoot=new Set(entries.map(entry => entry.root.rootId));
   const signatures=new Set(entries.map(entry => entry.signature));
@@ -253,6 +260,10 @@ export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: stri
     claudeDispatchSkips.conflictingBindings++;
     return null;
   }
+  const at=Date.parse(observedAt);
+  if(at<entries[0].from||at>=entries[0].until) return null;
+  if(claudeSessionRootSightings(sessionId).size===0 && !durableSightings?.size)
+    return entries[0].binding;
   const seen=new Set([...claudeSessionRootSightings(sessionId),...(durableSightings??[])]);
   const configuredSeen=[...seen].filter(digest => snapshot.claudeRootDigests.has(digest));
   const boundRootDigests=new Set(entries.map(entry => snapshot.rootDigests.get(entry.root.rootId)));
@@ -411,50 +422,64 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
     value.cacheReadTokens??null,value.cacheCreationTokens??null,value.costUsd??null,
   ])).digest("hex");
   const payloadDigest=nativeSignature(event),rootDigest=captureRootDigest(root);
-  const existing=database.prepare("select payload_json as payload from buffered_events where id=?").get(event.id) as {
-    payload: string;
-  }|undefined;
-  const priorSightings=database.prepare(`select payload_digest as digest,state
-    from capture_root_observations where event_id=?`).all(event.id) as Array<{
-    digest: string;
-    state: string;
-  }>;
-  // Compact source receipts survive raw retention so an epoch change cannot
-  // revive already observed consumption. They contain no paths or payloads.
-  const priorConflict=priorSightings.some(row => row.digest!==payloadDigest||row.state==="conflict");
-  const alreadyObserved=Boolean(existing)||priorSightings.length>0;
-  let same=false;
-  if(existing) {
-    try {
-      same=nativeSignature(JSON.parse(existing.payload))===payloadDigest;
+  // The raw event, root receipt and durable session veto share one commit.
+  // buffer.append uses a nested savepoint when called inside this transaction.
+  let result: { inserted:boolean;state:string|null };
+  try {
+    result=database.transaction(() => {
+      const existing=database.prepare("select payload_json as payload from buffered_events where id=?").get(event.id) as {
+        payload: string;
+      }|undefined;
+      const priorSightings=database.prepare(`select payload_digest as digest,state
+        from capture_root_observations where event_id=?`).all(event.id) as Array<{
+        digest: string;
+        state: string;
+      }>;
+      const priorConflict=priorSightings.some(row => row.digest!==payloadDigest||row.state==="conflict");
+      const alreadyObserved=Boolean(existing)||priorSightings.length>0;
+      let same=false;
+      if(existing) {
+        try { same=nativeSignature(JSON.parse(existing.payload))===payloadDigest; }
+        catch { /* corruption remains a conflict */ }
+      }
+      else same=priorSightings.length>0&&!priorConflict;
+      let inserted=false;
+      if(!alreadyObserved) {
+        if(trustedEpoch) captureRootEpochCapabilities.set(event,trustedEpoch);
+        try { inserted=buffer.append(event,[]); }
+        finally { captureRootEpochCapabilities.delete(event); }
+      }
+      // Another connection may have enrolled between the first check and append.
+      if(!alreadyObserved&&!inserted&&buffer.eventAdmissionReason(event.observedAt,
+        root.installationEpochId,trustedEpoch)) return { inserted:false,state:null };
+      const state=priorConflict? "conflict":alreadyObserved? (same? "duplicate":"conflict"):
+        inserted? "admitted":"conflict";
+      database.prepare(`insert into capture_root_observations values(?,?,?,?,?)
+        on conflict(root_digest,event_id) do update set state=case when payload_digest<>excluded.payload_digest then 'conflict' else state end`)
+        .run(rootDigest,event.id,payloadDigest,event.observedAt,state);
+      if(root.source==="claude_code"&&event.sessionId) database.prepare(`
+        insert into capture_root_session_sightings(source,session_id,root_digest,first_seen_at)
+        values('claude_code',?,?,?) on conflict do nothing`).run(event.sessionId,rootDigest,event.observedAt);
+      return { inserted,state };
+    }).immediate();
+  } catch(error) {
+    // A failed known-root intake is still an observed session. Keep a compact
+    // veto after rollback so a later rootless event cannot inherit A's bind.
+    if(root.source==="claude_code"&&event.sessionId) {
+      database.prepare(`insert into capture_root_session_sightings(source,session_id,root_digest,first_seen_at)
+        values('claude_code',?,?,?) on conflict do nothing`).run(event.sessionId,rootDigest,event.observedAt);
+      sessionSightingCaches.delete(database);
+      observeClaudeRootSession(root,event.sessionId);
     }
-    catch { /* corruption remains a conflict */ }
+    throw error;
   }
-  else
-    same=priorSightings.length>0&&!priorConflict;
-  let inserted=false;
-  if(!alreadyObserved) {
-    if(trustedEpoch) captureRootEpochCapabilities.set(event,trustedEpoch);
-    try { inserted=buffer.append(event,[]); }
-    finally { captureRootEpochCapabilities.delete(event); }
-  }
-  // Another connection may have enrolled between the first check and append.
-  if (!alreadyObserved && !inserted && buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId, trustedEpoch))
-    return false;
-  const state=priorConflict? "conflict":alreadyObserved? (same? "duplicate":"conflict"):inserted? "admitted":"conflict";
-  database.prepare(`insert into capture_root_observations values(?,?,?,?,?)
-    on conflict(root_digest,event_id) do update set state=case when payload_digest<>excluded.payload_digest then 'conflict' else state end`)
-    .run(rootDigest,event.id,payloadDigest,event.observedAt,state);
-  if(root.source==="claude_code"&&event.sessionId) {
-    database.prepare(`insert into capture_root_session_sightings(source,session_id,root_digest,first_seen_at)
-      values('claude_code',?,?,?) on conflict do nothing`).run(event.sessionId,rootDigest,event.observedAt);
-    const cached=sessionSightingCaches.get(database)?.sessions.get(event.sessionId);
-    cached?.add(rootDigest);
+  if(result.state&&root.source==="claude_code"&&event.sessionId) {
+    sessionSightingCaches.get(database)?.sessions.get(event.sessionId)?.add(rootDigest);
     observeClaudeRootSession(root,event.sessionId);
   }
-  if(state==="conflict")
+  if(result.state==="conflict")
     throw new Error("capture_logical_source_conflict");
-  return inserted;
+  return result.inserted;
 }
 
 /**
