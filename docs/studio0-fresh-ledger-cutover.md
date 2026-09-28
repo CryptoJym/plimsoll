@@ -45,11 +45,13 @@ keys, and capture-root configuration stay in place.
 
    Before scheduling the 90-second window, run the same read-only command
    with `--sizes` on a private Studio0 **ledger and root copy**. Require
-   `totalCarriedBytes <= carryBudgetBytes` (32 MiB). The plan reports exact
+   `totalCarriedBytes <= carryBudgetBytes` (8 MiB). The plan reports exact
    row counts and SQLite value-payload bytes per carried table; the budget
-   includes cursor and authorization rows, not the 88.7 GB archive. A 3 MiB
-   fixture copied in 3.5 seconds, so 32 MiB leaves more than twice that rate's
-   margin within 90 seconds. A refused budget requires a new plan, not an
+   includes cursor and authorization rows, not the 88.7 GB archive. A fixture
+   with 20,000 retained rows had 948,890 carried value bytes and took 4.6 to
+   7.0 seconds to plan and switch in two runs. Scaling both measured totals
+   to 8 MiB gives about 41 to 62 seconds within the 90-second window.
+   Actual Studio0 latency is still unverified. A refused budget requires a new plan, not an
    override. On the final stopped collector, require
    `status: capture_roots_epoch_plan`, `sidecarsMayAppear: false`, the root
    count and epoch, the listed `carriedRows` and `carriedBytes`, and the count

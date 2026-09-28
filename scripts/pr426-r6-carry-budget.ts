@@ -29,17 +29,17 @@ try {
   });
   old.database.prepare(`insert into codex_live_producers
     (producer_id,context_digest,context_json,credential_id,enabled)
-    values(?,?,?,?,0)`).run("large-retained-row", "digest", `{"padding":"${"x".repeat(33 * 1024 * 1024)}"}`,
+    values(?,?,?,?,0)`).run("large-retained-row", "digest", `{"padding":"${"x".repeat(9 * 1024 * 1024)}"}`,
       "credential");
   old.close();
   const input = { ledgerPath, archivePath: path.join(archiveDirectory, "old-ledger.sqlite"),
     config, authorityRoot: path.join(fixture, "lifecycle-authority") };
   const plan = planFreshLedgerCutover(input);
   assert.equal(plan.status, "refused");
-  assert.equal(plan.reason, "carried_state_exceeds_32_mib_budget");
+  assert.equal(plan.reason, "carried_state_exceeds_8_mib_budget");
   assert.equal(plan.carriedRows.codex_live_producers, 1);
   assert.ok(plan.carriedBytes.codex_live_producers > plan.carryBudgetBytes);
-  assert.throws(() => switchFreshLedger(input), /carried_state_exceeds_32_mib_budget/);
+  assert.throws(() => switchFreshLedger(input), /carried_state_exceeds_8_mib_budget/);
   assert.equal(fs.existsSync(input.archivePath), false);
   console.log(JSON.stringify({ reason: plan.reason,
     rows: plan.carriedRows.codex_live_producers,

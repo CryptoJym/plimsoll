@@ -54,11 +54,11 @@ try {
   const plan = planFreshLedgerCutover(input);
   const planMs = Math.round(performance.now() - started);
   assert.equal(plan.carriedRows.session_usage_authority, 20_000);
-  assert.ok(plan.carriedBytes.session_usage_authority > 0,
-    "plan must publish exact carried value bytes for each table");
+  assert.equal(plan.carriedBytes.session_usage_authority, 948_890,
+    "plan must publish the exact copied value bytes for 20,000 known rows");
   assert.equal(plan.totalCarriedBytes,
     Object.values(plan.carriedBytes).reduce((sum, value) => sum + value, 0));
-  assert.equal(plan.carryBudgetBytes, 32 * 1024 * 1024);
+  assert.equal(plan.carryBudgetBytes, 8 * 1024 * 1024);
   const afterPlan = digestFiles();
   const mainByteIdentical = afterPlan[path.basename(ledger)] === beforePlan[path.basename(ledger)];
   const sidecarsCreated = Object.keys(afterPlan).filter(name => !(name in beforePlan));
@@ -72,6 +72,7 @@ try {
   replacement.close();
   console.log(JSON.stringify({ archiveBytes, sourceRows: 20_000, planStatus: plan.status,
     carriedRowsReported: plan.carriedRows.session_usage_authority, carriedRowsActual: carried,
+    carriedValueBytes: plan.carriedBytes.session_usage_authority,
     planMs, switchMs, mainByteIdentical, sidecarsCreated, plans }));
   assert.equal(carried, 20_000);
 } finally {

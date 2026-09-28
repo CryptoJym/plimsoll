@@ -25,9 +25,10 @@ import { validateTranscriptParserState } from "./transcript-tailer";
 import { utcWeekStart } from "./weekly-tool-stats";
 
 const MIN_REPLACEMENT_VERSION = "0.7.46";
-/** Includes only copied SQLite value payloads, not the 88 GB archive. A 3 MB
- * fixture took 3.5 s to copy; 32 MiB leaves more than 2x margin inside 90 s. */
-const MAX_CARRIED_VALUE_BYTES = 32 * 1024 * 1024;
+/** Includes only copied SQLite value payloads, not the 88 GB archive. A
+ * 948,890-byte / 20,000-row fixture took 4.6-7.0 s to plan and switch;
+ * scaling to 8 MiB stays below the 90-second window at those rates. */
+const MAX_CARRIED_VALUE_BYTES = 8 * 1024 * 1024;
 const CURSOR_KEY = /^[a-f0-9]{64}$/;
 const CURSOR_IDENTITY = /^\d+:\d+:\d+$/;
 const LIVE_TABLES = [
@@ -503,7 +504,7 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
         requiresReportAcknowledgement: inspection.pending > 0 || !inspection.priorAcknowledged ||
           inspection.dueWeeksWithoutAcknowledgement.length > 0 };
       if (inspection.totalCarriedBytes > MAX_CARRIED_VALUE_BYTES) return {
-        ...fields, status: "refused", reason: "carried_state_exceeds_32_mib_budget",
+        ...fields, status: "refused", reason: "carried_state_exceeds_8_mib_budget",
         operatorAction: "Reduce carried authorization/cursor state before scheduling the 90-second window.",
       };
       if (inspection.pending) return { ...fields, status: "refused", reason: "weekly_report_unacknowledged" };
@@ -603,7 +604,7 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     const inspection = inspectArchive(old, { ...input, now: () => switchNow }, stat,
       staleFileKeys);
     if (inspection.totalCarriedBytes > MAX_CARRIED_VALUE_BYTES) {
-      throw new Error("carried_state_exceeds_32_mib_budget");
+      throw new Error("carried_state_exceeds_8_mib_budget");
     }
     if (inspection.pending) throw new Error("weekly_report_unacknowledged");
     if (inspection.attempts) throw new Error("current_utc_week_tool_attempts");
