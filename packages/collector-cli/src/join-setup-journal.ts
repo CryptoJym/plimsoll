@@ -21,6 +21,7 @@ export type JoinRestartObligation = {
   priorManifestDigest: string | null;
   priorContent: string | null;
   priorOwnedTemplateContent: string | null;
+  priorOwnedTemplateIdentityContent: string | null;
   replacementManifestDigest: string;
   createdAt: string;
 };
@@ -36,6 +37,14 @@ export type JoinRootJournal = {
 export const joinRestartObligationPath = (home: string) => path.join(home, "join.restart-obligation.json");
 const sha256 = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 
+function pathExistsNoFollow(file: string) {
+  try { fs.lstatSync(file); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 function fsyncDirectory(directory: string) {
   const descriptor = fs.openSync(directory, "r");
   try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
@@ -46,12 +55,18 @@ export function writeJoinRestartObligation(home: string, input: Omit<JoinRestart
     operationId: randomUUID(), configBeforeSha256: sha256(input.configBeforeRoots),
     createdAt: new Date().toISOString() };
   const file = joinRestartObligationPath(home);
-  const descriptor = fs.openSync(file, "wx", 0o600);
+  if (pathExistsNoFollow(file)) throw new Error("A previous collector restart obligation remains unresolved.");
+  const prepared = `${file}.prepared-${randomUUID()}`;
+  const descriptor = fs.openSync(prepared, "wx", 0o600);
   try {
-    fs.writeFileSync(descriptor, `${JSON.stringify(obligation)}\n`);
-    fs.fsyncSync(descriptor);
-  } finally { fs.closeSync(descriptor); }
-  fsyncDirectory(home);
+    try {
+      fs.writeFileSync(descriptor, `${JSON.stringify(obligation)}\n`);
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+    if (pathExistsNoFollow(file)) throw new Error("A previous collector restart obligation remains unresolved.");
+    fs.renameSync(prepared, file);
+    fsyncDirectory(home);
+  } finally { fs.rmSync(prepared, { force: true }); }
   return obligation;
 }
 
@@ -82,17 +97,42 @@ export function readJoinRestartObligation(home: string): JoinRestartObligation |
         (value.priorContent !== null && typeof value.priorContent !== "string") ||
         (value.priorManifestDigest !== null && typeof value.priorManifestDigest !== "string") ||
         (value.priorOwnedTemplateContent !== null && typeof value.priorOwnedTemplateContent !== "string") ||
+        (value.priorOwnedTemplateIdentityContent !== undefined &&
+          value.priorOwnedTemplateIdentityContent !== null &&
+          typeof value.priorOwnedTemplateIdentityContent !== "string") ||
         (value.priorContent === null) !== (value.priorManifestDigest === null) ||
         (value.priorContent !== null && `sha256:${sha256(value.priorContent!)}` !== value.priorManifestDigest))
       throw new Error("Join restart obligation is invalid.");
     collectorConfigSchema.parse(JSON.parse(value.configBeforeRoots));
-    return value as JoinRestartObligation;
+    return { ...value, priorOwnedTemplateIdentityContent:
+      value.priorOwnedTemplateIdentityContent ?? null } as JoinRestartObligation;
   } finally { fs.closeSync(descriptor); }
 }
 
 export function clearJoinRestartObligation(home: string) {
   fs.rmSync(joinRestartObligationPath(home));
   fsyncDirectory(home);
+}
+
+/** Called only after the caller proved the unchanged prior agent is serving. */
+export function setAsideUnreadableJoinRestartObligation(home: string, reason: string) {
+  const file = joinRestartObligationPath(home);
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
+      (stat.mode & 0o777) !== 0o600 || stat.size > MAX_OBLIGATION_BYTES)
+    throw new Error("The unreadable join restart obligation is not an owned private file.");
+  const suffix = randomUUID();
+  const aside = `${file}.unreadable-${suffix}`;
+  fs.renameSync(file, aside);
+  const note = path.join(home, `join.restart-obligation.recovery-${suffix}.json`);
+  const descriptor = fs.openSync(note, "wx", 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify({ schema: "plimsoll.join-recovery-note/v1",
+      reason, aside: path.basename(aside), createdAt: new Date().toISOString() })}\n`);
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
+  fsyncDirectory(home);
+  return path.basename(note);
 }
 
 function ensureRootJournal(database: Database.Database) {

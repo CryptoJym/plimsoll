@@ -56,7 +56,11 @@ export type LaunchAgentOptions = {
   restoreContent?: string;
   /** Recovery only: preserve the prior owned preimage (null means a legacy install). */
   restoreOwnedTemplateContent?: string | null;
+  /** Recovery only: restore the separate private identity record exactly. */
+  restoreOwnedTemplateIdentityContent?: string | null;
   expectedCurrentDigest?: string;
+  /** Join recovery names the temporary publish link in its durable obligation. */
+  commitOperationId?: string;
 };
 
 export type LaunchAgentEnvironmentKeys =
@@ -66,7 +70,7 @@ export type LaunchAgentEnvironmentKeys =
 export type LaunchAgentInstallReceipt = {
   schema: "plimsoll.launch-agent-install.v1";
   operation: "install";
-  status: "preview" | "installed" | "unchanged";
+  status: "preview" | "installed" | "unchanged" | "template_missing" | "template_changed";
   target: "user_launch_agent";
   label: typeof LAUNCH_AGENT_LABEL;
   changed: boolean;
@@ -961,7 +965,62 @@ export function launchAgentOwnedTemplatePath(homeDir = os.homedir()) {
   return `${launchAgentPlistPath(homeDir)}.plimsoll-owned-template.json`;
 }
 
-function readOwnedTemplate(homeDir: string): string | null {
+/** Independent private identity for the editable LaunchAgents template. */
+export function launchAgentOwnedTemplateIdentityPath(homeDir = os.homedir()) {
+  const homeKey = createHash("sha256").update(path.resolve(homeDir)).digest("hex");
+  return path.join(collectorHome(homeDir), `launch-agent-template-${homeKey}.identity.json`);
+}
+
+/** Finish only the known, digest-bound publish link left by a killed join. */
+export function finishInterruptedJoinLaunchAgentPublish(options: {
+  homeDir?: string; operationId: string; replacementManifestDigest: string;
+  mutationAuthority?: LifecycleMutationAuthority;
+}): boolean {
+  if (!/^[0-9a-f-]{36}$/i.test(options.operationId)) fail("COMMIT_OPERATION_INVALID");
+  const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
+  const visible = launchAgentPlistPath(homeDir);
+  const directory = path.dirname(visible);
+  const parentCheck = inspectPath(path.join(directory, `.plimsoll-parent-check-${randomUUID()}`));
+  if (parentCheck.exists) fail("JOIN_COMMIT_PARENT_CHANGED");
+  const commit = path.join(directory,
+    `.${path.basename(visible)}.plimsoll-commit-${options.operationId}`);
+  const temporary = lstat(commit);
+  if (!temporary) return false;
+  const fence = acquireMutationFence(options);
+  try {
+    const published = lstat(visible);
+    if (!temporary.isFile() || temporary.isSymbolicLink() ||
+        temporary.nlink !== (published ? 2 : 1) ||
+        permissionMode(temporary.mode) !== MANIFEST_MODE ||
+        (temporary.mode & SPECIAL_PERMISSION_MASK) !== 0 ||
+        (currentUid() !== undefined && temporary.uid !== currentUid()) ||
+        (published && (!published.isFile() || published.isSymbolicLink() ||
+          published.nlink !== 2 || published.dev !== temporary.dev || published.ino !== temporary.ino)))
+      fail("JOIN_COMMIT_LINK_UNSAFE");
+    const descriptor = fs.openSync(commit, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const bound = fs.fstatSync(descriptor);
+      if (bound.dev !== temporary.dev || bound.ino !== temporary.ino ||
+          bound.nlink !== temporary.nlink) fail("JOIN_COMMIT_LINK_CHANGED");
+      const content = fs.readFileSync(descriptor);
+      if (digest(content) !== options.replacementManifestDigest) fail("JOIN_COMMIT_DIGEST_CHANGED");
+      validateOwnedManifest(content.toString("utf8"));
+      assertStablePath(parentCheck);
+      assertMutationFence(fence);
+      if (!published) fs.linkSync(commit, visible);
+      const linked = fs.lstatSync(visible);
+      if (linked.dev !== temporary.dev || linked.ino !== temporary.ino || linked.nlink !== 2)
+        fail("JOIN_COMMIT_LINK_CHANGED");
+      assertStablePath(parentCheck);
+      assertMutationFence(fence);
+      fs.unlinkSync(commit);
+      fsyncDirectory(directory);
+      return true;
+    } finally { fs.closeSync(descriptor); }
+  } finally { fence?.release(); }
+}
+
+function readOwnedTemplate(homeDir: string): { manifest: string; content: string } | null {
   const file = launchAgentOwnedTemplatePath(homeDir);
   let stat: fs.Stats;
   try { stat = fs.lstatSync(file); }
@@ -977,16 +1036,114 @@ function readOwnedTemplate(homeDir: string): string | null {
     const bound = fs.fstatSync(descriptor);
     if (!bound.isFile() || bound.dev !== stat.dev || bound.ino !== stat.ino ||
         bound.nlink !== 1 || permissionMode(bound.mode) !== MANIFEST_MODE) fail("OWNED_TEMPLATE_CHANGED");
-    const value = JSON.parse(fs.readFileSync(descriptor, "utf8")) as Record<string, unknown>;
+    const content = fs.readFileSync(descriptor, "utf8");
+    const value = JSON.parse(content) as Record<string, unknown>;
     if (value.schema !== "plimsoll.launch-agent-owned-template/v1" ||
         typeof value.manifest !== "string" || typeof value.manifestDigest !== "string" ||
         digest(value.manifest) !== value.manifestDigest) fail("OWNED_TEMPLATE_INVALID");
     validateOwnedManifest(value.manifest);
-    return value.manifest;
+    return { manifest: value.manifest, content };
   } catch (error) {
     if (error instanceof LaunchAgentTransactionError) throw error;
     fail("OWNED_TEMPLATE_INVALID");
   } finally { fs.closeSync(descriptor); }
+}
+
+type OwnedTemplateIdentity = {
+  schema: "plimsoll.launch-agent-template-identity/v1";
+  templateDigest: string;
+  manifestDigest: string;
+};
+
+function parseOwnedTemplateIdentity(content: string): OwnedTemplateIdentity {
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(content) as Record<string, unknown>; }
+  catch { fail("OWNED_TEMPLATE_IDENTITY_INVALID"); }
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).sort().join(",") !== "manifestDigest,schema,templateDigest" ||
+      value.schema !== "plimsoll.launch-agent-template-identity/v1" ||
+      typeof value.templateDigest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.templateDigest) ||
+      typeof value.manifestDigest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.manifestDigest))
+    fail("OWNED_TEMPLATE_IDENTITY_INVALID");
+  return value as OwnedTemplateIdentity;
+}
+
+function readOwnedTemplateIdentity(homeDir: string): (OwnedTemplateIdentity & { content: string }) | null {
+  const file = launchAgentOwnedTemplateIdentityPath(homeDir);
+  const stat = lstat(file);
+  if (!stat) return null;
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
+      permissionMode(stat.mode) !== MANIFEST_MODE || stat.size > 4096)
+    fail("OWNED_TEMPLATE_IDENTITY_INVALID");
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const bound = fs.fstatSync(descriptor);
+    if (!bound.isFile() || bound.dev !== stat.dev || bound.ino !== stat.ino ||
+        bound.nlink !== 1 || permissionMode(bound.mode) !== MANIFEST_MODE)
+      fail("OWNED_TEMPLATE_IDENTITY_CHANGED");
+    const content = fs.readFileSync(descriptor, "utf8");
+    return { ...parseOwnedTemplateIdentity(content), content };
+  } finally { fs.closeSync(descriptor); }
+}
+
+function publishOwnedTemplateIdentity(homeDir: string, content: string | null) {
+  const file = launchAgentOwnedTemplateIdentityPath(homeDir);
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
+  const parent = fs.lstatSync(directory);
+  if (!parent.isDirectory() || parent.isSymbolicLink() || permissionMode(parent.mode) !== DIRECTORY_MODE)
+    fail("OWNED_TEMPLATE_IDENTITY_HOME_INVALID");
+  const existing = lstat(file);
+  if (existing && (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1 ||
+      permissionMode(existing.mode) !== MANIFEST_MODE)) fail("OWNED_TEMPLATE_IDENTITY_INVALID");
+  if (content === null) {
+    if (existing) {
+      fs.unlinkSync(file);
+      fsyncDirectory(directory);
+    }
+    return;
+  }
+  parseOwnedTemplateIdentity(content);
+  const prepared = `${file}.prepared-${randomUUID()}`;
+  const descriptor = fs.openSync(prepared, "wx", MANIFEST_MODE);
+  try {
+    fs.writeFileSync(descriptor, content);
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
+  try {
+    fs.renameSync(prepared, file);
+    fsyncDirectory(directory);
+  } finally { fs.rmSync(prepared, { force: true }); }
+}
+
+function ownedTemplateTrust(homeDir: string): {
+  evidence: "owned_template" | "legacy_runtime" | "template_missing" | "template_changed";
+  manifest: string | null;
+} {
+  let template: ReturnType<typeof readOwnedTemplate> = null;
+  let templateInvalid = false;
+  try { template = readOwnedTemplate(homeDir); }
+  catch (error) {
+    if (!(error instanceof LaunchAgentTransactionError)) throw error;
+    templateInvalid = true;
+  }
+  let identity: OwnedTemplateIdentity | null = null;
+  let identityInvalid = false;
+  try { identity = readOwnedTemplateIdentity(homeDir); }
+  catch (error) {
+    if (!(error instanceof LaunchAgentTransactionError)) throw error;
+    identityInvalid = true;
+  }
+  if (identityInvalid || templateInvalid || (template && !identity))
+    return { evidence: "template_changed", manifest: null };
+  if (identity && !template) return { evidence: "template_missing", manifest: null };
+  if (identity && template) {
+    if (digest(template.content) !== identity.templateDigest ||
+        digest(template.manifest) !== identity.manifestDigest)
+      return { evidence: "template_changed", manifest: null };
+    return { evidence: "owned_template", manifest: template.manifest };
+  }
+  return { evidence: "legacy_runtime", manifest: null };
 }
 
 function publishOwnedTemplate(homeDir: string, content: string | null) {
@@ -1029,12 +1186,70 @@ function publishOwnedTemplate(homeDir: string, content: string | null) {
   } finally { fs.rmSync(prepared, { force: true }); }
 }
 
+function ownedTemplateDocuments(source: Buffer) {
+  const template = `${JSON.stringify({ schema: "plimsoll.launch-agent-owned-template/v1",
+    manifestDigest: digest(source), manifest: source.toString("utf8") })}\n`;
+  const identity = `${JSON.stringify({
+    schema: "plimsoll.launch-agent-template-identity/v1",
+    templateDigest: digest(template), manifestDigest: digest(source),
+  })}\n`;
+  return { template, identity };
+}
+
 function writeOwnedTemplate(homeDir: string, source: Buffer) {
-  publishOwnedTemplate(homeDir, `${JSON.stringify({ schema: "plimsoll.launch-agent-owned-template/v1",
-    manifestDigest: digest(source), manifest: source.toString("utf8") })}\n`);
+  const documents = ownedTemplateDocuments(source);
+  publishOwnedTemplate(homeDir, documents.template);
+  publishOwnedTemplateIdentity(homeDir, documents.identity);
+}
+
+/** Complete or undo a journaled join's template publish after a process crash. */
+export function repairJoinedLaunchAgentOwnership(options: {
+  homeDir?: string;
+  visibleManifestDigest: string;
+  replacementManifestDigest: string;
+  priorManifestDigest: string | null;
+  priorOwnedTemplateContent: string | null;
+  priorOwnedTemplateIdentityContent: string | null;
+  mutationAuthority?: LifecycleMutationAuthority;
+}) {
+  const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
+  const fence = acquireMutationFence(options);
+  try {
+    const preimage = readPreimage(launchAgentPlistPath(homeDir));
+    try {
+      if (!preimage.content || digest(preimage.content) !== options.visibleManifestDigest)
+        fail("JOIN_OWNERSHIP_MANIFEST_CHANGED");
+      const template = readOwnedTemplate(homeDir);
+      const identity = readOwnedTemplateIdentity(homeDir);
+      const replacement = template && digest(template.manifest) === options.replacementManifestDigest
+        ? ownedTemplateDocuments(Buffer.from(template.manifest)) : null;
+      const identityIsPendingReplacement = identity?.manifestDigest === options.replacementManifestDigest &&
+        (!template || identity.content === replacement?.identity);
+      if ((template && template.content !== options.priorOwnedTemplateContent &&
+            template.content !== replacement?.template) ||
+          (identity && identity.content !== options.priorOwnedTemplateIdentityContent &&
+            !identityIsPendingReplacement))
+        fail("JOIN_OWNERSHIP_METADATA_CHANGED");
+      assertMutationFence(fence);
+      if (options.priorManifestDigest === null) {
+        if (options.visibleManifestDigest !== options.replacementManifestDigest)
+          fail("JOIN_OWNERSHIP_MANIFEST_CHANGED");
+        writeOwnedTemplate(homeDir, preimage.content);
+      } else {
+        if (options.visibleManifestDigest !== options.priorManifestDigest)
+          fail("JOIN_OWNERSHIP_MANIFEST_CHANGED");
+        publishOwnedTemplate(homeDir, options.priorOwnedTemplateContent);
+        publishOwnedTemplateIdentity(homeDir, options.priorOwnedTemplateIdentityContent);
+      }
+    } finally {
+      if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);
+    }
+  } finally { fence?.release(); }
 }
 
 export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInstallResult {
+  if (options.commitOperationId && !/^[0-9a-f-]{36}$/i.test(options.commitOperationId))
+    fail("COMMIT_OPERATION_INVALID");
   const normalized = normalizedOptions(options);
   const homeDir = ensureHomeRoot(normalized.homeDir ?? os.homedir());
   const plistPath = launchAgentPlistPath(homeDir);
@@ -1060,6 +1275,13 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
     }
     if (exactNoop) {
       assertStablePath(initial.snapshot);
+      const trust = ownedTemplateTrust(homeDir);
+      if (trust.evidence !== "owned_template") {
+        return { plistPath, receipt: installReceipt(
+          trust.evidence === "template_changed" ? "template_changed" : "template_missing",
+          digest(desired), undefined, initial, false,
+        ) };
+      }
       return {
         plistPath,
         receipt: installReceipt("unchanged", digest(desired), undefined, initial),
@@ -1143,8 +1365,9 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       // rename; this preserves both atomic visibility and the operator's file.
       const committedPath = path.join(
         path.dirname(snapshot.absolutePath),
-        `.${path.basename(snapshot.absolutePath)}.plimsoll-commit-${randomUUID()}`,
+        `.${path.basename(snapshot.absolutePath)}.plimsoll-commit-${options.commitOperationId ?? randomUUID()}`,
       );
+      if (lstat(committedPath)) fail("COMMIT_OBJECT_COLLISION");
       assertMutationFence(fence);
       fs.renameSync(prepared.path, committedPath);
       const committedStat = lstat(committedPath);
@@ -1187,6 +1410,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       if (Object.hasOwn(options, "restoreOwnedTemplateContent")) {
         if (options.restoreContent === undefined) fail("RECOVERY_TEMPLATE_WITHOUT_MANIFEST");
         publishOwnedTemplate(homeDir, options.restoreOwnedTemplateContent ?? null);
+        publishOwnedTemplateIdentity(homeDir, options.restoreOwnedTemplateIdentityContent ?? null);
       } else {
         writeOwnedTemplate(homeDir, desired);
       }
@@ -1234,7 +1458,8 @@ export function inspectLaunchAgentManifest(options: { homeDir?: string } = {}) {
 export function inspectLaunchAgentOwnership(options: { homeDir?: string; legacyRuntime?: {
   programArguments: string[]; workingDirectory: string;
 } } = {}): {
-  ownerEditedKeys: string[]; runtimeDriftKeys: string[]; evidence: "owned_template" | "legacy_runtime";
+  ownerEditedKeys: string[]; runtimeDriftKeys: string[];
+  evidence: "owned_template" | "legacy_runtime" | "template_missing" | "template_changed";
 } {
   const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
   const preimage = readPreimage(launchAgentPlistPath(homeDir));
@@ -1242,7 +1467,7 @@ export function inspectLaunchAgentOwnership(options: { homeDir?: string; legacyR
     if (!preimage.content) return { ownerEditedKeys: [], runtimeDriftKeys: [], evidence: "legacy_runtime" };
     const actual = validateOwnedManifest(preimage.content.toString("utf8"));
     assertStablePath(preimage.snapshot);
-    const template = readOwnedTemplate(homeDir);
+    const trust = ownedTemplateTrust(homeDir);
     // A pre-template install has no saved manifest preimage. A verified live
     // collector supplies its actual executable, script and cwd; a stopped
     // install is judged against this CLI's own runtime and otherwise needs
@@ -1253,28 +1478,26 @@ export function inspectLaunchAgentOwnership(options: { homeDir?: string; legacyR
     const runtimeExpected = parsePlist(renderLaunchAgentPlist({ homeDir,
       repoRoot: runtime.workingDirectory, workingDirectory: runtime.workingDirectory,
       programArguments: runtime.programArguments }));
-    const expected = template ? parsePlist(template) : runtimeExpected;
+    const expected = trust.manifest ? parsePlist(trust.manifest) : runtimeExpected;
     const differences: string[] = [];
-    for (const key of Object.keys(expected)) {
+    for (const key of new Set([...Object.keys(actual), ...Object.keys(expected)])) {
       if (key === "EnvironmentVariables") {
         const actualEnv = record(actual[key], "PLIST_ENVIRONMENT_INVALID");
         const expectedEnv = record(expected[key], "PLIST_ENVIRONMENT_INVALID");
-        for (const envKey of Object.keys(expectedEnv)) {
+        for (const envKey of new Set([...Object.keys(actualEnv), ...Object.keys(expectedEnv)])) {
           // Without an owned template, PATH has no trustworthy prior value:
           // a changed shell must not be mistaken for a manifest owner edit.
-          if (envKey === "PATH" && !template) continue;
+          if (envKey === "PATH" && trust.evidence === "legacy_runtime") continue;
           if (!isDeepStrictEqual(actualEnv[envKey], expectedEnv[envKey]))
             differences.push(`EnvironmentVariables.${envKey}`);
         }
       } else if (!isDeepStrictEqual(actual[key], expected[key])) differences.push(key);
     }
-    if (Object.hasOwn(actual, "ProcessType") && !Object.hasOwn(expected, "ProcessType"))
-      differences.push("ProcessType");
     const actualPath = record(actual.EnvironmentVariables, "PLIST_ENVIRONMENT_INVALID").PATH;
     const runtimePath = record(runtimeExpected.EnvironmentVariables, "PLIST_ENVIRONMENT_INVALID").PATH;
     const runtimeDriftKeys = isDeepStrictEqual(actualPath, runtimePath) ? [] : ["EnvironmentVariables.PATH"];
     return { ownerEditedKeys: differences, runtimeDriftKeys,
-      evidence: template ? "owned_template" : "legacy_runtime" };
+      evidence: trust.evidence };
   } finally {
     if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);
   }

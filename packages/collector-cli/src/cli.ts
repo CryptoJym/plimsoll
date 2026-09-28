@@ -91,12 +91,16 @@ import {
 import { enrollCodexLiveProducer } from "./codex-live-usage-auth";
 import {
   installLaunchAgent,
+  finishInterruptedJoinLaunchAgentPublish,
   inspectLaunchAgentManifest,
   inspectLaunchAgentOwnership,
   LAUNCH_AGENT_LABEL,
   LAUNCH_AGENT_SYSTEM_PATHS,
   launchAgentOwnedTemplatePath,
+  launchAgentOwnedTemplateIdentityPath,
   launchAgentPlistPath,
+  readLaunchAgentProgramArguments,
+  repairJoinedLaunchAgentOwnership,
   launchctlBootoutCommand,
   launchctlBootstrapCommand,
   launchctlKickstartCommand,
@@ -151,6 +155,7 @@ import {
   readJoinedRootJournal,
   restoreJoinConfigBytes,
   rollbackJoinedRootJournal,
+  setAsideUnreadableJoinRestartObligation,
   withJoinRootJournal,
   writeJoinRestartObligation,
   type JoinRestartObligation,
@@ -827,16 +832,38 @@ function installedLegacyLaunchAgentRuntime(): {
   programArguments: string[]; workingDirectory: string;
 } | undefined {
   const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
-  if (pidRead.kind !== "current" || !processIdentityIsLive(pidRead.record)) return undefined;
-  const record = pidRead.record;
-  if (record.command.length !== 2 || record.command[1] !== "start" ||
-      !path.isAbsolute(record.command[0]!) || record.cwd !== path.dirname(record.command[0]!))
-    return undefined;
-  const observed = spawnSync("/bin/ps", ["-p", String(record.pid), "-o", "comm="],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-  const executable = observed.status === 0 ? observed.stdout.trim() : "";
-  if (!path.isAbsolute(executable) || !processIdentityIsLive(record)) return undefined;
-  return { programArguments: [executable, ...record.command], workingDirectory: record.cwd };
+  if (pidRead.kind === "current" && processIdentityIsLive(pidRead.record)) {
+    const record = pidRead.record;
+    if (record.command.length === 2 && record.command[1] === "start" &&
+        path.isAbsolute(record.command[0]!) && record.cwd === path.dirname(record.command[0]!)) {
+      const observed = spawnSync("/bin/ps", ["-p", String(record.pid), "-o", "comm="],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      const executable = observed.status === 0 ? observed.stdout.trim() : "";
+      if (path.isAbsolute(executable) && processIdentityIsLive(record))
+        return { programArguments: [executable, ...record.command], workingDirectory: record.cwd };
+    }
+  }
+  // A stopped pre-template install has no PID. Its validated plist still
+  // identifies the installed runtime, which may be older than this CLI.
+  const installed = readLaunchAgentProgramArguments();
+  const args = [...installed.programArguments];
+  if (args.length !== 3 || args[2] !== "start" ||
+      installed.workingDirectory !== path.dirname(args[1]!)) return undefined;
+  let script: fs.Stats;
+  try { script = fs.lstatSync(args[1]!); }
+  catch { return undefined; }
+  if (!script.isFile() || script.isSymbolicLink() || script.nlink !== 1) return undefined;
+  const statePath = path.join(collectorHome(), "lifecycle", "state.json");
+  if (fs.existsSync(statePath)) {
+    try {
+      const stateStat = fs.lstatSync(statePath);
+      if (!stateStat.isFile() || stateStat.isSymbolicLink() || stateStat.nlink !== 1 || stateStat.size > 4096)
+        return undefined;
+      const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as { executablePath?: unknown };
+      if (state.executablePath !== args[1]) return undefined;
+    } catch { return undefined; }
+  }
+  return { programArguments: args, workingDirectory: installed.workingDirectory };
 }
 
 function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false,
@@ -960,7 +987,7 @@ async function restorePriorJoinedCollector(port: number, manifest: ReturnType<ty
     const visible = inspectLaunchAgentManifest();
     if (!visible.ok || visible.manifestDigest !== manifest.manifestDigest)
       throw new Error("The previous LaunchAgent changed during recovery; collector restart needs manual repair.");
-    const loaded = await loadVisibleLaunchAgent(manifest.plistPath, port, false, launchAgentMutationAuthority());
+    const loaded = await loadVisibleLaunchAgent(manifest.plistPath, port, false, joinLaunchAgentMutationAuthority());
     lastStatus = loaded.status;
     if (loaded.loaded) {
       const after = await verifyPostBootstrapReadiness(port, { timeoutMs: 30_000 });
@@ -1018,18 +1045,19 @@ async function finishJoinedCollectorSetupCore(
     workingDirectory: path.dirname(script) };
   const installPreview = installLaunchAgent({ ...installOptions, dryRun: true });
   if (manifest.ok && installPreview.receipt.wouldChange) {
-    const unload = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
+    const unload = await executeLaunchAgentUnload(config.port, joinLaunchAgentMutationAuthority());
     if (!unload.unloaded) throw new Error(`Collector restart was not proven safe (${unload.reason ?? unload.status}).`);
   }
   const installed = installLaunchAgent({
-    ...installOptions, mutationAuthority: launchAgentMutationAuthority(),
+    ...installOptions, commitOperationId: obligation.operationId,
+    mutationAuthority: joinLaunchAgentMutationAuthority(),
   });
   const visible = inspectLaunchAgentManifest();
   if (!visible.ok || visible.manifestDigest !== installed.receipt.manifestDigest) {
     throw new Error("Collector LaunchAgent install did not pass readback.");
   }
   await releaseStopWindowListener(config.port, resolveCollectorHome().home);
-  const load = await loadVisibleLaunchAgent(installed.plistPath, config.port, false, launchAgentMutationAuthority());
+  const load = await loadVisibleLaunchAgent(installed.plistPath, config.port, false, joinLaunchAgentMutationAuthority());
   const readiness = await verifyPostBootstrapReadiness(config.port, { timeoutMs: 30_000 });
   const connectivity = await checkCollectorConnectivity(config.port,
     readLocalIngestAuth(collectorHome())?.managementRead);
@@ -1040,7 +1068,12 @@ async function finishJoinedCollectorSetupCore(
       daemonState.sync.scheduler?.inFlight === true);
   const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
   const pidRecord = pidRead.kind === "current" ? pidRead.record : null;
-  if (!load.loaded || !readiness.verified || !connectivity.reachable || !syncArmed || !pidRecord ||
+  const servingInstalledRuntime = pidRecord?.command.length === 2 &&
+    pidRecord.command[0] === script && pidRecord.command[1] === "start" &&
+    pidRecord.cwd === path.dirname(script);
+  const loadSatisfied = load.loaded ||
+    (load.status === "lifecycle_fence_busy" && servingInstalledRuntime);
+  if (!loadSatisfied || !readiness.verified || !connectivity.reachable || !syncArmed || !pidRecord ||
       !processIdentityIsLive(pidRecord) || !runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity) ||
       connectivity.homeIdentityHash !== collectorHomeIdentityHash(collectorHome())) {
     throw new Error(`Collector was installed but readiness could not be verified (load=${load.status}, ` +
@@ -1053,10 +1086,62 @@ async function finishJoinedCollectorSetupCore(
     readinessVerified: true, runtimeIdentityVerified: true, syncArmed: true }, enrollment: result.enrollment };
 }
 
+async function readPendingJoinedCollectorObligation(home: string): Promise<JoinRestartObligation | null> {
+  try { return readJoinRestartObligation(home); }
+  catch {
+    const refusal = "The join restart obligation is unreadable and the previous collector " +
+      "cannot be proven unchanged and loaded; refusing recovery.";
+    try {
+      const config = readCollectorConfig();
+      if (config.status !== "valid") throw new Error("config missing");
+      const journalPresent = withJoinRootJournal(path.join(home, "work-ledger.sqlite"), (database) => {
+        const table = database.prepare("select name from sqlite_master where type = 'table' and name = 'join_root_registration_journal'").get();
+        if (!table) return false;
+        const row = database.prepare("select count(*) as count from join_root_registration_journal").get() as { count: number };
+        return row.count > 0;
+      });
+      if (journalPresent) throw new Error("root transaction present");
+      const manifest = inspectLaunchAgentManifest();
+      if (!manifest.ok) throw new Error("prior LaunchAgent missing");
+      const program = readLaunchAgentProgramArguments();
+      const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
+      if (pidRead.kind !== "current" || !processIdentityIsLive(pidRead.record))
+        throw new Error("prior collector PID missing");
+      const pid = pidRead.record;
+      const job = launchctlJobState();
+      const ownership = inspectLaunchAgentOwnership({
+        legacyRuntime: installedLegacyLaunchAgentRuntime(),
+      });
+      const ready = await verifyPostBootstrapReadiness(config.config.port, { timeoutMs: 0 });
+      const connected = await checkCollectorConnectivity(config.config.port,
+        readLocalIngestAuth(home)?.managementRead);
+      if (job.kind !== "reported" || job.processIdentity?.pid !== pid.pid ||
+          job.processIdentity.processStartFingerprint !== pid.processStartFingerprint ||
+          ownership.ownerEditedKeys.length !== 0 ||
+          !ready.verified || !connected.reachable ||
+          !runtimeIdentityMatches(pid, connected.runtimeIdentity) ||
+          connected.homeIdentityHash !== collectorHomeIdentityHash(home) ||
+          pid.command.length !== 2 || pid.command[0] !== program.programArguments[1] ||
+          pid.command[1] !== "start" || pid.cwd !== program.workingDirectory)
+        throw new Error("prior loaded runtime could not be verified");
+      const note = setAsideUnreadableJoinRestartObligation(home, "unreadable_pre_unload_obligation");
+      console.error(`Set aside an unreadable pre-unload join obligation; recovery note: ${note}.`);
+      return null;
+    } catch {
+      throw new Error(refusal);
+    }
+  }
+}
+
 async function recoverPendingJoinedCollector(): Promise<boolean> {
   const home = collectorHome();
-  const obligation = readJoinRestartObligation(home);
+  const obligation = await readPendingJoinedCollectorObligation(home);
   if (!obligation) return false;
+  finishInterruptedJoinLaunchAgentPublish({
+    operationId: obligation.operationId,
+    replacementManifestDigest: obligation.replacementManifestDigest,
+    mutationAuthority: joinLaunchAgentMutationAuthority(),
+  });
   const ledgerPath = path.join(home, "work-ledger.sqlite");
   const journal = withJoinRootJournal(ledgerPath, (database) =>
     readJoinedRootJournal(database, obligation.operationId));
@@ -1070,7 +1155,7 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
       if (serving.verified) throw new Error("A collector is serving without its LaunchAgent during join recovery.");
       return;
     }
-    const stopped = await executeLaunchAgentUnload(obligation.port, launchAgentMutationAuthority());
+    const stopped = await executeLaunchAgentUnload(obligation.port, joinLaunchAgentMutationAuthority());
     if (!stopped.unloaded)
       throw new Error(`Could not stop the collector safely for join recovery (${stopped.reason ?? stopped.status}).`);
   };
@@ -1109,8 +1194,9 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
         programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script) };
       installLaunchAgent({ ...options, restoreContent: obligation.priorContent,
         restoreOwnedTemplateContent: obligation.priorOwnedTemplateContent,
+        restoreOwnedTemplateIdentityContent: obligation.priorOwnedTemplateIdentityContent,
         ...(visible.ok && visible.manifestDigest ? { expectedCurrentDigest: visible.manifestDigest } : {}),
-        mutationAuthority: launchAgentMutationAuthority() });
+        mutationAuthority: joinLaunchAgentMutationAuthority() });
       visible = inspectLaunchAgentManifest();
     }
     if (!visible.ok || visible.manifestDigest !== obligation.priorManifestDigest)
@@ -1122,13 +1208,23 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
     const script = fs.realpathSync(process.argv[1] ?? "");
     const install = installLaunchAgent({ repoRoot: path.dirname(script),
       programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script),
-      mutationAuthority: launchAgentMutationAuthority() });
+      mutationAuthority: joinLaunchAgentMutationAuthority() });
     if (install.receipt.manifestDigest !== obligation.replacementManifestDigest)
       throw new Error("The fresh collector LaunchAgent differed from the journaled install.");
     visible = inspectLaunchAgentManifest();
     if (!visible.ok || visible.manifestDigest !== obligation.replacementManifestDigest)
       throw new Error("The fresh collector LaunchAgent did not pass recovery readback.");
   }
+  if (!visible.ok || !visible.manifestDigest)
+    throw new Error("The collector LaunchAgent was missing after join recovery.");
+  repairJoinedLaunchAgentOwnership({
+    visibleManifestDigest: visible.manifestDigest,
+    replacementManifestDigest: obligation.replacementManifestDigest,
+    priorManifestDigest: obligation.priorManifestDigest,
+    priorOwnedTemplateContent: obligation.priorOwnedTemplateContent,
+    priorOwnedTemplateIdentityContent: obligation.priorOwnedTemplateIdentityContent,
+    mutationAuthority: joinLaunchAgentMutationAuthority(),
+  });
   await restorePriorJoinedCollector(obligation.port, visible);
   clearJoinRestartObligation(home);
   withJoinRootJournal(ledgerPath, (database) => clearJoinedRootJournal(database, obligation.operationId));
@@ -1146,13 +1242,16 @@ async function finishJoinedCollectorSetup(
   const priorContent = priorManifest.ok ? fs.readFileSync(priorManifest.plistPath, "utf8") : null;
   const templatePath = launchAgentOwnedTemplatePath();
   const priorOwnedTemplateContent = fs.existsSync(templatePath) ? fs.readFileSync(templatePath, "utf8") : null;
+  const templateIdentityPath = launchAgentOwnedTemplateIdentityPath();
+  const priorOwnedTemplateIdentityContent = fs.existsSync(templateIdentityPath)
+    ? fs.readFileSync(templateIdentityPath, "utf8") : null;
   const script = fs.realpathSync(process.argv[1] ?? "");
   const installOptions = { repoRoot: path.dirname(script),
     programArguments: [process.execPath, script, "start"], workingDirectory: path.dirname(script) };
   const replacementManifestDigest = installLaunchAgent({ ...installOptions, dryRun: true }).receipt.manifestDigest;
   const obligation = writeJoinRestartObligation(collectorHome(), {
     priorManifestDigest: priorManifest.ok ? priorManifest.manifestDigest : null,
-    priorContent, priorOwnedTemplateContent, replacementManifestDigest,
+    priorContent, priorOwnedTemplateContent, priorOwnedTemplateIdentityContent, replacementManifestDigest,
     port: configRead.config.port, configPath: configRead.path,
     configBeforeRoots: fs.readFileSync(configRead.path, "utf8"),
   });
@@ -1244,6 +1343,14 @@ function loadedButUnspawned(job: ReturnType<typeof launchctlJobState>) {
 // cleanup). Read-only inspection and doctor never acquire a lease.
 function launchAgentMutationAuthority() {
   return new LifecycleMutationAuthority(defaultLifecycleAuthorityRoot());
+}
+
+function joinLaunchAgentMutationAuthority() {
+  // The durable join obligation lets a retry supersede a lease only when its
+  // recorded owner PID is definitely gone. Other lifecycle callers retain
+  // the ordinary expiry-only authority.
+  return new LifecycleMutationAuthority(defaultLifecycleAuthorityRoot(),
+    { recoverDeadOwner: true });
 }
 
 type LaunchAgentFence =
