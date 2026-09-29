@@ -586,21 +586,27 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   private currentInstallId() {
+    const state = readJson<unknown>(this.statePath);
+    if (state !== null && (!state || typeof state !== "object" || Array.isArray(state)))
+      throw new Error("lifecycle state is malformed");
+    const stateId = (state as { installId?: unknown } | null)?.installId;
+    const validId = (value: unknown): value is string =>
+      typeof value === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+    if (stateId !== undefined && !validId(stateId))
+      throw new Error("lifecycle state install identity is malformed");
     const identity = readJson<unknown>(this.installationPath);
-    if (identity === null) return randomUUID();
+    if (identity === null) return stateId ?? randomUUID();
     if (!identity || typeof identity !== "object" || Array.isArray(identity))
       throw new Error("lifecycle installation identity is malformed");
     const row = identity as { schemaVersion?: unknown; installId?: unknown; executablePath?: unknown };
-    if (row.schemaVersion !== 1 || typeof row.installId !== "string" ||
-        !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(row.installId) ||
-        typeof row.executablePath !== "string")
+    if (row.schemaVersion !== 1 || !validId(row.installId) || typeof row.executablePath !== "string")
       throw new Error("lifecycle installation identity is malformed");
-    const state = readJson<unknown>(this.statePath);
-    if (state === null) return randomUUID();
-    if (!state || typeof state !== "object" || Array.isArray(state) ||
-        (state as { installId?: unknown }).installId !== row.installId)
+    // state.json is the commit record. installation.json may already name the
+    // next runtime when an update was interrupted between the two renames.
+    // An older state without an id adopts the first durable installation id.
+    if (stateId !== undefined && stateId !== row.installId)
       throw new Error("lifecycle state does not match this installation");
-    return row.installId;
+    return stateId ?? row.installId;
   }
 
   async acquireLock(operationId: string) {
@@ -919,18 +925,19 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     const executablePath = this.verifyStagedRuntime(artifact);
     await this.service.activate({ executablePath, version: artifact.version });
     const installId = this.currentInstallId();
-    const targetDirectory = path.dirname(path.dirname(executablePath));
-    const temporary = `${this.currentPath}.next`;
-    fs.rmSync(temporary, { force: true });
-    fs.symlinkSync(targetDirectory, temporary, "dir");
-    fs.renameSync(temporary, this.currentPath);
-    writeJson(this.installationPath, { schemaVersion: 1, installId, executablePath }, this.root);
-    writeJson(this.statePath, {
+    writeJsonDurable(this.installationPath, { schemaVersion: 1, installId, executablePath }, this.root);
+    writeJsonDurable(this.statePath, {
       schemaVersion: 1,
       version: artifact.version,
       executablePath,
       installId,
     }, this.root);
+    const targetDirectory = path.dirname(path.dirname(executablePath));
+    const temporary = `${this.currentPath}.next`;
+    fs.rmSync(temporary, { force: true });
+    fs.symlinkSync(targetDirectory, temporary, "dir");
+    fs.renameSync(temporary, this.currentPath);
+    fsyncDirectory(this.root);
   }
 
   readiness(expectedVersion: string, input: { signal: AbortSignal; deadlineMs: number }) {
@@ -999,20 +1006,21 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     if (metadata.currentVersion && metadata.currentExecutable) {
       assertAbsoluteOwnedPath(metadata.currentExecutable, this.versionsRoot, "snapshot runtime");
       assertNoSymlink(metadata.currentExecutable, this.versionsRoot);
-      const targetDirectory = path.dirname(path.dirname(metadata.currentExecutable));
-      const temporary = `${this.currentPath}.restore`;
-      fs.rmSync(temporary, { force: true });
-      fs.symlinkSync(targetDirectory, temporary, "dir");
-      fs.renameSync(temporary, this.currentPath);
       const installId = this.currentInstallId();
-      writeJson(this.installationPath, { schemaVersion: 1, installId,
+      writeJsonDurable(this.installationPath, { schemaVersion: 1, installId,
         executablePath: metadata.currentExecutable }, this.root);
-      writeJson(this.statePath, {
+      writeJsonDurable(this.statePath, {
         schemaVersion: 1,
         version: metadata.currentVersion,
         executablePath: metadata.currentExecutable,
         installId,
       }, this.root);
+      const targetDirectory = path.dirname(path.dirname(metadata.currentExecutable));
+      const temporary = `${this.currentPath}.restore`;
+      fs.rmSync(temporary, { force: true });
+      fs.symlinkSync(targetDirectory, temporary, "dir");
+      fs.renameSync(temporary, this.currentPath);
+      fsyncDirectory(this.root);
     } else {
       fs.rmSync(this.currentPath, { force: true });
       fs.rmSync(this.statePath, { force: true });
