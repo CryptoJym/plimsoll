@@ -9,7 +9,8 @@ import { classifyEventType, isUuid } from "./normalizer";
 import { withRebuildCoordination } from "./rebuild-coordination";
 import { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 import { HOOK_ACK_LOOKUP_SQL, HOOK_ROW_LOOKUP_SQL, HOOK_ROW_LEGACY_LOOKUP_SQL,
-  ledgerAdmissionSequence, originalHookTimestampDigest, removeMaintenanceHookAdmission,
+  ensureMaintenanceEventOrderSchema, ledgerAdmissionSequence, originalHookTimestampDigest,
+  removeMaintenanceHookAdmission,
   sameHookIdentityPart } from "./maintenance-hook-admission";
 import { hookBodyDigest, hookBodyFromWire, hookReceiptFileName } from "./maintenance-hook-fingerprint";
 
@@ -166,7 +167,10 @@ function withHookHighWater<T>(home: string, marker: PauseMarker, action: (bounda
   let db: Database.Database | null = null;
   try {
     token = acquireRebuildOpenToken(ledger);
-    db = new Database(ledger, { fileMustExist: true, timeout: 500 });
+    db = new Database(ledger, { fileMustExist: true, timeout: 30_000 });
+    // Publish the complete schema first. A marker or receipt must never be
+    // fsynced against a sequence table whose transaction can still roll back.
+    ensureMaintenanceEventOrderSchema(db);
     db.exec("BEGIN IMMEDIATE");
   } catch (error) {
     db?.close();
@@ -180,6 +184,9 @@ function withHookHighWater<T>(home: string, marker: PauseMarker, action: (bounda
     return action({ highWater: null, admissionSequence: null, ledgerAbsentAtRefusal: false });
   }
   try {
+    // A paused listener can start while another daemon is upgrading this
+    // ledger. It waits for that complete schema commit, then takes the
+    // boundary under its own writer lock before recording the refusal.
     const result = action({ highWater: ledgerHighWater(db),
       admissionSequence: ledgerAdmissionSequence(db), ledgerAbsentAtRefusal: false });
     db.exec("COMMIT");
@@ -409,7 +416,7 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
   fsyncDirectory(directory);
 }
 
-type AdmissionMatch = "accepted" | "unverified" | "unknown" | "none";
+type AdmissionMatch = "accepted" | "unverified" | "unsequenced" | "unknown" | "none";
 function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt): AdmissionMatch {
   if (receipt.version !== 7 || !receipt.receiptId || !receipt.eventId ||
     !receipt.source || !receipt.kind || !receipt.tenantId) return "none";
@@ -435,6 +442,7 @@ function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt):
   let ambiguous = false;
   let digestlessAfter = false;
   let digestedAfter = false;
+  let unsequenced = false;
   for (const row of rows) {
     if (rejectedIds.has(row.id) || !sameEventId(row.id, receipt.eventId) ||
       row.source !== receipt.source || row.event_type !== receipt.kind ||
@@ -451,8 +459,10 @@ function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt):
     // without the trigger, so its first digestless row is still later evidence.
     if (receipt.ledgerAbsentAtRefusal && row.admission_seq === null)
       digestlessAfter = true;
+    else if (row.admission_seq === null) unsequenced = true;
   }
   if (digestlessAfter && !digestedAfter) return "unverified";
+  if (unsequenced) return "unsequenced";
   return ambiguous ? "unknown" : "none";
 }
 
@@ -487,7 +497,11 @@ function unknownFormatCount(records: TerminalRecord[]) {
     .map((entry) => `${entry.receipt}\0${entry.at}`)).size;
 }
 function unknownFormatLosses(records: TerminalRecord[]) {
-  const unique = new Map(unknownFormatRecords(records)
+  const unique = new Map(records.filter((entry) => entry.version === 1 &&
+    (entry.outcome === "unknown_receipt_format" ||
+      entry.outcome === "unsequenced_legacy_admission") &&
+    typeof entry.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(entry.receipt) &&
+    typeof entry.at === "string" && Number.isFinite(Date.parse(entry.at)))
     .map((entry) => [`${entry.receipt}\0${entry.at}`, entry]));
   return [...unique.values()].map((entry) => {
     const at = Date.parse(entry.at!);
@@ -645,7 +659,8 @@ export function reconcileMaintenanceRebuildRefusals(home: string,
       lost = unknownFormatLosses(records);
       for (const value of records) {
         if (value.version === 1 && (value.outcome === "terminal" ||
-          value.outcome === "retired_unverified" || value.outcome === "unknown_receipt_format") &&
+          value.outcome === "retired_unverified" || value.outcome === "unknown_receipt_format" ||
+          value.outcome === "unsequenced_legacy_admission") &&
           typeof value.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(value.receipt) &&
           typeof value.at === "string") terminal.add(`${value.receipt}\0${value.at}`);
       }
@@ -720,6 +735,20 @@ export function reconcileMaintenanceRebuildRefusals(home: string,
           if (receipt.receiptId) retiredIds.push(receipt.receiptId);
           continue;
         }
+        if (match === "unsequenced" && !pendingFile && nowMs - atMs >= MISSING_HOOK_RETRY_MS) {
+          // The old writer supplied the right identity but no durable order.
+          // It could predate the refusal, so it cannot prove capture. Record
+          // the unknown as a lasting claim loss instead of holding forever.
+          appendTerminalOutcome(home, { version: 1, receipt: path.basename(file), at: receipt.at,
+            route: "hook", eventId: receipt.eventId ?? null, source: receipt.source,
+            kind: receipt.kind, spoolName: receipt.spoolName,
+            outcome: "unsequenced_legacy_admission" });
+          lost.push({ fromMs: atMs, toMs: atMs, count: 1 });
+          fs.unlinkSync(file);
+          fsyncDirectory(directory);
+          if (receipt.receiptId) retiredIds.push(receipt.receiptId);
+          continue;
+        }
         if (!pendingFile && (checked || !receipt.eventId) && nowMs - atMs >= MISSING_HOOK_RETRY_MS) {
           if (!receipt.unknownAt) writeReceipt(file, { ...receipt, unknownAt: new Date(nowMs).toISOString() });
           if (match === "none") lost.push({ fromMs: atMs, toMs: atMs, count: 1 });
@@ -766,12 +795,16 @@ export function markMaintenanceRebuildPause(home: string) {
   const selectedExisted = fs.existsSync(file);
   const alternate = path.join(home, name === "ledger.sqlite" ? "work-ledger.sqlite" : "ledger.sqlite");
   const existedAtPause = selectedExisted || fs.existsSync(alternate);
-  writeMarker(home, { version: 1, at: new Date().toISOString(), pid: process.pid,
-    ledgerName: name, ledgerHighWater: selectedExisted ? observedLedgerHighWater(file)
-      : existedAtPause ? null : 0,
-    ledgerAdmissionSequence: selectedExisted ? observedLedgerAdmissionSequence(file)
-      : existedAtPause ? null : 0,
-    ledgerExistedAtPause: existedAtPause });
+  const marker: PauseMarker = { version: 1, at: new Date().toISOString(), pid: process.pid,
+    ledgerName: name, ledgerHighWater: existedAtPause ? null : 0,
+    ledgerAdmissionSequence: existedAtPause ? null : 0,
+    ledgerExistedAtPause: existedAtPause };
+  // Keep schema publication, the boundary observation and durable marker in
+  // one writer lock. A listener never publishes a partial-install sequence.
+  withHookHighWater(home, marker, (boundary) => {
+    writeMarker(home, { ...marker, ledgerHighWater: boundary.highWater,
+      ledgerAdmissionSequence: boundary.admissionSequence });
+  });
 }
 
 /** Called immediately after every daemon writer has quiesced, before the

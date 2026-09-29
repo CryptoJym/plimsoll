@@ -81,26 +81,43 @@ export function ensureMaintenanceHookAdmissionSchema(db: Database.Database) {
   }
   db.exec(`create index if not exists idx_maintenance_hook_admission_event
     on maintenance_rebuild_hook_admissions(admitted_event_id)`);
+  ensureMaintenanceEventOrderSchema(db);
+}
+
+/** Publish the side table and all triggers as one schema transition. A
+ * downgraded writer can insert only before BEGIN IMMEDIATE or after COMMIT;
+ * it can never see a committed table without its insert trigger. This also
+ * completes an interrupted installation made by an earlier build. */
+export function ensureMaintenanceEventOrderSchema(db: Database.Database) {
+  const installed = db.prepare(`select count(*) as n from sqlite_master
+    where (type = 'table' and name = 'maintenance_rebuild_event_order')
+       or (type = 'trigger' and name in (
+         'trg_maintenance_rebuild_event_order_insert',
+         'trg_maintenance_rebuild_event_order_delete',
+         'trg_maintenance_rebuild_event_order_rekey'))`).get() as { n: number };
+  if (installed.n === 4) return;
   // AUTOINCREMENT stores its last issued sequence in sqlite_sequence even
   // after retention deletes the top event. These triggers also run when
   // 0.7.44 writes through the same ledger after a downgrade.
-  db.exec(`create table if not exists maintenance_rebuild_event_order (
-    seq integer primary key autoincrement,
-    event_id text not null unique
-  )`);
-  db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_insert
-    after insert on buffered_events begin
-      insert into maintenance_rebuild_event_order(event_id) values (new.id);
-    end`);
-  db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_delete
-    after delete on buffered_events begin
-      delete from maintenance_rebuild_event_order where event_id = old.id;
-    end`);
-  db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_rekey
-    after update of id on buffered_events
-    when new.id is not old.id begin
-      update maintenance_rebuild_event_order set event_id = new.id where event_id = old.id;
-    end`);
+  db.transaction(() => {
+    db.exec(`create table if not exists maintenance_rebuild_event_order (
+      seq integer primary key autoincrement,
+      event_id text not null unique
+    )`);
+    db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_insert
+      after insert on buffered_events begin
+        insert into maintenance_rebuild_event_order(event_id) values (new.id);
+      end`);
+    db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_delete
+      after delete on buffered_events begin
+        delete from maintenance_rebuild_event_order where event_id = old.id;
+      end`);
+    db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_rekey
+      after update of id on buffered_events
+      when new.id is not old.id begin
+        update maintenance_rebuild_event_order set event_id = new.id where event_id = old.id;
+      end`);
+  }).immediate();
 }
 
 /** Never use max(rowid): SQLite can reuse it after the top row is pruned. */
