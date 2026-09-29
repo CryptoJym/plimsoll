@@ -707,13 +707,13 @@ export async function runWorkspaceHistoryUpload(
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history.',
     );
   }
   if ((!config.installKey || config.installKey === "local-dev") && !config.ingestKey) {
     throw new Error(
       "No workspace install credentials found (installKey is missing/local-dev and there is no ingestKey). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history.',
     );
   }
 
@@ -1190,13 +1190,13 @@ export async function runAttributionRepair(
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --repair-attribution.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history --repair-attribution.',
     );
   }
   if ((!config.installKey || config.installKey === "local-dev") && !config.ingestKey) {
     throw new Error(
       "No workspace install credentials found (installKey is missing/local-dev and there is no ingestKey). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --repair-attribution.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history --repair-attribution.',
     );
   }
 

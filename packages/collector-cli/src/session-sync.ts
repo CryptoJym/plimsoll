@@ -1277,13 +1277,13 @@ export async function runSessionSync(
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --sessions.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history --sessions.',
     );
   }
   if ((!config.installKey || config.installKey === "local-dev") && !config.ingestKey) {
     throw new Error(
       "No workspace install credentials found (installKey is missing/local-dev and there is no ingestKey). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --sessions.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history --sessions.',
     );
   }
 
