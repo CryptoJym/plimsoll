@@ -36,6 +36,8 @@ type NormalizeOptions = {
    * curl retries of the same hook post one ledger row.
    */
   producerEventId?: string;
+  /** Stable spool-unit UUID used only when neither producer nor body supplied one. */
+  fallbackEventId?: string;
   /**
    * Collector receive-time wall clock, defaulted to `Date.now`. Same kind of
    * outside-world seam as `JsonlTailerIo.now`: the hook intake clamp measures
@@ -104,12 +106,12 @@ function otelAttributeKey(value: Record<string, unknown>) {
   return typeof value.key === "string" && "value" in value ? value.key : undefined;
 }
 
-function collectOtelSignals(value: unknown, signals: OTelSignals) {
+function collectOtelSignals(value: unknown, signals: OTelSignals, receivedAtMs: number) {
   if (!value || typeof value !== "object") return;
 
   if (Array.isArray(value)) {
     for (const item of value) {
-      collectOtelSignals(item, signals);
+      collectOtelSignals(item, signals, receivedAtMs);
     }
     return;
   }
@@ -139,12 +141,12 @@ function collectOtelSignals(value: unknown, signals: OTelSignals) {
     const valueAtKey = record[key];
     if (typeof valueAtKey === "string" || typeof valueAtKey === "number") {
       const timestamp = unixNanoToIso(valueAtKey);
-      if (timestamp && timestampIsNotFromTheFuture(timestamp)) signals.timestamps.push(timestamp);
+      if (timestamp && timestampIsNotFromTheFuture(timestamp, receivedAtMs)) signals.timestamps.push(timestamp);
     }
   }
 
   for (const nested of Object.values(record)) {
-    collectOtelSignals(nested, signals);
+    collectOtelSignals(nested, signals, receivedAtMs);
   }
 }
 
@@ -213,13 +215,13 @@ export function clampFutureObservedAt(
   return { observedAt: new Date(receivedAtMs).toISOString(), clamped: true };
 }
 
-function extractOtelSignals(payload: Record<string, unknown>): OTelSignals {
+function extractOtelSignals(payload: Record<string, unknown>, receivedAtMs: number): OTelSignals {
   const signals: OTelSignals = {
     attributes: {},
     names: [],
     timestamps: [],
   };
-  collectOtelSignals(payload, signals);
+  collectOtelSignals(payload, signals, receivedAtMs);
   return {
     attributes: signals.attributes,
     names: [...new Set(signals.names)],
@@ -239,11 +241,11 @@ function rejectedAttributeReceipts(
   });
 }
 
-function safeSignalNames(names: readonly string[]) {
+function safeSignalNames(names: readonly string[], receivedAtMs: number) {
   const accepted: string[] = [];
   const rejected: string[] = [];
   for (const name of names) {
-    const result = validatedMetadataAttribute("otelEventName", name);
+    const result = validatedMetadataAttribute("otelEventName", name, receivedAtMs);
     if (result.accepted && typeof result.value === "string") {
       accepted.push(result.value);
     } else {
@@ -416,18 +418,18 @@ export function normalizeHookPayload(
   // Classify authority claims before the general sanitizer can collapse or
   // discard lookalike keys. Values remain in-memory only and can cross into an
   // event solely through the exact-alias validators below.
-  const rawOtelSignals = extractOtelSignals(raw);
+  const rawOtelSignals = extractOtelSignals(raw, receivedAtMs);
   const rawTopLevelAuthority = partitionHookAuthority(raw);
   const rawOtelAuthority = partitionHookAuthority(rawOtelSignals.attributes);
   const authorityPartitions = [rawTopLevelAuthority, rawOtelAuthority];
   const sanitized = sanitizeForPolicy(raw, policy);
   const safe = asRecord(sanitized.value);
-  const otelSignals = extractOtelSignals(safe);
+  const otelSignals = extractOtelSignals(safe, receivedAtMs);
   const topLevelAuthority = partitionHookAuthority(safe);
   const otelAuthority = partitionHookAuthority(otelSignals.attributes);
-  const admittedTopLevel = admittedMetadataAttributes(topLevelAuthority.metadata, "record");
-  const admittedOtel = admittedMetadataAttributes(otelAuthority.metadata, "record");
-  const admittedNames = safeSignalNames(otelSignals.names);
+  const admittedTopLevel = admittedMetadataAttributes(topLevelAuthority.metadata, "record", receivedAtMs);
+  const admittedOtel = admittedMetadataAttributes(otelAuthority.metadata, "record", receivedAtMs);
+  const admittedNames = safeSignalNames(otelSignals.names, receivedAtMs);
   const sourceRecords = [admittedTopLevel.attributes, admittedOtel.attributes];
   const eventIdSelection = selectValidatedHookAuthority(
     authorityPartitions,
@@ -437,7 +439,10 @@ export function normalizeHookPayload(
   const producerEventId = options.producerEventId && isUuid(options.producerEventId)
     ? options.producerEventId.trim().toLowerCase()
     : undefined;
-  const eventId = producerEventId ?? eventIdSelection.value ?? crypto.randomUUID();
+  const fallbackEventId = options.fallbackEventId && isUuid(options.fallbackEventId)
+    ? options.fallbackEventId.trim().toLowerCase()
+    : undefined;
+  const eventId = producerEventId ?? eventIdSelection.value ?? fallbackEventId ?? crypto.randomUUID();
   const eventTypeSelection = selectValidatedHookAuthority(
     authorityPartitions,
     "eventType",
@@ -472,7 +477,7 @@ export function normalizeHookPayload(
     authorityPartitions,
     "observedAt",
     (value, key) => {
-      const validated = validatedMetadataAttribute(key, value);
+      const validated = validatedMetadataAttribute(key, value, receivedAtMs);
       if (validated.accepted && typeof validated.value === "string") {
         return new Date(validated.value).toISOString();
       }
@@ -488,7 +493,7 @@ export function normalizeHookPayload(
     futureObservedAtRefused && observedAtSelection.value === undefined;
   const validatedTransportPath = options.transportPath === undefined
     ? undefined
-    : validatedMetadataAttribute("transport_path", options.transportPath);
+    : validatedMetadataAttribute("transport_path", options.transportPath, receivedAtMs);
   if (validatedTransportPath && !validatedTransportPath.accepted) {
     throw new Error("InvalidHookTransportPath");
   }
@@ -500,7 +505,7 @@ export function normalizeHookPayload(
   // Authority-like aliases were partitioned before this copy. This routine
   // view can contain analytical metadata, never caller claims for transport,
   // tenant, data mode, resolver linkage, event identity/time/type or action.
-  const admittedRoutine = admittedHookMetadata(topLevelAuthority.metadata);
+  const admittedRoutine = admittedHookMetadata(topLevelAuthority.metadata, receivedAtMs);
   const metadataBase: Record<string, unknown> = { ...admittedRoutine.attributes };
 
   const metadata = {

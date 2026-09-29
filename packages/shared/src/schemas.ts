@@ -438,9 +438,15 @@ export const aiWorkSessionSyncBatchSchema = z
     tenantId: idSchema.default(LOCAL_TENANT_ID),
     installKey: keySchema,
     appVersion: z.string().trim().min(1).default("0.1.0"),
+    sentAt: timestampSchema.optional(),
+    expiresAt: timestampSchema.optional(),
     sessions: z.array(aiWorkSessionSyncRowSchema).min(1).max(500),
   })
-  .strict();
+  .strict()
+  .refine((batch) => batch.sentAt === undefined && batch.expiresAt === undefined ||
+    batch.sentAt !== undefined && batch.expiresAt !== undefined &&
+    Date.parse(batch.expiresAt) > Date.parse(batch.sentAt),
+  "Session deadline requires sentAt and a later expiresAt.");
 export type AiWorkSessionSyncBatch = z.infer<typeof aiWorkSessionSyncBatchSchema>;
 
 /**

@@ -181,6 +181,9 @@ function admittedCostKind(event: AiInteractionEvent): CostKind | null {
 }
 
 const EVENT_COLUMNS = [
+  // Local-only receive clock for producer-ID hook replay. Unlike observed_at,
+  // it remains the receipt time when the body supplied its own event time.
+  "first_received_at text",
   "session_id text",
   "action_class text",
   "model text",
@@ -318,7 +321,8 @@ export class LocalEventBuffer {
         observed_at text not null,
         payload_json text not null,
         suppressed_fields_json text not null default '[]',
-        created_at text not null
+        created_at text not null,
+        first_received_at text
       );
       create table if not exists priority_repos (
         repo_hash text primary key,
@@ -2379,7 +2383,10 @@ export class LocalEventBuffer {
     return inserted > 0 || !existing;
   }
 
-  private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = [], project = true) {
+  private appendInCurrentTransaction(
+    event: AiInteractionEvent, suppressedFields: string[] = [], project = true,
+    firstReceivedAt?: string,
+  ) {
     if (!liveUsageAppendAllowed(this.db, event)) return { appended: false, repoContextRequest: null };
     if (event.dataMode === "evidence") {
       throw new Error(
@@ -2423,12 +2430,12 @@ export class LocalEventBuffer {
     const insert = this.insertEventStatement ??= this.db.prepare(
         `insert or ignore into buffered_events
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
-           created_at, session_id, action_class, model, input_tokens, output_tokens,
+           created_at, first_received_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
            machine, account_hash, workspace_id, device_id, installation_epoch_id, project_key, cost_kind, privacy_generation)
         values
           (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
-           @createdAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
+           @createdAt, @firstReceivedAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
            @machine, @accountHash, @workspaceId, @deviceId, @installationEpochId, @projectKey, @costKind, @privacyGeneration)`,
       );
@@ -2442,6 +2449,7 @@ export class LocalEventBuffer {
         payloadJson,
         suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         createdAt,
+        firstReceivedAt: firstReceivedAt ?? null,
         sessionId: event.sessionId ?? null,
         actionClass: event.actionClass ?? null,
         model: event.model ?? null,
@@ -2651,7 +2659,7 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] | undefined,
-    options: { integrityReceipt: true },
+    options: { integrityReceipt: true; firstReceivedAt?: string },
   ): {
     appended: boolean;
     deduplicated?: true;
@@ -2661,14 +2669,14 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] = [],
-    options: { integrityReceipt?: boolean } = {},
+    options: { integrityReceipt?: boolean; firstReceivedAt?: string } = {},
   ) {
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
     let result: ReturnType<LocalEventBuffer["appendInCurrentTransaction"]>;
     try {
       const run = () => {
-        const appended = this.appendInCurrentTransaction(event, suppressedFields);
+        const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
           handoffs,

@@ -600,11 +600,15 @@ export async function postHistoryBatch(input: {
   sleep: (ms: number) => Promise<void>;
   maxAttempts: number;
   timeoutMs?: number;
+  /** Do not sleep for a retry that cannot reach its transport handoff in time. */
+  retryDeadlineMs?: number;
   /** Session snapshots can receive an explicit accepted/rejected partition.
    * History/outcome callers keep the strict all-accepted behavior. */
   allowPartial?: boolean;
   /** Rechecked by the transport immediately before every retry's fetch. */
   beforeSend?: () => boolean;
+  /** Observe a fully read, byte-bounded non-success response. */
+  onResponse?: (response: { status: number; body: unknown }) => void;
   log: (line: string) => void;
 }): Promise<{
   accepted: number;
@@ -627,6 +631,7 @@ export async function postHistoryBatch(input: {
         throw new FatalUploadError(`Workspace delivery deferred: ${lastError}. Resume state retained.`);
       }
     }
+    if (response && !response.ok) input.onResponse?.(response);
     if (response?.ok) {
       const acknowledgement = response.acknowledgement;
       if (!acknowledgement) {
@@ -658,6 +663,9 @@ export async function postHistoryBatch(input: {
       const retryAfterSeconds = Number(response?.headers.get("retry-after") ?? "");
       const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
         ? Math.min(120_000, retryAfterSeconds * 1000) : Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+      if (input.retryDeadlineMs !== undefined && Date.now() + backoffMs >= input.retryDeadlineMs) {
+        throw new FatalUploadError("Workspace delivery deferred: retry_deadline_exceeded. Resume state retained.");
+      }
       input.log(JSON.stringify({ status: "workspace_backfill_retry", attempt, backoffMs, error: lastError }));
       await input.sleep(backoffMs);
     }
@@ -694,13 +702,13 @@ export async function runWorkspaceHistoryUpload(
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history.',
     );
   }
   if ((!config.installKey || config.installKey === "local-dev") && !config.ingestKey) {
     throw new Error(
       "No workspace install credentials found (installKey is missing/local-dev and there is no ingestKey). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history.',
     );
   }
 
@@ -1177,13 +1185,13 @@ export async function runAttributionRepair(
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --repair-attribution.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history --repair-attribution.',
     );
   }
   if ((!config.installKey || config.installKey === "local-dev") && !config.ingestKey) {
     throw new Error(
       "No workspace install credentials found (installKey is missing/local-dev and there is no ingestKey). " +
-        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --repair-attribution.',
+        'Run: plimsoll join --token-prompt --url <cloud-base-url> — then retry upload-history --repair-attribution.',
     );
   }
 

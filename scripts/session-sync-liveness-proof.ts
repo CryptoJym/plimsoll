@@ -90,9 +90,14 @@ async function main() {
     const expected = buildSessionSyncRow(direct[0]);
     assert.equal(expected.ok, true);
     if (!expected.ok) throw new Error("fixture_session_invalid");
+    const sent = aiWorkSessionSyncBatchSchema.parse(JSON.parse(body));
+    assert.ok(sent.sentAt && sent.expiresAt);
+    assert.equal(Date.parse(sent.expiresAt) - Date.parse(sent.sentAt),
+      Math.min(config.delivery.requestTimeoutSeconds * 1_000, 120_000) + 10_000);
     const expectedBody = JSON.stringify(aiWorkSessionSyncBatchSchema.parse({
       kind: "session_sync", tenantId, installKey: config.installKey,
-      appVersion: "0.1.0", sessions: [expected.row],
+      appVersion: "0.1.0", sentAt: sent.sentAt, expiresAt: sent.expiresAt,
+      sessions: [expected.row],
     }));
     assert.equal(body, expectedBody, "hosted payload bytes changed");
     console.log(JSON.stringify({ result: "PASS", snapshotBytes: JSON.stringify(direct).length,

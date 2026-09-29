@@ -415,9 +415,57 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-live-churn
 
+      - name: Prove Codex reconciliation cannot restart a partial summary (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-reconciliation
+
+      - name: Prove two collectors cannot commit a stale segment repair (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-concurrent-repair
+
+      - name: Prove retargeted checkpoints repair both sessions (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-retarget
+
+      - name: Prove distant checkpoint predecessors use bounded durable windows (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-window
+
+      - name: Prove long-session trigger writes fit the 750 ms writer budget (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-trigger-writer-burst
+
+      - name: Prove v3 upgrade drains beside a million-row session (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-v3-upgrade-gate
+
+      - name: Prove an append during segment repair enters the wire once (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-queued-append-repair
+
+      - name: Prove terminal and historical checkpoint erasures stay bounded (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-erasure
+
+      - name: Prove bounded historical edits and erasures (eco-6hoxj.163.114)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-historical-repair
+
+      - name: Prove bounded staggered future-row maturity (eco-6hoxj.163.113)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-future-maturity
+
       - name: Prove 0.7.41 and 0.7.39 downgrade privacy safety (eco-6hoxj.163.87)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-downgrade
+
+      - name: Prove real 0.7.44 writes keep summary cursors and wire exact (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-v44-downgrade
+
+      - name: Prove simultaneous summary schema upgrades both succeed (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-schema-upgrade-race
 
       - name: Prove a 0.7.39 ledger rebuilds its session summaries in bounded passes (eco-6hoxj.163.108)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -434,6 +482,26 @@ jobs:
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
+
+      - name: Prove session sync late remote refusal and crash lease recovery (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-remote-deadline
+
+      - name: Prove session sync wire handoff and lease reuse across retries (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-lease-retry
+
+      - name: Prove legacy rebuild records clock-skew refusals (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-legacy-skew
+
+      - name: Prove clock-skew refusal stops foreground and legacy sends in one cycle (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-skew-cycle
+
+      - name: Prove session sync refusal reads stay byte-bounded (eco-6hoxj.163.118)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-refusal-bound
 
       - name: Prove bounded legacy outbox writer turns and retryable busy refusals (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -625,6 +693,102 @@ jobs:
       - name: Prove transactional join and workspace isolation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-isolation
+
+      - name: Prove one-command join setup with fixture cloud and LaunchAgent
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-setup-e2e
+
+      - name: Prove join privacy and machine-label review regressions
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-review-regressions
+
+      - name: Prove join recovers an interrupted LaunchAgent publish (R3-1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r3-1
+
+      - name: Prove join restart obligation publication survives a crash (R3-2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r3-2
+
+      - name: Prove fake Codex rollouts are not auto-enrolled (R3-3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r3-3
+
+      - name: Prove added LaunchAgent keys are owner edits (R3-4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r3-4
+
+      - name: Prove stopped legacy collector preflight uses its runtime (R3-5)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r3-5
+
+      - name: Prove LaunchAgent template identity survives owner edits (R3-6)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r3-6
+
+      - name: Prove post-bootstrap retry accepts verified service (R3-7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r3-7
+
+      - name: Prove stopped legacy agent cannot trust owner-edited arguments (R4-1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-1
+
+      - name: Prove concurrent restart obligations cannot replace each other (R4-2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-2
+
+      - name: Prove an owner edit during restart is preserved and refused (R4-3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-3
+
+      - name: Prove foreign Studio rollouts remain preview only (R4-4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-4
+
+      - name: Prove Codex rollout originator and later metadata identity (R4-4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-identity
+
+      - name: Prove legacy LaunchAgent shell PATH drift remains allowed
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-legacy-path
+
+      - name: Prove stale or symlinked lifecycle state cannot vouch for an owner edit (R5-1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-1
+
+      - name: Prove recovery leaves a foreign prepared hard link in place (R5-2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-2
+
+      - name: Prove valid owner edits restart the collector on recovery conflicts (R5-3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-3
+
+      - name: Prove unread rollout tails remain explicit enrollment candidates (R5-4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-4
+
+      - name: Prove copied lifecycle records cannot outrank the live pointer (R6-1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r6-1
+
+      - name: Prove one bootstrap failure still restores the owner collector (R6-2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r6-2
+
+      - name: Prove every lifecycle pair crash point retries or restores (R6-3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r6-3
+
+      - name: Prove the live runtime pointer outranks copied lifecycle records
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r6-live-pointer
+
+      - name: Prove update and restore survive each lifecycle pair crash point
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r6-crash-matrix
 
       - name: Prove future-only enrollment withholds pre-join history (eco-6hoxj.163.22)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

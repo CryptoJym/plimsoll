@@ -223,7 +223,11 @@ async function main() {
   await check("native_runSync_uses_actual_progress_and_cache_only_status",()=>{
     const source=fs.readFileSync(path.resolve("packages/collector-cli/src/cli.ts"),"utf8");
     assert.match(source,/syncBackoff\.failure\(error, uploaded, Date\.now\(\), maintenanceBoundary\.status\(\)\.state === "circuit_open"\)/);assert.match(source,/let uploaded = 0;[\s\S]*?try \{[\s\S]*?uploaded \+= result\.uploadedEvents/);
-    assert.match(source,/syncStatus: \(\) => syncBackoff\.status\(syncInFlight\)/);
+    // eco-6hoxj.163.118 adds the clock-skew reason beside the scheduler status; both come from memory.
+    assert.match(source,/syncStatus: \(\) => (?:\(\{ \.\.\.)?syncBackoff\.status\(syncInFlight\)/);
+    assert.match(source,/sessionSync: sessionSyncClockSkewStatus\(sessionSyncState\) \}\)/);
+    const sessionSyncSource=fs.readFileSync(path.resolve("packages/collector-cli/src/session-sync.ts"),"utf8");
+    assert.match(sessionSyncSource,/export function sessionSyncClockSkewStatus\(state: DaemonSessionSyncState\) \{\n  return state\.clockSkewRefusalStreak/);
     assert.ok(!source.includes("syncFailureStreak += 1"));
   });
   await check("status_endpoint_exposes_in_memory_scheduler_without_a_ledger_read",async()=>{

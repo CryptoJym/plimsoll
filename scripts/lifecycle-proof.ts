@@ -317,6 +317,20 @@ async function main() {
     check("runtime_is_version_pinned_absolute_regular_file", path.isAbsolute(runtimePath) && fs.lstatSync(runtimePath).isFile() && !fs.lstatSync(runtimePath).isSymbolicLink(), runtimePath);
     check("private_runtime_permissions_are_0700", mode(happy.paths.lifecycleRoot) === 0o700 && mode(runtimePath) === 0o700, { root: mode(happy.paths.lifecycleRoot), runtime: mode(runtimePath) });
     const statePath = path.join(happy.paths.lifecycleRoot, "state.json");
+    const installationPath = path.join(happy.paths.lifecycleRoot, "installation.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      installId?: string; executablePath?: string;
+    };
+    const installation = fs.existsSync(installationPath)
+      ? JSON.parse(fs.readFileSync(installationPath, "utf8")) as {
+        installId?: string; executablePath?: string;
+      } : null;
+    check("installed_runtime_is_bound_to_this_installation",
+      /^[0-9a-f-]{36}$/.test(state.installId ?? "") &&
+      state.installId === installation?.installId &&
+      state.executablePath === installation?.executablePath &&
+      state.executablePath === runtimePath && mode(installationPath) === 0o600,
+      { state, installation });
     const receiptsRoot = path.join(happy.paths.lifecycleRoot, "receipts");
     const completedRoot = path.join(happy.paths.lifecycleRoot, "completed-operations");
     check(

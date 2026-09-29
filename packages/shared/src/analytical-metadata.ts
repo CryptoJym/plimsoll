@@ -651,8 +651,11 @@ function safeWorkItemId(value: unknown) {
   return `github:${linkageHash(`github.com/${repository.toLowerCase()}`)}/pull/${match[2]}`;
 }
 
-/** Exact-key string validation shared by OTLP capture and outbound sealing. */
-export function safeMetadataStringAttribute(key: string, value: unknown) {
+/** Exact-key string validation shared by OTLP capture and outbound sealing.
+ * A spooled hook supplies its original receive time so replay cannot change
+ * whether a timestamp passes the future-skew bound.
+ */
+export function safeMetadataStringAttribute(key: string, value: unknown, receivedAtMs = Date.now()) {
   const disposition = metadataKeyDisposition(key);
   if (!disposition || disposition.valueKind !== "string") return null;
   if (key === "workItemId") return safeWorkItemId(value);
@@ -715,7 +718,7 @@ export function safeMetadataStringAttribute(key: string, value: unknown) {
     const parsedAt = Date.parse(candidate);
     return candidate.length <= 80 &&
       !Number.isNaN(parsedAt) &&
-      parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs
+      parsedAt <= receivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs
       ? candidate
       : null;
   }
@@ -756,7 +759,7 @@ export function isApprovedAnalyticalScalarAttribute(key: string, value: unknown)
   return finiteNonnegative(value);
 }
 
-export function validatedMetadataAttribute(key: string, value: unknown) {
+export function validatedMetadataAttribute(key: string, value: unknown, receivedAtMs = Date.now()) {
   const disposition = metadataKeyDisposition(key);
   if (!disposition) return { accepted: false as const };
   if (disposition.valueKind === "analytical_scalar") {
@@ -764,7 +767,7 @@ export function validatedMetadataAttribute(key: string, value: unknown) {
       ? { accepted: true as const, value }
       : { accepted: false as const };
   }
-  const stringValue = safeMetadataStringAttribute(key, value);
+  const stringValue = safeMetadataStringAttribute(key, value, receivedAtMs);
   return stringValue === null
     ? { accepted: false as const }
     : { accepted: true as const, value: stringValue };
@@ -773,6 +776,7 @@ export function validatedMetadataAttribute(key: string, value: unknown) {
 export function admittedMetadataAttributes(
   input: Record<string, unknown>,
   surface: OtlpAttributeSurface = "record",
+  receivedAtMs = Date.now(),
 ) {
   const attributes: Record<string, unknown> = {};
   const rejectedKeys: string[] = [];
@@ -782,7 +786,7 @@ export function admittedMetadataAttributes(
       rejectedKeys.push(key);
       continue;
     }
-    const validated = validatedMetadataAttribute(key, value);
+    const validated = validatedMetadataAttribute(key, value, receivedAtMs);
     if (!validated.accepted) {
       rejectedKeys.push(key);
     } else {

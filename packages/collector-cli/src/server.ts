@@ -79,7 +79,7 @@ import {
 import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 // The drain reuses the normalizer's own readers rather than re-implementing
 // them, so the two cannot drift on what counts as a usable time (review r3, N2).
-import { isUuid, otelScalar, timestampIsNotFromTheFuture, unixNanoToIso } from "./normalizer";
+import { deterministicEventId, isUuid, otelScalar, timestampIsNotFromTheFuture, unixNanoToIso } from "./normalizer";
 import {
   HOOK_SPOOL_LIMITS,
   blankForbiddenRawContent,
@@ -204,7 +204,10 @@ function admitHookBody(
     buffer: LocalEventBuffer;
     budget: RequestBudget;
     producerEventId?: string;
+    fallbackEventId?: string;
+    now?: () => number;
     probe?: boolean;
+    spoolReplay?: boolean;
   },
 ) {
   const payload = parseBoundedJson(bodyText);
@@ -212,16 +215,45 @@ function admitHookBody(
   if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
   context.budget.checkpoint();
   return retryStorageBusy(context.budget, () => {
+    // A producer ID names one logical hook across live, stop-window and crash
+    // replay. Its first receive clock is committed with the row, independent
+    // of a body-owned event timestamp. Read it inside the storage retry,
+    // immediately before the synchronous append.
+    const receivedAtMs = context.now?.() ?? Date.now();
+    const firstRow = context.producerEventId
+      ? context.buffer.database.prepare(
+        "select first_received_at as firstReceivedAt, observed_at as observedAt " +
+        "from buffered_events where id = ?",
+      ).get(context.producerEventId) as { firstReceivedAt: string | null; observedAt: string } | undefined
+      : undefined;
+    const firstReceivedAtMs = firstRow?.firstReceivedAt ? Date.parse(firstRow.firstReceivedAt) : NaN;
+    const firstObservedAtMs = firstRow ? Date.parse(firstRow.observedAt) : NaN;
+    // Older rows have no receipt column. Their observed_at is a safe fallback
+    // only when the body had no usable event time; otherwise the old receipt
+    // cannot be reconstructed from this row.
+    const legacyRowUsedReceiveTime = !Number.isFinite(firstReceivedAtMs) && Number.isFinite(firstObservedAtMs)
+      && (!payload || typeof payload !== "object" || Array.isArray(payload)
+        || !bodyCarriesItsOwnTime(payload as Record<string, unknown>, firstObservedAtMs));
+    const stableReceivedAtMs = Number.isFinite(firstReceivedAtMs)
+      ? firstReceivedAtMs
+      : legacyRowUsedReceiveTime ? firstObservedAtMs : receivedAtMs;
+    const admittedPayload = context.spoolReplay
+      ? parseBoundedJson(spooledBodyWithHookTime(bodyText, new Date(stableReceivedAtMs).toISOString()))
+      : payload;
+    if (context.spoolReplay) assertBoundedJsonNodes(admittedPayload);
     const options = {
       config: context.config,
       buffer: context.buffer,
       source,
       producerEventId: context.producerEventId,
+      fallbackEventId: context.fallbackEventId,
+      now: () => stableReceivedAtMs,
+      firstReceivedAt: context.producerEventId ? new Date(stableReceivedAtMs).toISOString() : undefined,
     };
-    if (!context.probe) return appendForwardedHook(payload, options);
-    const canonical = normalizeForwardedHook(payload, options);
+    if (!context.probe) return appendForwardedHook(admittedPayload, options);
+    const canonical = normalizeForwardedHook(admittedPayload, options);
     canonical.event = markStopWindowProbe(canonical.event);
-    return appendNormalizedHook(context.buffer, canonical);
+    return appendNormalizedHook(context.buffer, canonical, options.firstReceivedAt);
   });
 }
 
@@ -247,8 +279,8 @@ const OTEL_TIME_KEYS = ["timeUnixNano", "observedTimeUnixNano", "startTimeUnixNa
  * empty string, `null`, a boolean, an object and an unparseable or future-dated
  * string are all rejected there, so none of them counts here either.
  */
-function usableObservedAtValue(key: string, value: unknown) {
-  const validated = validatedMetadataAttribute(key, value);
+function usableObservedAtValue(key: string, value: unknown, receivedAtMs = Date.now()) {
+  const validated = validatedMetadataAttribute(key, value, receivedAtMs);
   return validated.accepted && typeof validated.value === "string";
 }
 
@@ -266,11 +298,11 @@ function usableObservedAtValue(key: string, value: unknown) {
  * Exported for that check, which cannot otherwise reach a module-private
  * predicate — the mistake this fix undoes.
  */
-export function usableOtelTime(value: unknown) {
+export function usableOtelTime(value: unknown, receivedAtMs = Date.now()) {
   if (typeof value !== "string" && typeof value !== "number") return false;
   const timestamp = unixNanoToIso(value);
   if (!timestamp) return false;
-  return timestampIsNotFromTheFuture(timestamp);
+  return timestampIsNotFromTheFuture(timestamp, receivedAtMs);
 }
 
 type SpooledTimeSignals = {
@@ -285,10 +317,10 @@ type SpooledTimeSignals = {
  * decide an event's time. Same pre-order, same flattening, so a body with two
  * `timestamp` attributes is judged on the one the normalizer would end up with.
  */
-function collectSpooledTimeSignals(value: unknown, signals: SpooledTimeSignals) {
+function collectSpooledTimeSignals(value: unknown, signals: SpooledTimeSignals, receivedAtMs: number) {
   if (!value || typeof value !== "object") return;
   if (Array.isArray(value)) {
-    for (const item of value) collectSpooledTimeSignals(item, signals);
+    for (const item of value) collectSpooledTimeSignals(item, signals, receivedAtMs);
     return;
   }
   const record = value as Record<string, unknown>;
@@ -296,9 +328,9 @@ function collectSpooledTimeSignals(value: unknown, signals: SpooledTimeSignals) 
     signals.aliasAttributes[record.key] = otelScalar(record.value);
   }
   for (const key of OTEL_TIME_KEYS) {
-    if (usableOtelTime(record[key])) signals.usableOtelTimes += 1;
+    if (usableOtelTime(record[key], receivedAtMs)) signals.usableOtelTimes += 1;
   }
-  for (const nested of Object.values(record)) collectSpooledTimeSignals(nested, signals);
+  for (const nested of Object.values(record)) collectSpooledTimeSignals(nested, signals, receivedAtMs);
 }
 
 /**
@@ -318,19 +350,21 @@ function collectSpooledTimeSignals(value: unknown, signals: SpooledTimeSignals) 
  *     (`otelScalar` — i.e. a usable `stringValue`) is accepted the same way;
  *   - a `timeUnixNano`/`observedTimeUnixNano`/`startTimeUnixNano` counts only
  *     when it parses and is not from the future.
+ * Every comparison uses the envelope's durable receive time, including after
+ * a restart when the wall clock has advanced through the skew boundary.
  * When the body's own time is unusable this is false and the drain supplies the
  * envelope's `receivedAt` as a top-level `observedAt`. That is safe precisely
  * because the normalizer's own precedence then ignores the unusable field — it
  * rejects it live for the same reason.
  */
-function bodyCarriesItsOwnTime(payload: Record<string, unknown>) {
+function bodyCarriesItsOwnTime(payload: Record<string, unknown>, receivedAtMs: number) {
   for (const alias of OBSERVED_AT_ALIASES) {
-    if (alias in payload && usableObservedAtValue(alias, payload[alias])) return true;
+    if (alias in payload && usableObservedAtValue(alias, payload[alias], receivedAtMs)) return true;
   }
   const signals: SpooledTimeSignals = { aliasAttributes: {}, usableOtelTimes: 0 };
-  collectSpooledTimeSignals(payload, signals);
+  collectSpooledTimeSignals(payload, signals, receivedAtMs);
   for (const [key, value] of Object.entries(signals.aliasAttributes)) {
-    if (usableObservedAtValue(key, value)) return true;
+    if (usableObservedAtValue(key, value, receivedAtMs)) return true;
   }
   return signals.usableOtelTimes > 0;
 }
@@ -364,7 +398,7 @@ export function spooledBodyWithHookTime(bodyText: string, receivedAt: string) {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return bodyText;
   const payload = parsed as Record<string, unknown>;
-  if (bodyCarriesItsOwnTime(payload)) return bodyText;
+  if (bodyCarriesItsOwnTime(payload, receivedAtMs)) return bodyText;
   try {
     return JSON.stringify({ ...payload, observedAt: new Date(receivedAtMs).toISOString() });
   } catch {
@@ -497,11 +531,20 @@ export function createHookSpoolDrain(
         continue;
       }
       try {
-        // The hook's own time, not the drain's (review r2, F1).
+        // Replay every timestamp decision against the durable receive instant.
+        // A bad legacy envelope still has the fixed spool-file time to use.
+        const envelopeTime = Date.parse(read.envelope.receivedAt);
+        const receivedAtMs = Number.isFinite(envelopeTime) ? envelopeTime : file.spooledAtMs;
         await admitHookBody(
-          spooledBodyWithHookTime(read.envelope.body, read.envelope.receivedAt),
+          read.envelope.body,
           read.envelope.source,
-          { config, buffer, budget: createRequestBudget(), probe: read.envelope.probe },
+          {
+            config, buffer, budget: createRequestBudget(), probe: read.envelope.probe,
+            producerEventId: read.envelope.producerEventId,
+            fallbackEventId: deterministicEventId(["hook-spool:v1", file.name]),
+            now: () => receivedAtMs,
+            spoolReplay: true,
+          },
         );
         try {
           fs.unlinkSync(file.path);
@@ -925,6 +968,7 @@ export function createCollectorServer(
     source: LocalProducerSource,
     bodyText: string,
     receivedAtMs: number,
+    producerEventId?: string,
   ): IntakeSpoolOutcome => {
     // The kill switch, the two pre-write refusals and an unresolvable home all
     // answer before any byte is written, so none of them counts `refused` or
@@ -948,6 +992,7 @@ export function createCollectorServer(
       home,
       source,
       body: blanked.text,
+      producerEventId,
       blanked: blanked.blanked,
       // The daemon's request receive time, so the drain replays the event with
       // the time it ARRIVED rather than the time the ledger freed up.
@@ -1766,6 +1811,7 @@ export function createCollectorServer(
             buffer,
             budget,
             producerEventId,
+            now: () => receivedAtMs,
           });
         } catch (error) {
           // The ONE outcome that is spooled here: the busy class that answers
@@ -1788,7 +1834,7 @@ export function createCollectorServer(
           const failure = asHttpBoundaryRejection(error);
           const spooled =
             failure.reason === "storage_busy_retry" && failure.status === 503
-              ? spoolHookAtIntake(source, body.text, receivedAtMs)
+              ? spoolHookAtIntake(source, body.text, receivedAtMs, producerEventId)
               : null;
           // A spool that could not be written — bounds exhausted, disk, EACCES,
           // kill switch — keeps today's answer exactly: the loss stays visible.
