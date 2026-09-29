@@ -51,6 +51,8 @@ for (const [name, script, machine, receiptName] of specs) {
     TERM: "dumb", CI: "1", NO_COLOR: "1",
     NEXT_TELEMETRY_DISABLED: "1",
     ...(process.env.NODE_OPTIONS ? { NODE_OPTIONS: process.env.NODE_OPTIONS } : {}),
+    ...(process.env.PLIMSOLL_FIXTURE_PORT_COUNTER
+      ? { PLIMSOLL_FIXTURE_PORT_COUNTER: process.env.PLIMSOLL_FIXTURE_PORT_COUNTER } : {}),
   };
   const result = spawnSync(process.execPath,
     ["--import", path.join(repo, "node_modules", "tsx", "dist", "loader.mjs"), path.join(repo, script), ...args],
