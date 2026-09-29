@@ -100,6 +100,9 @@ function stubLaunchctl(bin: string) {
     '    rm -f "$state"',
     '    printf "bootout %s\\n" "$pid" >> "$trace"',
     '    bootouts="$(grep -c "^bootout " "$trace")"',
+    '    if [ "${PLIMSOLL_PROOF_FAIL_ONE_RECOVERY_BOOTSTRAP:-}" = "1" ] && [ "$bootouts" -eq 2 ]; then',
+    '      touch "$PLIMSOLL_HOME/fail-next-bootstrap"',
+    '    fi',
     '    if { [ "${PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT:-}" = "1" ] && [ "$bootouts" -eq 2 ]; } || { [ "${PLIMSOLL_PROOF_EDIT_ON_FIRST_BOOTOUT:-}" = "1" ] && [ "$bootouts" -eq 1 ]; }; then',
     '      plist="$HOME/Library/LaunchAgents/com.plimsoll.collector.plist"',
     "      /usr/bin/perl -0777 -i -pe 's{(<key>PATH</key>\\s*<string>)([^<]*)(</string>)}{$1$2:/opt/owner-custom-bin$3}' \"$plist\"",
@@ -123,6 +126,11 @@ function stubLaunchctl(bin: string) {
     '  exit 0',
     'fi',
     'if [ "$1" = "bootstrap" ] || [ "$1" = "kickstart" ]; then',
+    '  if [ -f "$PLIMSOLL_HOME/fail-next-bootstrap" ]; then',
+    '    rm -f "$PLIMSOLL_HOME/fail-next-bootstrap"',
+    '    printf "bootstrap_failed_once\\n" >> "$trace"',
+    '    exit 70',
+    '  fi',
     '  if [ -f "$state" ] && kill -0 "$(cat "$state")" 2>/dev/null; then exit 70; fi',
     '  plist="${3:-$HOME/Library/LaunchAgents/com.plimsoll.collector.plist}"',
     '  cli="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$plist")" || exit 68',
@@ -423,15 +431,18 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       // where that optional artifact is absent, PATH drift still forces the
       // installer through the same interrupted publish while a daemon serves.
       if (name === "path_drift" || name === "owner_edit_during_join" ||
-          name === "owner_edit_restore_conflict" || name === "owner_edit_unreadable" ||
+          name === "owner_edit_restore_conflict" || name === "owner_edit_one_bootstrap_failure" ||
+          name === "owner_edit_unreadable" ||
           name === "owner_edit_after_recheck" ||
           name === "legacy_path_drift_0744" ||
           (name === "crash_manifest_link_running" && !process.env.PLIMSOLL_PROOF_0744_CLI))
         f.env.PATH = `${f.env.PATH}:/opt/new-toolchain`;
       if (name === "owner_edit_during_join") f.env.PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT = "1";
-      if (name === "owner_edit_restore_conflict") {
+      if (name === "owner_edit_restore_conflict" || name === "owner_edit_one_bootstrap_failure") {
         f.env.PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT = "1";
         f.env.PLIMSOLL_PROOF_EDIT_CONFIG_ON_SECOND_BOOTOUT = "1";
+        if (name === "owner_edit_one_bootstrap_failure")
+          f.env.PLIMSOLL_PROOF_FAIL_ONE_RECOVERY_BOOTSTRAP = "1";
       }
       if (name === "owner_edit_after_recheck") {
         f.env.PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT = "1";
@@ -727,7 +738,8 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         trace.split("\n").filter((line) => line.startsWith("bootout ")).length === 2);
       return;
     }
-    if (name === "owner_edit_restore_conflict" || name === "owner_edit_unreadable" ||
+    if (name === "owner_edit_restore_conflict" || name === "owner_edit_one_bootstrap_failure" ||
+        name === "owner_edit_unreadable" ||
         name === "owner_edit_after_recheck") {
       const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
       const plistText = fs.readFileSync(plist, "utf8");
@@ -738,11 +750,12 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       const obligationPresent = fs.existsSync(path.join(f.data, "join.restart-obligation.json"));
       console.log(JSON.stringify({ scenario: name, exit: joined.code, status: result.status,
         running, obligationPresent, ownerPathPreserved: plistText.includes("/opt/owner-custom-bin"),
-        ownerConfigPreserved: name === "owner_edit_restore_conflict" ? configText.endsWith(" ") : null,
+        ownerConfigPreserved: ["owner_edit_restore_conflict", "owner_edit_one_bootstrap_failure"].includes(name)
+          ? configText.endsWith(" ") : null,
         laterOwnerEditPreserved: plistText.includes("/opt/owner-after-recheck"),
         plistUnreadable: plistText === "<plist>", bootouts: trace.split("\n").filter((line) =>
           line.startsWith("bootout ")).length, reason: result.reason ?? null }));
-      const ownerPlistIntact = name === "owner_edit_restore_conflict"
+      const ownerPlistIntact = ["owner_edit_restore_conflict", "owner_edit_one_bootstrap_failure"].includes(name)
         ? plistText.includes("/opt/owner-custom-bin")
         : name === "owner_edit_after_recheck"
           ? plistText.includes("/opt/owner-custom-bin") &&
@@ -754,7 +767,10 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       } else {
         check(`${name}_keeps_collector_serving_after_refusal`, joined.code !== 0 && running &&
           ownerPlistIntact && /restarted from the current owner LaunchAgent/i.test(String(result.reason)) &&
-          (name !== "owner_edit_restore_conflict" || configText.endsWith(" ")));
+          (!["owner_edit_restore_conflict", "owner_edit_one_bootstrap_failure"].includes(name) ||
+            configText.endsWith(" ")) &&
+          (name !== "owner_edit_one_bootstrap_failure" ||
+            trace.includes("bootstrap_failed_once")));
       }
       if (name === "owner_edit_restore_conflict") {
         const retry = await command(f.env, ["join", "--resume"], "", f.installedCli);
@@ -1089,6 +1105,10 @@ async function main() {
     }
     if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_restore_conflict") {
       await joinedScenario("owner_edit_restore_conflict", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_one_bootstrap_failure") {
+      await joinedScenario("owner_edit_one_bootstrap_failure", true, "ack");
       return;
     }
     if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_unreadable") {

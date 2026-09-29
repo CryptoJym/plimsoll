@@ -1030,6 +1030,7 @@ async function acknowledgeJoinedCollector(
 async function restoreCurrentOwnerJoinedCollector(port: number) {
   const deadline = performance.now() + 35_000;
   let lastStatus = "not_attempted";
+  let retryDelayMs = 250;
   const currentOwnerManifest = () => {
     try {
       const manifest = inspectLaunchAgentManifest();
@@ -1047,7 +1048,8 @@ async function restoreCurrentOwnerJoinedCollector(port: number) {
       joinLaunchAgentMutationAuthority());
     lastStatus = loaded.status;
     if (loaded.loaded) {
-      const after = await verifyPostBootstrapReadiness(port, { timeoutMs: 30_000 });
+      const after = await verifyPostBootstrapReadiness(port,
+        { timeoutMs: Math.max(0, Math.min(30_000, deadline - performance.now())) });
       const current = currentOwnerManifest();
       if (after.verified && current.manifestDigest === loaded.manifestDigest) return;
       if (after.verified && current.manifestDigest !== loaded.manifestDigest) {
@@ -1057,10 +1059,15 @@ async function restoreCurrentOwnerJoinedCollector(port: number) {
         continue;
       }
     }
-    if (loaded.status !== "lifecycle_fence_busy") break;
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    if (!loaded.loaded && loaded.status !== "lifecycle_fence_busy" && loaded.status !== "launchctl_failed" &&
+        loaded.status !== "kickstart_failed" && loaded.status !== "kickstart_readiness_failed") break;
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) break;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(retryDelayMs, remainingMs)));
+    retryDelayMs = Math.min(retryDelayMs * 2, 1_000);
   }
-  throw new Error(`Could not restore the previous running collector (${lastStatus}).`);
+  throw new Error(`Could not restore the previous running collector (${lastStatus}). ` +
+    "plimsoll join --resume will retry starting the current owner LaunchAgent.");
 }
 
 async function finishJoinedCollectorSetupCore(
