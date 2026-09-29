@@ -22,6 +22,8 @@ const event = (n: number) => `10000000-0000-4000-8000-${String(n).padStart(12, "
 const legacyTriggerNames = ["raw_update", "raw_delete", "outbox_insert", "outbox_update",
   "outbox_delete", "receipt_insert", "receipt_update", "receipt_delete"]
   .map((suffix) => `trg_session_summary_${suffix}`);
+const headTriggerName = (legacyName: string) =>
+  `${legacyName}_${legacyName.includes("_outbox_") ? "v43" : "v42"}`;
 
 function put(buffer: LocalEventBuffer, sid: string, n: number): void {
   buffer.database.prepare(`insert into buffered_events
@@ -104,7 +106,7 @@ async function main(): Promise<void> {
       { read: read(head41.database), maxRows: 1, maxMs: 1_000 });
     assert.equal(partial.complete, false);
     const headSql = new Map(legacyTriggerNames.map((name) =>
-      [name, triggerSql(head41.database, `${name}_v42`)]));
+      [name, triggerSql(head41.database, headTriggerName(name))]));
     head41.close();
 
     const old = new buffer41.LocalEventBuffer(file41, { workspaceId: workspace });
@@ -174,7 +176,7 @@ async function main(): Promise<void> {
       assert.ok(headSql.get("trg_session_summary_raw_update")?.includes("summary_scanned_aware_v1"));
       for (const name of legacyTriggerNames) {
         assert.ok(triggerSql(old.database, name), `0.7.41 did not install ${name}`);
-        assert.ok(headSql.get(name), `head did not install ${name}_v42`);
+        assert.ok(headSql.get(name), `head did not install ${headTriggerName(name)}`);
       }
       completion.check("0741_sync_start_installs_legacy_triggers");
       completion.check("0741_terminal_receipt_race_cannot_send");
@@ -212,7 +214,7 @@ async function main(): Promise<void> {
       ensureSessionSummarySchema(again.database);
       for (const name of legacyTriggerNames) {
         assert.equal(triggerSql(again.database, name), null);
-        assert.equal(triggerSql(again.database, `${name}_v42`), headSql.get(name));
+        assert.equal(triggerSql(again.database, headTriggerName(name)), headSql.get(name));
       }
       completion.check("head_reupgrade_removes_0741_triggers_and_keeps_scanned_aware_sql");
     } finally { again.close(); }
