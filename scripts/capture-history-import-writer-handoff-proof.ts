@@ -60,8 +60,13 @@ async function main() {
         birthtimeNs: stat.birthtimeNs };
     }), "2026-01-03T00:00:00.000Z");
     buffer.database.exec("create table history_handoff_probe (at text not null)");
+    let delayedRows = 0;
     buffer.database.function("history_handoff_delay", () => {
-      const until = performance.now() + 16;
+      // The first slice starts with four rows. Three 44 ms rows cross the
+      // 120 ms deadline while a fourth remains, independent of host speed.
+      // Later rows retain the steady load used to probe writer handoff.
+      delayedRows += 1;
+      const until = performance.now() + (delayedRows <= 3 ? 44 : 16);
       while (performance.now() < until) { /* deterministic one-row writer cost */ }
     });
     buffer.database.exec(`create trigger history_handoff_pressure before insert on buffered_events
