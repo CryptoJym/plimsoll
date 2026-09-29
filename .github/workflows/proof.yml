@@ -255,6 +255,78 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-symlink_parent_race
 
+      - name: Prove copied history rejects claude changed message id (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-claude_changed_message_id
+
+      - name: Prove copied history rejects equal counter byte codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_byte_codex
+
+      - name: Prove copied history rejects equal counter byte claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_byte_claude
+
+      - name: Prove copied history rejects trailing byte codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_byte_codex
+
+      - name: Prove copied history rejects trailing byte claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_byte_claude
+
+      - name: Prove copied history byte boundary first codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_first_codex
+
+      - name: Prove copied history byte boundary middle codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_middle_codex
+
+      - name: Prove copied history byte boundary last codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_last_codex
+
+      - name: Prove copied history byte boundary exact codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_exact_codex
+
+      - name: Prove copied history byte boundary nonusage codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_nonusage_codex
+
+      - name: Prove copied history byte boundary first claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_first_claude
+
+      - name: Prove copied history byte boundary middle claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_middle_claude
+
+      - name: Prove copied history byte boundary last claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_last_claude
+
+      - name: Prove copied history byte boundary exact claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_exact_claude
+
+      - name: Prove copied history byte boundary nonusage claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_nonusage_claude
+
+      - name: Prove original reviewer Codex overlap (r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-r2-overlap_codex
+
+      - name: Prove original reviewer Claude overlap (r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-r2-overlap_claude
+
+      - name: Prove original reviewer parent race (r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-r2-symlink_parent_race
+
       - name: Prove history WAL pause and resumable reader pin
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-wal
