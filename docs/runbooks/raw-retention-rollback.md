@@ -11,6 +11,8 @@ first seal or a re-seal uses the stored base envelope. A terminal privacy
 decision writes receipts for every linked legacy delivery ID and retires all
 those copies while the raw still exists. With no queued copy, 0.7.44 keeps
 that unuploaded raw; the newer pruner can expire it after re-upgrade.
+Expiry receipts retain the raw row ID, creation time and privacy generation, so
+0.7.44 can record a second expiry when a source later reuses an event ID.
 
 After re-upgrade, check `/status`: `delivery.remainingDelivery` should fall to
 zero after upload, and `retention.states.heldForUpload` should reflect only
@@ -20,3 +22,5 @@ If delivery remains nonzero, keep the ledger and retry delivery rather than
 clearing the outbox. The fixture proof `pnpm proof:retention-upgrade-downgrade`
 executes the exact 0.7.44 code against an upgraded ledger and checks the
 upload, acknowledgement, cleanup and status path.
+The `proof:retention-0739-*` fixtures also check a direct upgrade from exact
+0.7.39 and a 0.7.39 ledger rolled back to exact 0.7.44 before re-upgrade.

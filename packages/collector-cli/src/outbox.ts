@@ -2343,8 +2343,15 @@ export class DeliveryOutbox {
           ? markAcceptedPairedSpan.run(markParams).changes
           : markRaw.run(markParams).changes;
         if (marked !== 1 && !this.rawRetentionExpired(row)) {
-          locallyDead += this.deadActive(id, authoritativeReason ?? "local_privacy_violation", terminalAt);
-          continue;
+          const rawStillExists = row.rawRowid === null || Boolean(this.db.prepare(
+            `select 1 from buffered_events where rowid=?`,
+          ).get(row.rawRowid));
+          if (rawStillExists) {
+            locallyDead += this.deadActive(id, authoritativeReason ?? "local_privacy_violation", terminalAt);
+            continue;
+          }
+          // An absent raw is not itself a terminal privacy decision. The
+          // sealed outbox copy was revalidated before the remote accepted it.
         }
         const written = this.writeReceipt({
           deliveryId: id,
@@ -2897,10 +2904,9 @@ export class DeliveryOutbox {
       )
       .get(lineage.rawRowid) as RawPrivacyRow | undefined;
     if (!raw) {
-      // Raw retention is independent from delivery. The sealed outbox copy
-      // remains authoritative after a recorded expiry; an unrecorded delete
-      // is still a local integrity violation.
-      return this.rawRetentionExpired(lineage) ? null : "local_privacy_violation";
+      // The outbox owns a complete copy. Missing raw alone proves no terminal
+      // privacy decision; only exact lineage decisions can dead-letter it.
+      return null;
     }
     if (raw.uploadedAt !== null) return "local_privacy_violation";
     if (raw.usageDuplicateReason) return "local_usage_duplicate";

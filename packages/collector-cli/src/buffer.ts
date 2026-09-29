@@ -358,7 +358,7 @@ export class LocalEventBuffer {
         updated_at text not null
       );
       create table if not exists raw_retention_receipts (
-        event_id text primary key,
+        event_id text not null,
         raw_rowid integer not null,
         raw_created_at text not null,
         raw_generation text,
@@ -489,6 +489,48 @@ export class LocalEventBuffer {
       ) without rowid;
     `);
     markOpenStep("ledger.core_schema");
+    // Released collectors insert expiry receipts with INSERT OR IGNORE. Keep
+    // that statement valid after rollback while allowing a later incarnation
+    // of the same caller-controlled event ID to record its own expiry.
+    // The fast path avoids taking a writer lock on every subsequent open.
+    // Recheck under the writer lock so concurrent upgraders cannot both rebuild.
+    const oldReceiptKey = () => (this.db.pragma("table_info(raw_retention_receipts)") as
+      Array<{ name: string; pk: number }>).some((column) =>
+        column.name === "event_id" && column.pk !== 0);
+    const hasIncarnationIndex = () => Boolean(this.db.prepare(`select 1 from sqlite_master
+      where type='index' and name='idx_raw_retention_incarnation'`).get());
+    if (oldReceiptKey() || !hasIncarnationIndex()) this.db.transaction(() => {
+      if (oldReceiptKey()) {
+        const dependentTriggers = this.db.prepare(`select name,sql from sqlite_master
+          where type='trigger' and sql like '%raw_retention_receipts%'`).all() as
+          Array<{ name: string; sql: string }>;
+        for (const trigger of dependentTriggers) {
+          this.db.exec(`drop trigger "${trigger.name.replaceAll('"', '""')}"`);
+        }
+        this.db.exec(`
+          create table raw_retention_receipts_by_incarnation (
+            event_id text not null,
+            raw_rowid integer not null,
+            raw_created_at text not null,
+            raw_generation text,
+            expired_at text not null,
+            reason text not null check (reason = 'retention_window_elapsed')
+          );
+          insert into raw_retention_receipts_by_incarnation
+            (event_id,raw_rowid,raw_created_at,raw_generation,expired_at,reason)
+          select event_id,raw_rowid,raw_created_at,raw_generation,expired_at,reason
+          from raw_retention_receipts;
+          drop table raw_retention_receipts;
+          alter table raw_retention_receipts_by_incarnation rename to raw_retention_receipts;
+        `);
+        for (const trigger of dependentTriggers) this.db.exec(trigger.sql);
+      }
+      // The two expression terms distinguish NULL from an empty generation.
+      this.db.exec(`create unique index if not exists idx_raw_retention_incarnation
+        on raw_retention_receipts
+          (event_id,raw_rowid,raw_created_at,(raw_generation is null),coalesce(raw_generation,''))`);
+    }).immediate();
+    markOpenStep("ledger.retention_receipt_schema");
     const retentionControlColumns = new Set(
       (this.db.pragma("table_info(raw_retention_control)") as Array<{ name: string }>)
         .map((column) => column.name),

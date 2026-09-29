@@ -95,6 +95,10 @@ async function main() {
   const baseModule = await import(pathToFileURL(path.join(baseRoot,
     "packages/collector-cli/src/buffer.ts")).href);
   const OldBuffer = baseModule.LocalEventBuffer as typeof LocalEventBuffer;
+  const seedRoot = process.env.PR417_SEED_WORKTREE ?? baseRoot;
+  const seedModule = await import(pathToFileURL(path.join(seedRoot,
+    "packages/collector-cli/src/buffer.ts")).href);
+  const SeedBuffer = seedModule.LocalEventBuffer as typeof LocalEventBuffer;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pr417-upgrade-downgrade-"));
   const ledger = path.join(root, "ledger.sqlite");
   const now = new Date();
@@ -135,7 +139,7 @@ async function main() {
   };
 
   try {
-    const old = new OldBuffer(ledger, options);
+    const old = new SeedBuffer(ledger, options);
     try {
       for (const rawId of seededIds) {
         const event = aiInteractionEventSchema.parse({ id: rawId, sessionId: rawId,
@@ -263,6 +267,75 @@ async function main() {
         receipts: count(reupgraded, "upload_receipts"),
         held: status.retention?.states?.heldForUpload, status: statusResponse.status }));
     } finally { await close(statusServer); reupgraded.close(); }
+
+    // A caller can reuse an ID after its first raw has expired. The released
+    // 0.7.44 pruner must insert a second, exact-lineage expiry receipt into
+    // the upgraded schema before removing this newly queued raw.
+    const reusedId = ids.sealed;
+    let reusedDeliveryId = "";
+    let reusedGeneration = "";
+    const reused = new LocalEventBuffer(ledger, { ...options, delivery: { enabled: false } });
+    try {
+      const event = aiInteractionEventSchema.parse({ id: reusedId, sessionId: reusedId,
+        source: "codex", eventType: "assistant_response", dataMode: "metadata",
+        observedAt: oldAt, actionClass: "other", inputTokens: 2, outputTokens: 1 });
+      assert.equal(reused.append(event), true);
+      reused.database.prepare("update buffered_events set created_at=? where id=?")
+        .run(oldAt, reusedId);
+      reusedGeneration = (reused.database.prepare(`select privacy_generation as generation
+        from buffered_events where id=?`).get(reusedId) as { generation: string }).generation;
+      reused.delivery.configure({ enabled: true });
+      assert.equal(reused.delivery.repairRawById(reusedId).enqueued, 1);
+      reusedDeliveryId = (reused.database.prepare(`select delivery_id as id
+        from upload_outbox where raw_id=?`).get(reusedId) as { id: string }).id;
+      assert.notEqual(reusedDeliveryId, reusedId, "the first delivery ID has an acknowledgement");
+      assert.equal(reused.retentionStatus(30, now).states.heldForUpload, 1);
+      console.log(JSON.stringify({ phase: "reuse_upgrade", reusedId,
+        reusedDeliveryId, held: 1 }));
+    } finally { reused.close(); }
+
+    const oldAgain = new OldBuffer(ledger, { ...options, delivery: { enabled: true } });
+    try {
+      assert.equal(oldAgain.prune(30, { maxRows: 10, now }).events, 1);
+      assert.equal(exists(oldAgain, reusedId), false);
+      const expiries = oldAgain.database.prepare(`select raw_generation as generation
+        from raw_retention_receipts where event_id=? order by rowid`).all(reusedId) as
+        Array<{ generation: string | null }>;
+      assert.equal(expiries.length, 2, "exact 0.7.44 inserted the second expiry");
+      assert.equal(expiries[1]?.generation, reusedGeneration);
+      console.log(JSON.stringify({ phase: "reuse_downgrade", expiries: expiries.length,
+        exactNewExpiry: true }));
+    } finally { oldAgain.close(); }
+
+    const afterReuse = new LocalEventBuffer(ledger, { ...options, delivery: { enabled: true } });
+    try {
+      assert.equal(afterReuse.delivery.status(now).remainingDelivery, 1);
+      assert.equal(afterReuse.retentionStatus(30, now).states.heldForUpload, 0);
+      const uploaded = await uploadBufferedEvents(config, afterReuse, {
+        now: () => new Date(now.getTime() + 4_000_000),
+      });
+      assert.equal(uploaded.uploadedEvents, 1);
+      assert.ok(received.includes(reusedDeliveryId), "fixture received the reused incarnation");
+      assert.equal(afterReuse.delivery.status(now).remainingDelivery, 0);
+      assert.equal(count(afterReuse, "upload_outbox"), 0);
+      assert.deepEqual(afterReuse.database.prepare(`select terminal_state as state,
+        reason from upload_receipts where delivery_id=?`).get(reusedDeliveryId),
+        { state: "acknowledged", reason: "remote_acknowledged" });
+      statusServer = createCollectorServer(config, afterReuse);
+      const statusPort = await listen(statusServer);
+      const response = await fetch(`http://127.0.0.1:${statusPort}/status`);
+      assert.equal(response.status, 200);
+      const status = await response.json() as {
+        retention?: { states?: { heldForUpload?: number } };
+        delivery?: { remainingDelivery?: number };
+      };
+      assert.equal(status.retention?.states?.heldForUpload, 0);
+      assert.equal(status.delivery?.remainingDelivery, 0);
+      console.log(JSON.stringify({ phase: "reuse_reupgrade", uploaded: 1,
+        acknowledged: reusedDeliveryId, outbox: 0,
+        held: status.retention?.states?.heldForUpload,
+        remaining: status.delivery?.remainingDelivery }));
+    } finally { await close(statusServer); afterReuse.close(); }
   } finally {
     await close(ingestServer);
     fs.rmSync(root, { recursive: true, force: true });
