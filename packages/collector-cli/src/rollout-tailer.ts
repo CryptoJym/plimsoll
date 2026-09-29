@@ -60,7 +60,8 @@ import {
   maintenanceCandidateHash,
   type MaintenanceProgressStage,
 } from "./maintenance-progress";
-import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
+import { CodexAccountKeyCache, readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
+import { codexPlanLimitWindows, PlanLimitEmitter, type PlanLimitWindow } from "./plan-limit-observation";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
@@ -413,6 +414,8 @@ function restoreResultMutationSnapshot(
 }
 
 export class RolloutTailer {
+  private readonly accountKeys = new CodexAccountKeyCache();
+  private readonly planLimits: PlanLimitEmitter;
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
@@ -511,6 +514,7 @@ export class RolloutTailer {
     if (this.captureRoots.some(root => root.source !== "codex")) throw new Error("capture_root_provider_mismatch");
     ensureJsonlScanState(this.buffer.database);
     ensureJsonlContinuationStore(this.buffer.database);
+    this.planLimits = new PlanLimitEmitter(this.buffer);
   }
 
   close() {
@@ -1616,6 +1620,8 @@ export class RolloutTailer {
       repoContext: ActiveContext;
       lineageFirstUnknown?: TokenTotals;
     }> = [];
+    const accountKey = this.accountKeys.fromSessionsDir(this.activeCaptureRoot?.directory ?? this.sessionsDir);
+    const planReadings: Array<{ observedAt?: string; window: PlanLimitWindow; planType?: string; limitId?: string }> = [];
     let activeRepoContext: ActiveContext = state.activeRepoContextId
       ? { kind: "persisted", contextId: state.activeRepoContextId }
       : undefined;
@@ -1663,15 +1669,24 @@ export class RolloutTailer {
         if (typeof payload.originator === "string") state.originator = payload.originator;
         if (typeof payload.cli_version === "string") state.cliVersion = payload.cli_version;
       } else if (type === "turn_context") {
-        if (typeof payload.model === "string" && payload.model) state.model = payload.model;
+        if (typeof payload.model === "string" && payload.model) {
+          state.model = payload.model;
+          // Codex can report its first token count before turn_context.
+          for (const entry of pending) entry.model ??= state.model;
+        }
         activeRepoContext = observeContext("turn_context", payload.cwd);
       } else if (type === "event_msg" && payload.type === "token_count") {
         state.tokenCountIndex += 1;
         const info = (payload.info ?? {}) as Record<string, unknown>;
         const totals = totalsFrom(info.total_token_usage as Record<string, unknown> | undefined);
-        if (!totals) continue;
         const rateLimits = (payload.rate_limits ?? {}) as Record<string, unknown>;
         if (typeof rateLimits.plan_type === "string") state.planType = rateLimits.plan_type;
+        for (const window of codexPlanLimitWindows(rateLimits)) {
+          planReadings.push({ observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
+            window, planType: state.planType,
+            limitId: typeof rateLimits.limit_id === "string" ? rateLimits.limit_id : undefined });
+        }
+        if (!totals) continue;
         // Issue #153: the lineage's first totals observation diffs against
         // an ASSUMED zero baseline. A nonzero result cannot be attributed to
         // observed marginals — it may be genuine catch-up usage of a young
@@ -1695,6 +1710,16 @@ export class RolloutTailer {
           repoContext: activeRepoContext,
           ...(lineageFirstUnknown ? { lineageFirstUnknown } : {}),
         });
+      }
+    }
+
+    if (accountKey) {
+      for (const reading of planReadings) {
+        const clamped = clampFutureObservedAt(reading.observedAt, this.receivedAtMs);
+        const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
+        if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
+          window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
+          planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;
       }
     }
 
@@ -1780,6 +1805,7 @@ export class RolloutTailer {
           this.accountAttributionEnabled()),
         usageSource: "rollout",
         turnIndex: entry.index,
+        ...(accountKey ? { "user.account_id": accountKey } : {}),
       };
       if (state.originator) metadata.originator = state.originator;
       if (state.cliVersion) metadata.cliVersion = state.cliVersion;
@@ -1807,7 +1833,7 @@ export class RolloutTailer {
         dataMode: "metadata",
         eventType: "usage_rollout",
         observedAt,
-        actorId: typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : actorId,
+        actorId: accountKey ?? (typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : actorId),
         sessionId: state.conversationId,
         model: entry.model,
         actionClass: "other",

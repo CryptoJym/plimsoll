@@ -254,6 +254,8 @@ const RECORD_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
 ]);
 
 const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
+  ["planLimitWindowMinutes", "token_count"],
+  ["planLimitUsedPercent", "nonnegative_number"],
   ["reasoningOutputTokens", "token_count"],
   ["costUsdTicks", "token_count"],
   ["liveTotalTokens", "token_count"],
@@ -369,6 +371,10 @@ const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
 ];
 
 const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
+  ["planLimitSource", "classification"],
+  ["planLimitWindow", "classification"],
+  ["planLimitResetsAt", "timestamp"],
+  ["planLimitId", "identifier"],
   ["sourceVersion", "version"],
   ["sourceEventId", "identifier"],
   ["logicalSourceEventId", "identifier"],
@@ -718,7 +724,7 @@ export function safeMetadataStringAttribute(key: string, value: unknown, receive
     const parsedAt = Date.parse(candidate);
     return candidate.length <= 80 &&
       !Number.isNaN(parsedAt) &&
-      parsedAt <= receivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs
+      (key === "planLimitResetsAt" || parsedAt <= receivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs)
       ? candidate
       : null;
   }
