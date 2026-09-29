@@ -55,7 +55,11 @@ try {
   assert.equal(uninstall.status, 0, uninstall.stderr);
   assert.deepEqual(fs.readFileSync(path.join(alternate, "settings.json")), original);
   assert.equal(fs.existsSync(path.join(defaultDir, "settings.json")), false);
-  console.log(JSON.stringify({ proof: "claude-status-line-account", checks: 9, passed: 9, failed: 0 }));
+  const outside = `${root}-outside`;
+  const refused = runCli("setup-claude-status-line", "--config-dir", outside, "--uninstall");
+  assert.notEqual(refused.status, 0);
+  assert.equal(fs.existsSync(outside), false);
+  console.log(JSON.stringify({ proof: "claude-status-line-account", checks: 11, passed: 11, failed: 0 }));
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }

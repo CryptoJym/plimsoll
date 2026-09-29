@@ -50,6 +50,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import {
   applyClaudeSettings,
+  assertManagedConfigTarget,
   ClaudeConfigError,
 } from "../../collector-config/src/index";
 
@@ -1586,6 +1587,8 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
   }
   const results: Array<{ configDir: string; outcome: string }> = [];
   for (const dir of [...new Set(dirs)]) {
+    const settings = path.join(dir, "settings.json");
+    assertManagedConfigTarget(settings);
     const backup = path.join(dir, STATUS_LINE_BACKUP_NAME);
     if (uninstall) {
       if (fs.existsSync(backup)) { restoreClaudeStatusLine(dir); results.push({ configDir: dir, outcome: "restored" }); }
@@ -1593,7 +1596,6 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
       continue;
     }
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const settings = path.join(dir, "settings.json");
     const existed = fs.existsSync(settings);
     const newBackup = !fs.existsSync(backup);
     if (newBackup) {
