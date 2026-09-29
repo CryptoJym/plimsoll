@@ -133,7 +133,9 @@ async function main() {
       peakRss = Math.max(peakRss, process.memoryUsage().rss);
       console.error(JSON.stringify({ root: index + 1, importedRows: receipt.importedRows,
         elapsedSeconds: Math.round((performance.now() - importStarted) / 1000),
-        maxWriterSliceMs: receipt.maxWriterSliceMs, overBudgetSlices: receipt.overBudgetSlices }));
+        maxWriterSliceMs: receipt.maxWriterSliceMs, maxWriterWorkMs: receipt.maxWriterWorkMs,
+        maxWriterRowMs: receipt.maxWriterRowMs, overBudgetSlices: receipt.overBudgetSlices,
+        writerSlices: receipt.writerSlices, timeBudgetStops: receipt.timeBudgetStops }));
     }
     const importSeconds = (performance.now() - importStarted) / 1000;
     probe.kill("SIGTERM");

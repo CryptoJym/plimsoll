@@ -1047,10 +1047,12 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
       elapsed < 750 ? "250to750ms" : "750msOrMore";
     writerSliceHistogram[histogramBucket]! += 1;
     if (stoppedForTime) timeBudgetStops += 1;
-    // Use the committed cost to size the next row cap. A single expensive row
-    // keeps the next slice at one row until the ledger becomes responsive.
+    // Use the committed cost, including commit, to size the next row cap.
+    // A slow row or commit pushes the next slice toward one row; sustained
+    // headroom is required to grow again.
+    const targetRows = Math.max(1, Math.floor(processed * WRITER_TARGET_MS / Math.max(elapsed, 1)));
     if (elapsed > 200) {
-      nextRows = Math.max(1, Math.floor(nextRows / 2));
+      nextRows = Math.max(1, Math.min(Math.floor(nextRows / 2), targetRows));
       fastSliceStreak = 0;
     } else if (elapsed < 80 && !stoppedForTime) {
       // Grow only after sustained headroom; a single fast commit is not a
@@ -1063,7 +1065,8 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
       }
     } else {
       fastSliceStreak = 0;
-      if (elapsed > WRITER_TARGET_MS) nextRows = Math.max(1, nextRows - 1);
+      if (elapsed > WRITER_TARGET_MS)
+        nextRows = Math.max(1, Math.min(nextRows - 1, targetRows));
     }
     importedRows += receipt.rows;
     importedTokens.input += receipt.counts.input;
