@@ -118,3 +118,53 @@ try {
       "local_privacy_violation");
   } finally { restarted.close(); }
 } finally { fs.rmSync(root, { recursive: true, force: true }); }
+
+// A matching old ID/time is not enough to claim a receipt when a queued
+// delivery with that ID proves a different raw owner. Do not transfer that
+// ambiguous terminal decision onto the candidate raw.
+const collisionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pr417-null-generation-collision-"));
+const collisionBuffer = new LocalEventBuffer(path.join(collisionRoot, "ledger.sqlite"), {
+  workspaceId, deviceId, delivery: { enabled: true },
+});
+try {
+  const db = collisionBuffer.database;
+  const otherId = "00000000-0000-4000-8000-000000004179";
+  const other = aiInteractionEventSchema.parse({ ...event, id: otherId, sessionId: otherId,
+    observedAt: now.toISOString() });
+  db.prepare(`insert into buffered_events
+    (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+     workspace_id,device_id)
+    values (?,'codex','assistant_response','metadata',?,?,?,?,?)`)
+    .run(otherId, now.toISOString(), JSON.stringify(other), now.toISOString(),
+      workspaceId, deviceId);
+  assert.equal(collisionBuffer.delivery.repairRawById(otherId).enqueued, 1);
+  db.prepare("update upload_outbox set delivery_id=? where raw_id=?").run(id, otherId);
+  db.exec("drop trigger trg_events_privacy_generation_insert");
+  db.prepare(`insert into buffered_events
+    (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+     workspace_id,device_id)
+    values (?,'codex','assistant_response','metadata',?,?,?,?,?)`)
+    .run(id, oldAt, JSON.stringify(event), oldAt, workspaceId, deviceId);
+  db.prepare(`insert into upload_receipts
+    (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+    values (?,'dead','local_privacy_violation','local',0,?,?)`)
+    .run(id, oldAt, now.toISOString());
+  const repair = collisionBuffer.delivery.backfillLegacyReceiptLineage({ maxRows: 10 });
+  const raw = db.prepare(`select privacy_generation as generation,
+    privacy_disposition as disposition from buffered_events where id=?`).get(id) as
+    { generation: string | null; disposition: string | null };
+  const receipt = db.prepare(`select raw_rowid as rowid from upload_receipts
+    where delivery_id=?`).get(id) as { rowid: number | null };
+  assert.equal(repair.bound, 0);
+  assert.equal(receipt.rowid, null);
+  assert.equal(raw.generation, null,
+    "a conflicting outbox must prevent premature generation assignment");
+  assert.equal(raw.disposition, null,
+    "an ambiguous receipt cannot dispose a different raw");
+  assert.equal(collisionBuffer.listUnuploaded({ maxRows: 10 }).some((row) => row.id === id), false,
+    "the unbound receipt still holds privacy reads closed");
+  console.log(JSON.stringify({ phase: "conflicting_lineage", repair, raw, receipt }));
+} finally {
+  collisionBuffer.close();
+  fs.rmSync(collisionRoot, { recursive: true, force: true });
+}

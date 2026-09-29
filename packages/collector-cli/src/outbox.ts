@@ -1134,7 +1134,19 @@ export class DeliveryOutbox {
           length(cast(suppressed_fields_json as blob)) <= ?`);
     const assignLegacyGeneration = this.db.prepare(`update buffered_events
       set privacy_generation=@generation where rowid=@rawRowid and id=@rawId
-        and created_at=@rawCreatedAt and privacy_generation is null`);
+        and created_at=@rawCreatedAt and privacy_generation is null
+        and not exists (select 1 from buffered_events competing_raw
+          where competing_raw.id=@deliveryId and competing_raw.rowid<>@rawRowid)
+        and not exists (select 1 from raw_retention_receipts old_raw
+          where old_raw.event_id in (@rawId,@deliveryId)
+            and (old_raw.raw_rowid is not @rawRowid
+              or old_raw.raw_created_at is not @rawCreatedAt
+              or old_raw.raw_generation is not @generation))
+        and not exists (select 1 from upload_outbox o
+          where o.delivery_id=@deliveryId and
+            (o.raw_rowid is not @rawRowid or o.raw_id is not @rawId
+             or o.raw_created_at is not @rawCreatedAt
+             or o.raw_generation is not @generation))`);
     const bind = this.db.prepare(`update upload_receipts set
       raw_rowid=@rawRowid,raw_id=@rawId,raw_created_at=@rawCreatedAt,
       raw_generation=@rawGeneration
@@ -1185,28 +1197,29 @@ export class DeliveryOutbox {
             !candidates.some((raw) => raw.rawRowid === literal.rawRowid)) candidates.push(literal);
         const unique = cohort.length <= 1024 && candidates.length === 1
           ? candidates[0] : undefined;
-        // A NULL generation cannot be bound and then changed by raw migration:
-        // that would detach this terminal decision and expose an alternate ID.
-        // Both writes are in the same immediate transaction as the receipt bind.
+        // Prefer a stable generation before binding. A conflicting lineage
+        // leaves this receipt unbound; a matching old NULL-generation outbox
+        // can instead bind NULL and rely on the raw disposition below.
+        // All decisions are in the same immediate transaction.
         if (unique?.rawGeneration === null) {
           const generation = crypto.randomUUID();
           if (assignLegacyGeneration.run({
             generation, rawRowid: unique.rawRowid, rawId: unique.rawId,
-            rawCreatedAt: unique.rawCreatedAt,
+            rawCreatedAt: unique.rawCreatedAt, deliveryId: receipt.deliveryId,
           }).changes === 1) unique.rawGeneration = generation;
-        }
-        // A proven old privacy decision also lives on the raw. This keeps the
-        // read predicate, enqueue path and lease closed if a conflicting stale
-        // outbox or retention lineage prevents the receipt bind.
-        if (unique && isTerminalPrivacyReason(receipt.reason)) {
-          markRawPrivacyDisposition(this.db, unique.rawRowid,
-            receipt.reason, receipt.terminalAt);
         }
         const changes = unique ? bind.run({
           rawRowid: unique.rawRowid, rawId: unique.rawId,
           rawCreatedAt: unique.rawCreatedAt, rawGeneration: unique.rawGeneration,
           receiptRowid: receipt.receiptRowid, deliveryId: receipt.deliveryId,
         }).changes : 0;
+        // Only a successful lineage bind proves that this old privacy decision
+        // belongs to the raw. The raw disposition survives later generation
+        // assignment if a matching old outbox required a NULL-generation bind.
+        if (changes && unique && isTerminalPrivacyReason(receipt.reason)) {
+          markRawPrivacyDisposition(this.db, unique.rawRowid,
+            receipt.reason, receipt.terminalAt);
+        }
         bound += changes;
         if (!changes && candidates.length <= 2 && this.enabled) {
           // A completed raw cursor must not rewind over millions of uploaded
