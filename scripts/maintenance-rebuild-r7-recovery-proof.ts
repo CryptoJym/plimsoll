@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { connectionOwnershipClosed, observeRebuildConnectionOwnership, rebuildLedger } from
+import { rebuildLedger, type ConnectionOwnership } from
   "../packages/collector-cli/src/maintenance-rebuild";
 import { openRebuildFencedDatabase } from "../packages/collector-cli/src/rebuild-open-gate";
 import { currentRebuildWriterIdentity } from "../packages/collector-cli/src/rebuild-writer-identity";
@@ -38,12 +38,13 @@ function recoverCli(ledger: string) {
     "--ledger", ledger, "--copy-drill", "--copy-root", root, "--recover"],
   { cwd: process.cwd(), env: process.env, encoding: "utf8", timeout: 60_000 });
 }
-function waitFor(file: string, child: ReturnType<typeof spawn>) {
+function waitFor(file: string, child: ReturnType<typeof spawn>, output: () => string) {
   return new Promise<void>((resolve, reject) => {
     const deadline = Date.now() + 30_000;
     const poll = () => {
       if (fs.existsSync(file)) return resolve();
-      if (child.exitCode !== null || child.signalCode !== null) return reject(new Error("child_exited_before_seam"));
+      if (child.exitCode !== null || child.signalCode !== null) return reject(new Error(
+        `child_exited_before_seam:${child.exitCode ?? child.signalCode}\n${output()}`));
       if (Date.now() >= deadline) return reject(new Error("child_seam_timeout"));
       setTimeout(poll, 20);
     };
@@ -81,10 +82,13 @@ async function childRebuild(mode: "gap-child" | "complete-child", ledger: string
       return originalUnlink(file);
     }) as typeof fs.unlinkSync;
   }
-  const quiesce = async () => {
-    const after = observeRebuildConnectionOwnership(ledger);
-    return { before: after, after, connectionsClosed: connectionOwnershipClosed(after) };
-  };
+  // This drill targets the published-lock seam. The disposable fixture was
+  // closed before spawn, so supply its known empty quiesce receipt instead of
+  // making reaching the seam depend on a second, host-sensitive lsof run.
+  // rebuildLedger still performs its real lsof check under the fence; the
+  // writer-route proof separately exercises live connection ownership.
+  const empty: ConnectionOwnership = { openTokens: [], sqlitePids: [], writerLeases: [] };
+  const quiesce = async () => ({ before: empty, after: empty, connectionsClosed: true });
   const rebuilt = await rebuildLedger({ ledgerPath: ledger, stage: "S10", walHighWaterBytes: 0,
     copyDrill: true, quiesce, resume: async () => undefined, afterLockPublished });
   console.log(JSON.stringify({ check: "owner_swap_completed", pauseMs: rebuilt.pauseMs }));
@@ -96,7 +100,7 @@ async function liveGap() {
   const lock = `${ledger}.maintenance-rebuild.lock`;
   let recovery: ReturnType<typeof recoverCli> | undefined;
   try {
-    await waitFor(`${ledger}.r7-ready`, child);
+    await waitFor(`${ledger}.r7-ready`, child, output);
     assert.equal(fs.existsSync(lock), true, "owner has published its fence");
     assert.equal(fs.existsSync(`${ledger}.maintenance-rebuild.json`), false,
       "owner is paused before SQLite and the first state write");
