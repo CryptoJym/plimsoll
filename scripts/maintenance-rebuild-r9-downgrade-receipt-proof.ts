@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { advanceCaptureFrontier, CAPTURE_WRITE_LAG_MS } from "../packages/collector-cli/src/capture-frontier";
@@ -14,6 +15,9 @@ import { countMaintenanceRebuildRefusals, finishMaintenanceRebuildPause,
   "../packages/collector-cli/src/maintenance-rebuild-pause-state";
 
 const root = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "r2-old-drain-")));
+const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const oldRepo = path.join(root, "collector-0744");
+const oldCommit = "375f277b85f7d4ede7db77bf4359c371c0e8a4aa";
 const source = "claude_code";
 const body = JSON.stringify({ hook_event_name: "UserPromptSubmit",
   session_id: "b3f1c2d4-5e6a-4b7c-8d9e-0f1a2b3c4d5e",
@@ -21,7 +25,11 @@ const body = JSON.stringify({ hook_event_name: "UserPromptSubmit",
 
 async function main() {
   let buffer: { close(): void } | null = null;
+  let oldRepoCreated = false;
   try {
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", oldRepo, oldCommit], { cwd: repo });
+    oldRepoCreated = true;
+    fs.symlinkSync(path.join(repo, "node_modules"), path.join(oldRepo, "node_modules"), "dir");
     markMaintenanceRebuildPause(root);
     recordMaintenanceRebuildRefusal(root, "hook", source, body);
     const receiptDir = path.join(root, "maintenance-rebuild-refusals");
@@ -31,7 +39,7 @@ async function main() {
     const saved = writeHookSpoolEnvelope({ home: root, source, body, cause: "maintenance_rebuild" });
     assert.equal(saved.ok, true);
     finishMaintenanceRebuildPause(root);
-    const oldRoot = path.resolve("../plimsoll-0744/packages/collector-cli/src");
+    const oldRoot = path.join(oldRepo, "packages/collector-cli/src");
     const olderSpool = await import(pathToFileURL(path.join(oldRoot, "hook-spool.ts")).href);
     const olderServer = await import(pathToFileURL(path.join(oldRoot, "server.ts")).href);
     const olderBuffer = await import(pathToFileURL(path.join(oldRoot, "buffer.ts")).href);
@@ -74,8 +82,12 @@ async function main() {
     assert.equal(upgradedState.maintenanceRebuildPending, false);
     assert.notEqual(claim?.through, null, "the exact old-version drain restores capture attestation");
   } finally {
-    buffer?.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    try { buffer?.close(); }
+    finally {
+      try {
+        if (oldRepoCreated) execFileSync("git", ["worktree", "remove", "--force", oldRepo], { cwd: repo });
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
   }
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });
