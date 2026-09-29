@@ -121,7 +121,8 @@ export class PlanLimitEmitter {
       ...(input.planLimitId ? { planLimitId: input.planLimitId } : {}),
     };
     const event: AiInteractionEvent = aiInteractionEventSchema.parse({
-      id: deterministicEventId(["plan-limit", source, accountKey, window.window, window.resetsAt, String(Math.floor(window.usedPercent))]),
+      id: deterministicEventId(["plan-limit", source, accountKey, window.window, window.resetsAt,
+        String(Math.floor(window.usedPercent)), String(Math.floor(Date.parse(observedAt) / (15 * 60_000)))]),
       source,
       dataMode: "metadata",
       eventType: "plan_limit_observation",

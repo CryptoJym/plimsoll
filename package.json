@@ -203,6 +203,7 @@
     "proof:capacity-contract": "tsx scripts/provider-capacity-sync-proof.ts",
     "proof:capacity-adapters": "tsx scripts/provider-capacity-adapters-proof.ts",
     "proof:account-plan-limit": "tsx scripts/account-plan-limit-proof.ts",
+    "proof:plan-limit-event-id": "tsx scripts/plan-limit-event-id-proof.ts",
     "proof:claude-status-line-account": "tsx scripts/claude-status-line-account-proof.ts",
     "proof:release-qualification": "tsx scripts/release-qualification-proof.ts",
     "proof:privacy-spec": "tsx scripts/privacy-spec-proof.ts",
