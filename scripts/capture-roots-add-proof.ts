@@ -128,7 +128,7 @@ async function main() {
     fs.writeFileSync(path.join(codexProfileSessions,
       `rollout-2026-09-27T00-00-00-${evidenceSession}.jsonl`),
       `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
-        payload: { id: evidenceSession } })}\n`, { mode: 0o600 });
+        payload: { id: evidenceSession, originator: "codex_exec" } })}\n`, { mode: 0o600 });
     // A transcript in a root that is ALREADY registered, born long after the
     // enrollment baseline at BASELINE_BEFORE. Registering another root must
     // not flip this file from capturable to excluded (review r1, finding 1).

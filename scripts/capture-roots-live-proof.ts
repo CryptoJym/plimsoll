@@ -82,7 +82,7 @@ async function main() {
     fs.writeFileSync(path.join(codexLive,
       `rollout-2026-09-27T00-00-00-${evidenceSession}.jsonl`),
       `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
-        payload: { id: evidenceSession } })}\n`, { mode: 0o600 });
+        payload: { id: evidenceSession, originator: "codex_exec" } })}\n`, { mode: 0o600 });
     for (const directory of [claudeHooks, claudeOtel, gap])
       fs.writeFileSync(path.join(directory, `${evidenceSession}.jsonl`),
         '{"type":"user","message":{}}\n', { mode: 0o600 });
