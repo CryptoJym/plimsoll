@@ -6,6 +6,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { SqliteLedgerSnapshotAdapter } from "../packages/collector-cli/src/lifecycle-adapters";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { readReplacementLedgerMarker, restoreArchivedLedger, switchFreshLedger } from "../packages/collector-cli/src/fresh-ledger-cutover";
 import { acquireLedgerConnectionLock, ledgerConnectionLockPath, openLedgerCopyDatabase, readLedgerPublication, writeLedgerPublication } from "../packages/collector-cli/src/ledger-connection";
@@ -151,8 +152,28 @@ async function main(variant: string) {
       const afterCopy = acquireLedgerConnectionLock(ledger, "exclusive");
       afterCopy.release();
       assert.equal(fs.statSync(sidecar).ino, lockInode, "the stable lock is never replaced or deleted");
+      const checkpoint = new LocalEventBuffer(ledger, options);
+      checkpoint.database.pragma("wal_checkpoint(TRUNCATE)");
+      checkpoint.close();
+      switchFreshLedger(input);
+      const fresh = new LocalEventBuffer(ledger, options);
+      fresh.database.prepare("insert into maintenance_state(key,value,updated_at) values('r13-fresh-control','kept',?)")
+        .run(new Date().toISOString());
+      fresh.close();
+      const snapshot = path.join(fixture, "fresh-snapshot.sqlite");
+      const snapshots = new SqliteLedgerSnapshotAdapter();
+      await snapshots.snapshot({ source: ledger, destination: snapshot });
+      const beforeRestore = fs.statSync(ledger).ino;
+      await snapshots.restore({ source: snapshot, destination: ledger });
+      assert.notEqual(fs.statSync(ledger).ino, beforeRestore, "a valid snapshot restore replaces the inode");
+      const resumed = new LocalEventBuffer(ledger, options);
+      assert.equal((resumed.database.prepare("select value from maintenance_state where key='r13-fresh-control'").get() as { value: string }).value, "kept");
+      assert.ok(readReplacementLedgerMarker(ledger), "the verified fresh snapshot remains active");
+      resumed.close();
+      assert.equal(fs.statSync(sidecar).ino, lockInode);
       console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true,
-        publicationCommitKeepsExclusive: true, privateCopyHoldsDestinationLock: true, noTemporaryLock: true, stableLockInode: true }));
+        publicationCommitKeepsExclusive: true, privateCopyHoldsDestinationLock: true, noTemporaryLock: true,
+        stableLockInode: true, validFreshSnapshotRestarts: true }));
     } else if (variant === "old-connection") {
       for (const action of ["statement", "transaction"]) {
         for (const name of ["ready", "go", "result.json"]) fs.rmSync(path.join(fixture, name), { force: true });

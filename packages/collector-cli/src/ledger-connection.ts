@@ -88,11 +88,9 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
       if (beforeOpen && (beforeOpen.dev !== opened.dev || beforeOpen.ino !== opened.ino)) {
         throw new Error("ledger path changed while opening; collector restart required");
       }
-      if (publication && !privateCopy) {
-        if (opened.dev !== publication.device || opened.ino !== publication.inode) {
-          throw new Error("replacement_verification_failed: published ledger inode changed");
-        }
-      }
+      // A verified lifecycle snapshot restore intentionally changes the inode.
+      // Validate its marker and content below; bind this connection's write
+      // guard to the inode it actually opened.
       if (publication?.state === "ready" && !privateCopy) {
         const marker = database.prepare(`select archive_identity as archiveIdentity,
           archive_path as archivePath, post_switch_fence_pending as pending

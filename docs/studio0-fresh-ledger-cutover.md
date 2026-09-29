@@ -158,9 +158,11 @@ keys, and capture-root configuration stay in place.
    record in the lock sidecar remains pending until `integrity_check` passes,
    the expected replacement marker is present, and no foreign process holds
    the old inode or its WAL/SHM names. Collector openers verify that record,
-   the published inode, integrity, marker, and old handles before using the
-   fresh ledger. A pending or failed publication refuses a daemon, hook, CLI,
-   or restart. Long-lived connections also stat the ledger before each write
+   integrity, marker, and old handles before using the fresh ledger. A pending
+   or failed publication refuses a daemon, hook, CLI, or restart. A valid
+   lifecycle snapshot restore can replace the active inode; its matching marker
+   and intact SQLite content pass the same startup checks. Long-lived
+   connections also stat the ledger before each write
    transaction. If device or inode changes, they close without writing and
    exit with status 75 for supervision to restart them.
 
