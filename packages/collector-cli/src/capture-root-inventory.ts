@@ -418,6 +418,15 @@ export function verifiedCodexRolloutSessionId(file: string, row: unknown): strin
   return filenameId && filenameId === metadataId ? filenameId : undefined;
 }
 
+const CODEX_ORIGINATORS = new Set(["codex", "codex_cli_rs", "codex_exec",
+  "codex_app_server", "codex_vscode"]);
+
+function codexMetadataMatches(file: string, row: unknown): boolean {
+  if (!verifiedCodexRolloutSessionId(file, row)) return false;
+  const payload = (row as { payload: Record<string, unknown> }).payload;
+  return typeof payload.originator === "string" && CODEX_ORIGINATORS.has(payload.originator);
+}
+
 /** A bounded first-line check, with no rollout body or path exposed in a receipt. */
 function codexHomeEvidence(home: string, sessions: string): "verified" | "missing" | "exhausted" {
   const fileLimit = 128;
@@ -452,10 +461,21 @@ function codexHomeEvidence(home: string, sessions: string): "verified" | "missin
       try {
         const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
         try {
-          const bytes = Buffer.alloc(4096);
+          const bytes = Buffer.alloc(16 * 1024);
           const size = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
-          const row = JSON.parse(bytes.subarray(0, size).toString("utf8").split("\n", 1)[0]) as unknown;
-          if (verifiedCodexRolloutSessionId(file, row) === id) return "verified";
+          const lines = bytes.subarray(0, size).toString("utf8").split("\n");
+          if (fs.fstatSync(descriptor).size > size) lines.pop();
+          let codexMetadataSeen = false;
+          let conflict = false;
+          for (const line of lines) {
+            if (!line.includes('"session_meta"')) continue;
+            try {
+              const row = JSON.parse(line) as unknown;
+              if (!codexMetadataMatches(file, row)) { conflict = true; break; }
+              codexMetadataSeen = true;
+            } catch { conflict = true; break; }
+          }
+          if (codexMetadataSeen && !conflict) return "verified";
         } finally { fs.closeSync(descriptor); }
       } catch { /* Another rollout may provide the evidence. */ }
     }
