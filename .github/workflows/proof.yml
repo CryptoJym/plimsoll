@@ -255,6 +255,34 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r4-replay-barrier
 
+      - name: Prove timeout release commits after a transient SQLite writer lock (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-timeout-release-busy
+
+      - name: Prove replay timeout uses a monotonic clock (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-clock-skew-reconcile
+
+      - name: Prove removed roots release held hooks unbound after restart (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-held-root-removal-restart
+
+      - name: Prove unchanged roots still replay held hooks after restart (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-held-restart-same-roots
+
+      - name: Prove live file growth cannot move the startup EOF target (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-startup-eof-growth
+
+      - name: Prove large legacy rowids cannot poison promotion (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-promotion-rowid-overflow
+
+      - name: Prove malformed legacy cursors recover without manual repair (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-promotion-cursor-corruption
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability

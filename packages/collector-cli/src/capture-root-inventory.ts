@@ -271,12 +271,15 @@ export function claudeSessionRootSightings(sessionId: string): ReadonlySet<strin
   return seenClaudeSessionRoots.get(sessionId)??new Set<string>();
 }
 const claudeDispatchSkips={ conflictingBindings:0,otherRootSeen:0,ambiguousRoot:0,
-  replayTimeout:0 };
+  replayTimeout:0,replayRootUnavailable:0 };
 export function claudeDispatchSkipStatus() {
   return { ...claudeDispatchSkips,total:Object.values(claudeDispatchSkips).reduce((a,b)=>a+b,0) };
 }
 export function countClaudeReplayTimeout(count=1) {
   claudeDispatchSkips.replayTimeout+=count;
+}
+export function countClaudeReplayRootUnavailable(count=1) {
+  claudeDispatchSkips.replayRootUnavailable+=count;
 }
 /** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
@@ -415,23 +418,41 @@ export function promoteLegacyClaudeRootSightings(database: import("better-sqlite
     const key="claude_legacy_sighting_promotion_v1";
     const state=database.prepare("select value from maintenance_state where key=?").get(key) as
       {value:string}|undefined;
-    const cursor=state ? Number(state.value) : 0;
-    if(!Number.isSafeInteger(cursor)||cursor<0)
-      throw new Error("claude_legacy_sighting_cursor_invalid");
+    const countReason=(reason:string) => database.prepare(`insert into maintenance_state
+      (key,value,updated_at) values(?,'1',?) on conflict(key) do update set
+      value=cast(value as integer)+1,updated_at=excluded.updated_at`)
+      .run(reason,new Date().toISOString());
+    let cursor=0n;
+    if(state) {
+      try {
+        if(!/^(0|[1-9][0-9]*)$/.test(state.value)) throw new Error("invalid cursor");
+        cursor=BigInt(state.value);
+        if(cursor>9_223_372_036_854_775_807n) throw new Error("invalid cursor");
+      } catch {
+        cursor=0n;
+        countReason("claude_legacy_sighting_cursor_reset_count_v1");
+      }
+    }
     const rows=database.prepare(`select seen.rowid as rowid,seen.root_digest as rootDigest,
         seen.observed_at as observedAt,raw.session_id as sessionId
       from capture_root_observations seen
       left join buffered_events raw on raw.id=seen.event_id and raw.source='claude_code'
-      where seen.rowid>? order by seen.rowid limit ?`).all(cursor,limit) as Array<{
-        rowid:number;rootDigest:string;observedAt:string;sessionId:string|null;
+      where seen.rowid>? order by seen.rowid limit ?`).safeIntegers().all(cursor,limit) as Array<{
+        rowid:bigint;rootDigest:string;observedAt:string;sessionId:string|null;
       }>;
     if(!rows.length) return {visited:0,promoted:0,complete:true};
     const insert=database.prepare(`insert into capture_root_session_sightings
       (source,session_id,root_digest,first_seen_at) values('claude_code',?,?,?)
       on conflict do nothing`);
     let promoted=0;
-    for(const row of rows) if(row.sessionId)
-      promoted+=insert.run(row.sessionId,row.rootDigest,row.observedAt).changes;
+    for(const row of rows) {
+      if(!row.sessionId) {
+        countReason("claude_legacy_sighting_row_skipped_count_v1");
+        continue;
+      }
+      try { promoted+=insert.run(row.sessionId,row.rootDigest,row.observedAt).changes; }
+      catch { countReason("claude_legacy_sighting_row_skipped_count_v1"); }
+    }
     const next=rows.at(-1)?.rowid??cursor;
     database.prepare(`insert into maintenance_state(key,value,updated_at) values(?,?,?)
       on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at`)

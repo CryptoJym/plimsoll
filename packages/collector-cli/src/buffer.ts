@@ -213,6 +213,7 @@ const installationEpochIdSchema = z.string().uuid();
 
 export class LocalEventBuffer {
   private claudeReplayState: "inactive"|"pending"|"ready"|"timed_out"="inactive";
+  private claudeReplayRootSetJson="[]";
   private readonly deferredClaudeHookIds=new Set<string>();
   private readonly db: Database.Database;
   private readonly enrollmentNow: () => Date;
@@ -349,7 +350,8 @@ export class LocalEventBuffer {
       create table if not exists claude_replay_hooks (
         event_id text primary key,
         status text not null check(status in ('pending','timed_out')),
-        created_at text not null
+        created_at text not null,
+        root_set_json text
       );
       create trigger if not exists trg_claude_replay_raw_delete
       after delete on buffered_events begin
@@ -487,6 +489,12 @@ export class LocalEventBuffer {
       ) without rowid;
     `);
     markOpenStep("ledger.core_schema");
+    const replayHookColumns = new Set(
+      (this.db.pragma("table_info(claude_replay_hooks)") as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!replayHookColumns.has("root_set_json"))
+      this.db.exec("alter table claude_replay_hooks add column root_set_json text");
     const retentionControlColumns = new Set(
       (this.db.pragma("table_info(raw_retention_control)") as Array<{ name: string }>)
         .map((column) => column.name),
@@ -2635,8 +2643,8 @@ export class LocalEventBuffer {
       const run = () => {
         const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
         if(appended.appended && this.deferredClaudeHookIds.has(event.id))
-          this.db.prepare(`insert or ignore into claude_replay_hooks(event_id,status,created_at)
-            values(?,'pending',?)`).run(event.id,new Date().toISOString());
+          this.db.prepare(`insert or ignore into claude_replay_hooks(event_id,status,created_at,root_set_json)
+            values(?,'pending',?,?)`).run(event.id,new Date().toISOString(),this.claudeReplayRootSetJson);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
           handoffs,
@@ -2671,7 +2679,10 @@ export class LocalEventBuffer {
 
   /** The daemon activates this before accepting hooks. Fixture buffers remain
    * on the ordinary hot path unless a replay is explicitly started. */
-  beginClaudeReplayBarrier() { this.claudeReplayState="pending"; }
+  beginClaudeReplayBarrier(rootDigests:readonly string[]=[]) {
+    this.claudeReplayRootSetJson=JSON.stringify([...rootDigests].sort());
+    this.claudeReplayState="pending";
+  }
   finishClaudeReplayBarrier(reached: boolean) {
     this.claudeReplayState=reached ? "ready":"timed_out";
   }
