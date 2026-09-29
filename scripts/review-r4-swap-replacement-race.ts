@@ -7,8 +7,9 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
-import { switchFreshLedger } from "../packages/collector-cli/src/fresh-ledger-cutover";
+import { readReplacementLedgerMarker, switchFreshLedger } from "../packages/collector-cli/src/fresh-ledger-cutover";
 import { DEFAULT_JSONL_TAILER_IO, type JsonlTailerIo } from "../packages/collector-cli/src/jsonl-byte-tailer";
+import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 
@@ -23,8 +24,13 @@ const file = path.join(claude, "project", "70000000-0000-4000-8000-000000000007.
 const epoch = "10000000-0000-4000-8000-000000000001";
 const workspace = "30000000-0000-4000-8000-000000000003";
 const device = "40000000-0000-4000-8000-000000000004";
-const line = (id: string) => JSON.stringify({ type: "assistant", timestamp: new Date().toISOString(),
+const line = (id: string, timestamp = new Date().toISOString()) => JSON.stringify({ type: "assistant", timestamp,
   message: { id, model: "claude-opus-5", usage: { input_tokens: 10, output_tokens: 0 } } }) + "\n";
+const eventId = (id: string) => deterministicEventId(["claude-transcript", path.basename(file, ".jsonl"), id]);
+// A write immediately before rename can share the cutover's millisecond, which
+// the inclusive time fence admits. Give this excluded record an explicit past
+// stamp; the separate stamp-boundary proof covers equality at cutover.
+const preCutoverAt = new Date(Date.now() - 60_000).toISOString();
 fs.mkdirSync(codex);
 fs.mkdirSync(path.dirname(file), { recursive: true });
 fs.mkdirSync(archiveDirectory, { mode: 0o700 });
@@ -72,7 +78,7 @@ async function main() {
     fs.renameSync = ((source: fs.PathLike, destination: fs.PathLike) => {
       if (String(source) === `${ledgerPath}.replacement-stage` && String(destination) === ledgerPath) {
         const next = `${file}.writer-new`;
-        fs.writeFileSync(next, line("pre-swap-replacement"));
+        fs.writeFileSync(next, line("pre-swap-replacement", preCutoverAt));
         originalRename(next, file);
         injected = true;
       }
@@ -80,6 +86,9 @@ async function main() {
     }) as typeof fs.renameSync;
     try { switchFreshLedger(input); } finally { fs.renameSync = originalRename; }
     assert.equal(injected, true);
+    const marker = readReplacementLedgerMarker(ledgerPath);
+    assert.ok(marker && Date.parse(preCutoverAt) < Date.parse(marker.switchedAt),
+      "the excluded replacement record must be stamped strictly before the durable cutover");
     fs.appendFileSync(file, line("post-swap-early"));
     if (variant === "replace-after-rename") replace();
     if (variant === "append-before-first-scan") fs.appendFileSync(file, line("after-fence"));
@@ -95,7 +104,10 @@ async function main() {
     for (let pass = 0; pass < 8; pass++)
       await transcript.scan({ scope: "recent", automatic: { phase: "capture", budget: new CaptureWorkBudget() } });
     const earlyRows = (buffer.database.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
-    console.log(JSON.stringify({ injected, earlyRows, fileSize: fs.statSync(file).size,
+    const earlyIds = (buffer.database.prepare("select payload_json from buffered_events").all() as
+      Array<{ payload_json: string }>).map(row => JSON.parse(row.payload_json).id as string);
+    console.log(JSON.stringify({ injected, earlyRows, earlyIds, preCutoverAt, cutoverAt: marker.switchedAt,
+      fileSize: fs.statSync(file).size,
       cursor: buffer.database.prepare("select file_identity,committed_offset,size from rollout_scan_state").all(),
       carried: buffer.database.prepare("select file_identity,committed_offset from replacement_capture_cursors").all(),
       fences: buffer.database.prepare("select baseline_size from replacement_unseen_file_fences").all(),
@@ -108,8 +120,13 @@ async function main() {
     console.log(JSON.stringify({ variant, injected, earlyRows, stored: rows.length, staleGenerationCursorPassed,
       fileSize: fs.statSync(file).size, rows: rows.map(row => row.payload_json) }));
     assert.equal(earlyRows, 1, "a post-switch append before first scan must be captured");
+    assert.deepEqual(earlyIds, [eventId("post-swap-early")],
+      "only the early post-switch append is admitted so far");
     assert.equal(rows.length, 2,
-      `${variant}: first-scan baseline fences existing bytes and admits only later growth`);
+      `${variant}: a replaced generation excludes pre-cutover stamps and captures both post-switch appends`);
+    assert.deepEqual(rows.map(row => JSON.parse(row.payload_json).id as string).sort(),
+      [eventId("post-swap-early"), eventId("post-swap-late")].sort(),
+      "both post-switch records are captured once, with neither old record admitted");
     if (variant === "replace-after-rename") {
       assert.equal(staleGenerationCursorPassed, false,
         "a carried cursor from the old generation must never be applied to the post-rename file");
