@@ -524,6 +524,13 @@ jobs:
           pnpm proof:maintenance-rebuild-r16-listener-wait
           pnpm proof:maintenance-rebuild-r16-unsequenced
           pnpm proof:maintenance-rebuild-r16-tailer-cost
+          pnpm proof:maintenance-rebuild-r18-null-boundary
+          pnpm proof:maintenance-rebuild-r18-busy-refusal
+          pnpm proof:maintenance-rebuild-r18-busy-http
+          pnpm proof:maintenance-rebuild-r18-receipt-crash
+          pnpm proof:maintenance-rebuild-r18-migration-gap
+          pnpm proof:maintenance-rebuild-r18-schema-crash
+          pnpm proof:maintenance-rebuild-r18-schema-commit
           pnpm proof:maintenance-rebuild-writers
           pnpm proof:maintenance-rebuild-contract
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)

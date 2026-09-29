@@ -27,3 +27,36 @@ When B2a is available, clone the Studio5 ledger, record pre-S2 live bytes and me
 On a copy, replay two days at a measured raw growth rate, set a synthetic volume limit, and calculate an independent oracle from the copy's actual free bytes and true remaining conversion bytes. Walk published runway from above 30 days through 10, 5 and 2 days. At 10, assert conversion pauses and records the reason. At 5, assert only acknowledged, age-eligible rows outside open targets are released; every such row has `lean_hold_release_acked` and the required tombstone. Pending, dead, unmarked and open-target rows stay. At 2, assert the ABORT drill above runs and S0 is reported. At each step assert the published runway does not exceed the oracle or fire a rung later, `runway.g.gate` equals the host's post-catch-up preflight receipt, and `runway.g.owed` falls only with converter checkpointed page allocation, not dual-write; compare the converter's inside-transaction page delta with an independent page count around that chunk. Refuse the S3 recensus copy if it would cross a rung.
 
 For §5 item 2b, after rung-2 release flip `lean.facts=on` and `lean.read.dashboard=off`. Regenerate the old-path snapshot and assert it equals the pre-release snapshot minus exactly the ids receipted `lean_hold_release_acked`. Assert sealed segments and the cloud retain the full pre-release count and `/status` discloses the release set. Any missing receipt, tombstone, segment member or parity difference fails the gate. These are pending tests, not passed B13 evidence.
+
+
+## Round 18: busy boundaries and receipt publication
+
+The refusal path uses a single two-second monotonic budget for sequence-schema
+publication and `BEGIN IMMEDIATE` boundary capture. SQLite itself uses a zero
+busy timeout; retries share the deadline. The remaining part of the three-second
+HTTP budget covers private receipt publication and the 503 response. The schema
+table and its three triggers still commit atomically. An expired deadline records
+an explicitly null admission boundary before returning 503.
+
+A null boundary cannot establish an old-binary admission's order. After the
+client spool is gone and the ten-minute retry horizon expires, reconciliation
+fsyncs `unknown_admission_order` and retires the receipt. Capture claims retain
+that visible loss; this outcome is neither acceptance nor `retired_unverified`.
+An exact immutable digest can still prove acceptance before retirement.
+
+Receipt publishers and recoverers use a permanent SQLite coordination file per
+receipt identity in `maintenance-rebuild-refusal-locks/`. The OS releases its lock
+on process death; these coordination files must never be unlinked while the home
+is in use. A publisher writes the complete JSON to a private exclusive temporary,
+fsyncs it, then renames and fsyncs the directory. Reconciliation skips a live
+publisher. Abandoned temporaries and malformed published receipts receive a
+durable visible loss before unlink. For older writers that did not take the
+identity lock, a successful `lsof` no-handle observation is also required; an
+unavailable observation retains the hold for a later pass.
+
+Named controls: `r18-null-boundary`, `r18-busy-refusal`, `r18-busy-http`,
+`r18-receipt-crash`, `r18-migration-gap`, `r18-schema-crash`, and
+`r18-schema-commit` (all prefixed `proof:maintenance-rebuild-`). The old writer
+comes from a temporary worktree at pinned 0.7.44 source in this repository;
+cleanup removes it. The crash proof kills before receipt JSON write and after
+receipt fsync, and separately checks a live older writer holding the final FD.

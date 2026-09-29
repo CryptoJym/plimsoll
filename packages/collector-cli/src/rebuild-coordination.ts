@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 /** SQLite owns the cross-process lock. The coordination database is never
  * unlinked: replacing its inode would split publishers and recoverers into
  * independent lock domains. SQLite releases BEGIN EXCLUSIVE on process death. */
-export function withRebuildCoordination<T>(ledgerPath: string, action: () => T): T {
+export function withRebuildCoordination<T>(ledgerPath: string, action: () => T, timeoutMs = 30_000): T {
   if (!path.isAbsolute(ledgerPath) || path.normalize(ledgerPath) !== ledgerPath ||
     fs.realpathSync(path.dirname(ledgerPath)) !== path.dirname(ledgerPath)) {
     throw new Error("ledger_path_not_canonical");
@@ -17,7 +17,7 @@ export function withRebuildCoordination<T>(ledgerPath: string, action: () => T):
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const db = new Database(file, { timeout: 30_000 });
+  const db = new Database(file, { timeout: timeoutMs });
   try {
     fs.chmodSync(file, 0o600);
     db.pragma("journal_mode = DELETE");
