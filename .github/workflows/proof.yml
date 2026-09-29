@@ -283,6 +283,22 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r5-promotion-cursor-corruption
 
+      - name: Prove same-size startup transcript rewrite cannot stamp a held hook (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-truncate-regrow
+
+      - name: Prove larger startup transcript regrowth remains unvouched (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-larger-regrowth
+
+      - name: Prove a rewrite between replay reads remains unvouched (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-between-reads
+
+      - name: Prove identical startup transcript bytes remain vouched (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-identical-rewrite
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability

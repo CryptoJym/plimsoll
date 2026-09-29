@@ -56,6 +56,8 @@ export type JsonlTailRead = {
   continuation?: import("./jsonl-continuation").ContinuationProposal;
   skippedRecord?: CaptureSkippedRecord;
   lines: string[];
+  /** Raw complete-record bytes represented by this cursor advance. */
+  committedSourceSpan?: { offset: number; bytes: Buffer };
   observedSize: number;
   committedOffset: number;
   deferredBytes: number;
@@ -703,6 +705,7 @@ export function readJsonlTail(
 
     return {
       lines,
+      committedSourceSpan: { offset: start, bytes: bytes.subarray(0, slice.committedBytes) },
       observedSize,
       committedOffset,
       deferredBytes: Math.max(0, observedSize - committedOffset),

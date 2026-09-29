@@ -271,7 +271,7 @@ export function claudeSessionRootSightings(sessionId: string): ReadonlySet<strin
   return seenClaudeSessionRoots.get(sessionId)??new Set<string>();
 }
 const claudeDispatchSkips={ conflictingBindings:0,otherRootSeen:0,ambiguousRoot:0,
-  replayTimeout:0,replayRootUnavailable:0 };
+  replayTimeout:0,replayRootUnavailable:0,replayBytesUnvouched:0 };
 export function claudeDispatchSkipStatus() {
   return { ...claudeDispatchSkips,total:Object.values(claudeDispatchSkips).reduce((a,b)=>a+b,0) };
 }
@@ -280,6 +280,9 @@ export function countClaudeReplayTimeout(count=1) {
 }
 export function countClaudeReplayRootUnavailable(count=1) {
   claudeDispatchSkips.replayRootUnavailable+=count;
+}
+export function countClaudeReplayBytesUnvouched(count=1) {
+  claudeDispatchSkips.replayBytesUnvouched+=count;
 }
 /** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,

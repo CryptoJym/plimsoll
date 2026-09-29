@@ -202,6 +202,9 @@ export type TranscriptScanOptions = {
   quarantine?: { stage: MaintenanceProgressStage; candidateHash: string };
   onProgress?: (progress: { stage: MaintenanceProgressStage; candidateHash: string | null }) => boolean;
   deferredBeforeIo?: boolean;
+  /** Startup replay only: observe the exact bytes whose cursor committed. */
+  onCommittedSourceSpan?: (file: string, span: { offset: number; bytes: Buffer } | null,
+    committedOffset: number) => void;
 };
 
 function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
@@ -1208,6 +1211,8 @@ export class TranscriptTailer {
               );
             });
             committed = true;
+            options.onCommittedSourceSpan?.(candidate.file, read.committedSourceSpan ?? null,
+              read.committedOffset);
             if (read.skippedRecord) {
               result.skippedRecords = (result.skippedRecords ?? 0) + 1;
               result.skippedBytes = (result.skippedBytes ?? 0) + read.skippedRecord.bytes;

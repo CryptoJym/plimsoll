@@ -1,14 +1,16 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { performance } from "node:perf_hooks";
 
 import type { LocalEventBuffer } from "./buffer";
 import { aiInteractionEventSchema } from "../../shared/src/schemas";
 import { captureRootBaselineFiles, captureRootDigest, claudeBindingForUnrootedEvent,
-  countClaudeReplayRootUnavailable, countClaudeReplayTimeout, currentDispatchBindingSnapshot,
+  countClaudeReplayBytesUnvouched, countClaudeReplayRootUnavailable, countClaudeReplayTimeout,
+  currentDispatchBindingSnapshot,
   dispatchBindingMetadata, durableClaudeRootSessionSightings, inspectCaptureRoots,
   rootCursorKey, type CaptureRoot } from "./capture-root-inventory";
 import { TranscriptTailer } from "./transcript-tailer";
-import { jsonlScanStateKey } from "./jsonl-byte-tailer";
+import { ensureJsonlScanState, jsonlScanStateKey } from "./jsonl-byte-tailer";
 
 const MAX_REPLAY_WAIT_MS=5*60_000;
 const pause=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
@@ -16,7 +18,9 @@ const isWriterLock=(error:unknown)=>{
   const code=(error as {code?:unknown})?.code;
   return typeof code==="string"&&(code.startsWith("SQLITE_BUSY")||code.startsWith("SQLITE_LOCKED"));
 };
-type Target={file:string;size:number;dev:number;ino:number;birthtimeMs:number};
+type Target={file:string;size:number;start:number;digest:string;
+  dev:bigint;ino:bigint;birthtimeNs:bigint;lastVerifiedCtimeNs:bigint;
+  nextOffset:number;scanHash:crypto.Hash;verified:boolean;unvouched:boolean};
 export type ClaudeReplayBarrierReceipt={
   state:"ready"|"timed_out";waitMs:number;targets:number;scans:number;
   attributed:number;unbound:number;timedOutHooks:number;
@@ -25,22 +29,62 @@ export type ClaudeReplayBarrierReceipt={
 /** Freeze each configured root's file EOF when the listener opens. A file
  * removed, replaced or left unread cannot satisfy the barrier. The durable
  * hook holds keep only root digests, never transcript paths. */
-function startupTargets(roots:readonly CaptureRoot[]) {
+function startupTargets(buffer:LocalEventBuffer,roots:readonly CaptureRoot[]) {
   const targets:Target[]=[];
-  let blocked=false;
+  let blocked=false,bytesUnvouched=false;
+  ensureJsonlScanState(buffer.database);
+  const committedCursor=buffer.database.prepare(`select committed_offset as committedOffset
+    from rollout_scan_state where file=?`);
   for(const root of roots) {
     if(inspectCaptureRoots([root])[0]?.state!=="ready") { blocked=true;continue; }
     const scan=captureRootBaselineFiles("claude_code",root.directory);
     if(scan.errors) blocked=true;
     for(const file of scan.files) {
-      try {
-        const stat=fs.lstatSync(file);
-        if(!stat.isFile()||stat.isSymbolicLink()) { blocked=true;continue; }
-        targets.push({file,size:stat.size,dev:stat.dev,ino:stat.ino,birthtimeMs:stat.birthtimeMs});
-      } catch { blocked=true; }
+      let captured=false;
+      for(let attempt=0;attempt<3&&!captured;attempt++) {
+        let fd:number|undefined;
+        try {
+          fd=fs.openSync(file,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW??0));
+          const before=fs.fstatSync(fd,{bigint:true});
+          const pathBefore=fs.lstatSync(file,{bigint:true});
+          const size=Number(before.size);
+          if(!before.isFile()||pathBefore.isSymbolicLink()||!pathBefore.isFile()||
+             before.dev!==pathBefore.dev||before.ino!==pathBefore.ino||
+             before.birthtimeNs!==pathBefore.birthtimeNs||
+             !Number.isSafeInteger(size)||size<0) throw new Error("startup_file_changed");
+          const receipt=committedCursor.get(jsonlScanStateKey(rootCursorKey(roots,file))) as
+            {committedOffset:number|null}|undefined;
+          const start=receipt?.committedOffset??0;
+          if(!Number.isSafeInteger(start)||start<0||start>size)
+            throw new Error("startup_cursor_outside_file");
+          const hash=crypto.createHash("sha256");
+          const chunk=Buffer.allocUnsafe(64*1024);
+          for(let offset=start;offset<size;) {
+            const read=fs.readSync(fd,chunk,0,Math.min(chunk.length,size-offset),offset);
+            if(read<=0) throw new Error("startup_file_shrank");
+            hash.update(chunk.subarray(0,read));
+            offset+=read;
+          }
+          const after=fs.fstatSync(fd,{bigint:true});
+          const pathAfter=fs.lstatSync(file,{bigint:true});
+          if(after.dev!==before.dev||after.ino!==before.ino||
+             after.birthtimeNs!==before.birthtimeNs||after.ctimeNs!==before.ctimeNs||
+             after.mtimeNs!==before.mtimeNs||after.size!==before.size||
+             pathAfter.dev!==before.dev||pathAfter.ino!==before.ino||
+             pathAfter.birthtimeNs!==before.birthtimeNs||pathAfter.ctimeNs!==before.ctimeNs||
+             pathAfter.size!==before.size) continue;
+          targets.push({file,size,start,digest:hash.digest("hex"),dev:before.dev,
+            ino:before.ino,birthtimeNs:before.birthtimeNs,
+            lastVerifiedCtimeNs:before.ctimeNs,nextOffset:start,
+            scanHash:crypto.createHash("sha256"),verified:start===size,unvouched:false});
+          captured=true;
+        } catch { /* A moving file gets another bounded capture attempt. */ }
+        finally { if(fd!==undefined) fs.closeSync(fd); }
+      }
+      if(!captured) { blocked=true;bytesUnvouched=true; }
     }
   }
-  return {targets,blocked};
+  return {targets,blocked,bytesUnvouched};
 }
 
 /** The daemon calls this before it accepts hooks. The scan runs on later event
@@ -54,7 +98,8 @@ export function startClaudeReplayBarrier(buffer:LocalEventBuffer,captureRoots:re
   const started=performance.now();
   const timeoutMs=Math.max(1,Math.min(options.timeoutMs??MAX_REPLAY_WAIT_MS,MAX_REPLAY_WAIT_MS));
   const deadline=started+timeoutMs;
-  const snapshot=startupTargets(roots);
+  const snapshot=startupTargets(buffer,roots);
+  const targetsByFile=new Map(snapshot.targets.map(target=>[target.file,target]));
   let tailer:TranscriptTailer|undefined;
   if(roots.length && !snapshot.blocked) {
     try { tailer=new TranscriptTailer(buffer,roots[0]!.directory,undefined,roots); }
@@ -65,6 +110,56 @@ export function startClaudeReplayBarrier(buffer:LocalEventBuffer,captureRoots:re
   const controller=new AbortController();
   buffer.beginClaudeReplayBarrier(rootDigests);
   let scans=0,attributed=0,unbound=0;
+  const scanSourceSpan=(file:string,span:{offset:number;bytes:Buffer}|null,
+    committedOffset:number) => {
+    const target=targetsByFile.get(file);
+    if(!target||target.unvouched||target.verified) return;
+    if(!span) {
+      if(committedOffset>target.nextOffset) target.unvouched=true;
+      return;
+    }
+    const from=Math.max(span.offset,target.start);
+    const until=Math.min(span.offset+span.bytes.length,target.size);
+    if(until<=from) return;
+    if(from!==target.nextOffset) { target.unvouched=true;return; }
+    target.scanHash.update(span.bytes.subarray(from-span.offset,until-span.offset));
+    target.nextOffset=until;
+    if(until===target.size) {
+      target.verified=target.scanHash.digest("hex")===target.digest;
+      target.unvouched=!target.verified;
+    }
+  };
+  const bytesUnvouched=()=>snapshot.bytesUnvouched||snapshot.targets.some(target=>target.unvouched);
+  // A rewrite can interrupt the tailer before it commits the next slice. In
+  // that case there is no second byte span to hash, so confirm the changed
+  // generation against the captured region before considering any cursor.
+  const currentRegionStillMatches=(target:Target,ctimeNs:bigint) => {
+    let fd:number|undefined;
+    try {
+      fd=fs.openSync(target.file,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW??0));
+      const before=fs.fstatSync(fd,{bigint:true});
+      if(!before.isFile()||before.dev!==target.dev||before.ino!==target.ino||
+         before.birthtimeNs!==target.birthtimeNs||before.ctimeNs!==ctimeNs||
+         before.size<BigInt(target.size)) return false;
+      const hash=crypto.createHash("sha256");
+      const chunk=Buffer.allocUnsafe(64*1024);
+      for(let offset=target.start;offset<target.size;) {
+        const read=fs.readSync(fd,chunk,0,Math.min(chunk.length,target.size-offset),offset);
+        if(read<=0) return false;
+        hash.update(chunk.subarray(0,read));
+        offset+=read;
+      }
+      const after=fs.fstatSync(fd,{bigint:true});
+      const pathAfter=fs.lstatSync(target.file,{bigint:true});
+      if(after.ctimeNs!==before.ctimeNs||after.size!==before.size||
+         pathAfter.ctimeNs!==before.ctimeNs||pathAfter.size!==before.size||
+         pathAfter.dev!==before.dev||pathAfter.ino!==before.ino) return false;
+      if(hash.digest("hex")!==target.digest) return false;
+      target.lastVerifiedCtimeNs=ctimeNs;
+      return true;
+    } catch { return false; }
+    finally { if(fd!==undefined) fs.closeSync(fd); }
+  };
   const rootsUnchanged=() => {
     const current=currentDispatchBindingSnapshot().roots.filter(root=>root.source==="claude_code");
     return current.length===roots.length&&current.every((root,index)=>
@@ -73,17 +168,24 @@ export function startClaudeReplayBarrier(buffer:LocalEventBuffer,captureRoots:re
         roots[index]?.installationEpochId,roots[index]?.directory]));
   };
   const allCovered=() => !snapshot.blocked && snapshot.targets.every(target=>{
-    let stat:fs.Stats;
-    try { stat=fs.lstatSync(target.file); } catch { return false; }
+    let stat:fs.BigIntStats;
+    try { stat=fs.lstatSync(target.file,{bigint:true}); }
+    catch { target.unvouched=true;return false; }
     if(!stat.isFile()||stat.isSymbolicLink()||stat.dev!==target.dev||
-       stat.ino!==target.ino||stat.birthtimeMs!==target.birthtimeMs||stat.size<target.size)
-      return false;
+       stat.ino!==target.ino||stat.birthtimeNs!==target.birthtimeNs||
+       stat.size<BigInt(target.size)||stat.size<BigInt(target.start)) {
+      target.unvouched=true;return false;
+    }
+    if(stat.ctimeNs!==target.lastVerifiedCtimeNs&&
+       !currentRegionStillMatches(target,stat.ctimeNs)) {
+      target.unvouched=true;return false;
+    }
     const receipt=committedCursor?.get(jsonlScanStateKey(rootCursorKey(roots,target.file))) as
       {committedOffset:number|null}|undefined;
     // A live writer may grow this file after startup. Only the captured EOF
     // is part of this barrier. The committed offset excludes partial records;
     // a legacy size-only cursor must be replayed before it can satisfy us.
-    return receipt?.committedOffset!==null &&
+    return target.verified && receipt?.committedOffset!==null &&
       receipt?.committedOffset!==undefined && receipt.committedOffset>=target.size;
   });
   // A scan that could not advance an unchanged startup file need not repeat
@@ -175,17 +277,20 @@ export function startClaudeReplayBarrier(buffer:LocalEventBuffer,captureRoots:re
       let lastFullScanAt=-Infinity;
       while(performance.now()<deadline && !controller.signal.aborted) {
         if(allCovered()) { reached=true;break; }
+        if(bytesUnvouched()) break;
         if(tailer) {
           const fingerprint=targetFingerprint();
           if(fingerprint!==lastScanFingerprint || performance.now()-lastFullScanAt>=5_000) {
             scans++;
-            try { await tailer.scan({scope:"full",signal:controller.signal}); }
+            try { await tailer.scan({scope:"full",signal:controller.signal,
+              onCommittedSourceSpan:scanSourceSpan}); }
             catch { /* A missing or busy root remains untrusted until a retry. */ }
             lastScanFingerprint=fingerprint;
             lastFullScanAt=performance.now();
           }
         }
         if(allCovered()) { reached=true;break; }
+        if(bytesUnvouched()) break;
         await pause(Math.min(scanDelay,Math.max(1,deadline-performance.now())));
         if(tailer) scanDelay=Math.min(scanDelay*4,5_000);
       }
@@ -204,6 +309,7 @@ export function startClaudeReplayBarrier(buffer:LocalEventBuffer,captureRoots:re
     // pending. Hooks appended during lock retries join the release UPDATE.
     buffer.finishClaudeReplayBarrier(reached);
     if(timedOutHooks) countClaudeReplayTimeout(timedOutHooks);
+    if(timedOutHooks&&bytesUnvouched()) countClaudeReplayBytesUnvouched(timedOutHooks);
     return {state:reached?"ready":"timed_out",waitMs:performance.now()-started,
       targets:snapshot.targets.length,scans,attributed,unbound,timedOutHooks} as ClaudeReplayBarrierReceipt;
     })().then(resolve,reject);
