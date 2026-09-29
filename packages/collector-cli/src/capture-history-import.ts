@@ -264,20 +264,15 @@ function decodeCodexState(raw: string, sessionId: string): CodexState {
 function loadFileBaseline(db: DB, root: CaptureRoot, file: File) {
   if (!table(db, "capture_history_file_state")) return;
   const saved = db.prepare(`select root_id as rootId,source,prefix_hash as prefixHash,
-    baseline_json as baselineJson,handoff_ready as ready
+    baseline_json as baselineJson,handoff_ready as ready,published_rows as publishedRows
     from capture_history_file_state where file_key=?`)
     .get(file.fileKey) as { rootId: string; source: string; prefixHash: string;
-      baselineJson: string; ready: number } | undefined;
+      baselineJson: string; ready: number; publishedRows: number } | undefined;
   if (!saved) return;
   if (saved.rootId !== root.rootId || saved.source !== root.source) refusal("import_file_state_conflict");
-  if (saved.ready !== 1) {
-    const run = db.prepare(`select imported_rows as rows,completed_at as completedAt
-      from capture_history_import_runs where root_id=?`).get(root.rootId) as
-        { rows: number; completedAt: string | null } | undefined;
-    // An attempt that died before its first publication may re-preflight a
-    // changed prefix; no parser handoff or counted row escaped that attempt.
-    if (run?.rows === 0 && run.completedAt === null) return;
-  }
+  // Publication belongs to this file, not to the entire root. An earlier
+  // file may have committed while this one's prefix was still unverified.
+  if (saved.ready !== 1 && saved.publishedRows === 0) return;
   let baseline: { codex?: string; claude?: Array<[string, Amounts]> };
   try { baseline = JSON.parse(saved.baselineJson) as typeof baseline; }
   catch { refusal("import_file_state_invalid"); }
@@ -474,7 +469,7 @@ function candidateDigest(candidate: Candidate, index: number) {
   ])).digest("hex");
 }
 async function scan(db: DB, root: CaptureRoot, options: Options,
-  onMissing?: (candidate: Candidate, index: number, digest: string) => Promise<void>,
+  onMissing?: (candidate: Candidate, index: number, digest: string, file: File) => Promise<void>,
   expectedFiles?: File[], resume?: ResumePoint,
   onFileReady?: (file: File) => Promise<void>,
   onFilePublished?: (file: File) => Promise<void>): Promise<ScanResult> {
@@ -608,7 +603,7 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
     // preflight digest. Only this file's verified candidates may be published.
     if (onFileReady) await onFileReady(file);
     for (const item of verifiedCandidates) {
-      await onMissing!(item.candidate, item.index, item.digest);
+      await onMissing!(item.candidate, item.index, item.digest, file);
     }
     if (onFilePublished) await onFilePublished(file);
   }
@@ -677,7 +672,8 @@ function ensureImportLockSchema(db: DB) {
 }
 function ensureImportSchema(db: DB) {
   db.exec(`create table if not exists capture_history_import_runs (
-    root_id text primary key, root_digest text not null, source_digest text not null, source text not null,
+    root_id text primary key, root_digest text not null, source_digest text not null,
+    since_window text, source text not null,
     run_id text not null, imported_rows integer not null default 0,
     input_tokens integer not null default 0, cache_read_tokens integer not null default 0,
     cache_creation_tokens integer not null default 0, output_tokens integer not null default 0,
@@ -686,7 +682,8 @@ function ensureImportSchema(db: DB) {
     create table if not exists capture_history_file_state (
       file_key text primary key,root_id text not null,source text not null,
       prefix_hash text not null,baseline_json text not null,
-      handoff_ready integer not null default 0 check(handoff_ready in (0,1)));
+      handoff_ready integer not null default 0 check(handoff_ready in (0,1)),
+      published_rows integer not null default 0 check(published_rows>=0));
     create table if not exists capture_history_session_counters (
       source text not null,session_id text not null,last_index integer not null,
       state_json text not null,primary key(source,session_id));
@@ -703,6 +700,8 @@ function ensureImportSchema(db: DB) {
   const columns = db.pragma("table_info(capture_history_import_runs)") as Array<{ name: string }>;
   if (!columns.some(column => column.name === "source_digest"))
     db.exec("alter table capture_history_import_runs add column source_digest text");
+  if (!columns.some(column => column.name === "since_window"))
+    db.exec("alter table capture_history_import_runs add column since_window text");
   if (!columns.some(column => column.name === "resume_candidate_index"))
     db.exec("alter table capture_history_import_runs add column resume_candidate_index integer not null default 0");
   if (!columns.some(column => column.name === "resume_candidate_digest"))
@@ -710,6 +709,14 @@ function ensureImportSchema(db: DB) {
   const fileColumns = db.pragma("table_info(capture_history_file_state)") as Array<{ name: string }>;
   if (!fileColumns.some(column => column.name === "handoff_ready"))
     db.exec("alter table capture_history_file_state add column handoff_ready integer not null default 0");
+  if (!fileColumns.some(column => column.name === "published_rows")) {
+    db.exec("alter table capture_history_file_state add column published_rows integer not null default 0");
+    // A pre-upgrade interrupted file may have published a partial slice.
+    // Its per-file count is unknown, so keep its original digest binding.
+    db.exec(`update capture_history_file_state set published_rows=1
+      where handoff_ready=0 and exists (select 1 from capture_history_import_runs r
+        where r.root_id=capture_history_file_state.root_id and r.imported_rows>0)`);
+  }
   const revisionColumns = db.pragma("table_info(transcript_usage_revision_state)") as Array<{ name: string }>;
   if (!revisionColumns.some(column => column.name === "repo_context_id"))
     db.exec("alter table transcript_usage_revision_state add column repo_context_id text");
@@ -725,6 +732,10 @@ function rememberFileBaseline(db: DB, root: CaptureRoot, file: File) {
     ...(file.initialCodex ? { codex: JSON.stringify(file.initialCodex) } : {}),
     claude: [...(file.initialClaude ?? new Map()).entries()],
   });
+  // Refresh only this file's unpublished baseline after its entire prefix
+  // verifies. A file with committed rows keeps its original digest binding.
+  db.prepare(`delete from capture_history_file_state where file_key=?
+    and handoff_ready=0 and published_rows=0`).run(file.fileKey);
   db.prepare(`insert or ignore into capture_history_file_state
     (file_key,root_id,source,prefix_hash,baseline_json,handoff_ready) values (?,?,?,?,?,0)`)
     .run(file.fileKey, root.rootId, root.source, file.prefixHash, baseline);
@@ -843,25 +854,39 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         { rootId: string; pid: number; started: string; attemptId: string | null } | undefined;
     if (!held || held.rootId !== root.rootId || held.pid !== process.pid ||
         held.started !== ownerStart || held.attemptId !== attemptId) refusal("import_lock_lost");
-    const prior = db.prepare(`select root_digest as digest,source_digest as sourceDigest,run_id as runId,
+    const prior = db.prepare(`select root_digest as digest,source_digest as sourceDigest,
+      since_window as sinceWindow,run_id as runId,
       resume_candidate_index as resumeIndex,resume_candidate_digest as resumeDigest,
       imported_rows as importedRows,completed_at as completedAt
       from capture_history_import_runs where root_id=?`)
-      .get(root.rootId) as { digest: string; sourceDigest: string | null; runId: string;
+      .get(root.rootId) as { digest: string; sourceDigest: string | null;
+        sinceWindow: string | null; runId: string;
         resumeIndex: number; resumeDigest: string | null; importedRows: number;
         completedAt: string | null } | undefined;
     const digest = captureRootDigest(root);
     if (prior && prior.digest !== digest) refusal("root_identity_changed_since_import");
     if (prior && prior.sourceDigest !== fencedSourceDigest) {
-      // An interrupted attempt that published nothing may re-preflight a
-      // changed prefix from byte zero. Published history stays immutable.
-      if (prior.importedRows !== 0 || prior.completedAt !== null)
+      // The source digest also binds the since window. Only file bytes may
+      // be re-preflighted; a changed or legacy-unknown window still refuses.
+      if (prior.sinceWindow !== JSON.stringify(options.since ?? null))
+        refusal("fenced_history_changed_since_import");
+      // Preserve the digest of every file that published a row or parser
+      // handoff. A different, still-unpublished file may be re-preflighted
+      // even when earlier files in this root have committed.
+      const boundFiles = db.prepare(`select file_key as fileKey,prefix_hash as prefixHash
+        from capture_history_file_state where root_id=?
+          and (handoff_ready=1 or published_rows>0)`).all(root.rootId) as
+        Array<{ fileKey: string; prefixHash: string }>;
+      const currentHashes = new Map(first.files.map(file => [file.fileKey, file.prefixHash]));
+      if (prior.completedAt !== null || (prior.importedRows > 0 && boundFiles.length === 0) ||
+          boundFiles.some(file => currentHashes.get(file.fileKey) !== file.prefixHash))
         refusal("fenced_history_changed_since_import");
       db.prepare(`update capture_history_import_runs set source_digest=?,
         resume_candidate_index=0,resume_candidate_digest=null where root_id=?`)
         .run(fencedSourceDigest, root.rootId);
-      db.prepare(`delete from capture_history_file_state where root_id=? and handoff_ready=0`)
-        .run(root.rootId);
+      // Re-scan bound files from their stored parser baselines. Existing IDs
+      // dedupe; resetting the candidate cursor also discards progress made
+      // through an uncommitted file whose bytes may now differ.
       prior.resumeIndex = 0;
       prior.resumeDigest = null;
     }
@@ -871,8 +896,9 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     runId = prior?.runId ?? crypto.randomUUID();
     resume = { index: prior?.resumeIndex ?? 0, digest: prior?.resumeDigest ?? null };
     if (!prior) db.prepare(`insert into capture_history_import_runs
-      (root_id,root_digest,source_digest,source,run_id,started_at,updated_at) values (?,?,?,?,?,?,?)`)
-      .run(root.rootId, digest, fencedSourceDigest, root.source, runId,
+      (root_id,root_digest,source_digest,since_window,source,run_id,started_at,updated_at)
+      values (?,?,?,?,?,?,?,?)`)
+      .run(root.rootId, digest, fencedSourceDigest, JSON.stringify(options.since ?? null), root.source, runId,
         new Date().toISOString(), new Date().toISOString());
   }).immediate();
   const priorAutoCheckpoint = db.pragma("wal_autocheckpoint", { simple: true }) as number;
@@ -941,10 +967,12 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     "under25ms": 0, "25to50ms": 0, "50to100ms": 0, "100to250ms": 0, "250to750ms": 0, "750msOrMore": 0,
   };
   const importedTokens: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
-  let pending: Array<{ candidate: Candidate; index: number; digest: string }> = [];
+  let pending: Array<{ candidate: Candidate; index: number; digest: string; fileKey: string }> = [];
   const flush = async () => {
     if (!pending.length) return;
     const batch = pending.slice(0, nextRows);
+    const fileKey = batch[0]!.fileKey;
+    if (batch.some(item => item.fileKey !== fileKey)) refusal("mixed_file_slice");
     pending = pending.slice(batch.length);
     maintenanceIdle(db);
     let writerStarted = 0;
@@ -997,6 +1025,8 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
           where root_id=?`).run(rows, counts.input, counts.cacheRead, counts.cacheCreation,
             counts.output, new Date().toISOString(), batch[processed - 1]!.index,
             batch[processed - 1]!.digest, root.rootId);
+        if (rows) db.prepare(`update capture_history_file_state
+          set published_rows=published_rows+? where file_key=?`).run(rows, fileKey);
         writerWorkEnded = performance.now();
         return { rows, counts };
       }));
@@ -1053,8 +1083,8 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     // Verify every prefix before the first imported row. Suffix growth is
     // allowed, but a rewrite of any fenced byte aborts the entire preflight.
     for (const file of first.files) verifyFencedPrefix(file);
-    await scan(db, root, options, async (candidate, index, digest) => {
-      pending.push({ candidate, index, digest });
+    await scan(db, root, options, async (candidate, index, digest, file) => {
+      pending.push({ candidate, index, digest, fileKey: file.fileKey });
       while (pending.length >= nextRows) await flush();
     }, first.files, resume, async file => {
       // This small row preserves the exact initial parser baseline before a

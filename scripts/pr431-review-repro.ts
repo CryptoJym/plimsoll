@@ -384,6 +384,50 @@ async function changedPrefixDuringSecondScan() {
   } finally { fixture.close(); }
 }
 
+async function changedLaterFileAfterEarlierPublication() {
+  const fixture = setup(true);
+  try {
+    const root = captureRoot(path.join(fixture.fixture.home, "profile", "sessions"), "codex", fixture.buffer);
+    const laterSession = "019d0000-0000-7000-8000-000000000102";
+    const firstFile = codexFile(root.directory, SESSION, [0, 1]);
+    const laterFile = codexFile(root.directory, laterSession, [0, 2]);
+    seal(fixture.buffer, "codex", [firstFile, laterFile]);
+    const originalOpen = fs.openSync;
+    let readOpens = 0;
+    let refusal = "none";
+    try {
+      fs.openSync = ((target: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
+        if (String(target) === laterFile &&
+            (flags === "r" || flags === (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)) &&
+            ++readOpens === 3) {
+          const old = fs.readFileSync(laterFile, "utf8");
+          const changed = old.replace('"input_tokens":2', '"input_tokens":3')
+            .replace('"output_tokens":2', '"output_tokens":3');
+          assert.notEqual(changed, old);
+          fs.writeFileSync(laterFile, changed);
+        }
+        return originalOpen(target, flags, mode);
+      }) as typeof fs.openSync;
+      try { await applyCaptureHistory(fixture.buffer, root); }
+      catch (error) { refusal = String(error); }
+    } finally { fs.openSync = originalOpen; }
+    const rowCount = () => (fixture.buffer.database.prepare("select count(*) as n from buffered_events")
+      .get() as { n: number }).n;
+    const queuedCount = () => (fixture.buffer.database.prepare("select count(*) as n from upload_outbox")
+      .get() as { n: number }).n;
+    const beforeRetry = { rows: rowCount(), queued: queuedCount() };
+    assert.ok(refusal.includes("fenced_prefix_changed"), "later changed file must refuse");
+    assert.deepEqual(beforeRetry, { rows: 1, queued: 1 },
+      "only the earlier verified file may have published rows");
+    const retry = await applyCaptureHistory(fixture.buffer, root);
+    const afterRetry = { rows: rowCount(), queued: queuedCount() };
+    console.log(JSON.stringify({ case: "changed_later_file_after_earlier_publication", readOpens,
+      refusal, beforeRetry, retryImported: retry.importedRows, afterRetry }));
+    assert.equal(retry.importedRows, 1, "a stable uncommitted file must re-preflight from byte zero");
+    assert.deepEqual(afterRetry, { rows: 2, queued: 2 });
+  } finally { fixture.close(); }
+}
+
 async function resumeCursorBinding() {
   const fixture = setup();
   try {
@@ -733,7 +777,8 @@ const cases: Record<string, () => Promise<void>> = {
   growth: claudeGrowthAfterImport, growth_codex: codexGrowthAfterImport,
   growth_codex_race: codexGrowthDuringImport,
   tailer_race: tailerDuringImport,
-  changed: changedPrefixDuringSecondScan, cursor: resumeCursorBinding,
+  changed: changedPrefixDuringSecondScan,
+  changed_later: changedLaterFileAfterEarlierPublication, cursor: resumeCursorBinding,
   prewrite_crash: prewriteCrashRecovery,
   concurrent: sameProcessConcurrentImport, provenance: outboundProvenance,
   provenance_marker: () => outboundProvenance(true),
@@ -743,7 +788,7 @@ const cases: Record<string, () => Promise<void>> = {
   symlink: symlinkAndReplacement, symlink_race: symlinkSwapDuringSecondScan,
 };
 const groups: Record<string, string[]> = {
-  f1: ["changed"],
+  f1: ["changed", "changed_later"],
   f2: ["growth", "growth_codex", "growth_codex_race", "tailer_race"],
   f3: ["split", "split_claude"],
   f4: ["concurrent"],
