@@ -15,7 +15,7 @@
     {
       "name": "metadata_only_privacy",
       "kind": "line_summary_with_receipt",
-      "expectedArtifactDigest": "sha256:7b6d222b597e53f830b5c14071158f8daa6f57b74b2f2f861215a1ddfcec60d4"
+      "expectedArtifactDigest": "sha256:172ae1555dc07914b41a22128f8855afa502cc82da3e918ca90718a32c8d4304"
     },
     {
       "name": "canonical_lifecycle",

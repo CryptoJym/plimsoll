@@ -43,6 +43,11 @@ function columns(db: Database.Database, table: string) {
   );
 }
 
+const eligibilitySqlCache = new WeakMap<Database.Database, {
+  schemaVersion: number;
+  predicates: Map<string, string>;
+}>();
+
 /**
  * One authoritative event-eligibility predicate for every local/read/export
  * lane. Schema checks are O(1) control reads; row evaluation uses indexed
@@ -54,6 +59,18 @@ export function terminalPrivacyEligibilitySql(
   options: { includeUnboundLegacyReceipts?: boolean } = {},
 ) {
   const alias = safeAlias(rawAlias);
+  const includeUnbound = options.includeUnboundLegacyReceipts !== false;
+  // A maintenance turn asks for the same predicate many times. The SQL only
+  // depends on schema shape, so retain it until SQLite's schema cookie moves.
+  const schemaVersion = db.pragma("schema_version", { simple: true }) as number;
+  let cache = eligibilitySqlCache.get(db);
+  if (!cache || cache.schemaVersion !== schemaVersion) {
+    cache = { schemaVersion, predicates: new Map() };
+    eligibilitySqlCache.set(db, cache);
+  }
+  const cacheKey = `${alias}:${includeUnbound ? 1 : 0}`;
+  const cached = cache.predicates.get(cacheKey);
+  if (cached) return cached;
   const rawColumns = columns(db, "buffered_events");
   const terms: string[] = [];
   if (rawColumns.has("data_mode")) terms.push(`${alias}.data_mode <> 'evidence'`);
@@ -76,7 +93,6 @@ export function terminalPrivacyEligibilitySql(
     const receiptColumns = columns(db, "upload_receipts");
     const receiptLineage = ["raw_rowid", "raw_id", "raw_created_at", "raw_generation"]
       .every((column) => receiptColumns.has(column)) && rawColumns.has("privacy_generation");
-    const includeUnbound = options.includeUnboundLegacyReceipts !== false;
     if (receiptLineage && includeUnbound) registerRetentionDeliveryId(db);
     const dead = receiptColumns.has("terminal_state")
       ? "and privacy_receipt.terminal_state = 'dead'" : "";
@@ -89,9 +105,19 @@ export function terminalPrivacyEligibilitySql(
           and privacy_receipt.raw_created_at = ${alias}.created_at
           and privacy_receipt.raw_generation is ${alias}.privacy_generation
           ${dead} and privacy_receipt.reason in (${TERMINAL_REASONS_SQL}))`);
-      if (includeUnbound) terms.push(`not exists (select 1 from upload_receipts privacy_receipt
+      if (includeUnbound) terms.push(`(case when exists (
+        select 1 from upload_receipts unbound_privacy_receipt
+        where unbound_privacy_receipt.raw_rowid is null
+          and unbound_privacy_receipt.raw_id is null
+          and unbound_privacy_receipt.raw_created_at is null
+          and unbound_privacy_receipt.raw_generation is null
+          ${receiptColumns.has("terminal_state")
+            ? "and unbound_privacy_receipt.terminal_state = 'dead'" : ""}
+          and unbound_privacy_receipt.reason in (${TERMINAL_REASONS_SQL})
+      ) then not exists (select 1 from upload_receipts privacy_receipt
         where ${legacyNullLineageReceiptMatchSql(alias, "privacy_receipt")}
-          ${dead} and privacy_receipt.reason in (${TERMINAL_REASONS_SQL}))`);
+          ${dead} and privacy_receipt.reason in (${TERMINAL_REASONS_SQL}))
+        else 1 end)`);
     } else {
       terms.push(`not exists (select 1 from upload_receipts privacy_receipt
         where privacy_receipt.delivery_id = ${alias}.id
@@ -122,7 +148,9 @@ export function terminalPrivacyEligibilitySql(
        )`,
     );
   }
-  return terms.length > 0 ? `(${terms.join(" and ")})` : "1 = 1";
+  const predicate = terms.length > 0 ? `(${terms.join(" and ")})` : "1 = 1";
+  cache.predicates.set(cacheKey, predicate);
+  return predicate;
 }
 
 /** First terminal privacy disposition wins and cannot be cleared. */
