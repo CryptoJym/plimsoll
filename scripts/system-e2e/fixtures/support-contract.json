@@ -15,7 +15,7 @@
     {
       "name": "metadata_only_privacy",
       "kind": "line_summary_with_receipt",
-      "expectedArtifactDigest": "sha256:5b9df7cd0f8f1489c6c9607557a316e8d13053141827cc3b85610b8d1d1f43c6"
+      "expectedArtifactDigest": "sha256:7b6d222b597e53f830b5c14071158f8daa6f57b74b2f2f861215a1ddfcec60d4"
     },
     {
       "name": "canonical_lifecycle",
@@ -25,7 +25,7 @@
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:7deb87a6cc088dac05271daf3066c088c22ec21be079cf171c39d7315e9aaab5"
+      "expectedArtifactDigest": "sha256:94658ec29080cef41dcba82788d5b6c19aec04fa8239eb45cbab3830e35ce67b"
     },
     {
       "name": "launch_agent_unload_terminal_truth",
