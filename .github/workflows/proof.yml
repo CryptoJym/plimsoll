@@ -659,6 +659,14 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-r6-3
 
+      - name: Prove the live runtime pointer outranks copied lifecycle records
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r6-live-pointer
+
+      - name: Prove update and restore survive each lifecycle pair crash point
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r6-crash-matrix
+
       - name: Prove future-only enrollment withholds pre-join history (eco-6hoxj.163.22)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:enrollment-privacy

@@ -124,6 +124,8 @@
     "proof:join-r6-1": "tsx scripts/pr428-r6-join-proof.ts r6-1",
     "proof:join-r6-2": "tsx scripts/pr428-r6-join-proof.ts r6-2",
     "proof:join-r6-3": "tsx scripts/pr428-r6-join-proof.ts r6-3",
+    "proof:join-r6-live-pointer": "tsx scripts/pr428-r6-live-pointer-proof.ts",
+    "proof:join-r6-crash-matrix": "tsx scripts/pr428-r6-lifecycle-crash-proof.ts",
     "proof:device-registry": "tsx scripts/device-registry-proof.ts",
     "proof:enrollment-privacy": "tsx scripts/enrollment-privacy-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",
