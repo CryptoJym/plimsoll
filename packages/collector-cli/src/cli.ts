@@ -843,27 +843,27 @@ function installedLegacyLaunchAgentRuntime(): {
         return { programArguments: [executable, ...record.command], workingDirectory: record.cwd };
     }
   }
-  // A stopped pre-template install has no PID. Its validated plist still
-  // identifies the installed runtime, which may be older than this CLI.
-  const installed = readLaunchAgentProgramArguments();
-  const args = [...installed.programArguments];
-  if (args.length !== 3 || args[2] !== "start" ||
-      installed.workingDirectory !== path.dirname(args[1]!)) return undefined;
-  let script: fs.Stats;
-  try { script = fs.lstatSync(args[1]!); }
-  catch { return undefined; }
-  if (!script.isFile() || script.isSymbolicLink() || script.nlink !== 1) return undefined;
+  // A stopped install can only use private lifecycle state as evidence for an
+  // older runtime. The plist under inspection cannot vouch for its own args.
   const statePath = path.join(collectorHome(), "lifecycle", "state.json");
-  if (fs.existsSync(statePath)) {
-    try {
-      const stateStat = fs.lstatSync(statePath);
-      if (!stateStat.isFile() || stateStat.isSymbolicLink() || stateStat.nlink !== 1 || stateStat.size > 4096)
-        return undefined;
-      const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as { executablePath?: unknown };
-      if (state.executablePath !== args[1]) return undefined;
-    } catch { return undefined; }
-  }
-  return { programArguments: args, workingDirectory: installed.workingDirectory };
+  try {
+    const stateStat = fs.lstatSync(statePath);
+    if (!stateStat.isFile() || stateStat.isSymbolicLink() || stateStat.nlink !== 1 || stateStat.size > 4096)
+      return undefined;
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+      schemaVersion?: unknown; version?: unknown; executablePath?: unknown;
+    };
+    if (state.schemaVersion !== 1 || typeof state.version !== "string" ||
+        typeof state.executablePath !== "string" || !path.isAbsolute(state.executablePath))
+      return undefined;
+    const versions = path.join(collectorHome(), "lifecycle", "versions");
+    const relative = path.relative(versions, state.executablePath);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+    const script = fs.lstatSync(state.executablePath);
+    if (!script.isFile() || script.isSymbolicLink() || script.nlink !== 1) return undefined;
+    return { programArguments: [process.execPath, state.executablePath, "start"],
+      workingDirectory: path.dirname(state.executablePath) };
+  } catch { return undefined; }
 }
 
 function preflightJoinSetup(machineArgument?: string, replaceLaunchAgent = false,
@@ -1047,9 +1047,13 @@ async function finishJoinedCollectorSetupCore(
   if (manifest.ok && installPreview.receipt.wouldChange) {
     const unload = await executeLaunchAgentUnload(config.port, joinLaunchAgentMutationAuthority());
     if (!unload.unloaded) throw new Error(`Collector restart was not proven safe (${unload.reason ?? unload.status}).`);
+    const afterUnload = inspectLaunchAgentManifest();
+    if (!afterUnload.ok || afterUnload.manifestDigest !== plan.manifestDigest)
+      throw new Error("The LaunchAgent changed during unload; refusing to replace owner edits.");
   }
   const installed = installLaunchAgent({
     ...installOptions, commitOperationId: obligation.operationId,
+    ...(plan.manifestDigest ? { expectedCurrentDigest: plan.manifestDigest } : {}),
     mutationAuthority: joinLaunchAgentMutationAuthority(),
   });
   const visible = inspectLaunchAgentManifest();
@@ -1159,6 +1163,29 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
     if (!stopped.unloaded)
       throw new Error(`Could not stop the collector safely for join recovery (${stopped.reason ?? stopped.status}).`);
   };
+  const beforeRecovery = inspectLaunchAgentManifest();
+  const ownerEdited = beforeRecovery.ok && obligation.priorManifestDigest !== null &&
+    beforeRecovery.manifestDigest !== obligation.priorManifestDigest &&
+    beforeRecovery.manifestDigest !== obligation.replacementManifestDigest;
+  if (ownerEdited) {
+    // Keep the owner's plist. Roll back the joined roots and their seals while
+    // stopped, then restart that very plist; a failed bootstrap leaves the
+    // obligation in place for the next join retry.
+    await stopForRecovery();
+    const ownerManifest = inspectLaunchAgentManifest();
+    if (!ownerManifest.ok) throw new Error("The owner-edited LaunchAgent cannot be read for restart.");
+    restoreJoinConfigBytes(obligation, journal?.afterConfigSha256 ?? null);
+    if (journal) {
+      const rolledBack = withJoinRootJournal(ledgerPath, (database) => {
+        rollbackJoinedRootJournal(database, journal, true);
+        return true;
+      });
+      if (!rolledBack) throw new Error("The joined root seals could not be rolled back.");
+    }
+    await restorePriorJoinedCollector(obligation.port, ownerManifest);
+    clearJoinRestartObligation(home);
+    return true;
+  }
   if (journal?.state === "pending") {
     const currentConfigDigest = createHash("sha256")
       .update(fs.readFileSync(obligation.configPath)).digest("hex");
@@ -6396,6 +6423,12 @@ async function main() {
             return;
           }
           failure = { step, error: `unload_not_proven:${unload.reason ?? unload.status}` };
+        }
+        if (unload.unloaded && flag("--join-setup-child")) {
+          const afterUnload = inspectLaunchAgentManifest();
+          if (!afterUnload.ok || afterUnload.manifestDigest !== manifest.manifestDigest)
+            failure = { step: "launch_agent_owner_edit",
+              error: "The LaunchAgent changed during unload; refusing to record roots over owner edits." };
         }
       } catch (error) {
         restart = { attempted: true, skipped: false, unloadThrew: true };

@@ -56,15 +56,22 @@ export function writeJoinRestartObligation(home: string, input: Omit<JoinRestart
     createdAt: new Date().toISOString() };
   const file = joinRestartObligationPath(home);
   if (pathExistsNoFollow(file)) throw new Error("A previous collector restart obligation remains unresolved.");
-  const prepared = `${file}.prepared-${randomUUID()}`;
+  // The operation ID also identifies our temporary link after a crash. A
+  // second writer can publish between the initial check and this commit.
+  const prepared = `${file}.prepared-${obligation.operationId}`;
   const descriptor = fs.openSync(prepared, "wx", 0o600);
   try {
     try {
       fs.writeFileSync(descriptor, `${JSON.stringify(obligation)}\n`);
       fs.fsyncSync(descriptor);
     } finally { fs.closeSync(descriptor); }
-    if (pathExistsNoFollow(file)) throw new Error("A previous collector restart obligation remains unresolved.");
-    fs.renameSync(prepared, file);
+    try { fs.linkSync(prepared, file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST")
+        throw new Error("A previous collector restart obligation remains unresolved.");
+      throw error;
+    }
+    fs.unlinkSync(prepared);
     fsyncDirectory(home);
   } finally { fs.rmSync(prepared, { force: true }); }
   return obligation;
@@ -78,13 +85,13 @@ export function readJoinRestartObligation(home: string): JoinRestartObligation |
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.nlink !== 1 && stat.nlink !== 2) ||
       (stat.mode & 0o777) !== 0o600 || stat.size > MAX_OBLIGATION_BYTES)
     throw new Error("Join restart obligation is not an owned private file.");
   const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const bound = fs.fstatSync(descriptor);
-    if (bound.dev !== stat.dev || bound.ino !== stat.ino || bound.nlink !== 1)
+    if (bound.dev !== stat.dev || bound.ino !== stat.ino || bound.nlink !== stat.nlink)
       throw new Error("Join restart obligation changed during inspection.");
     const value = JSON.parse(fs.readFileSync(descriptor, "utf8")) as Partial<JoinRestartObligation>;
     if (value.schema !== OBLIGATION_SCHEMA || typeof value.operationId !== "string" ||
@@ -104,6 +111,17 @@ export function readJoinRestartObligation(home: string): JoinRestartObligation |
         (value.priorContent !== null && `sha256:${sha256(value.priorContent!)}` !== value.priorManifestDigest))
       throw new Error("Join restart obligation is invalid.");
     collectorConfigSchema.parse(JSON.parse(value.configBeforeRoots));
+    if (stat.nlink === 2) {
+      // A crash after the exclusive link leaves exactly our prepared name.
+      // Never remove any other extra hard link: it may be the owner's.
+      const prepared = `${file}.prepared-${value.operationId}`;
+      const sibling = fs.lstatSync(prepared);
+      if (!sibling.isFile() || sibling.dev !== stat.dev || sibling.ino !== stat.ino ||
+          sibling.nlink !== 2)
+        throw new Error("Join restart obligation has an unowned hard link.");
+      fs.unlinkSync(prepared);
+      fsyncDirectory(home);
+    }
     return { ...value, priorOwnedTemplateIdentityContent:
       value.priorOwnedTemplateIdentityContent ?? null } as JoinRestartObligation;
   } finally { fs.closeSync(descriptor); }
@@ -192,8 +210,9 @@ export function clearJoinedRootJournal(database: Database.Database, operationId:
   database.prepare(`delete from ${ROOT_JOURNAL_TABLE} where operation_id = ?`).run(operationId);
 }
 
-export function rollbackJoinedRootJournal(database: Database.Database, journal: JoinRootJournal) {
-  if (journal.state !== "pending") return;
+export function rollbackJoinedRootJournal(database: Database.Database, journal: JoinRootJournal,
+  includeCommitted = false) {
+  if (journal.state !== "pending" && !includeCommitted) return;
   database.transaction(() => {
     for (const entry of journal.seals) {
       const result = unsealCaptureBaselineGenerations(database, entry.source, entry.runId,
