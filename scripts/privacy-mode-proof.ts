@@ -36,6 +36,7 @@ import {
 import { collectSessionSnapshots } from "../packages/collector-cli/src/session-sync";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import {
+  isCollisionSafeDeliveryId,
   runAttributionRepair,
   runWorkspaceHistoryUpload,
 } from "../packages/collector-cli/src/upload-history";
@@ -1131,6 +1132,9 @@ async function main() {
       recycledDeliveries[0]?.generation === oldGeneration &&
       recycledDeliveries[0]?.state === "pending" &&
       recycledReceipts.length === 1 &&
+      recycledReceipts[0]?.deliveryId !== recycledId &&
+      isCollisionSafeDeliveryId(recycledId, recycledReceipts[0]!.deliveryId,
+        recycledAt, newGeneration) &&
       recycledReceipts[0]?.generation === newGeneration &&
       recycledReceipts[0]?.reason === "remote_acknowledged" &&
       recycledDashboardFacts === 1 &&
@@ -1145,8 +1149,21 @@ async function main() {
       wireCalls: recycledBodies.length,
       reopenWireCalls: recycledReopenBodies.length,
       receipt: recycledReceipt?.reason ?? null,
-      deliveries: recycledDeliveries,
-      receipts: recycledReceipts,
+      // The raw trigger assigns fresh UUID generations. Report their exact
+      // relationships without placing run-specific UUIDs into the committed
+      // system-E2E support artifact digest.
+      deliveries: recycledDeliveries.map((row) => ({
+        deliveryId: row.deliveryId === recycledId ? "original" : "alternate",
+        generation: row.generation === oldGeneration ? "old" :
+          row.generation === newGeneration ? "new" : "unmatched",
+        state: row.state,
+      })),
+      receipts: recycledReceipts.map((row) => ({
+        deliveryId: row.deliveryId === recycledId ? "original" : "alternate",
+        generation: row.generation === oldGeneration ? "old" :
+          row.generation === newGeneration ? "new" : "unmatched",
+        reason: row.reason,
+      })),
       rawUploadedAt: recycledRaw.uploadedAt,
       rawDisposition: recycledRaw.disposition,
       uploadCount: recycledUpload.uploadedEvents,
