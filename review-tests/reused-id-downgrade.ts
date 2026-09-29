@@ -57,10 +57,15 @@ try {
   try {
     assert.equal(downgraded.prune(30, { now }).events, 1);
     assert.equal(exists(downgraded), false);
-    const receipt = downgraded.database.prepare(`select raw_generation as g
-      from raw_retention_receipts where event_id=?`).get(id) as { g: string };
-    assert.notEqual(receipt.g, newGeneration,
-      "0.7.44 reused the first incarnation's expiry receipt");
+    const receipts = downgraded.database.prepare(`select raw_generation as g
+      from raw_retention_receipts where event_id=? order by rowid`).all(id) as
+      Array<{ g: string }>;
+    assert.equal(receipts.length, 2,
+      "0.7.44 must insert a separate expiry for the second incarnation");
+    assert.notEqual(receipts[0]?.g, newGeneration,
+      "the first incarnation's expiry must remain intact");
+    assert.equal(receipts[1]?.g, newGeneration,
+      "the second incarnation must own an exact expiry receipt");
   } finally { downgraded.close(); }
 
   const reupgraded = new LocalEventBuffer(ledger, {
