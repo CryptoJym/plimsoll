@@ -239,6 +239,22 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r3-tailer-sighting-first
 
+      - name: Prove a pre-insert crash holds the rootless hook until replay (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-first-sighting-before-insert
+
+      - name: Prove an uncommitted sighting cannot stamp an early hook (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-first-sighting-uncommitted
+
+      - name: Prove legacy prune and interrupted promotion preserve the veto (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-legacy-promotion
+
+      - name: Prove pending hooks are held and replay timeout stays unbound (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-replay-barrier
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability

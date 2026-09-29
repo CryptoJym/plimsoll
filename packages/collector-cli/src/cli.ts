@@ -74,6 +74,7 @@ import {
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
+import { startClaudeReplayBarrier } from "./claude-replay-barrier";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
@@ -2735,6 +2736,9 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    const claudeReplayBarrier=startClaudeReplayBarrier(buffer,config.captureRoots??[]);
+    void claudeReplayBarrier.done.then(receipt=>
+      console.log(JSON.stringify({status:"claude_replay_barrier",...receipt})));
     const pairingStatus = codexUsagePairingStatus(buffer.database);
     if (!pairingStatus.enabled) {
       console.warn(JSON.stringify({ warning: "codex_usage_pairing_disabled", reason: pairingStatus.reason,

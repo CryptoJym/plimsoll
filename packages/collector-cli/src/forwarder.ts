@@ -7,7 +7,7 @@ import {
 } from "../../shared/src/index";
 import { sealOutboundEvent } from "./outbound-envelope";
 import { attachRepoContextSidecar, extractRepoContextCwd } from "./repo-context";
-import { claudeBindingForUnrootedEvent, currentDispatchBindingSnapshot,
+import { claudeBindingForUnrootedEvent, countClaudeReplayTimeout, currentDispatchBindingSnapshot,
   dispatchBindingMetadata, durableClaudeRootSessionSightings,
   type DispatchBindingSnapshot } from "./capture-root-inventory";
 
@@ -49,9 +49,13 @@ export function normalizeForwardedHook(payload: unknown, options: ForwardedHookO
     fallbackEventId: options.fallbackEventId,
   });
   if (options.source === "claude_code" && normalized.event.sessionId) {
-    const binding = claudeBindingForUnrootedEvent(normalized.event.sessionId,
-      normalized.event.observedAt,options.dispatchSnapshot??currentDispatchBindingSnapshot(),
-      options.buffer ? durableClaudeRootSessionSightings(options.buffer.database,normalized.event.sessionId) : undefined);
+    const replay=options.buffer?.claudeReplayBarrierState();
+    if(replay==="pending") options.buffer!.deferClaudeHookUntilReplay(normalized.event.id);
+    if(replay==="timed_out") countClaudeReplayTimeout();
+    const binding = replay==="pending"||replay==="timed_out" ? null
+      : claudeBindingForUnrootedEvent(normalized.event.sessionId,
+        normalized.event.observedAt,options.dispatchSnapshot??currentDispatchBindingSnapshot(),
+        options.buffer ? durableClaudeRootSessionSightings(options.buffer.database,normalized.event.sessionId) : undefined);
     if (binding) normalized.event.metadata = {
       ...normalized.event.metadata, ...dispatchBindingMetadata(binding),
     };

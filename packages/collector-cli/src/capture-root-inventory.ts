@@ -270,9 +270,13 @@ export function observeClaudeRootSession(root: CaptureRoot,sessionId: string) {
 export function claudeSessionRootSightings(sessionId: string): ReadonlySet<string> {
   return seenClaudeSessionRoots.get(sessionId)??new Set<string>();
 }
-const claudeDispatchSkips={ conflictingBindings:0,otherRootSeen:0,ambiguousRoot:0 };
+const claudeDispatchSkips={ conflictingBindings:0,otherRootSeen:0,ambiguousRoot:0,
+  replayTimeout:0 };
 export function claudeDispatchSkipStatus() {
   return { ...claudeDispatchSkips,total:Object.values(claudeDispatchSkips).reduce((a,b)=>a+b,0) };
+}
+export function countClaudeReplayTimeout(count=1) {
+  claudeDispatchSkips.replayTimeout+=count;
 }
 /** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
@@ -398,6 +402,57 @@ function ensureRootObservationSchema(database: import("better-sqlite3").Database
   // A rolled-back transaction must not leave a cached schema assertion.
   if(!database.inTransaction)
     initializedObservationDatabases.add(database);
+}
+/** Page the pre-sighting observation ledger before retention can erase its raw
+ * session ID. The cursor and inserts commit together, so an interrupted page
+ * is simply retried. New observations written by an older binary have larger
+ * rowids and are visited on the next pass. */
+export function promoteLegacyClaudeRootSightings(database: import("better-sqlite3").Database,
+  maxRows = 128) {
+  ensureRootObservationSchema(database);
+  const limit=Math.max(1,Math.min(Math.trunc(maxRows),1024));
+  return database.transaction(() => {
+    const key="claude_legacy_sighting_promotion_v1";
+    const state=database.prepare("select value from maintenance_state where key=?").get(key) as
+      {value:string}|undefined;
+    const cursor=state ? Number(state.value) : 0;
+    if(!Number.isSafeInteger(cursor)||cursor<0)
+      throw new Error("claude_legacy_sighting_cursor_invalid");
+    const rows=database.prepare(`select seen.rowid as rowid,seen.root_digest as rootDigest,
+        seen.observed_at as observedAt,raw.session_id as sessionId
+      from capture_root_observations seen
+      left join buffered_events raw on raw.id=seen.event_id and raw.source='claude_code'
+      where seen.rowid>? order by seen.rowid limit ?`).all(cursor,limit) as Array<{
+        rowid:number;rootDigest:string;observedAt:string;sessionId:string|null;
+      }>;
+    if(!rows.length) return {visited:0,promoted:0,complete:true};
+    const insert=database.prepare(`insert into capture_root_session_sightings
+      (source,session_id,root_digest,first_seen_at) values('claude_code',?,?,?)
+      on conflict do nothing`);
+    let promoted=0;
+    for(const row of rows) if(row.sessionId)
+      promoted+=insert.run(row.sessionId,row.rootDigest,row.observedAt).changes;
+    const next=rows.at(-1)?.rowid??cursor;
+    database.prepare(`insert into maintenance_state(key,value,updated_at) values(?,?,?)
+      on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at`)
+      .run(key,String(next),new Date().toISOString());
+    if(promoted) sessionSightingCaches.delete(database);
+    return { visited:rows.length,promoted,complete:rows.length<limit };
+  }).immediate();
+}
+
+/** The final guard belongs in the raw deletion transaction: an older writer
+ * may append an observation between the migration page and the prune pass. */
+export function promoteClaudeRootSightingsForRaw(database: import("better-sqlite3").Database,
+  eventId: string) {
+  ensureRootObservationSchema(database);
+  const changed=database.prepare(`insert into capture_root_session_sightings
+      (source,session_id,root_digest,first_seen_at)
+    select 'claude_code',raw.session_id,seen.root_digest,seen.observed_at
+    from buffered_events raw join capture_root_observations seen on seen.event_id=raw.id
+    where raw.id=? and raw.source='claude_code' and raw.session_id is not null
+    on conflict do nothing`).run(eventId).changes;
+  if(changed) sessionSightingCaches.delete(database);
 }
 /** Session-to-root evidence is durable even after the ordinary raw row expires. */
 export function durableClaudeRootSessionSightings(database: import("better-sqlite3").Database,
