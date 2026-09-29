@@ -76,6 +76,9 @@ jobs:
           pnpm proof:retention-reused-id-privacy-collision
           pnpm proof:retention-reused-id-privacy-rowid
           pnpm proof:retention-repeated-reuse-property
+          pnpm proof:retention-stale-outbox-link
+          pnpm proof:retention-restamp-lineage
+          pnpm proof:retention-v2-trigger-upgrade
           pnpm proof:retention-lease-lineage-aba
           pnpm proof:retention-receipt-migration-crash
           pnpm proof:retention-0739-privacy

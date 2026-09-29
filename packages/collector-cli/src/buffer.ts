@@ -847,11 +847,19 @@ export class LocalEventBuffer {
           updated_at = excluded.updated_at;
       end;
 
-      -- Repo enrichment may discover linkage after capture. The delivery
-      -- copy accepts fill-only hashes until its first seal; retries never
-      -- change the bytes already attempted.
+    `);
+    // Replace the installed rowid-only trigger atomically on upgrade. Repo
+    // enrichment may fill an unsealed copy only for this exact raw incarnation.
+    const linkageTriggers = this.db.prepare(`select name from sqlite_master
+      where type='trigger' and name in ('trg_events_outbox_linkage_update',
+        'trg_events_outbox_linkage_update_v2', 'trg_events_outbox_linkage_update_v3')`)
+      .all() as Array<{ name: string }>;
+    if (linkageTriggers.length !== 1 ||
+        linkageTriggers[0].name !== "trg_events_outbox_linkage_update_v3") {
+      this.db.transaction(() => this.db.exec(`
       drop trigger if exists trg_events_outbox_linkage_update;
-      create trigger if not exists trg_events_outbox_linkage_update_v2
+      drop trigger if exists trg_events_outbox_linkage_update_v2;
+      create trigger if not exists trg_events_outbox_linkage_update_v3
       after update of repo_hash, branch_hash on buffered_events
       when (
         length(trim(new.repo_hash)) = 71 and
@@ -877,10 +885,13 @@ export class LocalEventBuffer {
               lower(substr(trim(new.branch_hash), 8)) not glob '*[^0-9a-f]*'
             then lower(trim(new.branch_hash)) end),
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        where raw_rowid = new.rowid
+        where raw_rowid = new.rowid and raw_id = new.id
+          and raw_created_at = new.created_at
+          and raw_generation is new.privacy_generation
           and sealed_envelope_json is null and attempt_count = 0;
       end;
-    `);
+      `)).immediate();
+    }
     markOpenStep("ledger.raw_indexes_and_triggers");
     // Empty on first upgrade; maintenance backfills older rows in bounded batches.
     ensureSessionContextIndexSchema(this.db);
