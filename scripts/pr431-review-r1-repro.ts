@@ -814,6 +814,16 @@ const cases: Record<string, () => Promise<void>> = {
   split: splitCodexSession, split_claude: splitClaudeSession,
   overlap_codex: overlappingCodexCopyAcrossRoots,
   overlap_claude: overlappingClaudeCopyAcrossRoots,
+  overlap_codex_all: async () => {
+    await overlappingCodexCopyAcrossRoots();
+    await overlappingCodexCopyAcrossRoots(true);
+    await mismatchedCopiedPrefix("codex");
+  },
+  overlap_claude_all: async () => {
+    await overlappingClaudeCopyAcrossRoots();
+    await overlappingClaudeCopyAcrossRoots(true);
+    await mismatchedCopiedPrefix("claude_code");
+  },
   overlap_codex_reverse: () => overlappingCodexCopyAcrossRoots(true),
   overlap_claude_reverse: () => overlappingClaudeCopyAcrossRoots(true),
   overlap_codex_mismatch: () => mismatchedCopiedPrefix("codex"),
