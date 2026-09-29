@@ -169,6 +169,7 @@
     "proof:pr426-r10-new-session-restart": "tsx scripts/review-r10-new-path-restart.ts restart",
     "proof:pr426-r10-untimestamped-new-path": "tsx scripts/review-r10-new-path-restart.ts untimestamped",
     "proof:pr426-r10-rename-delay-report": "tsx scripts/review-r6-presample-window.ts rename_after",
+    "proof:pr426-r10-epoch-fixture": "tsx scripts/fresh-ledger-epoch-proof.ts",
     "proof:dispatch-binding": "tsx scripts/run-proof.ts scripts/dispatch-binding-proof.ts",
     "proof:dispatch-bind-linkability": "tsx scripts/run-proof.ts scripts/dispatch-bind-linkability-proof.ts",
     "proof:dispatch-pairing-integration": "tsx scripts/run-proof.ts scripts/dispatch-pairing-integration-proof.ts",
