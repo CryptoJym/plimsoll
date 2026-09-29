@@ -44,6 +44,34 @@ try {
     cached: cached.states.heldForUpload, cachedExact: cached.lastPass.heldForUploadExact }));
   assert.equal(cached.states.heldForUpload, exact,
     "privacy generation assignment must invalidate the exact held-count cache");
+  const secondId = "00000000-0000-4000-8000-000000004178";
+  db.prepare(`insert into buffered_events
+    (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+     workspace_id,device_id)
+    values (?,'codex','assistant_response','metadata',?,'{}',?,?,?)`)
+    .run(secondId, oldAt, oldAt, "generation-count", "generation-device");
+  const second = db.prepare(`select rowid as rowid,privacy_generation as generation
+    from buffered_events where id=?`).get(secondId) as { rowid: number; generation: string };
+  db.prepare(`insert into upload_receipts
+    (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+    values (?,'dead','local_schema_invalid','local',0,?,?)`)
+    .run(secondId, oldAt, now.toISOString());
+  assert.equal(buffer.retentionProgressStatus(30, now).states.heldForUpload, 2);
+  const lineageRevisionBefore = (db.prepare("select revision as n from retention_hold_revision")
+    .get() as { n: number }).n;
+  db.prepare(`update upload_receipts set raw_rowid=?,raw_id=?,
+    raw_created_at=?,raw_generation=? where delivery_id=?`)
+    .run(second.rowid, secondId, oldAt, second.generation, secondId);
+  const lineageRevisionAfter = (db.prepare("select revision as n from retention_hold_revision")
+    .get() as { n: number }).n;
+  const lineageExact = buffer.retentionStatus(30, now).states.heldForUpload;
+  const lineageCached = buffer.retentionProgressStatus(30, now);
+  console.log(JSON.stringify({ lineageRevisionBefore, lineageRevisionAfter,
+    lineageExact, lineageCached: lineageCached.states.heldForUpload }));
+  assert.ok(lineageRevisionAfter > lineageRevisionBefore,
+    "binding a receipt must advance the durable held-count revision");
+  assert.equal(lineageCached.states.heldForUpload, lineageExact,
+    "receipt lineage binding must invalidate the exact held-count cache");
 } finally {
   buffer.close();
   fs.rmSync(root, { recursive: true, force: true });

@@ -38,6 +38,10 @@ try {
     enqueued: enqueued.enqueued, heldBefore: before, pass, rawPresent, outbox }));
   assert.equal(rawPresent, false,
     "terminally local-only event-detail raw should expire when delivery is disabled");
+  assert.equal(outbox, 0, "linked local-only delivery retires before raw expiry");
+  assert.equal((buffer.database.prepare(`select reason from upload_receipts where delivery_id=?`)
+    .get(id) as { reason: string }).reason, "local_schema_invalid");
+  assert.equal(buffer.retentionStatus(30, now).states.heldForUpload, 0);
 } finally {
   buffer.close();
   fs.rmSync(root, { recursive: true, force: true });

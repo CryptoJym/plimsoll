@@ -607,9 +607,10 @@ export class LocalEventBuffer {
       after delete on buffered_events begin
         update retention_hold_revision set revision=revision+1 where singleton=1;
       end;
-      create trigger if not exists trg_retention_hold_raw_update
+      drop trigger if exists trg_retention_hold_raw_update;
+      create trigger trg_retention_hold_raw_update
       after update of id,created_at,data_mode,uploaded_at,privacy_disposition,
-        usage_duplicate_reason,workspace_id,device_id on buffered_events begin
+        privacy_generation,usage_duplicate_reason,workspace_id,device_id on buffered_events begin
         update retention_hold_revision set revision=revision+1 where singleton=1;
       end;
       create trigger if not exists trg_retention_hold_outbox_insert
@@ -628,8 +629,10 @@ export class LocalEventBuffer {
       after insert on upload_receipts begin
         update retention_hold_revision set revision=revision+1 where singleton=1;
       end;
-      create trigger if not exists trg_retention_hold_receipt_update
-      after update of delivery_id,terminal_state,reason on upload_receipts begin
+      drop trigger if exists trg_retention_hold_receipt_update;
+      create trigger trg_retention_hold_receipt_update
+      after update of delivery_id,terminal_state,reason,raw_rowid,raw_id,
+        raw_created_at,raw_generation on upload_receipts begin
         update retention_hold_revision set revision=revision+1 where singleton=1;
       end;
       create trigger if not exists trg_retention_hold_receipt_delete
@@ -3171,7 +3174,7 @@ export class LocalEventBuffer {
   }
 
   private rawRetentionOutboxEligibleSql() {
-    return `(e.data_mode <> 'evidence' and e.privacy_disposition is null
+    return `(e.data_mode = 'metadata' and e.privacy_disposition is null
       and e.usage_duplicate_reason is null)`;
   }
 

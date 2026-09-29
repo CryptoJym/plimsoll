@@ -69,6 +69,10 @@ jobs:
           pnpm proof:authenticated-ingestion
           pnpm proof:status-http-rollout
           pnpm proof:retention
+          pnpm proof:retention-null-generation-privacy
+          pnpm proof:retention-upgrade-downgrade
+          pnpm proof:retention-event-detail-outbox
+          pnpm proof:retention-generation-count
 
       - name: Prove 0.7.44 dead-receipt lineage scale
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
