@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { readReplacementLedgerMarker, restoreArchivedLedger, switchFreshLedger } from "../packages/collector-cli/src/fresh-ledger-cutover";
-import { acquireLedgerConnectionLock, readLedgerPublication } from "../packages/collector-cli/src/ledger-connection";
+import { acquireLedgerConnectionLock, ledgerConnectionLockPath, openLedgerCopyDatabase, readLedgerPublication } from "../packages/collector-cli/src/ledger-connection";
 
 const workspace = "30000000-0000-4000-8000-000000000003";
 const device = "40000000-0000-4000-8000-000000000004";
@@ -40,7 +40,12 @@ function syncWait(file: string) {
 }
 
 const mode = process.argv[2];
-if (mode === "--open-child" || mode === "--held-child") {
+if (mode === "--copy-child") {
+  const copy = openLedgerCopyDatabase(process.argv[3]!, process.argv[4]!, { fileMustExist: true });
+  fs.writeFileSync(path.join(process.argv[5]!, "copy-ready"), String(process.pid));
+  const timer = setInterval(() => {}, 1_000);
+  process.once("SIGTERM", () => { clearInterval(timer); copy.close(); });
+} else if (mode === "--open-child" || mode === "--held-child") {
   const ledger = process.argv[3]!, fixture = process.argv[4]!;
   let buffer: LocalEventBuffer | undefined;
   try {
@@ -127,7 +132,20 @@ async function main(variant: string) {
       await stop(child); child = null;
       const exclusive = acquireLedgerConnectionLock(ledger, "exclusive");
       exclusive.release();
-      console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true }));
+      const sidecar = ledgerConnectionLockPath(ledger);
+      const lockInode = fs.statSync(sidecar).ino;
+      const copy = `${ledger}.restore-fixture`;
+      fs.copyFileSync(ledger, copy);
+      child = spawn(process.execPath, ["--import", loader, self, "--copy-child", copy, ledger, fixture], { env, stdio: "ignore" });
+      await waitFor(() => fs.existsSync(path.join(fixture, "copy-ready")), "private restore copy is open");
+      assert.throws(() => acquireLedgerConnectionLock(ledger, "exclusive"), /collector connections are still open/);
+      assert.equal(fs.existsSync(ledgerConnectionLockPath(copy)), false, "private copies use the destination lock");
+      await stop(child); child = null;
+      const afterCopy = acquireLedgerConnectionLock(ledger, "exclusive");
+      afterCopy.release();
+      assert.equal(fs.statSync(sidecar).ino, lockInode, "the stable lock is never replaced or deleted");
+      console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true,
+        privateCopyHoldsDestinationLock: true, noTemporaryLock: true, stableLockInode: true }));
     } else if (variant === "old-connection") {
       for (const action of ["statement", "transaction"]) {
         for (const name of ["ready", "go", "result.json"]) fs.rmSync(path.join(fixture, name), { force: true });

@@ -1,6 +1,6 @@
 import { otherProcessesWithFilesOpen, type OpenHandleCheck } from "./ledger-open-handles";
 export { otherProcessesWithFilesOpen, type OpenHandleCheck } from "./ledger-open-handles";
-import { openLedgerDatabase, ledgerConnectionWorkerSource } from "./ledger-connection";
+import { openLedgerDatabase, openLedgerCopyDatabase, ledgerConnectionWorkerSource } from "./ledger-connection";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -855,19 +855,21 @@ export type LedgerIntegrity =
   | { status: "unreadable"; code: string };
 
 /** Checks one ledger file; long checks must keep the operation's lease alive. */
-export type LedgerIntegrityCheck = (file: string, guard?: LifecycleFenceGuard) => Promise<LedgerIntegrity>;
+export type LedgerIntegrityCheck = (file: string, guard?: LifecycleFenceGuard, ledgerPath?: string) => Promise<LedgerIntegrity>;
 
 const MAX_INTEGRITY_COMPLAINTS = 1000;
 /** better-sqlite3 as this module loads it, so a helper process opens files the same way. */
 const BETTER_SQLITE3_ENTRY = createRequire(import.meta.url).resolve("better-sqlite3");
 const INTEGRITY_CHECK_SCRIPT = `
-const [entry, file, limit] = process.argv.slice(1);
+const [entry, file, limit, ledgerPath] = process.argv.slice(1);
 let db = null;
 let result;
 try {
   const Database = require(entry);
   ${ledgerConnectionWorkerSource}
-  db = openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
+  db = ledgerPath
+      ? openLedgerCopyDatabase(file, ledgerPath, { fileMustExist: true, timeout: 0 })
+      : openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
   db.pragma("locking_mode = EXCLUSIVE");
   const rows = db.pragma("integrity_check(" + (Number(limit) + 1) + ")").map((row) => String(Object.values(row)[0]));
   const complaints = rows.flatMap((row) => row.split("\\n")).map((line) => line.trim())
@@ -889,10 +891,12 @@ function integrityComplaints(rows: unknown[]) {
 }
 
 /** The same check in this process: the fallback when no helper process can start. */
-function integrityCheckInProcess(file: string): LedgerIntegrity {
+function integrityCheckInProcess(file: string, ledgerPath?: string): LedgerIntegrity {
   let db: InstanceType<typeof Database> | null = null;
   try {
-    db = openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
+    db = ledgerPath
+      ? openLedgerCopyDatabase(file, ledgerPath, { fileMustExist: true, timeout: 0 })
+      : openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
     db.pragma("locking_mode = EXCLUSIVE");
     const complaints = integrityComplaints(db.pragma(`integrity_check(${MAX_INTEGRITY_COMPLAINTS + 1})`) as unknown[]);
     return complaints.length === 0
@@ -945,16 +949,16 @@ export function whileKeepingLease<T>(guard: LifecycleFenceGuard | undefined, wor
  * helper process so this process stays free to renew the operation's lease
  * while it runs; a lost fence stops the check and the restore.
  */
-export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
+export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard, ledgerPath) => {
   let child: ReturnType<typeof spawn>;
   try {
-    child = spawn(process.execPath, ["-e", INTEGRITY_CHECK_SCRIPT, BETTER_SQLITE3_ENTRY, file, String(MAX_INTEGRITY_COMPLAINTS)], {
+    child = spawn(process.execPath, ["-e", INTEGRITY_CHECK_SCRIPT, BETTER_SQLITE3_ENTRY, file, String(MAX_INTEGRITY_COMPLAINTS), ledgerPath ?? ""], {
       env: { PATH: "/usr/bin:/bin" },
       stdio: ["ignore", "pipe", "ignore"],
     });
   } catch {
     guard?.keepAlive();
-    return Promise.resolve(integrityCheckInProcess(file));
+    return Promise.resolve(integrityCheckInProcess(file, ledgerPath));
   }
   const checked = new Promise<LedgerIntegrity>((resolve) => {
     let stdout = "";
@@ -968,7 +972,7 @@ export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
       settled = true;
       // The helper could not start: check here instead (the caller renews the
       // lease before and verifies the fence after).
-      resolve(integrityCheckInProcess(file));
+      resolve(integrityCheckInProcess(file, ledgerPath));
     });
     child.once("close", (code) => {
       if (settled) return;
@@ -994,8 +998,10 @@ export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
  * the WAL index in heap memory and never creates a -shm file; the lock is
  * held until close.
  */
-function openExclusive(file: string) {
-  const connection = openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
+function openExclusive(file: string, ledgerPath?: string) {
+  const connection = ledgerPath
+    ? openLedgerCopyDatabase(file, ledgerPath, { fileMustExist: true, timeout: 0 })
+    : openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
   try {
     connection.pragma("locking_mode = EXCLUSIVE");
     connection.exec("BEGIN EXCLUSIVE");
@@ -1156,7 +1162,7 @@ async function restoreLedger(
     fs.chmodSync(temporary, 0o600);
     fsyncFile(temporary);
     let integrity: "ok" | "preexisting_damage" = "ok";
-    const copyCheck = await options.integrityCheck(temporary, guard);
+    const copyCheck = await options.integrityCheck(temporary, guard, input.destination);
     if (copyCheck.status !== "ok") {
       // A snapshot of a ledger that was already damaged carries that damage.
       // Restoring it is no worse than keeping the live ledger when the live
@@ -1174,7 +1180,7 @@ async function restoreLedger(
     guard?.keepAlive();
     // Held until the swap is done, so nothing can open the restored ledger
     // under its final name before the replaced one is released.
-    restored = openExclusive(temporary);
+    restored = openExclusive(temporary, input.destination);
     live = lockLiveLedger(input.destination, options.openHandles);
     // The last moment to stop: nothing live has changed yet.
     guard?.assertCurrent();

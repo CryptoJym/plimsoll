@@ -52,10 +52,12 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
   };
 
   const open = (file: string, options: Database.Options = {},
-    intentionalRename = false): Database.Database => {
+    intentionalRename = false, barrierFile = file): Database.Database => {
     if (file === ":memory:" || file === "") return new Sqlite(file, options);
     file = paths.resolve(file);
-    const lease = acquire(file);
+    barrierFile = paths.resolve(barrierFile);
+    const privateCopy = barrierFile !== file;
+    const lease = acquire(barrierFile);
     let database: Database.Database;
     let publication: { state: string; device: number; inode: number;
       freshAttemptPath?: string; marker: { archiveIdentity: string; archivePath: string } } | undefined;
@@ -82,12 +84,12 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
       if (beforeOpen && (beforeOpen.dev !== opened.dev || beforeOpen.ino !== opened.ino)) {
         throw new Error("ledger path changed while opening; collector restart required");
       }
-      if (publication) {
+      if (publication && !privateCopy) {
         if (opened.dev !== publication.device || opened.ino !== publication.inode) {
           throw new Error("replacement_verification_failed: published ledger inode changed");
         }
       }
-      if (publication?.state === "ready") {
+      if (publication?.state === "ready" && !privateCopy) {
         const marker = database.prepare(`select archive_identity as archiveIdentity,
           archive_path as archivePath, post_switch_fence_pending as pending
           from collector_replacement_ledger where singleton=1`).get() as
@@ -112,7 +114,7 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
     } catch (error) {
       database.close();
       lease.release();
-      if (publication?.state === "ready" && !/^SQLITE_(BUSY|LOCKED)/.test(String((error as { code?: string }).code))) {
+      if (!privateCopy && publication?.state === "ready" && !/^SQLITE_(BUSY|LOCKED)/.test(String((error as { code?: string }).code))) {
         throw Object.assign(new Error("replacement_verification_failed: collector start refused", { cause: error }),
           { code: "LEDGER_PUBLICATION_INVALID", ledgerPath: file });
       }
@@ -149,7 +151,8 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
       const statement = prepare(...args);
       for (const method of ["run", "get", "all", "iterate"] as const) {
         const invoke = statement[method].bind(statement);
-        Object.defineProperty(statement, method, { configurable: true, value: (...values: unknown[]) => {
+        // Keep the native API writable for instrumentation that wraps a method.
+        Object.defineProperty(statement, method, { configurable: true, writable: true, value: (...values: unknown[]) => {
           if (!database.inTransaction) current();
           return Reflect.apply(invoke, statement, values);
         } });
@@ -158,7 +161,7 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
     }) as typeof database.prepare;
     for (const method of ["exec", "pragma"] as const) {
       const invoke = database[method].bind(database);
-      Object.defineProperty(database, method, { configurable: true, value: (...args: unknown[]) => {
+      Object.defineProperty(database, method, { configurable: true, writable: true, value: (...args: unknown[]) => {
         current();
         return Reflect.apply(invoke, database, args);
       } });
@@ -184,12 +187,18 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
     }) as typeof database.transaction;
     return database;
   };
-  return { acquire, open, lockPath };
+  // A private restore copy is guarded by the destination's stable lock. Its
+  // integrity is checked by the restore caller; it has no publication witness
+  // of its own and must not leave a temporary lock inode behind.
+  const openCopy = (file: string, ledgerPath: string, options: Database.Options = {}) =>
+    open(file, options, true, ledgerPath);
+  return { acquire, open, openCopy, lockPath };
 }
 
 const runtime = ledgerConnectionRuntime(Database, fs, path, childProcess);
 export const acquireLedgerConnectionLock = runtime.acquire;
 export const openLedgerDatabase = runtime.open;
+export const openLedgerCopyDatabase = runtime.openCopy;
 export const ledgerConnectionLockPath = runtime.lockPath;
 export type LedgerConnectionLock = ReturnType<typeof acquireLedgerConnectionLock>;
 
@@ -227,6 +236,6 @@ export function writeLedgerPublication(lock: LedgerConnectionLock, value: Ledger
 /** esbuild's optional function-name helper must also exist in eval workers. */
 export const ledgerConnectionWorkerSource = `
   const __name = (fn) => fn;
-  const openLedgerDatabase = (${ledgerConnectionRuntime.toString()})(
-    Database, require('node:fs'), require('node:path'), require('node:child_process')).open;
+  const { open: openLedgerDatabase, openCopy: openLedgerCopyDatabase } = (${ledgerConnectionRuntime.toString()})(
+    Database, require('node:fs'), require('node:path'), require('node:child_process'));
 `;
