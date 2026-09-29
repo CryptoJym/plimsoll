@@ -10,6 +10,7 @@ import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import { captureBaselineExcludedReceipt, captureBaselineStatus } from "./capture-baseline";
 import { appendRootObservation, captureRootDigest, captureRootObservationPayloadDigest, inspectCaptureRoots,
+  prepareCaptureRootObservationSchema,
   rootEventMetadata, validateCaptureRoots, type CaptureRoot } from "./capture-root-inventory";
 import { deterministicEventId } from "./normalizer";
 import { ensureJsonlScanState, jsonlScanStateKey, rememberJsonlScanCursor,
@@ -842,6 +843,10 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   }).immediate();
   lockOwned = true;
   ensureImportSchema(db);
+  // appendRootObservation normally initializes this lazily. Inside a writer
+  // transaction that cache deliberately stays cold after rollback, so every
+  // imported row would otherwise repeat CREATE TABLE/INDEX work.
+  prepareCaptureRootObservationSchema(db);
   const first = await scan(db, root, options);
   const fencedSourceDigest = sourceDigest(first.files, options.since);
   let runId = "";

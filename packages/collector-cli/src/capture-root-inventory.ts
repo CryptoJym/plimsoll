@@ -263,6 +263,10 @@ function ensureRootObservationSchema(database: import("better-sqlite3").Database
   if(!database.inTransaction)
     initializedObservationDatabases.add(database);
 }
+/** Prime the schema cache before a history writer slice acquires SQLite's writer. */
+export function prepareCaptureRootObservationSchema(database: import("better-sqlite3").Database) {
+  ensureRootObservationSchema(database);
+}
 export function captureRootObservationPayloadDigest(value: Pick<import("../../shared/src/schemas").AiInteractionEvent,
   "source" | "id" | "sessionId" | "observedAt" | "model" | "inputTokens" | "outputTokens" |
   "cacheReadTokens" | "cacheCreationTokens" | "costUsd">) {

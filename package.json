@@ -144,6 +144,7 @@
     "proof:capture-history-import": "tsx scripts/capture-history-import-proof.ts",
     "proof:capture-history-import-slices": "tsx scripts/capture-history-import-slices-proof.ts",
     "proof:capture-history-import-writer-handoff": "tsx scripts/capture-history-import-writer-handoff-proof.ts",
+    "proof:capture-history-import-writer-schema": "tsx scripts/pr431-review-repro.ts writer_schema",
     "proof:capture-history-import-f1": "tsx scripts/pr431-review-repro.ts f1",
     "proof:capture-history-import-f2": "tsx scripts/pr431-review-repro.ts f2",
     "proof:capture-history-import-f3": "tsx scripts/pr431-review-repro.ts f3",

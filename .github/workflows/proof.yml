@@ -211,6 +211,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-writer-handoff
 
+      - name: Prove history writer has no per-row schema work (eco-6hoxj.163.89 r4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-writer-schema
+
       - name: Prove history prefix verification before publication (F1)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-f1

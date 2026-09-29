@@ -428,6 +428,31 @@ async function changedLaterFileAfterEarlierPublication() {
   } finally { fixture.close(); }
 }
 
+async function noSchemaWorkInsideWriterSlice() {
+  const fixture = setup();
+  try {
+    const root = captureRoot(path.join(fixture.fixture.home, "profile", "sessions"), "codex", fixture.buffer);
+    const file = codexFile(root.directory, SESSION, [0, 1]);
+    seal(fixture.buffer, "codex", [file]);
+    const db = fixture.buffer.database;
+    const originalExec = db.exec;
+    let schemaCallsInsideWriter = 0;
+    try {
+      db.exec = ((sql: string) => {
+        if (db.inTransaction && sql.includes("create table if not exists capture_root_observations"))
+          schemaCallsInsideWriter += 1;
+        return originalExec.call(db, sql);
+      }) as typeof db.exec;
+      const receipt = await applyCaptureHistory(fixture.buffer, root);
+      console.log(JSON.stringify({ case: "no_schema_work_inside_writer_slice",
+        importedRows: receipt.importedRows, schemaCallsInsideWriter }));
+      assert.equal(receipt.importedRows, 1);
+      assert.equal(schemaCallsInsideWriter, 0,
+        "history writer slices must not repeat schema DDL for every row");
+    } finally { db.exec = originalExec; }
+  } finally { fixture.close(); }
+}
+
 async function resumeCursorBinding() {
   const fixture = setup();
   try {
@@ -779,6 +804,7 @@ const cases: Record<string, () => Promise<void>> = {
   tailer_race: tailerDuringImport,
   changed: changedPrefixDuringSecondScan,
   changed_later: changedLaterFileAfterEarlierPublication, cursor: resumeCursorBinding,
+  writer_schema: noSchemaWorkInsideWriterSlice,
   prewrite_crash: prewriteCrashRecovery,
   concurrent: sameProcessConcurrentImport, provenance: outboundProvenance,
   provenance_marker: () => outboundProvenance(true),
