@@ -211,6 +211,38 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-writer-handoff
 
+      - name: Prove history prefix verification before publication (F1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f1
+
+      - name: Prove history parser handoff to tailers (F2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f2
+
+      - name: Prove history cross-root session continuity (F3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f3
+
+      - name: Prove exclusive history import lock (F4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f4
+
+      - name: Prove outbound history provenance marker (F5)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f5
+
+      - name: Prove unique history apply receipts (F6)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f6
+
+      - name: Prove history file swap refusal (F7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f7
+
+      - name: Prove history WAL pause and resumable reader pin
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-wal
+
       - name: Prove dispatch binding and stamped capture paths (eco-6hoxj.165.3)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding

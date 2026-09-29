@@ -144,7 +144,8 @@ async function main() {
     buffer.database.prepare(`update buffered_events set input_tokens=100 where id=?`).run(partialFirst);
     const ownerStart = spawnSync("/bin/ps", ["-p", String(process.pid), "-o", "lstart="],
       { encoding: "utf8", env: { ...process.env, TZ: "UTC", LC_ALL: "C" } }).stdout.trim();
-    buffer.database.prepare(`insert into capture_history_import_lock values (1,'another-root',?,?)`)
+    buffer.database.prepare(`insert into capture_history_import_lock
+      (singleton,root_id,owner_pid,owner_start) values (1,'another-root',?,?)`)
       .run(process.pid, ownerStart);
     const beforeBlockedPrune = (buffer.database.prepare(`select count(*) as n from buffered_events`)
       .get() as { n: number }).n;
@@ -160,7 +161,7 @@ async function main() {
     check("concurrent_import_refuses_dry_run", concurrentPlanRefused);
     let concurrentRefused = false;
     try { await applyCaptureHistory(buffer, captureRoot); }
-    catch (error) { concurrentRefused = String(error).includes("another_import_holds_ledger"); }
+    catch (error) { concurrentRefused = String(error).includes("import_in_progress"); }
     check("concurrent_import_refuses_ledger", concurrentRefused);
     buffer.database.prepare(`update capture_history_import_lock set owner_pid=0 where singleton=1`).run();
     let unknownHolderRefused = false;
@@ -365,6 +366,8 @@ async function main() {
     try { await applyCaptureHistory(buffer, captureRoot, { stopAfterSlices: 1 }); }
     catch (error) { crashed = String(error).includes("capture_history_injected_crash"); }
     check("injected_crash_after_committed_slice", crashed);
+    const committedBeforeRecovery = (buffer.database.prepare(`select count(*) as n from buffered_events
+      where session_id=?`).get(crash) as { n: number }).n;
     buffer.database.prepare(`update capture_history_import_lock set owner_pid=999999
       where singleton=1`).run();
     const originalCrashBytes = fs.readFileSync(crashFile);
@@ -383,7 +386,8 @@ async function main() {
     const recovered = await applyCaptureHistory(buffer, captureRoot);
     const crashRows = (buffer.database.prepare(`select count(*) as n, sum(input_tokens) as input
       from buffered_events where session_id=?`).get(crash) as { n: number; input: number });
-    check("crash_resumes_exactly_once", recovered.importedRows === 12 && crashRows.n === 20 &&
+    check("crash_resumes_exactly_once", recovered.importedRows === 20 - committedBeforeRecovery &&
+      crashRows.n === 20 &&
       crashRows.input === crashAmounts.at(-1)![0]);
     const claimAfter = buffer.delivery.captureClaim([], claimSpool, new Date(claimAt));
     check("import_does_not_move_live_claim_watermark", claimBefore?.through === claimAt &&

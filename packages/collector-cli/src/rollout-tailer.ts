@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
+import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
@@ -1020,6 +1021,13 @@ export class RolloutTailer {
           consumeAutomaticFile(file);
           continue;
         }
+      }
+      if (growthStart !== null && historyGrowthNeedsHandoff(
+        this.buffer.database, rootForFile(this.captureRoots, file), file)) {
+        result.deferredGenerations += 1;
+        consumeAutomaticFile(file);
+        automaticFilesPartial.add(file);
+        continue;
       }
       const cursor = loadJsonlScanCursor<RolloutParserState>(
         this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateRolloutParserState,

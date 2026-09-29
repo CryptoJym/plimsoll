@@ -12,18 +12,33 @@ import { captureBaselineExcludedReceipt, captureBaselineStatus } from "./capture
 import { appendRootObservation, captureRootDigest, captureRootObservationPayloadDigest, inspectCaptureRoots,
   rootEventMetadata, validateCaptureRoots, type CaptureRoot } from "./capture-root-inventory";
 import { deterministicEventId } from "./normalizer";
+import { ensureJsonlScanState, jsonlScanStateKey, rememberJsonlScanCursor,
+  type JsonlTailRead } from "./jsonl-byte-tailer";
+import { rootCursorKey } from "./capture-root-inventory";
 
 const UUID_AT_END = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const READ_BYTES = 128 * 1024;
-const WRITER_INITIAL_ROWS = 8;
-const WRITER_MAX_ROWS = 128;
-const WRITER_TARGET_MS = 100;
+const WRITER_INITIAL_ROWS = 4;
+const WRITER_MAX_ROWS = 64;
+const WRITER_TARGET_MS = 120;
 const WRITER_HARD_MS = 250;
+const WAL_LIMIT_BYTES = 256 * 1024 * 1024;
+const WAL_STALL_MS = 60_000;
 type DB = Database.Database;
-type File = { file: string; limit: number; stamp: string; fencedAt: string; prefixHash?: string };
 type Amounts = { input: number; cacheRead: number; cacheCreation: number; output: number };
-type Candidate = { event: AiInteractionEvent; sourceId: string };
+type CodexState = { sessionId: string; previous: Amounts; index: number; observedBaseline: boolean;
+  reasoningOutput: number; contextOccurrenceIndex: number; model?: string; sessionStartedAt?: string;
+  originator?: string; cliVersion?: string; planType?: string };
+type ClaudeRevision = { sessionId: string; messageId: string; messageKey: string; current: Amounts };
+type File = { file: string; fileKey: string; limit: number; stamp: string; fencedAt: string;
+  prefixHash?: string; savedPrefixHash?: string; baselineDefined?: boolean;
+  initialCodex?: CodexState; finalCodex?: CodexState;
+  initialClaude?: Map<string, Amounts>; finalClaude?: Map<string, ClaudeRevision>;
+  cursor?: { observedSize: number; committedOffset: number; fileIdentity: string;
+    headHash: string | null; headBytes: number; continuityHash: string | null;
+    continuityBytes: number; mtimeMs: number; ctimeMs: number } };
+type Candidate = { event: AiInteractionEvent; sourceId: string; claudeRevision?: ClaudeRevision };
 export type CaptureHistoryPlan = {
   status: "capture_roots_history_plan"; rootId: string; source: CaptureRoot["source"];
   dryRun: true; files: number; sessions: number; skippedLiveSessions: number;
@@ -34,9 +49,12 @@ export type CaptureHistoryApplyReceipt = Omit<CaptureHistoryPlan, "status" | "dr
   status: "capture_roots_history_imported"; importedRows: number; importedTokens: Amounts;
   totalImportedRows: number; maxWriterSliceMs: number; overBudgetSlices: number;
   maxWriterWorkMs: number; maxWriterRowMs: number; writerSliceHistogram: Record<string, number>;
-  writerSlices: number; timeBudgetStops: number; runId: string;
+  writerSlices: number; timeBudgetStops: number; runId: string; attemptId: string;
+  maxWalBytes: number; walPauseMs: number;
 };
-type Options = { since?: string; stopAfterSlices?: number };
+type Options = { since?: string; stopAfterSlices?: number; attemptId?: string;
+  /** Synthetic proof override; the CLI never accepts these controls. */
+  walLimitBytes?: number; walStallMs?: number };
 
 function refusal(reason: string): never { throw new Error(`capture_history_refused:${reason}`); }
 function validIso(value: string) {
@@ -77,14 +95,15 @@ function candidateFiles(db: DB, root: CaptureRoot): File[] {
         if (!entry.isFile()) refusal("root_nonregular_entry");
         if (!entry.name.endsWith(".jsonl") ||
             (root.source === "codex" && !entry.name.startsWith("rollout-"))) continue;
-        const stat = fs.statSync(file, { bigint: true });
+        const stat = fs.lstatSync(file, { bigint: true });
         if (!stat.isFile()) refusal("file_not_regular");
         const receipt = captureBaselineExcludedReceipt(db, root.source, {
           path: file, device: stat.dev, inode: stat.ino, size: stat.size, birthtimeNs: stat.birthtimeNs,
         });
         if (receipt) {
           if (BigInt(receipt.baselineSize) > stat.size) refusal("fenced_prefix_truncated");
-          found.push({ file, limit: receipt.baselineSize, stamp: stamp(stat), fencedAt: receipt.baselinedAt });
+          found.push({ file, fileKey: crypto.createHash("sha256").update(`${root.rootId}\0${file}`).digest("hex"),
+            limit: receipt.baselineSize, stamp: stamp(stat), fencedAt: receipt.baselinedAt });
         } else found.push({ file, stat });
       }
     } finally { handle.closeSync(); }
@@ -100,10 +119,33 @@ function candidateFiles(db: DB, root: CaptureRoot): File[] {
   return fenced.sort((a, b) => a.file.localeCompare(b.file));
 }
 
+function openFencedFile(file: File): number {
+  // The path can be exchanged after directory discovery. O_NOFOLLOW closes
+  // the check/open race; the descriptor and path must still name the fence.
+  const before = fs.lstatSync(file.file, { bigint: true });
+  if (!before.isFile() || stamp(before) !== file.stamp || before.size < BigInt(file.limit))
+    refusal("file_changed_before_read");
+  let fd: number;
+  try { fd = fs.openSync(file.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+  catch (error) {
+    if (["ELOOP", "EMLINK", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? ""))
+      refusal("file_changed_before_read");
+    throw error;
+  }
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const after = fs.lstatSync(file.file, { bigint: true });
+    if (!opened.isFile() || !after.isFile() || stamp(opened) !== file.stamp ||
+        stamp(after) !== file.stamp || opened.size < BigInt(file.limit))
+      refusal("file_changed_before_read");
+    return fd;
+  } catch (error) { fs.closeSync(fd); throw error; }
+}
+
 /** Reads only complete lines inside the exact fenced prefix; source bytes do
  * not enter a receipt or the ledger. */
 function* lines(file: File): Generator<string> {
-  const fd = fs.openSync(file.file, "r");
+  const fd = openFencedFile(file);
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const hash = crypto.createHash("sha256");
   let offset = 0;
@@ -131,18 +173,35 @@ function* lines(file: File): Generator<string> {
       pending = Buffer.from(bytes.subarray(start));
       if (pending.length > MAX_LINE_BYTES) refusal("record_exceeds_byte_budget");
     }
+    if (pending.length) refusal("fenced_partial_record");
     const after = fs.fstatSync(fd, { bigint: true });
-    if (stamp(after) !== file.stamp || after.size < BigInt(file.limit))
+    const currentPath = fs.lstatSync(file.file, { bigint: true });
+    if (!currentPath.isFile() || stamp(currentPath) !== file.stamp ||
+        stamp(after) !== file.stamp || after.size < BigInt(file.limit))
       refusal("file_changed_during_read");
     const digest = hash.digest("hex");
     if (file.prefixHash && file.prefixHash !== digest) refusal("fenced_prefix_changed");
+    if (file.savedPrefixHash && file.savedPrefixHash !== digest)
+      refusal("fenced_history_changed_since_import");
     file.prefixHash = digest;
+    const headBytes = Math.min(512, file.limit);
+    const continuityBytes = Math.min(512, file.limit);
+    const head = Buffer.alloc(headBytes);
+    const continuity = Buffer.alloc(continuityBytes);
+    if (headBytes && fs.readSync(fd, head, 0, headBytes, 0) !== headBytes) refusal("fenced_prefix_short_read");
+    if (continuityBytes && fs.readSync(fd, continuity, 0, continuityBytes,
+      file.limit - continuityBytes) !== continuityBytes) refusal("fenced_prefix_short_read");
+    file.cursor = { observedSize: Number(after.size), committedOffset: file.limit,
+      fileIdentity: stamp(after), headHash: headBytes ? crypto.createHash("sha256").update(head).digest("hex") : null,
+      headBytes, continuityHash: continuityBytes ? crypto.createHash("sha256").update(continuity).digest("hex") : null,
+      continuityBytes, mtimeMs: Number(after.mtimeNs) / 1_000_000,
+      ctimeMs: Number(after.ctimeNs) / 1_000_000 };
   } finally { fs.closeSync(fd); }
 }
 
 function verifyFencedPrefix(file: File) {
   if (!file.prefixHash) refusal("prefix_hash_missing");
-  const fd = fs.openSync(file.file, "r");
+  const fd = openFencedFile(file);
   const hash = crypto.createHash("sha256");
   try {
     const before = fs.fstatSync(fd, { bigint: true });
@@ -184,6 +243,65 @@ function positiveDelta(now: Amounts, prior: Amounts): Amounts {
 function zero(value: Amounts) {
   return value.input === 0 && value.output === 0 && value.cacheRead === 0 && value.cacheCreation === 0;
 }
+const ZERO_AMOUNTS: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
+function initialCodexState(sessionId: string): CodexState {
+  return { sessionId, previous: { ...ZERO_AMOUNTS }, index: -1,
+    observedBaseline: false, reasoningOutput: 0, contextOccurrenceIndex: -1 };
+}
+function decodeCodexState(raw: string, sessionId: string): CodexState {
+  let state: CodexState;
+  try { state = JSON.parse(raw) as CodexState; }
+  catch { refusal("import_counter_state_invalid"); }
+  if (state.sessionId !== sessionId || !Number.isSafeInteger(state.index) || state.index < -1 ||
+      !Number.isSafeInteger(state.contextOccurrenceIndex) || state.contextOccurrenceIndex < -1 ||
+      typeof state.observedBaseline !== "boolean" || !state.previous ||
+      !Object.values(state.previous).every(value => Number.isSafeInteger(value) && value >= 0))
+    refusal("import_counter_state_invalid");
+  return state;
+}
+function loadFileBaseline(db: DB, root: CaptureRoot, file: File) {
+  if (!table(db, "capture_history_file_state")) return;
+  const saved = db.prepare(`select root_id as rootId,source,prefix_hash as prefixHash,
+    baseline_json as baselineJson,handoff_ready as ready
+    from capture_history_file_state where file_key=?`)
+    .get(file.fileKey) as { rootId: string; source: string; prefixHash: string;
+      baselineJson: string; ready: number } | undefined;
+  if (!saved) return;
+  if (saved.rootId !== root.rootId || saved.source !== root.source) refusal("import_file_state_conflict");
+  if (saved.ready !== 1) {
+    const run = db.prepare(`select imported_rows as rows,completed_at as completedAt
+      from capture_history_import_runs where root_id=?`).get(root.rootId) as
+        { rows: number; completedAt: string | null } | undefined;
+    // An attempt that died before its first publication may re-preflight a
+    // changed prefix; no parser handoff or counted row escaped that attempt.
+    if (run?.rows === 0 && run.completedAt === null) return;
+  }
+  let baseline: { codex?: string; claude?: Array<[string, Amounts]> };
+  try { baseline = JSON.parse(saved.baselineJson) as typeof baseline; }
+  catch { refusal("import_file_state_invalid"); }
+  file.savedPrefixHash = saved.prefixHash;
+  file.baselineDefined = true;
+  if (baseline.codex) {
+    const session = path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
+    if (!session) refusal("codex_file_session_missing");
+    file.initialCodex = decodeCodexState(baseline.codex, session);
+  }
+  file.initialClaude = new Map(baseline.claude ?? []);
+}
+function durableCodexState(db: DB, sessionId: string): CodexState | undefined {
+  if (!table(db, "capture_history_session_counters")) return undefined;
+  const row = db.prepare(`select state_json as state from capture_history_session_counters
+    where source='codex' and session_id=?`).get(sessionId) as { state: string } | undefined;
+  return row ? decodeCodexState(row.state, sessionId) : undefined;
+}
+function durableClaudeRevision(db: DB, sessionId: string, messageKey: string): Amounts | undefined {
+  if (!table(db, "transcript_usage_revision_state")) return undefined;
+  const row = db.prepare(`select input_tokens as input,cache_read_tokens as cacheRead,
+    cache_creation_tokens as cacheCreation,output_tokens as output
+    from transcript_usage_revision_state where source='claude_code' and session_id=? and message_key=?`)
+    .get(sessionId, messageKey) as Amounts | undefined;
+  return row;
+}
 function event(root: CaptureRoot, sourceId: string, sessionId: string, observedAt: string,
   model: string | undefined, delta: Amounts, extra: Record<string, unknown> = {},
   unvalidated = false): AiInteractionEvent {
@@ -213,13 +331,15 @@ function event(root: CaptureRoot, sourceId: string, sessionId: string, observedA
   });
 }
 
-function* codexEvents(root: CaptureRoot, file: File): Generator<Candidate> {
+function* codexEvents(root: CaptureRoot, file: File, db: DB,
+  sessions: Map<string, CodexState>, seenHashes: Map<string, Set<string>>): Generator<Candidate> {
   const sessionId = path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
   if (!sessionId) refusal("codex_file_session_missing");
-  let model: string | undefined;
-  let previous: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
-  let observedBaseline = false;
-  let index = -1;
+  const state = structuredClone(file.initialCodex ?? sessions.get(sessionId) ??
+    (file.baselineDefined ? undefined : durableCodexState(db, sessionId)) ?? initialCodexState(sessionId));
+  file.initialCodex ??= structuredClone(state);
+  let tokenObservations = 0;
+  let duplicateRestart = false;
   for (const line of lines(file)) {
     if (!line.includes('"session_meta"') && !line.includes('"turn_context"') &&
         !line.includes('"token_count"')) continue;
@@ -227,35 +347,68 @@ function* codexEvents(root: CaptureRoot, file: File): Generator<Candidate> {
     try { parsed = JSON.parse(line) as Record<string, any>; }
     catch { refusal("codex_relevant_json_invalid"); }
     if (parsed.type === "session_meta") {
+      state.contextOccurrenceIndex += 1;
       const id = parsed.payload?.id;
       if (typeof id !== "string" || id.toLowerCase() !== sessionId) refusal("codex_session_mismatch");
+      if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
+      else if (typeof parsed.payload?.timestamp === "string") state.sessionStartedAt = parsed.payload.timestamp;
+      if (typeof parsed.payload?.originator === "string") state.originator = parsed.payload.originator;
+      if (typeof parsed.payload?.cli_version === "string") state.cliVersion = parsed.payload.cli_version;
     } else if (parsed.type === "turn_context") {
-      if (typeof parsed.payload?.model === "string") model = parsed.payload.model;
+      state.contextOccurrenceIndex += 1;
+      if (typeof parsed.payload?.model === "string") state.model = parsed.payload.model;
     } else if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
-      index += 1;
+      state.index += 1;
       const reported = parsed.payload?.info?.total_token_usage;
       if (!reported) continue;
       const current = totals(reported);
-      const delta = positiveDelta(current, previous);
-      const firstUnknown = !observedBaseline && !zero(current);
-      previous = current;
-      observedBaseline = true;
+      if (tokenObservations === 0 &&
+          (current.input < state.previous.input || current.cacheRead < state.previous.cacheRead ||
+            current.cacheCreation < state.previous.cacheCreation || current.output < state.previous.output)) {
+        // A second physical copy of the same session prefix starts its
+        // counters again. Parse it from zero, but accept that reset only if
+        // its whole fenced digest exactly matches a prior file's digest.
+        duplicateRestart = true;
+        state.previous = { ...ZERO_AMOUNTS };
+        state.index = 0;
+        state.observedBaseline = false;
+        state.reasoningOutput = 0;
+        file.initialCodex = initialCodexState(sessionId);
+      }
+      const delta = positiveDelta(current, state.previous);
+      tokenObservations += 1;
+      const firstUnknown = !state.observedBaseline && !zero(current);
+      state.previous = current;
+      state.observedBaseline = true;
+      state.reasoningOutput = amount(reported.reasoning_output_tokens);
+      if (typeof parsed.payload?.rate_limits?.plan_type === "string")
+        state.planType = parsed.payload.rate_limits.plan_type;
       if (zero(delta)) continue;
-      const id = deterministicEventId(["codex-rollout", sessionId, String(index)]);
+      const id = deterministicEventId(["codex-rollout", sessionId, String(state.index)]);
       const observedAt = parsed.timestamp;
       if (typeof observedAt !== "string") refusal("codex_timestamp_missing");
       const marginal = firstUnknown ? { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 } : delta;
-      yield { sourceId: id, event: event(root, id, sessionId, observedAt, model, marginal,
-        { turnIndex: index, ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
+      yield { sourceId: id, event: event(root, id, sessionId, observedAt, state.model, marginal,
+        { turnIndex: state.index, ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
           sourceCumulativeInput: current.input, sourceCumulativeCachedInput: current.cacheRead,
           sourceCumulativeOutput: current.output } : {}) }, firstUnknown) };
     }
   }
+  if (duplicateRestart && !seenHashes.get(sessionId)?.has(file.prefixHash ?? ""))
+    refusal("counter_regression");
+  file.finalCodex = structuredClone(state);
+  sessions.set(sessionId, structuredClone(state));
+  const hashes = seenHashes.get(sessionId) ?? new Set<string>();
+  hashes.add(file.prefixHash!);
+  seenHashes.set(sessionId, hashes);
 }
 
 function* claudeEvents(root: CaptureRoot, file: File,
-  revisions: Map<string, Map<string, Amounts>>): Generator<Candidate> {
+  revisions: Map<string, Map<string, Amounts>>, db: DB): Generator<Candidate> {
   let sessionId = path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
+  const firstInFile = new Set<string>();
+  file.initialClaude ??= new Map();
+  file.finalClaude = new Map();
   for (const line of lines(file)) {
     if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
     let parsed: Record<string, any>;
@@ -271,10 +424,28 @@ function* claudeEvents(root: CaptureRoot, file: File,
     revisions.set(sessionId, byMessage);
     const messageId = parsed.message?.id;
     if (typeof messageId !== "string" || !messageId) refusal("claude_message_id_missing");
+    const messageKey = crypto.createHash("sha256").update(messageId).digest("hex");
+    const stateKey = `${sessionId}\0${messageKey}`;
+    if (!firstInFile.has(stateKey)) {
+      firstInFile.add(stateKey);
+      if (file.baselineDefined) {
+        const initial = file.initialClaude.get(stateKey);
+        if (initial) byMessage.set(messageId, initial);
+        else byMessage.delete(messageId);
+      } else {
+        const initial = byMessage.get(messageId) ?? durableClaudeRevision(db, sessionId, messageKey);
+        if (initial) {
+          byMessage.set(messageId, initial);
+          file.initialClaude.set(stateKey, initial);
+        }
+      }
+    }
     const current = totals(parsed.message?.usage);
     const prior = byMessage.get(messageId);
     const delta = positiveDelta(current, prior ?? { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 });
     byMessage.set(messageId, current);
+    const revision = { sessionId, messageId, messageKey, current };
+    file.finalClaude.set(stateKey, revision);
     if (zero(delta)) continue;
     const id = prior
       ? deterministicEventId(["claude-transcript-revision", sessionId, messageId,
@@ -282,7 +453,8 @@ function* claudeEvents(root: CaptureRoot, file: File,
       : deterministicEventId(["claude-transcript", sessionId, messageId]);
     if (typeof parsed.timestamp !== "string") refusal("claude_timestamp_missing");
     const model = typeof parsed.message?.model === "string" ? parsed.message.model : undefined;
-    yield { sourceId: id, event: event(root, id, sessionId, parsed.timestamp, model, delta) };
+    yield { sourceId: id, event: event(root, id, sessionId, parsed.timestamp, model, delta),
+      claudeRevision: revision };
   }
 }
 
@@ -301,14 +473,24 @@ function candidateDigest(candidate: Candidate, index: number) {
 }
 async function scan(db: DB, root: CaptureRoot, options: Options,
   onMissing?: (candidate: Candidate, index: number, digest: string) => Promise<void>,
-  expectedFiles?: File[], resume?: ResumePoint): Promise<ScanResult> {
+  expectedFiles?: File[], resume?: ResumePoint,
+  onFileReady?: (file: File) => Promise<void>,
+  onFilePublished?: (file: File) => Promise<void>): Promise<ScanResult> {
   if (options.since && !validIso(options.since)) refusal("since_invalid_iso");
   const files = candidateFiles(db, root);
   if (expectedFiles && (files.length !== expectedFiles.length || files.some((file, index) =>
     file.file !== expectedFiles[index]?.file || file.stamp !== expectedFiles[index]?.stamp ||
     file.limit !== expectedFiles[index]?.limit || file.fencedAt !== expectedFiles[index]?.fencedAt)))
     refusal("source_changed_after_plan");
-  if (expectedFiles) files.forEach((file, index) => { file.prefixHash = expectedFiles[index]!.prefixHash; });
+  if (expectedFiles) files.forEach((file, index) => {
+    const expected = expectedFiles[index]!;
+    file.prefixHash = expected.prefixHash;
+    file.savedPrefixHash = expected.savedPrefixHash;
+    file.baselineDefined = true;
+    file.initialCodex = expected.initialCodex ? structuredClone(expected.initialCodex) : undefined;
+    file.initialClaude = new Map(expected.initialClaude ?? []);
+  });
+  else files.forEach(file => loadFileBaseline(db, root, file));
   // A root observation identifies a pruned tailer event by ID even if the
   // retention receipt itself has no source. Only receipts with neither that
   // durable provenance nor a candidate ID remain globally ambiguous.
@@ -345,6 +527,8 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   const seen = new Map<string, string>();
   const matchedReceipts = new Set<string>();
   const revisions = new Map<string, Map<string, Amounts>>();
+  const codexStates = new Map<string, CodexState>();
+  const codexHashes = new Map<string, Set<string>>();
   let candidateIndex = 0;
   let resumeVerified = !resume?.index;
   const plan: CaptureHistoryPlan = { status: "capture_roots_history_plan", rootId: root.rootId,
@@ -353,7 +537,12 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
     tokens: { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 },
     fencedBytes: files.reduce((sum, file) => sum + file.limit, 0), since: options.since ?? null };
   for (const file of files) {
-    const events = root.source === "codex" ? codexEvents(root, file) : claudeEvents(root, file, revisions);
+    // A generator checks its prefix digest only when it reaches EOF. Keep
+    // candidates outside the ledger until that check has succeeded, so a
+    // changed file cannot expose a partial import to upload or projection.
+    const verifiedCandidates: Array<{ candidate: Candidate; index: number; digest: string }> = [];
+    const events = root.source === "codex" ? codexEvents(root, file, db, codexStates, codexHashes)
+      : claudeEvents(root, file, revisions, db);
     for (const candidate of events) {
       candidateIndex += 1;
       if (resume && candidateIndex === resume.index) {
@@ -408,10 +597,18 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       plan.tokens.cacheCreation += e.cacheCreationTokens ?? 0;
       if (onMissing) {
         if (resume && candidateIndex <= resume.index) refusal("resume_cursor_evidence_lost");
-        await onMissing(candidate, candidateIndex, candidateDigest(candidate, candidateIndex));
+        verifiedCandidates.push({ candidate, index: candidateIndex,
+          digest: candidateDigest(candidate, candidateIndex) });
       }
       if (plan.missingRows % 4096 === 0) await new Promise<void>(resolve => setImmediate(resolve));
     }
+    // The generator has reached EOF and compared all fenced bytes with the
+    // preflight digest. Only this file's verified candidates may be published.
+    if (onFileReady) await onFileReady(file);
+    for (const item of verifiedCandidates) {
+      await onMissing!(item.candidate, item.index, item.digest);
+    }
+    if (onFilePublished) await onFilePublished(file);
   }
   plan.sessions = sessions.size;
   if (!resumeVerified) refusal("resume_cursor_missing");
@@ -468,17 +665,35 @@ function maintenanceIdle(db: DB) {
   catch { /* Fail closed. */ }
   refusal("maintenance_rebuild_active_or_unknown");
 }
-function ensureImportSchema(db: DB) {
+function ensureImportLockSchema(db: DB) {
   db.exec(`create table if not exists capture_history_import_lock (
     singleton integer primary key check(singleton=1), root_id text not null,
-    owner_pid integer not null, owner_start text not null);
-    create table if not exists capture_history_import_runs (
+    owner_pid integer not null, owner_start text not null, owner_attempt_id text);`);
+  const lockColumns = db.pragma("table_info(capture_history_import_lock)") as Array<{ name: string }>;
+  if (!lockColumns.some(column => column.name === "owner_attempt_id"))
+    db.exec("alter table capture_history_import_lock add column owner_attempt_id text");
+}
+function ensureImportSchema(db: DB) {
+  db.exec(`create table if not exists capture_history_import_runs (
     root_id text primary key, root_digest text not null, source_digest text not null, source text not null,
     run_id text not null, imported_rows integer not null default 0,
     input_tokens integer not null default 0, cache_read_tokens integer not null default 0,
     cache_creation_tokens integer not null default 0, output_tokens integer not null default 0,
     started_at text not null, updated_at text not null, completed_at text,
     resume_candidate_index integer not null default 0, resume_candidate_digest text);
+    create table if not exists capture_history_file_state (
+      file_key text primary key,root_id text not null,source text not null,
+      prefix_hash text not null,baseline_json text not null,
+      handoff_ready integer not null default 0 check(handoff_ready in (0,1)));
+    create table if not exists capture_history_session_counters (
+      source text not null,session_id text not null,last_index integer not null,
+      state_json text not null,primary key(source,session_id));
+    create table if not exists transcript_usage_revision_state (
+      source text not null check(source='claude_code'),session_id text not null,
+      message_key text not null,input_tokens integer not null,cache_read_tokens integer not null,
+      cache_creation_tokens integer not null,output_tokens integer not null,
+      repo_context_id text,context_conflict integer not null default 0,
+      updated_at text not null,primary key(source,session_id,message_key));
     create trigger if not exists capture_history_import_block_prune
       before insert on raw_retention_receipts
       when exists (select 1 from capture_history_import_lock where singleton=1)
@@ -490,43 +705,164 @@ function ensureImportSchema(db: DB) {
     db.exec("alter table capture_history_import_runs add column resume_candidate_index integer not null default 0");
   if (!columns.some(column => column.name === "resume_candidate_digest"))
     db.exec("alter table capture_history_import_runs add column resume_candidate_digest text");
+  const fileColumns = db.pragma("table_info(capture_history_file_state)") as Array<{ name: string }>;
+  if (!fileColumns.some(column => column.name === "handoff_ready"))
+    db.exec("alter table capture_history_file_state add column handoff_ready integer not null default 0");
+  const revisionColumns = db.pragma("table_info(transcript_usage_revision_state)") as Array<{ name: string }>;
+  if (!revisionColumns.some(column => column.name === "repo_context_id"))
+    db.exec("alter table transcript_usage_revision_state add column repo_context_id text");
+  if (!revisionColumns.some(column => column.name === "context_conflict"))
+    db.exec("alter table transcript_usage_revision_state add column context_conflict integer not null default 0");
+  if (!table(db, "rollout_scan_state") || !(db.pragma("table_info(rollout_scan_state)") as Array<{ name: string }>)
+    .some(column => column.name === "parser_state_json")) ensureJsonlScanState(db);
+}
+
+function rememberFileBaseline(db: DB, root: CaptureRoot, file: File) {
+  if (!file.prefixHash) refusal("prefix_hash_missing");
+  const baseline = JSON.stringify({
+    ...(file.initialCodex ? { codex: JSON.stringify(file.initialCodex) } : {}),
+    claude: [...(file.initialClaude ?? new Map()).entries()],
+  });
+  db.prepare(`insert or ignore into capture_history_file_state
+    (file_key,root_id,source,prefix_hash,baseline_json,handoff_ready) values (?,?,?,?,?,0)`)
+    .run(file.fileKey, root.rootId, root.source, file.prefixHash, baseline);
+  const saved = db.prepare(`select prefix_hash as hash from capture_history_file_state where file_key=?`)
+    .get(file.fileKey) as { hash: string };
+  if (saved.hash !== file.prefixHash) refusal("fenced_history_changed_since_import");
+}
+
+function rememberClaudeRevision(db: DB, revision: ClaudeRevision) {
+  const { sessionId, messageKey, current } = revision;
+  db.prepare(`insert into transcript_usage_revision_state
+    (source,session_id,message_key,input_tokens,cache_read_tokens,cache_creation_tokens,
+      output_tokens,repo_context_id,context_conflict,updated_at)
+    values ('claude_code',?,?,?,?,?,?,null,0,?)
+    on conflict(source,session_id,message_key) do update set
+      input_tokens=excluded.input_tokens,cache_read_tokens=excluded.cache_read_tokens,
+      cache_creation_tokens=excluded.cache_creation_tokens,output_tokens=excluded.output_tokens,
+      updated_at=excluded.updated_at
+    where excluded.input_tokens>=transcript_usage_revision_state.input_tokens
+      and excluded.cache_read_tokens>=transcript_usage_revision_state.cache_read_tokens
+      and excluded.cache_creation_tokens>=transcript_usage_revision_state.cache_creation_tokens
+      and excluded.output_tokens>=transcript_usage_revision_state.output_tokens`)
+    .run(sessionId, messageKey, current.input, current.cacheRead,
+      current.cacheCreation, current.output, new Date().toISOString());
+}
+
+function rememberFileCursor(db: DB, root: CaptureRoot, file: File) {
+  if (!file.cursor) refusal("file_cursor_missing");
+  const key = rootCursorKey([root], file.file);
+  const existing = db.prepare(`select committed_offset as offset from rollout_scan_state where file=?`)
+    .get(jsonlScanStateKey(key)) as { offset: number | null } | undefined;
+  if (existing?.offset !== null && existing?.offset !== undefined && existing.offset > file.limit) return;
+  const state = root.source === "codex" ? (() => {
+    const final = file.finalCodex;
+    if (!final) refusal("codex_parser_state_missing");
+    return { parserKind: "codex-rollout-v2", checkpointVersion: 2,
+      conversationId: final.sessionId, previous: { input: final.previous.input,
+        cachedInput: final.previous.cacheRead, output: final.previous.output,
+        reasoningOutput: final.reasoningOutput }, tokenCountIndex: final.index,
+      contextOccurrenceIndex: final.contextOccurrenceIndex,
+      ...(final.model ? { model: final.model } : {}),
+      ...(final.sessionStartedAt ? { sessionStartedAt: final.sessionStartedAt } : {}),
+      ...(final.originator ? { originator: final.originator } : {}),
+      ...(final.cliVersion ? { cliVersion: final.cliVersion } : {}),
+      ...(final.planType ? { planType: final.planType } : {}) };
+  })() : (() => {
+    const revisions = [...(file.finalClaude?.values() ?? [])];
+    const session = revisions[0]?.sessionId ??
+      path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
+    return { parserKind: "claude-transcript-v3", checkpointVersion: 3,
+      ...(session ? { sessionId: session } : {}),
+      usageRevisions: revisions.slice(-64).map(revision => ({
+        messageId: revision.messageId, input: revision.current.input,
+        cacheRead: revision.current.cacheRead, cacheCreation: revision.current.cacheCreation,
+        output: revision.current.output,
+      })) };
+  })();
+  const c = file.cursor;
+  const read = { ...c, deferredBytes: c.observedSize - c.committedOffset,
+    workRemaining: c.observedSize > c.committedOffset, unresolvedRecord: null } as JsonlTailRead;
+  rememberJsonlScanCursor(db, key, state.parserKind, state.checkpointVersion, read, state);
 }
 const active = new Set<string>();
 export async function applyCaptureHistory(buffer: LocalEventBuffer, root: CaptureRoot,
   options: Options = {}): Promise<CaptureHistoryApplyReceipt> {
-  if (active.size) refusal("another_import_in_process");
+  if (active.size) refusal("import_in_progress");
+  active.add(root.rootId);
+  const attemptId = options.attemptId ?? crypto.randomUUID();
   const db = buffer.database;
-  const first = await scan(db, root, options); // all refusal evidence before writing
-  const fencedSourceDigest = sourceDigest(first.files, options.since);
+  let lockOwned = false;
+  try {
   maintenanceIdle(db);
-  ensureImportSchema(db);
+  ensureImportLockSchema(db);
   const ownerStart = processStart(process.pid);
   if (!ownerStart || ownerStart === "unknown") refusal("process_identity_unavailable");
+  const observedLock = db.prepare(`select root_id as rootId,owner_pid as pid,
+    owner_start as started,owner_attempt_id as attemptId
+    from capture_history_import_lock where singleton=1`).get() as
+      { rootId: string; pid: number; started: string; attemptId: string | null } | undefined;
+  if (observedLock) {
+    const holder = processStart(observedLock.pid);
+    if (holder === "unknown") refusal("import_holder_identity_unknown");
+    if (holder === observedLock.started) refusal("import_in_progress");
+  }
+  // Reserve the singleton before any preflight await. The active check and
+  // insertion share one IMMEDIATE transaction, including for another process.
+  db.transaction(() => {
+    maintenanceIdle(db);
+    const held = db.prepare(`select root_id as rootId,owner_pid as pid,
+      owner_start as started,owner_attempt_id as attemptId
+      from capture_history_import_lock where singleton=1`).get() as
+        { rootId: string; pid: number; started: string; attemptId: string | null } | undefined;
+    if (held) {
+      // A live or newly changed holder always wins. Only the exact stale row
+      // whose process identity was checked outside the write lock is removed.
+      if (!observedLock || held.rootId !== observedLock.rootId ||
+          held.pid !== observedLock.pid || held.started !== observedLock.started ||
+          held.attemptId !== observedLock.attemptId) refusal("import_in_progress");
+      db.prepare(`delete from capture_history_import_lock where singleton=1`).run();
+    }
+    db.prepare(`insert into capture_history_import_lock
+      (singleton,root_id,owner_pid,owner_start,owner_attempt_id) values (1,?,?,?,?)`)
+      .run(root.rootId, process.pid, ownerStart, attemptId);
+  }).immediate();
+  lockOwned = true;
+  ensureImportSchema(db);
+  const first = await scan(db, root, options);
+  const fencedSourceDigest = sourceDigest(first.files, options.since);
   let runId = "";
   let resume: ResumePoint = { index: 0, digest: null };
   db.transaction(() => {
     maintenanceIdle(db);
-    const held = db.prepare(`select root_id as rootId, owner_pid as pid, owner_start as started
+    const held = db.prepare(`select root_id as rootId, owner_pid as pid, owner_start as started,
+      owner_attempt_id as attemptId
       from capture_history_import_lock where singleton=1`).get() as
-        { rootId: string; pid: number; started: string } | undefined;
-    if (held) {
-      const holder = processStart(held.pid);
-      if (holder === "unknown") refusal("import_holder_identity_unknown");
-      if ((held.pid !== process.pid || held.started !== ownerStart || held.rootId !== root.rootId) &&
-          holder === held.started) refusal("another_import_holds_ledger");
-    }
-    if (held) db.prepare(`delete from capture_history_import_lock where singleton=1`).run();
-    db.prepare(`insert into capture_history_import_lock values (1,?,?,?)`)
-      .run(root.rootId, process.pid, ownerStart);
+        { rootId: string; pid: number; started: string; attemptId: string | null } | undefined;
+    if (!held || held.rootId !== root.rootId || held.pid !== process.pid ||
+        held.started !== ownerStart || held.attemptId !== attemptId) refusal("import_lock_lost");
     const prior = db.prepare(`select root_digest as digest,source_digest as sourceDigest,run_id as runId,
-      resume_candidate_index as resumeIndex,resume_candidate_digest as resumeDigest
+      resume_candidate_index as resumeIndex,resume_candidate_digest as resumeDigest,
+      imported_rows as importedRows,completed_at as completedAt
       from capture_history_import_runs where root_id=?`)
       .get(root.rootId) as { digest: string; sourceDigest: string | null; runId: string;
-        resumeIndex: number; resumeDigest: string | null } | undefined;
+        resumeIndex: number; resumeDigest: string | null; importedRows: number;
+        completedAt: string | null } | undefined;
     const digest = captureRootDigest(root);
     if (prior && prior.digest !== digest) refusal("root_identity_changed_since_import");
-    if (prior && prior.sourceDigest !== fencedSourceDigest)
-      refusal("fenced_history_changed_since_import");
+    if (prior && prior.sourceDigest !== fencedSourceDigest) {
+      // An interrupted attempt that published nothing may re-preflight a
+      // changed prefix from byte zero. Published history stays immutable.
+      if (prior.importedRows !== 0 || prior.completedAt !== null)
+        refusal("fenced_history_changed_since_import");
+      db.prepare(`update capture_history_import_runs set source_digest=?,
+        resume_candidate_index=0,resume_candidate_digest=null where root_id=?`)
+        .run(fencedSourceDigest, root.rootId);
+      db.prepare(`delete from capture_history_file_state where root_id=? and handoff_ready=0`)
+        .run(root.rootId);
+      prior.resumeIndex = 0;
+      prior.resumeDigest = null;
+    }
     if (prior && (!Number.isSafeInteger(prior.resumeIndex) || prior.resumeIndex < 0 ||
         (prior.resumeIndex === 0) !== (prior.resumeDigest === null)))
       refusal("resume_cursor_invalid");
@@ -542,7 +878,6 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   // turn a 16-row writer into an unbounded checkpoint. Keep checkpoints
   // outside the writer slice; the daemon's worker may also checkpoint.
   db.pragma("wal_autocheckpoint = 0");
-  active.add(root.rootId);
   let importedRows = 0;
   let maxWriterSliceMs = 0;
   let overBudgetSlices = 0;
@@ -551,6 +886,54 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   let slices = 0;
   let nextRows = WRITER_INITIAL_ROWS;
   let timeBudgetStops = 0;
+  let maxWalBytes = 0;
+  let walPauseMs = 0;
+  const walLimit = options.walLimitBytes ?? WAL_LIMIT_BYTES;
+  const walStall = options.walStallMs ?? WAL_STALL_MS;
+  if (!Number.isSafeInteger(walLimit) || walLimit < 1 ||
+      !Number.isSafeInteger(walStall) || walStall < 1) refusal("wal_budget_invalid");
+  const walPath = `${db.name}-wal`;
+  const walSize = () => {
+    try { return fs.statSync(walPath).size; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+      throw error;
+    }
+  };
+  const pauseForWal = async () => {
+    let size = walSize();
+    maxWalBytes = Math.max(maxWalBytes, size);
+    if (size <= walLimit) return;
+    const pausedAt = performance.now();
+    let lastProgress = pausedAt;
+    let bestBacklog = Number.POSITIVE_INFINITY;
+    while (size > walLimit) {
+      const status = db.pragma("wal_checkpoint(PASSIVE)") as Array<{
+        busy: number; log: number; checkpointed: number }>;
+      const frames = status[0];
+      const backlog = frames ? Math.max(0, frames.log - frames.checkpointed) : Number.POSITIVE_INFINITY;
+      if (backlog < bestBacklog) { bestBacklog = backlog; lastProgress = performance.now(); }
+      // PASSIVE moves committed frames out of the WAL. Once possible, a
+      // no-wait truncate releases its physical space without holding a writer
+      // while waiting for a pinned reader or competing intake connection.
+      const previousBusyTimeout = db.pragma("busy_timeout", { simple: true }) as number;
+      try {
+        db.pragma("busy_timeout = 0");
+        try { db.pragma("wal_checkpoint(TRUNCATE)"); }
+        catch (error) {
+          if (!(error as Error).message.includes("SQLITE_BUSY")) throw error;
+        }
+      } finally { db.pragma(`busy_timeout = ${previousBusyTimeout}`); }
+      const next = walSize();
+      if (next < size) lastProgress = performance.now();
+      size = next;
+      maxWalBytes = Math.max(maxWalBytes, size);
+      if (size <= walLimit) break;
+      if (performance.now() - lastProgress >= walStall) refusal("wal_checkpoint_stalled");
+      await new Promise<void>(resolve => setTimeout(resolve, 250));
+    }
+    walPauseMs += performance.now() - pausedAt;
+  };
   const writerSliceHistogram: Record<string, number> = {
     "under25ms": 0, "25to50ms": 0, "50to100ms": 0, "100to250ms": 0, "250to750ms": 0, "750msOrMore": 0,
   };
@@ -572,10 +955,12 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         // The IMMEDIATE transaction acquired the writer before this callback.
         // Contention waiting for another writer is not our held writer slice.
         writerStarted = performance.now();
-        const lock = db.prepare(`select root_id as rootId, owner_pid as pid, owner_start as started
+        const lock = db.prepare(`select root_id as rootId, owner_pid as pid, owner_start as started,
+          owner_attempt_id as attemptId
           from capture_history_import_lock where singleton=1`).get() as
-            { rootId: string; pid: number; started: string } | undefined;
-        if (!lock || lock.rootId !== root.rootId || lock.pid !== process.pid || lock.started !== ownerStart)
+            { rootId: string; pid: number; started: string; attemptId: string | null } | undefined;
+        if (!lock || lock.rootId !== root.rootId || lock.pid !== process.pid ||
+            lock.started !== ownerStart || lock.attemptId !== attemptId)
           refusal("import_lock_lost");
         maintenanceIdle(db);
         const counts: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
@@ -593,6 +978,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
             counts.output += e.outputTokens ?? 0;
             counts.cacheRead += e.cacheReadTokens ?? 0;
             counts.cacheCreation += e.cacheCreationTokens ?? 0;
+            if (item.candidate.claudeRevision) rememberClaudeRevision(db, item.candidate.claudeRevision);
           }
           processed += 1;
           writerRowMs = Math.max(writerRowMs, performance.now() - rowStarted);
@@ -625,8 +1011,11 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     if (stoppedForTime) timeBudgetStops += 1;
     // Use the committed cost to size the next row cap. A single expensive row
     // keeps the next slice at one row until the ledger becomes responsive.
-    nextRows = Math.max(1, Math.min(WRITER_MAX_ROWS,
-      Math.floor(processed * WRITER_TARGET_MS / Math.max(elapsed, 1) * 0.8)));
+    if (elapsed > 200) nextRows = Math.max(1, Math.floor(nextRows / 2));
+    else if (elapsed < 80 && !stoppedForTime)
+      nextRows = Math.min(WRITER_MAX_ROWS, nextRows + Math.max(1, Math.ceil(nextRows / 10)));
+    else if (elapsed > WRITER_TARGET_MS)
+      nextRows = Math.max(1, nextRows - 1);
     importedRows += receipt.rows;
     importedTokens.input += receipt.counts.input;
     importedTokens.output += receipt.counts.output;
@@ -638,6 +1027,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     // large. A root may finish before 512 slices, so that old cadence never
     // ran during the scale import.
     if (slices % 8 === 0) db.pragma("wal_checkpoint(PASSIVE)");
+    await pauseForWal();
     // SQLite's busy handler can miss a narrow unlock window and repeatedly
     // lose to the next import slice. Leave a full writer handoff interval for
     // hook, OTLP and tailer writers; observed import contention gets longer.
@@ -645,27 +1035,68 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     await new Promise<void>(resolve => setTimeout(resolve, writerWaitMs > 5 ? 500 : 250));
   };
   try {
-    // Verify every prefix before the first ledger mutation. Suffix growth is
+    await pauseForWal();
+    // Verify every prefix before the first imported row. Suffix growth is
     // allowed, but a rewrite of any fenced byte aborts the entire preflight.
     for (const file of first.files) verifyFencedPrefix(file);
     await scan(db, root, options, async (candidate, index, digest) => {
       pending.push({ candidate, index, digest });
       while (pending.length >= nextRows) await flush();
-    }, first.files, resume);
+    }, first.files, resume, async file => {
+      // This small row preserves the exact initial parser baseline before a
+      // crash can leave only some verified candidates committed.
+      db.transaction(() => rememberFileBaseline(db, root, file)).immediate();
+    }, async file => {
+      while (pending.length) await flush();
+      // The normal tailer defers this file until its verified cumulative
+      // state and all of its historical rows have reached the ledger.
+      if (root.source === "claude_code") {
+        const revisions = [...(file.finalClaude?.values() ?? [])];
+        for (let index = 0; index < revisions.length; index += 16) {
+          const batch = revisions.slice(index, index + 16);
+          db.transaction(() => {
+            for (const revision of batch) {
+              const authority = db.prepare(`select authority from session_usage_authority
+                where source='claude_code' and session_id=?`).get(revision.sessionId) as
+                  { authority: string } | undefined;
+              if (authority?.authority !== "live") rememberClaudeRevision(db, revision);
+            }
+          }).immediate();
+          if (index + 16 < revisions.length)
+            await new Promise<void>(resolve => setTimeout(resolve, 250));
+        }
+      }
+      db.transaction(() => {
+        if (file.finalCodex) {
+          db.prepare(`insert into capture_history_session_counters
+            (source,session_id,last_index,state_json) values ('codex',?,?,?)
+            on conflict(source,session_id) do update set
+              last_index=excluded.last_index,state_json=excluded.state_json
+            where excluded.last_index>capture_history_session_counters.last_index`)
+            .run(file.finalCodex.sessionId, file.finalCodex.index, JSON.stringify(file.finalCodex));
+        }
+        rememberFileCursor(db, root, file);
+        db.prepare(`update capture_history_file_state set handoff_ready=1 where file_key=?`)
+          .run(file.fileKey);
+      }).immediate();
+    });
     while (pending.length) await flush();
     db.transaction(() => {
-      const lock = db.prepare(`select root_id as rootId,owner_pid as pid,owner_start as started
+      const lock = db.prepare(`select root_id as rootId,owner_pid as pid,owner_start as started,
+        owner_attempt_id as attemptId
         from capture_history_import_lock where singleton=1`).get() as
-          { rootId: string; pid: number; started: string } | undefined;
-      if (!lock || lock.rootId !== root.rootId || lock.pid !== process.pid || lock.started !== ownerStart)
+          { rootId: string; pid: number; started: string; attemptId: string | null } | undefined;
+      if (!lock || lock.rootId !== root.rootId || lock.pid !== process.pid ||
+          lock.started !== ownerStart || lock.attemptId !== attemptId)
         refusal("import_lock_lost");
       db.prepare(`update capture_history_import_runs set completed_at=?,updated_at=? where root_id=?`)
         .run(new Date().toISOString(), new Date().toISOString(), root.rootId);
-      db.prepare(`delete from capture_history_import_lock where singleton=1`).run();
+      db.prepare(`delete from capture_history_import_lock where singleton=1 and owner_attempt_id=?`)
+        .run(attemptId);
+      lockOwned = false;
     }).immediate();
   } finally {
-    try { db.pragma(`wal_autocheckpoint = ${priorAutoCheckpoint}`); }
-    finally { active.delete(root.rootId); }
+    db.pragma(`wal_autocheckpoint = ${priorAutoCheckpoint}`);
   }
   const total = db.prepare(`select imported_rows as rows from capture_history_import_runs where root_id=?`)
     .get(root.rootId) as { rows: number };
@@ -673,5 +1104,11 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   return { ...plan, status: "capture_roots_history_imported", importedRows,
     importedTokens, totalImportedRows: total.rows, maxWriterSliceMs,
     overBudgetSlices, maxWriterWorkMs, maxWriterRowMs, writerSliceHistogram,
-    writerSlices: slices, timeBudgetStops, runId };
+    writerSlices: slices, timeBudgetStops, runId, attemptId, maxWalBytes, walPauseMs };
+  } finally {
+    try {
+      if (lockOwned) db.prepare(`delete from capture_history_import_lock
+        where singleton=1 and owner_attempt_id=?`).run(attemptId);
+    } finally { active.delete(root.rootId); }
+  }
 }

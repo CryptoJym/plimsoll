@@ -5426,8 +5426,19 @@ async function main() {
     };
 
     if (action === "import-history") {
+      const attemptId = randomUUID();
+      const writeAttemptReceipt = (value: Record<string, unknown>, suffix = "") => {
+        const receiptDirectory = path.join(collectorHome(), "receipts");
+        fs.mkdirSync(receiptDirectory, { recursive: true, mode: 0o700 });
+        const receiptPath = path.join(receiptDirectory, `capture-history-${attemptId}${suffix}.json`);
+        fs.writeFileSync(receiptPath, `${JSON.stringify(value, null, 2)}\n`,
+          { mode: 0o600, flag: "wx" });
+        return receiptPath;
+      };
       const refused = (reason: string) => {
-        console.log(JSON.stringify({ status: "capture_roots_history_refused", reason }, null, 2));
+        const value = { status: "capture_roots_history_refused", reason, attemptId };
+        const receiptPath = flag("--apply") ? writeAttemptReceipt(value) : null;
+        console.log(JSON.stringify({ ...value, ...(receiptPath ? { receiptPath } : {}) }, null, 2));
         process.exitCode = 1;
       };
       const args = process.argv.slice(4);
@@ -5463,14 +5474,17 @@ async function main() {
           finally { db.close(); }
           return;
         }
+        // This append-only marker survives abrupt process termination. A
+        // terminal receipt with the same attempt ID supersedes it; without
+        // one, the apply was interrupted before its outcome was confirmed.
+        writeAttemptReceipt({ status: "capture_roots_history_attempt_started",
+          reason: "interrupted_if_no_terminal_receipt", attemptId, rootId: root.rootId,
+          startedAt: new Date().toISOString() }, ".started");
         const buffer = openBuffer(config);
         let receipt;
-        try { receipt = await applyCaptureHistory(buffer, root, { since }); }
+        try { receipt = await applyCaptureHistory(buffer, root, { since, attemptId }); }
         finally { buffer.close(); }
-        const receiptDirectory = path.join(collectorHome(), "receipts");
-        fs.mkdirSync(receiptDirectory, { recursive: true, mode: 0o700 });
-        const receiptPath = path.join(receiptDirectory, `capture-history-${receipt.runId}.json`);
-        fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+        const receiptPath = writeAttemptReceipt(receipt);
         console.log(JSON.stringify({ ...receipt, receiptPath }, null, 2));
       } catch (error) {
         const message = error instanceof Error ? error.message : "";
