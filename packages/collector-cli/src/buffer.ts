@@ -3267,11 +3267,20 @@ export class LocalEventBuffer {
       let metricSamples = 0;
       const removeMetric = this.db.prepare(`delete from metric_samples where rowid = ?`);
       for (const row of metricRows) metricSamples += removeMetric.run(row.rowid).changes;
-      // A full page is a conservative continuation, never an exact backlog count.
-      const rawHasMore = rawLimit === 0 || candidates.length === rawLimit;
-      const hasMore = !lineageRepair.complete || retirementPending || rawHasMore ||
-        (remainingBudget > 0 && metricRows.length === remainingBudget);
       const last = candidates.at(-1);
+      // A full page alone does not prove more work. Probe just beyond its
+      // cursor so an idle ledger does not enter the five-second cadence.
+      const rawHasMore = (rawLimit === 0 || candidates.length === rawLimit) &&
+        Boolean(this.db.prepare(`select 1 from buffered_events e indexed by idx_events_retention
+          where e.created_at < ? and (e.created_at,e.id) > (?,?) limit 1`)
+          .get(cutoff, last?.rawCreatedAt ?? scan.at, last?.eventId ?? scan.id));
+      const metricHasMore = metricsPending && Boolean(this.db.prepare(
+        `select 1 from metric_samples indexed by idx_metrics_observed
+         where created_at < ? limit 1`,
+      ).get(cutoff));
+      const hasMore = !lineageRepair.complete || retirementPending || rawHasMore || metricHasMore;
+      const madeProgress = lineageRepair.visited > 0 || retirementPending ||
+        candidates.length > 0 || metricRows.length > 0;
       const next = rawLimit === 0 ? scan : rawHasMore && last
         ? {at:last.rawCreatedAt,id:last.eventId,metricsFirst:scan.metricsFirst}
         : {at:"",id:"",metricsFirst:scan.metricsFirst};
@@ -3297,6 +3306,7 @@ export class LocalEventBuffer {
         metricSamples,
         metricRowsVisited: metricRows.length,
         hasMore,
+        madeProgress,
       };
     }).immediate();
     if (run.events > 0) this.invalidateRetentionHoldCount();
@@ -3308,6 +3318,7 @@ export class LocalEventBuffer {
       migrationProtectedRows: run.migrationProtectedRows,
       metricRowsVisited: run.metricRowsVisited,
       hasMore: run.hasMore,
+      madeProgress: run.madeProgress,
     };
   }
 

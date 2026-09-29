@@ -22,7 +22,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-reliability-"));
 const realNow = Date.now;
 const now = realNow();
 const checks: Array<{ name: string; passed: boolean; detail?: unknown; error?: string }> = [];
-const EXPECTED_CHECKS = 12;
+const EXPECTED_CHECKS = 14;
 let nextId = 0;
 function event() {
   return aiInteractionEventSchema.parse({
@@ -434,6 +434,73 @@ async function main() {
       assert.equal((buffer.database.prepare("select count(*) as n from raw_retention_receipts").get() as any).n,4);
       return {protected:8,expired:4,outboxPreserved:8,passes:receipts.length};
     } finally {buffer.close();}
+  });
+  await check("idle_full_retention_page_has_no_ten_minute_followup", () => {
+    const buffer = new LocalEventBuffer(path.join(root, "idle-full-page.sqlite"), {
+      workspaceId: "idle-workspace", deviceId: "idle-device", delivery: { enabled: true },
+    });
+    let tick = now;
+    let serial = 0;
+    const pending = new Map<number, { callback: () => void; delay: number }>();
+    const old = "2000-01-01T00:00:00.000Z";
+    try {
+      const insert = buffer.database.prepare(`insert into buffered_events
+        (id,source,event_type,data_mode,observed_at,payload_json,created_at,workspace_id,device_id)
+        values (?, 'codex', 'assistant_response', 'metadata', ?, ?, ?, ?, ?)`);
+      for (let i = 0; i < 128; i++) {
+        const item = event();
+        insert.run(item.id, old, JSON.stringify(item), old, "idle-workspace", "idle-device");
+      }
+      assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as {n: number}).n, 128);
+      const cadence = new AutomaticRetentionCadence(
+        () => buffer.prune(90, { maxRows: 128, now: new Date(now) }),
+        { followupMs: 5_000, intervalMs: 60 * 60_000,
+          timer: { now: () => tick,
+            setTimeout: (callback, delay) => { const id = ++serial; pending.set(id, { callback, delay }); return id; },
+            clearTimeout: handle => { pending.delete(handle as number); } } },
+      );
+      try {
+        cadence.start();
+        const [id, first] = pending.entries().next().value!;
+        pending.delete(id);
+        first.callback();
+        const status = cadence.status();
+        assert.equal(status.counters.passes, 1);
+        assert.equal(status.lastPass?.eventRowsVisited, 128);
+        assert.equal(status.lastPass?.migrationProtectedRows, 128);
+        assert.equal(status.lastPass?.events, 0);
+        assert.equal(status.lastPass?.hasMore, false);
+        tick += 10 * 60_000;
+        assert.equal(pending.values().next().value?.delay, 60 * 60_000);
+        assert.equal(cadence.status().counters.passes, 1);
+        return { retentionPasses: 1, followupPassesOverTenMinutes: 0 };
+      } finally { cadence.stop(); }
+    } finally { buffer.close(); }
+  });
+  await check("no_progress_retention_continuation_backs_off", () => {
+    let tick = now;
+    let serial = 0;
+    const pending = new Map<number, { callback: () => void; delay: number }>();
+    const stalled = { cutoff: new Date(now).toISOString(), events: 0, metricSamples: 0,
+      eventRowsVisited: 0, metricRowsVisited: 0, migrationProtectedRows: 0,
+      hasMore: true, madeProgress: false } as ReturnType<LocalEventBuffer["prune"]>;
+    const cadence = new AutomaticRetentionCadence(() => stalled, {
+      followupMs: 5_000, intervalMs: 60 * 60_000,
+      timer: { now: () => tick,
+        setTimeout: (callback, delay) => { const id = ++serial; pending.set(id, { callback, delay }); return id; },
+        clearTimeout: handle => { pending.delete(handle as number); } },
+    });
+    try {
+      cadence.start();
+      const [id, first] = pending.entries().next().value!;
+      pending.delete(id);
+      first.callback();
+      assert.equal(cadence.status().counters.passes, 1);
+      assert.equal(pending.values().next().value?.delay, 60 * 60_000);
+      tick += 10 * 60_000;
+      assert.equal(cadence.status().counters.passes, 1);
+      return { retentionPasses: 1, followupPassesOverTenMinutes: 0 };
+    } finally { cadence.stop(); }
   });
   await check("retention_followups_converge_and_stop", () => {
     const buffer=fixture("followups");

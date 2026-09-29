@@ -63,7 +63,7 @@ export class AutomaticRetentionCadence {
       this.counters.eventsExpired += receipt.events;
       this.counters.metricsExpired += receipt.metricSamples;
       this.counters.migrationProtectedRows += receipt.migrationProtectedRows;
-      if (receipt.hasMore) delay = followup;
+      if (receipt.hasMore && receipt.madeProgress) delay = followup;
       this.options.onPass?.(receipt);
     } catch (error) {
       this.counters.failures += 1;
