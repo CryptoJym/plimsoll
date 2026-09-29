@@ -50,11 +50,21 @@ function trial(label: string, symlinkParent: boolean) {
     path.join(data, "collector.config.json"));
   const statePath = path.join(data, "lifecycle", "state.json");
   fs.writeFileSync(path.join(data, "lifecycle", "installation.json"), `${JSON.stringify({
-    schemaVersion: 1, installId: currentInstallId, executablePath: original,
+    schemaVersion: 1, installId: currentInstallId,
+    executablePath: symlinkParent ? owner : original,
   })}\n`, { mode: 0o600 });
   fs.writeFileSync(statePath, `${JSON.stringify({ schemaVersion: 1, version: "0.7.44",
     executablePath: owner, installId: symlinkParent ? currentInstallId : staleInstallId })}\n`,
   { mode: 0o600 });
+  const recordedInstallation = JSON.parse(fs.readFileSync(
+    path.join(data, "lifecycle", "installation.json"), "utf8")) as {
+      installId: string; executablePath: string;
+    };
+  const recordedState = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+    installId: string; executablePath: string;
+  };
+  const independentEvidenceMatches = recordedInstallation.installId === recordedState.installId &&
+    recordedInstallation.executablePath === recordedState.executablePath;
   const before = fs.readFileSync(installed.plistPath, "utf8");
   const changed = before.replace(`<string>${original}</string>`, `<string>${owner}</string>`)
     .replace(`<string>${runtime}</string>`, `<string>${path.dirname(owner)}</string>`);
@@ -64,12 +74,15 @@ function trial(label: string, symlinkParent: boolean) {
     "http://127.0.0.1:49390"], { env: { ...process.env, CI: "", GITHUB_ACTIONS: "" },
     input: "\n", encoding: "utf8", timeout: 20_000 });
   return { label, symlinkParent, status: /"status":\s*"([^"]+)"/.exec(joined.stdout)?.[1] ?? null,
-    exit: joined.status, ownerPath: owner, statePath, plistPath: installed.plistPath };
+    exit: joined.status, independentEvidenceMatches,
+    ownerPath: owner, statePath, plistPath: installed.plistPath };
 }
 try {
   const stale = trial("stale-previous-install", false);
   const forged = trial("symlinked-versions", true);
   console.log(JSON.stringify({ stale, forged }));
+  assert.equal(forged.independentEvidenceMatches, true,
+    "symlinked-parent fixture must match the current installation identity and runtime");
   assert.equal(stale.status, "join_preflight_failed",
     "stale lifecycle state vouched for an edited command");
   assert.equal(forged.status, "join_preflight_failed",
