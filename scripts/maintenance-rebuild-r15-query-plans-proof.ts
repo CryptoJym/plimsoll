@@ -3,17 +3,27 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { HOOK_ACK_LOOKUP_SQL, HOOK_ROW_LOOKUP_SQL, HOOK_ROW_LEGACY_LOOKUP_SQL } from
   "../packages/collector-cli/src/maintenance-hook-admission";
 
 async function main() {
-  const oldModule = path.resolve(process.env.PR424_0744_CHECKOUT ??
-    path.resolve(process.cwd(), "../plimsoll-0744"), "packages/collector-cli/src/buffer.ts");
-  const old = await import(pathToFileURL(oldModule).href);
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const root = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "r7-plans-")));
+  const oldRepo = path.join(root, "collector-0744");
+  let oldWorktreeAdded = false;
+  try {
+  // Match the other old-binary proofs: obtain the exact released source from
+  // this clone, including on CI runners with no neighboring checkout.
+  execFileSync("git", ["worktree", "add", "--detach", "--quiet", oldRepo,
+    "375f277b85f7d4ede7db77bf4359c371c0e8a4aa"], { cwd: repo });
+  oldWorktreeAdded = true;
+  fs.symlinkSync(path.join(repo, "node_modules"), path.join(oldRepo, "node_modules"), "dir");
+  const oldModule = path.join(oldRepo, "packages/collector-cli/src/buffer.ts");
+  const old = await import(pathToFileURL(oldModule).href);
   const current = new LocalEventBuffer(path.join(root, "current.sqlite"));
   const legacy = new old.LocalEventBuffer(path.join(root, "legacy.sqlite"));
   try {
@@ -62,7 +72,11 @@ async function main() {
   } finally {
     current.close();
     legacy.close();
-    fs.rmSync(root, { recursive: true, force: true });
+  }
+  } finally {
+    try {
+      if (oldWorktreeAdded) execFileSync("git", ["worktree", "remove", "--force", oldRepo], { cwd: repo });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   }
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

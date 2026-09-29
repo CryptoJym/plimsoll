@@ -14,8 +14,10 @@ import { finishMaintenanceRebuildPause, markMaintenanceRebuildPause,
   reconcileMaintenanceRebuildRefusals } from "../packages/collector-cli/src/maintenance-rebuild-pause-state";
 
 async function main() {
-  const oldRoot = path.resolve(process.env.PR424_0744_CHECKOUT ?? "../plimsoll-0744", "packages/collector-cli/src");
   if (process.argv[2] === "--old-writer") {
+    const oldCheckout = process.env.PR424_0744_CHECKOUT;
+    assert.ok(oldCheckout, "old writer requires the parent's pinned 0.7.44 worktree");
+    const oldRoot = path.resolve(oldCheckout, "packages/collector-cli/src");
     const oldBufferModule = await import(pathToFileURL(path.join(oldRoot, "buffer.ts")).href);
     const oldForwarder = await import(pathToFileURL(path.join(oldRoot, "forwarder.ts")).href);
     const oldConfig = await import(pathToFileURL(path.join(oldRoot, "config.ts")).href);
