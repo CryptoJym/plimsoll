@@ -1449,6 +1449,11 @@ export function stageAutomaticCaptureBaselineObservation(
     });
     return false;
   }
+  // A pathname missing from the switch inventory is new since cutover. Its
+  // first baseline may observe bytes written while the collector was stopped;
+  // those bytes must be judged by record time, never fenced at their size.
+  const baselineSize = replacementCaptureBoundary(database, source, input.observation)?.changed
+    ? 0 : normalized.size;
   let insertedGeneration = false;
   database.transaction(() => {
     const current = stateRow(database, source);
@@ -1486,9 +1491,9 @@ export function stageAutomaticCaptureBaselineObservation(
       input.runId,
       normalized.pathKey,
       normalized.generationKey,
+      baselineSize,
       normalized.size,
-      normalized.size,
-      normalized.size,
+      baselineSize,
       input.observedAt,
       input.observedAt,
     );
@@ -1507,9 +1512,9 @@ export function stageAutomaticCaptureBaselineObservation(
          where source = ? and run_id = ? and generation_key = ?`,
       ).run(
         normalized.pathKey,
+        baselineSize,
         normalized.size,
-        normalized.size,
-        normalized.size,
+        baselineSize,
         input.observedAt,
         source,
         input.runId,
@@ -1892,44 +1897,67 @@ export function captureBaselinePostEnrollmentOffset(
 const carriedCursorTablePresent = new WeakMap<object, boolean>();
 const replacementFenceTablePresent = new WeakMap<object, boolean>();
 const replacementBoundaryTablePresent = new WeakMap<object, boolean>();
+const replacementCutoverAt = new WeakMap<object, string | null>();
+
+/** The pending marker blocks collector opens. Once cleared, its timestamp is
+ * immutable for this database handle and is the one record-time boundary for
+ * both replaced generations and paths absent from the switch inventory. */
+function durableReplacementCutoverAt(database: Database.Database): string | null {
+  const cached = replacementCutoverAt.get(database);
+  if (cached !== undefined) return cached;
+  const present = database.prepare(`select 1 from sqlite_master where type='table'
+    and name='collector_replacement_ledger'`).get();
+  if (!present) {
+    replacementCutoverAt.set(database, null);
+    return null;
+  }
+  const row = database.prepare(`select switched_at as switchedAt,
+    post_switch_fence_pending as pending from collector_replacement_ledger where singleton=1`)
+    .get() as { switchedAt: string; pending: number } | undefined;
+  if (!row || row.pending !== 0 || !Number.isFinite(Date.parse(row.switchedAt))) {
+    throw new Error("replacement_post_switch_fence_pending");
+  }
+  replacementCutoverAt.set(database, row.switchedAt);
+  return row.switchedAt;
+}
 
 /** The swap's durable path identity. An unchanged generation uses its cursor
  * or size fence; a replacement uses the cutover time for each record. */
 export function replacementCaptureBoundary(database: Database.Database,
   source: HistoryCoverageSource, observation: CaptureBaselineFileObservation):
   { changed: boolean; cutoverAt: string } | null {
+  const cutoverAt = durableReplacementCutoverAt(database);
+  if (cutoverAt === null) return null;
   let present = replacementBoundaryTablePresent.get(database);
   if (present === undefined) {
     present = Boolean(database.prepare(`select 1 from sqlite_master where type='table' and name=?`)
       .get(REPLACEMENT_BOUNDARY_TABLE));
     replacementBoundaryTablePresent.set(database, present);
   }
-  if (!present) return null;
+  if (!present) throw new Error("replacement_file_boundaries_missing");
   const normalized = normalizeObservation(observation);
   if (!normalized) return null;
-  const row = database.prepare(`select generation_key as generationKey, cutover_at as cutoverAt
+  const row = database.prepare(`select generation_key as generationKey
     from ${REPLACEMENT_BOUNDARY_TABLE} where source=? and path_key=?`)
-    .get(source, normalized.pathKey) as { generationKey: string; cutoverAt: string } | undefined;
-  return row ? { changed: row.generationKey !== normalized.generationKey,
-    cutoverAt: row.cutoverAt } : null;
+    .get(source, normalized.pathKey) as { generationKey: string } | undefined;
+  return { changed: !row || row.generationKey !== normalized.generationKey, cutoverAt };
 }
 
 /** Called under the switch lease for every observed root path, before rename.
- * The final cutover instant is written together with pending=0 after rename. */
+ * The cutover instant lives once in the replacement ledger marker. */
 export function recordReplacementFileBoundaries(database: Database.Database,
-  source: HistoryCoverageSource, observations: readonly CaptureBaselineFileObservation[],
-  provisionalCutoverAt: string): number {
+  source: HistoryCoverageSource, observations: readonly CaptureBaselineFileObservation[]): number {
   database.exec(`create table if not exists ${REPLACEMENT_BOUNDARY_TABLE} (
     source text not null, path_key text not null, generation_key text not null,
-    cutover_at text not null, primary key(source,path_key)
+    primary key(source,path_key)
   ) without rowid`);
   replacementBoundaryTablePresent.set(database, true);
   const insert = database.prepare(`insert into ${REPLACEMENT_BOUNDARY_TABLE}
-    (source,path_key,generation_key,cutover_at) values(?,?,?,?)`);
+    (source,path_key,generation_key) values(?,?,?)`);
   for (const observation of observations) {
     const normalized = normalizeObservation(observation);
     if (!normalized) throw new Error("replacement_file_stat_ambiguous");
-    insert.run(source, normalized.pathKey, normalized.generationKey, provisionalCutoverAt);
+    insert.run(source, normalized.pathKey, normalized.generationKey);
   }
   return observations.length;
 }

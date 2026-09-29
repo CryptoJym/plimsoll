@@ -92,22 +92,34 @@ keys, and capture-root configuration stay in place.
    independently of host or filesystem clocks; later growth starts at that
    byte boundary. At read time the tailer compares the open file's device,
    inode and birth time with the generation observed at the switch. A changed
-   generation at an observed path starts at byte zero with fresh parser state;
-   only complete records whose own timestamps are at or after the durable
-   cutover instant are admitted. Existing event dedupe remains in force.
+   generation at an observed path starts at byte zero with fresh parser state.
+   A pathname **absent** from the final pre-rename inventory, in any configured
+   root, is new since cutover: its first baseline does not fence its current
+   size. It also starts at byte zero. For both kinds of file, only complete
+   records whose own timestamps are at or after the durable cutover instant
+   are admitted. Records with missing or unparseable timestamps are excluded
+   and counted in the capture scan's `enrollmentExcludedEvents` receipt.
+   Once the file has a cursor, normal byte-cursor progress and the read-time
+   generation check apply. Existing event dedupe remains in force.
    After the rename, while the switch lease is still held and before starting
    the collector, the command re-stats every carried-cursor file. Any changed
    generation loses its old cursor in the active ledger. The cutover instant is
-   sampled immediately after the active rename, then the final transaction
-   records it for every observed path and clears the pending
-   marker. A same-generation append remains eligible at the carried offset;
+   sampled immediately after the active rename returns, then the final
+   transaction records it once in the replacement ledger marker and clears
+   the pending marker. A same-generation append remains eligible at the carried offset;
    a replacement is admitted by each record's own timestamp, even if the
    replacement happens after the final re-stat. One irreducible window remains:
    a record stamped before this cutover instant but written into a replaced
-   file after the rename is excluded. Its extent depends on clock skew between
-   the tool and the collector; account for that when checking the cutover.
-   The replacement remains marked pending until that transaction commits, and
-   the 0.7.46 collector refuses to open a pending ledger.
+   or new-since-cutover file after the rename is excluded. The window includes
+   scheduling delay between the actual rename and the sample, plus clock skew
+   between the tool and the collector. The `epoch-switch --json` receipt and
+   replacement marker report `renameToSampleDelayMs`, a conservative upper
+   bound measured from just before the rename call through the sample. It
+   includes syscall time because the exact kernel rename instant is not
+   observable by the tool. Record this measured delay on Studio0 and account
+   for clock skew when checking the cutover. The replacement remains marked
+   pending until that transaction commits; the 0.7.46 collector refuses to
+   open a pending ledger, whether started by the daemon, a hook, or a restart.
 
    If the process stops after linking the archive but before the swap, the
    active and archive paths refer to the same old inode. Keep both paths. A

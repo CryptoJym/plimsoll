@@ -90,6 +90,10 @@ jobs:
           pnpm proof:pr426-r9-restore-clone-fsync-retry
           pnpm proof:pr426-r9-restore-journal-fsync-retry
           pnpm proof:pr426-r9-restore-nonce-reclone
+          pnpm proof:pr426-r10-new-path-after-rename
+          pnpm proof:pr426-r10-new-session-restart
+          pnpm proof:pr426-r10-untimestamped-new-path
+          pnpm proof:pr426-r10-rename-delay-report
 
       - name: Typecheck
         id: typecheck

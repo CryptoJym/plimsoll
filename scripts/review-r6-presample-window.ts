@@ -114,7 +114,8 @@ async function main() {
       }
       return originalFsync(fd);
     }) as typeof fs.fsyncSync;
-    try { switchFreshLedger({ ...input, onStep: step => {
+    let switchReceipt: ReturnType<typeof switchFreshLedger> | undefined;
+    try { switchReceipt = switchFreshLedger({ ...input, onStep: step => {
       if (step === "stage_bound" && timing === "stage_bound") inject();
       if (step === "archive_linked") {
         if (timing === "archive_linked") inject();
@@ -124,10 +125,18 @@ async function main() {
     finally { fs.renameSync = originalRename; (fs as any).lstatSync = originalLstat;
       fs.fsyncSync = originalFsync; }
     assert.equal(injected, true);
-    const cutoverAt = readReplacementLedgerMarker(ledgerPath)!.switchedAt;
+    const marker = readReplacementLedgerMarker(ledgerPath)!;
+    const cutoverAt = marker.switchedAt;
     assert.ok(preSampleAt && Date.parse(preSampleAt) < Date.parse(cutoverAt),
       "the writer's post-rename record precedes the sampled cutover without clock skew");
-    console.log(JSON.stringify({ preSampleAt, cutoverAt, gapMs: Date.parse(cutoverAt) - Date.parse(preSampleAt) }));
+    const gapMs = Date.parse(cutoverAt) - Date.parse(preSampleAt);
+    const measuredDelayMs = switchReceipt?.renameToSampleDelayMs ?? -1;
+    assert.ok(Number.isFinite(measuredDelayMs) && measuredDelayMs >= gapMs - 5,
+      "the cutover receipt must report an upper bound including rename scheduling delay");
+    assert.equal(marker.renameToSampleDelayMs, measuredDelayMs,
+      "the measured delay must survive a fresh read of the durable marker");
+    console.log(JSON.stringify({ preSampleAt, cutoverAt, gapMs,
+      renameToSampleDelayMs: measuredDelayMs }));
     if (timing === "fsync_after") assert.equal(fsyncRecord, true);
     fs.appendFileSync(file, line("post-swap-early"));
     if (variant === "replace-after-rename") replace();
