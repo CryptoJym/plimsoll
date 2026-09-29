@@ -261,6 +261,8 @@ function isolatedEnvironment(home: string, temp: string) {
     TERM: "dumb",
     CI: "1",
     NO_COLOR: "1",
+    NEXT_TELEMETRY_DISABLED: "1",
+    ...(process.env.NODE_OPTIONS ? { NODE_OPTIONS: process.env.NODE_OPTIONS } : {}),
     PLIMSOLL_SYSTEM_E2E_FINGERPRINT: flowFingerprint,
   } satisfies NodeJS.ProcessEnv;
 }
