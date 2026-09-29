@@ -3395,13 +3395,18 @@ async function main() {
           // while each maintenance job's bounded slice still advances it.
           const sessionIndex = sessionContextIndexStatus(buffer.database);
           const pairing = codexUsagePairingProgress(buffer.database);
+          const duplicateScan = projection.backfill.duplicateFactScan;
           return {
             pending: Object.values(projection.backlog).some(n => n > 0) ||
               !projection.backfill.complete || !projection.backfill.parityComplete || !projection.backfill.metricComplete ||
+              !duplicateScan.complete ||
               sessionIndex.state === "backfilling" || pairing.pending,
             units: Object.values(repairs.stages).reduce((sum, stage) => sum + stage.rowsVisited, 0) +
               projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited +
               sessionIndex.backfill.rowsVisited + pairing.units,
+            duplicateScan: { pending: !duplicateScan.complete, cursor: duplicateScan.cursor },
+            projectionMigration: { pending: !projection.backfill.complete ||
+              !projection.backfill.parityComplete || !projection.backfill.metricComplete },
           };
         },
         retryNotBefore: () => {
@@ -5086,10 +5091,12 @@ async function main() {
           elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
           backlog: status.backlog,
           migrationComplete: status.backfill.complete &&
-            status.backfill.parityComplete && status.backfill.metricComplete,
+            status.backfill.parityComplete && status.backfill.metricComplete &&
+            status.backfill.duplicateFactScan.complete,
         }));
         if (backlogTotal === 0 && status.backfill.complete &&
-          status.backfill.parityComplete && status.backfill.metricComplete) break;
+          status.backfill.parityComplete && status.backfill.metricComplete &&
+          status.backfill.duplicateFactScan.complete) break;
       }
       // Yield between synchronous slices so signals stay responsive.
       await new Promise<void>((resolve) => setImmediate(resolve));

@@ -500,12 +500,6 @@ test("uses the native workspace epoch and fails closed on legacy lineage", () =>
        dirty_session_backlog=0, account_invalidation_backlog=0,
        compact_mutation_backlog=0, compact_gc_backlog=0`,
     ).run(snapshotAt);
-    database.prepare(
-      `update dashboard_window_control set cutoff_at=?, target_cutoff_at=null,
-         expiry_cursor_at=null, expiry_cursor_id=null,
-         compact_expiry_high_water=null, compact_expiry_cursor_segment=null,
-         compact_expiry_cursor_offset=null`,
-    ).run("2020-01-01T00:00:00.000Z");
 
     const binding = database.prepare(
       `select current_workspace_id as workspaceId,
@@ -536,7 +530,7 @@ test("uses the native workspace epoch and fails closed on legacy lineage", () =>
          workspace_id=null, installation_epoch_id=null, projection_generation=null,
          published_at=null, updated_at=? where singleton=1`,
     ).run(snapshotAt);
-    buffer.projection.runMaintenance(new Date(transitionScanAt));
+    buffer.projection.runMaintenance(fixtureMaintenanceDate());
     const result = readFinanceProjectUsageProjection(database, request({ expectedWorkspaceId: "workspace-b" }));
     assert.equal(result.input.envelope.installationRef, binding.installationEpochId);
     assert.equal(result.input.source.records.length, 1);
@@ -595,12 +589,6 @@ test("does not strand a current epoch after an A-B-A transition", () => {
        dirty_session_backlog=0, account_invalidation_backlog=0,
        compact_mutation_backlog=0, compact_gc_backlog=0`,
     ).run(snapshotAt);
-    database.prepare(
-      `update dashboard_window_control set cutoff_at=?, target_cutoff_at=null,
-         expiry_cursor_at=null, expiry_cursor_id=null,
-         compact_expiry_high_water=null, compact_expiry_cursor_segment=null,
-         compact_expiry_cursor_offset=null`,
-    ).run("2020-01-01T00:00:00.000Z");
     for (const source of ["codex", "claude_code"] as const) {
       database.prepare(
         `update finance_source_coverage set retained_from=?, covered_through=?,
@@ -623,7 +611,7 @@ test("does not strand a current epoch after an A-B-A transition", () => {
          workspace_id=null, installation_epoch_id=null, projection_generation=null,
          published_at=null, updated_at=? where singleton=1`,
     ).run(snapshotAt);
-    buffer.projection.runMaintenance(new Date(scanAt));
+    buffer.projection.runMaintenance(fixtureMaintenanceDate());
 
     const result = readFinanceProjectUsageProjection(database, request({ expectedWorkspaceId: "workspace-a" }));
     assert.equal(result.input.source.records.length, 1);
@@ -634,6 +622,59 @@ test("does not strand a current epoch after an A-B-A transition", () => {
        where workspace_id='workspace-a' and installation_epoch_id=?`,
     ).get(current.currentInstallationEpochId) as { count: number };
     assert.equal(currentFacts.count, 1);
+  } finally {
+    close(buffer);
+  }
+});
+
+test("real workspace transitions publish only the current epoch without rewinding expiry", () => {
+  const baseMs = Date.now();
+  const observedAt = new Date(baseMs - 90 * 60_000).toISOString();
+  const transitionPeriod = {
+    start: new Date(baseMs - 2 * 60 * 60_000).toISOString(),
+    end: new Date(baseMs - 60 * 60_000).toISOString(),
+  };
+  const buffer = new LocalEventBuffer(":memory:", {
+    workspaceId: "workspace-a",
+    enrollmentNow: fixtureEnrollmentClock(),
+    delivery: { enabled: false },
+  });
+  try {
+    const settle = (workspaceId: string, inputTokens: number) => {
+      const scanAt = new Date().toISOString();
+      for (const source of ["codex", "claude_code"] as const) {
+        recordFinanceFullHistoryAttempt(buffer.database, source, scanAt, true);
+        assert.equal(recordFinanceCaptureActivity(buffer.database, source, scanAt, true, false), true);
+      }
+      for (let index = 0; index < 4; index += 1) {
+        buffer.projection.runMaintenance(new Date(Date.now() + 1_000 + index));
+      }
+      const control = buffer.database.prepare(
+        `select parity_ready as parityReady, degraded_reason as degradedReason
+         from dashboard_projection_control where singleton=1`,
+      ).get() as { parityReady: number; degradedReason: string | null };
+      assert.equal(control.parityReady, 1);
+      assert.equal(control.degradedReason, null);
+      const result = readFinanceProjectUsageProjection(buffer.database, request({
+        expectedWorkspaceId: workspaceId,
+        period: transitionPeriod,
+        now: new Date(Date.now() + 2_000).toISOString(),
+      }));
+      assert.equal(result.input.envelope.installationRef, buffer.workspaceBinding()?.currentInstallationEpochId);
+      assert.equal(result.input.source.records.length, 1);
+      assert.equal(result.input.source.records[0]?.inputTokens, inputTokens);
+    };
+
+    assert.equal(buffer.append(event(observedAt, { inputTokens: 1, outputTokens: 2 })), true);
+    settle("workspace-a", 1);
+    const firstEpoch = buffer.workspaceBinding()?.currentInstallationEpochId;
+    buffer.transitionWorkspace("workspace-a", "workspace-b");
+    assert.equal(buffer.append(event(observedAt, { inputTokens: 3, outputTokens: 4 })), true);
+    settle("workspace-b", 3);
+    buffer.transitionWorkspace("workspace-b", "workspace-a");
+    assert.notEqual(buffer.workspaceBinding()?.currentInstallationEpochId, firstEpoch);
+    assert.equal(buffer.append(event(observedAt, { inputTokens: 5, outputTokens: 6 })), true);
+    settle("workspace-a", 5);
   } finally {
     close(buffer);
   }

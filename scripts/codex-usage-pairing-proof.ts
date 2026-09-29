@@ -283,8 +283,21 @@ async function main() {
       const log = logEvent(r);
       const span = spanEvent(r);
       h.at(200); h.append(order === "log-first" ? log : span);
+      if (order === "span-first") {
+        check("span_fact_exists_before_late_pairing", Boolean(h.buffer.database.prepare(
+          `select 1 from dashboard_event_facts where raw_rowid=
+            (select rowid from buffered_events where id=?)`).get(span.event.id)));
+      }
       h.at(1_200); h.append(order === "log-first" ? span : log);
+      if (order === "span-first") {
+        check("late_pairing_queues_existing_span_fact_repair", Boolean(h.buffer.database.prepare(
+          `select 1 from dashboard_projection_repairs where raw_rowid=
+            (select rowid from buffered_events where id=?)`).get(span.event.id)));
+      }
       const beforeMaintenance = h.observe();
+      check(`${order}_has_no_duplicate_dashboard_fact`, !h.buffer.database.prepare(
+        `select 1 from dashboard_event_facts f join buffered_events b on b.rowid=f.raw_rowid
+         where b.usage_duplicate_reason is not null limit 1`).get());
       check(`${order}_pairs_at_ingest_without_trace`, once(beforeMaintenance) &&
         beforeMaintenance.local.markedDuplicates === 1 && beforeMaintenance.local.cache === r.cache,
         beforeMaintenance);

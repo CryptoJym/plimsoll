@@ -420,9 +420,57 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-live-churn
 
+      - name: Prove Codex reconciliation cannot restart a partial summary (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-reconciliation
+
+      - name: Prove two collectors cannot commit a stale segment repair (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-concurrent-repair
+
+      - name: Prove retargeted checkpoints repair both sessions (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-retarget
+
+      - name: Prove distant checkpoint predecessors use bounded durable windows (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-window
+
+      - name: Prove long-session trigger writes fit the 750 ms writer budget (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-trigger-writer-burst
+
+      - name: Prove v3 upgrade drains beside a million-row session (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-v3-upgrade-gate
+
+      - name: Prove an append during segment repair enters the wire once (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-queued-append-repair
+
+      - name: Prove terminal and historical checkpoint erasures stay bounded (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-checkpoint-erasure
+
+      - name: Prove bounded historical edits and erasures (eco-6hoxj.163.114)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-historical-repair
+
+      - name: Prove bounded staggered future-row maturity (eco-6hoxj.163.113)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-future-maturity
+
       - name: Prove 0.7.41 and 0.7.39 downgrade privacy safety (eco-6hoxj.163.87)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-downgrade
+
+      - name: Prove real 0.7.44 writes keep summary cursors and wire exact (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-v44-downgrade
+
+      - name: Prove simultaneous summary schema upgrades both succeed (eco-6hoxj.163.106)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-schema-upgrade-race
 
       - name: Prove a 0.7.39 ledger rebuilds its session summaries in bounded passes (eco-6hoxj.163.108)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

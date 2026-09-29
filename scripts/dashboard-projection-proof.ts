@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { pathToFileURL } from "node:url";
 import { gunzipSync } from "node:zlib";
 
 import Database from "better-sqlite3";
@@ -26,6 +29,17 @@ import {
 } from "../packages/collector-cli/src/dashboard-api";
 import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
+import {
+  AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS,
+  AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS,
+  AutomaticMaintenanceCadence,
+  CoalescingMaintenanceScheduler,
+  CollectorMaintenance,
+  automaticRepairServiceStatus,
+  drainProjectionMigration,
+  type AutomaticMaintenanceCadenceTimer,
+} from "../packages/collector-cli/src/maintenance";
+import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
 import {
   AUTOMATIC_DISCOVERY_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
@@ -128,6 +142,1037 @@ function settle(buffer: LocalEventBuffer, now = NOW, maxSlices = 100) {
   throw new Error(`projection did not settle: ${JSON.stringify(buffer.projection.status())}`);
 }
 
+/** Load the exact 0.7.44 projection reader from the committed release source.
+ * CI checks out full ancestry. Extracting its source in the disposable proof
+ * root keeps the compatibility test tied to the shipped reader, not a model
+ * of what that reader might do. */
+async function release044ProjectionReader(root: string) {
+  const release = "375f277b85f7d4ede7db77bf4359c371c0e8a4aa";
+  const oldRoot = path.join(root, "collector-0.7.44");
+  fs.mkdirSync(oldRoot);
+  const archive = spawnSync("git", ["archive", "--format=tar", release],
+    { cwd: process.cwd(), maxBuffer: 32 * 1024 * 1024 });
+  assert.equal(archive.status, 0, `0.7.44 source archive: ${archive.stderr.toString()}`);
+  const extract = spawnSync("tar", ["-xf", "-", "-C", oldRoot],
+    { input: archive.stdout, maxBuffer: 1024 * 1024 });
+  assert.equal(extract.status, 0, `0.7.44 source extraction: ${extract.stderr.toString()}`);
+  fs.symlinkSync(path.join(process.cwd(), "node_modules"), path.join(oldRoot, "node_modules"), "dir");
+  const source = path.join(oldRoot, "packages/collector-cli/src/dashboard-projection.ts");
+  const old = await import(pathToFileURL(source).href) as {
+    DASHBOARD_SCHEMA_VERSION: number;
+    DashboardProjectionStore: new (db: Database.Database, options?: {now?: Date}) =>
+      Pick<DashboardProjectionStore, "status" | "readSnapshot" | "runMaintenance">;
+  };
+  assert.equal(old.DASHBOARD_SCHEMA_VERSION, 2);
+  return old.DashboardProjectionStore;
+}
+
+async function prove044RollbackScanFence(root: string) {
+  const OldProjection = await release044ProjectionReader(root);
+  const file = path.join(root, "duplicate-scan-044-rollback.sqlite");
+  const buffer = new LocalEventBuffer(file);
+  const rows = Array.from({length:3}, () => event({source:"codex",model:"gpt-proof"}));
+  for (const row of rows) assert.equal(buffer.append(row), true);
+  settle(buffer);
+  buffer.close();
+
+  // Copy the green pre-upgrade ledger state. The duplicate change predates the
+  // trigger, so one raw row is excluded while its dashboard fact still exists.
+  const legacy = new Database(file);
+  legacy.exec(`drop trigger trg_dashboard_usage_duplicate_update;
+    drop table codex_duplicate_fact_scan;
+    update dashboard_projection_control set schema_version=2 where singleton=1;
+    update dashboard_snapshots set schema_version=2;`);
+  legacy.prepare(`update buffered_events set usage_duplicate_reason='codex_sse_event_span'
+    where id=?`).run(rows[0]!.id);
+  const preUpgrade = legacy.prepare(`select
+      (select count(*) from dashboard_event_facts) as facts,
+      (select count(*) from buffered_events where usage_duplicate_reason is null) as oracle,
+      (select count(*) from dashboard_projection_repairs) as repairs`).get() as
+      {facts:number;oracle:number;repairs:number};
+  assert.deepEqual(preUpgrade,{facts:3,oracle:2,repairs:0});
+  legacy.close();
+
+  let oldDb = new Database(file);
+  const oldBefore = new OldProjection(oldDb,{now:NOW});
+  const staleBefore = oldBefore.readSnapshot(30);
+  check("release_044_reader_sees_pre_upgrade_stale_snapshot",
+    staleBefore.kind === "ready" && staleBefore.snapshot.projection.parityReady &&
+      Number((staleBefore.snapshot.summary.totals as Record<string,number>).events) === 3,
+    {kind:staleBefore.kind,preUpgrade});
+  oldDb.close();
+
+  let upgraded = new LocalEventBuffer(file);
+  const pending = upgraded.projection.status();
+  const version = (upgraded.database.prepare(`select schema_version as version
+    from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
+  check("upgrade_fences_incomplete_duplicate_scan_without_rebuilding_facts",
+    !pending.backfill.duplicateFactScan.complete && !pending.parityReady &&
+      version === DASHBOARD_SCHEMA_VERSION &&
+      (upgraded.database.prepare(`select count(*) as n from dashboard_event_facts`)
+        .get() as {n:number}).n === preUpgrade.facts,
+    {version,pendingScan:pending.backfill.duplicateFactScan,preUpgrade});
+  upgraded.close();
+
+  oldDb = new Database(file);
+  const rolledBackPending = new OldProjection(oldDb,{now:NOW});
+  const refusedBefore = rolledBackPending.readSnapshot(30);
+  const oldTick = rolledBackPending.runMaintenance(NOW);
+  const oldStatus = rolledBackPending.status();
+  const persisted = oldDb.prepare(`select schema_version as version, parity_ready as parityReady,
+    degraded_reason as reason from dashboard_projection_control where singleton=1`).get() as
+    {version:number;parityReady:number;reason:string|null};
+  check("release_044_rollback_cannot_publish_while_duplicate_scan_pending",
+    refusedBefore.kind === "backfilling" && oldTick.ready === false &&
+      oldStatus.parityReady === false && oldStatus.degradedReason === "projection_schema_newer" &&
+      persisted.version > 2 && persisted.parityReady === 0 &&
+      persisted.reason === "projection_schema_newer",
+    {readKind:refusedBefore.kind,oldTick,oldStatus,persisted,preUpgrade});
+  oldDb.close();
+
+  upgraded = new LocalEventBuffer(file);
+  settle(upgraded);
+  const repaired = upgraded.projection.readSnapshot(30);
+  const repairedFacts = (upgraded.database.prepare(`select count(*) as n from dashboard_event_facts`)
+    .get() as {n:number}).n;
+  check("forward_upgrade_after_pending_rollback_drains_scan_and_restores_parity",
+    repaired.kind === "ready" && repaired.snapshot.projection.parityReady &&
+      upgraded.projection.status().backfill.duplicateFactScan.complete &&
+      repairedFacts === preUpgrade.oracle &&
+      Number((repaired.snapshot.summary.totals as Record<string,number>).events) === preUpgrade.oracle,
+    {kind:repaired.kind,repairedFacts,preUpgrade});
+  upgraded.close();
+
+  oldDb = new Database(file);
+  const rolledBackComplete = new OldProjection(oldDb,{now:NOW});
+  const refusedAfter = rolledBackComplete.readSnapshot(30);
+  const completeTick = rolledBackComplete.runMaintenance(NOW);
+  check("release_044_rollback_after_scan_complete_still_refuses_projection",
+    refusedAfter.kind === "backfilling" && completeTick.ready === false &&
+      rolledBackComplete.status().degradedReason === "projection_schema_newer",
+    {kind:refusedAfter.kind,completeTick});
+  oldDb.close();
+
+  upgraded = new LocalEventBuffer(file);
+  settle(upgraded);
+  const forwardAgain = upgraded.projection.readSnapshot(30);
+  check("reupgrade_after_complete_rollback_converges_without_rebuild",
+    forwardAgain.kind === "ready" && forwardAgain.snapshot.projection.parityReady &&
+      Number((forwardAgain.snapshot.summary.totals as Record<string,number>).events) === preUpgrade.oracle,
+    {kind:forwardAgain.kind,preUpgrade});
+  upgraded.close();
+}
+
+function proveDuplicateFactRepair(root: string) {
+  const file = path.join(root, "duplicate-fact-repair.sqlite");
+  let buffer = new LocalEventBuffer(file);
+  try {
+    const tokenFree = event({ source: "codex", sessionId: "duplicate-fact-session",
+      model: "gpt-proof" });
+    const withUsage = event({ source: "codex", sessionId: "duplicate-usage-session",
+      model: "gpt-proof", inputTokens: 17, outputTokens: 3, costUsd: 1.25 });
+    buffer.append(tokenFree);
+    buffer.append(withUsage);
+    settle(buffer);
+    let db = buffer.database;
+    const counts = () => ({
+      oracle: (db.prepare(`select count(*) as n from buffered_events
+        where usage_duplicate_reason is null`).get() as { n: number }).n,
+      facts: (db.prepare(`select count(*) as n from dashboard_event_facts`).get() as { n: number }).n,
+      events: (db.prepare(`select events from dashboard_window_totals where days=30`)
+        .get() as { events: number }).events,
+      usage: db.prepare(`select input_tokens as input,output_tokens as output,
+        cost_nanos as cost from dashboard_window_totals where days=30`).get() as
+        { input: number; output: number; cost: number },
+    });
+    check("duplicate_fixture_facts_preexist", counts().facts === 2, counts());
+    const flag = db.prepare(`update buffered_events set usage_duplicate_reason=? where id=?`);
+    flag.run("codex_sse_event_span", tokenFree.id);
+    check("duplicate_flag_only_queues_fact_repair", Boolean(db.prepare(
+      `select 1 from dashboard_projection_repairs where raw_rowid=
+        (select rowid from buffered_events where id=?)`).get(tokenFree.id)));
+    settle(buffer);
+    check("duplicate_token_free_fact_removed_matches_raw_oracle",
+      counts().oracle === 1 && counts().facts === 1 && counts().events === 1, counts());
+    flag.run("codex_sse_event_span", withUsage.id);
+    check("duplicate_usage_flag_queues_fact_repair", Boolean(db.prepare(
+      `select 1 from dashboard_projection_repairs where raw_rowid=
+        (select rowid from buffered_events where id=?)`).get(withUsage.id)));
+    settle(buffer);
+    const excluded = counts();
+    check("duplicate_usage_fact_removed_with_tokens_and_cost",
+      excluded.oracle === 0 && excluded.facts === 0 && excluded.events === 0 &&
+      excluded.usage.input === 0 && excluded.usage.output === 0 && excluded.usage.cost === 0,
+      excluded);
+    flag.run(null, tokenFree.id);
+    flag.run(null, withUsage.id);
+    settle(buffer);
+    const restored = counts();
+    check("unmarked_rows_restore_event_usage_and_cost",
+      restored.oracle === 2 && restored.facts === 2 && restored.events === 2 &&
+      restored.usage.input === 17 && restored.usage.output === 3 &&
+      restored.usage.cost === 1_250_000_000, restored);
+
+    // Simulate an older ledger whose repair receipt was lost after a fact was
+    // written. Reopening installs the trigger; the bounded scan finds the debt.
+    db.exec(`drop trigger trg_dashboard_usage_duplicate_update`);
+    flag.run("codex_sse_event_span", tokenFree.id);
+    check("legacy_duplicate_has_stale_fact_without_receipt",
+      counts().facts === 2 && !db.prepare(`select 1 from dashboard_projection_repairs
+        where raw_rowid=(select rowid from buffered_events where id=?)`).get(tokenFree.id));
+    db.exec(`update codex_duplicate_fact_scan set cursor_raw_rowid=0, complete=0`);
+    buffer.close();
+    buffer = new LocalEventBuffer(file);
+    db = buffer.database;
+    buffer.projection.runMaintenance(NOW);
+    settle(buffer);
+    const repaired = counts();
+    check("legacy_duplicate_scan_repairs_stale_fact",
+      repaired.oracle === 1 && repaired.facts === 1 && repaired.events === 1, repaired);
+  } finally {
+    buffer.close();
+  }
+}
+
+async function proveDuplicateScanUpgradeAndDrain(root: string) {
+  const file = path.join(root, "duplicate-scan-upgrade.sqlite");
+  const factCount = 3_101;
+  let buffer = new LocalEventBuffer(file);
+  let firstId = "";
+  try {
+    for (let index = 0; index < factCount; index += 1) {
+      const row = event({source:"codex",sessionId:"duplicate-scan-session",model:"gpt-proof"});
+      if (index === 0) firstId = row.id;
+      assert.equal(buffer.append(row), true);
+    }
+    settle(buffer);
+    const before = buffer.projection.readSnapshot(30);
+    check("duplicate_scan_upgrade_fixture_starts_ready_with_over_3000_facts",
+      before.kind === "ready" && before.snapshot.projection.parityReady === true &&
+      (buffer.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n === factCount,
+      {kind:before.kind,factCount});
+    buffer.close();
+
+    // Recreate the pre-fix upgrade boundary: a ready published snapshot and
+    // stale fact, but no duplicate-scan state or trigger from this release.
+    const legacy = new Database(file);
+    legacy.exec(`drop table codex_duplicate_fact_scan;
+      drop trigger trg_dashboard_usage_duplicate_update;`);
+    legacy.prepare(`update buffered_events set usage_duplicate_reason='codex_sse_event_span'
+      where id=?`).run(firstId);
+    const queued = (legacy.prepare(`select count(*) as n from dashboard_projection_repairs`)
+      .get() as {n:number}).n;
+    legacy.close();
+    check("duplicate_scan_upgrade_fixture_has_no_old_repair_receipt",queued === 0,{queued});
+
+    buffer = new LocalEventBuffer(file);
+    const pending = buffer.projection.status();
+    const stale = buffer.projection.readSnapshot(30);
+    check("duplicate_scan_upgrade_withholds_ready_snapshot_parity_before_maintenance",
+      pending.ready && !pending.parityReady && pending.dirty && pending.degraded &&
+      !pending.backfill.duplicateFactScan.complete &&
+      stale.kind === "ready" && stale.snapshot.projection.parityReady === false &&
+      stale.snapshot.projection.degraded === true,
+      {pending,readKind:stale.kind});
+
+    const drain = await drainProjectionMigration(buffer.projection);
+    const after = buffer.projection.status();
+    const repaired = buffer.projection.readSnapshot(30);
+    const facts = (buffer.database.prepare(`select count(*) as n from dashboard_event_facts`)
+      .get() as {n:number}).n;
+    check("duplicate_scan_over_3000_facts_drains_during_startup",
+      drain.drain.slices >= 4 && drain.drain.slices <= drain.drain.maxSlices &&
+      drain.drain.migrationRowsVisited === factCount && !drain.drain.stillMigrating &&
+      after.backfill.duplicateFactScan.complete && after.parityReady && !after.dirty &&
+      facts === factCount - 1 && repaired.kind === "ready" &&
+      repaired.snapshot.projection.parityReady === true &&
+      Number((repaired.snapshot.summary.totals as Record<string,number>).events) === factCount - 1,
+      {drain:drain.drain,after,facts,readKind:repaired.kind,
+        events:repaired.kind === "ready" ?
+          (repaired.snapshot.summary.totals as Record<string,number>).events : null});
+  } finally {
+    buffer.close();
+  }
+}
+
+async function proveScanSettlesUnderSteadyCapture(root: string) {
+  const file = path.join(root, "scan-steady-capture.sqlite");
+  const buffer = new LocalEventBuffer(file);
+  const rows = Array.from({length:3}, () => event({source:"codex",model:"gpt-proof"}));
+  for (const row of rows) assert.equal(buffer.append(row), true);
+  settle(buffer);
+  const db = buffer.database;
+  const duplicateRowid = (db.prepare(`select rowid as n from buffered_events where id=?`)
+    .get(rows[0]!.id) as {n:number}).n;
+  const captureRowid = (db.prepare(`select rowid as n from buffered_events where id=?`)
+    .get(rows[1]!.id) as {n:number}).n;
+  db.exec(`drop trigger trg_dashboard_usage_duplicate_update`);
+  db.prepare(`update buffered_events set usage_duplicate_reason='codex_sse_event_span'
+    where rowid=?`).run(duplicateRowid);
+  db.exec(`update codex_duplicate_fact_scan set cursor_raw_rowid=0,complete=0 where singleton=1;
+    update dashboard_projection_control set dirty=1,parity_ready=0,
+      degraded_reason='projection_repair_backlog' where singleton=1`);
+
+  const codexRoot = path.join(root, "steady-codex");
+  const claudeRoot = path.join(root, "steady-claude");
+  fs.mkdirSync(codexRoot); fs.mkdirSync(claudeRoot);
+  const maintenance = new CollectorMaintenance(buffer,
+    new RolloutTailer(buffer, codexRoot, () => []),
+    new TranscriptTailer(buffer, claudeRoot));
+  let syntheticNow = NOW.getTime(), repairClock = 0, ticks = 0;
+  let captureActive = true, scanSettledDuringCapture = false, captureTicks = 0;
+  let nextTimer: {at:number;callback:()=>void}|null = null;
+  const timer: AutomaticMaintenanceCadenceTimer = {
+    now: () => syntheticNow,
+    setTimeout: (callback, delayMs) => {
+      nextTimer = {at:syntheticNow+delayMs,callback}; return nextTimer;
+    },
+    clearTimeout: () => {nextTimer = null;},
+  };
+  const scheduler = new CoalescingMaintenanceScheduler(async () => {
+    const result = await maintenance.runRecent({clock:()=> (repairClock += 40)});
+    // A steady capture turn leaves one ordinary repair after projection has
+    // drained. It is not historical-scan debt and must not pin that scan.
+    if (captureActive) {
+      db.prepare(`insert into dashboard_projection_repairs
+        (raw_rowid,reason,queued_at) values (?,'proof_capture',?)
+        on conflict(raw_rowid) do update set reason=excluded.reason,
+          queued_at=excluded.queued_at`)
+        .run(captureRowid,new Date(syntheticNow).toISOString());
+      db.exec(`update dashboard_projection_control set dirty=1,parity_ready=0,
+        degraded_reason='projection_repair_backlog' where singleton=1`);
+      captureTicks++;
+    }
+    return result;
+  });
+  const cadence = new AutomaticMaintenanceCadence(scheduler,
+    () => captureBaselineStatus(db), {timer,repairProgress:()=>{
+      const state = buffer.projection.status();
+      const scan = state.backfill.duplicateFactScan;
+      return {pending:!scan.complete || !state.parityReady || state.backlog.repairs>0,
+        units:automaticRepairServiceStatus(db).stages.projection.rowsVisited,
+        duplicateScan:{pending:!scan.complete,cursor:scan.cursor}};
+    }});
+  try {
+    cadence.start();
+    while (ticks < 12) {
+      const due = nextTimer as {at:number;callback:()=>void}|null;
+      assert.ok(due);
+      nextTimer = null; syntheticNow = due.at; due.callback();
+      while (cadence.status().inFlight) await new Promise<void>(resolve=>setImmediate(resolve));
+      ticks++;
+      if (buffer.projection.status().backfill.duplicateFactScan.complete)
+        scanSettledDuringCapture = true;
+    }
+    captureActive = false;
+    while ((!buffer.projection.status().parityReady ||
+      cadence.status().retryClass !== "normal") && ticks < 60) {
+      const due = nextTimer as {at:number;callback:()=>void}|null;
+      assert.ok(due);
+      nextTimer = null; syntheticNow = due.at; due.callback();
+      while (cadence.status().inFlight) await new Promise<void>(resolve=>setImmediate(resolve));
+      ticks++;
+    }
+    const state = buffer.projection.status();
+    const stale = (db.prepare(`select count(*) as n from dashboard_event_facts f
+      join buffered_events b on b.rowid=f.raw_rowid
+      where b.usage_duplicate_reason is not null`).get() as {n:number}).n;
+    const snapshot = buffer.projection.readSnapshot(30);
+    const events = snapshot.kind === "ready" ?
+      Number((snapshot.snapshot.summary.totals as Record<string,number>).events) : null;
+    check("duplicate_scan_settles_under_continuous_capture_and_cadence_normalizes",
+      captureTicks === 12 && scanSettledDuringCapture && state.backfill.duplicateFactScan.complete &&
+      state.parityReady && !state.dirty && stale === 0 && events === 2 &&
+      cadence.status().retryClass === "normal", {ticks,captureTicks,
+        scanSettledDuringCapture,scan:state.backfill.duplicateFactScan,stale,events,
+        parityReady:state.parityReady,dirty:state.dirty,backlog:state.backlog,
+        degradedReason:state.degradedReason,
+        repairService:automaticRepairServiceStatus(db),retryClass:cadence.status().retryClass});
+  } finally {
+    cadence.stop(); scheduler.stopAccepting(); await scheduler.waitForIdle();
+    maintenance.close(); buffer.close();
+  }
+}
+
+function proveWholeTransactionAdmission(root: string) {
+  const file = path.join(root, "backlogged-upgrade-budget.sqlite");
+  const buffer = new LocalEventBuffer(file);
+  try {
+    const observedAt = new Date(NOW.getTime()-29*DAY_MS).toISOString();
+    for (let i=0; i<64; i++) assert.equal(buffer.append(event({observedAt,
+      source:"codex",model:"gpt-proof",sessionId:"budget-session"})),true);
+    settle(buffer);
+    const db = buffer.database;
+    const sessionHash = (db.prepare(`select session_hash as value
+      from dashboard_event_facts where session_hash is not null limit 1`)
+      .get() as {value:string}).value;
+    db.prepare(`insert into dashboard_compact_gc_days
+      (bucket_day,queued_at,updated_at) values (?,?,?)`)
+      .run("2026-06-16",NOW.toISOString(),NOW.toISOString());
+    db.prepare(`insert into dashboard_account_invalidations
+      (account_hash,queued_at) values (?,?)`).run(hash("d"),NOW.toISOString());
+    db.prepare(`insert into dashboard_dirty_sessions
+      (days,session_hash,reason,queued_at) values (90,?,'proof_backlog',?)`)
+      .run(sessionHash,NOW.toISOString());
+    db.exec(`update dashboard_projection_control set backfill_high_water=64,
+      backfill_cursor=0,backfill_complete=0,parity_cursor=0,parity_complete=0,
+      metric_backfill_high_water=1,metric_backfill_cursor=0,metric_backfill_complete=0,
+      dirty=1,parity_ready=0,degraded_reason='projection_backfilling' where singleton=1;
+      update dashboard_parity_window set events=0,token_events=0,input_tokens=0,
+      output_tokens=0,cache_read_tokens=0,cache_creation_tokens=0,cost_nanos=0;`);
+    const future = new Date(NOW.getTime()+2*DAY_MS);
+    const initial = buffer.projection.status();
+    const cutoff = new Date(future.getTime()-30*DAY_MS).toISOString();
+    db.prepare(`update dashboard_window_control set target_cutoff_at=? where days=30`)
+      .run(cutoff);
+    let clockMs=0;
+    const denied = buffer.projection.runMaintenance(future, {maxActiveMs:25,
+      clock:()=>clockMs,
+      onPhaseForProof:phase=>{if (phase === "scan") clockMs=30;}});
+    check("expired_active_budget_denies_all_later_projection_phases",
+      !initial.backfill.complete && !initial.backfill.parityComplete &&
+      initial.backlog.compactGcDays === 1 &&
+      denied.backfillRowsVisited === 0 && denied.parityRowsVisited === 0 &&
+      denied.compactGcItemsVisited === 0 && denied.compactGcDaysCompleted === 0 &&
+      denied.metricRowsVisited === 0 && denied.sessionRepairRowsVisited === 0 &&
+      denied.expiryFacts === 0 &&
+      !buffer.projection.status().backfill.metricComplete &&
+      buffer.projection.status().backlog.accountInvalidations === 1 &&
+      buffer.projection.status().backlog.dirtySessions === 1 &&
+      buffer.projection.status().backlog.expiryWindows === 1,
+      {denied,initialBacklog:initial.backlog,clockMs});
+    let maxHoldMs=0,backfill=0,parity=0,gc=0,expiry=0,sessionRepair=0;
+    for (let tick=0; tick<150; tick++) {
+      const started=performance.now();
+      const receipt=buffer.projection.runMaintenance(future,{maxActiveMs:25});
+      maxHoldMs=Math.max(maxHoldMs,performance.now()-started);
+      backfill+=receipt.backfillRowsVisited;
+      parity+=receipt.parityRowsVisited;
+      gc+=receipt.compactGcDaysCompleted;
+      expiry+=receipt.expiryFacts;
+      sessionRepair+=receipt.sessionRepairRowsVisited;
+      if (buffer.projection.status().parityReady) break;
+    }
+    const final=buffer.projection.status();
+    check("backlogged_upgrade_writer_hold_obeys_phase_admission",
+      backfill===64 && parity===64 && gc===1 && expiry>=64 && sessionRepair>=64 &&
+      maxHoldMs<750,
+      {maxHoldMs,backfill,parity,gc,expiry,sessionRepair,parityReady:final.parityReady,
+        backfillState:final.backfill,degradedReason:final.degradedReason,
+        backlog:final.backlog});
+  } finally {buffer.close();}
+}
+
+function proveTimedBackfillsUseAvailableBudget(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root, "timed-backfill-budget.sqlite"));
+  try {
+    for (let i = 0; i < 128; i++) assert.equal(buffer.append(event({source:"codex"})), true);
+    settle(buffer);
+    const db = buffer.database;
+    db.exec(`update dashboard_projection_control set backfill_high_water=128,
+      backfill_cursor=0,backfill_complete=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const fact = buffer.projection.runMaintenance(NOW,{maxActiveMs:25,clock:()=>0});
+    db.exec(`update dashboard_projection_control set backfill_cursor=128,
+      backfill_complete=1 where singleton=1`);
+    db.exec(`with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<128
+    ) insert into metric_samples (id,source,metric_name,observed_at,value,created_at)
+      select 'timed-metric-'||rowid,'codex','timed-proof',
+        '${NOW.toISOString()}',0,'${NOW.toISOString()}' from sequence;
+    update dashboard_projection_control set metric_backfill_high_water=128,
+      metric_backfill_cursor=0,metric_backfill_complete=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const metric = buffer.projection.runMaintenance(NOW,{maxActiveMs:25,clock:()=>0});
+    db.exec(`update dashboard_projection_control set metric_backfill_cursor=128,
+      metric_backfill_complete=1,parity_cursor=0,parity_complete=0,
+      dirty=1,parity_ready=0,degraded_reason='projection_backfilling' where singleton=1;
+      update dashboard_parity_window set events=0,token_events=0,input_tokens=0,
+        output_tokens=0,cache_read_tokens=0,cache_creation_tokens=0,cost_nanos=0`);
+    const parity = buffer.projection.runMaintenance(NOW,{maxActiveMs:25,clock:()=>0});
+    check("timed_fact_metric_and_parity_backfills_use_more_than_one_small_batch",
+      fact.backfillRowsVisited===128 && metric.metricRowsVisited===128 &&
+      parity.parityRowsVisited===128,
+      {factRows:fact.backfillRowsVisited,metricRows:metric.metricRowsVisited,
+        parityRows:parity.parityRowsVisited});
+
+    let maxWriterHoldMs=0;
+    const slowed = (phase:"backfill"|"metric"|"parity") => {
+      let virtualMs=0;
+      const started=performance.now();
+      const receipt=buffer.projection.runMaintenance(NOW,{maxActiveMs:25,
+        clock:()=>virtualMs,
+        onWorkRowForProof:rowPhase=>{if(rowPhase===phase)virtualMs++;}});
+      maxWriterHoldMs=Math.max(maxWriterHoldMs,performance.now()-started);
+      return {receipt,virtualMs};
+    };
+    db.exec(`update dashboard_projection_control set backfill_cursor=0,
+      backfill_complete=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const slowFact=slowed("backfill");
+    db.exec(`update dashboard_projection_control set backfill_cursor=128,
+      backfill_complete=1,metric_backfill_cursor=0,metric_backfill_complete=0,
+      dirty=1,parity_ready=0,degraded_reason='projection_backfilling' where singleton=1`);
+    const slowMetric=slowed("metric");
+    db.exec(`update dashboard_projection_control set metric_backfill_cursor=128,
+      metric_backfill_complete=1,parity_cursor=0,parity_complete=0,
+      dirty=1,parity_ready=0,degraded_reason='projection_backfilling' where singleton=1;
+      update dashboard_parity_window set events=0,token_events=0,input_tokens=0,
+        output_tokens=0,cache_read_tokens=0,cache_creation_tokens=0,cost_nanos=0`);
+    const slowParity=slowed("parity");
+    check("timed_backfill_batches_recheck_deadline_after_one_bounded_unit",
+      slowFact.receipt.backfillRowsVisited===32 && slowMetric.receipt.metricRowsVisited===32 &&
+      slowParity.receipt.parityRowsVisited===32 &&
+      [slowFact,slowMetric,slowParity].every(row=>row.virtualMs===32) &&
+      maxWriterHoldMs<750,
+      {factRows:slowFact.receipt.backfillRowsVisited,
+        metricRows:slowMetric.receipt.metricRowsVisited,
+        parityRows:slowParity.receipt.parityRowsVisited,
+        virtualMs:[slowFact.virtualMs,slowMetric.virtualMs,slowParity.virtualMs],
+        maxWriterHoldMs});
+  } finally {buffer.close();}
+}
+
+async function proveMillionFactTimedUpgrade(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root,"million-fact-timed-upgrade.sqlite"));
+  const factCount = 1_000_000;
+  try {
+    const db = buffer.database;
+    // A million retained historical facts coexist with a million-row metric
+    // migration. The metrics exercise the ordinary timed backfill without
+    // making the duplicate scan or a raw-event rebuild the rate limiter.
+    db.exec(`with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<${factCount}
+    ) insert into dashboard_event_facts
+      (projection_id,raw_rowid,source,event_type,observed_at,suppressed)
+      select 'upgrade-fact-'||rowid,rowid,'codex','otel_span',
+        '${NOW.toISOString()}',1 from sequence;
+    with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<${factCount}
+    ) insert into metric_samples (id,source,metric_name,observed_at,value,created_at)
+      select 'upgrade-metric-'||rowid,'codex','upgrade-proof',
+        '${NOW.toISOString()}',0,'${NOW.toISOString()}' from sequence;
+    update codex_duplicate_fact_scan set cursor_raw_rowid=${factCount},complete=1
+      where singleton=1;
+    update dashboard_projection_control set metric_backfill_high_water=${factCount},
+      metric_backfill_cursor=0,metric_backfill_complete=0,metric_sample_count=0,
+      backfill_high_water=0,backfill_cursor=0,backfill_complete=1,
+      parity_cursor=0,parity_complete=1,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1;`);
+    let maxWriterHoldMs=0,maxMetricRowsPerSlice=0;
+    const runSlice=buffer.projection.runMaintenance.bind(buffer.projection);
+    buffer.projection.runMaintenance=(now,options)=>{
+      const started=performance.now();
+      const receipt=runSlice(now,options);
+      maxWriterHoldMs=Math.max(maxWriterHoldMs,performance.now()-started);
+      maxMetricRowsPerSlice=Math.max(maxMetricRowsPerSlice,receipt.metricRowsVisited);
+      return receipt;
+    };
+    let simulatedMinutes=0,drains=0,visited=0;
+    const first=await drainProjectionMigration(buffer.projection,
+      {maxSlices:40,maxActiveMs:2_000,cadenceSeconds:60});
+    visited+=first.drain.migrationRowsVisited;drains++;simulatedMinutes++;
+    const oldSingleStageDays=factCount/8*5/(24*60*60);
+    check("million_fact_upgrade_first_drain_uses_timed_budget_and_observed_eta",
+      first.drain.migrationRowsVisited>320 &&
+      first.drain.estimatedMinutesUpperBound===Math.ceil(
+        first.drain.remainingRowidUpperBound/first.drain.migrationRowsVisited),
+      {firstDrain:first.drain,oldSingleStageDays,maxWriterHoldMs});
+    while(!buffer.projection.status().parityReady&&drains<90){
+      const next=await drainProjectionMigration(buffer.projection,
+        {maxSlices:40,maxActiveMs:2_000,cadenceSeconds:60});
+      visited+=next.drain.migrationRowsVisited;drains++;simulatedMinutes++;
+    }
+    const final=buffer.projection.status();
+    const facts=(db.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n;
+    check("million_fact_timed_upgrade_reaches_parity_with_bounded_writer_holds",
+      facts===factCount && visited===factCount && final.parityReady && !final.dirty &&
+      maxMetricRowsPerSlice<=1_000 && maxWriterHoldMs<750 && simulatedMinutes<=60,
+      {facts,visited,drains,simulatedMinutes,maxMetricRowsPerSlice,maxWriterHoldMs,
+        parityReady:final.parityReady,dirty:final.dirty,backlog:final.backlog,
+        firstDrain:first.drain});
+
+    // Repeat on the production scheduler and repair-stage rotation. Ordinary
+    // backfill gets a priority projection slice on each migration tick; the
+    // other stages keep their rotating allowance after that slice.
+    db.exec(`update dashboard_projection_control set metric_backfill_cursor=0,
+      metric_backfill_complete=0,metric_sample_count=0,dirty=1,parity_ready=0,
+      degraded_reason='projection_backfilling' where singleton=1`);
+    const codexRoot=path.join(root,"million-timed-codex");
+    const claudeRoot=path.join(root,"million-timed-claude");
+    fs.mkdirSync(codexRoot);fs.mkdirSync(claudeRoot);
+    const maintenance=new CollectorMaintenance(buffer,
+      new RolloutTailer(buffer,codexRoot,()=>[]),
+      new TranscriptTailer(buffer,claudeRoot));
+    let syntheticNow=NOW.getTime(),repairClock=0,ticks=0;
+    let nextTimer:{at:number;callback:()=>void}|null=null;
+    let projectionEveryTick=true,maxOtherStageGap=0;
+    let observedEtaMinutes:number|null=null,observedEtaAt:number|null=null;
+    let observedCadenceSeconds:number|null=null;
+    const otherStages=["reconciliation","repricing","repo_context_suppression","learning_facts"] as const;
+    const lastProgress=Object.fromEntries(otherStages.map(stage=>[stage,0])) as
+      Record<typeof otherStages[number],number>;
+    const timer:AutomaticMaintenanceCadenceTimer={
+      now:()=>syntheticNow,
+      setTimeout:(callback,delayMs)=>{
+        nextTimer={at:syntheticNow+delayMs,callback};return nextTimer;
+      },
+      clearTimeout:()=>{nextTimer=null;},
+    };
+    const scheduler=new CoalescingMaintenanceScheduler(async()=>
+      maintenance.runRecent({clock:()=>repairClock+=40}));
+    const cadence=new AutomaticMaintenanceCadence(scheduler,
+      ()=>captureBaselineStatus(db),{timer,repairProgress:()=>{
+        const state=buffer.projection.status();
+        const scan=state.backfill.duplicateFactScan;
+        return {pending:!state.parityReady || !state.backfill.metricComplete,
+          units:automaticRepairServiceStatus(db).stages.projection.rowsVisited,
+          duplicateScan:{pending:!scan.complete,cursor:scan.cursor},
+          projectionMigration:{pending:!state.backfill.complete ||
+            !state.backfill.parityComplete || !state.backfill.metricComplete}};
+      }});
+    try {
+      cadence.start();
+      while(!buffer.projection.status().parityReady&&ticks<2_000){
+        const due=nextTimer as {at:number;callback:()=>void}|null;
+        assert.ok(due,"timed upgrade lost its scheduled tick");
+        nextTimer=null;syntheticNow=due.at;
+        const before=automaticRepairServiceStatus(db);
+        const metricPending=!buffer.projection.status().backfill.metricComplete;
+        due.callback();
+        while(cadence.status().inFlight)await new Promise<void>(resolve=>setImmediate(resolve));
+        ticks++;
+        const run=scheduler.status().lastRun;
+        if(observedEtaMinutes===null &&
+            (run?.projectionDrain?.migrationRowsVisited??0)>=1_000){
+          observedEtaMinutes=run!.projectionDrain!.estimatedMinutesUpperBound;
+          observedCadenceSeconds=run!.projectionDrain!.cadenceSeconds;
+          observedEtaAt=syntheticNow;
+        }
+        const after=automaticRepairServiceStatus(db);
+        if(metricPending&&after.stages.projection.completed!==before.stages.projection.completed+1)
+          projectionEveryTick=false;
+        for(const stage of otherStages){
+          if(after.stages[stage].completed>before.stages[stage].completed)lastProgress[stage]=ticks;
+          maxOtherStageGap=Math.max(maxOtherStageGap,ticks-lastProgress[stage]);
+        }
+      }
+      const state=buffer.projection.status();
+      const elapsedMs=syntheticNow-NOW.getTime();
+      const actualRemainingMinutes=observedEtaAt===null?null:
+        (syntheticNow-observedEtaAt)/60_000;
+      check("million_fact_timed_upgrade_uses_fast_production_scheduler_without_starving_stages",
+        state.parityReady && !state.dirty && projectionEveryTick &&
+        ticks<=1_100 && elapsedMs<=44*60_000 &&
+        maxWriterHoldMs<750 && maxOtherStageGap<=8 &&
+        observedEtaMinutes!==null && actualRemainingMinutes!==null &&
+        observedCadenceSeconds===1 &&
+        Math.abs(observedEtaMinutes-actualRemainingMinutes)<=2 &&
+        otherStages.every(stage=>automaticRepairServiceStatus(db).stages[stage].completed>=100) &&
+        cadence.status().retryClass==="normal",
+        {facts,ticks,elapsedMs,simulatedMinutes:elapsedMs/60_000,
+          projectionEveryTick,maxWriterHoldMs,maxOtherStageGap,
+          otherStageCompleted:Object.fromEntries(otherStages.map(stage=>
+            [stage,automaticRepairServiceStatus(db).stages[stage].completed])),
+          parityReady:state.parityReady,dirty:state.dirty,
+          retryClass:cadence.status().retryClass,
+          observedEtaMinutes,actualRemainingMinutes,observedCadenceSeconds,
+          migrationIntervalMs:AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS});
+    } finally {
+      cadence.stop();scheduler.stopAccepting();await scheduler.waitForIdle();
+      maintenance.close();
+    }
+  } finally {buffer.close();}
+}
+
+async function proveMillionFactScanCadence(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root, "million-fact-scan.sqlite"));
+  const factCount = 1_000_001;
+  const codexRoot = path.join(root, "million-fact-codex");
+  const claudeRoot = path.join(root, "million-fact-claude");
+  fs.mkdirSync(codexRoot);
+  fs.mkdirSync(claudeRoot);
+  const maintenance = new CollectorMaintenance(buffer,
+    new RolloutTailer(buffer, codexRoot, () => []),
+    new TranscriptTailer(buffer, claudeRoot));
+  try {
+    // Suppressed facts make a million-row scan without a million raw payloads;
+    // the independent raw-row oracle and final dashboard both remain zero.
+    buffer.database.exec(`with recursive sequence(rowid) as (
+        select 1 union all select rowid+1 from sequence where rowid<${factCount}
+      ) insert into dashboard_event_facts
+        (projection_id,raw_rowid,source,event_type,observed_at,suppressed)
+        select 'scan-'||rowid,rowid,'codex','otel_span','${NOW.toISOString()}',1
+        from sequence;
+      update codex_duplicate_fact_scan set cursor_raw_rowid=0,complete=0 where singleton=1;
+      update dashboard_projection_control set parity_ready=0,dirty=1,
+        degraded_reason='projection_repair_backlog' where singleton=1;`);
+    // This fixture isolates production scheduler and stage rotation. Its
+    // deterministic monotonic clock charges 10 ms per 1,000 scan rows, so a
+    // cold SQLite page fault cannot change the admitted first-tick prefix.
+    // The calibrated slow-host fixture below measures the real writer hold.
+    const runProjectionSlice=buffer.projection.runMaintenance.bind(buffer.projection);
+    let projectionClock=0;
+    buffer.projection.runMaintenance=(now,options)=>runProjectionSlice(now,{
+      ...options,clock:()=>projectionClock,
+      onWorkRowForProof:phase=>{
+        if(phase==="scan")projectionClock+=0.01;
+      },
+    });
+    let ticks = 0;
+    let captureTurns = 0;
+    let projectionEveryTick = true;
+    let scanRowsVisited = 0;
+    const otherStages = ["reconciliation", "repricing", "repo_context_suppression", "learning_facts"] as const;
+    const lastProgress = Object.fromEntries(otherStages.map(stage => [stage, 0])) as
+      Record<typeof otherStages[number], number>;
+    let maxOtherStageGap = 0;
+    let syntheticNow = NOW.getTime();
+    let repairClock = 0;
+    let nextTimer: { at: number; callback: () => void } | null = null;
+    const timer: AutomaticMaintenanceCadenceTimer = {
+      now: () => syntheticNow,
+      setTimeout: (callback, delayMs) => {
+        nextTimer = { at: syntheticNow + delayMs, callback };
+        return nextTimer;
+      },
+      clearTimeout: () => { nextTimer = null; },
+    };
+    // The injected monotonic stage clock makes the first admitted repair unit
+    // consume the real 75 ms rotation allowance without sleeping for 1,001
+    // ticks. runRecent still uses its production REPAIR_STAGES and one-slice
+    // projection drain; the real SQLite projector advances the scan cursor.
+    const scheduler = new CoalescingMaintenanceScheduler(async () =>
+      maintenance.runRecent({clock:()=> (repairClock += 40)}));
+    const cadence = new AutomaticMaintenanceCadence(scheduler,
+      () => captureBaselineStatus(buffer.database),
+      {timer,repairProgress:()=>{
+        const status = buffer.projection.status();
+        const scan = status.backfill.duplicateFactScan;
+        return {pending:!scan.complete || !status.parityReady,
+          units:automaticRepairServiceStatus(buffer.database).stages.projection.rowsVisited,
+          duplicateScan:{pending:!scan.complete,cursor:scan.cursor}};
+      }});
+    cadence.start();
+    const startedAt = syntheticNow;
+    while (!buffer.projection.status().parityReady && ticks < 6_000) {
+      const due = nextTimer as {at:number;callback:()=>void}|null;
+      assert.ok(due, "scan cadence lost its pending timer");
+      nextTimer = null;
+      syntheticNow = due.at;
+      const before = automaticRepairServiceStatus(buffer.database);
+      const scanBefore = buffer.projection.status().backfill.duplicateFactScan;
+      due.callback();
+      while (cadence.status().inFlight) await new Promise<void>((resolve)=>setImmediate(resolve));
+      ticks += 1;
+      const run = scheduler.status().lastRun;
+      if (run?.captureTurn) captureTurns += 1;
+      scanRowsVisited += run?.projection?.duplicateFactScanRowsVisited ?? 0;
+      const after = automaticRepairServiceStatus(buffer.database);
+      if (!scanBefore.complete && after.stages.projection.completed !== before.stages.projection.completed + 1)
+        projectionEveryTick = false;
+      for (const stage of otherStages) {
+        if (after.stages[stage].completed > before.stages[stage].completed) lastProgress[stage] = ticks;
+        maxOtherStageGap = Math.max(maxOtherStageGap, ticks - lastProgress[stage]);
+      }
+    }
+    const elapsedMs = syntheticNow - startedAt;
+    const final = cadence.status();
+    cadence.stop();
+    scheduler.stopAccepting();
+    await scheduler.waitForIdle();
+    const projection = buffer.projection.status();
+    const service = automaticRepairServiceStatus(buffer.database);
+    const snapshot = buffer.projection.readSnapshot(30);
+    const events = snapshot.kind === "ready" ?
+      Number((snapshot.snapshot.summary.totals as Record<string,number>).events) : null;
+    check("million_fact_scan_uses_bounded_fast_ticks_and_preserves_capture_turns",
+      ticks === 1_001 && captureTurns === ticks && projectionEveryTick &&
+      scanRowsVisited === factCount && projection.backfill.duplicateFactScan.cursor === factCount &&
+      projection.backfill.duplicateFactScan.complete && projection.parityReady && !projection.dirty &&
+      events === 0 && Object.values(service.stages).every(stage => stage.failures === 0) &&
+      otherStages.every(stage => service.stages[stage].completed >= 100) && maxOtherStageGap <= 8 &&
+      elapsedMs === 5_000 + 1_000 * AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS &&
+      elapsedMs < 60 * 60_000 && final.retryClass === "normal" &&
+      scheduler.status().maxConcurrentJobs === 1 &&
+      scheduler.status().overlappingJobs === 0 && scheduler.status().failedRuns === 0,
+      {factCount,ticks,captureTurns,projectionEveryTick,scanRowsVisited,
+        parityReady:projection.parityReady,events,otherStageCompleted:Object.fromEntries(
+          otherStages.map(stage => [stage, service.stages[stage].completed])),maxOtherStageGap,
+        elapsedMs,elapsedMinutes:elapsedMs/60_000,
+        retryClass:final.retryClass,maxConcurrentJobs:scheduler.status().maxConcurrentJobs});
+  } finally {
+    maintenance.close();
+    buffer.close();
+  }
+}
+
+function proveMillionFactVersionFenceCost(root: string) {
+  // Reuse the completed million-fact scheduler fixture. This is the same
+  // control-row version transition an existing 0.7.44 ledger takes on upgrade.
+  const file = path.join(root, "million-fact-scan.sqlite");
+  const stateSql = `select backfill_cursor as backfillCursor, parity_cursor as parityCursor,
+    projection_rows_visited as rowsVisited, snapshot_builds as snapshotBuilds,
+    generation from dashboard_projection_control where singleton=1`;
+  const beforeDb = new Database(file);
+  const factCount = (beforeDb.prepare(`select count(*) as n from dashboard_event_facts`)
+    .get() as {n:number}).n;
+  beforeDb.prepare(`update dashboard_projection_control set schema_version=2 where singleton=1`).run();
+  const before = beforeDb.prepare(stateSql).get() as Record<string,number>;
+  beforeDb.close();
+  const started = performance.now();
+  const upgraded = new LocalEventBuffer(file);
+  const openMs = performance.now() - started;
+  try {
+    const after = upgraded.database.prepare(stateSql).get() as Record<string,number>;
+    const version = (upgraded.database.prepare(`select schema_version as version
+      from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
+    const factsAfter = (upgraded.database.prepare(`select count(*) as n from dashboard_event_facts`)
+      .get() as {n:number}).n;
+    check("million_fact_version_fence_is_control_row_update_without_rebuild",
+      factCount === 1_000_001 && factsAfter === factCount &&
+        version === DASHBOARD_SCHEMA_VERSION &&
+        JSON.stringify(after) === JSON.stringify(before),
+      {factCount,factsAfter,version,before,after,openMs});
+  } finally {
+    upgraded.close();
+  }
+}
+
+type MillionFactRowCosts = {scanMsPerRow:number;repairMsPerRow:number};
+async function proveMillionFactDuplicateRepairCadence(root: string, slow = false,
+  reference?: MillionFactRowCosts): Promise<MillionFactRowCosts> {
+  const prefix = slow ? "slow-" : "";
+  const buffer = new LocalEventBuffer(path.join(root, `${prefix}million-duplicate-fact-scan.sqlite`));
+  const factCount = 1_000_001;
+  const duplicateCount = 300_000;
+  const codexRoot = path.join(root, `${prefix}million-duplicate-fact-codex`);
+  const claudeRoot = path.join(root, `${prefix}million-duplicate-fact-claude`);
+  fs.mkdirSync(codexRoot);
+  fs.mkdirSync(claudeRoot);
+  const db = buffer.database;
+  // This is an upgraded-ledger fixture: historical raw rows and facts already
+  // exist before the collector installs its one-time scan. Suspend only insert
+  // triggers during bulk seeding, then restore their exact production SQL.
+  const insertTriggers = (db.prepare(`select name,sql from sqlite_master
+    where type='trigger' and tbl_name='buffered_events'`).all() as
+    Array<{name:string;sql:string}>).filter(row => /\bafter\s+insert\b/i.test(row.sql));
+  assert.ok(insertTriggers.length > 0);
+  for (const trigger of insertTriggers) db.exec(`drop trigger "${trigger.name}"`);
+  db.exec(`with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<1000000
+    ) insert into buffered_events
+      (rowid,id,source,event_type,data_mode,observed_at,payload_json,created_at,usage_duplicate_reason)
+      select rowid,'historical-duplicate-'||rowid,'codex','otel_span','local',
+        '${NOW.toISOString()}','{}','${NOW.toISOString()}','codex_sse_event_span'
+      from sequence where rowid%10 in (1,2,3);
+    with recursive sequence(rowid) as (
+      select 1 union all select rowid+1 from sequence where rowid<${factCount}
+    ) insert into dashboard_event_facts
+      (projection_id,raw_rowid,source,event_type,observed_at,suppressed)
+      select 'historical-fact-'||rowid,rowid,'codex','otel_span',
+        '${NOW.toISOString()}',1 from sequence;`);
+  for (const trigger of insertTriggers) db.exec(trigger.sql);
+  const restored = (db.prepare(`select name from sqlite_master
+    where type='trigger' and tbl_name='buffered_events'`).all() as Array<{name:string}>);
+  assert.ok(insertTriggers.every(trigger => restored.some(row => row.name === trigger.name)));
+  const seededDuplicates = (db.prepare(`select count(*) as n from buffered_events
+    where usage_duplicate_reason='codex_sse_event_span'`).get() as {n:number}).n;
+  const seededFacts = (db.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n;
+  assert.equal(seededDuplicates, duplicateCount);
+  assert.equal(seededFacts, factCount);
+  assert.equal((db.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n, 0);
+  // The bulk loader bypasses the projection triggers. Seed the matching
+  // aggregates too: a duplicate repair must subtract from a fact that was
+  // counted, rather than manufacturing a negative total in this fixture.
+  db.transaction(()=>{
+    const day=NOW.toISOString().slice(0,10);
+    for(const days of [7,...DASHBOARD_WINDOWS]){
+      db.prepare(`update dashboard_window_totals set events=? where days=?`).run(factCount,days);
+      db.prepare(`insert into dashboard_source_window (days,source,events)
+        values (?,'codex',?)`).run(days,factCount);
+      db.prepare(`insert into dashboard_daily_window (days,day,events)
+        values (?,?,?)`).run(days,day,factCount);
+    }
+    for(const days of DASHBOARD_WINDOWS)db.prepare(
+      `update dashboard_parity_window set events=? where days=?`).run(factCount,days);
+    db.prepare(`update dashboard_lifetime_totals set events=?,
+      oldest_observed_at=?,newest_observed_at=? where singleton=1`)
+      .run(factCount,NOW.toISOString(),NOW.toISOString());
+  })();
+  db.exec(`update codex_duplicate_fact_scan set cursor_raw_rowid=0,complete=0 where singleton=1;
+    update dashboard_projection_control set
+      backfill_high_water=1000000,backfill_cursor=1000000,backfill_complete=1,
+      parity_cursor=1000000,parity_complete=1,
+      metric_backfill_high_water=0,metric_backfill_cursor=0,metric_backfill_complete=1,
+      ready=0,parity_ready=0,dirty=1,degraded_reason='projection_repair_backlog'
+      where singleton=1;`);
+  const maintenance = new CollectorMaintenance(buffer,
+    new RolloutTailer(buffer, codexRoot, () => []),
+    new TranscriptTailer(buffer, claudeRoot));
+  const runProjectionSlice = buffer.projection.runMaintenance.bind(buffer.projection);
+  let maxProjectionSliceMs = 0;
+  let maxSimulatedSliceMs = 0;
+  let simulatedClock = 0;
+  let observedScanMs = 0;
+  let observedScanRows = 0;
+  let observedRepairMs = 0;
+  let observedRepairRows = 0;
+  const injectedScanRowMs = slow ? Math.max(0.004, 2*(reference?.scanMsPerRow ?? 0.002)) : 0;
+  const injectedRepairRowMs = slow ? Math.max(0.25, 2*(reference?.repairMsPerRow ?? 0.125)) : 0;
+  let slowestSlicePhases: Record<string, number> = {};
+  let slowestSliceRows = {scan:0,repair:0};
+  buffer.projection.runMaintenance = (now, options) => {
+    assert.equal(options?.maxActiveMs, 25, "scheduled projection uses the production 25 ms admission");
+    const started = performance.now();
+    const simulatedStarted = simulatedClock;
+    const phases: Record<string, number> = {};
+    // The full proof calibrates row cost on this host's preceding production
+    // scheduler run, then advances the injected monotonic clock by at least
+    // twice that cost per admitted row. Actual transaction wall is checked too.
+    const receipt = runProjectionSlice(now, {
+      ...options,
+      ...(slow ? {
+        clock: () => simulatedClock,
+        onWorkRowForProof: (phase: "scan" | "repair" | "backfill" | "metric" | "parity" | "expiry") => {
+          if (phase === "scan") simulatedClock += injectedScanRowMs;
+          if (phase === "repair") simulatedClock += injectedRepairRowMs;
+        },
+      } : {}),
+      onPhaseForProof: (phase, durationMs) => { phases[phase] = durationMs; },
+    });
+    const elapsed = performance.now() - started;
+    if (elapsed > maxProjectionSliceMs) {
+      maxProjectionSliceMs = elapsed;
+      slowestSlicePhases = phases;
+      slowestSliceRows = {scan:receipt.duplicateFactScanRowsVisited,
+        repair:receipt.repairRowsVisited};
+    }
+    maxSimulatedSliceMs = Math.max(maxSimulatedSliceMs, simulatedClock-simulatedStarted);
+    if (!slow) {
+      if (receipt.duplicateFactScanRowsVisited > 0) {
+        observedScanMs += phases.scan ?? 0;
+        observedScanRows += receipt.duplicateFactScanRowsVisited;
+      }
+      if (receipt.repairRowsVisited > 0) {
+        observedRepairMs += phases.repair ?? 0;
+        observedRepairRows += receipt.repairRowsVisited;
+      }
+    }
+    assert.ok(receipt.repairRowsVisited <= 250);
+    return receipt;
+  };
+  try {
+    let syntheticNow = NOW.getTime();
+    let repairClock = 0;
+    let ticks = 0;
+    let scanRowsVisited = 0;
+    let repairRowsVisited = 0;
+    let scanEndTick = 0;
+    let backlogAtScanEnd = 0;
+    let fastWhileDraining = true;
+    const otherStages = ["reconciliation", "repricing", "repo_context_suppression", "learning_facts"] as const;
+    const lastProgress = Object.fromEntries(otherStages.map(stage => [stage, 0])) as
+      Record<typeof otherStages[number], number>;
+    let maxOtherStageGap = 0;
+    let nextTimer: {at:number;callback:()=>void}|null = null;
+    const timer: AutomaticMaintenanceCadenceTimer = {
+      now: () => syntheticNow,
+      setTimeout: (callback, delayMs) => {
+        nextTimer = {at:syntheticNow+delayMs,callback};
+        return nextTimer;
+      },
+      clearTimeout: () => { nextTimer = null; },
+    };
+    const scheduler = new CoalescingMaintenanceScheduler(async () =>
+      maintenance.runRecent({clock:()=> (repairClock += 40)}));
+    const cadence = new AutomaticMaintenanceCadence(scheduler,
+      () => captureBaselineStatus(db),
+      {timer,repairProgress:()=>{
+        const projection = buffer.projection.status();
+        const scan = projection.backfill.duplicateFactScan;
+        const repairs = automaticRepairServiceStatus(db);
+        return {pending:Object.values(projection.backlog).some(n=>n>0) ||
+            !projection.backfill.complete || !projection.backfill.parityComplete ||
+            !projection.backfill.metricComplete || !scan.complete,
+          units:Object.values(repairs.stages).reduce((sum,stage)=>sum+stage.rowsVisited,0)+
+            projection.counters.snapshotBuilds+projection.counters.expiryFacts+
+            projection.counters.compactGcItemsVisited,
+          duplicateScan:{pending:!scan.complete,cursor:scan.cursor}};
+      }});
+    cadence.start();
+    const startedAt = syntheticNow;
+    while (!buffer.projection.status().parityReady && ticks < 14_400) {
+      const due = nextTimer as {at:number;callback:()=>void}|null;
+      assert.ok(due, "duplicate-heavy scan cadence lost its pending timer");
+      nextTimer = null;
+      syntheticNow = due.at;
+      const before = automaticRepairServiceStatus(db);
+      due.callback();
+      while (cadence.status().inFlight) await new Promise<void>(resolve=>setImmediate(resolve));
+      ticks += 1;
+      const run = scheduler.status().lastRun;
+      scanRowsVisited += run?.projection?.duplicateFactScanRowsVisited ?? 0;
+      repairRowsVisited += run?.projection?.repairRowsVisited ?? 0;
+      const projection = buffer.projection.status();
+      if (!scanEndTick && projection.backfill.duplicateFactScan.cursor === factCount) {
+        scanEndTick = ticks;
+        backlogAtScanEnd = projection.backlog.repairs;
+      }
+      if (projection.backfill.duplicateFactScan.cursor === factCount &&
+          projection.backlog.repairs > 0 && cadence.status().retryClass !== "duplicate_scan") {
+        fastWhileDraining = false;
+      }
+      const after = automaticRepairServiceStatus(db);
+      for (const stage of otherStages) {
+        if (after.stages[stage].completed > before.stages[stage].completed) lastProgress[stage] = ticks;
+        maxOtherStageGap = Math.max(maxOtherStageGap, ticks-lastProgress[stage]);
+      }
+    }
+    const elapsedMs = syntheticNow-startedAt;
+    const finalCadence = cadence.status();
+    cadence.stop();
+    scheduler.stopAccepting();
+    await scheduler.waitForIdle();
+    const projection = buffer.projection.status();
+    const service = automaticRepairServiceStatus(db);
+    const finalFacts = (db.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n;
+    const staleFacts = (db.prepare(`select count(*) as n from dashboard_event_facts f
+      join buffered_events b on b.rowid=f.raw_rowid
+      where b.usage_duplicate_reason is not null`).get() as {n:number}).n;
+    const common = projection.parityReady && !projection.dirty &&
+      projection.backfill.duplicateFactScan.complete &&
+      projection.backlog.repairs === 0 && scanRowsVisited === factCount &&
+      repairRowsVisited === duplicateCount && finalFacts === factCount-duplicateCount &&
+      staleFacts === 0 && scanEndTick === 1_001 && backlogAtScanEnd >= 40_000 &&
+      fastWhileDraining && maxProjectionSliceMs < 750 &&
+      otherStages.every(stage => service.stages[stage].completed >= 150) &&
+      maxOtherStageGap <= 32 && Object.values(service.stages).every(stage => stage.failures === 0) &&
+      scheduler.status().maxConcurrentJobs === 1 && scheduler.status().overlappingJobs === 0 &&
+      scheduler.status().failedRuns === 0 && finalCadence.retryClass === "normal";
+    check(slow ? "million_duplicate_slow_rows_obey_active_budget_on_production_scheduler" :
+        "million_duplicate_fact_scan_drains_repairs_on_fast_production_cadence",
+      common && (slow
+        ? ticks <= 14_100 && elapsedMs < 60*60_000 &&
+          maxSimulatedSliceMs <= 25 + 8*injectedRepairRowMs + 1
+        : ticks <= 14_100 && elapsedMs < 60*60_000),
+      {factCount,duplicateCount,seededDuplicates,seededFacts,ticks,scanEndTick,
+        backlogAtScanEnd,scanRowsVisited,repairRowsVisited,finalFacts,staleFacts,
+        fastWhileDraining,maxProjectionSliceMs,maxSimulatedSliceMs,
+        reference,observedScanMs,observedScanRows,observedRepairMs,observedRepairRows,
+        injectedScanRowMs,injectedRepairRowMs,
+        slowestSlicePhases,slowestSliceRows,maxOtherStageGap,
+        otherStageCompleted:Object.fromEntries(otherStages.map(stage=>[stage,service.stages[stage].completed])),
+        parityReady:projection.parityReady,repairBacklog:projection.backlog.repairs,
+        elapsedMs,elapsedMinutes:elapsedMs/60_000,retryClass:finalCadence.retryClass});
+    return {scanMsPerRow:observedScanMs/Math.max(1,observedScanRows),
+      repairMsPerRow:observedRepairMs/Math.max(1,observedRepairRows)};
+  } finally {
+    maintenance.close();
+    buffer.close();
+  }
+}
+
 function readySnapshot(
   buffer: LocalEventBuffer,
   days: number,
@@ -197,6 +1242,143 @@ function dropProjectionState(db:Database.Database){
   ).all() as Array<{type:"table"|"trigger"|"index";name:string}>;
   for(const object of objects.filter((row)=>row.type==="trigger"))db.exec(`drop trigger if exists ${object.name}`);
   for(const object of objects.filter((row)=>row.type==="table"))db.exec(`drop table if exists ${object.name}`);
+}
+
+function proveMixedFactAndCompactExpiry(root:string,compactRows:number,timed:boolean){
+  const name=`mixed-expiry-${compactRows}-${timed?"timed":"unbounded"}`;
+  const file=path.join(root,`${name}.sqlite`);
+  new LocalEventBuffer(file).close();
+  const seed=new Database(file);
+  dropProjectionState(seed);
+  const observedAt=new Date(NOW.getTime()-29*DAY_MS).toISOString();
+  const insert=seed.prepare(`insert into buffered_events
+    (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at)
+    values (?,?,?,?,?,?,?,?)`);
+  seed.transaction(()=>{
+    for(let index=0;index<compactRows;index++)insert.run(
+      `${name}-${index}`,"codex","otel_span","metadata",observedAt,"{}","[]",NOW.toISOString());
+  })();
+  seed.close();
+  const buffer=new LocalEventBuffer(file);
+  try{
+    assert.equal(buffer.append(event({sessionId:name,model:"gpt-mixed-expiry",
+      observedAt,inputTokens:2,outputTokens:3})),true);
+    settle(buffer,NOW,30);
+    const compactSegments=(buffer.database.prepare(`select count(*) as n
+      from dashboard_compact_segments`).get() as {n:number}).n;
+    const ordinaryFacts=(buffer.database.prepare(`select count(*) as n
+      from dashboard_event_facts`).get() as {n:number}).n;
+    assert(compactSegments>0);
+    assert.equal(ordinaryFacts,1);
+    const advanced=new Date(NOW.getTime()+2*DAY_MS);
+    const receipts=[];
+    for(let tick=0;tick<12;tick++){
+      let activeRows=0;
+      receipts.push(timed?buffer.projection.runMaintenance(advanced,{
+        maxActiveMs:25,clock:()=>activeRows,
+        onWorkRowForProof:phase=>{if(phase==="expiry")activeRows++;},
+      }):buffer.projection.runMaintenance(advanced));
+      if(buffer.projection.status().backlog.expiryWindows===0)break;
+    }
+    settle(buffer,advanced,30);
+    const snapshot=readySnapshot(buffer,30);
+    const totals=snapshot.summary.totals as Record<string,number>;
+    const model=buffer.database.prepare(`select calls,input_tokens as inputTokens
+      from dashboard_model_window where days=30 and model='gpt-mixed-expiry'`)
+      .get() as {calls:number;inputTokens:number}|undefined;
+    const visited=receipts.reduce((sum,receipt)=>sum+receipt.expiryFacts,0);
+    check(`mixed_fact_and_compact_expiry_${timed?"timed":"unbounded"}_does_not_repeat_fact`,
+      visited===compactRows+1&&totals.events===0&&totals.inputTokens===0&&
+      (model?.calls??0)===0&&(model?.inputTokens??0)===0&&buffer.projection.status().parityReady,
+      {compactRows,compactSegments,ordinaryFacts,visited,events:totals.events,
+        inputTokens:totals.inputTokens,model,parityReady:buffer.projection.status().parityReady,
+        ticks:receipts.length});
+  }finally{buffer.close();}
+}
+
+function proveNegativeTotalPublicationGuard(root:string){
+  for(const field of ["events","input_tokens","model_calls","model_input_tokens"] as const){
+    const file=path.join(root,`negative-publication-${field}.sqlite`);
+    const buffer=new LocalEventBuffer(file);
+    try{
+      assert.equal(buffer.append(event({sessionId:`negative-${field}`,model:"gpt-guard",
+        inputTokens:4,outputTokens:5})),true);
+      settle(buffer,NOW);
+      const before=readySnapshot(buffer,30);
+      const table=field.startsWith("model_")?"dashboard_model_window":"dashboard_window_totals";
+      const column=field==="model_calls"?"calls":field==="model_input_tokens"?"input_tokens":field;
+      buffer.database.prepare(`update ${table} set ${column}=-1 where days=30`).run();
+      buffer.database.exec(`update dashboard_projection_control set dirty=1,
+        parity_ready=0 where singleton=1`);
+      buffer.projection.runMaintenance(NOW);
+      const status=buffer.projection.status();
+      const after=buffer.projection.readSnapshot(30);
+      const stored=buffer.database.prepare(`select generation,payload_json as payload
+        from dashboard_snapshots where days=30`).get() as {generation:number;payload:string};
+      const storedTotals=(JSON.parse(stored.payload) as {summary:{totals:{events:number;inputTokens:number}}})
+        .summary.totals;
+      check(`negative_${field}_total_refuses_parity_publication`,
+        !status.parityReady&&status.dirty&&status.degradedReason==="projection_negative_total"&&
+        status.lastErrorAt!==null&&stored.generation===before.generation&&
+        storedTotals.events>=0&&storedTotals.inputTokens>=0&&
+        after.kind==="ready"&&after.snapshot.projection.status==="stale",
+        {field,generationBefore:before.generation,generationAfter:stored.generation,
+          status:status.degradedReason,parityReady:status.parityReady,dirty:status.dirty,
+          storedTotals,readKind:after.kind});
+      buffer.database.prepare(`update ${table} set ${column}=? where days=30`)
+        .run(field==="events"||field==="model_calls"?1:4);
+      buffer.projection.runMaintenance(NOW);
+      const recovered=buffer.projection.status();
+      check(`corrected_${field}_total_republishes_parity`,
+        recovered.parityReady&&!recovered.dirty&&recovered.degradedReason===null&&
+        recovered.generation===before.generation+1,
+        {field,parityReady:recovered.parityReady,dirty:recovered.dirty,
+          reason:recovered.degradedReason,generation:recovered.generation});
+    }finally{buffer.close();}
+  }
+  const file=path.join(root,"negative-stored-generation.sqlite");
+  const seeded=new LocalEventBuffer(file);
+  assert.equal(seeded.append(event({sessionId:"negative-stored",model:"gpt-guard"})),true);
+  settle(seeded,NOW);
+  seeded.close();
+  const db=new Database(file);
+  const stored=db.prepare(`select payload_json as payload from dashboard_snapshots
+    where days=30`).get() as {payload:string};
+  const payload=JSON.parse(stored.payload) as {summary:{totals:{events:number}}};
+  payload.summary.totals.events=-1;
+  db.prepare(`update dashboard_snapshots set payload_json=? where days=30`)
+    .run(JSON.stringify(payload));
+  db.close();
+  const reopened=new LocalEventBuffer(file);
+  try{
+    const status=reopened.projection.status();
+    const read=reopened.projection.readSnapshot(30);
+    check("preexisting_negative_snapshot_is_quarantined_on_open",
+      !status.parityReady&&status.dirty&&status.degradedReason==="projection_negative_total"&&
+      status.lastErrorAt!==null&&read.kind==="backfilling",
+      {parityReady:status.parityReady,dirty:status.dirty,reason:status.degradedReason,
+        readKind:read.kind});
+    reopened.database.exec(`savepoint corrupted_control;
+      update dashboard_projection_control set parity_ready=1,dirty=0,
+        degraded_reason=null where singleton=1`);
+    try{
+      const corruptRead=reopened.projection.readSnapshot(30);
+      check("negative_snapshot_read_veto_survives_corrupted_green_control",
+        corruptRead.kind==="backfilling"&&
+        !corruptRead.status.parityReady&&
+        corruptRead.status.degradedReason==="projection_negative_total",
+        {readKind:corruptRead.kind,status:corruptRead.kind==="backfilling"
+          ?corruptRead.status.degradedReason:null});
+    }finally{reopened.database.exec(`rollback to corrupted_control; release corrupted_control`);}
+    reopened.projection.runMaintenance(NOW);
+    const repaired=reopened.projection.readSnapshot(30);
+    check("valid_aggregate_replaces_quarantined_negative_generation",
+      reopened.projection.status().parityReady&&repaired.kind==="ready"&&
+      repaired.snapshot.summary.totals!==undefined&&
+      (repaired.snapshot.summary.totals as {events:number}).events===1,
+      {parityReady:reopened.projection.status().parityReady,
+        readKind:repaired.kind});
+  }finally{reopened.close();}
 }
 
 function downgradeCompactProjectionToC0(db:Database.Database){
@@ -338,6 +1520,90 @@ async function main() {
   ];
 
   try {
+    if (process.argv.includes("--r10-guard-only")) {
+      proveNegativeTotalPublicationGuard(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    if (process.argv.includes("--r10-only")) {
+      proveMixedFactAndCompactExpiry(root,300,false);
+      proveMixedFactAndCompactExpiry(root,100,true);
+      proveNegativeTotalPublicationGuard(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    if (process.argv.includes("--pr419-duplicate-only")) {
+      proveDuplicateFactRepair(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
+    if (process.argv.includes("--pr419-upgrade-only")) {
+      await proveDuplicateScanUpgradeAndDrain(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
+    if (process.argv.includes("--rollback-only")) {
+      await prove044RollbackScanFence(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
+    if (process.argv.includes("--million-duplicate-only")) {
+      await proveMillionFactDuplicateRepairCadence(root);
+      console.log(JSON.stringify({status:"pass",check:checks.at(-1)?.name,
+        detail:checks.at(-1)?.detail},null,2));
+      return;
+    }
+    if (process.argv.includes("--million-scan-only")) {
+      await proveMillionFactScanCadence(root);
+      console.log(JSON.stringify({status:"pass",check:checks.at(-1)?.name,
+        detail:checks.at(-1)?.detail},null,2));
+      return;
+    }
+    if (process.argv.includes("--million-duplicate-slow-only")) {
+      const reference = await proveMillionFactDuplicateRepairCadence(root);
+      await proveMillionFactDuplicateRepairCadence(root, true, reference);
+      console.log(JSON.stringify({status:"pass",check:checks.at(-1)?.name,
+        detail:checks.at(-1)?.detail},null,2));
+      return;
+    }
+    if (process.argv.includes("--round7-only")) {
+      await proveScanSettlesUnderSteadyCapture(root);
+      proveWholeTransactionAdmission(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
+    if (process.argv.includes("--round7-budget-only")) {
+      proveWholeTransactionAdmission(root);
+      console.log(JSON.stringify({status:"pass",checks:checks.map(check=>check.name)},null,2));
+      return;
+    }
+    if (process.argv.includes("--round8-small-only")) {
+      proveTimedBackfillsUseAvailableBudget(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    if (process.argv.includes("--round8-million-only")) {
+      await proveMillionFactTimedUpgrade(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    if (process.argv.includes("--round8-only")) {
+      proveTimedBackfillsUseAvailableBudget(root);
+      await proveMillionFactTimedUpgrade(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
+    proveDuplicateFactRepair(root);
+    await proveDuplicateScanUpgradeAndDrain(root);
+    await proveScanSettlesUnderSteadyCapture(root);
+    proveWholeTransactionAdmission(root);
+    proveTimedBackfillsUseAvailableBudget(root);
+    await proveMillionFactTimedUpgrade(root);
+    await proveMillionFactScanCadence(root);
+    proveMillionFactVersionFenceCost(root);
+    const millionDuplicateReference = await proveMillionFactDuplicateRepairCadence(root);
+    await proveMillionFactDuplicateRepairCadence(root, true, millionDuplicateReference);
+    await prove044RollbackScanFence(root);
     buffer.recordRepoLabel(repoA, "proof/repo-a");
     buffer.recordRepoLabel(repoB, "proof/repo-b");
     buffer.setPriorityRepo(repoA, URL_SENTINEL);
@@ -688,6 +1954,10 @@ async function main() {
       {receipts:compactExpiryReceipts.map((receipt)=>({expiry:receipt.expiryFacts,backlog:receipt.backlog.expiryWindows})),
         finalGeneration:compactExpiryAfter.generation});
     compactExpiry.close();
+
+    proveMixedFactAndCompactExpiry(root,300,false);
+    proveMixedFactAndCompactExpiry(root,100,true);
+    proveNegativeTotalPublicationGuard(root);
 
     // Generic sessionless zero-value spans dominate the live raw history. They
     // must backfill into compressed segments, not one six-index fact per span.
@@ -4135,6 +5405,16 @@ async function main() {
       checks: checks.length,
       names: checks.map((entry) => entry.name),
       evidence:{
+        duplicateScanUpgrade:checks.find((entry)=>entry.name===
+          "duplicate_scan_over_3000_facts_drains_during_startup")?.detail,
+        versionFenceCost:checks.find((entry)=>entry.name===
+          "million_fact_version_fence_is_control_row_update_without_rebuild")?.detail,
+        millionScanCadence:checks.find((entry)=>entry.name===
+          "million_fact_scan_uses_bounded_fast_ticks_and_preserves_capture_turns")?.detail,
+        millionDuplicateScanCadence:checks.find((entry)=>entry.name===
+          "million_duplicate_fact_scan_drains_repairs_on_fast_production_cadence")?.detail,
+        millionDuplicateSlowCadence:checks.find((entry)=>entry.name===
+          "million_duplicate_slow_rows_obey_active_budget_on_production_scheduler")?.detail,
         idleRestartReads:restartReads,
         missedClaude:missedClaudeEvidence,
         compactStorage:checks.find((entry)=>entry.name==="generic_zero_value_spans_use_bounded_compressed_projection_storage")?.detail,

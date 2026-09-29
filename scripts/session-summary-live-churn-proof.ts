@@ -249,6 +249,10 @@ async function initialCatchUp(buffer: LocalEventBuffer, churn?: ChurnSchedule) {
     // Later passes retain the production 5,000-row summary cap.
     const cycle = await daemonCycle(buffer, churn && pass === 1 ? 1 : undefined);
     updates.push(...cycle.updates.values());
+    for (const pendingId of cycle.result?.pendingSummarySessionIds ?? []) {
+      assert.ok(!cycle.sent.some((row) => row.session.id === pendingId),
+        "a partial accumulator cannot be sent");
+    }
     elapsedMs += [...cycle.updates.values()].reduce((sum, update) => sum + update.durationMs, 0);
     const rows = rowCount(buffer);
     const bound = drainBound(rows, elapsedMs) + (churn ? 1 : 0);
@@ -273,26 +277,25 @@ async function proveBusySession(size: number, ordinal: number) {
     let previousHorizon = loadDaemonSessionSyncState(buffer.database).lastSuccessfulUntil;
     const activePasses: number[] = [];
     const retryMarks: number[] = [];
-    const fallbackPasses: number[] = [];
+    const repairRows: number[] = [];
     let priorScannedCorrections = 0;
     for (const checkpoint of [3, 6]) {
       while (churn.marks < checkpoint) await churn.waitForTick(churn.marks + 1);
       const beforeFallbacks = sessionSummaryCounters(buffer.database).fallbackRecomputes;
       const { cycle, passes, updates, retryMarks: duringRetries } = await initialCatchUp(buffer, churn);
-      const fallbacks = updates.filter((update) => update.fullRecompute);
+      const read = updates.reduce((sum, update) => sum + update.rowsRead, 0);
       const scannedSinceLastCycle = churn.scannedCorrections.length - priorScannedCorrections;
-      assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes - beforeFallbacks,
-        fallbacks.length);
+      assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes, beforeFallbacks,
+        "queued scanned corrections must repair segments without restarting the session");
+      assert.ok(updates.every((update) => !update.fullRecompute));
       if (scannedSinceLastCycle > 0) {
-        assert.ok(fallbacks.length > 0, "a scanned correction must restart the durable prefix");
-        for (const fallback of fallbacks) assert.equal(fallback.fallbackReason, "ledger_mutation");
-      } else {
-        assert.equal(fallbacks.length, 0, "unscanned corrections must remain incremental");
+        assert.ok(read > 0, "a scanned correction must cause a bounded repair read");
       }
+      assert.ok(updates.every((update) => update.rowsRead <= SESSION_SUMMARY_DEFAULT_MAX_ROWS));
       priorScannedCorrections = churn.scannedCorrections.length;
       activePasses.push(passes);
       retryMarks.push(duringRetries);
-      fallbackPasses.push(fallbacks.length);
+      repairRows.push(read);
       assert.ok(passes >= 2 && duringRetries >= 1,
         JSON.stringify({ size, checkpoint, passes, duringRetries }));
       assert.ok(cycle.result?.ok && cycle.result.summaryComplete,
@@ -311,29 +314,27 @@ async function proveBusySession(size: number, ordinal: number) {
     if (churn.marks > marksBeforeStop) {
       const cleanup = await initialCatchUp(buffer);
       cleanupPasses = cleanup.passes;
-      const cleanupFallbacks = cleanup.updates.filter((update) => update.fullRecompute);
+      const cleanupRead = cleanup.updates.reduce((sum, update) => sum + update.rowsRead, 0);
       const scannedDuringStop = churn.scannedCorrections.length - priorScannedCorrections;
       if (scannedDuringStop > 0) {
-        assert.ok(cleanupFallbacks.length > 0, "the stopped tail must rebuild a scanned correction");
-        for (const fallback of cleanupFallbacks) assert.equal(fallback.fallbackReason, "ledger_mutation");
-      } else {
-        assert.equal(cleanupFallbacks.length, 0);
+        assert.ok(cleanupRead > 0, "the stopped tail must repair a scanned correction");
       }
-      fallbackPasses.push(cleanupFallbacks.length);
+      assert.ok(cleanup.updates.every((update) => !update.fullRecompute &&
+        update.rowsRead <= SESSION_SUMMARY_DEFAULT_MAX_ROWS));
+      repairRows.push(cleanupRead);
       assert.ok(cleanup.cycle.result?.ok && cleanup.cycle.result.summaryComplete);
       assert.deepEqual(cleanup.cycle.sent.find((row) => row.session.id === session),
         expectedWire(buffer, session, cleanup.cycle.until));
     }
     assert.ok(churn.scannedCorrections.length > 0,
       "the fixed schedule must correct a previously scanned row");
-    assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes - baseRecomputes,
-      fallbackPasses.reduce((sum, count) => sum + count, 0));
+    assert.equal(sessionSummaryCounters(buffer.database).fallbackRecomputes, baseRecomputes);
     assert.ok(activeElapsedMs >= 6_000);
     assert.ok(churn.marks >= 6 && churn.appends >= 4);
     assert.equal(churn.appends, 2 * Math.ceil(churn.marks / 3));
     completion.check(`daemon_${size}_rows_1_mark_per_second_40_appends_per_minute`);
     console.log(JSON.stringify({ size, initialPasses, activeCycles: 2, activePasses, retryMarks,
-      fallbackPasses, scannedCorrections: churn.scannedCorrections,
+      repairRows, scannedCorrections: churn.scannedCorrections,
       marks: churn.marks, appends: churn.appends, activeElapsedMs, cleanupPasses,
       horizon: previousHorizon }));
   } finally { buffer.close(); }
@@ -350,14 +351,16 @@ async function proveHistoricalAndReadRace() {
     buffer.database.prepare("update buffered_events set output_tokens = 7 where id = ?").run(ids[0]);
     assert.ok(revision(buffer, session) > before);
     const first = await updateSessionSummary(buffer.database, session, new Date().toISOString(), {
-      read: directRead,
+      read: directRead, maxRows: 1_000,
     });
     assert.equal(first.complete, false);
-    assert.equal(state(buffer, session).mode, "fallback");
+    assert.equal(first.snapshot, null, "a partial segment repair cannot be sent");
+    assert.equal(state(buffer, session).mode, "incremental");
     const afterFirst = revision(buffer, session);
     buffer.database.prepare("update buffered_events set output_tokens = 9 where id = ?").run(ids.at(-1));
     buffer.database.prepare("delete from buffered_events where id = ?").run(ids.at(-2));
-    assert.equal(revision(buffer, session), afterFirst);
+    assert.ok(revision(buffer, session) > afterFirst,
+      "subsequent scanned edits must remain visible during segment repair");
     const final = await completeSummary(buffer, session, first, (result) => {
       assert.equal(result.fullRecompute, false);
     });
@@ -367,11 +370,11 @@ async function proveHistoricalAndReadRace() {
     })[0]);
     completion.check("unscanned_historical_edit_and_erasure_keep_cursor_and_match_full_rebuild");
 
-    // Moving an as-yet-unread row behind the historical cursor is different:
-    // it would be missed by the seek, so this one must restart the session.
+    // Move a row behind the historical cursor while a different segment is
+    // being repaired. The rowid repair queue must still produce an exact wire.
     buffer.database.prepare("update buffered_events set input_tokens = 12 where id = ?").run(ids[0]);
     let beforeMove = await updateSessionSummary(buffer.database, session, new Date().toISOString(), {
-      read: directRead,
+      read: directRead, maxRows: 1_000,
     });
     let preMovePasses = 1;
     let preMoveElapsedMs = beforeMove.durationMs;
@@ -385,6 +388,7 @@ async function proveHistoricalAndReadRace() {
       preMoveElapsedMs += beforeMove.durationMs;
     }
     assert.equal(beforeMove.complete, false);
+    assert.equal(beforeMove.snapshot, null);
     const cursor = JSON.parse(state(buffer, session).accumulatorJson) as { cursorObservedAt: string | null };
     assert.ok(cursor.cursorObservedAt && cursor.cursorObservedAt > "2026-01-01T00:00:00.000Z",
       JSON.stringify({ beforeMove, cursor }));
@@ -395,23 +399,26 @@ async function proveHistoricalAndReadRace() {
     const firstMoved = await updateSessionSummary(buffer.database, session, new Date().toISOString(), {
       read: directRead,
     });
-    assert.equal(firstMoved.fullRecompute, true);
-    const moved = await completeSummary(buffer, session, firstMoved);
+    assert.equal(firstMoved.fullRecompute, false,
+      "moving a scanned row repairs bounded segments without a session restart");
+    const moved = await completeSummary(buffer, session, firstMoved, (update) => {
+      assert.equal(update.fullRecompute, false);
+    });
     assert.equal(moved.complete, true);
     assert.deepEqual(moved.snapshot, collectSessionSnapshots(buffer.database, {
       sessionIds: [session], until: new Date().toISOString(),
     })[0]);
-    completion.check("row_moved_behind_historical_cursor_restarts_only_that_session");
+    completion.check("row_moved_behind_historical_cursor_repairs_only_that_session");
 
     // A write after the worker has read a slice but before its state commit
     // must discard that slice, even though the old durable cursor calls it
     // unscanned. This exercises the activity fence without a timing race.
     buffer.database.prepare("update buffered_events set input_tokens = 13 where id = ?").run(ids[0]);
     const restarted = await updateSessionSummary(buffer.database, session, new Date().toISOString(), {
-      read: directRead,
+      read: directRead, maxRows: 1_000,
     });
     assert.equal(restarted.complete, false);
-    const committedBeforeRace = JSON.parse(state(buffer, session).accumulatorJson).events;
+    const committedBeforeRace = state(buffer, session).accumulatorJson;
     let injected = false;
     const beforeActivity = activity(buffer, session);
     const beforeRevision = revision(buffer, session);
@@ -421,18 +428,20 @@ async function proveHistoricalAndReadRace() {
         if (!injected && rows.length > 0 &&
             typeof (rows[0] as { outputTokens?: unknown }).outputTokens === "number") {
           injected = true;
-        const id = (rows[0] as { id: string }).id;
+          const id = (rows[0] as { id: string }).id;
           buffer.database.prepare("update buffered_events set output_tokens = 17 where id = ?").run(id);
         }
         return rows;
       },
     });
     assert.equal(injected, true);
-    assert.equal(revision(buffer, session), beforeRevision);
+    assert.ok(revision(buffer, session) > beforeRevision,
+      "the scanned row changed during a repair read");
     assert.ok(activity(buffer, session) > beforeActivity);
     assert.equal(raced.complete, false);
-    assert.equal(raced.fallbackReason, "ledger_edit_during_slice");
-    assert.equal(JSON.parse(state(buffer, session).accumulatorJson).events, committedBeforeRace);
+    assert.equal(raced.snapshot, null, "a raced slice cannot reach the wire");
+    assert.equal(raced.fallbackReason, "ledger_mutation_during_slice");
+    assert.equal(state(buffer, session).accumulatorJson, committedBeforeRace);
     const recovered = await completeSummary(buffer, session, raced);
     assert.equal(recovered.complete, true);
     assert.deepEqual(recovered.snapshot, collectSessionSnapshots(buffer.database, {

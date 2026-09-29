@@ -98,12 +98,34 @@ async function main() {
     assert.ok(answers.length > 0);
     assert.equal(refusals.length, 0, "steady OTLP intake must not be refused during one legacy migration slice");
 
+    // The upgrade scan works over existing dashboard facts. Populate this
+    // synthetic ledger before timing it alongside the bounded outbox slices.
+    // The legacy upload rows lack privacy-generation metadata, so they are
+    // not eligible for a new fact. Seed their historical facts directly to
+    // model a pre-upgrade projection without changing the outbox workload.
+    intake.database.exec(`insert or ignore into dashboard_event_facts
+      (projection_id,raw_rowid,source,event_type,observed_at)
+      select 'contention-legacy-'||rowid,rowid,source,event_type,observed_at
+      from buffered_events where rowid<=${rows};
+      delete from dashboard_projection_repairs;`);
+    const projected = (intake.database.prepare(`select count(*) as n from dashboard_event_facts`)
+      .get() as {n:number}).n;
+    assert.ok(projected >= rows, "scan timing fixture needs existing facts");
+    intake.database.exec(`update codex_duplicate_fact_scan set cursor_raw_rowid=0,complete=0
+      where singleton=1`);
+
     // The bounded daemon slices must still finish the cursor, not merely
     // avoid the lock by abandoning pre-outbox rows.
     intake.delivery.configure({ enabled: true, limits: config.delivery });
     const sliceMs: number[] = [];
+    const scanSliceMs: number[] = [];
     let complete = false;
     for (let pass = 0; pass < 100 && !complete; pass++) {
+      if (!intake.projection.status().backfill.duplicateFactScan.complete) {
+        const scanAt = performance.now();
+        intake.projection.runMaintenance();
+        scanSliceMs.push(performance.now() - scanAt);
+      }
       const at = performance.now();
       const result = intake.delivery.migrateLegacy({
         maxRows: 256, maxBytes: 1_048_576, maxWriterMs: 100,
@@ -111,9 +133,16 @@ async function main() {
       sliceMs.push(performance.now() - at);
       complete = result.complete;
     }
-    console.log(JSON.stringify({ cursorComplete: complete, slices: sliceMs.length, maxSliceMs: Math.max(...sliceMs) }));
+    console.log(JSON.stringify({ cursorComplete: complete, slices: sliceMs.length,
+      maxSliceMs: Math.max(...sliceMs),scanSlices:scanSliceMs.length,
+      maxScanSliceMs:Math.max(...scanSliceMs) }));
     assert.ok(complete, "the legacy cursor must complete across bounded slices");
     assert.ok(Math.max(...sliceMs) < 750, "one bounded slice must fit the intake busy budget");
+    assert.ok(scanSliceMs.length >= 2 &&
+      intake.projection.status().backfill.duplicateFactScan.complete,
+      "the duplicate-fact scan must complete beside the outbox slices");
+    assert.ok(Math.max(...scanSliceMs) < 750,
+      "one duplicate-fact scan slice must fit the intake busy budget");
 
     // Another writer can still hold SQLite for longer than a request. The
     // collector must mark that 503 retryable for an OTLP exporter.
