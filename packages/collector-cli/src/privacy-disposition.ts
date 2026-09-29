@@ -125,29 +125,6 @@ export function terminalPrivacyEligibilitySql(
     }
   }
 
-  const outboxColumns = columns(db, "upload_outbox");
-  if (
-    rawColumns.has("privacy_generation") &&
-    outboxColumns.has("raw_id") &&
-    outboxColumns.has("raw_created_at") &&
-    outboxColumns.has("raw_generation")
-  ) {
-    terms.push(
-      `not exists (
-         select 1 from upload_outbox privacy_outbox
-         where privacy_outbox.raw_rowid = ${alias}.rowid
-           and (
-             privacy_outbox.raw_id is null or
-             privacy_outbox.raw_created_at is null or
-             privacy_outbox.raw_generation is null or
-             ${alias}.privacy_generation is null or
-             privacy_outbox.raw_id is not ${alias}.id or
-             privacy_outbox.raw_created_at is not ${alias}.created_at or
-             privacy_outbox.raw_generation is not ${alias}.privacy_generation
-           )
-       )`,
-    );
-  }
   const predicate = terms.length > 0 ? `(${terms.join(" and ")})` : "1 = 1";
   cache.predicates.set(cacheKey, predicate);
   return predicate;

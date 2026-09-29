@@ -20,9 +20,12 @@ try {
     observedAt: "2000-01-01T00:00:00.000Z", actionClass: "other",
     inputTokens: 1, outputTokens: 1, metadata: { proof: "atomicity" },
   });
+  buffer.delivery.configure({ enabled: false });
   assert.equal(buffer.append(raw), true);
   db.prepare("update buffered_events set created_at=? where id=?")
     .run("2000-01-01T00:00:00.000Z", raw.id);
+  buffer.delivery.configure({ enabled: true });
+  assert.equal(buffer.delivery.repairRawById(raw.id).enqueued, 1);
   assert.equal((db.prepare("select count(*) as n from upload_outbox where raw_id=?")
     .get(raw.id) as { n: number }).n, 1);
   buffer.transitionWorkspace("old-workspace", "new-workspace", "review-device");
@@ -69,9 +72,14 @@ try {
     const localRaw = aiInteractionEventSchema.parse({ ...raw,
       id: "00000000-0000-4000-8000-000000000102",
       sessionId: "00000000-0000-4000-8000-000000000102" });
+    local.delivery.configure({ enabled: false });
     assert.equal(local.append(localRaw), true);
-    localDb.prepare("update buffered_events set created_at=?,data_mode='evidence' where id=?")
+    localDb.prepare("update buffered_events set created_at=? where id=?")
       .run("2000-01-01T00:00:00.000Z", localRaw.id);
+    local.delivery.configure({ enabled: true });
+    assert.equal(local.delivery.repairRawById(localRaw.id).enqueued, 1);
+    localDb.prepare("update buffered_events set data_mode='evidence' where id=?")
+      .run(localRaw.id);
     local.delivery.configure({ enabled: false });
     const localCount = (table: string) => (localDb.prepare(`select count(*) as n from ${table}`)
       .get() as { n: number }).n;

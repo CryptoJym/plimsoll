@@ -2008,7 +2008,8 @@ export class LocalEventBuffer {
        order by suppressed_at, context_id limit 1`,
     );
     const selectRows = this.db.prepare(
-      `select l.event_id as eventId, e.rowid
+      `select l.event_id as eventId, e.rowid,
+         e.created_at as createdAt,e.privacy_generation as generation
        from repo_context_event_links l indexed by idx_repo_context_event_links_cleanup
        left join buffered_events e on e.id = l.event_id
        where l.context_id = ? and l.suppression_cleaned = 0
@@ -2016,7 +2017,9 @@ export class LocalEventBuffer {
     );
     const clearOutbox = this.db.prepare(
       `update upload_outbox set repo_hash = null, branch_hash = null, updated_at = ?
-       where raw_rowid = ? and sealed_envelope_json is null and attempt_count = 0`,
+       where raw_rowid = ? and raw_id = ? and raw_created_at = ?
+         and raw_generation is ?
+         and sealed_envelope_json is null and attempt_count = 0`,
     );
     const clearRow = this.db.prepare(
       `update buffered_events set repo_hash = null, branch_hash = null, head_sha = null
@@ -2049,10 +2052,13 @@ export class LocalEventBuffer {
       const rows = selectRows.all(context.contextId, bounded - rowsVisited) as Array<{
         eventId: string;
         rowid: number | null;
+        createdAt: string | null;
+        generation: string | null;
       }>;
       for (const row of rows) {
         rowsVisited += 1;
-        if (row.rowid !== null) clearOutbox.run(now, row.rowid);
+        if (row.rowid !== null) clearOutbox.run(now, row.rowid,
+          row.eventId, row.createdAt, row.generation);
         rowsCleared += clearRow.run(row.eventId).changes;
         markCleaned.run(row.eventId, context.contextId);
       }
@@ -3172,7 +3178,9 @@ export class LocalEventBuffer {
     // the derived delivery id. A linked row can share that id with another raw.
     const activeOutbox = `(exists (
       select 1 from upload_outbox o
-      where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
+      where o.raw_rowid = e.rowid and (o.raw_id is null or
+        (o.raw_id = e.id and o.raw_created_at = e.created_at
+          and o.raw_generation is e.privacy_generation))
     ) or exists (
       select 1 from upload_outbox o where o.delivery_id = retention_delivery_id(e.id)
         and o.raw_rowid is null and o.raw_id is null
@@ -3279,14 +3287,17 @@ export class LocalEventBuffer {
         if (row.workspaceId !== this.workspaceId || row.deviceId !== this.deviceId) {
           // Close one linked delivery per visit. A raw row with more than one
           // legacy delivery is revisited by the bounded retention cursor.
-          if (this.delivery.retirePriorAudienceRaw(row.rawRowid, row.eventId, now.toISOString())) {
+          if (this.delivery.retirePriorAudienceRaw(row.rawRowid, row.eventId,
+            row.rawCreatedAt, row.rawGeneration, row.workspaceId, row.deviceId,
+            now.toISOString())) {
             retirementPending = true;
             continue;
           }
         }
         if (!row.uploadEligible) {
           if (this.delivery.retireIneligibleRaw(row.rawRowid, row.eventId,
-            row.dataMode, row.privacyDisposition, row.usageDuplicateReason, now.toISOString())) {
+            row.rawCreatedAt, row.rawGeneration, row.dataMode,
+            row.privacyDisposition, row.usageDuplicateReason, now.toISOString())) {
             retirementPending = true;
             continue;
           }

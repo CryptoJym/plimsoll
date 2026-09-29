@@ -11,7 +11,7 @@ import {
   collectorBufferPath,
   collectorLogPath,
 } from "./config";
-import { ensureUuidEventId } from "./delivery-id";
+import { deterministicEventId, ensureUuidEventId } from "./delivery-id";
 export { ensureUuidEventId, POSTGRES_UUID_RE } from "./delivery-id";
 import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
@@ -57,10 +57,23 @@ export function collisionSafeDeliveryId(rawId: string, attempt: number): string 
     ensureUuidEventId(`workspace-backfill-collision|${rawId}|${attempt}`).id;
 }
 
-export function isCollisionSafeDeliveryId(rawId: string, deliveryId: string): boolean {
+/** A reused caller ID gets a namespace tied to its raw incarnation. */
+export function incarnationDeliveryId(rawId: string, createdAt: string,
+  generation: string | null, attempt = 0): string {
+  return deterministicEventId(["collector-raw-incarnation-v1",
+    JSON.stringify([rawId, createdAt, generation, attempt])]);
+}
+
+export function isCollisionSafeDeliveryId(rawId: string, deliveryId: string,
+  createdAt?: string, generation?: string | null): boolean {
   if (ensureUuidEventId(rawId).id === deliveryId) return true;
   for (let attempt = 1; attempt < 32; attempt++) {
     if (collisionSafeDeliveryId(rawId, attempt) === deliveryId) return true;
+  }
+  if (createdAt !== undefined && generation !== undefined) {
+    for (let attempt = 0; attempt < 32; attempt++) {
+      if (incarnationDeliveryId(rawId, createdAt, generation, attempt) === deliveryId) return true;
+    }
   }
   return false;
 }

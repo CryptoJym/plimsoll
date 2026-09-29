@@ -517,6 +517,10 @@ try {
     db.prepare("update buffered_events set created_at=? where id in (?,?)")
       .run(oldCreatedAt, receiptOnly.id, activeAfterAck.id);
     db.prepare("delete from upload_outbox where delivery_id=?").run(receiptOnly.id);
+    // The fixture backdates the raw after append. Recreate its active delivery
+    // with the same creation time so the test still exercises one incarnation.
+    db.prepare("delete from upload_outbox where delivery_id=?").run(activeAfterAck.id);
+    assert.equal(buffer.delivery.repairRawById(activeAfterAck.id).enqueued, 1);
     db.prepare("update buffered_events set uploaded_at=? where id=?").run(at, activeAfterAck.id);
     for (const row of [receiptOnly, activeAfterAck])
       receiptForRaw(db, row.id, row.id, "acknowledged", "remote_acknowledged", "success", at);

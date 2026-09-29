@@ -72,6 +72,12 @@ jobs:
           pnpm proof:retention-null-generation-privacy
           pnpm proof:retention-upgrade-downgrade
           pnpm proof:retention-reused-id-downgrade
+          pnpm proof:retention-repeated-reuse-downgrade
+          pnpm proof:retention-reused-id-privacy-collision
+          pnpm proof:retention-reused-id-privacy-rowid
+          pnpm proof:retention-repeated-reuse-property
+          pnpm proof:retention-lease-lineage-aba
+          pnpm proof:retention-receipt-migration-crash
           pnpm proof:retention-0739-privacy
           pnpm proof:retention-0739-delivery
           pnpm proof:retention-0739-v44-rollback

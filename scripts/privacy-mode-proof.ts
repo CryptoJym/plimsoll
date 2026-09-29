@@ -748,7 +748,7 @@ async function main() {
   record(
     "canonical_presealed_metadata_envelope_cannot_override_linked_evidence_row",
     staleReceipts.length === 2 &&
-      staleReceipts.every((receipt) => receipt?.reason === "local_evidence_quarantined") &&
+      staleReceipts.every((receipt) => receipt === undefined) &&
       evidenceRow.uploadedAt === null &&
       legacyUploadBodies.length === 1 &&
       legacyUploadBodies.every((body) => !hasPrivateTerm(body)),
@@ -765,16 +765,16 @@ async function main() {
       legacyUpload.uploadedEvents === 1 &&
       evidenceRow.uploadedAt === null &&
       quarantineReceipt?.reason === "local_evidence_quarantined" &&
-      staleReceipts.every((receipt) => receipt?.reason === "local_evidence_quarantined") &&
-      lineageReceipts[0]?.reason === "local_privacy_violation" &&
-      lineageReceipts[1]?.reason === "local_privacy_violation" &&
+      staleReceipts.every((receipt) => receipt === undefined) &&
+      lineageReceipts[0] === undefined &&
+      lineageReceipts[1] === undefined &&
       lineageReceipts[2]?.reason === "local_evidence_quarantined" &&
-      activeInvalidRows === 0 &&
+      activeInvalidRows === 5 &&
       statelessUpload.uploadedEvents === 0 &&
       statelessBodies.length === 0 &&
       reopenUpload.uploadedEvents === 0 &&
       reopenUploadBodies.length === 0 &&
-      reopenedInvalidRows === 0 &&
+      reopenedInvalidRows === 5 &&
       (history.audit.skipped.local_evidence_quarantine_migration_required ?? 0) +
         (history.audit.skipped.local_privacy_terminal ?? 0) === 2 &&
       history.sentEvents === 1 &&
@@ -1045,6 +1045,11 @@ async function main() {
       .prepare(`select privacy_generation as generation from buffered_events where rowid = ?`)
       .get(recycledRowid) as { generation: string }
   ).generation;
+  const recycledState = () => recycledBuffer.database.prepare(
+    `select privacy_disposition as disposition,uploaded_at as uploadedAt
+     from buffered_events where rowid=?`,
+  ).get(recycledRowid);
+  const rawStates: unknown[] = [recycledState()];
   const recycledPrivacySql = terminalPrivacyEligibilitySql(
     recycledBuffer.database,
     "buffered_events",
@@ -1056,7 +1061,8 @@ async function main() {
     )
     .all() as Array<{ detail: string }>;
   const recycledPlanText = recycledPlan.map((row) => row.detail).join("\n");
-  const recycledMarkUploaded = recycledBuffer.markUploaded([recycledId]);
+  const recycledListed = recycledBuffer.list().some((row) => row.id === recycledId);
+  rawStates.push(recycledState());
   const recycledSnapshots = collectSessionSnapshots(recycledBuffer.database, {
     until: "2026-07-17T12:13:00.000Z",
   });
@@ -1070,6 +1076,7 @@ async function main() {
       });
     },
   });
+  rawStates.push(recycledState());
   for (let pass = 0; pass < 4; pass += 1) {
     recycledBuffer.projection.runMaintenance(new Date("2026-07-17T12:13:00.000Z"));
   }
@@ -1082,6 +1089,14 @@ async function main() {
   const recycledReceipt = recycledBuffer.database
     .prepare(`select reason from upload_receipts where delivery_id = ?`)
     .get(recycledId) as { reason: string } | undefined;
+  const recycledDeliveries = recycledBuffer.database.prepare(
+    `select delivery_id as deliveryId, raw_generation as generation, state
+     from upload_outbox where raw_id=? order by delivery_id`,
+  ).all(recycledId) as Array<{ deliveryId: string; generation: string; state: string }>;
+  const recycledReceipts = recycledBuffer.database.prepare(
+    `select delivery_id as deliveryId,raw_generation as generation,reason
+     from upload_receipts order by delivery_id`,
+  ).all() as Array<{ deliveryId: string; generation: string; reason: string }>;
   const recycledDashboardFacts = (
     recycledBuffer.database
       .prepare(`select count(*) as n from dashboard_event_facts where raw_rowid = ?`)
@@ -1102,33 +1117,135 @@ async function main() {
     },
   });
   record(
-    "recycled_rowid_same_id_and_created_at_cannot_resurrect_stale_envelope",
+    "recycled_rowid_same_id_and_created_at_preserves_both_incarnations",
     oldGeneration !== newGeneration &&
-      recycledMarkUploaded === 0 &&
-      recycledSnapshots.length === 0 &&
-      recycledUpload.uploadedEvents === 0 &&
-      recycledBodies.length === 0 &&
-      recycledRaw.uploadedAt === null &&
-      recycledRaw.disposition === "local_privacy_violation" &&
-      recycledReceipt?.reason === "local_privacy_violation" &&
-      recycledDashboardFacts === 0 &&
+      recycledListed &&
+      recycledSnapshots.reduce((sum, row) => sum + row.inputTokens, 0) === 31 &&
+      recycledUpload.uploadedEvents === 1 &&
+      recycledBodies.length === 1 &&
+      recycledBodies.every((body) => !hasPrivateTerm(body)) &&
+      recycledRaw.uploadedAt !== null &&
+      recycledRaw.disposition === null &&
+      recycledReceipt === undefined &&
+      recycledDeliveries.length === 1 &&
+      recycledDeliveries[0]?.generation === oldGeneration &&
+      recycledDeliveries[0]?.state === "pending" &&
+      recycledReceipts.length === 1 &&
+      recycledReceipts[0]?.generation === newGeneration &&
+      recycledReceipts[0]?.reason === "remote_acknowledged" &&
+      recycledDashboardFacts === 1 &&
       recycledReopen.uploadedEvents === 0 &&
       recycledReopenBodies.length === 0 &&
-      recycledPlanText.includes("idx_upload_outbox_raw_rowid") &&
-      !recycledPlanText.includes("SCAN privacy_outbox") &&
+      !recycledPlanText.includes("privacy_outbox") &&
       !recycledPlanText.includes("SCAN privacy_receipt"),
     {
       generationChanged: oldGeneration !== newGeneration,
-      publicMarkedUploaded: recycledMarkUploaded,
+      newRawListed: recycledListed,
       sessionTokens: recycledSnapshots.reduce((sum, row) => sum + row.inputTokens, 0),
       wireCalls: recycledBodies.length,
       reopenWireCalls: recycledReopenBodies.length,
       receipt: recycledReceipt?.reason ?? null,
+      deliveries: recycledDeliveries,
+      receipts: recycledReceipts,
+      rawUploadedAt: recycledRaw.uploadedAt,
+      rawDisposition: recycledRaw.disposition,
+      uploadCount: recycledUpload.uploadedEvents,
+      rawStates,
       dashboardFacts: recycledDashboardFacts,
       indexedPrivacyPlan: recycledPlanText,
     },
   );
   recycledBuffer.close();
+
+  // A legacy outbox may retain only a rowid. Reusing that location must not
+  // suppress a later metadata raw or turn its successful ACK into a privacy
+  // dead letter; the partial old copy remains unresolved on reopen.
+  const partialLedger = path.join(root, "partial-rowid-reuse.sqlite");
+  let partialBuffer = new LocalEventBuffer(partialLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const partialId = "11711711-1111-4111-8111-111111111134";
+  const partialAt = "2026-07-17T12:14:00.000Z";
+  const partialEvent = aiInteractionEventSchema.parse({ ...safeEvent,
+    id: partialId, observedAt: partialAt,
+    sessionId: "11711711-1111-4111-8111-111111111135",
+  });
+  const partialDb = partialBuffer.database;
+  const partialOld = partialDb.prepare(`insert into buffered_events
+    (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at)
+    values (?, 'codex', 'user_prompt_submit', 'evidence', ?, ?, '[]', ?)`).run(
+    partialId, partialAt, JSON.stringify({ ...evidenceEvent,
+      id: partialId, observedAt: partialAt }), partialAt);
+  const partialRowid = Number(partialOld.lastInsertRowid);
+  const partialEnvelope = canonicalMetadataEnvelope(partialId, partialAt);
+  partialDb.prepare(`insert into upload_outbox
+    (delivery_id,raw_rowid,base_envelope_json,base_bytes,
+     sealed_envelope_json,sealed_bytes,state,attempt_count,next_attempt_at,
+     last_failure_class,created_at,updated_at)
+    values (?,?,?,?,?,?,'pending',0,?,'none',?,?)`).run(
+    partialId, partialRowid, partialEnvelope, Buffer.byteLength(partialEnvelope),
+    partialEnvelope, Buffer.byteLength(partialEnvelope), partialAt, partialAt, partialAt);
+  partialDb.prepare("delete from buffered_events where rowid=?").run(partialRowid);
+  partialDb.prepare(`insert into buffered_events
+    (rowid,id,source,event_type,data_mode,observed_at,payload_json,
+     suppressed_fields_json,created_at,session_id,input_tokens,output_tokens)
+    values (? ,?,'codex','assistant_response','metadata',?,?,'[]',?,?,1,1)`).run(
+    partialRowid, partialId, partialAt, JSON.stringify(partialEvent),
+    partialAt, partialEvent.sessionId);
+  const partialNewGeneration = (partialDb.prepare(
+    "select privacy_generation as generation from buffered_events where rowid=?",
+  ).get(partialRowid) as { generation: string }).generation;
+  const partialListed = partialBuffer.list().some((row) => row.id === partialId);
+  const partialRepair = partialBuffer.delivery.repairRawById(partialId);
+  const partialBodies: string[] = [];
+  const partialUpload = await uploadBufferedEvents(metadataConfig, partialBuffer, {
+    fetchImpl: async (_input, init) => {
+      partialBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify(acceptedFixtureDelivery(
+        String(init?.body ?? ""), metadataConfig.installKey)), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const partialReceipt = partialDb.prepare(`select raw_generation as generation,
+    reason from upload_receipts where raw_id=? and raw_generation=?`).get(
+    partialId, partialNewGeneration) as { generation: string; reason: string } | undefined;
+  const partialOldPending = (partialDb.prepare(
+    "select state from upload_outbox where delivery_id=?",
+  ).get(partialId) as { state: string } | undefined)?.state;
+  const partialUploadedAt = (partialDb.prepare(
+    "select uploaded_at as uploadedAt from buffered_events where rowid=?",
+  ).get(partialRowid) as { uploadedAt: string | null }).uploadedAt;
+  partialBuffer.close();
+  partialBuffer = new LocalEventBuffer(partialLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const partialReopenBodies: string[] = [];
+  const partialReopen = await uploadBufferedEvents(metadataConfig, partialBuffer, {
+    fetchImpl: async (_input, init) => {
+      partialReopenBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify(acceptedFixtureDelivery(
+        String(init?.body ?? ""), metadataConfig.installKey)), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const partialStillPending = (partialBuffer.database.prepare(
+    "select state from upload_outbox where delivery_id=?",
+  ).get(partialId) as { state: string } | undefined)?.state;
+  record("partial_legacy_rowid_link_cannot_block_new_incarnation",
+    partialListed && partialRepair.enqueued === 1 &&
+      partialUpload.uploadedEvents === 1 && partialBodies.length === 1 &&
+      partialBodies.every((body) => !hasPrivateTerm(body)) &&
+      partialReceipt?.reason === "remote_acknowledged" &&
+      partialUploadedAt !== null && partialOldPending === "pending" &&
+      partialReopen.uploadedEvents === 0 && partialReopenBodies.length === 0 &&
+      partialStillPending === "pending",
+    { listed: partialListed, repair: partialRepair.enqueued,
+      uploaded: partialUpload.uploadedEvents, wireCalls: partialBodies.length,
+      receipt: partialReceipt?.reason ?? null, oldPending: partialOldPending,
+      reopenCalls: partialReopenBodies.length });
+  partialBuffer.close();
 
   const raceHome = path.join(root, "race-home");
   fs.mkdirSync(raceHome, { recursive: true, mode: 0o700 });
