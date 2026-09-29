@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { AutomaticRetentionCadence } from "./retention-cadence";
-import { capacityAdaptersCliMain } from "./provider-capacity-adapters";
+import { claudeStatusLineCliMain } from "./claude-status-line-command";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
@@ -2191,11 +2191,11 @@ async function main() {
   }
 
   if (command === "__plimsoll-capacity-statusline-proxy") {
-    await capacityAdaptersCliMain(process.argv.slice(2));
+    await claudeStatusLineCliMain(process.argv.slice(2));
     return;
   }
   if (command === "setup" && process.argv[3] === "claude-status-line") {
-    await capacityAdaptersCliMain(["setup-claude-status-line", ...process.argv.slice(4)]);
+    await claudeStatusLineCliMain(["setup-claude-status-line", ...process.argv.slice(4)]);
     return;
   }
 
