@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ClaudeAccountKeyCache } from "./local-identity";
 
 import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
@@ -350,6 +351,7 @@ function restoreResultMutationSnapshot(
 }
 
 export class TranscriptTailer {
+  private readonly accountKeys = new ClaudeAccountKeyCache();
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
@@ -1682,6 +1684,8 @@ export class TranscriptTailer {
     const metadata: Record<string, unknown> = { ...rootEventMetadata(this.activeCaptureRoot, previous
       ? deterministicEventId(["claude-transcript-revision", state.sessionId, entry.messageId, String(entry.input), String(entry.cacheRead), String(entry.cacheCreation), String(entry.output)])
       : eventBaseId, observedAt, state.sessionId), usageSource: "transcript" };
+    const accountKey = this.accountKeys.fromProjectsDir(this.activeCaptureRoot?.directory ?? this.projectsDir);
+    if (accountKey) metadata["user.account_uuid"] = accountKey;
     if (priced) {
       metadata.costEstimated = true;
       metadata.costKind = "estimated";
@@ -1706,7 +1710,7 @@ export class TranscriptTailer {
       eventType: "usage_transcript",
       observedAt,
       sessionId: state.sessionId,
-      actorId: typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : undefined,
+      actorId: accountKey ?? (typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : undefined),
       model: entry.model,
       actionClass: "other",
       inputTokens: delta.input,

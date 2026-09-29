@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { hashProtectedValue } from "../../shared/src/policy";
+import { providerAccountKey } from "../../shared/src/policy";
 
 /**
  * Local account identity (issue 0028). AI-tool accounts are tied to emails;
@@ -12,18 +12,14 @@ import { hashProtectedValue } from "../../shared/src/policy";
  *     https://api.openai.com/auth claims (chatgpt_account_id, plan type,
  *     last_refresh for the honest-attribution window)
  *
- * Everything read here is LOCAL-ONLY material: raw emails/ids go into
- * account_labels (never uploaded, proof-enforced); only the deterministic
- * hash of the codex account id is stamped onto events. Wire telemetry
- * identities do NOT derive from these values (verified 2026-06-10 — no hash
- * chain matches), so nothing here is ever auto-attached to telemetry-derived
- * hashes; humans link identities via merge/labels.
+ * Everything read here is LOCAL-ONLY material: raw emails/ids stay local;
+ * provider account keys use the same protected OTLP value hash as wire rows.
  */
 
 export type LocalIdentity = {
   source: "claude_code" | "codex";
   email?: string;
-  /** codex only: stable identity hash for rollout-derived events. */
+  /** Provider account key shared by local labels, OTLP and file-derived rows. */
   actorHash?: string;
   /** codex only: chatgpt_plan_type (e.g. "pro") for plan-leverage suggestions. */
   planType?: string;
@@ -37,6 +33,61 @@ export type LocalIdentityPaths = {
   claudeConfigPath?: string | null;
   codexAuthPath?: string | null;
 };
+
+/** Reads a Codex home's auth file once per observed mtime, retaining only its key. */
+export class CodexAccountKeyCache {
+  private readonly entries = new Map<string, { mtimeMs: number | null; key?: string }>();
+
+  fromSessionsDir(sessionsDir: string): string | undefined {
+    const file = path.join(path.dirname(sessionsDir), "auth.json");
+    let mtimeMs: number | null = null;
+    try {
+      const stat = fs.lstatSync(file);
+      if (stat.isFile() && !stat.isSymbolicLink()) mtimeMs = stat.mtimeMs;
+    } catch { /* Missing or unreadable auth stays unattributed. */ }
+    const old = this.entries.get(file);
+    if (old?.mtimeMs === mtimeMs) return old.key;
+    let key: string | undefined;
+    if (mtimeMs !== null) {
+      const auth = readJson(file);
+      const tokens = auth?.tokens;
+      const id = tokens && typeof tokens === "object" && !Array.isArray(tokens)
+        ? (tokens as Record<string, unknown>).account_id : undefined;
+      if (typeof id === "string" && id.length > 0) key = providerAccountKey(id);
+    }
+    this.entries.set(file, { mtimeMs, key });
+    return key;
+  }
+}
+
+/** Claude config roots use .claude.json; the default profile keeps it beside .claude. */
+export class ClaudeAccountKeyCache {
+  private readonly entries = new Map<string, { mtimeMs: number | null; key?: string }>();
+
+  fromProjectsDir(projectsDir: string): string | undefined {
+    const configDir = path.dirname(projectsDir);
+    const explicitDir = process.env.CLAUDE_CONFIG_DIR && path.resolve(process.env.CLAUDE_CONFIG_DIR) === path.resolve(configDir);
+    const file = !explicitDir && path.resolve(configDir) === path.join(os.homedir(), ".claude")
+      ? path.join(os.homedir(), ".claude.json") : path.join(configDir, ".claude.json");
+    let mtimeMs: number | null = null;
+    try {
+      const stat = fs.lstatSync(file);
+      if (stat.isFile() && !stat.isSymbolicLink()) mtimeMs = stat.mtimeMs;
+    } catch { /* Missing or unreadable account stays unattributed. */ }
+    const old = this.entries.get(file);
+    if (old?.mtimeMs === mtimeMs) return old.key;
+    let key: string | undefined;
+    if (mtimeMs !== null) {
+      const config = readJson(file);
+      const oauth = config?.oauthAccount;
+      const id = oauth && typeof oauth === "object" && !Array.isArray(oauth)
+        ? (oauth as Record<string, unknown>).accountUuid : undefined;
+      if (typeof id === "string" && id.length > 0) key = providerAccountKey(id);
+    }
+    this.entries.set(file, { mtimeMs, key });
+    return key;
+  }
+}
 
 function readJson(file: string): Record<string, unknown> | undefined {
   try {
@@ -61,10 +112,13 @@ function jwtClaims(token: unknown): Record<string, unknown> | undefined {
 export function readLocalIdentities(paths: LocalIdentityPaths = {}): LocalIdentity[] {
   const identities: LocalIdentity[] = [];
 
-  const claude = paths.claudeConfigPath === null ? undefined : readJson(paths.claudeConfigPath ?? path.join(os.homedir(), ".claude.json"));
+  const claude = paths.claudeConfigPath === null ? undefined : readJson(paths.claudeConfigPath ??
+    (process.env.CLAUDE_CONFIG_DIR ? path.join(process.env.CLAUDE_CONFIG_DIR, ".claude.json") : path.join(os.homedir(), ".claude.json")));
   const oauth = (claude?.oauthAccount ?? {}) as Record<string, unknown>;
-  if (typeof oauth.emailAddress === "string" && oauth.emailAddress.includes("@")) {
-    identities.push({ source: "claude_code", email: oauth.emailAddress });
+  const claudeId = typeof oauth.accountUuid === "string" ? oauth.accountUuid : undefined;
+  if (claudeId || typeof oauth.emailAddress === "string" && oauth.emailAddress.includes("@")) {
+    identities.push({ source: "claude_code", email: typeof oauth.emailAddress === "string" ? oauth.emailAddress : undefined,
+      actorHash: claudeId ? providerAccountKey(claudeId) : undefined });
   }
 
   const auth = paths.codexAuthPath === null ? undefined : readJson(paths.codexAuthPath ?? path.join(os.homedir(), ".codex", "auth.json"));
@@ -72,13 +126,14 @@ export function readLocalIdentities(paths: LocalIdentityPaths = {}): LocalIdenti
     const tokens = (auth.tokens ?? {}) as Record<string, unknown>;
     const claims = jwtClaims(tokens.id_token) ?? {};
     const apiAuth = (claims["https://api.openai.com/auth"] ?? {}) as Record<string, unknown>;
-    const accountId = typeof apiAuth.chatgpt_account_id === "string" ? apiAuth.chatgpt_account_id : undefined;
+    const accountId = typeof tokens.account_id === "string" ? tokens.account_id :
+      typeof apiAuth.chatgpt_account_id === "string" ? apiAuth.chatgpt_account_id : undefined;
     const email = typeof auth.email === "string" && auth.email.includes("@") ? auth.email : undefined;
     if (accountId || email) {
       identities.push({
         source: "codex",
         email,
-        actorHash: accountId ? hashProtectedValue(accountId) : undefined,
+        actorHash: accountId ? providerAccountKey(accountId) : undefined,
         planType: typeof apiAuth.chatgpt_plan_type === "string" ? apiAuth.chatgpt_plan_type : undefined,
         validFrom:
           typeof auth.last_refresh === "string" && !Number.isNaN(Date.parse(auth.last_refresh))
