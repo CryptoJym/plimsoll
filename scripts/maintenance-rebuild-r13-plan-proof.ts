@@ -21,7 +21,7 @@ try {
     { name: "acknowledgement", sql: HOOK_ACK_LOOKUP_SQL, args: [randomUUID()],
       expected: "maintenance_rebuild_hook_admissions" },
     { name: "older_binary_fallback", sql: HOOK_ROW_LOOKUP_SQL,
-      args: [id, id.toLowerCase(), id.toUpperCase()], expected: "buffered_events" },
+      args: [id, id.toLowerCase(), id.toUpperCase()], expected: "e" },
   ];
   for (const query of queries) {
     const plan = buffer.database.prepare(`explain query plan ${query.sql}`).all(...query.args) as

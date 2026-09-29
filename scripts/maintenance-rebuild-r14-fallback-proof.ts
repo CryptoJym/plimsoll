@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { DEFAULT_POLICY } from "../packages/shared/src/index";
 import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
 import { hookBodyDigest } from "../packages/collector-cli/src/maintenance-hook-fingerprint";
 import { finishMaintenanceRebuildPause, markMaintenanceRebuildPause,
@@ -29,8 +30,9 @@ for (const immutableDigest of [null, "matching", "different", "legacy_spooled"] 
     const timestamp = new Date().toISOString();
     buffer.database.prepare(`insert into buffered_events
       (id,source,event_type,data_mode,observed_at,payload_json,created_at,session_id,maintenance_hook_body_digest)
-      values (?,'claude_code','user_prompt_submit','safe',?,'{}',?,?,?)`)
-      .run(body.id, timestamp, timestamp, body.session_id,
+      values (?,'claude_code','user_prompt_submit','safe',?,?,?,?,?)`)
+      .run(body.id, timestamp, JSON.stringify({ tenantId: DEFAULT_POLICY.tenantId }),
+        timestamp, body.session_id,
         immutableDigest === null || immutableDigest === "legacy_spooled" ? null
           : immutableDigest === "matching" ? receipt.bodyDigest : "f".repeat(64));
     const nowMs = Date.parse(receipt.at) + MISSING_HOOK_RETRY_MS + 1_000;

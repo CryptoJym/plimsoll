@@ -12,10 +12,28 @@ const canonicalIdKeys = new Set<string>([
 function canonicalBody(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) return value.map((entry) => canonicalBody(entry, depth + 1));
   if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+  const record = value as Record<string, unknown>;
+  // The normalizer reads OTLP {key, value} attributes at any nesting depth.
+  // Only its identity aliases have case-insensitive UUID semantics; retained
+  // nonidentity attributes remain byte-for-byte significant after key sorting.
+  const attributeIdentity = typeof record.key === "string" && canonicalIdKeys.has(record.key);
+  return Object.fromEntries(Object.entries(record)
     .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
     .map(([key, entry]) => [key, depth === 0 && canonicalIdKeys.has(key) &&
-      typeof entry === "string" && isUuid(entry) ? entry.toLowerCase() : canonicalBody(entry, depth + 1)]));
+      typeof entry === "string" && isUuid(entry) ? entry.toLowerCase() :
+      key === "value" && attributeIdentity ? canonicalAttributeIdentity(entry, depth + 1) :
+      canonicalBody(entry, depth + 1)]));
+}
+
+function canonicalAttributeIdentity(value: unknown, depth: number): unknown {
+  if (typeof value === "string" && isUuid(value)) return value.toLowerCase();
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (typeof record.stringValue === "string" && isUuid(record.stringValue)) {
+      return canonicalBody({ ...record, stringValue: record.stringValue.toLowerCase() }, depth);
+    }
+  }
+  return canonicalBody(value, depth);
 }
 
 /** Fingerprint the caller's privacy-blanked JSON, before receive-time

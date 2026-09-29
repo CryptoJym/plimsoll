@@ -226,6 +226,7 @@ export type DeliveryCaptureClaim = {
   gaps: Array<{ from: string; to: string }>;
   /** Visible older-binary retries retired without exact digest evidence. */
   unverifiedHookRetries?: number;
+  unknownHookReceiptFormats?: number;
 };
 
 /** Why a claim attests nothing (review r2 B3): the cloud withdraws what it held. */
@@ -637,6 +638,8 @@ export class DeliveryOutbox {
         gaps: gaps.map((gap) => ({ from: new Date(gap.fromMs).toISOString(), to: new Date(gap.toMs).toISOString() })),
         ...((spool?.unverifiedHookRetries ?? 0) > 0
           ? { unverifiedHookRetries: spool!.unverifiedHookRetries } : {}),
+        ...((spool?.unknownHookReceiptFormats ?? 0) > 0
+          ? { unknownHookReceiptFormats: spool!.unknownHookReceiptFormats } : {}),
       };
     });
     return run.immediate();

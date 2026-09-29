@@ -9,11 +9,14 @@ import { hookBodyDigestCandidates, hookReceiptFileName } from "./maintenance-hoo
 
 export const HOOK_ACK_LOOKUP_SQL = `select admitted_event_id, outcome
   from maintenance_rebuild_hook_admissions where receipt_id = ?`;
-export const HOOK_ROW_LOOKUP_SQL = `select rowid, id, source, event_type, session_id,
-    maintenance_hook_body_digest as body_digest
-  from buffered_events where id in (?, ?, ?)`;
+export const HOOK_ROW_LOOKUP_SQL = `select e.rowid, e.id, e.source, e.event_type, e.session_id,
+    json_extract(e.payload_json, '$.tenantId') as tenant_id,
+    e.maintenance_hook_body_digest as body_digest, o.seq as admission_seq
+  from buffered_events e left join maintenance_rebuild_event_order o on o.event_id = e.id
+  where e.id in (?, ?, ?)`;
 export const HOOK_ROW_LEGACY_LOOKUP_SQL = `select rowid, id, source, event_type, session_id,
-    null as body_digest
+    json_extract(payload_json, '$.tenantId') as tenant_id,
+    null as body_digest, null as admission_seq
   from buffered_events where id in (?, ?, ?)`;
 
 export function sameHookIdentityPart(left: string | null, right: string | null) {
@@ -78,12 +81,44 @@ export function ensureMaintenanceHookAdmissionSchema(db: Database.Database) {
   }
   db.exec(`create index if not exists idx_maintenance_hook_admission_event
     on maintenance_rebuild_hook_admissions(admitted_event_id)`);
+  // AUTOINCREMENT stores its last issued sequence in sqlite_sequence even
+  // after retention deletes the top event. These triggers also run when
+  // 0.7.44 writes through the same ledger after a downgrade.
+  db.exec(`create table if not exists maintenance_rebuild_event_order (
+    seq integer primary key autoincrement,
+    event_id text not null unique
+  )`);
+  db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_insert
+    after insert on buffered_events begin
+      insert into maintenance_rebuild_event_order(event_id) values (new.id);
+    end`);
+  db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_delete
+    after delete on buffered_events begin
+      delete from maintenance_rebuild_event_order where event_id = old.id;
+    end`);
+  db.exec(`create trigger if not exists trg_maintenance_rebuild_event_order_rekey
+    after update of id on buffered_events
+    when new.id is not old.id begin
+      update maintenance_rebuild_event_order set event_id = new.id where event_id = old.id;
+    end`);
+}
+
+/** Never use max(rowid): SQLite can reuse it after the top row is pruned. */
+export function ledgerAdmissionSequence(db: Database.Database): number | null {
+  const exists = db.prepare(`select 1 from sqlite_master where type = 'table'
+    and name = 'maintenance_rebuild_event_order'`).get();
+  if (!exists) return null;
+  const row = db.prepare(`select seq from sqlite_sequence
+    where name = 'maintenance_rebuild_event_order'`).get() as { seq: number } | undefined;
+  const sequence = row?.seq ?? 0;
+  if (!Number.isSafeInteger(sequence) || sequence < 0) throw new Error("maintenance_admission_sequence_unsafe");
+  return sequence;
 }
 
 type PendingHookReceipt = {
-  version: 6; route: "hook"; receiptId: string; eventId: string;
-  source: string; kind: string; sessionId: string | null;
-  bodyDigest: string; ledgerHighWater: number | null;
+  version: 7; route: "hook"; receiptId: string; eventId: string;
+  source: string; kind: string; sessionId: string | null; tenantId: string;
+  bodyDigest: string; ledgerAdmissionSequence: number | null;
 };
 
 /** Called inside the same SQLite transaction as the buffered_events insert.
@@ -91,12 +126,18 @@ type PendingHookReceipt = {
  * receipt count. The fingerprint is of the original caller body: a retry
  * resends it unchanged, even if admission clamps time or later enriches JSON. */
 export function recordMaintenanceHookAdmission(db: Database.Database,
-  rawPayload: unknown, event: AiInteractionEvent) {
+  rawPayload: unknown, event: AiInteractionEvent, inserted = true) {
   if (db.name === ":memory:") return;
   const directory = path.join(path.dirname(db.name), "maintenance-rebuild-refusals");
   const candidates = hookBodyDigestCandidates(rawPayload);
-  const admittedRow = db.prepare("select rowid from buffered_events where id = ?")
-    .get(event.id) as { rowid: number } | undefined;
+  const admittedRow = db.prepare(`select rowid,
+      maintenance_hook_body_digest as body_digest,
+      json_extract(payload_json, '$.tenantId') as tenant_id,
+      source, event_type, session_id
+    from buffered_events where id = ?`).get(event.id) as {
+      rowid: number; body_digest: string | null; tenant_id: string | null;
+      source: string; event_type: string; session_id: string | null
+    } | undefined;
   if (!admittedRow) throw new Error("maintenance_admission_row_missing");
   const insert = db.prepare(`insert into maintenance_rebuild_hook_admissions
     (receipt_id, admitted_event_id, admitted_rowid, outcome, receipt_name) values (?, ?, ?, 'accepted', ?)
@@ -120,21 +161,27 @@ export function recordMaintenanceHookAdmission(db: Database.Database,
       if (error instanceof SyntaxError) continue;
       throw error;
     }
-    if (receipt.version !== 6 || receipt.route !== "hook" || !isUuid(receipt.receiptId) ||
+    if (receipt.version !== 7 || receipt.route !== "hook" || !isUuid(receipt.receiptId) ||
       !isUuid(receipt.eventId) || receipt.source !== event.source ||
       receipt.kind !== event.eventType ||
       receipt.bodyDigest !== candidate.digest ||
+      receipt.tenantId !== event.tenantId ||
+      admittedRow.tenant_id !== receipt.tenantId ||
+      admittedRow.source !== receipt.source ||
+      admittedRow.event_type !== receipt.kind ||
       !sameHookIdentityPart(receipt.eventId, event.id) ||
       (candidate.injectedId !== null && !sameHookIdentityPart(candidate.injectedId, receipt.eventId)) ||
-      !sameHookIdentityPart(receipt.sessionId, event.sessionId ?? null)) continue;
-    // This INSERT and its acknowledgement share a transaction that started
-    // after the durable refusal. That ordering is stronger than rowid when
-    // retention reused the top rowid or a busy snapshot could not be read.
+      !sameHookIdentityPart(receipt.sessionId, event.sessionId ?? null) ||
+      !sameHookIdentityPart(receipt.sessionId, admittedRow.session_id) ||
+      (!inserted && admittedRow.body_digest !== candidate.digest)) continue;
+    // A digest match proves the same caller body, even if this append
+    // deduplicated against a row captured before the refusal. Both the
+    // acknowledgement and any newly inserted row share this transaction.
     insert.run(receipt.receiptId, event.id, admittedRow.rowid, entry);
     admittedDigest = candidate.digest;
     break;
   }
-  db.prepare(`update buffered_events set maintenance_hook_body_digest = ?
+  if (inserted) db.prepare(`update buffered_events set maintenance_hook_body_digest = ?
     where id = ? and maintenance_hook_body_digest is null`).run(admittedDigest, event.id);
 }
 

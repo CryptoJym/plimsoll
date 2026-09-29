@@ -2622,7 +2622,7 @@ export class LocalEventBuffer {
     event: AiInteractionEvent,
     suppressedFields: string[] | undefined,
     options: { integrityReceipt: true; firstReceivedAt?: string;
-      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent) => void },
+      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent, inserted: boolean) => void },
   ): {
     appended: boolean;
     deduplicated?: true;
@@ -2633,7 +2633,7 @@ export class LocalEventBuffer {
     event: AiInteractionEvent,
     suppressedFields: string[] = [],
     options: { integrityReceipt?: boolean; firstReceivedAt?: string;
-      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent) => void } = {},
+      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent, inserted: boolean) => void } = {},
   ) {
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
@@ -2641,7 +2641,8 @@ export class LocalEventBuffer {
     try {
       const run = () => {
         const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
-        if (appended.appended) options.onCommittedAppend?.(this.db, event);
+        if (appended.appended || appended.deduplicated)
+          options.onCommittedAppend?.(this.db, event, appended.appended);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
           handoffs,

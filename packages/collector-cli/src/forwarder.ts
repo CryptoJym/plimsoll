@@ -76,7 +76,7 @@ export function appendNormalizedHook(
     canonical.suppressedFields,
     { integrityReceipt: true, firstReceivedAt,
       onCommittedAppend: rawPayload === undefined ? undefined :
-        (db, event) => recordMaintenanceHookAdmission(db, rawPayload, event) },
+        (db, event, inserted) => recordMaintenanceHookAdmission(db, rawPayload, event, inserted) },
   );
   return {
     ...canonical,

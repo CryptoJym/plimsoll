@@ -125,7 +125,8 @@ import {
   scanProducerProcesses,
 } from "./producer-processes";
 import { healthzProof, isHealthzChallenge, summaryPendingStatus } from "./status-summary";
-import { pendingMaintenanceHookEventId, readUnverifiedHookRetries, reconcileMaintenanceRebuildRefusals,
+import { pendingMaintenanceHookEventId, readUnknownHookReceiptFormats,
+  readUnverifiedHookRetries, reconcileMaintenanceRebuildRefusals,
   resolveMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 let dashboardHtml: string | undefined;
@@ -803,6 +804,14 @@ export function createCollectorServer(
   const localAuth = options.localAuth ?? null;
   const authEnforced = localAuth !== null;
   const maintenanceRefusalHome = options.localAuthHome ?? options.liveProducerHome ?? options.hookSpoolHome;
+  const captureRecoveryStatus = () => {
+    const unverifiedHookRetries = maintenanceRefusalHome
+      ? readUnverifiedHookRetries(maintenanceRefusalHome) : 0;
+    const unknownHookReceiptFormats = maintenanceRefusalHome
+      ? readUnknownHookReceiptFormats(maintenanceRefusalHome) : 0;
+    return { unverifiedHookRetries,
+      ...(unknownHookReceiptFormats === 0 ? {} : { unknownHookReceiptFormats }) };
+  };
   // Keep one bounded read result, not another persistent ledger or worker.
   let jevCache: { days: number; at: number; snapshot: JevAnalysisSnapshot } | null = null;
   const sourceRateLimiter = createSourceRateLimiter(
@@ -1223,8 +1232,7 @@ export function createCollectorServer(
       sessionAttribution: refreshControl ? sessionContextIndexStatus(buffer.database)
         : cachedControl?.sessionAttribution ?? null,
       maintenance,
-      captureRecovery: { unverifiedHookRetries: maintenanceRefusalHome
-        ? readUnverifiedHookRetries(maintenanceRefusalHome) : 0 },
+      captureRecovery: captureRecoveryStatus(),
       captureHealth: status.health ?? null,
       historyCoverage,
       captureBaseline: refreshControl ? captureBaselineStatus(buffer.database) : cachedControl?.captureBaseline ?? null,
@@ -1312,8 +1320,7 @@ export function createCollectorServer(
       summaryPending: summaryPendingStatus(buffer.database),
       unlinkableBindCount: countUnlinkableDispatchBindings(currentDispatchCaptureRoots()),
       maintenance: options.maintenanceStatus?.() ?? null,
-      captureRecovery: { unverifiedHookRetries: maintenanceRefusalHome
-        ? readUnverifiedHookRetries(maintenanceRefusalHome) : 0 },
+      captureRecovery: captureRecoveryStatus(),
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
       accountAssertions,

@@ -23,6 +23,8 @@ export type CaptureSpoolState = {
   maintenanceRebuildPending?: boolean;
   /** Older-binary hook retries consumed without an immutable body digest. */
   unverifiedHookRetries?: number;
+  /** Retired old-format refusals whose exact tenant/body outcome is unknowable. */
+  unknownHookReceiptFormats?: number;
 };
 
 export function captureSpoolState(home: string): CaptureSpoolState {
@@ -32,7 +34,8 @@ export function captureSpoolState(home: string): CaptureSpoolState {
   const arrivals = listings.flatMap((listing) => listing ?? []);
   const refusalState = reconcileMaintenanceRebuildRefusals(home);
   const refused = refusalState.count;
-  const unreadable = [...listings, ...logs, refused, refusalState.unverifiedHookRetries]
+  const unreadable = [...listings, ...logs, refused, refusalState.unverifiedHookRetries,
+    refusalState.unknownHookReceiptFormats]
     .some((value) => value === null);
   // Current client retries use the 0.7.44-compatible filename and a durable
   // refusal receipt until drain. Recognize previously tagged files as well.
@@ -57,5 +60,6 @@ export function captureSpoolState(home: string): CaptureSpoolState {
     unreadable,
     maintenanceRebuildPending,
     unverifiedHookRetries: refusalState.unverifiedHookRetries ?? 0,
+    unknownHookReceiptFormats: refusalState.unknownHookReceiptFormats ?? 0,
   };
 }

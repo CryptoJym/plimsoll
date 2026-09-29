@@ -510,6 +510,16 @@ jobs:
           pnpm proof:maintenance-rebuild-r14-body-mismatch
           pnpm proof:maintenance-rebuild-r14-ack-retention
           pnpm proof:maintenance-rebuild-r14-fallback
+          pnpm proof:maintenance-rebuild-r15-rowid-reuse
+          pnpm proof:maintenance-rebuild-r15-prior-duplicate
+          pnpm proof:maintenance-rebuild-r15-nested-uuid
+          pnpm proof:maintenance-rebuild-r15-cross-tenant
+          pnpm proof:maintenance-rebuild-r15-old-format
+          pnpm proof:maintenance-rebuild-r15-fingerprint-controls
+          pnpm proof:maintenance-rebuild-r15-unverified-gates
+          pnpm proof:maintenance-rebuild-r15-query-plans
+          pnpm proof:maintenance-rebuild-r15-five-paired-timing
+          pnpm proof:maintenance-rebuild-r15-digest-anywhere
           pnpm proof:maintenance-rebuild-writers
           pnpm proof:maintenance-rebuild-contract
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)
