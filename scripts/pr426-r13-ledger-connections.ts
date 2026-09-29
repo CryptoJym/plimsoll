@@ -55,7 +55,8 @@ if (mode === "--copy-child") {
       console.log(JSON.stringify({ opened: true, marker: Boolean(readReplacementLedgerMarker(ledger)) }));
       buffer.close();
     } else {
-      const statement = buffer.database.prepare("insert into maintenance_state(key,value,updated_at) values('r13-stale-write','bad',?)");
+      const statement = buffer.database.prepare("insert into maintenance_state(key,value,updated_at) values('r13-stale-write','bad',?)" +
+        (process.argv[5] === "returning" ? " returning key" : ""));
       const transaction = buffer.database.transaction(() => statement.run(new Date().toISOString()));
       fs.writeFileSync(path.join(fixture, "ready"), String(process.pid));
       const timer = setInterval(() => {
@@ -63,6 +64,7 @@ if (mode === "--copy-child") {
         clearInterval(timer);
         try {
           if (process.argv[5] === "transaction") transaction.immediate();
+          else if (process.argv[5] === "returning") statement.get(new Date().toISOString());
           else statement.run(new Date().toISOString());
           fs.writeFileSync(path.join(fixture, "result.json"), JSON.stringify({ wrote: true }));
         } catch (error) {
@@ -157,6 +159,17 @@ async function main(variant: string) {
       checkpoint.close();
       switchFreshLedger(input);
       const fresh = new LocalEventBuffer(ledger, options);
+      const originalStat = fs.statSync;
+      let readStatCalls = 0;
+      (fs as unknown as { statSync: typeof fs.statSync }).statSync = (() => { readStatCalls += 1; throw new Error("read_path_stat_forbidden"); }) as typeof fs.statSync;
+      try {
+        const read = fresh.database.prepare("select 1 as value");
+        assert.equal(read.readonly, true);
+        assert.deepEqual(read.get(), { value: 1 });
+        assert.deepEqual(read.all(), [{ value: 1 }]);
+        assert.deepEqual([...read.iterate()], [{ value: 1 }]);
+      } finally { (fs as unknown as { statSync: typeof fs.statSync }).statSync = originalStat; }
+      assert.equal(readStatCalls, 0, "read-only statements do not stat the ledger");
       fresh.database.prepare("insert into maintenance_state(key,value,updated_at) values('r13-fresh-control','kept',?)")
         .run(new Date().toISOString());
       fresh.close();
@@ -173,9 +186,9 @@ async function main(variant: string) {
       assert.equal(fs.statSync(sidecar).ino, lockInode);
       console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true,
         publicationCommitKeepsExclusive: true, privateCopyHoldsDestinationLock: true, noTemporaryLock: true,
-        stableLockInode: true, validFreshSnapshotRestarts: true }));
+        stableLockInode: true, readOnlyStatementsDoNotStat: true, validFreshSnapshotRestarts: true }));
     } else if (variant === "old-connection") {
-      for (const action of ["statement", "transaction"]) {
+      for (const action of ["statement", "transaction", "returning"]) {
         for (const name of ["ready", "go", "result.json"]) fs.rmSync(path.join(fixture, name), { force: true });
         child = spawn(process.execPath, ["--import", loader, self, "--held-child", ledger, fixture, action], { env, stdio: "ignore" });
         await waitFor(() => fs.existsSync(path.join(fixture, "ready")), "old collector is ready");

@@ -149,13 +149,14 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
     };
     const prepare = database.prepare.bind(database);
     database.prepare = ((...args: Parameters<typeof prepare>) => {
-      if (!database.inTransaction) current();
       const statement = prepare(...args);
       for (const method of ["run", "get", "all", "iterate"] as const) {
         const invoke = statement[method].bind(statement);
         // Keep the native API writable for instrumentation that wraps a method.
         Object.defineProperty(statement, method, { configurable: true, writable: true, value: (...values: unknown[]) => {
-          if (!database.inTransaction) current();
+          // Read-only dashboard requests stay free of filesystem work. SQLite
+          // classifies writes, including INSERT ... RETURNING used via get().
+          if (!statement.readonly && !database.inTransaction) current();
           return Reflect.apply(invoke, statement, values);
         } });
       }
