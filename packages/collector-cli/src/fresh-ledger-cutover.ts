@@ -20,7 +20,7 @@ import { readLiveProducerBindings, LIVE_BINDINGS_FILE } from "./codex-live-usage
 import type { CollectorConfig } from "./config";
 import { loadJsonlScanCursorByKey, ensureJsonlScanState,
   jsonlScanStateKey } from "./jsonl-byte-tailer";
-import { otherProcessesWithFilesOpen } from "./lifecycle-adapters";
+import { otherProcessesWithFilesOpen } from "./ledger-open-handles";
 import { LifecycleMutationAuthority } from "./lifecycle-authority";
 import { acquireLedgerConnectionLock, readLedgerPublication, writeLedgerPublication,
   type LedgerConnectionLock, type LedgerPublication } from "./ledger-connection";
@@ -569,7 +569,7 @@ function openReadOnlyPlanDatabase(ledgerPath: string): {
     // better-sqlite3 does not enable SQLITE_OPEN_URI. Node's built-in SQLite
     // does, allowing an immutable read of a closed, checkpointed WAL ledger
     // without creating WAL/SHM sidecars.
-    const SQLite = createRequire(import.meta.url)("node:sqlite") as {
+    const SQLite = createRequire(typeof __filename === "string" ? __filename : import.meta.url)("node:sqlite") as {
       DatabaseSync: new (file: string, options: { readOnly: boolean }) => {
         prepare(sql: string): { all(...params: unknown[]): unknown[];
           get(...params: unknown[]): unknown; iterate(...params: unknown[]): Iterable<unknown> };
@@ -826,7 +826,7 @@ function preserveLeftoverStageSidecars(stage: string, freshAttemptPath: string) 
 }
 
 function immutableStageHasReplacementMarker(stage: string): boolean {
-  const SQLite = createRequire(import.meta.url)("node:sqlite") as {
+  const SQLite = createRequire(typeof __filename === "string" ? __filename : import.meta.url)("node:sqlite") as {
     DatabaseSync: new (file: string, options: { readOnly: boolean }) => {
       prepare(sql: string): { get(): unknown }; close(): void;
     };
