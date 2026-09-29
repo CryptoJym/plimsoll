@@ -5,11 +5,12 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { durableClaudeRootSessionSightings, recordClaudeRootSessionSighting } from
+import { captureRootDigest, durableClaudeRootSessionSightings, recordClaudeRootSessionSighting } from
   "../packages/collector-cli/src/capture-root-inventory";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createProofCompletion } from "./lib/proof-completion";
+import { aiInteractionEventSchema } from "../packages/shared/src/schemas";
 
 const home = process.env.HOME!;
 const plimsoll = process.env.PLIMSOLL_HOME!;
@@ -59,6 +60,25 @@ async function main() {
     assert.equal(sightings, 1);
     assert.deepEqual(rawCountsAtSighting, [0], "sighting must commit once before any raw row");
 
+    // An older ledger may have a raw root receipt but no compact sighting.
+    // Re-reading its file must migrate the observation before raw retention
+    // can remove the only evidence that this root saw the session.
+    const legacySession = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const legacyId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const legacyEvent = aiInteractionEventSchema.parse({ id: legacyId,source:"claude_code",
+      dataMode:"metadata",eventType:"assistant_response",observedAt,sessionId:legacySession,
+      metadata:{ captureRootId:root.rootId,captureProfileId:root.profileId } });
+    assert.equal(buffer.append(legacyEvent,[]),true);
+    buffer.database.prepare("insert into capture_root_observations values(?,?,?,?,?)")
+      .run(captureRootDigest(root),legacyId,"legacy-digest",observedAt,"admitted");
+    assert.equal(durableClaudeRootSessionSightings(buffer.database,legacySession).size,1);
+    assert.equal(recordClaudeRootSessionSighting(buffer,root,legacySession,observedAt),true);
+    const compact = buffer.database.prepare(`select count(*) as n from capture_root_session_sightings
+      where source='claude_code' and session_id=? and root_digest=?`)
+      .get(legacySession,captureRootDigest(root)) as { n:number };
+    assert.equal(compact.n,1,"legacy observation must gain an independent durable sighting");
+    console.log(JSON.stringify({ scenario:"legacy_observation_promoted",compactSightings:compact.n }));
+
     // Report the additive cost without making wall-clock time a CI gate.
     const samples: number[] = [];
     for(let i=0;i<100;i++) {
@@ -75,8 +95,9 @@ async function main() {
     buffer.database.prepare = originalPrepare;
     buffer.close();
   }
-  const proof = createProofCompletion("pr429-r3-tailer-sighting-first", 1);
+  const proof = createProofCompletion("pr429-r3-tailer-sighting-first", 2);
   proof.check("one_durable_sighting_before_two_transcript_rows");
+  proof.check("legacy_observation_promoted_before_raw_retention");
   proof.complete();
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

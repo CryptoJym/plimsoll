@@ -434,7 +434,11 @@ export function recordClaudeRootSessionSighting(buffer: import("./buffer").Local
   const database=buffer.database;
   ensureRootObservationSchema(database);
   const rootDigest=captureRootDigest(root);
-  if(durableClaudeRootSessionSightings(database,sessionId).has(rootDigest)) {
+  // The read-only legacy fallback joins raw observations. It is a veto, but
+  // cannot substitute for the compact row after raw retention removes it.
+  const hasCompactSighting=() => Boolean(database.prepare(`select 1 from capture_root_session_sightings
+    where source='claude_code' and session_id=? and root_digest=?`).get(sessionId,rootDigest));
+  if(hasCompactSighting()) {
     observeClaudeRootSession(root,sessionId);
     return false;
   }
@@ -450,7 +454,7 @@ export function recordClaudeRootSessionSighting(buffer: import("./buffer").Local
     try { write(); }
     finally {
       sessionSightingCaches.delete(database);
-      if(durableClaudeRootSessionSightings(database,sessionId).has(rootDigest))
+      if(hasCompactSighting())
         observeClaudeRootSession(root,sessionId);
     }
     throw error;
