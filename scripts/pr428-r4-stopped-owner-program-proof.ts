@@ -42,8 +42,10 @@ try {
   const changed = before.replace(`<string>${original}</string>`, `<string>${owner}</string>`);
   assert.notEqual(changed, before);
   fs.writeFileSync(installed.plistPath, changed, { mode: 0o600 });
+  // The outer workflow is CI; the fixture child must exercise owner setup.
+  const setupEnv = { ...process.env, CI: "", GITHUB_ACTIONS: "" };
   const joined = spawnSync(process.execPath, [cli, "join", "--token-stdin", "--url",
-    "http://127.0.0.1:49390"], { env: { ...process.env }, input: "\n",
+    "http://127.0.0.1:49390"], { env: setupEnv, input: "\n",
     encoding: "utf8", timeout: 20_000 });
   const status = /"status":\s*"([^"]+)"/.exec(joined.stdout)?.[1] ?? null;
   console.log(JSON.stringify({ status, exit: joined.status,
@@ -57,7 +59,7 @@ try {
     "the refusal must name the edit and the explicit replacement path");
   const explicit = spawnSync(process.execPath, [cli, "join", "--replace-launch-agent",
     "--token-stdin", "--url", "http://127.0.0.1:49390"],
-    { env: { ...process.env }, input: "\n", encoding: "utf8", timeout: 20_000 });
+    { env: setupEnv, input: "\n", encoding: "utf8", timeout: 20_000 });
   const explicitStatus = /"status":\s*"([^"]+)"/.exec(explicit.stdout)?.[1] ?? null;
   assert.equal(explicitStatus, "join_failed",
     "explicit replacement should pass local preflight before reading a token");

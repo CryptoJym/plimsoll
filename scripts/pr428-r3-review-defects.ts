@@ -55,7 +55,8 @@ function addPathEntry(plistPath: string) {
   return edited;
 }
 function joinStatus(home: string, data: string) {
-  const env = { ...process.env, HOME: home, USERPROFILE: home, PLIMSOLL_HOME: data,
+  // CI itself is join-only, while this child intentionally tests owner setup.
+  const env = { ...process.env, CI: "", GITHUB_ACTIONS: "", HOME: home, USERPROFILE: home, PLIMSOLL_HOME: data,
     CODEX_HOME: path.join(home, ".codex"), CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
     XDG_CONFIG_HOME: path.join(home, ".config"), XDG_CACHE_HOME: path.join(home, ".cache"),
     XDG_STATE_HOME: path.join(home, ".local/state"), TMPDIR: path.join(home, "tmp") };
