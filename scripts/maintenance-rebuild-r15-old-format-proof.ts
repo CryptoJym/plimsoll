@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
@@ -13,15 +14,26 @@ import { MISSING_HOOK_RETRY_MS, reconcileMaintenanceRebuildRefusals } from
   "../packages/collector-cli/src/maintenance-rebuild-pause-state";
 
 async function main() {
-  const previous = path.resolve(process.env.PR424_R6_CHECKOUT ??
-    path.resolve(process.cwd(), "../plimsoll-r13"), "packages/collector-cli/src");
-  const oldBufferModule = await import(pathToFileURL(path.join(previous, "buffer.ts")).href);
-  const oldPause = await import(pathToFileURL(path.join(previous, "maintenance-rebuild-pause-state.ts")).href);
-  const home = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "r7-v5-upgrade-")));
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "r7-v5-upgrade-")));
+  const home = path.join(root, "home");
+  const oldRepo = path.join(root, "previous-pr-head");
+  fs.mkdirSync(home);
   const ledger = path.join(home, "ledger.sqlite");
   const body = { id: randomUUID(), session_id: randomUUID(),
     hook_event_name: "UserPromptSubmit", timestamp: new Date().toISOString(), input_tokens: 9 };
+  let oldWorktreeAdded = false;
   try {
+    // This unreleased PR head wrote v5 receipts. Build the fixture from the
+    // pinned source inside this proof, so CI and a clean clone need no sibling
+    // checkout or environment variable.
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", oldRepo,
+      "953277833d9e29fb285e19679f1bb4d64329354b"], { cwd: repo });
+    oldWorktreeAdded = true;
+    fs.symlinkSync(path.join(repo, "node_modules"), path.join(oldRepo, "node_modules"), "dir");
+    const previous = path.join(oldRepo, "packages/collector-cli/src");
+    const oldBufferModule = await import(pathToFileURL(path.join(previous, "buffer.ts")).href);
+    const oldPause = await import(pathToFileURL(path.join(previous, "maintenance-rebuild-pause-state.ts")).href);
     const oldBuffer = new oldBufferModule.LocalEventBuffer(ledger);
     try {
       oldPause.markMaintenanceRebuildPause(home);
@@ -69,6 +81,10 @@ async function main() {
     assert.equal(unknown.unknownHookReceiptFormats, 2);
     assert.equal(unknown.lost.length, 2);
     assert.equal(fs.existsSync(unknownFile), false);
-  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  } finally {
+    try {
+      if (oldWorktreeAdded) execFileSync("git", ["worktree", "remove", "--force", oldRepo], { cwd: repo });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });
