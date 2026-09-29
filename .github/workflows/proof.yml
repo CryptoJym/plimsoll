@@ -327,6 +327,26 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r9-changed-resume-append
 
+      - name: Prove reviewer oversized continuation cannot adopt a rewritten prefix (PR #429 round eight)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-continuation-prefix-rewrite
+
+      - name: Prove reviewer normal append still rejects a rewritten prefix (PR #429 round eight)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-normal-append-control
+
+      - name: Prove oversized continuation with unchanged prefix still stamps (PR #429 round ten)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-oversized-unchanged
+
+      - name: Prove oversized continuation catches a change in the last 64 KiB (PR #429 round ten)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-oversized-last-64k
+
+      - name: Prove two oversized appends cannot adopt a changed old prefix (PR #429 round ten)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-oversized-two-appends
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability

@@ -376,6 +376,12 @@ export function rememberJsonlScanCursor<T>(
   read: JsonlTailRead,
   parserState: T,
 ) {
+  // Every cursor writer must first prepare a digest from verified source bytes.
+  // A future caller that omits that step must fail closed at the durable write.
+  if (read.committedOffset > 0 &&
+    (typeof read.committedPrefixHash !== "string" || !SHA256_RE.test(read.committedPrefixHash))) {
+    throw new JsonlSnapshotChangedError();
+  }
   database
     .prepare(
       `insert into ${STATE_TABLE}
@@ -460,22 +466,29 @@ export function prepareJsonlCommittedPrefixHash<T>(
   const span = read.committedSourceSpan;
   const canExtend = span && span.offset + span.bytes.length === read.committedOffset &&
     (!read.reset || span.offset === 0);
+  // A reset rebuilds from byte zero. Otherwise any cursor that preserves or
+  // advances the old committed offset must prove its old bytes first, including
+  // continuation completions that have no committed source span.
+  const oldOffset = !read.reset && cursor?.committedOffset !== null &&
+    cursor?.committedOffset !== undefined && cursor.committedOffset > 0 &&
+    read.committedOffset >= cursor.committedOffset ? cursor.committedOffset : 0;
+  const oldDigest = oldOffset > 0 ? cursor?.committedPrefixHash : null;
+  if (oldOffset > 0 && (typeof oldDigest !== "string" || !SHA256_RE.test(oldDigest))) {
+    throw new JsonlSnapshotChangedError();
+  }
+  const oldPrefix = oldOffset > 0 ? {offset: oldOffset, digest: oldDigest!} : undefined;
   let hash: crypto.Hash;
-  if (canExtend && span.offset === 0) {
+  if (canExtend && span.offset === 0 && oldOffset === 0) {
     hash = crypto.createHash("sha256");
-  } else if (canExtend && prior?.offset === span.offset &&
+  } else if (canExtend && prior?.offset === span.offset && span.offset === oldOffset &&
     prior.identity === read.fileIdentity &&
-    prior.digest === cursor?.committedPrefixHash) {
+    prior.digest === oldDigest) {
     hash = prior.hash.copy();
   } else {
-    hash = captureCommittedPrefixHash(file, canExtend ? span.offset : read.committedOffset, read);
-    // A reopened tailer must not turn a changed historical prefix into a new
-    // trusted cursor merely because later records were appended. The old
-    // sightings belong to the digest that was committed with the old offset.
-    if (canExtend && span.offset > 0 && cursor?.committedOffset === span.offset &&
-      hash.copy().digest("hex") !== cursor.committedPrefixHash) {
-      throw new JsonlSnapshotChangedError();
-    }
+    // One stable descriptor read supplies the final hash and checks the old
+    // digest at its exact offset, even when a continuation supplies no span.
+    hash = captureCommittedPrefixHash(file, canExtend ? span.offset : read.committedOffset,
+      read, oldPrefix);
   }
   if (canExtend) hash.update(span.bytes);
   const digest = hash.copy().digest("hex");
@@ -485,8 +498,13 @@ export function prepareJsonlCommittedPrefixHash<T>(
   states.set(key, {offset: read.committedOffset, identity: read.fileIdentity, hash, digest});
 }
 
-function captureCommittedPrefixHash(file: string, end: number, read: JsonlTailRead) {
-  if (!nonnegativeInteger(end) || end > read.observedSize) throw new JsonlSnapshotChangedError();
+function captureCommittedPrefixHash(file: string, end: number, read: JsonlTailRead,
+  expectedPrefix?: {offset: number; digest: string}) {
+  if (!nonnegativeInteger(end) || end > read.observedSize ||
+    (expectedPrefix && (!nonnegativeInteger(expectedPrefix.offset) ||
+      expectedPrefix.offset > end || !SHA256_RE.test(expectedPrefix.digest)))) {
+    throw new JsonlSnapshotChangedError();
+  }
   for (let attempt = 0; attempt < 3; attempt++) {
     let fd: number | undefined;
     try {
@@ -501,16 +519,24 @@ function captureCommittedPrefixHash(file: string, end: number, read: JsonlTailRe
       const hash = crypto.createHash("sha256");
       const chunk = Buffer.allocUnsafe(64 * 1024);
       let offset = 0;
+      let prefixDigest: string | undefined;
       while (offset < end) {
-        const count = fs.readSync(fd, chunk, 0, Math.min(chunk.length, end - offset), offset);
+        const boundary = expectedPrefix && offset < expectedPrefix.offset
+          ? expectedPrefix.offset : end;
+        const count = fs.readSync(fd, chunk, 0,
+          Math.min(chunk.length, end - offset, boundary - offset), offset);
         if (count <= 0) break;
         hash.update(chunk.subarray(0, count));
         offset += count;
+        if (expectedPrefix && offset === expectedPrefix.offset) {
+          prefixDigest = hash.copy().digest("hex");
+        }
       }
       const after = fs.fstatSync(fd, {bigint: true});
       const pathAfter = fs.lstatSync(file, {bigint: true});
       if (offset === end && sameGenerationSnapshot(after, generationSnapshot(before)) &&
-        sameGenerationSnapshot(pathAfter, generationSnapshot(before))) return hash;
+        sameGenerationSnapshot(pathAfter, generationSnapshot(before)) &&
+        (!expectedPrefix || prefixDigest === expectedPrefix.digest)) return hash;
     } catch { /* A moving source may become stable on another bounded try. */ }
     finally { if (fd !== undefined) fs.closeSync(fd); }
   }
