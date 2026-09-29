@@ -607,6 +607,30 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-r3-7
 
+      - name: Prove stopped legacy agent cannot trust owner-edited arguments (R4-1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-1
+
+      - name: Prove concurrent restart obligations cannot replace each other (R4-2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-2
+
+      - name: Prove an owner edit during restart is preserved and refused (R4-3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-3
+
+      - name: Prove foreign Studio rollouts remain preview only (R4-4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-4
+
+      - name: Prove Codex rollout originator and later metadata identity (R4-4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-identity
+
+      - name: Prove legacy LaunchAgent shell PATH drift remains allowed
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r4-legacy-path
+
       - name: Prove future-only enrollment withholds pre-join history (eco-6hoxj.163.22)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:enrollment-privacy

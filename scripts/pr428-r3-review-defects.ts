@@ -84,7 +84,7 @@ try {
   fs.mkdirSync(compact, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(compact, `rollout-${compactId}.jsonl`),
     `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-28T00:00:00Z",
-      payload: { id: compactId } })}\n`);
+      payload: { id: compactId, originator: "codex_exec" } })}\n`);
   const compactCandidate = discoverCaptureRootCandidates(compactHome).find((entry) =>
     entry.shape === "studio_codex_conductor");
   check("valid_compact_codex_rollout_remains_auto_enrollable",
@@ -95,7 +95,7 @@ try {
     ".clientai/studio/borg/conductors/primary/profile/sessions/2026/09/28");
   fs.mkdirSync(untimed, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(untimed, `rollout-${untimedId}.jsonl`),
-    `${JSON.stringify({ type: "session_meta", payload: { id: untimedId } })}\n`);
+    `${JSON.stringify({ type: "session_meta", payload: { id: untimedId, originator: "codex_exec" } })}\n`);
   const untimedCandidate = discoverCaptureRootCandidates(untimedHome).find((entry) =>
     entry.shape === "studio_codex_conductor");
   check("valid_untimed_codex_rollout_keeps_tailers_existing_identity_rule",
@@ -148,16 +148,28 @@ try {
   }
 
   if (active("r3-5")) {
-  const priorRuntime = path.join(root, "old-runtime", "cli.mjs");
+  const priorRuntime = path.join(root, "stopped-pre-template", ".plimsoll", "lifecycle",
+    "versions", "0.7.44", "darwin-arm64", "cli.mjs");
   fs.mkdirSync(path.dirname(priorRuntime), { recursive: true, mode: 0o700 });
   fs.writeFileSync(priorRuntime, "// fixture runtime path\n", { mode: 0o600 });
   const stopped = manifestFixture("stopped-pre-template", priorRuntime);
   fs.rmSync(launchAgentOwnedTemplatePath(stopped.home));
+  fs.writeFileSync(path.join(stopped.data, "lifecycle", "state.json"),
+    `${JSON.stringify({ schemaVersion: 1, version: "0.7.44", executablePath: priorRuntime })}\n`,
+    { mode: 0o600 });
   writeCollectorConfigTransactionally(collectorConfigSchema.parse({ port: 49390 }),
     path.join(stopped.data, "collector.config.json"));
   const joined = joinStatus(stopped.home, stopped.data);
-  check("stopped_legacy_without_owner_edits_passes_preflight",
+  check("stopped_legacy_with_independent_runtime_passes_preflight",
     joined.status !== "join_preflight_failed", joined);
+
+  const unsupported = manifestFixture("stopped-without-runtime-evidence", priorRuntime);
+  fs.rmSync(launchAgentOwnedTemplatePath(unsupported.home));
+  writeCollectorConfigTransactionally(collectorConfigSchema.parse({ port: 49390 }),
+    path.join(unsupported.data, "collector.config.json"));
+  const unsupportedJoin = joinStatus(unsupported.home, unsupported.data);
+  check("stopped_legacy_without_independent_runtime_requires_replacement",
+    unsupportedJoin.status === "join_preflight_failed", unsupportedJoin);
   }
 } finally { fs.rmSync(root, { recursive: true, force: true }); }
 console.log(JSON.stringify({ proof: "pr428-r3-review-defects", selected, failures }));

@@ -14,6 +14,8 @@ import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { deriveCaptureRootIdentity, discoverCaptureRootCandidates } from "../packages/collector-cli/src/capture-root-inventory";
 import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
 import { dashboardSummary } from "../packages/collector-cli/src/dashboard-api";
+import { LifecycleMutationAuthority } from
+  "../packages/collector-cli/src/lifecycle-authority";
 import { useFixtureRoot } from "./lib/fixture-root";
 
 const repo = path.resolve(import.meta.dirname, "..");
@@ -68,6 +70,10 @@ function stubLaunchctl(bin: string) {
     'state="${PLIMSOLL_PROOF_LAUNCHCTL_STATE:?}"',
     'trace="${PLIMSOLL_PROOF_LAUNCHCTL_TRACE:?}"',
     'if [ "$1" = "print" ]; then',
+    '  if [ -f "${PLIMSOLL_PROOF_LOADED_STOPPED_MARKER:-/dev/null}" ]; then',
+    '    printf "    state = not running\\n    runs = 1\\n"',
+    '    exit 0',
+    '  fi',
     '  if [ -f "$state" ]; then',
     '    pid="$(cat "$state")"',
     '    if kill -0 "$pid" 2>/dev/null; then',
@@ -79,6 +85,11 @@ function stubLaunchctl(bin: string) {
     '  exit 113',
     'fi',
     'if [ "$1" = "bootout" ]; then',
+    '  if [ -f "${PLIMSOLL_PROOF_LOADED_STOPPED_MARKER:-/dev/null}" ]; then',
+    '    rm -f "$PLIMSOLL_PROOF_LOADED_STOPPED_MARKER"',
+    '    printf "bootout stopped\\n" >> "$trace"',
+    '    exit 0',
+    '  fi',
     '  if [ -f "$state" ]; then',
     '    pid="$(cat "$state")"',
     '    kill -TERM "$pid" 2>/dev/null || exit 1',
@@ -88,6 +99,11 @@ function stubLaunchctl(bin: string) {
     '    done',
     '    rm -f "$state"',
     '    printf "bootout %s\\n" "$pid" >> "$trace"',
+    '    bootouts="$(grep -c "^bootout " "$trace")"',
+    '    if { [ "${PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT:-}" = "1" ] && [ "$bootouts" -eq 2 ]; } || { [ "${PLIMSOLL_PROOF_EDIT_ON_FIRST_BOOTOUT:-}" = "1" ] && [ "$bootouts" -eq 1 ]; }; then',
+    '      plist="$HOME/Library/LaunchAgents/com.plimsoll.collector.plist"',
+    "      /usr/bin/perl -0777 -i -pe 's{(<key>PATH</key>\\s*<string>)([^<]*)(</string>)}{$1$2:/opt/owner-custom-bin$3}' \"$plist\"",
+    '    fi',
     '    if [ "${PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT:-}" = "1" ]; then',
     '      /usr/bin/sqlite3 "$PLIMSOLL_HOME/work-ledger.sqlite" "update automatic_capture_baseline_state set status=\'complete\', completed_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'), updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'), files_discovered=files_validated, discovery_errors=0, stat_errors=0, error_code=null, error_at=null where source=\'codex\'"',
     '    fi',
@@ -270,7 +286,16 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     fs.writeFileSync(path.join(path.dirname(codex), "config.toml"), 'model = "gpt-6-sol"\n', { mode: 0o600 });
     fs.writeFileSync(path.join(codex, `rollout-2026-09-27T00-00-00-${studioSession}.jsonl`),
       `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
-        payload: { id: studioSession } })}\n`, { mode: 0o600 });
+        payload: { id: studioSession, originator: "codex_exec" } })}\n`, { mode: 0o600 });
+    const foreign = path.join(f.home,
+      ".clientai/studio/borg/conductors/other-tool/profile/sessions");
+    if (name === "foreign_rollout") {
+      fs.mkdirSync(foreign, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(foreign,
+        `rollout-2026-09-27T00-00-00-${studioSession}.jsonl`),
+      `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
+        payload: { id: studioSession, originator: "claude_code" } })}\n`, { mode: 0o600 });
+    }
     if (name.startsWith("exhausted_")) {
       const recent = path.join(codex, "2026", "09", "28");
       fs.mkdirSync(recent, { recursive: true, mode: 0o700 });
@@ -295,7 +320,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       'model = "gpt-6-sol"\n', { mode: 0o600 });
     fs.writeFileSync(path.join(studio, `rollout-2026-09-27T00-00-00-${studioSession}.jsonl`),
       `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
-        payload: { id: studioSession } })}\n`, { mode: 0o600 });
+        payload: { id: studioSession, originator: "codex_exec" } })}\n`, { mode: 0o600 });
     const candidates = discoverCaptureRootCandidates(f.home);
     if (name !== "symlink_private") check(`${name}_named_studio_rule_only`,
       candidates.some((entry) => entry.shape === "studio_codex_conductor" && entry.directory === studio) &&
@@ -329,7 +354,9 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         } finally { buffer.close(); }
       }
       const installed = await command(f.env, ["install-launch-agent", "--load"], "",
-        (name === "running_0744_layout" || name === "crash_manifest_link_running") && process.env.PLIMSOLL_PROOF_0744_CLI
+        (["running_0744_layout", "stopped_0744_layout", "loaded_stopped_0744_layout",
+          "mid_restart_0744_layout", "legacy_path_drift_0744",
+          "crash_manifest_link_running"].includes(name)) && process.env.PLIMSOLL_PROOF_0744_CLI
           ? process.env.PLIMSOLL_PROOF_0744_CLI : f.installedCli);
       const started = installed.code === 0 && fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
@@ -340,6 +367,27 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
           ? fs.readFileSync(f.env.PLIMSOLL_PROOF_DAEMON_LOG!, "utf8").slice(-1200) : null,
       })}`);
       check(`${name}_fixture_collector_started_before_join`, true);
+      if (name === "stopped_0744_layout") {
+        const stopped = await command(f.env, ["unload-launch-agent"], "",
+          process.env.PLIMSOLL_PROOF_0744_CLI);
+        check("released_0744_agent_unloaded_before_join", stopped.code === 0 &&
+          !fs.existsSync(f.state) &&
+          !await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+        console.log(JSON.stringify({ scenario: name, priorTemplateExists: fs.existsSync(path.join(
+          f.home, "Library/LaunchAgents/com.plimsoll.collector.plist.plimsoll-owned-template.json")),
+          priorLifecycleStateExists: fs.existsSync(path.join(f.data, "lifecycle/state.json")) }));
+      }
+      if (name === "loaded_stopped_0744_layout") {
+        const pid = Number(fs.readFileSync(f.state, "utf8").trim());
+        process.kill(pid, "SIGTERM");
+        check("released_0744_agent_stopped_before_join",
+          !await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT)));
+        fs.rmSync(f.state, { force: true });
+        const marker = path.join(path.dirname(f.state), "loaded-stopped.marker");
+        fs.writeFileSync(marker, "1\n", { mode: 0o600 });
+        f.env.PLIMSOLL_PROOF_LOADED_STOPPED_MARKER = marker;
+      }
+      if (name === "mid_restart_0744_layout") f.env.PLIMSOLL_PROOF_DELAY_RESTART = "1";
       if (name === "corrupt_obligation_loaded")
         fs.writeFileSync(path.join(f.data, "join.restart-obligation.json"), "", { mode: 0o600 });
       if (name === "crash_after_config_commit") {
@@ -363,9 +411,12 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       // The published 0.7.44 CLI changes the manifest by itself. In CI,
       // where that optional artifact is absent, PATH drift still forces the
       // installer through the same interrupted publish while a daemon serves.
-      if (name === "path_drift" ||
+      if (name === "path_drift" || name === "owner_edit_during_join" ||
+          name === "legacy_path_drift_0744" ||
           (name === "crash_manifest_link_running" && !process.env.PLIMSOLL_PROOF_0744_CLI))
         f.env.PATH = `${f.env.PATH}:/opt/new-toolchain`;
+      if (name === "owner_edit_during_join") f.env.PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT = "1";
+      if (name === "owner_edit_first_unload") f.env.PLIMSOLL_PROOF_EDIT_ON_FIRST_BOOTOUT = "1";
       if (name === "crash_after_config_commit") f.env.PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT = "1";
       if (name === "crash_after_config_commit" || name === "crash_fresh_after_config_commit") {
         const preload = path.join(f.home, "kill-after-config-commit.mjs");
@@ -426,12 +477,17 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     if (name.startsWith("crash_obligation_")) {
       const preload = path.join(f.home, "crash-obligation.mjs");
       const atOpen = name === "crash_obligation_open";
+      const atRename = name === "crash_obligation_rename";
+      const atLink = name === "crash_obligation_link";
+      const atDirectoryFsync = name === "crash_obligation_directory_fsync";
       fs.writeFileSync(preload, [
         'import fs from "node:fs";',
         'const tracked = new Set();',
-        'const nativeOpen = fs.openSync, nativeFsync = fs.fsyncSync;',
+        'const nativeOpen = fs.openSync, nativeFsync = fs.fsyncSync, nativeRename = fs.renameSync, nativeLink = fs.linkSync;',
         'fs.openSync = (...args) => { const fd = nativeOpen(...args); if (process.argv[2] === "join" && String(args[0]).includes("/join.restart-obligation.json")) { tracked.add(fd); if (' + String(atOpen) + ') process.kill(process.pid, "SIGKILL"); } return fd; };',
-        'fs.fsyncSync = (fd) => { nativeFsync(fd); if (process.argv[2] === "join" && tracked.has(fd)) process.kill(process.pid, "SIGKILL"); };',
+        'fs.fsyncSync = (fd) => { nativeFsync(fd); if (process.argv[2] === "join" && tracked.has(fd) && !' + String(atRename || atLink || atDirectoryFsync) + ') process.kill(process.pid, "SIGKILL"); if (process.argv[2] === "join" && ' + String(atDirectoryFsync) + ' && fs.fstatSync(fd).isDirectory() && fs.existsSync(process.env.PLIMSOLL_HOME + "/join.restart-obligation.json")) process.kill(process.pid, "SIGKILL"); };',
+        'fs.renameSync = (...args) => { nativeRename(...args); if (process.argv[2] === "join" && ' + String(atRename) + ' && String(args[1]).endsWith("/join.restart-obligation.json")) process.kill(process.pid, "SIGKILL"); };',
+        'fs.linkSync = (...args) => { nativeLink(...args); if (process.argv[2] === "join" && ' + String(atLink) + ' && String(args[1]).endsWith("/join.restart-obligation.json")) process.kill(process.pid, "SIGKILL"); };',
       ].join("\n") + "\n", { mode: 0o600 });
       f.env.NODE_OPTIONS = `--import=${preload}`;
     }
@@ -585,6 +641,34 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     }
     if (prompt) check("fresh_prompt_hides_token_and_exits", true);
     const result = receipt(joined.stdout);
+    if (name === "legacy_path_drift_0744") {
+      const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+      console.log(JSON.stringify({ scenario: name, exit: joined.code, status: result.status,
+        reason: result.message ?? result.reason ?? null, plistPresent: fs.existsSync(plist),
+        cloudJoins: remote.joins.length }));
+      check("released_0744_template_allows_shell_path_drift", joined.code === 0 &&
+        result.status === "joined");
+      return;
+    }
+    if (name === "owner_edit_during_join" || name === "owner_edit_first_unload") {
+      const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+      const ownerPathPreserved = fs.readFileSync(plist, "utf8").includes("/opt/owner-custom-bin");
+      const trace = fs.readFileSync(f.trace, "utf8");
+      const running = fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(
+        path.join(f.data, "collector.config.json"), "utf8")));
+      const obligationPresent = fs.existsSync(path.join(f.data, "join.restart-obligation.json"));
+      console.log(JSON.stringify({ scenario: name, exit: joined.code, status: result.status,
+        ownerPathPreserved, bootouts: trace.split("\n").filter((line) => line.startsWith("bootout ")).length,
+        running, rootCount: config.captureRoots?.length ?? 0, obligationPresent,
+        trace, reason: result.reason ?? null }));
+      check("owner_edit_during_join_is_preserved_and_refused", joined.code !== 0 &&
+        result.status === "joined_setup_incomplete" && ownerPathPreserved && running &&
+        (config.captureRoots?.length ?? 0) === 0 && !obligationPresent &&
+        trace.split("\n").filter((line) => line.startsWith("bootout ")).length === 2);
+      return;
+    }
     if (name === "corrupt_obligation_loaded") {
       const notes = fs.readdirSync(f.data).filter((entry) =>
         entry.startsWith("join.restart-obligation.recovery-") && entry.endsWith(".json"));
@@ -650,6 +734,14 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     if (name === "clock_skew") console.log(JSON.stringify({ scenario: name, joinCode: joined.code,
       joinStatus: result.status, reason: result.reason ?? null }));
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8")));
+    if (name === "foreign_rollout") {
+      const enrolled = config.captureRoots?.some((entry) => entry.directory === foreign) ?? false;
+      console.log(JSON.stringify({ scenario: name, joinExit: joined.code,
+        joinStatus: result.status, foreignFolderRegistered: enrolled,
+        rootCount: config.captureRoots?.length ?? 0 }));
+      check("foreign_tool_rollout_is_not_automatically_registered", !enrolled);
+      return;
+    }
     if (name.startsWith("exhausted_")) {
       const rootCount = config.captureRoots?.length ?? 0;
       const explicit = name === "exhausted_explicit";
@@ -756,6 +848,24 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
           localEvents, setupRows,
           plainResultSeen: joined.stdout.includes("First contact confirmed") }));
       check(`${name}_single_command_finishes_ready_and_acknowledged`, true);
+      if (name === "busy_fence_serving_rejoin") {
+        const held = new LifecycleMutationAuthority(path.join(f.data, "lifecycle-authority"))
+          .acquire({ leaseMs: 30_000 });
+        check("busy_fence_fixture_lease_acquired", held.kind === "acquired");
+        if (held.kind !== "acquired") throw new Error("fixture lease was unavailable");
+        try {
+          const second = await command(f.env, ["join", "--token-stdin", "--url",
+            `http://127.0.0.1:${remote.port}`], `${token}\n`, f.installedCli);
+          const secondResult = receipt(second.stdout);
+          const runningAfter = fs.existsSync(f.state) &&
+            await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+          console.log(JSON.stringify({ scenario: name, secondExit: second.code,
+            secondStatus: secondResult.status, reason: secondResult.reason ?? null,
+            runningAfter }));
+          check("serving_collector_satisfies_busy_lifecycle_fence",
+            second.code === 0 && secondResult.status === "joined" && runningAfter);
+        } finally { held.lease.release(); }
+      }
       if (name === "fresh" && process.env.PLIMSOLL_PROOF_0744_CLI) {
         const old = await command(f.env, ["status", "--json"], "", process.env.PLIMSOLL_PROOF_0744_CLI);
         check("released_0744_cli_opens_head_joined_ledger", old.code === 0 &&
@@ -823,6 +933,30 @@ async function main() {
       await joinedScenario("running_0744_layout", true, "ack");
       return;
     }
+    if (process.env.PR428_REVIEW_SCENARIO === "stopped_0744_layout") {
+      await joinedScenario("stopped_0744_layout", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "loaded_stopped_0744_layout") {
+      await joinedScenario("loaded_stopped_0744_layout", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "mid_restart_0744_layout") {
+      await joinedScenario("mid_restart_0744_layout", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "legacy_path_drift_0744") {
+      await joinedScenario("legacy_path_drift_0744", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "busy_fence_serving_rejoin") {
+      await joinedScenario("busy_fence_serving_rejoin", false, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "foreign_rollout") {
+      await joinedScenario("foreign_rollout", false, "ack");
+      return;
+    }
     if (process.env.PR428_REVIEW_SCENARIO === "no_daemon_only") {
       await joinOnlyScenario("explicit_no_daemon", "--no-daemon");
       return;
@@ -841,6 +975,14 @@ async function main() {
     }
     if (process.env.PR428_REVIEW_SCENARIO === "edited_manifest") {
       await joinedScenario("edited_manifest", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_during_join") {
+      await joinedScenario("owner_edit_during_join", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_first_unload") {
+      await joinedScenario("owner_edit_first_unload", true, "ack");
       return;
     }
     if (process.env.PR428_REVIEW_SCENARIO === "fleet_label") {
@@ -887,9 +1029,10 @@ async function main() {
       await joinedScenario("crash_manifest_link_running", true, "ack");
       return;
     }
-    if (process.env.PR428_REVIEW_SCENARIO === "crash_obligation_open" ||
-        process.env.PR428_REVIEW_SCENARIO === "crash_obligation_fsync") {
-      await joinedScenario(process.env.PR428_REVIEW_SCENARIO, false, "ack");
+    if (["crash_obligation_open", "crash_obligation_fsync", "crash_obligation_rename",
+      "crash_obligation_link",
+      "crash_obligation_directory_fsync"].includes(process.env.PR428_REVIEW_SCENARIO ?? "")) {
+      await joinedScenario(process.env.PR428_REVIEW_SCENARIO!, false, "ack");
       return;
     }
     if (process.env.PR428_REVIEW_SCENARIO === "corrupt_obligation_loaded") {

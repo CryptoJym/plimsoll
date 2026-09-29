@@ -74,7 +74,7 @@ try {
   const rolloutId = "12345678-1234-4234-8234-123456789abc";
   const rolloutName = `rollout-2026-09-28T00-00-00-${rolloutId}.jsonl`;
   const rollout = `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-28T00:00:00Z",
-    payload: { id: rolloutId } })}\n`;
+    payload: { id: rolloutId, originator: "codex_exec" } })}\n`;
   const withoutConfig = path.join(root, "codex-without-optional-config");
   const currentDay = path.join(withoutConfig, ".codex/sessions/2026/09/28");
   fs.mkdirSync(currentDay, { recursive: true });
