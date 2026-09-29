@@ -33,9 +33,8 @@
  * Cadence: manual refresh only. Nothing here schedules, retries on its own,
  * or runs in the background.
  *
- * Profile scope: the DEFAULT provider profiles only. Alternate
- * CLAUDE_CONFIG_DIR / CODEX_HOME profiles belong to issue #172 and are
- * deliberately unreachable from this module.
+ * The standalone Claude status-line setup command accepts explicit config
+ * directories; the Codex app-server probe remains default-profile only.
  */
 
 import {
@@ -44,6 +43,7 @@ import {
 } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -55,6 +55,10 @@ import {
 
 import { PLIMSOLL_VERSION } from "./version";
 import { resolveCollectorHome } from "./collector-home";
+import { providerAccountKey } from "../../shared/src/policy";
+import { claudePlanLimitWindows, PlanLimitEmitter } from "./plan-limit-observation";
+import { LocalEventBuffer } from "./buffer";
+import { collectorBufferPath, ensureCollectorHome } from "./config";
 
 // ---------------------------------------------------------------------------
 // Contract constants
@@ -1542,6 +1546,72 @@ export function configureClaudeStatusLineProxy(
 // Direct-invocation command surface (manual refresh only)
 // ---------------------------------------------------------------------------
 
+const STATUS_LINE_BACKUP_NAME = ".plimsoll-status-line-original.json";
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function restoreClaudeStatusLine(configDir: string): void {
+  const settings = path.join(configDir, "settings.json");
+  const backup = path.join(configDir, STATUS_LINE_BACKUP_NAME);
+  const stat = fs.lstatSync(backup);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("status_line_backup_invalid");
+  const current = JSON.parse(fs.readFileSync(settings, "utf8")) as Record<string, unknown>;
+  const command = (current.statusLine as Record<string, unknown> | undefined)?.command;
+  if (typeof command !== "string" || !command.includes(STATUS_LINE_PROXY_INVOCATION_MARKER)) {
+    throw new Error("status_line_not_owned");
+  }
+  const saved = JSON.parse(fs.readFileSync(backup, "utf8")) as { existed?: boolean; bytes?: string };
+  if (typeof saved.existed !== "boolean" || typeof saved.bytes !== "string") throw new Error("status_line_backup_invalid");
+  if (saved.existed) {
+    const temp = `${settings}.plimsoll-restore-${process.pid}`;
+    fs.writeFileSync(temp, Buffer.from(saved.bytes, "base64"), { mode: 0o600, flag: "wx" });
+    fs.renameSync(temp, settings);
+  } else fs.rmSync(settings);
+  fs.rmSync(backup);
+}
+
+/** Standalone source command; each target preserves its original bytes for uninstall. */
+export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string }> {
+  const dirs = [path.join(os.homedir(), ".claude")];
+  let uninstall = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--uninstall") { uninstall = true; continue; }
+    if (argv[index] === "--config-dir" && argv[index + 1] && !argv[index + 1]!.startsWith("--")) {
+      dirs.push(path.resolve(argv[++index]!));
+      continue;
+    }
+    throw new Error("usage: setup-claude-status-line [--config-dir <dir>]... [--uninstall]");
+  }
+  const results: Array<{ configDir: string; outcome: string }> = [];
+  for (const dir of [...new Set(dirs)]) {
+    const backup = path.join(dir, STATUS_LINE_BACKUP_NAME);
+    if (uninstall) {
+      if (fs.existsSync(backup)) { restoreClaudeStatusLine(dir); results.push({ configDir: dir, outcome: "restored" }); }
+      else results.push({ configDir: dir, outcome: "not_installed" });
+      continue;
+    }
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const settings = path.join(dir, "settings.json");
+    const existed = fs.existsSync(settings);
+    const newBackup = !fs.existsSync(backup);
+    if (newBackup) {
+      const bytes = existed ? fs.readFileSync(settings) : Buffer.alloc(0);
+      fs.writeFileSync(backup, JSON.stringify({ existed, bytes: bytes.toString("base64") }), { flag: "wx", mode: 0o600 });
+    }
+    const command = ["env", dir === dirs[0] ? "-u CLAUDE_CONFIG_DIR" : `CLAUDE_CONFIG_DIR=${shellQuote(dir)}`,
+      shellQuote(process.execPath), ...process.execArgv.map(shellQuote), shellQuote(path.resolve(process.argv[1]!))].join(" ");
+    const outcome = configureClaudeStatusLineProxy({ settingsPath: settings, baseProxyCommand: command });
+    if ("reason" in outcome) {
+      if (newBackup) fs.rmSync(backup);
+      throw new Error(`claude_status_line_${outcome.outcome}:${outcome.reason}`);
+    }
+    results.push({ configDir: dir, outcome: outcome.outcome });
+  }
+  return results;
+}
+
 function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
@@ -1628,6 +1698,34 @@ async function statusLineProxyMain(argv: string[]): Promise<void> {
     stdinBytes,
     chainCommand: chainCommand === null || chainCommand.length === 0 ? null : chainCommand,
   });
+  if (!overBound) {
+    try {
+      const accountFile = process.env.CLAUDE_CONFIG_DIR
+        ? path.join(process.env.CLAUDE_CONFIG_DIR, ".claude.json")
+        : path.join(os.homedir(), ".claude.json");
+      const stat = fs.lstatSync(accountFile);
+      if (stat.isFile() && !stat.isSymbolicLink()) {
+        const identity = JSON.parse(fs.readFileSync(accountFile, "utf8")) as { oauthAccount?: { accountUuid?: unknown } };
+        const id = identity.oauthAccount?.accountUuid;
+        if (typeof id === "string" && id.length > 0) {
+          const payload = JSON.parse(stdinBytes.toString("utf8")) as unknown;
+          const windows = claudePlanLimitWindows(payload);
+          if (windows.length > 0) {
+            ensureCollectorHome();
+            const buffer = new LocalEventBuffer(collectorBufferPath());
+            try {
+              const emitter = new PlanLimitEmitter(buffer);
+              const accountKey = providerAccountKey(id);
+              for (const window of windows) emitter.observe({ source: "claude_code", accountKey,
+                observedAt: result.receipt.observedAt, window, planLimitSource: "claude_status_line" });
+            } finally { buffer.close(); }
+          }
+        }
+      }
+    } catch {
+      // Collection is best-effort; the original status line always gets its output.
+    }
+  }
   if (result.stdout.length > 0) process.stdout.write(result.stdout);
   if (result.stderr.length > 0) process.stderr.write(result.stderr);
   process.exitCode = result.exitCode === 0 ? 0 : result.exitCode;
@@ -1643,6 +1741,7 @@ export function invokedAsCapacityAdaptersCli(
   const knownCommands = [
     "refresh",
     "install-claude-statusline",
+    "setup-claude-status-line",
     STATUS_LINE_PROXY_INVOCATION_MARKER,
   ];
   if (!knownCommands.includes(command)) return false;
@@ -1668,6 +1767,10 @@ export async function capacityAdaptersCliMain(argv: string[]): Promise<void> {
   }
   if (command === "install-claude-statusline") {
     installClaudeStatuslineCommand(rest);
+    return;
+  }
+  if (command === "setup-claude-status-line") {
+    printJson({ status: "claude_status_line_setup", results: setupClaudeStatusLine(rest) });
     return;
   }
   if (command === STATUS_LINE_PROXY_INVOCATION_MARKER) {

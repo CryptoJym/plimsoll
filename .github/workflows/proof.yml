@@ -580,6 +580,12 @@ jobs:
           pnpm proof:capacity-contract
           pnpm proof:capacity-adapters
 
+      - name: Prove provider account keys and plan-limit readings (eco-6hoxj.165.99.1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:account-plan-limit
+          pnpm proof:claude-status-line-account
+
       - name: Prove lane receipts, fleet operations and release qualification (#176/#154/#171)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
