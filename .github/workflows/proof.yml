@@ -631,6 +631,22 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-r4-legacy-path
 
+      - name: Prove stale or symlinked lifecycle state cannot vouch for an owner edit (R5-1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-1
+
+      - name: Prove recovery leaves a foreign prepared hard link in place (R5-2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-2
+
+      - name: Prove valid owner edits restart the collector on recovery conflicts (R5-3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-3
+
+      - name: Prove unread rollout tails remain explicit enrollment candidates (R5-4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-r5-4
+
       - name: Prove future-only enrollment withholds pre-join history (eco-6hoxj.163.22)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:enrollment-privacy
