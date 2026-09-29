@@ -11,9 +11,83 @@ import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collec
 import { refreshUnsentRawDelivery } from "../packages/collector-cli/src/outbox";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { collisionSafeDeliveryId } from "../packages/collector-cli/src/upload-history";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const rollbackStatement = "Rolling back to 0.7.44 restores its retention: expired rows may be pruned locally before upload; their queued copies still upload.";
+
+async function privacySiblingRollback(OldBuffer: typeof LocalEventBuffer) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pr417-privacy-rollback-"));
+  const ledger = path.join(root, "ledger.sqlite");
+  const id = "00000000-0000-4000-8000-000000004180";
+  const alternate = collisionSafeDeliveryId(id, 1);
+  const oldAt = new Date(Date.now() - 45 * 86_400_000).toISOString();
+  const now = new Date();
+  const options = { workspaceId: "privacy-downgrade-proof", deviceId: "privacy-device",
+    delivery: { enabled: true }, enrollmentNow: () => new Date(Date.now() - 60 * 86_400_000) };
+  try {
+    const before = new LocalEventBuffer(ledger, options);
+    try {
+      const event = aiInteractionEventSchema.parse({ id, sessionId: id, source: "codex",
+        eventType: "assistant_response", dataMode: "metadata", observedAt: oldAt,
+        actionClass: "other", inputTokens: 1, outputTokens: 1 });
+      before.database.prepare(`insert into buffered_events
+        (id,source,event_type,data_mode,observed_at,payload_json,created_at,
+         workspace_id,device_id)
+        values (?,'codex','assistant_response','metadata',?,?,?,?,?)`)
+        .run(id, oldAt, JSON.stringify(event), oldAt, options.workspaceId, options.deviceId);
+      assert.equal(before.delivery.repairRawById(id).enqueued, 1);
+      // A legacy raw can carry more than one collision-safe delivery ID.
+      before.database.prepare(`insert into upload_outbox
+        (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,
+         workspace_id,device_id,base_envelope_json,base_bytes,repo_hash,branch_hash,
+         sealed_envelope_json,sealed_bytes,state,attempt_count,next_attempt_at,
+         lease_id,lease_expires_at,last_failure_class,created_at,updated_at)
+        select ?,raw_rowid,raw_id,raw_created_at,raw_generation,workspace_id,device_id,
+          replace(base_envelope_json,?,?),base_bytes,repo_hash,branch_hash,
+          sealed_envelope_json,sealed_bytes,state,attempt_count,next_attempt_at,
+          lease_id,lease_expires_at,last_failure_class,created_at,updated_at
+        from upload_outbox where delivery_id=?`)
+        .run(alternate, id, alternate, id);
+      before.database.prepare(`update upload_outbox set next_attempt_at=?
+        where delivery_id=?`).run(oldAt, id);
+      before.database.prepare(`update buffered_events set
+        privacy_disposition='local_privacy_violation',privacy_disposed_at=? where id=?`)
+        .run(now.toISOString(), id);
+      const lease = before.delivery.lease({ maxRows: 1,
+        now: new Date(now.getTime() + 3_600_000) });
+      assert.equal(lease.locallyDead, 2,
+        "one terminal privacy decision must close every linked legacy copy");
+      assert.equal((before.database.prepare(`select count(*) as n from upload_outbox
+        where raw_id=?`).get(id) as { n: number }).n, 0);
+      for (const deliveryId of [id, alternate]) {
+        const receipt = before.database.prepare(`select reason from upload_receipts
+          where delivery_id=?`).get(deliveryId) as { reason: string };
+        assert.equal(receipt.reason, "local_privacy_violation");
+      }
+      console.log(JSON.stringify({ phase: "privacy_before_rollback",
+        retired: lease.locallyDead, outbox: 0 }));
+    } finally { before.close(); }
+    const old = new OldBuffer(ledger, options);
+    try {
+      const pruned = old.prune(30, { maxRows: 10, now });
+      assert.equal(pruned.events, 0,
+        "exact 0.7.44 must keep the privacy raw after all linked copies retire");
+      assert.ok(old.database.prepare(`select 1 from buffered_events where id=?`).get(id));
+      console.log(JSON.stringify({ phase: "privacy_old_prune", pruned }));
+    } finally { old.close(); }
+    const after = new LocalEventBuffer(ledger, options);
+    try {
+      const lease = after.delivery.lease({ now: new Date(now.getTime() + 5_000_000) });
+      assert.equal(lease.items.length, 0);
+      assert.equal(after.prune(30, { maxRows: 10, now }).events, 1,
+        "the newer pruner can expire the terminally local-only raw");
+      assert.equal(after.retentionStatus(30, now).states.heldForUpload, 0);
+      console.log(JSON.stringify({ phase: "privacy_reupgrade",
+        leasable: lease.items.length, outbox: 0, held: 0 }));
+    } finally { after.close(); }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
 
 async function main() {
   const baseRoot = process.env.PR417_BASE_WORKTREE;
@@ -189,12 +263,13 @@ async function main() {
         receipts: count(reupgraded, "upload_receipts"),
         held: status.retention?.states?.heldForUpload, status: statusResponse.status }));
     } finally { await close(statusServer); reupgraded.close(); }
-    assert.ok(fs.readFileSync(path.join(__dirname, "../docs/runbooks/raw-retention-rollback.md"), "utf8")
-      .includes(rollbackStatement), "the runbook must state 0.7.44 rollback behavior");
   } finally {
     await close(ingestServer);
     fs.rmSync(root, { recursive: true, force: true });
   }
+  await privacySiblingRollback(OldBuffer);
+  assert.ok(fs.readFileSync(path.join(__dirname, "../docs/runbooks/raw-retention-rollback.md"), "utf8")
+    .includes(rollbackStatement), "the runbook must state 0.7.44 rollback behavior");
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });

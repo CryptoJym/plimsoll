@@ -1217,7 +1217,7 @@ export class DeliveryOutbox {
         // belongs to the raw. The raw disposition survives later generation
         // assignment if a matching old outbox required a NULL-generation bind.
         if (changes && unique && isTerminalPrivacyReason(receipt.reason)) {
-          markRawPrivacyDisposition(this.db, unique.rawRowid,
+          this.retireLinkedPrivacyDeliveries(unique.rawRowid, unique.rawId,
             receipt.reason, receipt.terminalAt);
         }
         bound += changes;
@@ -1360,24 +1360,23 @@ export class DeliveryOutbox {
       existingReceipt?.reason === "local_evidence_quarantined" ||
       existingReceipt?.reason === "local_privacy_violation"
     ) {
-      markRawPrivacyDisposition(
-        this.db,
-        row.rawRowid,
-        existingReceipt.reason,
-        this.clock().toISOString(),
-      );
-      return { enqueued: 0, dead: 0 };
+      const terminalAt = this.clock().toISOString();
+      return { enqueued: 0,
+        dead: this.retireLinkedPrivacyDeliveries(row.rawRowid, row.rawId,
+          existingReceipt.reason, terminalAt) };
     }
     const prepared = prepareDelivery(row, this.limits.maxItemBytes,
       deliveryId === ensureUuidEventId(row.rawId).id ? undefined : deliveryId);
     if (prepared.ok === false) {
       const terminalAt = this.clock().toISOString();
+      let retired = 0;
       if (isTerminalPrivacyReason(prepared.reason)) {
-        markRawPrivacyDisposition(this.db, row.rawRowid, prepared.reason, terminalAt);
+        retired = this.retireLinkedPrivacyDeliveries(row.rawRowid, row.rawId,
+          prepared.reason, terminalAt);
       }
       return {
         enqueued: 0,
-        dead: this.writeReceipt({
+        dead: retired + this.writeReceipt({
           deliveryId: prepared.deliveryId,
           lineage: row,
           state: "dead",
@@ -1390,15 +1389,11 @@ export class DeliveryOutbox {
     }
     if (!row.privacyGeneration) {
       const terminalAt = this.clock().toISOString();
-      markRawPrivacyDisposition(
-        this.db,
-        row.rawRowid,
-        "local_privacy_violation",
-        terminalAt,
-      );
+      const retired = this.retireLinkedPrivacyDeliveries(row.rawRowid, row.rawId,
+        "local_privacy_violation", terminalAt);
       return {
         enqueued: 0,
-        dead: this.writeReceipt({
+        dead: retired + this.writeReceipt({
           deliveryId: prepared.deliveryId,
           lineage: row,
           state: "dead",
@@ -2803,6 +2798,30 @@ export class DeliveryOutbox {
     return deliveries.length > 1;
   }
 
+  /** Persist every terminal privacy decision before an old binary can prune
+   * the raw. A historical raw may have multiple collision-safe delivery IDs;
+   * leaving one active would let 0.7.44 remove the raw and then re-lease it. */
+  private retireLinkedPrivacyDeliveries(rawRowid: number, rawId: string,
+    reason: TerminalPrivacyReason, terminalAt: string) {
+    const linked = { rawRowid, rawId, reason,
+      statusClass: terminalStatusClass(reason), terminalAt };
+    const apply = () => {
+      markRawPrivacyDisposition(this.db, rawRowid, reason, terminalAt);
+      const written = this.db.prepare(`insert or ignore into upload_receipts
+        (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,
+         terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+        select delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,
+          'dead',@reason,@statusClass,attempt_count,created_at,@terminalAt
+        from upload_outbox where raw_rowid=@rawRowid
+          and (raw_id is null or raw_id=@rawId)`).run(linked).changes;
+      this.db.prepare(`delete from upload_outbox where raw_rowid=@rawRowid
+        and (raw_id is null or raw_id=@rawId)`).run(linked);
+      this.clearValidationProbeIfEmpty(terminalAt);
+      return written;
+    };
+    return this.db.inTransaction ? apply() : this.db.transaction(apply).immediate();
+  }
+
   private deadActive(
     deliveryId: string,
     reason: DeliveryReceiptReason,
@@ -2811,17 +2830,30 @@ export class DeliveryOutbox {
   ) {
     const row = this.db
       .prepare(
-        `select raw_rowid as rawRowid, attempt_count as attemptCount,
-           created_at as createdAt
+        `select raw_rowid as rawRowid,raw_id as rawId,
+           raw_created_at as rawCreatedAt,raw_generation as rawGeneration,
+           attempt_count as attemptCount,created_at as createdAt
          from upload_outbox where delivery_id = ?`,
       )
       .get(deliveryId) as
-        | { rawRowid: number | null; attemptCount: number; createdAt: string }
+        | { rawRowid: number | null; rawId: string | null;
+            rawCreatedAt: string | null; rawGeneration: string | null;
+            attemptCount: number; createdAt: string }
         | undefined;
     if (!row) return 0;
+    let siblingReceipts = 0;
     if (row.rawRowid !== null && isTerminalPrivacyReason(reason)) {
-      markRawPrivacyDisposition(this.db, row.rawRowid, reason, terminalAt);
-      disposedRawRowids?.add(row.rawRowid);
+      const owner = this.db.prepare(`select id from buffered_events
+        where rowid=? and created_at is ? and privacy_generation is ?
+          and (? is null or id is ?)`).get(
+        row.rawRowid, row.rawCreatedAt, row.rawGeneration,
+        row.rawId, row.rawId,
+      ) as { id: string } | undefined;
+      if (owner) {
+        disposedRawRowids?.add(row.rawRowid);
+        siblingReceipts = this.retireLinkedPrivacyDeliveries(
+          row.rawRowid, owner.id, reason, terminalAt);
+      }
     }
     const written = this.writeReceipt({
       deliveryId,
@@ -2833,7 +2865,7 @@ export class DeliveryOutbox {
     });
     this.db.prepare(`delete from upload_outbox where delivery_id = ?`).run(deliveryId);
     this.clearValidationProbeIfEmpty(terminalAt);
-    return written;
+    return siblingReceipts + written;
   }
 
   private authoritativePrivacyReason(
