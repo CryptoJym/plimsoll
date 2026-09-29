@@ -62,7 +62,7 @@ async function main() {
     const cursor = buffer.database.prepare(`select resume_candidate_index as position,
       resume_candidate_digest as digest from capture_history_import_runs where root_id=?`)
       .get(captureRoot.rootId) as { position: number; digest: string };
-    assert.equal(cursor.position, 8);
+    assert.equal(cursor.position, 4);
     assert.match(cursor.digest, /^[0-9a-f]{64}$/);
     // The simulated process died after commit. Preserve the committed row and
     // make the lock stale exactly as a new process would observe it.
@@ -74,7 +74,7 @@ async function main() {
       .run(cursor.digest, captureRoot.rootId);
     admitted = 0;
     const receipt = await applyCaptureHistory(buffer, captureRoot);
-    assert.equal(receipt.importedRows, 504);
+    assert.equal(receipt.importedRows, 508);
     assert.ok(receipt.timeBudgetStops > 0, "writer deadline was exercised");
     assert.ok(receipt.maxWriterSliceMs < 250, "writer slice exceeded 250 ms");
     assert.ok(receipt.writerSlices > 1);

@@ -20,7 +20,9 @@ const UUID_AT_END = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const READ_BYTES = 128 * 1024;
 const WRITER_INITIAL_ROWS = 4;
-const WRITER_MAX_ROWS = 64;
+// Leave room for a slow individual row and commit while targeting 120 ms.
+// The 64-row cap produced a 264.8 ms slice on a 32-core host at 0.42 load/core.
+const WRITER_MAX_ROWS = 40;
 const WRITER_TARGET_MS = 120;
 const WRITER_HARD_MS = 250;
 const WAL_LIMIT_BYTES = 256 * 1024 * 1024;
@@ -885,6 +887,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   let maxWriterRowMs = 0;
   let slices = 0;
   let nextRows = WRITER_INITIAL_ROWS;
+  let fastSliceStreak = 0;
   let timeBudgetStops = 0;
   let maxWalBytes = 0;
   let walPauseMs = 0;
@@ -1011,11 +1014,22 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     if (stoppedForTime) timeBudgetStops += 1;
     // Use the committed cost to size the next row cap. A single expensive row
     // keeps the next slice at one row until the ledger becomes responsive.
-    if (elapsed > 200) nextRows = Math.max(1, Math.floor(nextRows / 2));
-    else if (elapsed < 80 && !stoppedForTime)
-      nextRows = Math.min(WRITER_MAX_ROWS, nextRows + Math.max(1, Math.ceil(nextRows / 10)));
-    else if (elapsed > WRITER_TARGET_MS)
-      nextRows = Math.max(1, nextRows - 1);
+    if (elapsed > 200) {
+      nextRows = Math.max(1, Math.floor(nextRows / 2));
+      fastSliceStreak = 0;
+    } else if (elapsed < 80 && !stoppedForTime) {
+      // Grow only after sustained headroom; a single fast commit is not a
+      // reliable estimate of the next commit on a shared host.
+      fastSliceStreak += 1;
+      if (fastSliceStreak >= 3) {
+        nextRows = Math.min(WRITER_MAX_ROWS,
+          nextRows + Math.max(1, Math.ceil(nextRows / 12)));
+        fastSliceStreak = 0;
+      }
+    } else {
+      fastSliceStreak = 0;
+      if (elapsed > WRITER_TARGET_MS) nextRows = Math.max(1, nextRows - 1);
+    }
     importedRows += receipt.rows;
     importedTokens.input += receipt.counts.input;
     importedTokens.output += receipt.counts.output;
