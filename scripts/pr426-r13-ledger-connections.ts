@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { readReplacementLedgerMarker, restoreArchivedLedger, switchFreshLedger } from "../packages/collector-cli/src/fresh-ledger-cutover";
-import { acquireLedgerConnectionLock, ledgerConnectionLockPath, openLedgerCopyDatabase, readLedgerPublication } from "../packages/collector-cli/src/ledger-connection";
+import { acquireLedgerConnectionLock, ledgerConnectionLockPath, openLedgerCopyDatabase, readLedgerPublication, writeLedgerPublication } from "../packages/collector-cli/src/ledger-connection";
 
 const workspace = "30000000-0000-4000-8000-000000000003";
 const device = "40000000-0000-4000-8000-000000000004";
@@ -131,7 +131,14 @@ async function main(variant: string) {
       assert.throws(() => acquireLedgerConnectionLock(ledger, "exclusive"), /collector connections are still open/);
       await stop(child); child = null;
       const exclusive = acquireLedgerConnectionLock(ledger, "exclusive");
-      exclusive.release();
+      try {
+        assert.equal(exclusive.database.pragma("fullfsync", { simple: true }), 1);
+        assert.equal(exclusive.database.pragma("synchronous", { simple: true }), 3);
+        writeLedgerPublication(exclusive, null);
+        const afterCommit = invoke([self, "--open-child", ledger, fixture]);
+        assert.equal(afterCommit.status, 1, afterCommit.stdout + afterCommit.stderr);
+        assert.match(afterCommit.stderr, /ledger switch in progress/);
+      } finally { exclusive.release(); }
       const sidecar = ledgerConnectionLockPath(ledger);
       const lockInode = fs.statSync(sidecar).ino;
       const copy = `${ledger}.restore-fixture`;
@@ -145,7 +152,7 @@ async function main(variant: string) {
       afterCopy.release();
       assert.equal(fs.statSync(sidecar).ino, lockInode, "the stable lock is never replaced or deleted");
       console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true,
-        privateCopyHoldsDestinationLock: true, noTemporaryLock: true, stableLockInode: true }));
+        publicationCommitKeepsExclusive: true, privateCopyHoldsDestinationLock: true, noTemporaryLock: true, stableLockInode: true }));
     } else if (variant === "old-connection") {
       for (const action of ["statement", "transaction"]) {
         for (const name of ["ready", "go", "result.json"]) fs.rmSync(path.join(fixture, name), { force: true });

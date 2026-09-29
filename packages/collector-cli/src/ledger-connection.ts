@@ -29,7 +29,11 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
       if (before.dev !== after.dev || before.ino !== after.ino) throw new Error("ledger_connection_lock_changed");
       // No busy wait: even a collector launched by supervision must refuse
       // before opening the ledger. A read forces a SHARED rollback-file lock.
-      if (mode === "exclusive") database.pragma("locking_mode = EXCLUSIVE");
+      if (mode === "exclusive") {
+        database.pragma("fullfsync = ON");
+        database.pragma("synchronous = EXTRA");
+        database.pragma("locking_mode = EXCLUSIVE");
+      }
       database.exec(mode === "exclusive" ? "BEGIN EXCLUSIVE" : "BEGIN");
       database.prepare("select name from sqlite_master limit 1").get();
     } catch (error) {
@@ -226,8 +230,9 @@ export function writeLedgerPublication(lock: LedgerConnectionLock, value: Ledger
   if (value) lock.database.prepare("insert or replace into ledger_publication values (1,?)").run(JSON.stringify(value));
   else lock.database.exec("delete from ledger_publication");
   lock.database.exec("COMMIT");
-  const fd = fs.openSync(lock.sidecar, "r");
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  // SQLite's EXTRA + fullfsync commit flushes its own descriptor. Opening
+  // and closing another descriptor on this inode would drop this process's
+  // POSIX locks, even though SQLite still believes it holds EXCLUSIVE.
   const directory = fs.openSync(path.dirname(lock.sidecar), "r");
   try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
   lock.database.exec("BEGIN EXCLUSIVE");
