@@ -299,6 +299,26 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r6-startup-eof-identical-rewrite
 
+      - name: Prove a committed EOF cursor cannot vouch rewritten bytes (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-committed-eof
+
+      - name: Prove a changed prefix is caught with its last 64 KiB preserved (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-preserve-last-64k
+
+      - name: Prove identical bytes with a new ctime retain the correct veto (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-identical-ctime
+
+      - name: Prove a legacy cursor without a digest cannot stamp a held hook (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-legacy-no-digest
+
+      - name: Prove changed committed bytes remain unvouched when later bytes grow (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-middle-appended
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability

@@ -16,6 +16,7 @@ import {
   ensureJsonlScanState,
   jsonlScanStateKey,
   loadJsonlScanCursor,
+  prepareJsonlCommittedPrefixHash,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
   type JsonlTailerIo,
@@ -1183,6 +1184,10 @@ export class RolloutTailer {
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            if (read.continuation?.action !== "checkpoint") {
+              prepareJsonlCommittedPrefixHash(this.buffer.database,
+                candidate.file, this.cursorKey(candidate.file), cursor, read);
+            }
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();

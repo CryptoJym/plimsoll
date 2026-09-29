@@ -17,6 +17,7 @@ import {
   ensureJsonlScanState,
   jsonlScanStateKey,
   loadJsonlScanCursor,
+  prepareJsonlCommittedPrefixHash,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
   type JsonlTailerIo,
@@ -1148,6 +1149,10 @@ export class TranscriptTailer {
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            if (read.continuation?.action !== "checkpoint") {
+              prepareJsonlCommittedPrefixHash(this.buffer.database,
+                candidate.file, this.cursorKey(candidate.file), cursor, read);
+            }
             // Persist the first known-root session sighting before the raw,
             // receipt and cursor transaction. A process kill cannot erase it.
             if(this.activeCaptureRoot && (read.lines.length>0 || initialState.pending)) {

@@ -18,7 +18,7 @@ const isWriterLock=(error:unknown)=>{
   const code=(error as {code?:unknown})?.code;
   return typeof code==="string"&&(code.startsWith("SQLITE_BUSY")||code.startsWith("SQLITE_LOCKED"));
 };
-type Target={file:string;size:number;start:number;digest:string;
+type Target={file:string;size:number;start:number;digest:string;prefixDigest:string;
   dev:bigint;ino:bigint;birthtimeNs:bigint;lastVerifiedCtimeNs:bigint;
   nextOffset:number;scanHash:crypto.Hash;verified:boolean;unvouched:boolean};
 export type ClaudeReplayBarrierReceipt={
@@ -33,7 +33,8 @@ function startupTargets(buffer:LocalEventBuffer,roots:readonly CaptureRoot[]) {
   const targets:Target[]=[];
   let blocked=false,bytesUnvouched=false;
   ensureJsonlScanState(buffer.database);
-  const committedCursor=buffer.database.prepare(`select committed_offset as committedOffset
+  const committedCursor=buffer.database.prepare(`select committed_offset as committedOffset,
+    committed_prefix_hash as committedPrefixHash
     from rollout_scan_state where file=?`);
   for(const root of roots) {
     if(inspectCaptureRoots([root])[0]?.state!=="ready") { blocked=true;continue; }
@@ -53,12 +54,27 @@ function startupTargets(buffer:LocalEventBuffer,roots:readonly CaptureRoot[]) {
              before.birthtimeNs!==pathBefore.birthtimeNs||
              !Number.isSafeInteger(size)||size<0) throw new Error("startup_file_changed");
           const receipt=committedCursor.get(jsonlScanStateKey(rootCursorKey(roots,file))) as
-            {committedOffset:number|null}|undefined;
+            {committedOffset:number|null;committedPrefixHash:string|null}|undefined;
           const start=receipt?.committedOffset??0;
           if(!Number.isSafeInteger(start)||start<0||start>size)
             throw new Error("startup_cursor_outside_file");
+          // A cursor at EOF is useful only when its previously committed bytes
+          // are still the bytes that produced its session sightings. Older
+          // ledgers have no digest and must fail closed until replayed.
+          if(start>0&&!/^[0-9a-f]{64}$/.test(receipt?.committedPrefixHash??""))
+            throw new Error("startup_cursor_without_prefix_digest");
+          const prefixHash=crypto.createHash("sha256");
           const hash=crypto.createHash("sha256");
           const chunk=Buffer.allocUnsafe(64*1024);
+          for(let offset=0;offset<start;) {
+            const read=fs.readSync(fd,chunk,0,Math.min(chunk.length,start-offset),offset);
+            if(read<=0) throw new Error("startup_prefix_shrank");
+            prefixHash.update(chunk.subarray(0,read));
+            offset+=read;
+          }
+          const prefixDigest=prefixHash.digest("hex");
+          if(start>0&&prefixDigest!==receipt?.committedPrefixHash)
+            throw new Error("startup_cursor_prefix_changed");
           for(let offset=start;offset<size;) {
             const read=fs.readSync(fd,chunk,0,Math.min(chunk.length,size-offset),offset);
             if(read<=0) throw new Error("startup_file_shrank");
@@ -73,7 +89,7 @@ function startupTargets(buffer:LocalEventBuffer,roots:readonly CaptureRoot[]) {
              pathAfter.dev!==before.dev||pathAfter.ino!==before.ino||
              pathAfter.birthtimeNs!==before.birthtimeNs||pathAfter.ctimeNs!==before.ctimeNs||
              pathAfter.size!==before.size) continue;
-          targets.push({file,size,start,digest:hash.digest("hex"),dev:before.dev,
+          targets.push({file,size,start,digest:hash.digest("hex"),prefixDigest,dev:before.dev,
             ino:before.ino,birthtimeNs:before.birthtimeNs,
             lastVerifiedCtimeNs:before.ctimeNs,nextOffset:start,
             scanHash:crypto.createHash("sha256"),verified:start===size,unvouched:false});
@@ -141,12 +157,17 @@ export function startClaudeReplayBarrier(buffer:LocalEventBuffer,captureRoots:re
       if(!before.isFile()||before.dev!==target.dev||before.ino!==target.ino||
          before.birthtimeNs!==target.birthtimeNs||before.ctimeNs!==ctimeNs||
          before.size<BigInt(target.size)) return false;
+      const prefixHash=crypto.createHash("sha256");
       const hash=crypto.createHash("sha256");
       const chunk=Buffer.allocUnsafe(64*1024);
-      for(let offset=target.start;offset<target.size;) {
+      for(let offset=0;offset<target.size;) {
         const read=fs.readSync(fd,chunk,0,Math.min(chunk.length,target.size-offset),offset);
         if(read<=0) return false;
-        hash.update(chunk.subarray(0,read));
+        if(offset<target.start) {
+          const prefixBytes=Math.min(read,target.start-offset);
+          prefixHash.update(chunk.subarray(0,prefixBytes));
+          if(prefixBytes<read) hash.update(chunk.subarray(prefixBytes,read));
+        } else hash.update(chunk.subarray(0,read));
         offset+=read;
       }
       const after=fs.fstatSync(fd,{bigint:true});
@@ -154,7 +175,8 @@ export function startClaudeReplayBarrier(buffer:LocalEventBuffer,captureRoots:re
       if(after.ctimeNs!==before.ctimeNs||after.size!==before.size||
          pathAfter.ctimeNs!==before.ctimeNs||pathAfter.size!==before.size||
          pathAfter.dev!==before.dev||pathAfter.ino!==before.ino) return false;
-      if(hash.digest("hex")!==target.digest) return false;
+      if(prefixHash.digest("hex")!==target.prefixDigest||hash.digest("hex")!==target.digest)
+        return false;
       target.lastVerifiedCtimeNs=ctimeNs;
       return true;
     } catch { return false; }
