@@ -463,8 +463,10 @@ function codexHomeEvidence(home: string, sessions: string): "verified" | "missin
         try {
           const bytes = Buffer.alloc(16 * 1024);
           const size = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+          // A matching first record cannot certify metadata in an unread tail.
+          // Keep this folder available for explicit enrollment instead.
+          if (fs.fstatSync(descriptor).size > size) continue;
           const lines = bytes.subarray(0, size).toString("utf8").split("\n");
-          if (fs.fstatSync(descriptor).size > size) lines.pop();
           let codexMetadataSeen = false;
           let conflict = false;
           for (const line of lines) {
