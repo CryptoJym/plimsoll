@@ -34,14 +34,18 @@ type CodexState = { sessionId: string; previous: Amounts; index: number; observe
   reasoningOutput: number; contextOccurrenceIndex: number; model?: string; sessionStartedAt?: string;
   originator?: string; cliVersion?: string; planType?: string };
 type ClaudeRevision = { sessionId: string; messageId: string; messageKey: string; current: Amounts };
+type PrefixCheckpoint = { digest: string; current: Amounts; messageKey?: string; codexState?: CodexState };
+type ConfinedParent = { path: string; stamp: string };
 type File = { file: string; fileKey: string; limit: number; stamp: string; fencedAt: string;
+  parents: ConfinedParent[];
   prefixHash?: string; savedPrefixHash?: string; baselineDefined?: boolean;
   initialCodex?: CodexState; finalCodex?: CodexState;
   initialClaude?: Map<string, Amounts>; finalClaude?: Map<string, ClaudeRevision>;
   cursor?: { observedSize: number; committedOffset: number; fileIdentity: string;
     headHash: string | null; headBytes: number; continuityHash: string | null;
     continuityBytes: number; mtimeMs: number; ctimeMs: number } };
-type Candidate = { event: AiInteractionEvent; sourceId: string; claudeRevision?: ClaudeRevision };
+type Candidate = { event: AiInteractionEvent; sourceId: string; claudeRevision?: ClaudeRevision;
+  prefixCheckpoint?: PrefixCheckpoint };
 export type CaptureHistoryPlan = {
   status: "capture_roots_history_plan"; rootId: string; source: CaptureRoot["source"];
   dryRun: true; files: number; sessions: number; skippedLiveSessions: number;
@@ -75,6 +79,20 @@ function beforeEnrollment(stat: fs.BigIntStats, enrolledAt: string) {
   const at = BigInt(Date.parse(enrolledAt)) * 1_000_000n;
   return stat.birthtimeNs <= at || stat.mtimeNs <= at;
 }
+function confinedDirectory(directory: string, expected?: ConfinedParent) {
+  let stat: fs.BigIntStats;
+  try { stat = fs.lstatSync(directory, { bigint: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") refusal("root_parent_changed");
+    throw error;
+  }
+  if (!stat.isDirectory() || (expected && stamp(stat) !== expected.stamp))
+    refusal("root_parent_changed");
+  return { path: directory, stamp: stamp(stat) };
+}
+function verifyParents(file: File) {
+  for (const parent of file.parents) confinedDirectory(parent.path, parent);
+}
 function candidateFiles(db: DB, root: CaptureRoot): File[] {
   validateCaptureRoots([root]);
   if (inspectCaptureRoots([root])[0]?.state !== "ready") refusal("root_not_physical_and_ready");
@@ -82,34 +100,47 @@ function candidateFiles(db: DB, root: CaptureRoot): File[] {
   if (!source || source.status !== "complete" || source.unresolvedObservationErrors !== 0)
     refusal("baseline_incomplete_or_ambiguous");
   const found: Array<File | { file: string; stat: fs.BigIntStats }> = [];
-  const dirs = [root.directory];
+  const rootParent = confinedDirectory(root.directory);
+  const dirs = [{ directory: root.directory, parents: [rootParent] }];
   let entries = 0;
   while (dirs.length) {
-    const directory = dirs.pop()!;
+    const { directory, parents } = dirs.pop()!;
+    for (const parent of parents) confinedDirectory(parent.path, parent);
     const handle = fs.opendirSync(directory, { bufferSize: 32 });
     try {
+      // opendir can follow an exchanged parent. Check again after it returns,
+      // then bind every descendant to the physical chain seen at discovery.
+      for (const parent of parents) confinedDirectory(parent.path, parent);
       let entry: fs.Dirent | null;
       while ((entry = handle.readSync())) {
         entries += 1;
         if (entries > 2_000_000) refusal("root_entry_limit");
         const file = path.join(directory, entry.name);
-        if (entry.isSymbolicLink()) refusal("root_symlink_entry");
-        if (entry.isDirectory()) { dirs.push(file); continue; }
-        if (!entry.isFile()) refusal("root_nonregular_entry");
+        for (const parent of parents) confinedDirectory(parent.path, parent);
+        const stat = fs.lstatSync(file, { bigint: true });
+        if (entry.isSymbolicLink() || stat.isSymbolicLink()) refusal("root_symlink_entry");
+        if (entry.isDirectory()) {
+          if (!stat.isDirectory()) refusal("root_parent_changed");
+          dirs.push({ directory: file, parents: [...parents,
+            { path: file, stamp: stamp(stat) }] });
+          continue;
+        }
+        if (!entry.isFile() || !stat.isFile()) refusal("root_nonregular_entry");
         if (!entry.name.endsWith(".jsonl") ||
             (root.source === "codex" && !entry.name.startsWith("rollout-"))) continue;
-        const stat = fs.lstatSync(file, { bigint: true });
-        if (!stat.isFile()) refusal("file_not_regular");
+        for (const parent of parents) confinedDirectory(parent.path, parent);
         const receipt = captureBaselineExcludedReceipt(db, root.source, {
           path: file, device: stat.dev, inode: stat.ino, size: stat.size, birthtimeNs: stat.birthtimeNs,
         });
         if (receipt) {
           if (BigInt(receipt.baselineSize) > stat.size) refusal("fenced_prefix_truncated");
           found.push({ file, fileKey: crypto.createHash("sha256").update(`${root.rootId}\0${file}`).digest("hex"),
-            limit: receipt.baselineSize, stamp: stamp(stat), fencedAt: receipt.baselinedAt });
+            limit: receipt.baselineSize, stamp: stamp(stat), fencedAt: receipt.baselinedAt,
+            parents });
         } else found.push({ file, stat });
       }
     } finally { handle.closeSync(); }
+    for (const parent of parents) confinedDirectory(parent.path, parent);
   }
   const fenced = found.filter((file): file is File => "limit" in file);
   if (!fenced.length) refusal("no_fenced_generation_evidence");
@@ -125,6 +156,7 @@ function candidateFiles(db: DB, root: CaptureRoot): File[] {
 function openFencedFile(file: File): number {
   // The path can be exchanged after directory discovery. O_NOFOLLOW closes
   // the check/open race; the descriptor and path must still name the fence.
+  verifyParents(file);
   const before = fs.lstatSync(file.file, { bigint: true });
   if (!before.isFile() || stamp(before) !== file.stamp || before.size < BigInt(file.limit))
     refusal("file_changed_before_read");
@@ -137,6 +169,7 @@ function openFencedFile(file: File): number {
   }
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
+    verifyParents(file);
     const after = fs.lstatSync(file.file, { bigint: true });
     if (!opened.isFile() || !after.isFile() || stamp(opened) !== file.stamp ||
         stamp(after) !== file.stamp || opened.size < BigInt(file.limit))
@@ -178,6 +211,7 @@ function* lines(file: File): Generator<string> {
     }
     if (pending.length) refusal("fenced_partial_record");
     const after = fs.fstatSync(fd, { bigint: true });
+    verifyParents(file);
     const currentPath = fs.lstatSync(file.file, { bigint: true });
     if (!currentPath.isFile() || stamp(currentPath) !== file.stamp ||
         stamp(after) !== file.stamp || after.size < BigInt(file.limit))
@@ -218,6 +252,7 @@ function verifyFencedPrefix(file: File) {
       offset += take;
     }
     const after = fs.fstatSync(fd, { bigint: true });
+    verifyParents(file);
     if (stamp(after) !== file.stamp || after.size < BigInt(file.limit) ||
         hash.digest("hex") !== file.prefixHash) refusal("fenced_prefix_changed");
   } finally { fs.closeSync(fd); }
@@ -245,6 +280,14 @@ function positiveDelta(now: Amounts, prior: Amounts): Amounts {
 }
 function zero(value: Amounts) {
   return value.input === 0 && value.output === 0 && value.cacheRead === 0 && value.cacheCreation === 0;
+}
+function sameAmounts(a: Amounts, b: Amounts) {
+  return a.input === b.input && a.cacheRead === b.cacheRead &&
+    a.cacheCreation === b.cacheCreation && a.output === b.output;
+}
+function belowAmounts(a: Amounts, b: Amounts) {
+  return a.input < b.input || a.cacheRead < b.cacheRead ||
+    a.cacheCreation < b.cacheCreation || a.output < b.output;
 }
 const ZERO_AMOUNTS: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
 function initialCodexState(sessionId: string): CodexState {
@@ -300,6 +343,29 @@ function durableClaudeRevision(db: DB, sessionId: string, messageKey: string): A
     .get(sessionId, messageKey) as Amounts | undefined;
   return row;
 }
+function durablePrefixCheckpoint(db: DB, source: CaptureRoot["source"], sessionId: string,
+  digest: string, current: Amounts, messageKey?: string): PrefixCheckpoint | undefined {
+  if (!table(db, "capture_history_import_prefixes")) return undefined;
+  const row = db.prepare(`select input_tokens as input,cache_read_tokens as cacheRead,
+    cache_creation_tokens as cacheCreation,output_tokens as output,
+    message_key as messageKey,parser_state_json as parserState
+    from capture_history_import_prefixes where source=? and session_id=? and prefix_digest=?`)
+    .get(source, sessionId, digest) as (Amounts & { messageKey: string | null;
+      parserState: string | null }) | undefined;
+  if (!row || !sameAmounts(row, current) || row.messageKey !== (messageKey ?? null)) return undefined;
+  return { digest, current, ...(messageKey ? { messageKey } : {}),
+    ...(row.parserState ? { codexState: decodeCodexState(row.parserState, sessionId) } : {}) };
+}
+function rememberPrefixCheckpoint(db: DB, source: CaptureRoot["source"], sessionId: string,
+  checkpoint: PrefixCheckpoint) {
+  db.prepare(`insert or ignore into capture_history_import_prefixes
+    (source,session_id,prefix_digest,input_tokens,cache_read_tokens,
+      cache_creation_tokens,output_tokens,message_key,parser_state_json)
+    values (?,?,?,?,?,?,?,?,?)`).run(source, sessionId, checkpoint.digest,
+      checkpoint.current.input, checkpoint.current.cacheRead,
+      checkpoint.current.cacheCreation, checkpoint.current.output,
+      checkpoint.messageKey ?? null, checkpoint.codexState ? JSON.stringify(checkpoint.codexState) : null);
+}
 function event(root: CaptureRoot, sourceId: string, sessionId: string, observedAt: string,
   model: string | undefined, delta: Amounts, extra: Record<string, unknown> = {},
   unvalidated = false): AiInteractionEvent {
@@ -333,12 +399,18 @@ function* codexEvents(root: CaptureRoot, file: File, db: DB,
   sessions: Map<string, CodexState>, seenHashes: Map<string, Set<string>>): Generator<Candidate> {
   const sessionId = path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
   if (!sessionId) refusal("codex_file_session_missing");
-  const state = structuredClone(file.initialCodex ?? sessions.get(sessionId) ??
+  let state = structuredClone(file.initialCodex ?? sessions.get(sessionId) ??
     (file.baselineDefined ? undefined : durableCodexState(db, sessionId)) ?? initialCodexState(sessionId));
+  const imported = durableCodexState(db, sessionId);
   file.initialCodex ??= structuredClone(state);
   let tokenObservations = 0;
-  let duplicateRestart = false;
+  let replayingPrefix = false;
+  let matchedPrefix = false;
+  let legacyDuplicate = false;
+  let replayedZero = false;
+  const prefix = crypto.createHash("sha256");
   for (const line of lines(file)) {
+    prefix.update(line).update("\n");
     if (!line.includes('"session_meta"') && !line.includes('"turn_context"') &&
         !line.includes('"token_count"')) continue;
     let parsed: Record<string, any>;
@@ -356,25 +428,52 @@ function* codexEvents(root: CaptureRoot, file: File, db: DB,
       state.contextOccurrenceIndex += 1;
       if (typeof parsed.payload?.model === "string") state.model = parsed.payload.model;
     } else if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
-      state.index += 1;
       const reported = parsed.payload?.info?.total_token_usage;
-      if (!reported) continue;
+      if (!reported) { state.index += 1; continue; }
       const current = totals(reported);
-      if (tokenObservations === 0 &&
-          (current.input < state.previous.input || current.cacheRead < state.previous.cacheRead ||
-            current.cacheCreation < state.previous.cacheCreation || current.output < state.previous.output)) {
-        // A second physical copy of the same session prefix starts its
-        // counters again. Parse it from zero, but accept that reset only if
-        // its whole fenced digest exactly matches a prior file's digest.
-        duplicateRestart = true;
-        state.previous = { ...ZERO_AMOUNTS };
-        state.index = 0;
-        state.observedBaseline = false;
-        state.reasoningOutput = 0;
+      if (tokenObservations === 0 && belowAmounts(current, state.previous)) {
+        // A copied session restarts its counters. Only records whose rolling
+        // digest was already imported may be skipped; the first new record
+        // after the durable counter is the sole marginal suffix.
+        replayingPrefix = true;
         file.initialCodex = initialCodexState(sessionId);
       }
-      const delta = positiveDelta(current, state.previous);
       tokenObservations += 1;
+      if (replayingPrefix && zero(current)) {
+        // The zero observation still occupies index zero. The legacy
+        // identical-file fallback needs the same parser position as the
+        // ordinary tailer before it sees the first positive counter.
+        state.previous = { ...ZERO_AMOUNTS };
+        state.index = 0;
+        state.observedBaseline = true;
+        state.reasoningOutput = amount(reported.reasoning_output_tokens);
+        replayedZero = true;
+        continue;
+      }
+      if (replayingPrefix && !zero(current)) {
+        const checkpoint = durablePrefixCheckpoint(db, "codex", sessionId,
+          prefix.copy().digest("hex"), current);
+        if (checkpoint?.codexState) {
+          state = structuredClone(checkpoint.codexState);
+          matchedPrefix = true;
+          if (imported && sameAmounts(current, imported.previous)) replayingPrefix = false;
+          continue;
+        }
+        // Two identical files in the current scan may have no durable
+        // checkpoint yet. Retain the original whole-file-digest fallback.
+        if (!seenHashes.get(sessionId)?.size) refusal("counter_regression");
+        legacyDuplicate = true;
+        replayingPrefix = false;
+        if (!replayedZero) {
+          state.previous = { ...ZERO_AMOUNTS };
+          state.index = -1;
+          state.observedBaseline = false;
+          state.reasoningOutput = 0;
+        }
+      }
+      if (replayingPrefix) continue;
+      state.index += 1;
+      const delta = positiveDelta(current, state.previous);
       const firstUnknown = !state.observedBaseline && !zero(current);
       state.previous = current;
       state.observedBaseline = true;
@@ -389,10 +488,13 @@ function* codexEvents(root: CaptureRoot, file: File, db: DB,
       yield { sourceId: id, event: event(root, id, sessionId, observedAt, state.model, marginal,
         { turnIndex: state.index, ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
           sourceCumulativeInput: current.input, sourceCumulativeCachedInput: current.cacheRead,
-          sourceCumulativeOutput: current.output } : {}) }, firstUnknown) };
+          sourceCumulativeOutput: current.output } : {}) }, firstUnknown),
+        prefixCheckpoint: { digest: prefix.copy().digest("hex"), current,
+          codexState: structuredClone(state) } };
     }
   }
-  if (duplicateRestart && !seenHashes.get(sessionId)?.has(file.prefixHash ?? ""))
+  if ((replayingPrefix && !matchedPrefix) ||
+      (legacyDuplicate && !seenHashes.get(sessionId)?.has(file.prefixHash ?? "")))
     refusal("counter_regression");
   file.finalCodex = structuredClone(state);
   sessions.set(sessionId, structuredClone(state));
@@ -407,7 +509,13 @@ function* claudeEvents(root: CaptureRoot, file: File,
   const firstInFile = new Set<string>();
   file.initialClaude ??= new Map();
   file.finalClaude = new Map();
+  const prefix = crypto.createHash("sha256");
+  let replayingPrefix = false;
+  let matchedPrefix = false;
+  let replayMessageKey: string | undefined;
+  let replayTarget: Amounts | undefined;
   for (const line of lines(file)) {
+    prefix.update(line).update("\n");
     if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
     let parsed: Record<string, any>;
     try { parsed = JSON.parse(line) as Record<string, any>; }
@@ -440,6 +548,22 @@ function* claudeEvents(root: CaptureRoot, file: File,
     }
     const current = totals(parsed.message?.usage);
     const prior = byMessage.get(messageId);
+    if (!replayingPrefix && !matchedPrefix && prior && belowAmounts(current, prior)) {
+      replayingPrefix = true;
+      replayMessageKey = messageKey;
+      replayTarget = prior;
+    }
+    if (replayingPrefix) {
+      const checkpoint = durablePrefixCheckpoint(db, "claude_code", sessionId,
+        prefix.copy().digest("hex"), current, messageKey);
+      if (!checkpoint) refusal("counter_regression");
+      matchedPrefix = true;
+      byMessage.set(messageId, current);
+      file.finalClaude.set(stateKey, { sessionId, messageId, messageKey, current });
+      if (messageKey === replayMessageKey && replayTarget && sameAmounts(current, replayTarget))
+        replayingPrefix = false;
+      continue;
+    }
     const delta = positiveDelta(current, prior ?? { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 });
     byMessage.set(messageId, current);
     const revision = { sessionId, messageId, messageKey, current };
@@ -452,7 +576,8 @@ function* claudeEvents(root: CaptureRoot, file: File,
     if (typeof parsed.timestamp !== "string") refusal("claude_timestamp_missing");
     const model = typeof parsed.message?.model === "string" ? parsed.message.model : undefined;
     yield { sourceId: id, event: event(root, id, sessionId, parsed.timestamp, model, delta),
-      claudeRevision: revision };
+      claudeRevision: revision,
+      prefixCheckpoint: { digest: prefix.copy().digest("hex"), current, messageKey } };
   }
 }
 
@@ -602,11 +727,15 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
     }
     // The generator has reached EOF and compared all fenced bytes with the
     // preflight digest. Only this file's verified candidates may be published.
+    verifyParents(file);
     if (onFileReady) await onFileReady(file);
     for (const item of verifiedCandidates) {
       await onMissing!(item.candidate, item.index, item.digest, file);
     }
-    if (onFilePublished) await onFilePublished(file);
+    if (onFilePublished) {
+      verifyParents(file);
+      await onFilePublished(file);
+    }
   }
   plan.sessions = sessions.size;
   if (!resumeVerified) refusal("resume_cursor_missing");
@@ -688,6 +817,12 @@ function ensureImportSchema(db: DB) {
     create table if not exists capture_history_session_counters (
       source text not null,session_id text not null,last_index integer not null,
       state_json text not null,primary key(source,session_id));
+    create table if not exists capture_history_import_prefixes (
+      source text not null,session_id text not null,prefix_digest text not null,
+      input_tokens integer not null,cache_read_tokens integer not null,
+      cache_creation_tokens integer not null,output_tokens integer not null,
+      message_key text,parser_state_json text,
+      primary key(source,session_id,prefix_digest));
     create table if not exists transcript_usage_revision_state (
       source text not null check(source='claude_code'),session_id text not null,
       message_key text not null,input_tokens integer not null,cache_read_tokens integer not null,
@@ -978,6 +1113,9 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     const batch = pending.slice(0, nextRows);
     const fileKey = batch[0]!.fileKey;
     if (batch.some(item => item.fileKey !== fileKey)) refusal("mixed_file_slice");
+    const sourceFile = first.files.find(file => file.fileKey === fileKey);
+    if (!sourceFile) refusal("source_file_missing");
+    verifyParents(sourceFile);
     pending = pending.slice(batch.length);
     maintenanceIdle(db);
     let writerStarted = 0;
@@ -991,6 +1129,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         // The IMMEDIATE transaction acquired the writer before this callback.
         // Contention waiting for another writer is not our held writer slice.
         writerStarted = performance.now();
+        verifyParents(sourceFile);
         const lock = db.prepare(`select root_id as rootId, owner_pid as pid, owner_start as started,
           owner_attempt_id as attemptId
           from capture_history_import_lock where singleton=1`).get() as
@@ -1015,6 +1154,8 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
             counts.cacheRead += e.cacheReadTokens ?? 0;
             counts.cacheCreation += e.cacheCreationTokens ?? 0;
             if (item.candidate.claudeRevision) rememberClaudeRevision(db, item.candidate.claudeRevision);
+            if (item.candidate.prefixCheckpoint)
+              rememberPrefixCheckpoint(db, root.source, e.sessionId!, item.candidate.prefixCheckpoint);
           }
           processed += 1;
           writerRowMs = Math.max(writerRowMs, performance.now() - rowStarted);
@@ -1032,6 +1173,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
             batch[processed - 1]!.digest, root.rootId);
         if (rows) db.prepare(`update capture_history_file_state
           set published_rows=published_rows+? where file_key=?`).run(rows, fileKey);
+        verifyParents(sourceFile);
         writerWorkEnded = performance.now();
         return { rows, counts };
       }));
@@ -1107,6 +1249,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         for (let index = 0; index < revisions.length; index += 16) {
           const batch = revisions.slice(index, index + 16);
           db.transaction(() => {
+            verifyParents(file);
             for (const revision of batch) {
               const authority = db.prepare(`select authority from session_usage_authority
                 where source='claude_code' and session_id=?`).get(revision.sessionId) as
@@ -1119,13 +1262,21 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         }
       }
       db.transaction(() => {
+        verifyParents(file);
         if (file.finalCodex) {
-          db.prepare(`insert into capture_history_session_counters
-            (source,session_id,last_index,state_json) values ('codex',?,?,?)
-            on conflict(source,session_id) do update set
-              last_index=excluded.last_index,state_json=excluded.state_json
-            where excluded.last_index>capture_history_session_counters.last_index`)
-            .run(file.finalCodex.sessionId, file.finalCodex.index, JSON.stringify(file.finalCodex));
+          const final = file.finalCodex;
+          const prior = durableCodexState(db, final.sessionId);
+          // A shorter verified copy may have a different token-count index.
+          // The global baseline follows admitted cumulative usage, never a
+          // larger index whose counter would move backward.
+          if (!prior || (!belowAmounts(final.previous, prior.previous) &&
+              (!sameAmounts(final.previous, prior.previous) || final.index > prior.index))) {
+            db.prepare(`insert into capture_history_session_counters
+              (source,session_id,last_index,state_json) values ('codex',?,?,?)
+              on conflict(source,session_id) do update set
+                last_index=excluded.last_index,state_json=excluded.state_json`)
+              .run(final.sessionId, final.index, JSON.stringify(final));
+          }
         }
         rememberFileCursor(db, root, file);
         db.prepare(`update capture_history_file_state set handoff_ready=1 where file_key=?`)

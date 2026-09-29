@@ -243,6 +243,18 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-f7
 
+      - name: Prove copied Codex prefix imports only its suffix (N1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-overlap_codex
+
+      - name: Prove copied Claude prefix imports only its suffix (N1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-overlap_claude
+
+      - name: Prove exchanged history parent cannot escape the root (N2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-symlink_parent_race
+
       - name: Prove history WAL pause and resumable reader pin
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-wal
