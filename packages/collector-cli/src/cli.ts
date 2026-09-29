@@ -1009,21 +1009,35 @@ async function acknowledgeJoinedCollector(
   throw new Error(`No first contact acknowledgement arrived within ${JOIN_FIRST_UPLOAD_WAIT_MS / 1000} seconds.`);
 }
 
-async function restorePriorJoinedCollector(port: number, manifest: ReturnType<typeof inspectLaunchAgentManifest>) {
-  if (!manifest.ok) return;
+async function restoreCurrentOwnerJoinedCollector(port: number) {
   const deadline = performance.now() + 35_000;
   let lastStatus = "not_attempted";
+  const currentOwnerManifest = () => {
+    try {
+      const manifest = inspectLaunchAgentManifest();
+      if (manifest.ok) return manifest;
+    } catch { /* same clear refusal for an unreadable plist */ }
+    throw new Error("The owner LaunchAgent is unreadable or invalid; leaving the collector as-is.");
+  };
   while (performance.now() < deadline) {
+    const visible = currentOwnerManifest();
     const before = await verifyPostBootstrapReadiness(port, { timeoutMs: 0 });
     if (before.verified) return;
-    const visible = inspectLaunchAgentManifest();
-    if (!visible.ok || visible.manifestDigest !== manifest.manifestDigest)
-      throw new Error("The previous LaunchAgent changed during recovery; collector restart needs manual repair.");
-    const loaded = await loadVisibleLaunchAgent(manifest.plistPath, port, false, joinLaunchAgentMutationAuthority());
+    // Use the currently readable owner plist on each attempt. Its PATH may
+    // have changed after the earlier recovery inspection.
+    const loaded = await loadVisibleLaunchAgent(visible.plistPath, port, false,
+      joinLaunchAgentMutationAuthority());
     lastStatus = loaded.status;
     if (loaded.loaded) {
       const after = await verifyPostBootstrapReadiness(port, { timeoutMs: 30_000 });
-      if (after.verified) return;
+      const current = currentOwnerManifest();
+      if (after.verified && current.manifestDigest === loaded.manifestDigest) return;
+      if (after.verified && current.manifestDigest !== loaded.manifestDigest) {
+        const stopped = await executeLaunchAgentUnload(port, joinLaunchAgentMutationAuthority());
+        if (!stopped.unloaded)
+          throw new Error("The owner LaunchAgent changed again and its prior load could not be stopped safely.");
+        continue;
+      }
     }
     if (loaded.status !== "lifecycle_fence_busy") break;
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -1214,7 +1228,7 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
       });
       if (!rolledBack) throw new Error("The joined root seals could not be rolled back.");
     }
-    await restorePriorJoinedCollector(obligation.port, ownerManifest);
+    await restoreCurrentOwnerJoinedCollector(obligation.port);
     clearJoinRestartObligation(home);
     return true;
   }
@@ -1284,7 +1298,7 @@ async function recoverPendingJoinedCollector(): Promise<boolean> {
     priorOwnedTemplateIdentityContent: obligation.priorOwnedTemplateIdentityContent,
     mutationAuthority: joinLaunchAgentMutationAuthority(),
   });
-  await restorePriorJoinedCollector(obligation.port, visible);
+  await restoreCurrentOwnerJoinedCollector(obligation.port);
   clearJoinRestartObligation(home);
   withJoinRootJournal(ledgerPath, (database) => clearJoinedRootJournal(database, obligation.operationId));
   return true;
@@ -1321,12 +1335,26 @@ async function finishJoinedCollectorSetup(
       clearJoinedRootJournal(database, obligation.operationId));
     return finished;
   } catch (error) {
+    const originalMessage = error instanceof Error ? error.message : String(error);
+    let recoveryError: unknown = null;
     try { await recoverPendingJoinedCollector(); }
-    catch (recovery) {
-      throw new Error(`${error instanceof Error ? error.message : String(error)} ` +
-        `Recovery also failed: ${recovery instanceof Error ? recovery.message : String(recovery)}`);
+    catch (recovery) { recoveryError = recovery; }
+    if (recoveryError !== null) {
+      const recoveryMessage = (recoveryError instanceof Error ? recoveryError.message :
+        String(recoveryError)).replace(/\.+$/, "");
+      let restorationError: unknown = null;
+      try { await restoreCurrentOwnerJoinedCollector(obligation.port); }
+      catch (restoration) { restorationError = restoration; }
+      if (restorationError !== null) {
+        throw new Error(`${originalMessage} Recovery also failed: ${recoveryMessage}. ` +
+          `Restart from the current owner LaunchAgent failed: ${
+            restorationError instanceof Error ? restorationError.message : String(restorationError)}`);
+      }
+      throw new Error(`${originalMessage} Recovery also failed: ${recoveryMessage}. ` +
+        "Collector restarted from the current owner LaunchAgent; the owner plist and config were preserved.");
     }
-    throw error;
+    throw new Error(`${originalMessage} Collector restarted from the current owner LaunchAgent; ` +
+      "the owner plist and config were preserved.");
   }
 }
 
@@ -3044,9 +3072,29 @@ async function main() {
       if (await recoverPendingJoinedCollector())
         console.log("Recovered the previous collector and verified its health before retrying join.");
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Collector restart recovery failed.";
+      const reason = error instanceof Error ? error.message : "Collector restart recovery failed.";
+      let restored = false;
+      let restorationReason = "The collector port could not be verified for restart.";
+      let recoveryPort: number | null = null;
+      try {
+        const config = readCollectorConfig();
+        if (config.status === "valid") recoveryPort = config.config.port;
+        else recoveryPort = readJoinRestartObligation(collectorHome())?.port ?? null;
+      } catch { /* unresolved obligation or config stays on disk for review */ }
+      if (recoveryPort !== null) {
+        try {
+          await restoreCurrentOwnerJoinedCollector(recoveryPort);
+          restored = true;
+        } catch (restoration) {
+          restorationReason = restoration instanceof Error ? restoration.message : String(restoration);
+        }
+      }
+      const message = `${reason} ${restored
+        ? "Collector restarted from the current owner LaunchAgent; the owner plist and config were preserved."
+        : `Collector restart was not verified: ${restorationReason}`}`;
       console.error(message);
-      console.log(JSON.stringify({ status: "join_recovery_failed", message, configTouched: false }, null, 2));
+      console.log(JSON.stringify({ status: "join_recovery_failed", message, configTouched: false,
+        daemon: { running: restored, readinessVerified: restored } }, null, 2));
       process.exitCode = 1;
       return;
     }

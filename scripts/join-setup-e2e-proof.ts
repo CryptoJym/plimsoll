@@ -731,12 +731,14 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         name === "owner_edit_after_recheck") {
       const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
       const plistText = fs.readFileSync(plist, "utf8");
+      const configText = fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8");
       const trace = fs.readFileSync(f.trace, "utf8");
       const running = fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
       const obligationPresent = fs.existsSync(path.join(f.data, "join.restart-obligation.json"));
       console.log(JSON.stringify({ scenario: name, exit: joined.code, status: result.status,
         running, obligationPresent, ownerPathPreserved: plistText.includes("/opt/owner-custom-bin"),
+        ownerConfigPreserved: name === "owner_edit_restore_conflict" ? configText.endsWith(" ") : null,
         laterOwnerEditPreserved: plistText.includes("/opt/owner-after-recheck"),
         plistUnreadable: plistText === "<plist>", bootouts: trace.split("\n").filter((line) =>
           line.startsWith("bootout ")).length, reason: result.reason ?? null }));
@@ -746,8 +748,27 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
           ? plistText.includes("/opt/owner-custom-bin") &&
             plistText.includes("/opt/owner-after-recheck")
           : plistText === "<plist>";
-      check(`${name}_keeps_collector_serving_after_refusal`, joined.code !== 0 && running &&
-        ownerPlistIntact);
+      if (name === "owner_edit_unreadable") {
+        check("unreadable_owner_plist_is_preserved_and_named", joined.code !== 0 &&
+          !running && ownerPlistIntact && /unreadable|invalid/i.test(String(result.reason)));
+      } else {
+        check(`${name}_keeps_collector_serving_after_refusal`, joined.code !== 0 && running &&
+          ownerPlistIntact && /restarted from the current owner LaunchAgent/i.test(String(result.reason)) &&
+          (name !== "owner_edit_restore_conflict" || configText.endsWith(" ")));
+      }
+      if (name === "owner_edit_restore_conflict") {
+        const retry = await command(f.env, ["join", "--resume"], "", f.installedCli);
+        const afterRetry = await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+        const ownerBytesRetained = fs.readFileSync(plist, "utf8") === plistText &&
+          fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8") === configText;
+        const retryStatus = /"status":\s*"([^"]+)"/.exec(retry.stdout)?.[1] ?? null;
+        console.log(JSON.stringify({ scenario: "owner_edit_restore_conflict_retry",
+          exit: retry.code, status: retryStatus,
+          running: afterRetry, ownerBytesRetained, stderr: retry.stderr.slice(0, 300) }));
+        check("config_conflict_retry_restores_owner_collector", retry.code !== 0 &&
+          retryStatus === "join_recovery_failed" &&
+          afterRetry && ownerBytesRetained);
+      }
       return;
     }
     if (name === "corrupt_obligation_loaded") {
