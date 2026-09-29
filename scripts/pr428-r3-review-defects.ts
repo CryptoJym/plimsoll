@@ -163,6 +163,8 @@ try {
     `${JSON.stringify({ schemaVersion: 1, version: "0.7.44", executablePath: priorRuntime,
       installId })}\n`,
     { mode: 0o600 });
+  fs.symlinkSync(path.dirname(path.dirname(priorRuntime)),
+    path.join(stopped.data, "lifecycle", "current"), "dir");
   writeCollectorConfigTransactionally(collectorConfigSchema.parse({ port: 49390 }),
     path.join(stopped.data, "collector.config.json"));
   const joined = joinStatus(stopped.home, stopped.data);

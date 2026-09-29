@@ -893,6 +893,24 @@ function installedLegacyLaunchAgentRuntime(): {
     if (!relative || relative.startsWith("..") || path.isAbsolute(relative) ||
         relative.split(path.sep)[0] !== state.version) return undefined;
     if (!physicalFile(state.executablePath, 64 * 1024 * 1024)) return undefined;
+    // The current link is the live runtime pointer. A copied pair of private
+    // records cannot attest to a different command, even when they agree with
+    // each other. Check the link target's spelling as well as its real path so
+    // that a symlinked parent inside versions cannot hide in the resolution.
+    const current = path.join(support, "lifecycle", "current");
+    if (!fs.lstatSync(current).isSymbolicLink()) return undefined;
+    const target = path.resolve(path.dirname(current), fs.readlinkSync(current));
+    const targetRelative = path.relative(versions, target);
+    if (!targetRelative || targetRelative.startsWith("..") || path.isAbsolute(targetRelative))
+      return undefined;
+    let cursor = versions;
+    for (const segment of targetRelative.split(path.sep)) {
+      cursor = path.join(cursor, segment);
+      const part = fs.lstatSync(cursor);
+      if (!part.isDirectory() || part.isSymbolicLink()) return undefined;
+    }
+    if (fs.realpathSync(current) !== fs.realpathSync(target) ||
+        path.dirname(path.dirname(state.executablePath)) !== target) return undefined;
     return { programArguments: [process.execPath, state.executablePath, "start"],
       workingDirectory: path.dirname(state.executablePath) };
   } catch { return undefined; }
