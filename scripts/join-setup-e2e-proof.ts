@@ -360,7 +360,12 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       if (name === "crash_after_bootout") f.env.PLIMSOLL_PROOF_CRASH_AFTER_BOOTOUT = "1";
       if (name === "crash_parent_after_bootout") f.env.PLIMSOLL_PROOF_KILL_JOIN_AND_ADD = "1";
       if (name === "delayed_restart") f.env.PLIMSOLL_PROOF_DELAY_RESTART = "1";
-      if (name === "path_drift") f.env.PATH = `${f.env.PATH}:/opt/new-toolchain`;
+      // The published 0.7.44 CLI changes the manifest by itself. In CI,
+      // where that optional artifact is absent, PATH drift still forces the
+      // installer through the same interrupted publish while a daemon serves.
+      if (name === "path_drift" ||
+          (name === "crash_manifest_link_running" && !process.env.PLIMSOLL_PROOF_0744_CLI))
+        f.env.PATH = `${f.env.PATH}:/opt/new-toolchain`;
       if (name === "crash_after_config_commit") f.env.PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT = "1";
       if (name === "crash_after_config_commit" || name === "crash_fresh_after_config_commit") {
         const preload = path.join(f.home, "kill-after-config-commit.mjs");
