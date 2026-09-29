@@ -104,6 +104,13 @@ function stubLaunchctl(bin: string) {
     '      plist="$HOME/Library/LaunchAgents/com.plimsoll.collector.plist"',
     "      /usr/bin/perl -0777 -i -pe 's{(<key>PATH</key>\\s*<string>)([^<]*)(</string>)}{$1$2:/opt/owner-custom-bin$3}' \"$plist\"",
     '    fi',
+    '    if [ "${PLIMSOLL_PROOF_EDIT_CONFIG_ON_SECOND_BOOTOUT:-}" = "1" ] && [ "$bootouts" -eq 2 ]; then',
+    '      printf " " >> "$PLIMSOLL_HOME/collector.config.json"',
+    '    fi',
+    '    if [ "${PLIMSOLL_PROOF_TRUNCATE_PLIST_ON_SECOND_BOOTOUT:-}" = "1" ] && [ "$bootouts" -eq 2 ]; then',
+    '      plist="$HOME/Library/LaunchAgents/com.plimsoll.collector.plist"',
+    '      printf "<plist>" > "$plist"',
+    '    fi',
     '    if [ "${PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT:-}" = "1" ]; then',
     '      /usr/bin/sqlite3 "$PLIMSOLL_HOME/work-ledger.sqlite" "update automatic_capture_baseline_state set status=\'complete\', completed_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'), updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\'), files_discovered=files_validated, discovery_errors=0, stat_errors=0, error_code=null, error_at=null where source=\'codex\'"',
     '    fi',
@@ -289,12 +296,16 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         payload: { id: studioSession, originator: "codex_exec" } })}\n`, { mode: 0o600 });
     const foreign = path.join(f.home,
       ".clientai/studio/borg/conductors/other-tool/profile/sessions");
-    if (name === "foreign_rollout") {
+    if (name === "foreign_rollout" || name === "foreign_rollout_beyond_limit") {
       fs.mkdirSync(foreign, { recursive: true, mode: 0o700 });
+      const positive = `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
+        payload: { id: studioSession, originator: "codex_exec" } })}\n`;
+      const padding = `${JSON.stringify({ type: "fixture_other", padding: "x".repeat(20_000) })}\n`;
       fs.writeFileSync(path.join(foreign,
         `rollout-2026-09-27T00-00-00-${studioSession}.jsonl`),
-      `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
-        payload: { id: studioSession, originator: "claude_code" } })}\n`, { mode: 0o600 });
+        `${name === "foreign_rollout_beyond_limit" ? positive + padding : ""}${JSON.stringify({
+          type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
+          payload: { id: studioSession, originator: "claude_code" } })}\n`, { mode: 0o600 });
     }
     if (name.startsWith("exhausted_")) {
       const recent = path.join(codex, "2026", "09", "28");
@@ -412,10 +423,37 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       // where that optional artifact is absent, PATH drift still forces the
       // installer through the same interrupted publish while a daemon serves.
       if (name === "path_drift" || name === "owner_edit_during_join" ||
+          name === "owner_edit_restore_conflict" || name === "owner_edit_unreadable" ||
+          name === "owner_edit_after_recheck" ||
           name === "legacy_path_drift_0744" ||
           (name === "crash_manifest_link_running" && !process.env.PLIMSOLL_PROOF_0744_CLI))
         f.env.PATH = `${f.env.PATH}:/opt/new-toolchain`;
       if (name === "owner_edit_during_join") f.env.PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT = "1";
+      if (name === "owner_edit_restore_conflict") {
+        f.env.PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT = "1";
+        f.env.PLIMSOLL_PROOF_EDIT_CONFIG_ON_SECOND_BOOTOUT = "1";
+      }
+      if (name === "owner_edit_after_recheck") {
+        f.env.PLIMSOLL_PROOF_EDIT_ON_SECOND_BOOTOUT = "1";
+        const preload = path.join(f.home, "edit-after-recheck.mjs");
+        fs.writeFileSync(preload, [
+          'import fs from "node:fs";',
+          'const original = fs.renameSync;',
+          'fs.renameSync = (...args) => {',
+          '  original(...args);',
+          '  if (process.argv[2] === "join" && String(args[0]).includes(".join-root-rollback-") &&',
+          '      String(args[1]).endsWith("/collector.config.json")) {',
+          '    const plist = process.env.HOME + "/Library/LaunchAgents/com.plimsoll.collector.plist";',
+          '    const value = fs.readFileSync(plist, "utf8");',
+          '    fs.writeFileSync(plist, value.replace(/(<key>PATH<\\/key>\\s*<string>)([^<]*)(<\\/string>)/,',
+          '      "$1$2:/opt/owner-after-recheck$3"));',
+          '  }',
+          '};',
+        ].join("\n") + "\n", { mode: 0o600 });
+        f.env.NODE_OPTIONS = `--import=${preload}`;
+      }
+      if (name === "owner_edit_unreadable")
+        f.env.PLIMSOLL_PROOF_TRUNCATE_PLIST_ON_SECOND_BOOTOUT = "1";
       if (name === "owner_edit_first_unload") f.env.PLIMSOLL_PROOF_EDIT_ON_FIRST_BOOTOUT = "1";
       if (name === "crash_after_config_commit") f.env.PLIMSOLL_PROOF_SEAL_BASELINE_AFTER_BOOTOUT = "1";
       if (name === "crash_after_config_commit" || name === "crash_fresh_after_config_commit") {
@@ -498,6 +536,26 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       f.env.PLIMSOLL_PROOF_CLOCK_SKEW = "1";
     }
     const prompt = name === "fresh";
+    if (name === "two_join_race") {
+      const args = ["join", "--token-stdin", "--url", `http://127.0.0.1:${remote.port}`];
+      const pair = await Promise.all([
+        command(f.env, args, `${token}\n`, f.installedCli),
+        command(f.env, args, `${token}\n`, f.installedCli),
+      ]);
+      const statuses = pair.map((entry) => receipt(entry.stdout).status);
+      const runningAfter = fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      const obligationPresent = fs.existsSync(path.join(f.data, "join.restart-obligation.json"));
+      const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(
+        path.join(f.data, "collector.config.json"), "utf8")));
+      console.log(JSON.stringify({ scenario: name, exits: pair.map((entry) => entry.code),
+        statuses, cloudJoins: remote.joins.length, runningAfter, obligationPresent,
+        roots: config.captureRoots?.length ?? 0 }));
+      check("two_concurrent_joins_leave_one_serving_collector_and_no_obligation",
+        statuses.includes("joined") && runningAfter && !obligationPresent &&
+        (config.captureRoots?.length ?? 0) === 2);
+      return;
+    }
     let joined: ChildResult;
     try {
       joined = await command(f.env, ["join", prompt ? "--token-prompt" : "--token-stdin", "--url",
@@ -669,6 +727,29 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
         trace.split("\n").filter((line) => line.startsWith("bootout ")).length === 2);
       return;
     }
+    if (name === "owner_edit_restore_conflict" || name === "owner_edit_unreadable" ||
+        name === "owner_edit_after_recheck") {
+      const plist = path.join(f.home, "Library/LaunchAgents/com.plimsoll.collector.plist");
+      const plistText = fs.readFileSync(plist, "utf8");
+      const trace = fs.readFileSync(f.trace, "utf8");
+      const running = fs.existsSync(f.state) &&
+        await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+      const obligationPresent = fs.existsSync(path.join(f.data, "join.restart-obligation.json"));
+      console.log(JSON.stringify({ scenario: name, exit: joined.code, status: result.status,
+        running, obligationPresent, ownerPathPreserved: plistText.includes("/opt/owner-custom-bin"),
+        laterOwnerEditPreserved: plistText.includes("/opt/owner-after-recheck"),
+        plistUnreadable: plistText === "<plist>", bootouts: trace.split("\n").filter((line) =>
+          line.startsWith("bootout ")).length, reason: result.reason ?? null }));
+      const ownerPlistIntact = name === "owner_edit_restore_conflict"
+        ? plistText.includes("/opt/owner-custom-bin")
+        : name === "owner_edit_after_recheck"
+          ? plistText.includes("/opt/owner-custom-bin") &&
+            plistText.includes("/opt/owner-after-recheck")
+          : plistText === "<plist>";
+      check(`${name}_keeps_collector_serving_after_refusal`, joined.code !== 0 && running &&
+        ownerPlistIntact);
+      return;
+    }
     if (name === "corrupt_obligation_loaded") {
       const notes = fs.readdirSync(f.data).filter((entry) =>
         entry.startsWith("join.restart-obligation.recovery-") && entry.endsWith(".json"));
@@ -734,7 +815,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
     if (name === "clock_skew") console.log(JSON.stringify({ scenario: name, joinCode: joined.code,
       joinStatus: result.status, reason: result.reason ?? null }));
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8")));
-    if (name === "foreign_rollout") {
+    if (name === "foreign_rollout" || name === "foreign_rollout_beyond_limit") {
       const enrolled = config.captureRoots?.some((entry) => entry.directory === foreign) ?? false;
       console.log(JSON.stringify({ scenario: name, joinExit: joined.code,
         joinStatus: result.status, foreignFolderRegistered: enrolled,
@@ -957,6 +1038,10 @@ async function main() {
       await joinedScenario("foreign_rollout", false, "ack");
       return;
     }
+    if (process.env.PR428_REVIEW_SCENARIO === "foreign_rollout_beyond_limit") {
+      await joinedScenario("foreign_rollout_beyond_limit", false, "ack");
+      return;
+    }
     if (process.env.PR428_REVIEW_SCENARIO === "no_daemon_only") {
       await joinOnlyScenario("explicit_no_daemon", "--no-daemon");
       return;
@@ -979,6 +1064,22 @@ async function main() {
     }
     if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_during_join") {
       await joinedScenario("owner_edit_during_join", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_restore_conflict") {
+      await joinedScenario("owner_edit_restore_conflict", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_unreadable") {
+      await joinedScenario("owner_edit_unreadable", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_after_recheck") {
+      await joinedScenario("owner_edit_after_recheck", true, "ack");
+      return;
+    }
+    if (process.env.PR428_REVIEW_SCENARIO === "two_join_race") {
+      await joinedScenario("two_join_race", false, "ack");
       return;
     }
     if (process.env.PR428_REVIEW_SCENARIO === "owner_edit_first_unload") {
