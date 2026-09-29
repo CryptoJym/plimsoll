@@ -763,10 +763,15 @@ function writeMarker(home: string, marker: PauseMarker) {
 export function markMaintenanceRebuildPause(home: string) {
   const name = ledgerName(home);
   const file = path.join(home, name);
+  const selectedExisted = fs.existsSync(file);
+  const alternate = path.join(home, name === "ledger.sqlite" ? "work-ledger.sqlite" : "ledger.sqlite");
+  const existedAtPause = selectedExisted || fs.existsSync(alternate);
   writeMarker(home, { version: 1, at: new Date().toISOString(), pid: process.pid,
-    ledgerName: name, ledgerHighWater: observedLedgerHighWater(file),
-    ledgerAdmissionSequence: observedLedgerAdmissionSequence(file),
-    ledgerExistedAtPause: fs.existsSync(file) });
+    ledgerName: name, ledgerHighWater: selectedExisted ? observedLedgerHighWater(file)
+      : existedAtPause ? null : 0,
+    ledgerAdmissionSequence: selectedExisted ? observedLedgerAdmissionSequence(file)
+      : existedAtPause ? null : 0,
+    ledgerExistedAtPause: existedAtPause });
 }
 
 /** Called immediately after every daemon writer has quiesced, before the
