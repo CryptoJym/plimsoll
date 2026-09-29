@@ -100,7 +100,13 @@ keys, and capture-root configuration stay in place.
    are admitted. Records with missing or unparseable timestamps are excluded
    and counted in the capture scan's `enrollmentExcludedEvents` receipt.
    Once the file has a cursor, normal byte-cursor progress and the read-time
-   generation check apply. Existing event dedupe remains in force.
+   generation check apply. Existing event dedupe remains in force. The old
+   ledger's SQLite `BEGIN EXCLUSIVE` transaction starts before the final
+   inventory and remains open through the rename. The switch also checks that
+   no other process has the old ledger or its sidecars open. Keep the collector
+   stopped. A path first created after the final inventory cannot add a row
+   to the archived ledger: an attempted old-ledger writer is blocked while the
+   exclusive transaction holds the old inode.
    After the rename, while the switch lease is still held and before starting
    the collector, the command re-stats every carried-cursor file. Any changed
    generation loses its old cursor in the active ledger. The cutover instant is
@@ -108,16 +114,28 @@ keys, and capture-root configuration stay in place.
    transaction records it once in the replacement ledger marker and clears
    the pending marker. A same-generation append remains eligible at the carried offset;
    a replacement is admitted by each record's own timestamp, even if the
-   replacement happens after the final re-stat. One irreducible window remains:
-   a record stamped before this cutover instant but written into a replaced
-   or new-since-cutover file after the rename is excluded. The window includes
-   scheduling delay between the actual rename and the sample, plus clock skew
-   between the tool and the collector. The `epoch-switch --json` receipt and
-   replacement marker report `renameToSampleDelayMs`, a conservative upper
-   bound measured from just before the rename call through the sample. It
-   includes syscall time because the exact kernel rename instant is not
-   observable by the tool. Record this measured delay on Studio0 and account
-   for clock skew when checking the cutover. The replacement remains marked
+   replacement happens after the final re-stat. There are two timing windows
+   for a replaced or new-since-cutover file:
+
+   - **Backward skew can exclude a post-rename record.** A record written
+     after the rename but stamped before the cutover sample is excluded. Its
+     time window is bounded by the collector-to-tool clock skew plus
+     `renameToSampleDelayMs`. The receipt and marker measure that delay from
+     just before the rename call through the sample, including syscall and
+     scheduling time.
+   - **Forward skew can admit a pre-rename record.** A path first created
+     after the final inventory can contain a record written before the rename
+     but stamped at or after the cutover sample. The physical writing window
+     is bounded by `inventoryToRenameDelayMs`, measured from final inventory
+     completion through rename return. Admission additionally requires enough
+     forward clock skew to reach the sampled cutover time. This record is
+     counted once in the fresh ledger: the stopped collector and exclusive
+     old-ledger lock prevent it from entering the archive during that gap.
+
+   Both durations are conservative upper bounds because the exact kernel
+   rename instant is not observable by the tool. The `epoch-switch --json`
+   receipt and replacement marker report both durations; record them on
+   Studio0 and account for collector clock skew. The replacement remains marked
    pending until that transaction commits; the 0.7.46 collector refuses to
    open a pending ledger, whether started by the daemon, a hook, or a restart.
 

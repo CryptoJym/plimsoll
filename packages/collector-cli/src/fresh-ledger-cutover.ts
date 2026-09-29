@@ -74,6 +74,8 @@ export type FreshLedgerCutoverPlan = {
   untrackedFileFences: number;
   /** Upper bound from just before active rename through the cutover sample. */
   renameToSampleDelayMs?: number;
+  /** Upper bound from final file inventory completion through active rename. */
+  inventoryToRenameDelayMs?: number;
   dueWeeksWithoutAcknowledgement: string[];
   recoveryStagePresent: boolean;
   sidecarsMayAppear: boolean;
@@ -92,6 +94,7 @@ export type ReplacementLedgerMarker = {
   minCollectorVersion: typeof MIN_REPLACEMENT_VERSION;
   switchedAt: string;
   renameToSampleDelayMs: number | null;
+  inventoryToRenameDelayMs: number | null;
   cursorRows: number;
 };
 
@@ -497,7 +500,8 @@ function finalizeReplacementFileFences(stage: Database.Database, input: CutoverI
  * offset; a new generation uses the durable record-time boundary. */
 function reconcilePostRenameCarriedFences(active: Database.Database,
   carriedPaths: ReturnType<typeof finalizeReplacementFileFences>["carriedPaths"],
-  heartbeat: () => void, cutoverAt: Date, renameToSampleDelayMs: number):
+  heartbeat: () => void, cutoverAt: Date, renameToSampleDelayMs: number,
+  inventoryToRenameDelayMs: number):
   { cursorRows: number; fencedFiles: number } {
   const changed: Array<{ fileKey: string; source: "codex" | "claude_code";
     observation: CaptureBaselineFileObservation | null }> = [];
@@ -538,9 +542,9 @@ function reconcilePostRenameCarriedFences(active: Database.Database,
     // from the final pre-rename inventory. Clearing pending in this same
     // transaction is the first point at which a collector may open it.
     active.prepare(`update collector_replacement_ledger
-      set cursor_rows=?, switched_at=?, rename_to_sample_delay_ms=?,
+      set cursor_rows=?, switched_at=?, rename_to_sample_delay_ms=?, inventory_to_rename_delay_ms=?,
         post_switch_fence_pending=0 where singleton=1`)
-      .run(cursorRows, cutoverAt.toISOString(), renameToSampleDelayMs);
+      .run(cursorRows, cutoverAt.toISOString(), renameToSampleDelayMs, inventoryToRenameDelayMs);
   }).immediate();
   return { cursorRows: carriedPaths.length - changed.length,
     fencedFiles: changed.filter(row => row.observation !== null).length };
@@ -964,6 +968,7 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
       singleton integer primary key check(singleton=1), archive_identity text not null,
       archive_path text not null, min_version text not null, switched_at text not null,
       rename_to_sample_delay_ms real check(rename_to_sample_delay_ms>=0),
+      inventory_to_rename_delay_ms real check(inventory_to_rename_delay_ms>=0),
       cursor_rows integer not null, post_switch_fence_pending integer not null default 1
         check(post_switch_fence_pending in (0,1))
     );`);
@@ -1028,11 +1033,13 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     input.onStep?.("archive_linked");
     heartbeat();
     const finalFiles = finalizeReplacementFileFences(replacementLock, input, heartbeat);
+    const inventoryFinished = performance.now();
     replacementLock.exec("COMMIT");
     heartbeat();
     replacementLock.exec("BEGIN EXCLUSIVE");
     const renameStarted = performance.now();
     fs.renameSync(stage, input.ledgerPath);
+    const renameReturned = performance.now();
     // This is the narrowest observable cutover instant. Capture it before
     // directory fsync and the carried-path reconciliation can take time.
     const renamedAt = new Date(Math.max((input.now ?? (() => new Date()))().getTime(),
@@ -1041,6 +1048,9 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     // monotonic interval begins just before the syscall, so it conservatively
     // includes syscall time and any scheduling delay before the sample.
     const renameToSampleDelayMs = performance.now() - renameStarted;
+    // The kernel rename is somewhere inside the syscall. Measuring through
+    // its return gives a conservative upper bound on the preceding gap.
+    const inventoryToRenameDelayMs = renameReturned - inventoryFinished;
     fsyncDirectory(path.dirname(input.ledgerPath));
     switched = true;
     replacementLock.exec("COMMIT");
@@ -1048,13 +1058,13 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     activeLock = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
     activeLock.pragma("locking_mode = EXCLUSIVE");
     const afterSwap = reconcilePostRenameCarriedFences(activeLock, finalFiles.carriedPaths,
-      heartbeat, renamedAt, renameToSampleDelayMs);
+      heartbeat, renamedAt, renameToSampleDelayMs, inventoryToRenameDelayMs);
     activeLock.close(); activeLock = null;
     input.onStep?.("switched");
     return { ...first, archiveIdentity: inspection.archiveIdentity,
       archiveLatestRecordedAt: inspection.latest, cursorRows: afterSwap.cursorRows,
       untrackedFileFences: finalFiles.fencedFiles + afterSwap.fencedFiles,
-      renameToSampleDelayMs };
+      renameToSampleDelayMs, inventoryToRenameDelayMs };
   } finally {
     staged?.close();
     if (old?.inTransaction) old.exec("COMMIT");
@@ -1072,17 +1082,21 @@ export function readReplacementLedgerMarker(ledgerPath: string): ReplacementLedg
   const db = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
   try {
     if (!hasTable(db, "collector_replacement_ledger")) return null;
-    const hasDelay = columns(db, "collector_replacement_ledger")
-      .includes("rename_to_sample_delay_ms");
+    const markerColumns = columns(db, "collector_replacement_ledger");
+    const hasDelay = markerColumns.includes("rename_to_sample_delay_ms");
+    const hasInventoryDelay = markerColumns.includes("inventory_to_rename_delay_ms");
     const row = db.prepare(`select archive_identity as archiveIdentity,archive_path as archivePath,
       min_version as minCollectorVersion,switched_at as switchedAt,cursor_rows as cursorRows,
-      ${hasDelay ? "rename_to_sample_delay_ms" : "null"} as renameToSampleDelayMs
+      ${hasDelay ? "rename_to_sample_delay_ms" : "null"} as renameToSampleDelayMs,
+      ${hasInventoryDelay ? "inventory_to_rename_delay_ms" : "null"} as inventoryToRenameDelayMs
       from collector_replacement_ledger where singleton=1`).get() as ReplacementLedgerMarker | undefined;
     if (!row || !CURSOR_KEY.test(row.archiveIdentity) || !path.isAbsolute(row.archivePath) ||
         row.minCollectorVersion !== MIN_REPLACEMENT_VERSION ||
         !Number.isFinite(Date.parse(row.switchedAt)) ||
         (row.renameToSampleDelayMs !== null &&
           (!Number.isFinite(row.renameToSampleDelayMs) || row.renameToSampleDelayMs < 0)) ||
+        (row.inventoryToRenameDelayMs !== null &&
+          (!Number.isFinite(row.inventoryToRenameDelayMs) || row.inventoryToRenameDelayMs < 0)) ||
         !Number.isSafeInteger(row.cursorRows) || row.cursorRows < 0) {
       throw new Error("replacement_ledger_marker_invalid");
     }

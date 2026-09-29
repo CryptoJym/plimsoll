@@ -96,6 +96,19 @@ jobs:
           pnpm proof:pr426-r10-rename-delay-report
           pnpm proof:pr426-r10-epoch-fixture
 
+      - name: Prove forward-skew records occur exactly once across archive and fresh ledger (PR 426 round 11)
+        run: |
+          pnpm proof:pr426-r11-review-pre-rename-missed
+          pnpm proof:pr426-r11-review-during-rename
+          pnpm proof:pr426-r11-review-future-skew
+          pnpm proof:pr426-r11-review-future-skew-only
+          pnpm proof:pr426-r11-review-stamp-boundary
+          pnpm proof:pr426-r11-review-backward-skew
+          pnpm proof:pr426-r11-review-hook-first
+          pnpm proof:pr426-r11-review-crash-markers
+          pnpm proof:pr426-r11-exactly-once
+          pnpm proof:pr426-r11-window-measurement
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit
