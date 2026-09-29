@@ -8,6 +8,8 @@ import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 import { classifyEventType, isUuid } from "./normalizer";
 import { withRebuildCoordination } from "./rebuild-coordination";
 import { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
+import { HOOK_ACK_LOOKUP_SQL, HOOK_ROW_LOOKUP_SQL,
+  originalHookTimestampDigest, sameHookIdentityPart } from "./maintenance-hook-admission";
 
 const MARKER = "maintenance-rebuild-pause.json";
 const REFUSALS = "maintenance-rebuild-refusals";
@@ -16,9 +18,10 @@ type PauseMarker = { version: 1; at: string; pid?: number; endedAt?: string;
   ledgerName?: "work-ledger.sqlite" | "ledger.sqlite"; ledgerHighWater?: number | null };
 
 type RefusalRoute = "hook" | "otlp" | "live";
-type RefusalReceipt = { version: 1 | 2 | 3 | 4; route: RefusalRoute; at: string;
+type RefusalReceipt = { version: 1 | 2 | 3 | 4 | 5; route: RefusalRoute; at: string;
   source?: string; eventId?: string; kind?: string; ledgerHighWater?: number | null;
   eventDigest?: string | null; receiveClockFallback?: boolean;
+  receiptId?: string; sessionId?: string | null; originalTimestampDigest?: string | null;
   spoolName?: string; unknownAt?: string };
 /** The client writes its retry immediately after the response; the spool's
  * ten-minute stale-pending diagnostic is our conservative missing-retry
@@ -77,12 +80,15 @@ function hookReceiptIdentity(home: string, source: string, body: string | Buffer
     const next = normalizeForwardedHook(payload, { ...options, now: () => atMs + 1_000 }).event;
     const receiveClockFallback = event.observedAt !== next.observedAt;
     return { kind: event.eventType,
+      sessionId: event.sessionId ?? null,
+      originalTimestampDigest: originalHookTimestampDigest(payload),
       eventDigest: normalizedEventDigest(event as Record<string, unknown>, receiveClockFallback),
       receiveClockFallback };
   } catch {
     // Malformed or unnormalizable requests are still refused. Their receipt
     // can settle only on the exact terminal outcome, never on a ledger guess.
-    return { kind: hookEventKind(body), eventDigest: null, receiveClockFallback: false };
+    return { kind: hookEventKind(body), sessionId: null,
+      originalTimestampDigest: null, eventDigest: null, receiveClockFallback: false };
   }
 }
 function ledgerName(home: string): "work-ledger.sqlite" | "ledger.sqlite" {
@@ -171,7 +177,7 @@ function readReceipt(file: string): RefusalReceipt {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) throw new Error("maintenance_refusal_unsafe");
   const value = JSON.parse(fs.readFileSync(file, "utf8")) as RefusalReceipt;
-  if (![1, 2, 3, 4].includes(value.version) || !["hook", "otlp", "live"].includes(value.route) ||
+  if (![1, 2, 3, 4, 5].includes(value.version) || !["hook", "otlp", "live"].includes(value.route) ||
     !Number.isFinite(Date.parse(value.at)) ||
     (value.source !== undefined && !/^[a-z_]{1,32}$/.test(value.source)) ||
     (value.eventId !== undefined && !isUuid(value.eventId)) ||
@@ -181,6 +187,19 @@ function readReceipt(file: string): RefusalReceipt {
         (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
     (value.version === 4 && (value.route !== "hook" || !value.source || !value.eventId ||
       typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.eventDigest === null || (typeof value.eventDigest === "string" &&
+        /^[a-f0-9]{64}$/.test(value.eventDigest))) ||
+      typeof value.receiveClockFallback !== "boolean" ||
+      !(value.ledgerHighWater === null ||
+        (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
+    (value.version === 5 && (value.route !== "hook" || !value.source || !value.eventId ||
+      !value.receiptId || !isUuid(value.receiptId) ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.sessionId === null ||
+        (typeof value.sessionId === "string" && value.sessionId.length <= 256)) ||
+      !(value.originalTimestampDigest === null ||
+        (typeof value.originalTimestampDigest === "string" &&
+          /^[a-f0-9]{64}$/.test(value.originalTimestampDigest))) ||
       !(value.eventDigest === null || (typeof value.eventDigest === "string" &&
         /^[a-f0-9]{64}$/.test(value.eventDigest))) ||
       typeof value.receiveClockFallback !== "boolean" ||
@@ -265,17 +284,20 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
         throw new Error("maintenance_refusal_event_id_changed");
       }
       const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
-      if ((prior.version === 3 || prior.version === 4) &&
+      if ((prior.version === 3 || prior.version === 4 || prior.version === 5) &&
         (prior.source !== source || prior.kind !== identity.kind ||
-          (prior.version === 4 && prior.eventDigest !== identity.eventDigest))) {
+          (prior.version === 5 &&
+            (!sameHookIdentityPart(prior.sessionId ?? null, identity.sessionId) ||
+              prior.originalTimestampDigest !== identity.originalTimestampDigest)))) {
         throw new Error("maintenance_refusal_identity_changed");
       }
-      if (prior.version !== 4 || prior.source !== source || prior.eventId !== eventId ||
+      if (prior.version !== 5 || prior.source !== source || prior.eventId !== eventId ||
         (options.spoolName && prior.spoolName !== options.spoolName)) {
         withHookHighWater(home, marker, (highWater) => {
-          writeReceipt(file, { ...prior, version: 4, source,
+          writeReceipt(file, { ...prior, version: 5, source,
+            receiptId: prior.receiptId ?? randomUUID(),
             eventId: prior.eventId ?? eventId, ...identity,
-            ledgerHighWater: prior.version === 3 || prior.version === 4
+            ledgerHighWater: prior.version === 3 || prior.version === 4 || prior.version === 5
               ? prior.ledgerHighWater ?? null : highWater,
             ...(options.spoolName ? { spoolName: options.spoolName } : {}) });
         });
@@ -288,7 +310,7 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
       const eventId = options.eventId ?? hookEventId(body) ?? randomUUID();
       const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
       withHookHighWater(home, marker, (highWater) => {
-        const value: RefusalReceipt = { version: 4, route, source,
+        const value: RefusalReceipt = { version: 5, route, source, receiptId: randomUUID(),
           at: new Date().toISOString(), eventId, ...identity, ledgerHighWater: highWater,
           ...(options.spoolName ? { spoolName: options.spoolName } : {}) };
         fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
@@ -304,16 +326,26 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
 }
 
 function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt) {
-  if (receipt.version !== 4 || !receipt.eventId || !receipt.source || !receipt.kind ||
-    !receipt.eventDigest) return false;
-  const idPredicate = isUuid(receipt.eventId) ? "id = ? COLLATE NOCASE" : "id = ?";
-  const rows = db.prepare(`select payload_json from buffered_events where source = ?
-    and event_type = ? and ${idPredicate}`)
-    .all(receipt.source, receipt.kind, receipt.eventId) as Array<{ payload_json: string }>;
-  return rows.some((row) => {
-    const event = JSON.parse(row.payload_json) as Record<string, unknown>;
-    return normalizedEventDigest(event, receipt.receiveClockFallback === true) === receipt.eventDigest;
-  });
+  if (receipt.version !== 5 || !receipt.receiptId || !receipt.eventId ||
+    !receipt.source || !receipt.kind) return false;
+  const hasAdmissionTable = db.prepare(`select 1 from sqlite_master
+    where type = 'table' and name = 'maintenance_rebuild_hook_admissions'`).get();
+  const admissions = hasAdmissionTable ? db.prepare(HOOK_ACK_LOOKUP_SQL).all(receipt.receiptId) as
+    Array<{ admitted_event_id: string; outcome: "accepted" | "mismatch" }> : [];
+  if (admissions.some((admission) => admission.outcome === "accepted")) return true;
+  const rejectedIds = new Set(admissions.filter((admission) => admission.outcome === "mismatch")
+    .map((admission) => admission.admitted_event_id));
+  // SQLite's ID primary-key index supports every spelling below. Apply
+  // canonical UUID equality, source, kind and session after that point lookup.
+  // Older binaries have no acknowledgement table, but their immutable row
+  // identity still settles a compatible retry after enrichment or time clamp.
+  const variants = [receipt.eventId, receipt.eventId.toLowerCase(), receipt.eventId.toUpperCase()];
+  const rows = db.prepare(HOOK_ROW_LOOKUP_SQL).all(...variants) as
+    Array<{ id: string; source: string; event_type: string; session_id: string | null }>;
+  return rows.some((row) => !rejectedIds.has(row.id) &&
+    sameEventId(row.id, receipt.eventId!) && row.source === receipt.source &&
+    row.event_type === receipt.kind &&
+    sameHookIdentityPart(row.session_id, receipt.sessionId ?? null));
 }
 
 function terminalTailStart(descriptor: number, size: number) {

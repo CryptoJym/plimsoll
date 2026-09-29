@@ -251,11 +251,12 @@ function admitHookBody(
       fallbackEventId: context.fallbackEventId,
       now: () => stableReceivedAtMs,
       firstReceivedAt: context.producerEventId ? new Date(stableReceivedAtMs).toISOString() : undefined,
+      originalHookPayload: payload,
     };
     if (!context.probe) return appendForwardedHook(admittedPayload, options);
     const canonical = normalizeForwardedHook(admittedPayload, options);
     canonical.event = markStopWindowProbe(canonical.event);
-    return appendNormalizedHook(context.buffer, canonical, options.firstReceivedAt);
+    return appendNormalizedHook(context.buffer, canonical, options.firstReceivedAt, payload);
   });
 }
 

@@ -7,6 +7,7 @@ import {
 } from "../../shared/src/index";
 import { sealOutboundEvent } from "./outbound-envelope";
 import { attachRepoContextSidecar, extractRepoContextCwd } from "./repo-context";
+import { recordMaintenanceHookAdmission } from "./maintenance-hook-admission";
 
 type ForwardedHookOptions = {
   config: CollectorConfig;
@@ -17,13 +18,16 @@ type ForwardedHookOptions = {
   firstReceivedAt?: string;
   producerEventId?: string;
   fallbackEventId?: string;
+  /** Raw caller body before spool replay supplies a receive-time alias. */
+  originalHookPayload?: unknown;
 };
 
 export function appendForwardedHook(
   payload: unknown,
   options: ForwardedHookOptions & { buffer: LocalEventBuffer },
 ) {
-  return appendNormalizedHook(options.buffer, normalizeForwardedHook(payload, options), options.firstReceivedAt);
+  return appendNormalizedHook(options.buffer, normalizeForwardedHook(payload, options),
+    options.firstReceivedAt, options.originalHookPayload ?? payload);
 }
 
 /**
@@ -65,11 +69,14 @@ export function appendNormalizedHook(
   buffer: LocalEventBuffer,
   canonical: ReturnType<typeof normalizeForwardedHook>,
   firstReceivedAt?: string,
+  rawPayload?: unknown,
 ) {
   const appended = buffer.append(
     canonical.event,
     canonical.suppressedFields,
-    { integrityReceipt: true, firstReceivedAt },
+    { integrityReceipt: true, firstReceivedAt,
+      onCommittedAppend: rawPayload === undefined ? undefined :
+        (db, event) => recordMaintenanceHookAdmission(db, rawPayload, event) },
   );
   return {
     ...canonical,

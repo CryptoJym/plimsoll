@@ -37,6 +37,7 @@ import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFin
   advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
+import { ensureMaintenanceHookAdmissionSchema } from "./maintenance-hook-admission";
 import {
   canonicalRepoContextCwd,
   peekRepoContextSidecar,
@@ -577,6 +578,7 @@ export class LocalEventBuffer {
       end;
     `);
     markOpenStep("ledger.privacy_schema");
+    ensureMaintenanceHookAdmissionSchema(this.db);
     this.delivery = new DeliveryOutbox(this.db, {
       ...(options.delivery ?? {}),
       deviceId: options.deviceId,
@@ -2618,7 +2620,8 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] | undefined,
-    options: { integrityReceipt: true; firstReceivedAt?: string },
+    options: { integrityReceipt: true; firstReceivedAt?: string;
+      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent) => void },
   ): {
     appended: boolean;
     deduplicated?: true;
@@ -2628,7 +2631,8 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] = [],
-    options: { integrityReceipt?: boolean; firstReceivedAt?: string } = {},
+    options: { integrityReceipt?: boolean; firstReceivedAt?: string;
+      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent) => void } = {},
   ) {
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
@@ -2636,6 +2640,7 @@ export class LocalEventBuffer {
     try {
       const run = () => {
         const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
+        if (appended.appended) options.onCommittedAppend?.(this.db, event);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
           handoffs,
