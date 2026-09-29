@@ -36,12 +36,12 @@ type CodexState = { sessionId: string; previous: Amounts; index: number; observe
 type ClaudeRevision = { sessionId: string; messageId: string; messageKey: string; current: Amounts };
 type RecordBytes = { recordIndex: number; byteOffset: number; digest: string };
 type SessionBytes = { length: number; digest: string; records?: RecordBytes[] };
-type PrefixCheckpoint = { digest: string; current: Amounts; recordIndex?: number; byteOffset?: number; messageKey?: string; codexState?: CodexState };
+type PrefixCheckpoint = RecordBytes & { current: Amounts; messageKey?: string; codexState?: CodexState };
 type ConfinedParent = { path: string; stamp: string };
 type File = { file: string; fileKey: string; limit: number; stamp: string; fencedAt: string;
   parents: ConfinedParent[];
   sessionId?: string; records?: RecordBytes[]; lineOffset?: number; lineDigest?: () => string;
-  shorterImportedCopy?: boolean; writtenRecordIndex?: number;
+  shorterImportedCopy?: boolean; writtenRecordIndex?: number; importedByteLength?: number;
   recordRefusals?: Array<{ reason: string; byteOffset: number; usage?: boolean }>;
   prefixHash?: string; savedPrefixHash?: string; baselineDefined?: boolean;
   initialCodex?: CodexState; finalCodex?: CodexState;
@@ -391,7 +391,8 @@ function fingerprintLength(file: File, length: number) {
 }
 function verifyImportedBytes(db: DB, root: CaptureRoot, file: File, verified: Map<string, SessionBytes>) {
   if (!file.sessionId) return;
-  const prior = verified.get(file.sessionId) ?? importedSessionBytes(db, root.source, file.sessionId);
+  const stored = importedSessionBytes(db, root.source, file.sessionId);
+  const prior = verified.get(file.sessionId) ?? stored;
   if (!prior && importedSessionWithoutBytes(db, root.source, file.sessionId))
     refusal("imported_prefix_fingerprint_missing");
   if (prior) {
@@ -414,6 +415,7 @@ function verifyImportedBytes(db: DB, root: CaptureRoot, file: File, verified: Ma
       if (saved.digest !== last.digest) refusal("counter_regression:copied_prefix_bytes_differ");
       file.shorterImportedCopy = true;
     }
+    file.importedByteLength = stored?.length;
   }
   if (!prior || file.limit > prior.length)
     return { length: file.limit, digest: file.prefixHash!, records: file.records };
@@ -772,6 +774,11 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
         plan.existingRows += 1;
         continue;
       }
+      // Byte-proven imported records stay old even when a prior time filter
+      // left no counted row or delivery ID for them. Only bytes after that
+      // imported length can supply new rows from this copy.
+      if (file.importedByteLength !== undefined &&
+          candidate.prefixCheckpoint!.byteOffset <= file.importedByteLength) continue;
       plan.missingRows += 1;
       plan.tokens.input += e.inputTokens ?? 0;
       plan.tokens.output += e.outputTokens ?? 0;

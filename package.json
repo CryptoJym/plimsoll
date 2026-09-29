@@ -312,7 +312,9 @@
     "proof:capture-history-import-short_no_usage_codex": "tsx scripts/capture-history-import-short-copy-proof.ts short_no_usage_codex",
     "proof:capture-history-import-short_no_usage_claude": "tsx scripts/capture-history-import-short-copy-proof.ts short_no_usage_claude",
     "proof:capture-history-import-short_bad_usage_codex": "tsx scripts/capture-history-import-short-copy-proof.ts short_bad_usage_codex",
-    "proof:capture-history-import-short_bad_usage_claude": "tsx scripts/capture-history-import-short-copy-proof.ts short_bad_usage_claude"
+    "proof:capture-history-import-short_bad_usage_claude": "tsx scripts/capture-history-import-short-copy-proof.ts short_bad_usage_claude",
+    "proof:capture-history-import-seen_prefix_codex": "tsx scripts/capture-history-import-short-copy-proof.ts seen_prefix_codex",
+    "proof:capture-history-import-seen_prefix_claude": "tsx scripts/capture-history-import-short-copy-proof.ts seen_prefix_claude"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

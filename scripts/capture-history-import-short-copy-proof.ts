@@ -13,7 +13,7 @@ const SESSION = "019d0000-0000-7000-8000-000000000702";
 const START = "2026-01-01T00:00:00.000Z", FENCE = "2026-01-03T00:00:00.000Z";
 type Source = "codex" | "claude_code";
 const cases = ["short_match", "short_changed", "short_after_usage", "seen_suffix", "new_suffix",
-  "missing_fingerprint", "missing_record", "short_invalid_after_usage", "invalid_prefix", "new_invalid", "short_no_usage", "short_bad_usage"] as const;
+  "missing_fingerprint", "missing_record", "short_invalid_after_usage", "invalid_prefix", "new_invalid", "short_no_usage", "short_bad_usage", "seen_prefix"] as const;
 type Case = typeof cases[number];
 const sha = (bytes: Buffer) => crypto.createHash("sha256").update(bytes).digest("hex");
 const line = (row: unknown) => JSON.stringify(row) + "\n";
@@ -56,6 +56,7 @@ async function prove(source: Source, which: Case) {
       assert.equal(Buffer.byteLength(copy), Buffer.byteLength(throughUsage));
     }
     if (which === "seen_suffix" || which === "new_suffix") copy = line(usage(source, 250, 6));
+    if (which === "seen_prefix") copy = original + line(usage(source, 250, 6));
     if (["missing_fingerprint", "invalid_prefix", "new_invalid"].includes(which)) copy = original;
     const copiedBytes = Buffer.from(copy);
     if (["short_invalid_after_usage", "invalid_prefix", "new_invalid"].includes(which)) {
@@ -76,7 +77,14 @@ async function prove(source: Source, which: Case) {
     const total = () => (buffer.database.prepare(`select coalesce(sum(input_tokens),0) as n
       from buffered_events where session_id=?`).get(SESSION) as { n: number }).n;
     if (which !== "new_suffix" && which !== "new_invalid") {
-      await applyCaptureHistory(buffer, roots[0]!); assert.equal(total(), 200);
+      const firstOptions = which === "seen_prefix" ? { since: `2026-01-02T00:00:0${source === "codex" ? 3 : 2}.000Z` } : {};
+      await applyCaptureHistory(buffer, roots[0]!, firstOptions); assert.equal(total(), which === "seen_prefix" ? 100 : 200);
+      if (which === "seen_prefix") {
+        const saved = buffer.database.prepare(`select imported_length as length,prefix_digest as digest
+          from capture_history_session_bytes where source=? and session_id=?`).get(source, SESSION) as { length: number; digest: string };
+        assert.equal(saved.length, Buffer.byteLength(original)); assert.equal(saved.digest, sha(Buffer.from(original)));
+        assert.equal(sha(copiedBytes.subarray(0, saved.length)), saved.digest);
+      }
       if (which === "missing_fingerprint") buffer.database.exec("drop table if exists capture_history_session_bytes");
       if (which === "missing_record" && buffer.database.prepare("select 1 from sqlite_master where name='capture_history_record_bytes'").get())
         buffer.database.prepare(`delete from capture_history_record_bytes where source=? and session_id=? and record_index=?`)
@@ -84,6 +92,7 @@ async function prove(source: Source, which: Case) {
     }
     const before = (buffer.database.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
     const plan = await planCaptureHistory(buffer.database, roots[1]!);
+    if (which === "seen_prefix") { assert.equal(plan.missingRows, 1); assert.equal(plan.tokens.input, 50); }
     const refused = ["short_changed", "seen_suffix", "missing_fingerprint", "missing_record", "invalid_prefix", "new_invalid", "short_no_usage", "short_bad_usage"].includes(which);
     const reasons = (plan as typeof plan & { refusals?: Array<{ reason: string }> }).refusals ?? [];
     if (refused) { assert.equal(plan.missingRows, 0); assert.equal(reasons.length, 1); }
@@ -95,8 +104,8 @@ async function prove(source: Source, which: Case) {
       assert.equal(reason, reasons[0]!.reason); assert.equal(added, 0); assert.equal(total(), which === "new_invalid" ? 0 : 200);
       assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as { n: number }).n, before);
     } else {
-      assert.equal(reason, "none"); assert.equal(added, which === "new_suffix" ? 1 : 0);
-      assert.equal(total(), which === "new_suffix" ? (source === "codex" ? 0 : 250) : 200);
+      assert.equal(reason, "none"); assert.equal(added, which === "new_suffix" || which === "seen_prefix" ? 1 : 0);
+      assert.equal(total(), which === "new_suffix" ? (source === "codex" ? 0 : 250) : which === "seen_prefix" ? 150 : 200);
       assert.equal((await applyCaptureHistory(buffer, roots[1]!)).importedRows, 0);
     }
     if (["short_match", "short_after_usage", "short_invalid_after_usage"].includes(which)) {
