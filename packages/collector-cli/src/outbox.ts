@@ -2843,11 +2843,15 @@ export class DeliveryOutbox {
     if (!row) return 0;
     let siblingReceipts = 0;
     if (row.rawRowid !== null && isTerminalPrivacyReason(reason)) {
+      // A recycled row with the same id and timestamp must inherit the
+      // terminal privacy decision even when its generation changed. A row
+      // with another id cannot inherit that old delivery's decision.
       const owner = this.db.prepare(`select id from buffered_events
-        where rowid=? and created_at is ? and privacy_generation is ?
-          and (? is null or id is ?)`).get(
-        row.rawRowid, row.rawCreatedAt, row.rawGeneration,
-        row.rawId, row.rawId,
+        where rowid=? and created_at is ?
+          and ((? is not null and id is ?)
+            or (? is null and privacy_generation is ?))`).get(
+        row.rawRowid, row.rawCreatedAt,
+        row.rawId, row.rawId, row.rawId, row.rawGeneration,
       ) as { id: string } | undefined;
       if (owner) {
         disposedRawRowids?.add(row.rawRowid);
