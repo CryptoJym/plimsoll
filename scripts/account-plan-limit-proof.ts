@@ -56,6 +56,8 @@ async function main() {
 
     buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
     const tailer = new RolloutTailer(buffer, sessions, () => []);
+    assert.equal((buffer.database.prepare("select count(*) as n from sqlite_master where name='plan_limit_emission_state'")
+      .get() as { n: number }).n, 0, "an idle tailer does not create plan-limit state");
     const session = "019e9999-1111-7222-8333-444444444444";
     const rollout = path.join(day, `rollout-2026-09-29T09-00-00-${session}.jsonl`);
     const reset = 1790676000;
@@ -144,7 +146,7 @@ async function main() {
     try {
       assert.ok((oldBuffer.database.prepare("select count(*) as n from buffered_events where event_type='plan_limit_observation'").get() as { n: number }).n >= 6);
     } finally { oldBuffer.close(); }
-    console.log(JSON.stringify({ proof: "account-plan-limit", checks: 22, passed: 22, failed: 0 }));
+    console.log(JSON.stringify({ proof: "account-plan-limit", checks: 23, passed: 23, failed: 0 }));
   } finally {
     buffer?.close();
     if (oldWorktree) {

@@ -77,18 +77,24 @@ type LastEmission = { usedPercent: number; resetsAt: string; observedAt: string 
 /** Persists only hashed account keys and provider-reported limits. */
 export class PlanLimitEmitter {
   private readonly last = new Map<string, LastEmission | null>();
+  private schemaReady = false;
 
-  constructor(private readonly buffer: LocalEventBuffer) {
-    buffer.database.exec(`create table if not exists plan_limit_emission_state (
+  constructor(private readonly buffer: LocalEventBuffer) {}
+
+  private ensureSchema() {
+    if (this.schemaReady) return;
+    this.buffer.database.exec(`create table if not exists plan_limit_emission_state (
       source text not null, account_key text not null, window text not null,
       used_percent real not null, resets_at text not null, observed_at text not null,
       primary key (source, account_key, window)
     )`);
+    this.schemaReady = true;
   }
 
   observe(input: Observation): boolean {
     const { source, accountKey, window, observedAt } = input;
     if (!/^sha256:[a-f0-9]{16}$/.test(accountKey) || !Number.isFinite(Date.parse(observedAt))) return false;
+    this.ensureSchema();
     const cacheKey = JSON.stringify([source, accountKey, window.window]);
     if (!this.last.has(cacheKey)) {
       const row = this.buffer.database.prepare(`select used_percent as usedPercent, resets_at as resetsAt,
