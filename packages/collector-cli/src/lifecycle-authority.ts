@@ -247,8 +247,9 @@ export class LifecycleMutationAuthority {
   private readonly root: string;
   private readonly leasesDirectory: string;
   private readonly defaultLeaseMs: number;
+  private readonly recoverDeadOwner: boolean;
 
-  constructor(root: string, options: { defaultLeaseMs?: number } = {}) {
+  constructor(root: string, options: { defaultLeaseMs?: number; recoverDeadOwner?: boolean } = {}) {
     if (!path.isAbsolute(root)) throw new Error("authority root must be absolute");
     this.root = path.resolve(root);
     this.leasesDirectory = path.join(this.root, "leases");
@@ -257,6 +258,7 @@ export class LifecycleMutationAuthority {
       throw new Error("default lease duration must be between 1 and 86400000 milliseconds");
     }
     this.defaultLeaseMs = leaseMs;
+    this.recoverDeadOwner = options.recoverDeadOwner === true;
   }
 
   private initialize() {
@@ -309,12 +311,19 @@ export class LifecycleMutationAuthority {
       if (scan.kind === "ambiguous") return scan;
       const top = [...scan.entries].sort((left, right) => left.revision - right.revision).at(-1);
       if (top && top.record.state === "held" && now() < top.record.expiresAtMs) {
-        return {
-          kind: "busy",
-          reason: "held_by_current_owner",
-          currentRevision: top.revision,
-          busyUntilMs: top.record.expiresAtMs,
-        };
+        let ownerDefinitelyGone = false;
+        if (this.recoverDeadOwner) {
+          try { process.kill(top.record.ownerPid, 0); }
+          catch (error) { ownerDefinitelyGone = (error as NodeJS.ErrnoException).code === "ESRCH"; }
+        }
+        if (!ownerDefinitelyGone) {
+          return {
+            kind: "busy",
+            reason: "held_by_current_owner",
+            currentRevision: top.revision,
+            busyUntilMs: top.record.expiresAtMs,
+          };
+        }
       }
       const revision = (top?.revision ?? 0) + 1;
       const acquiredAtMs = now();

@@ -55,6 +55,7 @@ export const collectorConfigSchema = z
     uploadUrl: z.string().url().optional(),
     accountActorSaltEndpoint: z.string().url().optional(),
     tenantId: z.string().trim().min(1).default(LOCAL_TENANT_ID),
+    workspaceName: z.string().trim().min(1).max(200).optional(),
     installKey: z.string().trim().min(1).default("local-dev"),
     /** Stable local activation identity; never replaced by a hosted id. */
     deviceId: z.string().trim().min(1).optional(),
@@ -71,6 +72,8 @@ export const collectorConfigSchema = z
       if (!roots) return;
       try { validateCaptureRoots(roots); } catch { ctx.addIssue({ code: "custom", message: "Invalid or overlapping capture root inventory" }); }
     }),
+    /** Clear-text identity label used to derive every local capture root. */
+    enrollmentMachineLabel: z.string().trim().min(1).max(128).optional(),
     subscriptions: z
       .array(
         z.object({
