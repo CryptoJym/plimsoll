@@ -13,10 +13,9 @@ import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 
-const variant = process.argv[2];
-assert.ok(variant === "append-before-first-scan" || variant === "replace-after-rename");
+const variant: string = "untracked-swap-replacement";
 const fixture = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(),
-  `pr426-r7-${variant}-`)));
+  `pr426-r5-untracked-${variant}-`)));
 const ledgerPath = path.join(fixture, "work-ledger.sqlite");
 const archiveDirectory = path.join(fixture, "archive");
 const codex = path.join(fixture, "codex");
@@ -54,27 +53,33 @@ async function main() {
         if (cursor?.fileIdentity && cursor.fileIdentity !== identity) staleGenerationCursorPassed = true;
         return DEFAULT_JSONL_TAILER_IO.readTail(candidate, stat, cursor, limits);
       } };
-    transcript = new TranscriptTailer(buffer, undefined, io, [roots[1]!]);
-    await transcript.scan({ scope: "full" });
-    assert.equal((buffer.database.prepare("select count(*) as n from rollout_scan_state")
-      .get() as { n: number }).n, 1);
-    transcript.close(); transcript = undefined;
+    // The file exists but has never been scanned, so the switch stages it as
+    // an untracked generation. A replacement after final observation must be
+    // rechecked just like a carried cursor.
     buffer.close(); buffer = undefined;
     const oldInode = fs.statSync(file).ino;
     const replace = () => {
       const next = `${file}.new`;
-      // This is historical content copied into the replacement generation.
-      // The new read-time rule admits a genuinely post-cutover record even if
-      // it existed before first scan, so make the old stamp explicit here.
-      fs.writeFileSync(next, line("before-fence", new Date(Date.now() - 3_600_000)));
+      fs.writeFileSync(next, line("before-fence"));
       fs.renameSync(next, file);
       assert.notEqual(fs.statSync(file).ino, oldInode);
     };
     const input = { ledgerPath, archivePath: path.join(archiveDirectory, "old-ledger.sqlite"),
       config, authorityRoot: path.join(fixture, "lifecycle-authority") };
-    switchFreshLedger({ ...input, onStep: step => {
-      if (variant === "append-before-first-scan" && step === "stage_bound") replace();
-    } });
+    const originalRename = fs.renameSync;
+    let injected = false;
+    fs.renameSync = ((source: fs.PathLike, destination: fs.PathLike) => {
+      if (String(source) === `${ledgerPath}.replacement-stage` && String(destination) === ledgerPath) {
+        const next = `${file}.writer-new`;
+        fs.writeFileSync(next, line("pre-swap-replacement", new Date(Date.now() - 3_600_000)));
+        originalRename(next, file);
+        injected = true;
+      }
+      return originalRename(source, destination);
+    }) as typeof fs.renameSync;
+    try { switchFreshLedger(input); } finally { fs.renameSync = originalRename; }
+    assert.equal(injected, true);
+    fs.appendFileSync(file, line("post-swap-early"));
     if (variant === "replace-after-rename") replace();
     if (variant === "append-before-first-scan") fs.appendFileSync(file, line("after-fence"));
     buffer = new LocalEventBuffer(ledgerPath, { workspaceId: workspace, deviceId: device,
@@ -86,17 +91,29 @@ async function main() {
         await tailer.scan({ scope: "recent", automatic: { phase: "baseline", budget: new CaptureWorkBudget() } });
     }
     assert.equal(captureBaselineStatus(buffer.database).status, "complete");
-    if (variant === "replace-after-rename") fs.appendFileSync(file, line("after-fence"));
+    for (let pass = 0; pass < 8; pass++)
+      await transcript.scan({ scope: "recent", automatic: { phase: "capture", budget: new CaptureWorkBudget() } });
+    const earlyRows = (buffer.database.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
+    console.log(JSON.stringify({ injected, earlyRows, fileSize: fs.statSync(file).size,
+      cursor: buffer.database.prepare("select file_identity,committed_offset,size from rollout_scan_state").all(),
+      carried: buffer.database.prepare("select file_identity,committed_offset from replacement_capture_cursors").all(),
+      fences: buffer.database.prepare("select baseline_size from replacement_unseen_file_fences").all(),
+      baseline: buffer.database.prepare("select baseline_size from automatic_capture_baseline_generations").all() }));
+    fs.appendFileSync(file, line("post-swap-late"));
     for (let pass = 0; pass < 8; pass++)
       await transcript.scan({ scope: "recent", automatic: { phase: "capture", budget: new CaptureWorkBudget() } });
     const rows = buffer.database.prepare("select payload_json from buffered_events").all() as
       Array<{ payload_json: string }>;
-    console.log(JSON.stringify({ variant, stored: rows.length, staleGenerationCursorPassed,
+    console.log(JSON.stringify({ variant, injected, earlyRows, stored: rows.length, staleGenerationCursorPassed,
       fileSize: fs.statSync(file).size, rows: rows.map(row => row.payload_json) }));
-    assert.equal(rows.length, 1,
-      `${variant}: historical replacement content is excluded and later records are admitted`);
-    assert.equal((JSON.parse(rows[0]!.payload_json) as {id:string}).id,
-      deterministicEventId(["claude-transcript", path.basename(file, ".jsonl"), "after-fence"]));
+    assert.equal(earlyRows, 1, "a post-switch append before first scan must be captured");
+    assert.equal(rows.length, 2,
+      `${variant}: first-scan baseline fences existing bytes and admits only later growth`);
+    const capturedIds = rows.map(row => (JSON.parse(row.payload_json) as {id:string}).id).sort();
+    const expectedIds = ["post-swap-early", "post-swap-late"].map(id =>
+      deterministicEventId(["claude-transcript", path.basename(file, ".jsonl"), id])).sort();
+    assert.deepEqual(capturedIds, expectedIds,
+      "only the two post-switch records may be stored, never the old or pre-switch records");
     if (variant === "replace-after-rename") {
       assert.equal(staleGenerationCursorPassed, false,
         "a carried cursor from the old generation must never be applied to the post-rename file");

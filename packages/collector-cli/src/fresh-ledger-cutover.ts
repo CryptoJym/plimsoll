@@ -9,7 +9,8 @@ import Database from "better-sqlite3";
 import { z } from "zod";
 
 import { LocalEventBuffer } from "./buffer";
-import { carriedCaptureCursorMatches, recordReplacementUnseenFileFences,
+import { carriedCaptureCursorMatches, recordReplacementFileBoundaries,
+  recordReplacementUnseenFileFences,
   type CaptureBaselineFileObservation } from "./capture-baseline";
 import { captureRootBaselineFiles, captureRootBaselineObservations,
   rootCursorKey } from "./capture-root-inventory";
@@ -439,7 +440,7 @@ function untrackedRootFiles(db: Database.Database, input: CutoverInput) {
  * This runs under the old-ledger lock and lifecycle lease immediately before
  * the active pathname is replaced. A stale cursor cannot suppress growth. */
 function finalizeReplacementFileFences(stage: Database.Database, input: CutoverInput,
-  heartbeat: () => void): { cursorRows: number; fencedFiles: number; carriedPaths: Array<{
+  heartbeat: () => void, provisionalCutoverAt: string): { cursorRows: number; fencedFiles: number; carriedPaths: Array<{
     fileKey: string; source: "codex" | "claude_code"; path: string;
     fileIdentity: string; committedOffset: number;
   }> } {
@@ -476,6 +477,9 @@ function finalizeReplacementFileFences(stage: Database.Database, input: CutoverI
   }
   const untracked = observations.filter(entry => !validKeys.has(entry.fileKey));
   for (const source of ["codex", "claude_code"] as const) {
+    recordReplacementFileBoundaries(stage, source,
+      observations.filter(entry => entry.source === source).map(entry => entry.observation),
+      provisionalCutoverAt);
     recordReplacementUnseenFileFences(stage, source,
       untracked.filter(entry => entry.source === source).map(entry => entry.observation));
     heartbeat();
@@ -485,12 +489,12 @@ function finalizeReplacementFileFences(stage: Database.Database, input: CutoverI
   return { cursorRows: validKeys.size, fencedFiles: untracked.length, carriedPaths };
 }
 
-/** The stage observation precedes the rename. Re-stat only its carried paths
- * after the active name has changed; a same-generation append keeps its old
- * committed offset, while a new generation receives its size at this point. */
+/** The stage observation precedes the rename. Re-stat carried paths after
+ * the active name has changed. A same-generation append keeps its committed
+ * offset; a new generation uses the durable record-time boundary. */
 function reconcilePostRenameCarriedFences(active: Database.Database,
   carriedPaths: ReturnType<typeof finalizeReplacementFileFences>["carriedPaths"],
-  heartbeat: () => void): { cursorRows: number; fencedFiles: number } {
+  heartbeat: () => void, cutoverAt: Date): { cursorRows: number; fencedFiles: number } {
   const changed: Array<{ fileKey: string; source: "codex" | "claude_code";
     observation: CaptureBaselineFileObservation | null }> = [];
   for (const row of carriedPaths) {
@@ -526,8 +530,14 @@ function reconcilePostRenameCarriedFences(active: Database.Database,
     }
     const cursorRows = (active.prepare("select count(*) as n from replacement_capture_cursors")
       .get() as { n: number }).n;
+    // Persist the instant sampled immediately after the active rename, before
+    // the post-rename scan. A later generation uses it as its record-time
+    // boundary, including records written while this reconciliation runs.
+    active.prepare("update replacement_file_boundaries set cutover_at=?")
+      .run(cutoverAt.toISOString());
     active.prepare(`update collector_replacement_ledger
-      set cursor_rows=?, post_switch_fence_pending=0 where singleton=1`).run(cursorRows);
+      set cursor_rows=?, switched_at=?, post_switch_fence_pending=0 where singleton=1`)
+      .run(cursorRows, cutoverAt.toISOString());
   }).immediate();
   return { cursorRows: carriedPaths.length - changed.length,
     fencedFiles: changed.filter(row => row.observation !== null).length };
@@ -804,6 +814,81 @@ function preserveLeftoverStageSidecars(stage: string, freshAttemptPath: string) 
   }
 }
 
+function immutableStageHasReplacementMarker(stage: string): boolean {
+  const SQLite = createRequire(import.meta.url)("node:sqlite") as {
+    DatabaseSync: new (file: string, options: { readOnly: boolean }) => {
+      prepare(sql: string): { get(): unknown }; close(): void;
+    };
+  };
+  const db = new SQLite.DatabaseSync(`${pathToFileURL(stage).href}?immutable=1`, { readOnly: true });
+  try {
+    return Boolean(db.prepare(`select 1 from sqlite_master where type='table'
+      and name='collector_replacement_ledger'`).get());
+  } finally { db.close(); }
+}
+
+/** A retry never publishes a stage written by an earlier attempt. Keep its
+ * bytes for diagnosis, including WAL frames, then start with a new APFS clone
+ * of the unchanged archive. This also recovers a kill before the journal or
+ * nonce was durable. Foreign active-ledger copies and aliases are refused. */
+function retainSuspectRestoreStage(stage: string, archivePath: string,
+  ledgerPath: string, freshAttemptPath: string) {
+  const artifacts = [stage, `${stage}-wal`, `${stage}-shm`, `${stage}-journal`,
+    restoreStageJournalPath(stage)].filter(file => {
+      try { fs.lstatSync(file); return true; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    });
+  if (!artifacts.length) return;
+  const stagePresent = artifacts.includes(stage);
+  if (stagePresent) {
+    const stat = fs.lstatSync(stage);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() ||
+        stat.dev !== fs.lstatSync(archivePath).dev ||
+        stat.ino === fs.lstatSync(archivePath).ino ||
+        stat.ino === fs.lstatSync(ledgerPath).ino) {
+      throw new Error("restore_stage_identity_changed");
+    }
+    // Keep the original WAL bytes before any SQLite open, even the read-only
+    // provenance probe below. The suspect rename retains the originals too.
+    preserveLeftoverStageSidecars(stage, freshAttemptPath);
+    // A complete, unrelated replacement clone is a foreign stage. The
+    // archive's clone has no replacement marker. An interrupted/partial clone
+    // may be unreadable, which is safe to retain and replace from the archive.
+    try {
+      if (immutableStageHasReplacementMarker(stage)) throw new Error("restore_stage_not_archive_clone");
+    } catch (error) {
+      if (error instanceof Error && error.message === "restore_stage_not_archive_clone") throw error;
+    }
+  }
+  for (const file of artifacts) {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.()) {
+      throw new Error("restore_stage_unsafe");
+    }
+  }
+  // Preserve a separately named APFS clone of every sidecar, as well as the
+  // original alongside the suspect main file. A kill during these renames is
+  // idempotent: the next attempt retains whatever still has a stage pathname.
+  if (!stagePresent) preserveLeftoverStageSidecars(stage, freshAttemptPath);
+  const retainedBase = `${freshAttemptPath}.restore-stage.suspect-${Date.now()}-${crypto.randomUUID()}`;
+  for (const file of artifacts) {
+    if (!fs.existsSync(file)) continue;
+    fs.chmodSync(file, 0o600);
+    fs.renameSync(file, `${retainedBase}${file.slice(stage.length)}`);
+  }
+  fsyncDirectory(path.dirname(stage));
+  fsyncDirectory(path.dirname(freshAttemptPath));
+}
+
+function restoreRecoveryArtifactsPresent(stage: string, freshAttemptPath: string): boolean {
+  if (stageArtifactPresent(stage) || fs.existsSync(restoreStageJournalPath(stage))) return true;
+  const prefix = `${path.basename(freshAttemptPath)}.restore-stage.suspect-`;
+  return fs.readdirSync(path.dirname(freshAttemptPath)).some(name => name.startsWith(prefix));
+}
+
 /** Prepare a fully bound replacement beside the old ledger, then atomically
  * replace the active pathname. A hard link preserves the quiesced old inode
  * at the archive path without copying the 88 GB history. */
@@ -938,18 +1023,24 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     fsyncDirectory(path.dirname(input.archivePath));
     input.onStep?.("archive_linked");
     heartbeat();
-    const finalFiles = finalizeReplacementFileFences(replacementLock, input, heartbeat);
+    const finalFiles = finalizeReplacementFileFences(replacementLock, input, heartbeat,
+      switchNow.toISOString());
     replacementLock.exec("COMMIT");
     heartbeat();
     replacementLock.exec("BEGIN EXCLUSIVE");
     fs.renameSync(stage, input.ledgerPath);
+    // This is the narrowest observable cutover instant. Capture it before
+    // directory fsync and the carried-path reconciliation can take time.
+    const renamedAt = new Date(Math.max((input.now ?? (() => new Date()))().getTime(),
+      switchNow.getTime()));
     fsyncDirectory(path.dirname(input.ledgerPath));
     switched = true;
     replacementLock.exec("COMMIT");
     replacementLock.close(); replacementLock = null;
     activeLock = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
     activeLock.pragma("locking_mode = EXCLUSIVE");
-    const afterSwap = reconcilePostRenameCarriedFences(activeLock, finalFiles.carriedPaths, heartbeat);
+    const afterSwap = reconcilePostRenameCarriedFences(activeLock, finalFiles.carriedPaths,
+      heartbeat, renamedAt);
     activeLock.close(); activeLock = null;
     input.onStep?.("switched");
     return { ...first, archiveIdentity: inspection.archiveIdentity,
@@ -1098,9 +1189,8 @@ export function restoreArchivedLedger(input: {
       epochId: binding.epochId };
   } finally { archived.close(); }
   const stage = `${input.ledgerPath}.restore-stage`;
-  const stageExists = stageArtifactPresent(stage);
-  if (stageExists && !fs.existsSync(stage)) throw new Error("restore_stage_incomplete");
-  if (!activeMarker && (stageExists || !freshStat)) throw new Error("restore_completion_ambiguous");
+  const stageExists = restoreRecoveryArtifactsPresent(stage, input.freshAttemptPath);
+  if (!activeMarker && (fs.existsSync(stage) || !freshStat)) throw new Error("restore_completion_ambiguous");
   if (!activeMarker) {
     // The stage rename is the commit point. A kill before the following
     // directory fsync leaves a complete restored ledger and retained fresh
@@ -1130,10 +1220,10 @@ export function restoreArchivedLedger(input: {
   let stageExistsNow: boolean;
   let freshExistsNow: boolean;
   try {
-    stageExistsNow = stageArtifactPresent(stage);
+    stageExistsNow = restoreRecoveryArtifactsPresent(stage, input.freshAttemptPath);
     const activeMarkerNow = readReplacementLedgerMarker(input.ledgerPath);
     if (!activeMarkerNow) {
-      if (stageExistsNow || !fs.existsSync(input.freshAttemptPath)) {
+      if (fs.existsSync(stage) || !fs.existsSync(input.freshAttemptPath)) {
         throw new Error("restore_completion_ambiguous");
       }
       fsyncDirectory(path.dirname(input.ledgerPath));
@@ -1142,8 +1232,7 @@ export function restoreArchivedLedger(input: {
       return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
         archivePreserved: true };
     }
-    if (activeMarkerNow.archiveIdentity !== marker.archiveIdentity ||
-        (stageExistsNow && !fs.existsSync(stage))) {
+    if (activeMarkerNow.archiveIdentity !== marker.archiveIdentity) {
       throw new Error("restore_stage_or_marker_changed");
     }
     freshExistsNow = fs.existsSync(input.freshAttemptPath);
@@ -1151,9 +1240,12 @@ export function restoreArchivedLedger(input: {
         fs.lstatSync(input.ledgerPath).ino) {
       throw new Error("restore_fresh_attempt_changed");
     }
-    if (stageExistsNow) readRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
-    else if (fs.existsSync(restoreStageJournalPath(stage))) {
-      throw new Error("restore_stage_journal_without_stage");
+    // A previous attempt's stage is never reused, even if its identity and
+    // nonce still match: its mutable content may have changed after a kill.
+    // Structural aliases and a copied active ledger remain hard refusals.
+    if (stageExistsNow || fs.existsSync(restoreStageJournalPath(stage))) {
+      retainSuspectRestoreStage(stage, input.archivePath, input.ledgerPath,
+        input.freshAttemptPath);
     }
   } catch (error) {
     lease.release();
@@ -1181,33 +1273,25 @@ export function restoreArchivedLedger(input: {
       if (!checkpoint || checkpoint.busy || checkpoint.log) throw new Error("replacement_wal_not_checkpointed");
     }
     replacement.exec("BEGIN EXCLUSIVE");
-    let stageJournal: RestoreStageJournal;
-    if (!stageExistsNow) {
-      // The archive inode is never handed to the old runtime. A killed clone
-      // leaves a stage which SQLite can recover and fold on the next attempt.
-      const clone = spawnSync("/bin/cp", ["-c", input.archivePath, stage], {
-        stdio: "ignore", timeout: 300_000,
-      });
-      if (clone.error || clone.status !== 0) throw new Error("archive_clone_unavailable");
-      const stageFd = fs.openSync(stage, "r");
-      try { fs.fsyncSync(stageFd); } finally { fs.closeSync(stageFd); }
-      fsyncDirectory(path.dirname(stage));
-      stageJournal = createRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
-    } else {
-      stageJournal = readRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
-      preserveLeftoverStageSidecars(stage, input.freshAttemptPath);
-    }
+    // APFS clonefile is near-instant and leaves the archive immutable. Each
+    // attempt gets a new clone; no earlier stage can influence publication.
+    const clone = spawnSync("/bin/cp", ["-c", input.archivePath, stage], {
+      stdio: "ignore", timeout: 300_000,
+    });
+    if (clone.error || clone.status !== 0) throw new Error("archive_clone_unavailable");
+    const stageFd = fs.openSync(stage, "r");
+    try { fs.fsyncSync(stageFd); } finally { fs.closeSync(stageFd); }
+    fsyncDirectory(path.dirname(stage));
+    const stageJournal = createRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
     restoredLock = new Database(stage, { fileMustExist: true, timeout: 0 });
     restoredLock.pragma("locking_mode = EXCLUSIVE");
-    if (!stageExistsNow) {
-      restoredLock.exec(`create table collector_restore_stage (
-        singleton integer primary key check(singleton=1), archive_identity text not null,
-        stage_nonce text not null, clone_size text not null
-      )`);
-      restoredLock.prepare(`insert into collector_restore_stage
-        (singleton,archive_identity,stage_nonce,clone_size) values(1,?,?,?)`)
-        .run(stageJournal.archiveIdentity, stageJournal.nonce, stageJournal.cloneSize);
-    }
+    restoredLock.exec(`create table collector_restore_stage (
+      singleton integer primary key check(singleton=1), archive_identity text not null,
+      stage_nonce text not null, clone_size text not null
+    )`);
+    restoredLock.prepare(`insert into collector_restore_stage
+      (singleton,archive_identity,stage_nonce,clone_size) values(1,?,?,?)`)
+      .run(stageJournal.archiveIdentity, stageJournal.nonce, stageJournal.cloneSize);
     restoredLock.exec("BEGIN EXCLUSIVE");
     assertRestoreStageImage(restoredLock, stageJournal, archiveBinding);
     const heartbeat = () => {

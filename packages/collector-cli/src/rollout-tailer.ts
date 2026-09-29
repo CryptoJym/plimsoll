@@ -36,6 +36,7 @@ import {
   captureBaselinePostEnrollmentOffset,
   carriedCaptureCursorMatches,
   carriedCaptureCursorOffset,
+  replacementCaptureBoundary,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -419,6 +420,7 @@ export class RolloutTailer {
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
   private activeCarriedBytes = false;
+  private activeReplacementCutoverAt: string | null = null;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
   private eligibleDirectories: string[] | null = null;
@@ -1037,7 +1039,9 @@ export class RolloutTailer {
       // A fenced automatic generation starts at its own byte boundary with
       // fresh parser state. Other scans retain the old cursor as reset
       // evidence; the JSONL reader will discard it on generation change.
-      const cursor = growthStart !== null && storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity
+      const boundary = replacementCaptureBoundary(this.buffer.database, "codex", observation);
+      const cursor = (boundary?.changed && storedCursor?.fileIdentity !== identity) ||
+        (growthStart !== null && storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity)
         ? undefined : storedCursor;
       let initialOffset: number | undefined;
       if (growthStart !== null) {
@@ -1184,6 +1188,7 @@ export class RolloutTailer {
           const before = resultMutationSnapshot(result);
           const activeRootBefore = this.activeCaptureRoot;
           const carriedBytesBefore = this.activeCarriedBytes;
+          const cutoverBefore = this.activeReplacementCutoverAt;
           let parseFailure = false;
           let committed = false;
           let validationDeferred = false;
@@ -1207,6 +1212,11 @@ export class RolloutTailer {
               cursor.committedOffset >= carriedOffset && cursor.fileIdentity === read.fileIdentity;
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            const readObservation = baselineObservation(candidate.file, this.regularFileStat(candidate.file));
+            if (`${readObservation.device}:${readObservation.inode}:${readObservation.birthtimeNs}` !==
+                read.fileIdentity) throw new Error("capture_generation_changed_before_commit");
+            const readBoundary = replacementCaptureBoundary(this.buffer.database, "codex", readObservation);
+            this.activeReplacementCutoverAt = readBoundary?.changed ? readBoundary.cutoverAt : null;
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();
@@ -1284,6 +1294,7 @@ export class RolloutTailer {
           } catch {
             this.activeCaptureRoot = activeRootBefore;
             this.activeCarriedBytes = carriedBytesBefore;
+            this.activeReplacementCutoverAt = cutoverBefore;
             const parseErrors = result.parseErrors - before.parseErrors;
             restoreResultMutationSnapshot(result, before);
             if (parseFailure) {
@@ -1779,6 +1790,12 @@ export class RolloutTailer {
       // the same rewrite and is counted with it.
       const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
       const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
+      if (this.activeReplacementCutoverAt &&
+          (!entry.observedAt || !Number.isFinite(Date.parse(entry.observedAt)) ||
+           Date.parse(entry.observedAt) < Date.parse(this.activeReplacementCutoverAt))) {
+        result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
+        continue;
+      }
       const activeCaptureRoot = this.captureRootAt(this.activeCaptureRoot, observedAt);
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.

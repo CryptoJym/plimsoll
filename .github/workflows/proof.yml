@@ -81,6 +81,16 @@ jobs:
           pnpm proof:pr426-r8-restore-sidecar-inventory
           pnpm proof:pr426-r8-restore-sidecar-checkpoint
 
+      - name: Prove read-time generation admission and archive-only restore retries (PR 426 round 9)
+        run: |
+          pnpm proof:pr426-r9-untracked-swap-race
+          pnpm proof:pr426-r9-carried-post-stat-race
+          pnpm proof:pr426-r9-rename-fsync-record
+          pnpm proof:pr426-r9-restore-content-reclone
+          pnpm proof:pr426-r9-restore-clone-fsync-retry
+          pnpm proof:pr426-r9-restore-journal-fsync-retry
+          pnpm proof:pr426-r9-restore-nonce-reclone
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit

@@ -78,26 +78,34 @@ keys, and capture-root configuration stay in place.
    creates and binds a staged replacement to the agreed root epoch, and
    carries each valid per-file committed cursor whose file generation still
    matches, plus Codex live authorization rows. Immediately before rename,
-   under the switch lease, it rechecks each carried cursor against the file's
+   under the switch lease, it observes every existing file path and generation,
+   both carried and untracked, and rechecks each carried cursor against the file's
    current generation and size. A replaced or shortened generation loses its
-   old cursor and is fenced at its size at that moment. It creates a hard link for
+   old cursor. It creates a hard link for
    the archive and atomically swaps the
    already-bound stage into the active pathname. The archive is never
    deleted. The replacement's durable marker records the archive identity,
    archive path, and minimum collector version 0.7.46. Files with carried
    cursors resume at their committed byte offsets, even when appended records
    have timestamps before the switch. Every physically present file without
-   a carried cursor is fenced at its observed switch size, independently of
-   host or filesystem clocks; later growth starts at that byte boundary.
-   A new file generation at an old pathname is treated as a file without a
-   carried cursor: its obsolete archive cursor is validated but not copied.
+   a carried cursor retains a byte fence for its observed generation,
+   independently of host or filesystem clocks; later growth starts at that
+   byte boundary. At read time the tailer compares the open file's device,
+   inode and birth time with the generation observed at the switch. A changed
+   generation at an observed path starts at byte zero with fresh parser state;
+   only complete records whose own timestamps are at or after the durable
+   cutover instant are admitted. Existing event dedupe remains in force.
    After the rename, while the switch lease is still held and before starting
    the collector, the command re-stats every carried-cursor file. Any changed
-   generation is fenced at the size observed then, in one transaction in the
-   active ledger. A same-generation append remains eligible at the carried
-   offset. Bytes written into a replaced generation between the rename and
-   this final re-stat are fenced. This short window is bounded by the final
-   re-stat, with the collector stopped; do not treat those bytes as captured.
+   generation loses its old cursor in the active ledger. The cutover instant is
+   sampled immediately after the active rename, then the final transaction
+   records it for every observed path and clears the pending
+   marker. A same-generation append remains eligible at the carried offset;
+   a replacement is admitted by each record's own timestamp, even if the
+   replacement happens after the final re-stat. One irreducible window remains:
+   a record stamped before this cutover instant but written into a replaced
+   file after the rename is excluded. Its extent depends on clock skew between
+   the tool and the collector; account for that when checking the cutover.
    The replacement remains marked pending until that transaction commits, and
    the 0.7.46 collector refuses to open a pending ledger.
 
@@ -162,18 +170,23 @@ retain the fresh attempt for reconciliation rather than replaying it through
 the old runtime.
 
 If the restore process dies, rerun the same `epoch-restore` command with the
-same three paths. A pre-rename stage is recovered and folded again under the
+same three paths. A pre-rename stage is retained as suspect under the
+mutation lease. Restore then APFS-clones the unchanged archive again, writes a
+new journal and nonce, and folds into that new clone under the
 mutation lease; a post-rename rerun confirms the active archived image and
 durably syncs its directory. Wait for the killed lease's fencing deadline if
 the command reports it busy. Keep the archive, retained fresh attempt, and
 all sidecars; no manual cleanup is required. Restore writes a durable stage
 identity journal with the archive identity and the clone's device, inode and
-original size. A rerun accepts only that recorded stage; before publication it
-checks the staged ledger has the archived binding and no replacement marker.
-An unrelated or unverifiable stage is refused and retained for inspection.
-Before reopening a leftover stage, restore APFS-clones its WAL, shared-memory
-and rollback-journal sidecars into private `.recovered-*` artifacts, then lets
-SQLite replay the original sidecars. It never deletes those retained artifacts.
+original size. A retry never publishes a prior stage, even if its identity and
+nonce still match. Before publication it checks the newly cloned ledger has
+the archived binding and no replacement marker. A hard link, symlink or copy
+of the active replacement at the stage path is refused and left in place.
+Before probing a leftover stage, restore APFS-clones its WAL, shared-memory
+and rollback-journal sidecars into private `.recovered-*` artifacts. It then
+renames the suspect stage, sidecars and journal into private `.suspect-*`
+artifacts. These artifacts are James's to inspect and delete later; the
+collector never deletes them.
 
 If the restore command refuses, keep the daemon stopped and inspect its reason
 and the three paths. Do not hand the replacement pathname to an old runtime.

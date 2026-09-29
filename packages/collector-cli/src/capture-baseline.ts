@@ -14,6 +14,7 @@ const GENERATION_TABLE = "automatic_capture_baseline_generations";
 const PENDING_GENERATION_TABLE = "automatic_capture_baseline_pending_generations";
 const ERROR_TABLE = "automatic_capture_baseline_observation_errors";
 const REPLACEMENT_FENCE_TABLE = "replacement_unseen_file_fences";
+const REPLACEMENT_BOUNDARY_TABLE = "replacement_file_boundaries";
 const SCHEMA_VERSION = 2;
 const initializedDatabases = new WeakSet<object>();
 
@@ -1690,6 +1691,20 @@ export function classifyCaptureBaselineFile(
       historyInvalidated: false,
     };
   }
+  // A path seen at cutover may subsequently name a different file. Its old
+  // generation's byte fence cannot apply to the replacement: read complete
+  // records from byte zero and admit them by their own timestamps instead.
+  const replacementBoundary = replacementCaptureBoundary(database, source, observation);
+  if (options.mode === "automatic" && replacementBoundary?.changed) {
+    if (unresolvedError) return {
+      decision: "block", reason: CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+      matchedExcludedGeneration: false, observedGrowth: false, historyInvalidated: false,
+    };
+    return {
+      decision: "capture", reason: "generation_not_baselined",
+      matchedExcludedGeneration: false, observedGrowth: false, historyInvalidated: false,
+    };
+  }
   if (options.mode === "automatic" && replacementFence !== null) {
     if (unresolvedError || normalized.size < replacementFence) return {
       decision: "block", reason: CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
@@ -1847,6 +1862,7 @@ export function captureBaselineExcludedSize(
     where type='table' and name in (?,?,?)`).get(STATE_TABLE, GENERATION_TABLE, ERROR_TABLE) as {n:number};
   if (schema.n !== 3) return null;
   const normalized = normalizeObservation(observation);
+  if (replacementCaptureBoundary(database, source, observation)?.changed) return null;
   if (normalized) {
     const replacementFence = replacementUnseenFileFence(database, source, normalized);
     if (replacementFence !== null) return replacementFence;
@@ -1875,6 +1891,48 @@ export function captureBaselinePostEnrollmentOffset(
 
 const carriedCursorTablePresent = new WeakMap<object, boolean>();
 const replacementFenceTablePresent = new WeakMap<object, boolean>();
+const replacementBoundaryTablePresent = new WeakMap<object, boolean>();
+
+/** The swap's durable path identity. An unchanged generation uses its cursor
+ * or size fence; a replacement uses the cutover time for each record. */
+export function replacementCaptureBoundary(database: Database.Database,
+  source: HistoryCoverageSource, observation: CaptureBaselineFileObservation):
+  { changed: boolean; cutoverAt: string } | null {
+  let present = replacementBoundaryTablePresent.get(database);
+  if (present === undefined) {
+    present = Boolean(database.prepare(`select 1 from sqlite_master where type='table' and name=?`)
+      .get(REPLACEMENT_BOUNDARY_TABLE));
+    replacementBoundaryTablePresent.set(database, present);
+  }
+  if (!present) return null;
+  const normalized = normalizeObservation(observation);
+  if (!normalized) return null;
+  const row = database.prepare(`select generation_key as generationKey, cutover_at as cutoverAt
+    from ${REPLACEMENT_BOUNDARY_TABLE} where source=? and path_key=?`)
+    .get(source, normalized.pathKey) as { generationKey: string; cutoverAt: string } | undefined;
+  return row ? { changed: row.generationKey !== normalized.generationKey,
+    cutoverAt: row.cutoverAt } : null;
+}
+
+/** Called under the switch lease for every observed root path, before rename.
+ * The final cutover instant is written together with pending=0 after rename. */
+export function recordReplacementFileBoundaries(database: Database.Database,
+  source: HistoryCoverageSource, observations: readonly CaptureBaselineFileObservation[],
+  provisionalCutoverAt: string): number {
+  database.exec(`create table if not exists ${REPLACEMENT_BOUNDARY_TABLE} (
+    source text not null, path_key text not null, generation_key text not null,
+    cutover_at text not null, primary key(source,path_key)
+  ) without rowid`);
+  replacementBoundaryTablePresent.set(database, true);
+  const insert = database.prepare(`insert into ${REPLACEMENT_BOUNDARY_TABLE}
+    (source,path_key,generation_key,cutover_at) values(?,?,?,?)`);
+  for (const observation of observations) {
+    const normalized = normalizeObservation(observation);
+    if (!normalized) throw new Error("replacement_file_stat_ambiguous");
+    insert.run(source, normalized.pathKey, normalized.generationKey, provisionalCutoverAt);
+  }
+  return observations.length;
+}
 
 /** An archive cursor is allowed through the replacement's baseline only for
  * the exact file generation that committed it. New generations retain the
