@@ -1575,7 +1575,9 @@ function restoreClaudeStatusLine(configDir: string): void {
 
 /** Standalone source command; each target preserves its original bytes for uninstall. */
 export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string }> {
-  const dirs = [path.join(os.homedir(), ".claude")];
+  const defaultDir = process.env.CLAUDE_CONFIG_DIR
+    ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : path.join(os.homedir(), ".claude");
+  const dirs = [defaultDir];
   let uninstall = false;
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--uninstall") { uninstall = true; continue; }
@@ -1602,7 +1604,8 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
       const bytes = existed ? fs.readFileSync(settings) : Buffer.alloc(0);
       fs.writeFileSync(backup, JSON.stringify({ existed, bytes: bytes.toString("base64") }), { flag: "wx", mode: 0o600 });
     }
-    const command = ["env", dir === dirs[0] ? "-u CLAUDE_CONFIG_DIR" : `CLAUDE_CONFIG_DIR=${shellQuote(dir)}`,
+    const command = ["env", dir === path.join(os.homedir(), ".claude") && !process.env.CLAUDE_CONFIG_DIR
+      ? "-u CLAUDE_CONFIG_DIR" : `CLAUDE_CONFIG_DIR=${shellQuote(dir)}`,
       shellQuote(process.execPath), ...process.execArgv.map(shellQuote), shellQuote(path.resolve(process.argv[1]!))].join(" ");
     const outcome = configureClaudeStatusLineProxy({ settingsPath: settings, baseProxyCommand: command });
     if ("reason" in outcome) {
@@ -1785,6 +1788,7 @@ export async function capacityAdaptersCliMain(argv: string[]): Promise<void> {
   process.exitCode = 64;
 }
 
-if (invokedAsCapacityAdaptersCli(import.meta.url, process.argv[1], process.argv[2])) {
+if (path.basename(fileURLToPath(import.meta.url)) === "provider-capacity-adapters.ts" &&
+    invokedAsCapacityAdaptersCli(import.meta.url, process.argv[1], process.argv[2])) {
   void capacityAdaptersCliMain(process.argv.slice(2));
 }

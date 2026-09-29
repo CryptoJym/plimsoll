@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit",
     "contracts:lean": "node --import tsx --test tests/contracts/lean/*.contract.ts",
     "collector": "tsx packages/collector-cli/src/cli.ts",
-    "setup:claude-status-line": "tsx packages/collector-cli/src/provider-capacity-adapters.ts setup-claude-status-line",
+    "setup:claude-status-line": "tsx packages/collector-cli/src/cli.ts setup claude-status-line",
     "proof": "tsx scripts/run-proof.ts scripts/signal-fidelity-proof.ts",
     "proof:gemini-adapter": "tsx scripts/gemini-adapter-proof.ts",
     "proof:grok-source": "tsx scripts/grok-source-proof.ts",
