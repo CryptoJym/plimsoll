@@ -65,19 +65,15 @@ async function main() {
       const uploaded = await uploadBufferedEvents(config, buffer, {
         now: () => new Date(now.getTime() + 3_600_000),
       });
-      console.log(JSON.stringify({ phase: "missing_raw_result", uploaded, received,
-        receipt: buffer.database.prepare(`select terminal_state,reason from upload_receipts
-          where delivery_id=?`).get(id),
-        remaining: buffer.delivery.status(now).remainingDelivery }));
-      assert.equal(uploaded.uploadedEvents, 1,
-        "a missing raw without an exact privacy decision must not be dead-lettered");
-      assert.deepEqual(received, [id]);
+      assert.equal(uploaded.uploadedEvents, 0,
+        "an unrecorded delete must not become a deliverable expiry");
+      assert.deepEqual(received, []);
       assert.deepEqual(buffer.database.prepare(`select terminal_state as state,
         reason from upload_receipts where delivery_id=?`).get(id),
-        { state: "acknowledged", reason: "remote_acknowledged" });
+        { state: "dead", reason: "local_schema_invalid" });
       assert.equal(buffer.delivery.status(now).remainingDelivery, 0);
-      console.log(JSON.stringify({ phase: "missing_raw_without_privacy", uploaded: 1,
-        acknowledged: id, remaining: 0 }));
+      console.log(JSON.stringify({ phase: "missing_raw_without_privacy", uploaded: 0,
+        localReason: "local_schema_invalid", remaining: 0 }));
     } finally { buffer.close(); }
   } finally {
     if (server?.listening) await new Promise<void>((resolve) => server!.close(() => resolve()));

@@ -13,6 +13,8 @@ those copies while the raw still exists. With no queued copy, 0.7.44 keeps
 that unuploaded raw; the newer pruner can expire it after re-upgrade.
 Expiry receipts retain the raw row ID, creation time and privacy generation, so
 0.7.44 can record a second expiry when a source later reuses an event ID.
+An outbox copy whose raw disappeared without an exact expiry receipt is a local
+integrity failure (`local_schema_invalid`), not a privacy rejection.
 
 After re-upgrade, check `/status`: `delivery.remainingDelivery` should fall to
 zero after upload, and `retention.states.heldForUpload` should reflect only
