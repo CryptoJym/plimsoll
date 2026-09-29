@@ -306,7 +306,9 @@
     "proof:capture-history-import-new_invalid_codex": "tsx scripts/capture-history-import-short-copy-proof.ts new_invalid_codex",
     "proof:capture-history-import-short_invalid_after_usage_claude": "tsx scripts/capture-history-import-short-copy-proof.ts short_invalid_after_usage_claude",
     "proof:capture-history-import-invalid_prefix_claude": "tsx scripts/capture-history-import-short-copy-proof.ts invalid_prefix_claude",
-    "proof:capture-history-import-new_invalid_claude": "tsx scripts/capture-history-import-short-copy-proof.ts new_invalid_claude"
+    "proof:capture-history-import-new_invalid_claude": "tsx scripts/capture-history-import-short-copy-proof.ts new_invalid_claude",
+    "proof:capture-history-import-record-gaps_codex": "tsx scripts/capture-history-import-record-gaps-proof.ts codex",
+    "proof:capture-history-import-record-gaps_claude": "tsx scripts/capture-history-import-record-gaps-proof.ts claude"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

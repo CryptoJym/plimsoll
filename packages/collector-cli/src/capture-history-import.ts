@@ -419,8 +419,11 @@ function verifyImportedBytes(db: DB, root: CaptureRoot, file: File, verified: Ma
     return { length: file.limit, digest: file.prefixHash!, records: file.records };
 }
 function rememberRecordBytes(db: DB, source: CaptureRoot["source"], sessionId: string, record: RecordBytes) {
-  db.prepare(`insert or ignore into capture_history_record_bytes
-    (source,session_id,record_index,byte_offset,prefix_digest) values (?,?,?,?,?)`)
+  db.prepare(`insert into capture_history_record_bytes
+    (source,session_id,record_index,byte_offset,prefix_digest) values (?,?,?,?,?)
+    on conflict(source,session_id,record_index,byte_offset) do update set prefix_digest=excluded.prefix_digest
+    where excluded.byte_offset>coalesce((select imported_length from capture_history_session_bytes
+      where source=excluded.source and session_id=excluded.session_id),0)`)
     .run(source, sessionId, record.recordIndex, record.byteOffset, record.digest);
 }
 function rememberSessionBytes(db: DB, source: CaptureRoot["source"], sessionId: string, length: number, digest: string) {
@@ -434,11 +437,42 @@ function isLiveSession(db: DB, source: CaptureRoot["source"], sessionId: string)
   return (db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
     .get(source, sessionId) as { authority: string } | undefined)?.authority === "live";
 }
+function lastStoredRecordIndex(db: DB, root: CaptureRoot, file: File) {
+  const length = Math.min(importedSessionBytes(db, root.source, file.sessionId!)?.length ?? 0, file.limit);
+  const saved = db.prepare(`select max(record_index) as n from capture_history_record_bytes
+    where source=? and session_id=? and byte_offset<=?`).get(root.source, file.sessionId, length) as { n: number | null };
+  return saved.n ?? -1;
+}
+async function prepareRecordBytes(db: DB, root: CaptureRoot, file: File, through: number,
+  afterSlice: () => Promise<void>) {
+  let written = file.writtenRecordIndex ?? lastStoredRecordIndex(db, root, file);
+  file.writtenRecordIndex = written;
+  // Zero-token records can separate two counted rows by an arbitrary amount.
+  // Save the excess in small transactions before the counted-row writer;
+  // that writer saves at most 40 remaining fingerprints with its rows.
+  while (through - written > WRITER_MAX_ROWS) {
+    let last = written;
+    let live = false;
+    db.transaction(() => {
+      verifyParents(file);
+      if (isLiveSession(db, root.source, file.sessionId!)) { live = true; return; }
+      const started = performance.now();
+      let rows = 0;
+      do { rememberRecordBytes(db, root.source, file.sessionId!, file.records![++last]!); rows++; }
+      while (last < through - WRITER_MAX_ROWS && rows < WRITER_MAX_ROWS &&
+        performance.now() - started < WRITER_TARGET_MS);
+    }).immediate();
+    if (live) return;
+    written = last;
+    file.writtenRecordIndex = last;
+    await afterSlice();
+    await new Promise<void>(resolve => setTimeout(resolve, 250));
+  }
+}
 async function rememberRemainingRecordBytes(db: DB, root: CaptureRoot, file: File) {
   if (!file.sessionId || isLiveSession(db, root.source, file.sessionId)) return;
-  const saved = db.prepare(`select max(record_index) as n from capture_history_record_bytes
-    where source=? and session_id=?`).get(root.source, file.sessionId) as { n: number | null };
-  const remaining = (file.records ?? []).filter(record => record.recordIndex > (saved.n ?? -1));
+  const saved = lastStoredRecordIndex(db, root, file);
+  const remaining = (file.records ?? []).filter(record => record.recordIndex > saved);
   for (let index = 0; index < remaining.length;) {
     db.transaction(() => {
       verifyParents(file);
@@ -1145,6 +1179,14 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
     const sourceFile = first.files.find(file => file.fileKey === fileKey);
     if (!sourceFile) refusal("source_file_missing");
     verifyParents(sourceFile);
+    const throughRecord = batch.at(-1)!.candidate.prefixCheckpoint?.recordIndex;
+    if (throughRecord !== undefined) {
+      let recordSlices = 0;
+      await prepareRecordBytes(db, root, sourceFile, throughRecord, async () => {
+        if (++recordSlices % 8 === 0) db.pragma("wal_checkpoint(PASSIVE)");
+        await pauseForWal();
+      });
+    }
     pending = pending.slice(batch.length);
     maintenanceIdle(db);
     let writerStarted = 0;

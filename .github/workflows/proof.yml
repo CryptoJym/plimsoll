@@ -461,6 +461,14 @@ jobs:
         run: pnpm proof:capture-history-import-missing_record_claude
 
 
+      - name: Prove zero-token usage records stay within writer counts (Codex)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-record-gaps_codex
+
+      - name: Prove zero-token usage records stay within writer counts (Claude)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-record-gaps_claude
+
       - name: Prove history WAL pause and resumable reader pin
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-wal
