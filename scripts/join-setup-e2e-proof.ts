@@ -126,6 +126,15 @@ function stubLaunchctl(bin: string) {
     '  exit 0',
     'fi',
     'if [ "$1" = "bootstrap" ] || [ "$1" = "kickstart" ]; then',
+    '  if [ "${PLIMSOLL_PROOF_FAIL_RECOVERY_BOOTSTRAP_ONCE:-}" = "1" ] && [ "$1" = "bootstrap" ]; then',
+    '    bootouts="$(grep -c "^bootout " "$trace" 2>/dev/null || true)"',
+    '    marker="$PLIMSOLL_HOME/review-bootstrap-failed-once"',
+    '    if [ "$bootouts" -ge 2 ] && [ ! -e "$marker" ]; then',
+    '      : > "$marker"',
+    '      printf "bootstrap_failed_once\\n" >> "$trace"',
+    '      exit 69',
+    '    fi',
+    '  fi',
     '  if [ -f "$PLIMSOLL_HOME/fail-next-bootstrap" ]; then',
     '    rm -f "$PLIMSOLL_HOME/fail-next-bootstrap"',
     '    printf "bootstrap_failed_once\\n" >> "$trace"',
@@ -748,10 +757,12 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       const running = fs.existsSync(f.state) &&
         await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
       const obligationPresent = fs.existsSync(path.join(f.data, "join.restart-obligation.json"));
+      const bootstrapFailedOnce = fs.existsSync(path.join(f.data, "review-bootstrap-failed-once"));
       console.log(JSON.stringify({ scenario: name, exit: joined.code, status: result.status,
         running, obligationPresent, ownerPathPreserved: plistText.includes("/opt/owner-custom-bin"),
         ownerConfigPreserved: ["owner_edit_restore_conflict", "owner_edit_one_bootstrap_failure"].includes(name)
           ? configText.endsWith(" ") : null,
+        bootstrapFailedOnce,
         laterOwnerEditPreserved: plistText.includes("/opt/owner-after-recheck"),
         plistUnreadable: plistText === "<plist>", bootouts: trace.split("\n").filter((line) =>
           line.startsWith("bootout ")).length, reason: result.reason ?? null }));
@@ -761,6 +772,20 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
           ? plistText.includes("/opt/owner-custom-bin") &&
             plistText.includes("/opt/owner-after-recheck")
           : plistText === "<plist>";
+      if (name === "owner_edit_restore_conflict" &&
+          process.env.PLIMSOLL_PROOF_FAIL_RECOVERY_BOOTSTRAP_ONCE === "1") {
+        const retry = await command(f.env, ["join", "--resume"], "", f.installedCli);
+        const runningAfterRetry = await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
+        const ownerBytesRetained = fs.readFileSync(plist, "utf8") === plistText &&
+          fs.readFileSync(path.join(f.data, "collector.config.json"), "utf8") === configText;
+        console.log(JSON.stringify({ scenario: "bootstrap_failed_once_retry", retryExit: retry.code,
+          runningAfterRetry, ownerBytesRetained,
+          retryStatus: /"status":\s*"([^"]+)"/.exec(retry.stdout)?.[1] ?? null }));
+        check("one_shot_bootstrap_failure_does_not_leave_valid_owner_agent_stopped",
+          joined.code !== 0 && bootstrapFailedOnce && ownerPlistIntact &&
+          configText.endsWith(" ") && ownerBytesRetained && running && runningAfterRetry);
+        return;
+      }
       if (name === "owner_edit_unreadable") {
         check("unreadable_owner_plist_is_preserved_and_named", joined.code !== 0 &&
           !running && ownerPlistIntact && /unreadable|invalid/i.test(String(result.reason)));
