@@ -69,6 +69,7 @@ async function main() {
   let overBudgetSlices = 0;
   let writerSlices = 0;
   let timeBudgetStops = 0;
+  let injectedDeadlineRows = 0;
   const writerSliceHistogram: Record<string, number> = {};
   let peakRss = process.memoryUsage().rss;
   let probe: ReturnType<typeof spawn> | null = null;
@@ -102,6 +103,18 @@ async function main() {
       const stat = fs.statSync(file, { bigint: true });
       return { path: file, device: stat.dev, inode: stat.ino, size: stat.size, birthtimeNs: stat.birthtimeNs };
     }), FENCE);
+    // Fixture-only pressure makes the first four-row slice cross 120 ms
+    // after three rows. The gate then proves the deadline path even on a
+    // fast, normally scheduled host without weakening the 250 ms limit.
+    buffer.database.function("history_scale_deadline_delay", () => {
+      if (injectedDeadlineRows >= 3) return;
+      injectedDeadlineRows += 1;
+      const until = performance.now() + 44;
+      while (performance.now() < until) { /* deterministic fixture row cost */ }
+    });
+    buffer.database.exec(`create trigger history_scale_deadline_pressure
+      before insert on buffered_events when new.event_type='usage_rollout'
+      begin select history_scale_deadline_delay(); end`);
     buffer.database.exec(`create table if not exists history_import_probe (at text not null)`);
     const code = `const DB=require('better-sqlite3');const {performance}=require('node:perf_hooks');
       const db=new DB(process.env.PROBE_LEDGER,{timeout:2000});db.pragma('wal_autocheckpoint=0');
@@ -121,6 +134,7 @@ async function main() {
     let imported = 0;
     for (let index = 0; index < roots.length; index += 1) {
       const receipt = await applyCaptureHistory(buffer, roots[index]!);
+      if (index === 0) buffer.database.exec("drop trigger history_scale_deadline_pressure");
       imported += receipt.importedRows;
       maxWriterSliceMs = Math.max(maxWriterSliceMs, receipt.maxWriterSliceMs);
       maxWriterWorkMs = Math.max(maxWriterWorkMs, receipt.maxWriterWorkMs);
@@ -153,13 +167,14 @@ async function main() {
       sourceBytes, importSeconds, totalSeconds: (performance.now() - started) / 1000,
       peakRssBytes: Math.max(peakRss, process.resourceUsage().maxRSS * 1024),
       maxWriterSliceMs, maxWriterWorkMs, maxWriterRowMs, overBudgetSlices,
-      writerSlices, timeBudgetStops, writerSliceHistogram,
+      writerSlices, timeBudgetStops, injectedDeadlineRows, writerSliceHistogram,
       intake: probeReceipt, ledgerRows, projected }, null, 2));
     assert.equal(imported, USAGE_ROWS);
     assert.equal(ledgerRows, USAGE_ROWS);
     assert.deepEqual(projected, { rows: USAGE_ROWS, input: USAGE_ROWS });
     assert.equal(probeRows, probeReceipt.count);
     assert.equal(Object.values(writerSliceHistogram).reduce((sum, count) => sum + count, 0), writerSlices);
+    assert.equal(injectedDeadlineRows, 3);
     // A million-row host must exercise the deadline, not merely the row cap.
     // Removing the deadline makes this scale proof fail even on a fast host.
     assert.ok(timeBudgetStops > 0, "writer deadline was not exercised");
