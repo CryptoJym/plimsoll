@@ -276,7 +276,13 @@
     "proof:capture-history-import-seen_suffix_claude": "tsx scripts/capture-history-import-short-copy-proof.ts seen_suffix_claude",
     "proof:capture-history-import-new_suffix_claude": "tsx scripts/capture-history-import-short-copy-proof.ts new_suffix_claude",
     "proof:capture-history-import-missing_fingerprint_claude": "tsx scripts/capture-history-import-short-copy-proof.ts missing_fingerprint_claude",
-    "proof:capture-history-import-missing_record_claude": "tsx scripts/capture-history-import-short-copy-proof.ts missing_record_claude"
+    "proof:capture-history-import-missing_record_claude": "tsx scripts/capture-history-import-short-copy-proof.ts missing_record_claude",
+    "proof:capture-history-import-short_invalid_after_usage_codex": "tsx scripts/capture-history-import-short-copy-proof.ts short_invalid_after_usage_codex",
+    "proof:capture-history-import-invalid_prefix_codex": "tsx scripts/capture-history-import-short-copy-proof.ts invalid_prefix_codex",
+    "proof:capture-history-import-new_invalid_codex": "tsx scripts/capture-history-import-short-copy-proof.ts new_invalid_codex",
+    "proof:capture-history-import-short_invalid_after_usage_claude": "tsx scripts/capture-history-import-short-copy-proof.ts short_invalid_after_usage_claude",
+    "proof:capture-history-import-invalid_prefix_claude": "tsx scripts/capture-history-import-short-copy-proof.ts invalid_prefix_claude",
+    "proof:capture-history-import-new_invalid_claude": "tsx scripts/capture-history-import-short-copy-proof.ts new_invalid_claude"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

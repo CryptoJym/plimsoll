@@ -327,6 +327,31 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-r2-symlink_parent_race
 
+      - name: Prove history file bytes short invalid after usage codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_invalid_after_usage_codex
+
+      - name: Prove history file bytes invalid prefix codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-invalid_prefix_codex
+
+      - name: Prove history file bytes new invalid codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_invalid_codex
+
+      - name: Prove history file bytes short invalid after usage claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_invalid_after_usage_claude
+
+      - name: Prove history file bytes invalid prefix claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-invalid_prefix_claude
+
+      - name: Prove history file bytes new invalid claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_invalid_claude
+
+
       - name: Prove history files three codex (r7)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-three_codex

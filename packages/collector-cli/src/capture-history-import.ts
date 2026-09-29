@@ -42,6 +42,7 @@ type File = { file: string; fileKey: string; limit: number; stamp: string; fence
   parents: ConfinedParent[];
   sessionId?: string; records?: RecordBytes[]; lineOffset?: number; lineDigest?: () => string;
   shorterImportedCopy?: boolean; writtenRecordIndex?: number;
+  recordRefusals?: Array<{ reason: string; byteOffset: number }>;
   prefixHash?: string; savedPrefixHash?: string; baselineDefined?: boolean;
   initialCodex?: CodexState; finalCodex?: CodexState;
   initialClaude?: Map<string, Amounts>; finalClaude?: Map<string, ClaudeRevision>;
@@ -212,7 +213,13 @@ function* lines(file: File): Generator<string> {
         recordHash.update(bytes.subarray(start, index + 1));
         file.lineOffset = offset - bytes.length + index + 1;
         file.lineDigest = () => recordHash.copy().digest("hex");
-        yield decoder.decode(line);
+        let text: string;
+        try { text = decoder.decode(line); }
+        catch {
+          (file.recordRefusals ??= []).push({ reason: "source_utf8_invalid", byteOffset: file.lineOffset });
+          text = line.toString("utf8");
+        }
+        yield text;
         start = index + 1;
       }
       pending = Buffer.from(bytes.subarray(start));
@@ -408,8 +415,8 @@ function verifyImportedBytes(db: DB, root: CaptureRoot, file: File, verified: Ma
       file.shorterImportedCopy = true;
     }
   }
-  if (!prior || file.limit > prior.length) verified.set(file.sessionId,
-    { length: file.limit, digest: file.prefixHash!, records: file.records });
+  if (!prior || file.limit > prior.length)
+    return { length: file.limit, digest: file.prefixHash!, records: file.records };
 }
 function rememberRecordBytes(db: DB, source: CaptureRoot["source"], sessionId: string, record: RecordBytes) {
   db.prepare(`insert or ignore into capture_history_record_bytes
@@ -473,6 +480,12 @@ function event(root: CaptureRoot, sourceId: string, sessionId: string, observedA
   });
 }
 
+function rememberRecordRefusal(file: File, error: unknown) {
+  const reason = String(error).match(/capture_history_refused:(.+)$/)?.[1];
+  if (!reason) throw error;
+  (file.recordRefusals ??= []).push({ reason, byteOffset: file.lineOffset! });
+}
+
 function* codexEvents(root: CaptureRoot, file: File): Generator<Candidate> {
   const sessionId = path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
   if (!sessionId) refusal("codex_file_session_missing");
@@ -482,49 +495,52 @@ function* codexEvents(root: CaptureRoot, file: File): Generator<Candidate> {
   const state = structuredClone(file.initialCodex ?? initialCodexState(sessionId));
   file.initialCodex ??= structuredClone(state);
   file.records = [];
+  file.recordRefusals = [];
   for (const line of lines(file)) {
-    if (!line.includes('"session_meta"') && !line.includes('"turn_context"') &&
-        !line.includes('"token_count"')) continue;
-    let parsed: Record<string, any>;
-    try { parsed = JSON.parse(line) as Record<string, any>; }
-    catch { refusal("codex_relevant_json_invalid"); }
-    if (parsed.type === "session_meta") {
-      state.contextOccurrenceIndex += 1;
-      const id = parsed.payload?.id;
-      if (typeof id !== "string" || id.toLowerCase() !== sessionId) refusal("codex_session_mismatch");
-      if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
-      else if (typeof parsed.payload?.timestamp === "string") state.sessionStartedAt = parsed.payload.timestamp;
-      if (typeof parsed.payload?.originator === "string") state.originator = parsed.payload.originator;
-      if (typeof parsed.payload?.cli_version === "string") state.cliVersion = parsed.payload.cli_version;
-    } else if (parsed.type === "turn_context") {
-      state.contextOccurrenceIndex += 1;
-      if (typeof parsed.payload?.model === "string") state.model = parsed.payload.model;
-    } else if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
-      const reported = parsed.payload?.info?.total_token_usage;
-      if (!reported) { state.index += 1; continue; }
-      const record: RecordBytes = { recordIndex: file.records.length,
-        byteOffset: file.lineOffset!, digest: file.lineDigest!() };
-      file.records.push(record);
-      const current = totals(reported);
-      state.index += 1;
-      const delta = positiveDelta(current, state.previous);
-      const firstUnknown = !state.observedBaseline && !zero(current);
-      state.previous = current;
-      state.observedBaseline = true;
-      state.reasoningOutput = amount(reported.reasoning_output_tokens);
-      if (typeof parsed.payload?.rate_limits?.plan_type === "string")
-        state.planType = parsed.payload.rate_limits.plan_type;
-      if (zero(delta)) continue;
-      const id = deterministicEventId(["codex-rollout", sessionId, String(state.index)]);
-      const observedAt = parsed.timestamp;
-      if (typeof observedAt !== "string") refusal("codex_timestamp_missing");
-      const marginal = firstUnknown ? { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 } : delta;
-      yield { sourceId: id, event: event(root, id, sessionId, observedAt, state.model, marginal,
-        { turnIndex: state.index, ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
-          sourceCumulativeInput: current.input, sourceCumulativeCachedInput: current.cacheRead,
-          sourceCumulativeOutput: current.output } : {}) }, firstUnknown),
-        prefixCheckpoint: { ...record, current, codexState: structuredClone(state) } };
-    }
+    try {
+      if (!line.includes('"session_meta"') && !line.includes('"turn_context"') &&
+          !line.includes('"token_count"')) continue;
+      let parsed: Record<string, any>;
+      try { parsed = JSON.parse(line) as Record<string, any>; }
+      catch { refusal("codex_relevant_json_invalid"); }
+      if (parsed.type === "session_meta") {
+        state.contextOccurrenceIndex += 1;
+        const id = parsed.payload?.id;
+        if (typeof id !== "string" || id.toLowerCase() !== sessionId) refusal("codex_session_mismatch");
+        if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
+        else if (typeof parsed.payload?.timestamp === "string") state.sessionStartedAt = parsed.payload.timestamp;
+        if (typeof parsed.payload?.originator === "string") state.originator = parsed.payload.originator;
+        if (typeof parsed.payload?.cli_version === "string") state.cliVersion = parsed.payload.cli_version;
+      } else if (parsed.type === "turn_context") {
+        state.contextOccurrenceIndex += 1;
+        if (typeof parsed.payload?.model === "string") state.model = parsed.payload.model;
+      } else if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
+        const reported = parsed.payload?.info?.total_token_usage;
+        if (!reported) { state.index += 1; continue; }
+        const record: RecordBytes = { recordIndex: file.records.length,
+          byteOffset: file.lineOffset!, digest: file.lineDigest!() };
+        file.records.push(record);
+        const current = totals(reported);
+        state.index += 1;
+        const delta = positiveDelta(current, state.previous);
+        const firstUnknown = !state.observedBaseline && !zero(current);
+        state.previous = current;
+        state.observedBaseline = true;
+        state.reasoningOutput = amount(reported.reasoning_output_tokens);
+        if (typeof parsed.payload?.rate_limits?.plan_type === "string")
+          state.planType = parsed.payload.rate_limits.plan_type;
+        if (zero(delta)) continue;
+        const id = deterministicEventId(["codex-rollout", sessionId, String(state.index)]);
+        const observedAt = parsed.timestamp;
+        if (typeof observedAt !== "string") refusal("codex_timestamp_missing");
+        const marginal = firstUnknown ? { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 } : delta;
+        yield { sourceId: id, event: event(root, id, sessionId, observedAt, state.model, marginal,
+          { turnIndex: state.index, ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
+            sourceCumulativeInput: current.input, sourceCumulativeCachedInput: current.cacheRead,
+            sourceCumulativeOutput: current.output } : {}) }, firstUnknown),
+          prefixCheckpoint: { ...record, current, codexState: structuredClone(state) } };
+      }
+    } catch (error) { rememberRecordRefusal(file, error); }
   }
   file.finalCodex = structuredClone(state);
 }
@@ -535,39 +551,42 @@ function* claudeEvents(root: CaptureRoot, file: File): Generator<Candidate> {
   file.initialClaude ??= new Map();
   file.finalClaude = new Map();
   file.records = [];
+  file.recordRefusals = [];
   for (const line of lines(file)) {
-    if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
-    let parsed: Record<string, any>;
-    try { parsed = JSON.parse(line) as Record<string, any>; }
-    catch { refusal("claude_relevant_json_invalid"); }
-    if (parsed.type !== "assistant") continue;
-    const claimed = typeof parsed.sessionId === "string"
-      ? parsed.sessionId.match(UUID_AT_END)?.[0]?.toLowerCase() : undefined;
-    sessionId ??= claimed;
-    if (!sessionId || (claimed && claimed !== sessionId)) refusal("claude_session_mismatch");
-    file.sessionId = sessionId;
-    const record: RecordBytes = { recordIndex: file.records.length,
-      byteOffset: file.lineOffset!, digest: file.lineDigest!() };
-    file.records.push(record);
-    const messageId = parsed.message?.id;
-    if (typeof messageId !== "string" || !messageId) refusal("claude_message_id_missing");
-    const messageKey = crypto.createHash("sha256").update(messageId).digest("hex");
-    const stateKey = `${sessionId}\0${messageKey}`;
-    const current = totals(parsed.message?.usage);
-    const prior = byMessage.get(messageId) ?? file.initialClaude.get(stateKey);
-    const delta = positiveDelta(current, prior ?? ZERO_AMOUNTS);
-    byMessage.set(messageId, current);
-    const revision = { sessionId, messageId, messageKey, current };
-    file.finalClaude.set(stateKey, revision);
-    if (zero(delta)) continue;
-    const id = prior
-      ? deterministicEventId(["claude-transcript-revision", sessionId, messageId,
-          String(current.input), String(current.cacheRead), String(current.cacheCreation), String(current.output)])
-      : deterministicEventId(["claude-transcript", sessionId, messageId]);
-    if (typeof parsed.timestamp !== "string") refusal("claude_timestamp_missing");
-    const model = typeof parsed.message?.model === "string" ? parsed.message.model : undefined;
-    yield { sourceId: id, event: event(root, id, sessionId, parsed.timestamp, model, delta),
-      claudeRevision: revision, prefixCheckpoint: { ...record, current, messageKey } };
+    try {
+      if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
+      let parsed: Record<string, any>;
+      try { parsed = JSON.parse(line) as Record<string, any>; }
+      catch { refusal("claude_relevant_json_invalid"); }
+      if (parsed.type !== "assistant") continue;
+      const claimed = typeof parsed.sessionId === "string"
+        ? parsed.sessionId.match(UUID_AT_END)?.[0]?.toLowerCase() : undefined;
+      sessionId ??= claimed;
+      if (!sessionId || (claimed && claimed !== sessionId)) refusal("claude_session_mismatch");
+      file.sessionId = sessionId;
+      const record: RecordBytes = { recordIndex: file.records.length,
+        byteOffset: file.lineOffset!, digest: file.lineDigest!() };
+      file.records.push(record);
+      const messageId = parsed.message?.id;
+      if (typeof messageId !== "string" || !messageId) refusal("claude_message_id_missing");
+      const messageKey = crypto.createHash("sha256").update(messageId).digest("hex");
+      const stateKey = `${sessionId}\0${messageKey}`;
+      const current = totals(parsed.message?.usage);
+      const prior = byMessage.get(messageId) ?? file.initialClaude.get(stateKey);
+      const delta = positiveDelta(current, prior ?? ZERO_AMOUNTS);
+      byMessage.set(messageId, current);
+      const revision = { sessionId, messageId, messageKey, current };
+      file.finalClaude.set(stateKey, revision);
+      if (zero(delta)) continue;
+      const id = prior
+        ? deterministicEventId(["claude-transcript-revision", sessionId, messageId,
+            String(current.input), String(current.cacheRead), String(current.cacheCreation), String(current.output)])
+        : deterministicEventId(["claude-transcript", sessionId, messageId]);
+      if (typeof parsed.timestamp !== "string") refusal("claude_timestamp_missing");
+      const model = typeof parsed.message?.model === "string" ? parsed.message.model : undefined;
+      yield { sourceId: id, event: event(root, id, sessionId, parsed.timestamp, model, delta),
+        claudeRevision: revision, prefixCheckpoint: { ...record, current, messageKey } };
+    } catch (error) { rememberRecordRefusal(file, error); }
   }
   file.sessionId ??= sessionId;
 }
@@ -654,7 +673,12 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
     let events: Candidate[];
     try {
       events = [...(root.source === "codex" ? codexEvents(root, file) : claudeEvents(root, file))];
-      verifyImportedBytes(db, root, file, verifiedSessions);
+      const newBytes = verifyImportedBytes(db, root, file, verifiedSessions);
+      const lastUsageOffset = file.records?.at(-1)?.byteOffset ?? 0;
+      const brokenRecord = file.recordRefusals?.find(row =>
+        !file.shorterImportedCopy || row.byteOffset <= lastUsageOffset);
+      if (brokenRecord) refusal(brokenRecord.reason);
+      if (newBytes && file.sessionId) verifiedSessions.set(file.sessionId, newBytes);
     } catch (error) {
       const reason = String(error).match(/capture_history_refused:(.+)$/)?.[1];
       if (!reason || expectedFiles) throw error;
