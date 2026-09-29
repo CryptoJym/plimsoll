@@ -1,3 +1,4 @@
+import { openLedgerDatabase, ledgerConnectionWorkerSource } from "./ledger-connection";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -362,7 +363,7 @@ function openLedgerReadOnly(homeDir?: string): InstanceType<typeof Database> | n
     if (!fs.existsSync(databasePath)) return null;
     const stat = fs.lstatSync(databasePath);
     if (!stat.isFile()) return null;
-    return new Database(databasePath, { readonly: true, fileMustExist: true });
+    return openLedgerDatabase(databasePath, { readonly: true, fileMustExist: true });
   } catch {
     return null;
   }
@@ -372,7 +373,7 @@ function ledgerIsCompatible(homeDir?: string): boolean {
   const databasePath = collectorBufferPath(homeDir);
   try {
     if (!fs.existsSync(databasePath)) return true;
-    const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+    const db = openLedgerDatabase(databasePath, { readonly: true, fileMustExist: true });
     try {
       db.prepare("select count(*) as n from sqlite_master").get();
       return true;
@@ -863,7 +864,8 @@ let db = null;
 let result;
 try {
   const Database = require(entry);
-  db = new Database(file, { fileMustExist: true, timeout: 0 });
+  ${ledgerConnectionWorkerSource}
+  db = openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
   db.pragma("locking_mode = EXCLUSIVE");
   const rows = db.pragma("integrity_check(" + (Number(limit) + 1) + ")").map((row) => String(Object.values(row)[0]));
   const complaints = rows.flatMap((row) => row.split("\\n")).map((line) => line.trim())
@@ -888,7 +890,7 @@ function integrityComplaints(rows: unknown[]) {
 function integrityCheckInProcess(file: string): LedgerIntegrity {
   let db: InstanceType<typeof Database> | null = null;
   try {
-    db = new Database(file, { fileMustExist: true, timeout: 0 });
+    db = openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
     db.pragma("locking_mode = EXCLUSIVE");
     const complaints = integrityComplaints(db.pragma(`integrity_check(${MAX_INTEGRITY_COMPLAINTS + 1})`) as unknown[]);
     return complaints.length === 0
@@ -991,7 +993,7 @@ export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
  * held until close.
  */
 function openExclusive(file: string) {
-  const connection = new Database(file, { fileMustExist: true, timeout: 0 });
+  const connection = openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
   try {
     connection.pragma("locking_mode = EXCLUSIVE");
     connection.exec("BEGIN EXCLUSIVE");
@@ -1306,7 +1308,7 @@ function quiesceLedger(source: string, openHandles: OpenHandleCheck):
   | { fallback: LifecycleCloneFallback } {
   let connection: InstanceType<typeof Database>;
   try {
-    connection = new Database(source, { fileMustExist: true, timeout: 0 });
+    connection = openLedgerDatabase(source, { fileMustExist: true, timeout: 0 }, true);
   } catch {
     return { fallback: "quiescence_unproven" };
   }
@@ -1482,7 +1484,7 @@ export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
       fs.rmSync(input.destination, { force: true });
       fs.rmSync(`${input.destination}-wal`, { force: true });
       fs.rmSync(`${input.destination}-shm`, { force: true });
-      const db = new Database(input.source, { readonly: true, fileMustExist: true });
+      const db = openLedgerDatabase(input.source, { readonly: true, fileMustExist: true });
       try {
         // A full copy of a large ledger takes minutes: keep the lease alive between steps.
         await db.backup(input.destination, input.guard

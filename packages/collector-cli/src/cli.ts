@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { openLedgerDatabase } from "./ledger-connection";
 import { AutomaticRetentionCadence } from "./retention-cadence";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
@@ -52,7 +53,7 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
 
 import { LocalEventBuffer } from "./buffer";
 import { planFreshLedgerCutover, switchFreshLedger,
-  restoreArchivedLedger, assertReplacementRuntimeCompatible } from "./fresh-ledger-cutover";
+  restoreArchivedLedger, assertReplacementRuntimeCompatible, recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
@@ -2176,7 +2177,7 @@ function readInstallationEpochId(roots: readonly CaptureRoot[]): string | null {
   const bufferPath = collectorBufferPath();
   if (fs.existsSync(bufferPath)) {
     try {
-      const database = new Database(bufferPath, { readonly: true, fileMustExist: true });
+      const database = openLedgerDatabase(bufferPath, { readonly: true, fileMustExist: true });
       try {
         const row = database
           .prepare("select current_installation_epoch_id as epoch from collector_workspace_binding where singleton = 1")
@@ -2221,7 +2222,7 @@ async function main() {
     // the copy so openBuffer takes the same bound-ledger path as the daemon.
     // This read-only probe is outside the measured open and never touches the
     // source host's config or identity files.
-    const bindingDatabase = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    const bindingDatabase = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
     let rehearsalBinding: { workspaceId: string; deviceId: string | null } | undefined;
     try {
       const hasBindingTable = bindingDatabase.prepare(
@@ -2346,7 +2347,7 @@ async function main() {
       process.exitCode = 64;
       return;
     }
-    const database = new Database(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
+    const database = openLedgerDatabase(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
     try {
       database.pragma(`busy_timeout = ${Math.max(1, timeoutMs - 250)}`);
       const rows = database.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
@@ -2537,7 +2538,7 @@ async function main() {
     try {
       if (accountAssertionMutation.yes) {
         ensureCollectorHome();
-        database = new Database(databasePath, { timeout: 5_000 });
+        database = openLedgerDatabase(databasePath, { timeout: 5_000 });
         const state = setAccountAssertionAdapterEnabled(database, accountAssertionMutation.source, accountAssertionMutation.enabled);
         console.log(JSON.stringify({
           status: "account_assertion_adapter_updated",
@@ -2546,7 +2547,7 @@ async function main() {
           stateKey: "account_assertion_adapters_v1",
         }, null, 2));
       } else if (fs.existsSync(databasePath)) {
-        database = new Database(databasePath, { readonly: true, timeout: 5_000 });
+        database = openLedgerDatabase(databasePath, { readonly: true, timeout: 5_000 });
         const hasState = Boolean(database.prepare("select 1 from sqlite_master where type='table' and name='maintenance_state'").get());
         const state = hasState ? readAccountAssertionAdapterState(database) : null;
         console.log(JSON.stringify({
@@ -3823,7 +3824,7 @@ async function main() {
           unavailable: ["ledger_missing"] }, null, 2));
         return;
       }
-      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      const ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
       try {
         console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
           : JSON.stringify({ ...budgetStatus(ledger), daily: budgetDailyRows(ledger) }, null, 2));
@@ -6080,7 +6081,7 @@ async function main() {
           mode: "advisory", startedDay: null, samples: [], daily: [] }, null, 2));
         return;
       }
-      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      const ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
       try {
         console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
           : JSON.stringify(budgetExport(ledger), null, 2));
@@ -6631,7 +6632,7 @@ async function main() {
         throw new Error(others === null ? "pairing index upgrade cannot prove ledger quiescence" :
           "pairing index upgrade requires every other ledger connection to be stopped");
       }
-      const database = new Database(ledgerPath, { readonly: !apply, fileMustExist: true, timeout: 0 });
+      const database = openLedgerDatabase(ledgerPath, { readonly: !apply, fileMustExist: true, timeout: 0 });
       try {
         const before = codexUsagePairingStatus(database);
         if (!apply) {
@@ -6961,7 +6962,7 @@ async function main() {
       if (listener.kind !== "absent") throw new Error(`purge_requires_closed_listener:${listener.kind}`);
       if (fs.existsSync(ledgerPath)) {
         if (!fs.lstatSync(ledgerPath).isFile()) throw new Error("purge_ledger_not_regular_file");
-        const ledger = new Database(ledgerPath, { fileMustExist: true, timeout: 0 });
+        const ledger = openLedgerDatabase(ledgerPath, { fileMustExist: true, timeout: 0 });
         try {
           const checkpoint = ledger.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
           if (checkpoint[0]?.busy !== 0) throw new Error("purge_wal_checkpoint_busy");
@@ -7366,6 +7367,14 @@ async function main() {
 }
 
 main().catch((error) => {
+  if (error?.code === "LEDGER_PUBLICATION_INVALID" && typeof error.ledgerPath === "string") {
+    try {
+      recoverInvalidLedgerPublication(error.ledgerPath);
+      console.error("replacement_verification_failed; archive restored; command refused");
+    } catch (recoveryError) { console.error(recoveryError); }
+    process.exitCode = 1;
+    return;
+  }
   console.error(error);
   process.exitCode = 1;
 });

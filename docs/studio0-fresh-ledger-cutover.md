@@ -59,7 +59,10 @@ keys, and capture-root configuration stay in place.
    count and epoch, the listed `carriedRows` and `carriedBytes`, and the count
    of `untrackedFileFences`. The plan checks the archived
    binding against the configured tenant, device and root epoch.
-   A closed ledger uses an immutable SQLite read and leaves no new files. If
+   A closed ledger uses an immutable SQLite read and leaves no new ledger
+   WAL or SHM files. The opener barrier uses the persistent
+   `work-ledger.sqlite.connections.lock.sqlite` sidecar. Never delete, rename,
+   or replace that lock file. If
    the ledger is open or closure cannot be proved, the result explicitly says
    `sidecarsMayAppear: true`; stop the owner and rerun. Never delete sidecars.
    The plan reads the old ledger; it does not write a replacement. It refuses
@@ -72,6 +75,19 @@ keys, and capture-root configuration stay in place.
    ```sh
    plimsoll capture-roots epoch-switch --archive "$archive" --json
    ```
+
+   Keep every other ledger opener stopped for the entire switch, including
+   interactive `sqlite3`, database browsers, old collector builds, and scripts.
+   **Nothing else may open the ledger during the switch.** A raw SQLite
+   connection does not participate in the collector's opener barrier.
+
+   Every collector connection, including CLI commands and worker threads,
+   holds a shared sidecar lock from before opening SQLite until it closes.
+   The switch acquires that lock exclusively before its first handle check
+   and retains it through verified publication. A CLI, daemon, or supervised
+   restart that encounters it refuses immediately with `ledger switch in
+   progress`; it does not open the ledger or wait for the switch to finish.
+   Retry that start after the switch succeeds.
 
    The command rechecks the plan under the lifecycle mutation authority,
    takes SQLite exclusive ownership of the old inode, checkpoints its WAL,
@@ -102,11 +118,12 @@ keys, and capture-root configuration stay in place.
    Once the file has a cursor, normal byte-cursor progress and the read-time
    generation check apply. Existing event dedupe remains in force. The old
    ledger's SQLite `BEGIN EXCLUSIVE` transaction starts before the final
-   inventory and remains open through the rename. The switch also checks that
-   no other process has the old ledger or its sidecars open. Keep the collector
-   stopped. A path first created after the final inventory cannot add a row
-   to the archived ledger: an attempted old-ledger writer is blocked while the
-   exclusive transaction holds the old inode.
+   inventory and remains open through the rename. Immediately before any
+   ledger or sidecar rename, it checks again that no foreign process has the
+   old inode, WAL, or SHM open. A foreign handle aborts before the rename.
+   Keep the collector stopped. A path first created after its root was
+   inventoried cannot add a row to the archive: the stopped writers, shared
+   connection barrier, and exclusive old-ledger transaction prevent that.
    After the rename, while the switch lease is still held and before starting
    the collector, the command re-stats every carried-cursor file. Any changed
    generation loses its old cursor in the active ledger. The cutover instant is
@@ -124,10 +141,11 @@ keys, and capture-root configuration stay in place.
      just before the rename call through the sample, including syscall and
      scheduling time.
    - **Forward skew can admit a pre-rename record.** A path first created
-     after the final inventory can contain a record written before the rename
+     after its root was listed can contain a record written before the rename
      but stamped at or after the cutover sample. The physical writing window
-     is bounded by `inventoryToRenameDelayMs`, measured from final inventory
-     completion through rename return. Admission additionally requires enough
+     is bounded by `inventoryToRenameDelayMs`, measured from **before the first
+     root listing in the final inventory** through rename return. This includes
+     all remaining inventory, fence commits, and handle checks. Admission additionally requires enough
      forward clock skew to reach the sampled cutover time. This record is
      counted once in the fresh ledger: the stopped collector and exclusive
      old-ledger lock prevent it from entering the archive during that gap.
@@ -136,8 +154,27 @@ keys, and capture-root configuration stay in place.
    rename instant is not observable by the tool. The `epoch-switch --json`
    receipt and replacement marker report both durations; record them on
    Studio0 and account for collector clock skew. The replacement remains marked
-   pending until that transaction commits; the 0.7.46 collector refuses to
-   open a pending ledger, whether started by the daemon, a hook, or a restart.
+   pending until that transaction commits. A separate durable publication
+   record in the lock sidecar remains pending until `integrity_check` passes,
+   the expected replacement marker is present, and no foreign process holds
+   the old inode or its WAL/SHM names. Collector openers verify that record,
+   the published inode, integrity, marker, and old handles before using the
+   fresh ledger. A pending or failed publication refuses a daemon, hook, CLI,
+   or restart. Long-lived connections also stat the ledger before each write
+   transaction. If device or inode changes, they close without writing and
+   exit with status 75 for supervision to restart them.
+
+   A failed publication retains the candidate as a timestamped
+   `.verification-suspect-*` file, restores the original inode while still
+   holding the barrier, and attempts the normal archive re-clone recovery.
+   Startup verification failure likewise retains the suspect and restores
+   through `epoch-restore`. That start still refuses: inspect the reported
+   recovery before restarting. Suspect contents are never folded into the
+   archive; keep them for reconciliation. If a raw foreign handle prevents
+   recovery, close that opener and rerun `epoch-restore` with the archive and
+   retained suspect path reported by the failure. The durable failed marker
+   blocks collector starts until recovery succeeds. James owns inspection
+   and later deletion of these suspects; the collector never deletes them.
 
    If the process stops after linking the archive but before the swap, the
    active and archive paths refer to the same old inode. Keep both paths. A
@@ -153,8 +190,8 @@ keys, and capture-root configuration stay in place.
    after the swap, inspect the active
    ledger's `collector_replacement_ledger` row and archive inode before
    retrying. Do not unlink or overwrite either ledger to guess which step
-   completed. If a crash occurs after the swap but before the final file
-   fences commit, keep the collector stopped and restore the archive with the
+   completed. If a crash occurs after the swap but before verified publication
+   completes, keep the collector stopped and restore the archive with the
    command below before attempting another cutover.
 7. Start the 0.7.46 collector. Check readiness, queue/spool gates, session
    sync, all 23 roots, zero `epoch_mismatch`, Claude/Codex forward appends,

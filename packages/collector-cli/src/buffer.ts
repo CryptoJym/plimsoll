@@ -1,3 +1,5 @@
+import { openLedgerDatabase } from "./ledger-connection";
+import { recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallationEpoch,
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
@@ -274,7 +276,14 @@ export class LocalEventBuffer {
     if (options.freshCaptureRootEpoch === null && !fs.existsSync(path)) {
       throw new Error("fresh_ledger_capture_root_epochs_conflict");
     }
-    this.db = new Database(path, { timeout });
+    try { this.db = openLedgerDatabase(path, { timeout }); }
+    catch (error) {
+      if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
+        recoverInvalidLedgerPublication(path);
+        throw new Error("replacement_verification_failed; archive restored; collector start refused", { cause: error });
+      }
+      throw error;
+    }
     // An interrupted rename must not admit a first scan before the post-swap
     // file-generation fences are durable. Restore can still open it directly.
     try {

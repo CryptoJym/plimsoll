@@ -1,3 +1,4 @@
+import { openLedgerDatabase } from "./ledger-connection";
 import fs from "node:fs";
 import { postDelivery } from "./delivery-post";
 import { pinnedUploadUrl, TransportError, type JsonPostResult } from "./http-transport";
@@ -803,7 +804,7 @@ export async function runOutcomesSync(
   if (!ledger) {
     const ledgerPath = options.ledgerPath ?? collectorBufferPath();
     try {
-      ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+      ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
       ownsLedger = true;
     } catch (error) {
       throw new Error(

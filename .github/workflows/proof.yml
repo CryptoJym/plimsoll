@@ -109,6 +109,22 @@ jobs:
           pnpm proof:pr426-r11-exactly-once
           pnpm proof:pr426-r11-window-measurement
 
+      - name: Prove ledger connection fencing and conservative forward window (PR 426 round 13)
+        run: |
+          pnpm proof:pr426-r13-real-collector-opener
+          pnpm proof:pr426-r13-raw-old-handle
+          pnpm proof:pr426-r13-forward-window-bound
+          pnpm proof:pr426-r13-cutover-recovery
+          pnpm proof:pr426-r13-cli-refusal
+          pnpm proof:pr426-r13-supervised-restart
+          pnpm proof:pr426-r13-shared-lifetime
+          pnpm proof:pr426-r13-old-connection
+          pnpm proof:pr426-r13-missing-marker-recovery
+          pnpm proof:pr426-r13-integrity-recovery
+          pnpm proof:pr426-r13-post-check-raw-handle
+          pnpm proof:pr426-r13-startup-marker-recovery
+          pnpm proof:pr426-r13-startup-integrity-recovery
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit

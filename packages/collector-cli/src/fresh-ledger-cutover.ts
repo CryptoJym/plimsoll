@@ -22,6 +22,8 @@ import { loadJsonlScanCursorByKey, ensureJsonlScanState,
   jsonlScanStateKey } from "./jsonl-byte-tailer";
 import { otherProcessesWithFilesOpen } from "./lifecycle-adapters";
 import { LifecycleMutationAuthority } from "./lifecycle-authority";
+import { acquireLedgerConnectionLock, readLedgerPublication, writeLedgerPublication,
+  type LedgerConnectionLock, type LedgerPublication } from "./ledger-connection";
 import { validateRolloutParserState } from "./rollout-tailer";
 import { validateTranscriptParserState } from "./transcript-tailer";
 import { utcWeekStart } from "./weekly-tool-stats";
@@ -74,7 +76,7 @@ export type FreshLedgerCutoverPlan = {
   untrackedFileFences: number;
   /** Upper bound from just before active rename through the cutover sample. */
   renameToSampleDelayMs?: number;
-  /** Upper bound from final file inventory completion through active rename. */
+  /** Upper bound from before the first final-inventory listing through rename. */
   inventoryToRenameDelayMs?: number;
   dueWeeksWithoutAcknowledgement: string[];
   recoveryStagePresent: boolean;
@@ -106,7 +108,7 @@ type CutoverInput = {
   /** Same authority root as lifecycle mutations for the collector home. */
   authorityRoot?: string;
   /** Fault-injection seam; never used by the CLI. */
-  onStep?: (step: "old_locked" | "stage_bound" | "archive_linked" | "switched") => void;
+  onStep?: (step: "old_locked" | "stage_bound" | "archive_linked" | "candidate_published" | "switched") => void;
   /** Fault-injection seam for a process kill during a carried-table copy. */
   onCopyRow?: (table: string, copied: number) => void;
 };
@@ -589,7 +591,7 @@ function openReadOnlyPlanDatabase(ledgerPath: string): {
 
 /** Read-only preflight. The switch repeats every check while holding the
  * original inode exclusively; a prior plan is never an authorization token. */
-export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverPlan {
+export function planFreshLedgerCutover(input: CutoverInput, heldBarrier?: LedgerConnectionLock): FreshLedgerCutoverPlan {
   const roots = input.config.captureRoots ?? [];
   let sidecarsMayAppear = false;
   const base = {
@@ -604,7 +606,9 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
     priorUtcWeekToolAttempts: 0, priorWeekReportAcknowledged: true,
     nextSafeWindowAt: null as string | null, requiresReportAcknowledgement: false,
   };
+  let barrier: LedgerConnectionLock | undefined;
   try {
+    if (!heldBarrier) barrier = acquireLedgerConnectionLock(input.ledgerPath);
     const epoch = rootEpoch(input);
     const old = assertPaths(input);
     const opened = openReadOnlyPlanDatabase(input.ledgerPath);
@@ -648,7 +652,7 @@ export function planFreshLedgerCutover(input: CutoverInput): FreshLedgerCutoverP
   } catch (error) {
     return { ...base, sidecarsMayAppear,
       status: "refused", reason: error instanceof Error ? error.message : "archive_unreadable" };
-  }
+  } finally { barrier?.release(); }
 }
 
 function copyTable(source: Database.Database, target: Database.Database, table: string,
@@ -900,7 +904,35 @@ function restoreRecoveryArtifactsPresent(stage: string, freshAttemptPath: string
  * replace the active pathname. A hard link preserves the quiesced old inode
  * at the archive path without copying the 88 GB history. */
 export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
-  const first = planFreshLedgerCutover(input);
+  const barrier = acquireLedgerConnectionLock(input.ledgerPath, "exclusive");
+  let recovery: LedgerPublication | null = null;
+  try {
+    return switchFreshLedgerUnderBarrier(input, barrier);
+  } catch (error) {
+    recovery = readLedgerPublication(barrier);
+    // Release only after the old inode has been put back. A foreign raw
+    // handle can then write only that original ledger, never the candidate.
+    barrier.release();
+    if (recovery?.state === "failed" && recovery.freshAttemptPath) {
+      try {
+        restoreArchivedLedger({ ledgerPath: input.ledgerPath, archivePath: input.archivePath,
+          freshAttemptPath: recovery.freshAttemptPath, authorityRoot: input.authorityRoot });
+      } catch (restoreError) {
+        throw new Error(`replacement_verification_failed; archive recovery refused: ${String(restoreError)}; archive=${input.archivePath}; save-fresh=${recovery.freshAttemptPath}`,
+          { cause: error });
+      }
+      throw new Error("replacement_verification_failed; archive restored; collector start refused", { cause: error });
+    }
+    throw error;
+  } finally { barrier.release(); }
+}
+
+function switchFreshLedgerUnderBarrier(input: CutoverInput, barrier: LedgerConnectionLock): FreshLedgerCutoverPlan {
+  const priorPublication = readLedgerPublication(barrier);
+  if (priorPublication && !["ready", "restored"].includes(priorPublication.state)) {
+    throw new Error("replacement_verification_pending: run epoch-restore before switching again");
+  }
+  const first = planFreshLedgerCutover(input, barrier);
   if (first.status !== "ready") throw new Error(first.reason ?? "cutover_refused");
   const authority = new LifecycleMutationAuthority(input.authorityRoot ??
     path.join(path.dirname(input.ledgerPath), "lifecycle-authority"));
@@ -913,6 +945,7 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
   let activeLock: Database.Database | null = null;
   const stage = `${input.ledgerPath}${STAGE_SUFFIX}`;
   let switched = false;
+  let publication: LedgerPublication | null = null;
   const heartbeat = () => {
     if (!lease.renew().ok) throw new Error("cutover_lifecycle_authority_lost");
   };
@@ -1022,6 +1055,28 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     // pre-cutover 0644 SQLite mode, including across a crash after link.
     fs.chmodSync(input.ledgerPath, 0o600);
     if (!fs.existsSync(input.archivePath)) fs.linkSync(input.ledgerPath, input.archivePath);
+    fsyncDirectory(path.dirname(input.archivePath));
+    input.onStep?.("archive_linked");
+    heartbeat();
+    const inventoryStarted = performance.now();
+    const finalFiles = finalizeReplacementFileFences(replacementLock, input, heartbeat);
+    replacementLock.exec("COMMIT");
+    heartbeat();
+    replacementLock.exec("BEGIN EXCLUSIVE");
+    const candidate = fs.statSync(stage);
+    publication = { state: "publishing", device: candidate.dev, inode: candidate.ino,
+      marker: { archiveIdentity: inspection.archiveIdentity, archivePath: path.resolve(input.archivePath),
+        minCollectorVersion: MIN_REPLACEMENT_VERSION, switchedAt: switchNow.toISOString(),
+        renameToSampleDelayMs: null, inventoryToRenameDelayMs: null, cursorRows: finalFiles.cursorRows } };
+    writeLedgerPublication(barrier, publication);
+    // This second check is after all inventory/carry work and before ANY
+    // rename. It catches uncooperative raw SQLite openers under our old lock.
+    const lateHandles = otherProcessesWithFilesOpen([input.ledgerPath,
+      `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`, input.archivePath,
+      `${input.archivePath}-wal`, `${input.archivePath}-shm`]);
+    if (lateHandles === null || lateHandles.length) {
+      throw new Error("ledger_quiescence_unproven: foreign handle before rename");
+    }
     for (const suffix of ["-wal", "-shm"] as const) {
       const source = `${input.ledgerPath}${suffix}`;
       if (fs.existsSync(source)) {
@@ -1029,16 +1084,9 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
         fs.renameSync(source, `${input.archivePath}${suffix}`);
       }
     }
-    fsyncDirectory(path.dirname(input.archivePath));
-    input.onStep?.("archive_linked");
-    heartbeat();
-    const finalFiles = finalizeReplacementFileFences(replacementLock, input, heartbeat);
-    const inventoryFinished = performance.now();
-    replacementLock.exec("COMMIT");
-    heartbeat();
-    replacementLock.exec("BEGIN EXCLUSIVE");
     const renameStarted = performance.now();
     fs.renameSync(stage, input.ledgerPath);
+    switched = true;
     const renameReturned = performance.now();
     // This is the narrowest observable cutover instant. Capture it before
     // directory fsync and the carried-path reconciliation can take time.
@@ -1050,21 +1098,68 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
     const renameToSampleDelayMs = performance.now() - renameStarted;
     // The kernel rename is somewhere inside the syscall. Measuring through
     // its return gives a conservative upper bound on the preceding gap.
-    const inventoryToRenameDelayMs = renameReturned - inventoryFinished;
+    const inventoryToRenameDelayMs = renameReturned - inventoryStarted;
     fsyncDirectory(path.dirname(input.ledgerPath));
-    switched = true;
     replacementLock.exec("COMMIT");
     replacementLock.close(); replacementLock = null;
+    input.onStep?.("candidate_published");
     activeLock = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
     activeLock.pragma("locking_mode = EXCLUSIVE");
     const afterSwap = reconcilePostRenameCarriedFences(activeLock, finalFiles.carriedPaths,
       heartbeat, renamedAt, renameToSampleDelayMs, inventoryToRenameDelayMs);
+    const marker = activeLock.prepare(`select archive_identity as archiveIdentity,
+      post_switch_fence_pending as pending from collector_replacement_ledger where singleton=1`)
+      .get() as { archiveIdentity: string; pending: number } | undefined;
+    if (!marker || marker.archiveIdentity !== inspection.archiveIdentity || marker.pending !== 0 ||
+        activeLock.pragma("integrity_check", { simple: true }) !== "ok") {
+      throw new Error("replacement_verification_failed: integrity or replacement marker");
+    }
+    // The old transaction is still held. A raw connection that opened in
+    // the last-check/rename gap cannot finish a write before this inspection.
+    const remainingHandles = otherProcessesWithFilesOpen([input.archivePath,
+      `${input.archivePath}-wal`, `${input.archivePath}-shm`,
+      `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`]);
+    if (remainingHandles === null || remainingHandles.length) {
+      throw new Error("replacement_verification_failed: old inode or sidecar is held by another process");
+    }
     activeLock.close(); activeLock = null;
+    writeLedgerPublication(barrier, { ...publication, state: "ready",
+      marker: { ...publication.marker, switchedAt: renamedAt.toISOString(),
+        cursorRows: afterSwap.cursorRows, renameToSampleDelayMs, inventoryToRenameDelayMs } });
     input.onStep?.("switched");
     return { ...first, archiveIdentity: inspection.archiveIdentity,
       archiveLatestRecordedAt: inspection.latest, cursorRows: afterSwap.cursorRows,
       untrackedFileFences: finalFiles.fencedFiles + afterSwap.fencedFiles,
       renameToSampleDelayMs, inventoryToRenameDelayMs };
+  } catch (error) {
+    if (switched && publication) {
+      // No collector has been admitted. Retain the suspect image and restore
+      // the old pathname/inode under both locks before releasing either one.
+      // This also makes a raw surviving handle harmless during recovery.
+      try { activeLock?.close(); } finally { activeLock = null; }
+      try { replacementLock?.close(); } finally { replacementLock = null; }
+      const suspect = `${input.ledgerPath}.verification-suspect-${Date.now()}-${crypto.randomUUID()}`;
+      fs.linkSync(input.ledgerPath, suspect);
+      for (const suffix of ["-wal", "-shm"] as const) {
+        if (fs.existsSync(`${input.ledgerPath}${suffix}`)) {
+          fs.renameSync(`${input.ledgerPath}${suffix}`, `${suspect}${suffix}`);
+        }
+      }
+      fs.linkSync(input.archivePath, stage);
+      fs.renameSync(stage, input.ledgerPath);
+      for (const suffix of ["-wal", "-shm"] as const) {
+        if (fs.existsSync(`${input.archivePath}${suffix}`)) {
+          fs.renameSync(`${input.archivePath}${suffix}`, `${input.ledgerPath}${suffix}`);
+        }
+      }
+      fsyncDirectory(path.dirname(input.ledgerPath));
+      const restored = fs.statSync(input.ledgerPath);
+      writeLedgerPublication(barrier, { ...publication, state: "failed", device: restored.dev,
+        inode: restored.ino, freshAttemptPath: suspect });
+    } else if (publication) {
+      writeLedgerPublication(barrier, priorPublication);
+    }
+    throw error;
   } finally {
     staged?.close();
     if (old?.inTransaction) old.exec("COMMIT");
@@ -1077,10 +1172,12 @@ export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
   }
 }
 
-export function readReplacementLedgerMarker(ledgerPath: string): ReplacementLedgerMarker | null {
+export function readReplacementLedgerMarker(ledgerPath: string, heldBarrier?: LedgerConnectionLock): ReplacementLedgerMarker | null {
   if (!fs.existsSync(ledgerPath)) return null;
-  const db = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+  const barrier = heldBarrier ? null : acquireLedgerConnectionLock(ledgerPath);
+  let db: Database.Database | undefined;
   try {
+    db = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
     if (!hasTable(db, "collector_replacement_ledger")) return null;
     const markerColumns = columns(db, "collector_replacement_ledger");
     const hasDelay = markerColumns.includes("rename_to_sample_delay_ms");
@@ -1101,7 +1198,7 @@ export function readReplacementLedgerMarker(ledgerPath: string): ReplacementLedg
       throw new Error("replacement_ledger_marker_invalid");
     }
     return row;
-  } finally { db.close(); }
+  } finally { try { db?.close(); } finally { barrier?.release(); } }
 }
 
 function foldReplacementWeeklyFacts(replacement: Database.Database, restored: Database.Database,
@@ -1167,21 +1264,58 @@ function foldReplacementWeeklyFacts(replacement: Database.Database, restored: Da
   return events;
 }
 
+/** Startup found a published generation damaged. Retain it in full; never
+ * fold untrusted contents into the archive clone. The caller still refuses
+ * this start after a successful recovery so supervision makes a fresh attempt. */
+export function recoverInvalidLedgerPublication(ledgerPath: string): void {
+  const barrier = acquireLedgerConnectionLock(ledgerPath, "exclusive");
+  let publication: LedgerPublication;
+  let suspect: string;
+  try {
+    const recorded = readLedgerPublication(barrier);
+    if (!recorded || recorded.state !== "ready") throw new Error("replacement_recovery_state_unavailable");
+    publication = recorded;
+    const others = otherProcessesWithFilesOpen([ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`,
+      recorded.marker.archivePath, `${recorded.marker.archivePath}-wal`, `${recorded.marker.archivePath}-shm`]);
+    if (others === null || others.length) throw new Error("replacement_recovery_refused: foreign ledger handle");
+    suspect = `${ledgerPath}.verification-suspect-${Date.now()}-${crypto.randomUUID()}`;
+    fs.linkSync(ledgerPath, suspect);
+    fsyncDirectory(path.dirname(ledgerPath));
+    writeLedgerPublication(barrier, { ...recorded, state: "failed", freshAttemptPath: suspect });
+  } finally { barrier.release(); }
+  restoreArchivedLedger({ ledgerPath, archivePath: publication.marker.archivePath, freshAttemptPath: suspect });
+}
+
 /** Restore the archived image by an APFS clone while retaining both originals.
  * The active pathname is replaced atomically, so even a mistakenly started old
  * runtime can only see a complete, original ledger after this command returns. */
 export function restoreArchivedLedger(input: {
   ledgerPath: string; archivePath: string; freshAttemptPath: string; authorityRoot?: string;
 }): { archiveIdentity: string; freshAttemptPath: string; archivePreserved: true } {
+  const barrier = acquireLedgerConnectionLock(input.ledgerPath, "exclusive");
+  try { return restoreArchivedLedgerUnderBarrier(input, barrier); }
+  finally { barrier.release(); }
+}
+
+function restoreArchivedLedgerUnderBarrier(input: {
+  ledgerPath: string; archivePath: string; freshAttemptPath: string; authorityRoot?: string;
+}, barrier: LedgerConnectionLock): { archiveIdentity: string; freshAttemptPath: string; archivePreserved: true } {
   if (![input.ledgerPath, input.archivePath, input.freshAttemptPath].every(path.isAbsolute) ||
       new Set([input.ledgerPath, input.archivePath, input.freshAttemptPath]
         .map(file => path.resolve(file))).size !== 3) {
     throw new Error("restore_path_invalid");
   }
-  const activeMarker = readReplacementLedgerMarker(input.ledgerPath);
+  const publication = readLedgerPublication(barrier);
+  const unpublished = publication?.state === "publishing" || publication?.state === "failed";
+  if (publication?.freshAttemptPath && publication.freshAttemptPath !== input.freshAttemptPath) {
+    throw new Error("restore_fresh_attempt_changed");
+  }
+  // An external durable publication record remains trustworthy when a raw
+  // opener damaged the candidate's own marker. No collector was admitted.
+  const activeMarker = unpublished ? publication.marker : readReplacementLedgerMarker(input.ledgerPath, barrier);
   const freshExists = fs.existsSync(input.freshAttemptPath);
   const marker = activeMarker ?? (freshExists
-    ? readReplacementLedgerMarker(input.freshAttemptPath) : null);
+    ? (publication?.state === "restored" ? publication.marker : readReplacementLedgerMarker(input.freshAttemptPath)) : null);
   if (!marker || marker.archivePath !== path.resolve(input.archivePath)) {
     throw new Error("replacement_archive_marker_mismatch");
   }
@@ -1197,7 +1331,7 @@ export function restoreArchivedLedger(input: {
       attemptDirectory.dev !== currentStat.dev || archiveStat.dev !== currentStat.dev ||
       (freshStat && (!freshStat.isFile() || freshStat.isSymbolicLink() ||
         freshStat.uid !== process.getuid?.() || freshStat.dev !== currentStat.dev ||
-        (activeMarker && freshStat.ino !== currentStat.ino))) ||
+        (activeMarker && !unpublished && freshStat.ino !== currentStat.ino))) ||
       (!freshStat && (fs.existsSync(`${input.freshAttemptPath}-wal`) ||
         fs.existsSync(`${input.freshAttemptPath}-shm`)))) {
     throw new Error("restore_paths_unsafe");
@@ -1225,6 +1359,8 @@ export function restoreArchivedLedger(input: {
     // attempt; a rerun only needs to durably publish the directory entry.
     fsyncDirectory(path.dirname(input.ledgerPath));
     retainRestoreJournal(stage, input.freshAttemptPath);
+    writeLedgerPublication(barrier, { state: "restored", device: currentStat.dev, inode: currentStat.ino,
+      marker, freshAttemptPath: input.freshAttemptPath });
     return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
       archivePreserved: true };
   }
@@ -1249,13 +1385,16 @@ export function restoreArchivedLedger(input: {
   let freshExistsNow: boolean;
   try {
     stageExistsNow = restoreRecoveryArtifactsPresent(stage, input.freshAttemptPath);
-    const activeMarkerNow = readReplacementLedgerMarker(input.ledgerPath);
+    const activeMarkerNow = unpublished ? publication.marker : readReplacementLedgerMarker(input.ledgerPath, barrier);
     if (!activeMarkerNow) {
       if (fs.existsSync(stage) || !fs.existsSync(input.freshAttemptPath)) {
         throw new Error("restore_completion_ambiguous");
       }
       fsyncDirectory(path.dirname(input.ledgerPath));
       retainRestoreJournal(stage, input.freshAttemptPath);
+      const current = fs.statSync(input.ledgerPath);
+      writeLedgerPublication(barrier, { state: "restored", device: current.dev, inode: current.ino,
+        marker, freshAttemptPath: input.freshAttemptPath });
       lease.release();
       return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
         archivePreserved: true };
@@ -1264,7 +1403,7 @@ export function restoreArchivedLedger(input: {
       throw new Error("restore_stage_or_marker_changed");
     }
     freshExistsNow = fs.existsSync(input.freshAttemptPath);
-    if (freshExistsNow && fs.lstatSync(input.freshAttemptPath).ino !==
+    if (!unpublished && freshExistsNow && fs.lstatSync(input.freshAttemptPath).ino !==
         fs.lstatSync(input.ledgerPath).ino) {
       throw new Error("restore_fresh_attempt_changed");
     }
@@ -1282,25 +1421,33 @@ export function restoreArchivedLedger(input: {
   let replacement: Database.Database | null = null;
   let restoredLock: Database.Database | null = null;
   try {
-    replacement = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
-    replacement.pragma("locking_mode = EXCLUSIVE");
-    replacement.exec("BEGIN EXCLUSIVE; COMMIT");
+    // A corrupt, never-admitted candidate cannot supply SQLite locks or SQL
+    // facts. The opener barrier and handle checks protect its retained files.
+    // A failed switch has already restored the healthy old inode, which can
+    // still be locked normally during the clone publication.
+    if (!unpublished || currentStat.ino === archiveStat.ino) {
+      replacement = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
+      replacement.pragma("locking_mode = EXCLUSIVE");
+      replacement.exec("BEGIN EXCLUSIVE; COMMIT");
+    }
     const others = otherProcessesWithFilesOpen([input.ledgerPath,
       `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`]);
     if (others === null || others.length) throw new Error("ledger_quiescence_unproven");
-    const currentMarker = replacement.prepare(
-      "select archive_identity as archiveIdentity from collector_replacement_ledger where singleton=1")
-      .get() as { archiveIdentity: string } | undefined;
-    if (currentMarker?.archiveIdentity !== marker.archiveIdentity) {
-      throw new Error("replacement_archive_marker_changed");
+    if (!unpublished) {
+      const currentMarker = replacement!.prepare(
+        "select archive_identity as archiveIdentity from collector_replacement_ledger where singleton=1")
+        .get() as { archiveIdentity: string } | undefined;
+      if (currentMarker?.archiveIdentity !== marker.archiveIdentity) {
+        throw new Error("replacement_archive_marker_changed");
+      }
     }
-    if (replacement.pragma("journal_mode", { simple: true }) === "wal") {
+    if (replacement?.pragma("journal_mode", { simple: true }) === "wal") {
       replacement.pragma("checkpoint_fullfsync = ON");
       const [checkpoint] = replacement.pragma("wal_checkpoint(TRUNCATE)") as
         Array<{ busy: number; log: number }>;
       if (!checkpoint || checkpoint.busy || checkpoint.log) throw new Error("replacement_wal_not_checkpointed");
     }
-    replacement.exec("BEGIN EXCLUSIVE");
+    replacement?.exec("BEGIN EXCLUSIVE");
     // APFS clonefile is near-instant and leaves the archive immutable. Each
     // attempt gets a new clone; no earlier stage can influence publication.
     const clone = spawnSync("/bin/cp", ["-c", input.archivePath, stage], {
@@ -1325,7 +1472,7 @@ export function restoreArchivedLedger(input: {
     const heartbeat = () => {
       if (!lease.renew().ok) throw new Error("restore_lifecycle_authority_lost");
     };
-    foldReplacementWeeklyFacts(replacement, restoredLock, marker.switchedAt, heartbeat);
+    if (!unpublished) foldReplacementWeeklyFacts(replacement!, restoredLock, marker.switchedAt, heartbeat);
     // The restored image must contain its committed weekly fold before it
     // becomes active. No uploader can see the clone until the atomic rename.
     restoredLock.exec("COMMIT");
@@ -1347,6 +1494,9 @@ export function restoreArchivedLedger(input: {
     readRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
     assertRestoreStageImage(restoredLock, stageJournal, archiveBinding);
     heartbeat();
+    const lateHandles = otherProcessesWithFilesOpen([input.ledgerPath,
+      `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`]);
+    if (lateHandles === null || lateHandles.length) throw new Error("ledger_quiescence_unproven: foreign handle before restore rename");
     fs.chmodSync(input.ledgerPath, 0o600);
     if (!freshExistsNow) fs.linkSync(input.ledgerPath, input.freshAttemptPath);
     for (const suffix of ["-wal", "-shm"] as const) {
@@ -1367,6 +1517,12 @@ export function restoreArchivedLedger(input: {
     fs.renameSync(stage, input.ledgerPath);
     fsyncDirectory(path.dirname(input.ledgerPath));
     retainRestoreJournal(stage, input.freshAttemptPath);
+    if (restoredLock.pragma("integrity_check", { simple: true }) !== "ok") {
+      throw new Error("restored_archive_integrity_failed");
+    }
+    const restored = fs.statSync(input.ledgerPath);
+    writeLedgerPublication(barrier, { state: "restored", device: restored.dev, inode: restored.ino,
+      marker, freshAttemptPath: input.freshAttemptPath });
     return { archiveIdentity: marker.archiveIdentity, freshAttemptPath: input.freshAttemptPath,
       archivePreserved: true };
   } finally {

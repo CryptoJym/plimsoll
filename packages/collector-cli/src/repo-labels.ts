@@ -1,3 +1,4 @@
+import { openLedgerDatabase } from "./ledger-connection";
 import { authenticatedJsonPost, pinnedUploadUrl } from "./http-transport";
 
 import Database from "better-sqlite3";
@@ -203,7 +204,7 @@ export function prepareRepoLabelsPush(options: { ledgerPath?: string } = {}): {
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
   let ledger: Database.Database;
   try {
-    ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
   } catch (error) {
     throw new Error(
       `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — no labels to push.`,
