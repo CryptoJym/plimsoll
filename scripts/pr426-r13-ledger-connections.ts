@@ -9,6 +9,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { SqliteLedgerSnapshotAdapter } from "../packages/collector-cli/src/lifecycle-adapters";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { readReplacementLedgerMarker, restoreArchivedLedger, switchFreshLedger } from "../packages/collector-cli/src/fresh-ledger-cutover";
+import { withJoinRootJournal } from "../packages/collector-cli/src/join-setup-journal";
 import { acquireLedgerConnectionLock, ledgerConnectionLockPath, openLedgerCopyDatabase, readLedgerPublication, writeLedgerPublication } from "../packages/collector-cli/src/ledger-connection";
 
 const workspace = "30000000-0000-4000-8000-000000000003";
@@ -41,7 +42,12 @@ function syncWait(file: string) {
 }
 
 const mode = process.argv[2];
-if (mode === "--copy-child") {
+if (mode === "--join-journal-child") {
+  try {
+    withJoinRootJournal(process.argv[3]!, database => database.prepare("select 1").get());
+    console.log("join journal opened");
+  } catch (error) { console.error(String(error)); process.exitCode = 1; }
+} else if (mode === "--copy-child") {
   const copy = openLedgerCopyDatabase(process.argv[3]!, process.argv[4]!, { fileMustExist: true });
   fs.writeFileSync(path.join(process.argv[5]!, "copy-ready"), String(process.pid));
   const timer = setInterval(() => {}, 1_000);
@@ -141,7 +147,12 @@ async function main(variant: string) {
         const afterCommit = invoke([self, "--open-child", ledger, fixture]);
         assert.equal(afterCommit.status, 1, afterCommit.stdout + afterCommit.stderr);
         assert.match(afterCommit.stderr, /ledger switch in progress/);
+        const joinJournal = invoke([self, "--join-journal-child", ledger, fixture]);
+        assert.equal(joinJournal.status, 1, joinJournal.stdout + joinJournal.stderr);
+        assert.match(joinJournal.stderr, /ledger switch in progress/);
       } finally { exclusive.release(); }
+      const joinedAfterSwitch = invoke([self, "--join-journal-child", ledger, fixture]);
+      assert.equal(joinedAfterSwitch.status, 0, joinedAfterSwitch.stdout + joinedAfterSwitch.stderr);
       const sidecar = ledgerConnectionLockPath(ledger);
       const lockInode = fs.statSync(sidecar).ino;
       const copy = `${ledger}.restore-fixture`;
