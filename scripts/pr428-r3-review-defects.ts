@@ -155,8 +155,13 @@ try {
   fs.writeFileSync(priorRuntime, "// fixture runtime path\n", { mode: 0o600 });
   const stopped = manifestFixture("stopped-pre-template", priorRuntime);
   fs.rmSync(launchAgentOwnedTemplatePath(stopped.home));
+  const installId = "12345678-1234-4234-8234-123456789abc";
+  fs.writeFileSync(path.join(stopped.data, "lifecycle", "installation.json"),
+    `${JSON.stringify({ schemaVersion: 1, installId, executablePath: priorRuntime })}\n`,
+    { mode: 0o600 });
   fs.writeFileSync(path.join(stopped.data, "lifecycle", "state.json"),
-    `${JSON.stringify({ schemaVersion: 1, version: "0.7.44", executablePath: priorRuntime })}\n`,
+    `${JSON.stringify({ schemaVersion: 1, version: "0.7.44", executablePath: priorRuntime,
+      installId })}\n`,
     { mode: 0o600 });
   writeCollectorConfigTransactionally(collectorConfigSchema.parse({ port: 49390 }),
     path.join(stopped.data, "collector.config.json"));

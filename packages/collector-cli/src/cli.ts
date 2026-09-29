@@ -845,22 +845,54 @@ function installedLegacyLaunchAgentRuntime(): {
   }
   // A stopped install can only use private lifecycle state as evidence for an
   // older runtime. The plist under inspection cannot vouch for its own args.
-  const statePath = path.join(collectorHome(), "lifecycle", "state.json");
+  const support = collectorHome();
+  const statePath = path.join(support, "lifecycle", "state.json");
+  const installationPath = path.join(support, "lifecycle", "installation.json");
   try {
-    const stateStat = fs.lstatSync(statePath);
-    if (!stateStat.isFile() || stateStat.isSymbolicLink() || stateStat.nlink !== 1 || stateStat.size > 4096)
-      return undefined;
-    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
-      schemaVersion?: unknown; version?: unknown; executablePath?: unknown;
+    const supportReal = fs.realpathSync(support);
+    if (fs.lstatSync(support).isSymbolicLink()) return undefined;
+    const physicalFile = (file: string, maxBytes: number) => {
+      if (!path.isAbsolute(file) || path.resolve(file) !== file) return null;
+      const relative = path.relative(support, file);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+      let cursor = support;
+      const segments = relative.split(path.sep);
+      for (const [index, segment] of segments.entries()) {
+        cursor = path.join(cursor, segment);
+        const part = fs.lstatSync(cursor);
+        if (part.isSymbolicLink() || (index < segments.length - 1 && !part.isDirectory())) return null;
+        const realRelative = path.relative(supportReal, fs.realpathSync(cursor));
+        if (!realRelative || realRelative.startsWith("..") || path.isAbsolute(realRelative)) return null;
+      }
+      const stat = fs.lstatSync(file);
+      return stat.isFile() && stat.nlink === 1 && stat.size <= maxBytes ? stat : null;
     };
-    if (state.schemaVersion !== 1 || typeof state.version !== "string" ||
+    const readPrivate = (file: string) => {
+      const stat = physicalFile(file, 4096);
+      if (!stat || (stat.mode & 0o777) !== 0o600) return null;
+      const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const opened = fs.fstatSync(descriptor);
+        if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size) return null;
+        return JSON.parse(fs.readFileSync(descriptor, "utf8")) as Record<string, unknown>;
+      } finally { fs.closeSync(descriptor); }
+    };
+    const state = readPrivate(statePath);
+    const installation = readPrivate(installationPath);
+    const installId = state?.installId;
+    if (!installation || typeof installId !== "string" ||
+        !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(installId) ||
+        installation.schemaVersion !== 1 || installation.installId !== installId ||
+        installation.executablePath !== state?.executablePath)
+      return undefined;
+    if (state?.schemaVersion !== 1 || typeof state.version !== "string" ||
         typeof state.executablePath !== "string" || !path.isAbsolute(state.executablePath))
       return undefined;
-    const versions = path.join(collectorHome(), "lifecycle", "versions");
+    const versions = path.join(support, "lifecycle", "versions");
     const relative = path.relative(versions, state.executablePath);
-    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
-    const script = fs.lstatSync(state.executablePath);
-    if (!script.isFile() || script.isSymbolicLink() || script.nlink !== 1) return undefined;
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative) ||
+        relative.split(path.sep)[0] !== state.version) return undefined;
+    if (!physicalFile(state.executablePath, 64 * 1024 * 1024)) return undefined;
     return { programArguments: [process.execPath, state.executablePath, "start"],
       workingDirectory: path.dirname(state.executablePath) };
   } catch { return undefined; }

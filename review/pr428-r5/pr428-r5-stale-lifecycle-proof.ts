@@ -15,12 +15,14 @@ const originalEnv = { ...process.env };
 function trial(label: string, symlinkParent: boolean) {
   const home = path.join(root, label, "home");
   const data = path.join(home, ".plimsoll");
-  const runtime = path.join(root, label, "installed-runtime");
-  const original = path.join(runtime, "cli.mjs");
   const versions = path.join(data, "lifecycle", "versions");
+  const runtime = path.join(versions, "0.7.43", "darwin-arm64");
+  const original = path.join(runtime, "cli.mjs");
   const prior = path.join(versions, "0.7.44");
   const external = path.join(root, label, "writable-elsewhere");
   const owner = path.join(prior, "owner-cli.mjs");
+  const currentInstallId = "12345678-1234-4234-8234-123456789abc";
+  const staleInstallId = "22345678-1234-4234-8234-123456789abc";
   fs.mkdirSync(data, { recursive: true, mode: 0o700 });
   fs.mkdirSync(runtime, { recursive: true, mode: 0o700 });
   fs.mkdirSync(versions, { recursive: true, mode: 0o700 });
@@ -47,8 +49,12 @@ function trial(label: string, symlinkParent: boolean) {
   writeCollectorConfigTransactionally(collectorConfigSchema.parse({ port: 49390 }),
     path.join(data, "collector.config.json"));
   const statePath = path.join(data, "lifecycle", "state.json");
+  fs.writeFileSync(path.join(data, "lifecycle", "installation.json"), `${JSON.stringify({
+    schemaVersion: 1, installId: currentInstallId, executablePath: original,
+  })}\n`, { mode: 0o600 });
   fs.writeFileSync(statePath, `${JSON.stringify({ schemaVersion: 1, version: "0.7.44",
-    executablePath: owner })}\n`, { mode: 0o600 });
+    executablePath: owner, installId: symlinkParent ? currentInstallId : staleInstallId })}\n`,
+  { mode: 0o600 });
   const before = fs.readFileSync(installed.plistPath, "utf8");
   const changed = before.replace(`<string>${original}</string>`, `<string>${owner}</string>`)
     .replace(`<string>${runtime}</string>`, `<string>${path.dirname(owner)}</string>`);
