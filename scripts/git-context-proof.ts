@@ -444,7 +444,9 @@ async function proveMaintenanceTailerLatency(root: string) {
 }
 
 async function main() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-git-context-proof-"));
+  // Keep the Unix-socket fixture below macOS's sockaddr_un path limit even
+  // when CI places TMPDIR beneath a deeply nested disposable home.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "git-ctx-"));
   try {
     proveValidRepositories(root);
     await proveUnsafeMetadata(root);
