@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -495,6 +495,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private readonly completedRoot: string;
   private readonly trashRoot: string;
   private readonly statePath: string;
+  private readonly installationPath: string;
   private readonly journalPath: string;
   private readonly lockPath: string;
   private readonly currentPath: string;
@@ -548,6 +549,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     this.completedRoot = path.join(this.root, "completed-operations");
     this.trashRoot = path.join(this.root, "trash");
     this.statePath = path.join(this.root, "state.json");
+    this.installationPath = path.join(this.root, "installation.json");
     this.journalPath = path.join(this.root, "journal.json");
     this.lockPath = path.join(this.root, "operation.lock");
     this.currentPath = path.join(this.root, "current");
@@ -581,6 +583,30 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     const stat = fs.lstatSync(row.executablePath);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("installed runtime is malformed");
     return { schemaVersion: 1 as const, version: row.version, executablePath: row.executablePath };
+  }
+
+  private currentInstallId() {
+    const state = readJson<unknown>(this.statePath);
+    if (state !== null && (!state || typeof state !== "object" || Array.isArray(state)))
+      throw new Error("lifecycle state is malformed");
+    const stateId = (state as { installId?: unknown } | null)?.installId;
+    const validId = (value: unknown): value is string =>
+      typeof value === "string" && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+    if (stateId !== undefined && !validId(stateId))
+      throw new Error("lifecycle state install identity is malformed");
+    const identity = readJson<unknown>(this.installationPath);
+    if (identity === null) return stateId ?? randomUUID();
+    if (!identity || typeof identity !== "object" || Array.isArray(identity))
+      throw new Error("lifecycle installation identity is malformed");
+    const row = identity as { schemaVersion?: unknown; installId?: unknown; executablePath?: unknown };
+    if (row.schemaVersion !== 1 || !validId(row.installId) || typeof row.executablePath !== "string")
+      throw new Error("lifecycle installation identity is malformed");
+    // state.json is the commit record. installation.json may already name the
+    // next runtime when an update was interrupted between the two renames.
+    // An older state without an id adopts the first durable installation id.
+    if (stateId !== undefined && stateId !== row.installId)
+      throw new Error("lifecycle state does not match this installation");
+    return stateId ?? row.installId;
   }
 
   async acquireLock(operationId: string) {
@@ -898,16 +924,20 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   async switchTo(artifact: RuntimeArtifact) {
     const executablePath = this.verifyStagedRuntime(artifact);
     await this.service.activate({ executablePath, version: artifact.version });
+    const installId = this.currentInstallId();
+    writeJsonDurable(this.installationPath, { schemaVersion: 1, installId, executablePath }, this.root);
+    writeJsonDurable(this.statePath, {
+      schemaVersion: 1,
+      version: artifact.version,
+      executablePath,
+      installId,
+    }, this.root);
     const targetDirectory = path.dirname(path.dirname(executablePath));
     const temporary = `${this.currentPath}.next`;
     fs.rmSync(temporary, { force: true });
     fs.symlinkSync(targetDirectory, temporary, "dir");
     fs.renameSync(temporary, this.currentPath);
-    writeJson(this.statePath, {
-      schemaVersion: 1,
-      version: artifact.version,
-      executablePath,
-    }, this.root);
+    fsyncDirectory(this.root);
   }
 
   readiness(expectedVersion: string, input: { signal: AbortSignal; deadlineMs: number }) {
@@ -976,19 +1006,25 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     if (metadata.currentVersion && metadata.currentExecutable) {
       assertAbsoluteOwnedPath(metadata.currentExecutable, this.versionsRoot, "snapshot runtime");
       assertNoSymlink(metadata.currentExecutable, this.versionsRoot);
+      const installId = this.currentInstallId();
+      writeJsonDurable(this.installationPath, { schemaVersion: 1, installId,
+        executablePath: metadata.currentExecutable }, this.root);
+      writeJsonDurable(this.statePath, {
+        schemaVersion: 1,
+        version: metadata.currentVersion,
+        executablePath: metadata.currentExecutable,
+        installId,
+      }, this.root);
       const targetDirectory = path.dirname(path.dirname(metadata.currentExecutable));
       const temporary = `${this.currentPath}.restore`;
       fs.rmSync(temporary, { force: true });
       fs.symlinkSync(targetDirectory, temporary, "dir");
       fs.renameSync(temporary, this.currentPath);
-      writeJson(this.statePath, {
-        schemaVersion: 1,
-        version: metadata.currentVersion,
-        executablePath: metadata.currentExecutable,
-      }, this.root);
+      fsyncDirectory(this.root);
     } else {
       fs.rmSync(this.currentPath, { force: true });
       fs.rmSync(this.statePath, { force: true });
+      fs.rmSync(this.installationPath, { force: true });
     }
     await this.service.restore({
       executablePath: metadata.currentExecutable,
@@ -1035,6 +1071,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     fs.rmSync(this.currentPath, { force: true });
     fs.rmSync(this.versionsRoot, { recursive: true, force: true });
     fs.rmSync(this.statePath, { force: true });
+    fs.rmSync(this.installationPath, { force: true });
     return targets;
   }
 

@@ -55,9 +55,12 @@ for (const [name, script, machine, receiptName] of specs) {
     HOME: home, PLIMSOLL_HOME: path.join(home, ".plimsoll"), TMPDIR: temp,
     PATH: process.env.PATH ?? "/usr/bin:/bin", SHELL: "/bin/zsh",
     LANG: "C.UTF-8", LC_ALL: "C.UTF-8", USER: "plimsoll-e2e", LOGNAME: "plimsoll-e2e",
-    TERM: "dumb", CI: "1", NO_COLOR: "1",
-    NEXT_TELEMETRY_DISABLED: "1",
-    ...(portGuard ? { NODE_OPTIONS: `--require=${portGuard}` } : {}),
+    TERM: "dumb", CI: "1", NO_COLOR: "1", NEXT_TELEMETRY_DISABLED: "1",
+    ...((process.env.NODE_OPTIONS || portGuard) ? {
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, portGuard ? `--require=${portGuard}` : ""].filter(Boolean).join(" "),
+    } : {}),
+    ...(process.env.PLIMSOLL_FIXTURE_PORT_COUNTER
+      ? { PLIMSOLL_FIXTURE_PORT_COUNTER: process.env.PLIMSOLL_FIXTURE_PORT_COUNTER } : {}),
   };
   const result = spawnSync(process.execPath,
     ["--import", path.join(repo, "node_modules", "tsx", "dist", "loader.mjs"), path.join(repo, script), ...args],
