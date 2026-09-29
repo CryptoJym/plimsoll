@@ -1152,6 +1152,7 @@ export class TranscriptTailer {
             if (read.continuation?.action !== "checkpoint") {
               prepareJsonlCommittedPrefixHash(this.buffer.database,
                 candidate.file, this.cursorKey(candidate.file), cursor, read);
+              read.assertStableForCommit();
             }
             // Persist the first known-root session sighting before the raw,
             // receipt and cursor transaction. A process kill cannot erase it.

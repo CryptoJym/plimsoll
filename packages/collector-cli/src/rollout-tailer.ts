@@ -1187,6 +1187,7 @@ export class RolloutTailer {
             if (read.continuation?.action !== "checkpoint") {
               prepareJsonlCommittedPrefixHash(this.buffer.database,
                 candidate.file, this.cursorKey(candidate.file), cursor, read);
+              read.assertStableForCommit();
             }
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {

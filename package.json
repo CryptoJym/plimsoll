@@ -183,6 +183,8 @@
     "proof:pr429-r7-identical-ctime": "tsx scripts/run-proof.ts scripts/pr429-r7-committed-prefix-proof.ts identical-ctime",
     "proof:pr429-r7-legacy-no-digest": "tsx scripts/run-proof.ts scripts/pr429-r7-committed-prefix-proof.ts legacy-no-digest",
     "proof:pr429-r7-middle-appended": "tsx scripts/run-proof.ts scripts/pr429-r7-committed-prefix-proof.ts middle-appended",
+    "proof:pr429-r9-legacy-resume-append": "tsx scripts/run-proof.ts scripts/pr429-r7-committed-prefix-proof.ts legacy-resume-append",
+    "proof:pr429-r9-changed-resume-append": "tsx scripts/run-proof.ts scripts/pr429-r7-committed-prefix-proof.ts changed-resume-append",
     "proof:dispatch-bind-linkability": "tsx scripts/run-proof.ts scripts/dispatch-bind-linkability-proof.ts",
     "proof:dispatch-pairing-integration": "tsx scripts/run-proof.ts scripts/dispatch-pairing-integration-proof.ts",
     "proof:capture-roots-live": "tsx scripts/capture-roots-live-proof.ts",

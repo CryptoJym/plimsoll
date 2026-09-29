@@ -16,7 +16,8 @@ import { createProofCompletion } from "./lib/proof-completion";
 
 const scenario = process.argv[2] ?? "offset-eof";
 assert.ok(["offset-eof", "preserve-last-64k", "identical-ctime",
-  "legacy-no-digest", "middle-appended"].includes(scenario));
+  "legacy-no-digest", "middle-appended", "legacy-resume-append",
+  "changed-resume-append"].includes(scenario));
 const now = Date.now();
 const sessionA = crypto.randomUUID();
 const sessionC = crypto.randomUUID();
@@ -30,11 +31,15 @@ const usage = (sessionId:string) => JSON.stringify({type:"assistant",sessionId,
     model:"claude-sonnet-4-20250514",content:[],usage:{input_tokens:1,output_tokens:1,
       cache_read_input_tokens:0,cache_creation_input_tokens:0}}})+"\n";
 const edge = JSON.stringify({type:"progress",padding:"x".repeat(70_000)})+"\n";
+const resumeEdge = (JSON.stringify({type:"progress",padding:"x".repeat(512)})+"\n").repeat(140);
 const partial = '{"type":"progress","padding":"xxxxxxxxxx';
+const resumeAppend = scenario === "legacy-resume-append" || scenario === "changed-resume-append";
 const original = scenario === "identical-ctime" ? usage(sessionA) :
+  resumeAppend ? resumeEdge+usage(sessionC)+resumeEdge :
   scenario === "preserve-last-64k" ? usage(sessionC)+edge :
   scenario === "middle-appended" ? usage(sessionC)+partial : usage(sessionC);
 const replacement = scenario === "identical-ctime" ? original :
+  resumeAppend ? resumeEdge+usage(sessionA)+resumeEdge+JSON.stringify({type:"progress",padding:"tail"})+"\n" :
   scenario === "preserve-last-64k" ? usage(sessionA)+edge :
   scenario === "middle-appended" ? usage(sessionA)+partial+'more"}\n' : usage(sessionA);
 const binding = dispatchBindingSchema.parse({sessionId:sessionA,
@@ -72,7 +77,7 @@ async function main() {
     crypto.createHash("sha256").update(original.slice(0,committed)).digest("hex"));
   assert.equal(durableClaudeRootSessionSightings(buffer.database,sessionA).size,
     scenario === "identical-ctime" ? 1 : 0);
-  if (scenario === "legacy-no-digest") {
+  if (scenario === "legacy-no-digest" || scenario === "legacy-resume-append") {
     buffer.database.prepare("update rollout_scan_state set committed_prefix_hash=null where file=?")
       .run(key);
   }
@@ -96,12 +101,39 @@ async function main() {
     assert.equal(replacement.slice(committed-64*1024,committed),
       original.slice(committed-64*1024,committed));
   }
-  if (scenario === "middle-appended") {
-    assert.ok(committed<original.length);
+  if (scenario === "middle-appended" || resumeAppend) {
+    if (resumeAppend) assert.equal(committed,original.length);
+    else assert.ok(committed<original.length);
     assert.ok(replacement.length>original.length);
   } else assert.equal(replacement.length,original.length);
   buffer = new LocalEventBuffer(dbPath,options);
   try {
+    if (resumeAppend) {
+      assert.equal(replacement.slice(0,512),original.slice(0,512));
+      assert.equal(replacement.slice(committed-512,committed),
+        original.slice(committed-512,committed));
+      const resumed = new TranscriptTailer(buffer,A.directory,undefined,config.captureRoots??[]);
+      const resumeScans: unknown[] = [];
+      try {
+        for (let attempt=0;attempt<3;attempt++) {
+          const scan = await resumed.scan({scope:"full"});
+          resumeScans.push({parseErrors:scan.parseErrors,slicesCommitted:scan.slicesCommitted,
+            recordsCommitted:scan.recordsCommitted,unresolvedRecords:scan.unresolvedRecords,
+            cursor:cursor()?.offset});
+          if (cursor()?.offset === replacement.length) break;
+        }
+      }
+      finally { resumed.close(); }
+      console.log(JSON.stringify({scenario,resumeScans,afterCursor:cursor(),
+        rootBSawA:durableClaudeRootSessionSightings(buffer.database,sessionA).size}));
+      if (scenario === "legacy-resume-append") {
+        assert.equal(cursor()?.offset,replacement.length);
+        assert.equal(durableClaudeRootSessionSightings(buffer.database,sessionA).size,1);
+      } else {
+        assert.equal(cursor()?.offset,committed);
+        assert.equal(durableClaudeRootSessionSightings(buffer.database,sessionA).size,0);
+      }
+    }
     const skippedBefore = claudeDispatchSkipStatus().replayBytesUnvouched??0;
     const barrier = startClaudeReplayBarrier(buffer,config.captureRoots??[],{timeoutMs:800});
     const hook = appendForwardedHook({id:crypto.randomUUID(),
@@ -118,7 +150,7 @@ async function main() {
       finalSize:replacement.length,cursorDigest:beforeCursor.digest,
       ctimeChanged:finalStat.ctimeNs!==initialStat.ctimeNs,receipt,savedWork,unvouched}));
     assert.equal(savedWork,null,"an unvouched prefix must never stamp A");
-    if (scenario === "identical-ctime") {
+    if (scenario === "identical-ctime" || scenario === "legacy-resume-append") {
       assert.equal(receipt.state,"ready");
       assert.equal(receipt.attributed,0);
       assert.equal(unvouched,0);

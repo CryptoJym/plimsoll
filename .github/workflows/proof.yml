@@ -319,6 +319,14 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:pr429-r7-middle-appended
 
+      - name: Prove legacy committed bytes rebuild before an append (PR #429 round nine)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r9-legacy-resume-append
+
+      - name: Prove changed committed bytes cannot be rehashed by an append (PR #429 round nine)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r9-changed-resume-append
+
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability

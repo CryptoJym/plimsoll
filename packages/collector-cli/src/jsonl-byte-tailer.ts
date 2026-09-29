@@ -469,6 +469,13 @@ export function prepareJsonlCommittedPrefixHash<T>(
     hash = prior.hash.copy();
   } else {
     hash = captureCommittedPrefixHash(file, canExtend ? span.offset : read.committedOffset, read);
+    // A reopened tailer must not turn a changed historical prefix into a new
+    // trusted cursor merely because later records were appended. The old
+    // sightings belong to the digest that was committed with the old offset.
+    if (canExtend && span.offset > 0 && cursor?.committedOffset === span.offset &&
+      hash.copy().digest("hex") !== cursor.committedPrefixHash) {
+      throw new JsonlSnapshotChangedError();
+    }
   }
   if (canExtend) hash.update(span.bytes);
   const digest = hash.copy().digest("hex");
@@ -843,6 +850,10 @@ export function truncateJsonlReadToCompleteRecords(bytes: Buffer, maxRecords: nu
 function validCursorEnvelope(row: RawCursorRow) {
   if (!nonnegativeInteger(row.size)) return false;
   if (!nonnegativeInteger(row.committedOffset) || row.committedOffset > row.size) return false;
+  // A pre-digest cursor with committed bytes has no evidence for those bytes.
+  // Rebuild it from byte zero before any later append can advance the cursor.
+  if (row.committedOffset > 0 &&
+    (typeof row.committedPrefixHash !== "string" || !SHA256_RE.test(row.committedPrefixHash))) return false;
   if (!nonnegativeInteger(row.deferredBytes)) return false;
   if (row.committedOffset + row.deferredBytes !== row.size) return false;
   if (typeof row.fileIdentity !== "string" || row.fileIdentity.length === 0) return false;
