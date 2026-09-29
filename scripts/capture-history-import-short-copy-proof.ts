@@ -13,7 +13,7 @@ const SESSION = "019d0000-0000-7000-8000-000000000702";
 const START = "2026-01-01T00:00:00.000Z", FENCE = "2026-01-03T00:00:00.000Z";
 type Source = "codex" | "claude_code";
 const cases = ["short_match", "short_changed", "short_after_usage", "seen_suffix", "new_suffix",
-  "missing_fingerprint", "missing_record", "short_invalid_after_usage", "invalid_prefix", "new_invalid"] as const;
+  "missing_fingerprint", "missing_record", "short_invalid_after_usage", "invalid_prefix", "new_invalid", "short_no_usage", "short_bad_usage"] as const;
 type Case = typeof cases[number];
 const sha = (bytes: Buffer) => crypto.createHash("sha256").update(bytes).digest("hex");
 const line = (row: unknown) => JSON.stringify(row) + "\n";
@@ -48,6 +48,13 @@ async function prove(source: Source, which: Case) {
     let copy = short;
     if (which === "short_changed") copy = short.replace("first-a", "first-b");
     if (which === "short_after_usage") copy = short.replace("after-a", "after-b");
+    if (which === "short_no_usage") copy = head;
+    if (which === "short_bad_usage") {
+      copy = throughUsage;
+      const at = source === "codex" ? copy.length - 2 : copy.lastIndexOf(SESSION) + SESSION.length - 1;
+      copy = copy.slice(0, at) + (source === "codex" ? "]" : "3") + copy.slice(at + 1);
+      assert.equal(Buffer.byteLength(copy), Buffer.byteLength(throughUsage));
+    }
     if (which === "seen_suffix" || which === "new_suffix") copy = line(usage(source, 250, 6));
     if (["missing_fingerprint", "invalid_prefix", "new_invalid"].includes(which)) copy = original;
     const copiedBytes = Buffer.from(copy);
@@ -77,7 +84,7 @@ async function prove(source: Source, which: Case) {
     }
     const before = (buffer.database.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
     const plan = await planCaptureHistory(buffer.database, roots[1]!);
-    const refused = ["short_changed", "seen_suffix", "missing_fingerprint", "missing_record", "invalid_prefix", "new_invalid"].includes(which);
+    const refused = ["short_changed", "seen_suffix", "missing_fingerprint", "missing_record", "invalid_prefix", "new_invalid", "short_no_usage", "short_bad_usage"].includes(which);
     const reasons = (plan as typeof plan & { refusals?: Array<{ reason: string }> }).refusals ?? [];
     if (refused) { assert.equal(plan.missingRows, 0); assert.equal(reasons.length, 1); }
     else assert.equal(reasons.length, 0);
