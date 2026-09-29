@@ -503,6 +503,7 @@ jobs:
           pnpm proof:maintenance-rebuild-r13-enrichment
           pnpm proof:maintenance-rebuild-r13-identity
           pnpm proof:maintenance-rebuild-r13-atomic
+          pnpm proof:maintenance-rebuild-r13-nested-time
           pnpm proof:maintenance-rebuild-r13-old-binary
           pnpm proof:maintenance-rebuild-writers
           pnpm proof:maintenance-rebuild-contract

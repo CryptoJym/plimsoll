@@ -79,6 +79,7 @@
     "proof:maintenance-rebuild-r13-enrichment": "tsx scripts/maintenance-rebuild-r13-enrichment-proof.ts",
     "proof:maintenance-rebuild-r13-identity": "tsx scripts/maintenance-rebuild-r13-identity-proof.ts",
     "proof:maintenance-rebuild-r13-atomic": "tsx scripts/maintenance-rebuild-r13-atomic-proof.ts",
+    "proof:maintenance-rebuild-r13-nested-time": "tsx scripts/maintenance-rebuild-r13-nested-time-proof.ts",
     "proof:maintenance-rebuild-r13-old-binary": "tsx scripts/maintenance-rebuild-r13-old-binary-proof.ts",
     "proof:maintenance-rebuild-writers": "tsx scripts/maintenance-rebuild-writer-routes-proof.ts",
     "proof:maintenance-rebuild-contract": "tsx scripts/maintenance-rebuild-contract-proof.ts",

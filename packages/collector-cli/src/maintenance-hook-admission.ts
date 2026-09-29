@@ -18,12 +18,30 @@ export function sameHookIdentityPart(left: string | null, right: string | null) 
 
 /** Preserve the caller's time claim before the normalizer can clamp it. */
 export function originalHookTimestampDigest(payload: unknown): string | null {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
-  const input = payload as Record<string, unknown>;
-  const claims = Object.fromEntries(HOOK_AUTHORITY_CONTRACT.observedAt.aliases
-    .filter((alias) => Object.prototype.hasOwnProperty.call(input, alias))
-    .map((alias) => [alias, input[alias]]));
-  return Object.keys(claims).length === 0 ? null :
+  const aliases = new Set<string>([...HOOK_AUTHORITY_CONTRACT.observedAt.aliases,
+    "timeUnixNano", "observedTimeUnixNano", "startTimeUnixNano"]);
+  const claims: Array<[string, unknown]> = [];
+  const seen = new WeakSet<object>();
+  const visit = (value: unknown, location: string, depth: number) => {
+    if (!value || typeof value !== "object" || depth > 32 || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => visit(entry, `${location}[${index}]`, depth + 1));
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    // OTLP attributes put the authority name in `key` and its original scalar
+    // in `value`; normalizer.ts selects these along with direct aliases.
+    if (typeof record.key === "string" && aliases.has(record.key) && "value" in record) {
+      claims.push([`${location}.attribute:${record.key}`, record.value]);
+    }
+    for (const key of Object.keys(record).sort()) {
+      if (aliases.has(key)) claims.push([`${location}.${key}`, record[key]]);
+      visit(record[key], `${location}.${key}`, depth + 1);
+    }
+  };
+  visit(payload, "$", 0);
+  return claims.length === 0 ? null :
     createHash("sha256").update(JSON.stringify(claims)).digest("hex");
 }
 
