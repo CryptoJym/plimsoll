@@ -2,6 +2,7 @@ import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallati
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
 import os from "node:os";
+import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import Database from "better-sqlite3";
@@ -37,7 +38,7 @@ import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFin
   advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
-import { ensureMaintenanceHookAdmissionSchema } from "./maintenance-hook-admission";
+import { ensureMaintenanceHookAdmissionSchema, pruneRetiredMaintenanceHookAdmissions } from "./maintenance-hook-admission";
 import {
   canonicalRepoContextCwd,
   peekRepoContextSidecar,
@@ -3103,6 +3104,7 @@ export class LocalEventBuffer {
       let events = 0;
       for (const row of candidates) {
         if (row.migrationProtected) { migrationProtectedRows += 1; continue; }
+        pruneRetiredMaintenanceHookAdmissions(this.db, path.dirname(this.db.name), row.eventId);
         recordExpiry.run({
           eventId: row.eventId,
           rawRowid: row.rawRowid,

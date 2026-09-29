@@ -57,26 +57,32 @@ async function main() {
       deviceId: "44444444-4444-7444-8444-444444444444", delivery: { enabled: true },
     });
     let through: string | null | undefined;
+    let claimUnverifiedHookRetries: number | undefined;
     try {
       upgraded.delivery.migrateLegacy({ now: new Date() });
       const coveredAt = new Date(Date.now() + CAPTURE_WRITE_LAG_MS).toISOString();
       for (const producer of ["codex", "claude_code", "grok"] as const) {
         advanceCaptureFrontier(upgraded.database, producer, { complete: true, files: [] }, coveredAt);
       }
-      through = upgraded.delivery.captureClaim([], state)?.through;
+      const claim = upgraded.delivery.captureClaim([], state);
+      through = claim?.through;
+      claimUnverifiedHookRetries = claim?.unverifiedHookRetries;
     } finally { upgraded.close(); }
     const pending = olderSpool.listHookSpoolFiles(root).length;
     const receipts = fs.readdirSync(receiptDir).filter((entry) => entry.endsWith(".receipt"));
     console.log(JSON.stringify({ check: "uppercase_id_old_drain_reconciliation", upperId,
       receiptEventId: receipt.eventId, rows, recovered: tick.recovered, pending,
       receipts: receipts.length, maintenanceRebuildPending: state.maintenanceRebuildPending,
-      claimThrough: through }));
+      unverifiedHookRetries: state.unverifiedHookRetries,
+      claimUnverifiedHookRetries, claimThrough: through }));
     assert.equal(tick.recovered, 1);
     assert.equal(pending, 0);
     assert.deepEqual(rows.map((row) => row.id), [upperId]);
     assert.equal(receipt.eventId, upperId, "the receipt retains the producer's original UUID spelling");
     assert.equal(receipts.length, 0, "exact old-version ledger acceptance must retire the receipt");
     assert.equal(state.maintenanceRebuildPending, false);
+    assert.equal(state.unverifiedHookRetries, 1);
+    assert.equal(claimUnverifiedHookRetries, 1);
     assert.notEqual(through, null, "the old-version drain restores capture attestation");
   } finally {
     try { buffer?.close(); }

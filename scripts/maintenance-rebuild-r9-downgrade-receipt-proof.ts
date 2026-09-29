@@ -10,6 +10,9 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { advanceCaptureFrontier, CAPTURE_WRITE_LAG_MS } from "../packages/collector-cli/src/capture-frontier";
 import { writeHookSpoolEnvelope } from "../packages/collector-cli/src/hook-spool";
 import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
+import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { countMaintenanceRebuildRefusals, finishMaintenanceRebuildPause,
   markMaintenanceRebuildPause, recordMaintenanceRebuildRefusal } from
   "../packages/collector-cli/src/maintenance-rebuild-pause-state";
@@ -64,6 +67,7 @@ async function main() {
       deviceId: "44444444-4444-7444-8444-444444444444", delivery: { enabled: true },
     });
     let claim;
+    let statusUnverifiedHookRetries: number | null | undefined;
     try {
       upgraded.delivery.migrateLegacy({ now: new Date() });
       const coveredAt = new Date(Date.now() + CAPTURE_WRITE_LAG_MS).toISOString();
@@ -71,15 +75,36 @@ async function main() {
         advanceCaptureFrontier(upgraded.database, producer, { complete: true, files: [] }, coveredAt);
       }
       claim = upgraded.delivery.captureClaim([], upgradedState);
+      const auth = loadOrCreateLocalIngestAuth(root);
+      const server = createCollectorServer(collectorConfigSchema.parse({}), upgraded,
+        { localAuth: auth, localAuthHome: root });
+      try {
+        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+        const port = (server.address() as { port: number }).port;
+        const response = await fetch(`http://127.0.0.1:${port}/status`,
+          { headers: { "x-plimsoll-token": auth.managementRead } });
+        assert.equal(response.status, 200);
+        const status = await response.json() as { captureRecovery?: { unverifiedHookRetries?: number | null } };
+        statusUnverifiedHookRetries = status.captureRecovery?.unverifiedHookRetries;
+      } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
     } finally { upgraded.close(); }
     console.log(JSON.stringify({ check: "downgrade_drain_then_upgrade", tick, pending,
       refusalCount, upgradedPending: upgradedState.maintenanceRebuildPending,
+      unverifiedHookRetries: upgradedState.unverifiedHookRetries,
+      statusUnverifiedHookRetries,
+      claimUnverifiedHookRetries: claim?.unverifiedHookRetries,
       claimUnattested: claim?.unattested, claimThrough: claim?.through }));
     assert.equal(tick.recovered, 1);
     assert.equal(pending, 0);
     assert.equal(refusalCount, 0,
       "0.7.44 must not leave an orphaned private receipt after draining the compatible retry");
     assert.equal(upgradedState.maintenanceRebuildPending, false);
+    assert.equal(upgradedState.unverifiedHookRetries, 1,
+      "the 0.7.44 drain is retired unverified, never acknowledged as exact");
+    assert.equal(claim?.unverifiedHookRetries, 1,
+      "the attestation record carries the durable unverified count");
+    assert.equal(statusUnverifiedHookRetries, 1,
+      "the capture status exposes the durable unverified count");
     assert.notEqual(claim?.through, null, "the exact old-version drain restores capture attestation");
   } finally {
     try { buffer?.close(); }

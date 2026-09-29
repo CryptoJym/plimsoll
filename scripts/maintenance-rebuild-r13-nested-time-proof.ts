@@ -1,4 +1,4 @@
-/** The admission acknowledgement checks nested OTLP time claims before clamp. */
+/** The body fingerprint checks nested OTLP time claims before clamp. */
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -36,7 +36,9 @@ for (const exact of [true, false]) {
     const admission = buffer.database.prepare(`select outcome from maintenance_rebuild_hook_admissions
       where receipt_id = ?`).get(receipt.receiptId) as { outcome: string } | undefined;
     const state = reconcileMaintenanceRebuildRefusals(home);
-    assert.equal(admission?.outcome, exact ? "accepted" : "mismatch");
+    // A changed caller timestamp has a different fingerprint and cannot
+    // acquire an acknowledgement for the refused body.
+    assert.equal(admission?.outcome, exact ? "accepted" : undefined);
     assert.equal(state.count, exact ? 0 : 1);
     console.log(JSON.stringify({ check: "nested_original_timestamp", exact,
       outcome: admission?.outcome, pending: state.count }));

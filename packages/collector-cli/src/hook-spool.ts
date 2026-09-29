@@ -7,13 +7,12 @@ import { maintenanceRebuildPauseSeen, MISSING_HOOK_RETRY_MS, prepareMaintenanceH
 import { recordSpoolLoss } from "./spool-losses";
 
 import {
-  isProtectedMetadataFieldName,
-  isSafeSuppressionSourceKey,
-  isSensitiveMetadataSemanticKey,
   protectedMetadataFieldNames,
 } from "../../shared/src/index";
 import { resolveCollectorHome } from "./collector-home";
 import { isUuid } from "./normalizer";
+import { SPOOL_DERIVATION_INPUT_KEYS, spoolKeepsProtectedIdentityRaw,
+  blankForbiddenRawContent } from "./hook-spool-privacy";
 
 /**
  * Bead eco-6hoxj.61: hook events the local collector cannot accept right now
@@ -206,31 +205,7 @@ export type HookSpoolEnvelope = {
  * proof (`scripts/hook-spool-proof.ts`, case `q`) is the guard in the other
  * direction — a key whose blanking moves a persisted value belongs here.
  */
-export const SPOOL_DERIVATION_INPUT_KEYS = [
-  // The four keys `extractRepoContextCwd` (`repo-context.ts:22`, `CWD_KEYS`)
-  // reads from the raw payload. `appendForwardedHook` (`forwarder.ts:42`) uses
-  // the result to attach the repo-context sidecar, which the ledger turns into
-  // the event's repository linkage rows (repo/branch/head). Blanked, the event
-  // loses its repository attribution for good.
-  "cwd",
-  "current_working_directory",
-  "workdir",
-  "working_directory",
-  // The one `eventType` authority alias that is itself sensitive — as a
-  // camelCase variant of the approved `hook_event_name`, `isSensitiveMetadata
-  // SemanticKey` strips it. `normalizeHookPayload` selects the event's type
-  // from this value in the RAW body (`hook-authority.ts:81`,
-  // `normalizer.ts:364`), so blanking it would move `event_type`. The other
-  // value-bearing authority aliases (`id`/`eventId`/`event_id`,
-  // `eventType`/`event_type`/`type`, `actionClass`/`action_class`,
-  // `observedAt`/`observed_at`/`timestamp`/`time`) are not sensitive, so they
-  // are never blanked and need no exemption; the authority aliases that ARE
-  // sensitive but only ever produce a receipt from the key's presence
-  // (`transportPath`, `repo_hash`, `branch_hash`, `head_sha`, `tenant.id`, …)
-  // are blanked, and their receipts are unchanged because a receipt is built
-  // from the key path, never the value.
-  "hookEventName",
-] as const;
+export { SPOOL_DERIVATION_INPUT_KEYS };
 
 /**
  * The collector's own pre-write rule on its own, with no exemption applied:
@@ -239,9 +214,7 @@ export const SPOOL_DERIVATION_INPUT_KEYS = [
  * raw-content names, the private-concept rule and the raw/path word rule;
  * `!isSafeSuppressionSourceKey` is a name it cannot even put in a receipt.
  */
-function collectorStripsKeyOutright(key: string) {
-  return !isSafeSuppressionSourceKey(key) || isSensitiveMetadataSemanticKey(key);
-}
+// The shared privacy rule is implemented in hook-spool-privacy.ts.
 
 /**
  * The SECOND group of derivation inputs (review r3, N3; review r4, F1): the
@@ -293,9 +266,7 @@ function collectorStripsKeyOutright(key: string) {
  * conjunction would turn fourteen canonical path/email names raw in the spool
  * — the opposite of this fix.
  */
-export function spoolKeepsProtectedIdentityRaw(key: string) {
-  return !collectorStripsKeyOutright(key) && isProtectedMetadataFieldName(key);
-}
+export { spoolKeepsProtectedIdentityRaw };
 
 /**
  * The canonical spelling of every name the rule above covers: the shared list
@@ -373,8 +344,6 @@ export const SPOOL_DERIVATION_INPUT_DISCLOSURE: readonly SpoolDerivationInputDis
   })),
 ];
 
-const derivationInputKeys = new Set<string>(SPOOL_DERIVATION_INPUT_KEYS);
-
 /**
  * True when the collector would strip this key's value before the local
  * database write, so the spool must not hold it either.
@@ -393,11 +362,7 @@ const derivationInputKeys = new Set<string>(SPOOL_DERIVATION_INPUT_KEYS);
  *     become an override of the DROP rule by accident.
  * Both are disclosed in `SPOOL_DERIVATION_INPUT_DISCLOSURE`.
  */
-function spoolSuppressedKey(key: string) {
-  if (derivationInputKeys.has(key)) return false;
-  if (spoolKeepsProtectedIdentityRaw(key)) return false;
-  return collectorStripsKeyOutright(key);
-}
+// The shared suppression predicate is implemented in hook-spool-privacy.ts.
 
 /**
  * Blank everything the ledger would not keep, before it can reach the disk.
@@ -418,47 +383,7 @@ function spoolSuppressedKey(key: string) {
  * (`null`): it is a body the collector would refuse anyway, and putting
  * unexaminable bytes on disk is the thing this function exists to prevent.
  */
-export function blankForbiddenRawContent(
-  body: string,
-): { text: string; blanked: number } | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  let blanked = 0;
-  const blank = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map((item) => blank(item));
-    if (!value || typeof value !== "object") return value;
-    const record = value as Record<string, unknown>;
-    // OTLP-shaped attribute: the name is in `key` and the content is in
-    // `value`. `sanitizeRoutineMetadata` judges the attribute by that name and
-    // stops descending; so do we.
-    const semanticKey = typeof record.key === "string" ? record.key : undefined;
-    if (semanticKey && "value" in record && spoolSuppressedKey(semanticKey)) {
-      blanked += 1;
-      return { ...record, value: "" };
-    }
-    const next: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(record)) {
-      if (spoolSuppressedKey(key)) {
-        blanked += 1;
-        next[key] = "";
-        continue;
-      }
-      next[key] = blank(nested);
-    }
-    return next;
-  };
-  let text: string | undefined;
-  try {
-    text = JSON.stringify(blank(parsed));
-  } catch {
-    return null;
-  }
-  return text === undefined ? null : { text, blanked };
-}
+export { blankForbiddenRawContent };
 
 /**
  * Private-path rule, identical to the one the collector home itself is held

@@ -224,6 +224,8 @@ export type DeliveryCaptureClaim = {
   withheld: number;
   /** At most CAPTURE_CLAIM_MAX_GAPS closed intervals in which data is known to be missing. */
   gaps: Array<{ from: string; to: string }>;
+  /** Visible older-binary retries retired without exact digest evidence. */
+  unverifiedHookRetries?: number;
 };
 
 /** Why a claim attests nothing (review r2 B3): the cloud withdraws what it held. */
@@ -633,6 +635,8 @@ export class DeliveryOutbox {
         dead: lost.dead + spoolLosses.reduce((total, loss) => total + loss.count, 0),
         withheld: lost.withheld,
         gaps: gaps.map((gap) => ({ from: new Date(gap.fromMs).toISOString(), to: new Date(gap.toMs).toISOString() })),
+        ...((spool?.unverifiedHookRetries ?? 0) > 0
+          ? { unverifiedHookRetries: spool!.unverifiedHookRetries } : {}),
       };
     });
     return run.immediate();

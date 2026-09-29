@@ -505,6 +505,11 @@ jobs:
           pnpm proof:maintenance-rebuild-r13-atomic
           pnpm proof:maintenance-rebuild-r13-nested-time
           pnpm proof:maintenance-rebuild-r13-old-binary
+          pnpm proof:maintenance-rebuild-r14-fanout
+          pnpm proof:maintenance-rebuild-r14-prior-row
+          pnpm proof:maintenance-rebuild-r14-body-mismatch
+          pnpm proof:maintenance-rebuild-r14-ack-retention
+          pnpm proof:maintenance-rebuild-r14-fallback
           pnpm proof:maintenance-rebuild-writers
           pnpm proof:maintenance-rebuild-contract
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)

@@ -8,8 +8,9 @@ import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 import { classifyEventType, isUuid } from "./normalizer";
 import { withRebuildCoordination } from "./rebuild-coordination";
 import { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
-import { HOOK_ACK_LOOKUP_SQL, HOOK_ROW_LOOKUP_SQL,
-  originalHookTimestampDigest, sameHookIdentityPart } from "./maintenance-hook-admission";
+import { HOOK_ACK_LOOKUP_SQL, HOOK_ROW_LOOKUP_SQL, HOOK_ROW_LEGACY_LOOKUP_SQL,
+  originalHookTimestampDigest, removeMaintenanceHookAdmission, sameHookIdentityPart } from "./maintenance-hook-admission";
+import { hookBodyDigest, hookBodyFromWire, hookReceiptFileName } from "./maintenance-hook-fingerprint";
 
 const MARKER = "maintenance-rebuild-pause.json";
 const REFUSALS = "maintenance-rebuild-refusals";
@@ -18,10 +19,11 @@ type PauseMarker = { version: 1; at: string; pid?: number; endedAt?: string;
   ledgerName?: "work-ledger.sqlite" | "ledger.sqlite"; ledgerHighWater?: number | null };
 
 type RefusalRoute = "hook" | "otlp" | "live";
-type RefusalReceipt = { version: 1 | 2 | 3 | 4 | 5; route: RefusalRoute; at: string;
+type RefusalReceipt = { version: 1 | 2 | 3 | 4 | 5 | 6; route: RefusalRoute; at: string;
   source?: string; eventId?: string; kind?: string; ledgerHighWater?: number | null;
   eventDigest?: string | null; receiveClockFallback?: boolean;
   receiptId?: string; sessionId?: string | null; originalTimestampDigest?: string | null;
+  bodyDigest?: string | null;
   spoolName?: string; unknownAt?: string };
 /** The client writes its retry immediately after the response; the spool's
  * ten-minute stale-pending diagnostic is our conservative missing-retry
@@ -30,8 +32,20 @@ export const MISSING_HOOK_RETRY_MS = 600_000;
 const SPOOL_NAME = /^\d{13,}-\d+-[0-9a-f]{6}\.json$/;
 function refusalDirectory(home: string) { return path.join(home, REFUSALS); }
 function refusalPath(home: string, route: RefusalRoute, source: string, body: string | Buffer) {
+  if (route === "hook") {
+    try {
+      return path.join(refusalDirectory(home), hookReceiptFileName(source, hookBodyDigest(hookBodyFromWire(body))));
+    } catch { /* Invalid JSON still has a terminal receipt keyed by its wire bytes. */ }
+  }
   const digest = createHash("sha256").update(`${route}\0${source}\0`).update(body).digest("hex");
   return path.join(refusalDirectory(home), `${digest}.receipt`);
+}
+function existingRefusalPath(home: string, route: RefusalRoute, source: string, body: string | Buffer) {
+  const current = refusalPath(home, route, source, body);
+  if (fs.existsSync(current) || route !== "hook") return current;
+  const legacyName = createHash("sha256").update(`${route}\0${source}\0`).update(body).digest("hex");
+  const legacy = path.join(refusalDirectory(home), `${legacyName}.receipt`);
+  return fs.existsSync(legacy) ? legacy : current;
 }
 function fsyncDirectory(directory: string) {
   const descriptor = fs.openSync(directory, "r");
@@ -81,6 +95,7 @@ function hookReceiptIdentity(home: string, source: string, body: string | Buffer
     const receiveClockFallback = event.observedAt !== next.observedAt;
     return { kind: event.eventType,
       sessionId: event.sessionId ?? null,
+      bodyDigest: hookBodyDigest(payload),
       originalTimestampDigest: originalHookTimestampDigest(payload),
       eventDigest: normalizedEventDigest(event as Record<string, unknown>, receiveClockFallback),
       receiveClockFallback };
@@ -88,6 +103,7 @@ function hookReceiptIdentity(home: string, source: string, body: string | Buffer
     // Malformed or unnormalizable requests are still refused. Their receipt
     // can settle only on the exact terminal outcome, never on a ledger guess.
     return { kind: hookEventKind(body), sessionId: null,
+      bodyDigest: null,
       originalTimestampDigest: null, eventDigest: null, receiveClockFallback: false };
   }
 }
@@ -177,7 +193,7 @@ function readReceipt(file: string): RefusalReceipt {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) throw new Error("maintenance_refusal_unsafe");
   const value = JSON.parse(fs.readFileSync(file, "utf8")) as RefusalReceipt;
-  if (![1, 2, 3, 4, 5].includes(value.version) || !["hook", "otlp", "live"].includes(value.route) ||
+  if (![1, 2, 3, 4, 5, 6].includes(value.version) || !["hook", "otlp", "live"].includes(value.route) ||
     !Number.isFinite(Date.parse(value.at)) ||
     (value.source !== undefined && !/^[a-z_]{1,32}$/.test(value.source)) ||
     (value.eventId !== undefined && !isUuid(value.eventId)) ||
@@ -205,6 +221,15 @@ function readReceipt(file: string): RefusalReceipt {
       typeof value.receiveClockFallback !== "boolean" ||
       !(value.ledgerHighWater === null ||
         (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
+    (value.version === 6 && (value.route !== "hook" || !value.source || !value.eventId ||
+      !value.receiptId || !isUuid(value.receiptId) ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.sessionId === null ||
+        (typeof value.sessionId === "string" && value.sessionId.length <= 256)) ||
+      !(value.bodyDigest === null || (typeof value.bodyDigest === "string" &&
+        /^[a-f0-9]{64}$/.test(value.bodyDigest))) ||
+      !(value.ledgerHighWater === null ||
+        (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
     (value.unknownAt !== undefined && !Number.isFinite(Date.parse(value.unknownAt))) ||
     (value.spoolName !== undefined && !SPOOL_NAME.test(value.spoolName))) {
     throw new Error("maintenance_refusal_unsafe");
@@ -224,7 +249,7 @@ function writeReceipt(file: string, value: RefusalReceipt) {
  * supplied no ID, bind its compatible retry to the ID durably minted by the
  * pause listener, so even an old drain records the same ledger key. */
 export function prepareMaintenanceHookSpoolBody(home: string, source: string, body: string) {
-  const original = refusalPath(home, "hook", source, body);
+  const original = existingRefusalPath(home, "hook", source, body);
   let receipt: RefusalReceipt | null = null;
   try { receipt = readReceipt(original); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -247,7 +272,7 @@ export function prepareMaintenanceHookSpoolBody(home: string, source: string, bo
 export function pendingMaintenanceHookEventId(home: string, source: string, body: string) {
   if (hookEventId(body)) return null;
   try {
-    const receipt = readReceipt(refusalPath(home, "hook", source, body));
+    const receipt = readReceipt(existingRefusalPath(home, "hook", source, body));
     return receipt.route === "hook" && receipt.source === source ? receipt.eventId ?? null : null;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -271,7 +296,7 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
   }
   const dirStat = fs.lstatSync(directory);
   if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) throw new Error("maintenance_refusals_unsafe");
-  const file = refusalPath(home, route, source, body);
+  const file = existingRefusalPath(home, route, source, body);
   let descriptor: number;
   try { descriptor = fs.openSync(file, "wx", 0o600); }
   catch (error) {
@@ -284,20 +309,21 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
         throw new Error("maintenance_refusal_event_id_changed");
       }
       const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
-      if ((prior.version === 3 || prior.version === 4 || prior.version === 5) &&
+      if ((prior.version === 3 || prior.version === 4 || prior.version === 5 || prior.version === 6) &&
         (prior.source !== source || prior.kind !== identity.kind ||
-          (prior.version === 5 &&
+          ((prior.version === 5 || prior.version === 6) &&
             (!sameHookIdentityPart(prior.sessionId ?? null, identity.sessionId) ||
-              prior.originalTimestampDigest !== identity.originalTimestampDigest)))) {
+              prior.originalTimestampDigest !== identity.originalTimestampDigest ||
+              (prior.version === 6 && prior.bodyDigest !== identity.bodyDigest))))) {
         throw new Error("maintenance_refusal_identity_changed");
       }
-      if (prior.version !== 5 || prior.source !== source || prior.eventId !== eventId ||
+      if (prior.version !== 6 || prior.source !== source || prior.eventId !== eventId ||
         (options.spoolName && prior.spoolName !== options.spoolName)) {
         withHookHighWater(home, marker, (highWater) => {
-          writeReceipt(file, { ...prior, version: 5, source,
+          writeReceipt(file, { ...prior, version: 6, source,
             receiptId: prior.receiptId ?? randomUUID(),
             eventId: prior.eventId ?? eventId, ...identity,
-            ledgerHighWater: prior.version === 3 || prior.version === 4 || prior.version === 5
+            ledgerHighWater: prior.version === 3 || prior.version === 4 || prior.version === 5 || prior.version === 6
               ? prior.ledgerHighWater ?? null : highWater,
             ...(options.spoolName ? { spoolName: options.spoolName } : {}) });
         });
@@ -310,7 +336,7 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
       const eventId = options.eventId ?? hookEventId(body) ?? randomUUID();
       const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
       withHookHighWater(home, marker, (highWater) => {
-        const value: RefusalReceipt = { version: 5, route, source, receiptId: randomUUID(),
+        const value: RefusalReceipt = { version: 6, route, source, receiptId: randomUUID(),
           at: new Date().toISOString(), eventId, ...identity, ledgerHighWater: highWater,
           ...(options.spoolName ? { spoolName: options.spoolName } : {}) };
         fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
@@ -325,27 +351,69 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
   fsyncDirectory(directory);
 }
 
-function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt) {
-  if (receipt.version !== 5 || !receipt.receiptId || !receipt.eventId ||
-    !receipt.source || !receipt.kind) return false;
+type AdmissionMatch = "accepted" | "unverified" | "unknown" | "none";
+function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt): AdmissionMatch {
+  if ((receipt.version !== 5 && receipt.version !== 6) || !receipt.receiptId || !receipt.eventId ||
+    !receipt.source || !receipt.kind) return "none";
   const hasAdmissionTable = db.prepare(`select 1 from sqlite_master
     where type = 'table' and name = 'maintenance_rebuild_hook_admissions'`).get();
   const admissions = hasAdmissionTable ? db.prepare(HOOK_ACK_LOOKUP_SQL).all(receipt.receiptId) as
     Array<{ admitted_event_id: string; outcome: "accepted" | "mismatch" }> : [];
-  if (admissions.some((admission) => admission.outcome === "accepted")) return true;
+  if (admissions.some((admission) => admission.outcome === "accepted")) return "accepted";
   const rejectedIds = new Set(admissions.filter((admission) => admission.outcome === "mismatch")
     .map((admission) => admission.admitted_event_id));
-  // SQLite's ID primary-key index supports every spelling below. Apply
-  // canonical UUID equality, source, kind and session after that point lookup.
-  // Older binaries have no acknowledgement table, but their immutable row
-  // identity still settles a compatible retry after enrichment or time clamp.
+  // SQLite's ID primary-key index supports every spelling below. A row at or
+  // below the refusal boundary is older evidence. A later row without an
+  // immutable body digest (0.7.44) is an unknown, never exact acceptance.
   const variants = [receipt.eventId, receipt.eventId.toLowerCase(), receipt.eventId.toUpperCase()];
-  const rows = db.prepare(HOOK_ROW_LOOKUP_SQL).all(...variants) as
-    Array<{ id: string; source: string; event_type: string; session_id: string | null }>;
-  return rows.some((row) => !rejectedIds.has(row.id) &&
-    sameEventId(row.id, receipt.eventId!) && row.source === receipt.source &&
-    row.event_type === receipt.kind &&
-    sameHookIdentityPart(row.session_id, receipt.sessionId ?? null));
+  const hasDigest = db.prepare(`select 1 from pragma_table_info('buffered_events')
+    where name = 'maintenance_hook_body_digest'`).get();
+  const rows = db.prepare(hasDigest ? HOOK_ROW_LOOKUP_SQL : HOOK_ROW_LEGACY_LOOKUP_SQL).all(...variants) as
+    Array<{ rowid: number; id: string; source: string; event_type: string;
+      session_id: string | null; body_digest: string | null }>;
+  let ambiguous = false;
+  let digestlessAfter = false;
+  let digestedAfter = false;
+  for (const row of rows) {
+    if (rejectedIds.has(row.id) || !sameEventId(row.id, receipt.eventId) ||
+      row.source !== receipt.source || row.event_type !== receipt.kind ||
+      !sameHookIdentityPart(row.session_id, receipt.sessionId ?? null)) continue;
+    ambiguous = true;
+    if (receipt.ledgerHighWater === null || receipt.ledgerHighWater === undefined ||
+      row.rowid <= receipt.ledgerHighWater) continue;
+    if (row.body_digest === null) digestlessAfter = true;
+    else digestedAfter = true;
+    if (receipt.version === 6 && receipt.bodyDigest && row.body_digest === receipt.bodyDigest) {
+      return "accepted";
+    }
+  }
+  if (digestlessAfter && !digestedAfter) return "unverified";
+  return ambiguous ? "unknown" : "none";
+}
+
+type TerminalRecord = { version?: number; receipt?: string; at?: string;
+  outcome?: string; eventId?: string | null; source?: string; kind?: string; spoolName?: string };
+function terminalRecords(home: string): TerminalRecord[] {
+  try {
+    return fs.readFileSync(path.join(home, TERMINAL), "utf8").split("\n").filter(Boolean)
+      .flatMap((line) => {
+        try { return [JSON.parse(line) as TerminalRecord]; }
+        catch { return []; /* An unfinished last line is not a durable outcome. */ }
+      });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+function unverifiedCount(records: TerminalRecord[]) {
+  return new Set(records.filter((entry) => entry.version === 1 &&
+    entry.outcome === "retired_unverified" && typeof entry.receipt === "string" &&
+    /^[a-f0-9]{64}\.receipt$/.test(entry.receipt) && typeof entry.at === "string")
+    .map((entry) => `${entry.receipt}\0${entry.at}`)).size;
+}
+export function readUnverifiedHookRetries(home: string): number | null {
+  try { return unverifiedCount(terminalRecords(home)); }
+  catch { return null; }
 }
 
 function terminalTailStart(descriptor: number, size: number) {
@@ -411,7 +479,7 @@ export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRou
   source: string, body: string | Buffer,
   options: { outcome?: "accepted" | "terminal"; acceptedEventId?: string;
     ledger?: Database.Database; spoolName?: string } = {}) {
-  let file = refusalPath(home, route, source, body);
+  let file = existingRefusalPath(home, route, source, body);
   try {
     let receipt: RefusalReceipt;
     try { receipt = readReceipt(file); }
@@ -432,7 +500,7 @@ export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRou
     if (route === "hook" && options.outcome !== "terminal") {
       if (!receipt.eventId || !options.acceptedEventId ||
         !sameEventId(options.acceptedEventId, receipt.eventId) || !options.ledger ||
-        !ledgerAdmissionMatches(options.ledger, receipt)) return;
+        ledgerAdmissionMatches(options.ledger, receipt) !== "accepted") return;
     }
     if (options.outcome === "terminal") {
       // Record the exact receipt instance before removing its hold. A crash
@@ -442,6 +510,7 @@ export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRou
     }
     fs.unlinkSync(file);
     fsyncDirectory(refusalDirectory(home));
+    if (receipt.receiptId && options.ledger) removeMaintenanceHookAdmission(options.ledger, receipt.receiptId);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -455,39 +524,41 @@ export function countMaintenanceRebuildRefusals(home: string): number | null {
 /** Only a row admitted after this refusal, with its canonical ID, source and
  * kind, may settle an old-version drain. Missing files alone never do. */
 export function reconcileMaintenanceRebuildRefusals(home: string,
-  ledgerPath?: string, nowMs = Date.now()): { count: number | null; lost: Array<{ fromMs: number; toMs: number; count: number }> } {
+  ledgerPath?: string, nowMs = Date.now()): { count: number | null;
+    unverifiedHookRetries: number | null;
+    lost: Array<{ fromMs: number; toMs: number; count: number }> } {
   const directory = refusalDirectory(home);
   try {
     const stat = fs.lstatSync(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return { count: null, lost: [] };
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return { count: null, unverifiedHookRetries: null, lost: [] };
     const entries = fs.readdirSync(directory, { withFileTypes: true });
     if (entries.some((entry) =>
       !(/^[a-f0-9]{64}\.receipt$/.test(entry.name) ||
         /^[a-f0-9]{64}\.receipt\.[0-9a-f-]{36}\.tmp$/.test(entry.name)) ||
-      !entry.isFile() || entry.isSymbolicLink())) return { count: null, lost: [] };
+      !entry.isFile() || entry.isSymbolicLink())) return { count: null, unverifiedHookRetries: null, lost: [] };
     const receiptFiles = entries.filter((entry) => entry.name.endsWith(".receipt"))
       .map((entry) => path.join(directory, entry.name));
-    if (receiptFiles.length === 0) return { count: 0, lost: [] };
+    if (receiptFiles.length === 0) return { count: 0, unverifiedHookRetries: readUnverifiedHookRetries(home), lost: [] };
     const receipts = receiptFiles.map(readReceipt);
     const terminal = new Set<string>();
+    let unverifiedHookRetries: number;
     try {
-      for (const line of fs.readFileSync(path.join(home, TERMINAL), "utf8").split("\n").filter(Boolean)) {
-        try {
-          const value = JSON.parse(line) as { version?: number; receipt?: string; at?: string;
-            outcome?: string };
-          if (value.version === 1 && value.outcome === "terminal" &&
-            typeof value.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(value.receipt) &&
-            typeof value.at === "string") terminal.add(`${value.receipt}\0${value.at}`);
-        } catch { /* A killed append leaves its receipt for exact retry or a visible unknown. */ }
+      const records = terminalRecords(home);
+      unverifiedHookRetries = unverifiedCount(records);
+      for (const value of records) {
+        if (value.version === 1 && (value.outcome === "terminal" || value.outcome === "retired_unverified") &&
+          typeof value.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(value.receipt) &&
+          typeof value.at === "string") terminal.add(`${value.receipt}\0${value.at}`);
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { count: null, lost: [] };
+      return { count: null, unverifiedHookRetries: null, lost: [] };
     }
     const hookReceipts = receipts.filter((receipt) => receipt.route === "hook");
+    const retiredIds: string[] = [];
     let db: Database.Database | null = null;
+    const marker = readMaintenanceRebuildPause(home);
+    const selected = ledgerPath ?? selectedLedger(home, marker ?? undefined);
     if (hookReceipts.length > 0) {
-      const marker = readMaintenanceRebuildPause(home);
-      const selected = ledgerPath ?? selectedLedger(home, marker ?? undefined);
       if (fs.existsSync(selected) && !fs.existsSync(`${selected}.maintenance-rebuild.lock`)) {
         try { db = new Database(selected, { readonly: true, fileMustExist: true, timeout: 0 }); }
         catch { /* An unavailable ledger holds receipts until a later pass. */ }
@@ -502,36 +573,66 @@ export function reconcileMaintenanceRebuildRefusals(home: string,
         if (terminal.has(`${path.basename(file)}\0${receipt.at}`)) {
           fs.unlinkSync(file);
           fsyncDirectory(directory);
+          if (receipt.receiptId) retiredIds.push(receipt.receiptId);
           continue;
         }
         if (receipt.route !== "hook") { count += 1; continue; }
-        let accepted = false;
+        let match: AdmissionMatch = "none";
         let checked = false;
         if (db && receipt.eventId) {
           try {
-            accepted = ledgerAdmissionMatches(db, receipt);
+            match = ledgerAdmissionMatches(db, receipt);
             checked = true;
           }
           catch { /* An unreadable inventory never proves acceptance. */ }
         }
-        if (accepted) {
+        if (match === "accepted") {
           fs.unlinkSync(file);
           fsyncDirectory(directory);
+          if (receipt.receiptId) retiredIds.push(receipt.receiptId);
           continue;
         }
         const pendingFile = receipt.spoolName &&
           fs.existsSync(path.join(home, "hook-spool", receipt.spoolName));
+        if (match === "unverified" && receipt.spoolName && !pendingFile) {
+          appendTerminalOutcome(home, { version: 1, receipt: path.basename(file), at: receipt.at,
+            route: "hook", eventId: receipt.eventId ?? null, source: receipt.source,
+            kind: receipt.kind, spoolName: receipt.spoolName, outcome: "retired_unverified" });
+          unverifiedHookRetries += 1;
+          console.warn(JSON.stringify({ status: "maintenance_hook_retired_unverified",
+            eventId: receipt.eventId, source: receipt.source, kind: receipt.kind,
+            spoolName: receipt.spoolName }));
+          fs.unlinkSync(file);
+          fsyncDirectory(directory);
+          if (receipt.receiptId) retiredIds.push(receipt.receiptId);
+          continue;
+        }
         const atMs = Date.parse(receipt.at);
         if (!pendingFile && (checked || !receipt.eventId) && nowMs - atMs >= MISSING_HOOK_RETRY_MS) {
           if (!receipt.unknownAt) writeReceipt(file, { ...receipt, unknownAt: new Date(nowMs).toISOString() });
-          lost.push({ fromMs: atMs, toMs: atMs, count: 1 });
+          if (match === "none") lost.push({ fromMs: atMs, toMs: atMs, count: 1 });
+          else count += 1;
         } else count += 1;
       }
     } finally { db?.close(); }
-    return { count, lost };
+    if (retiredIds.length > 0 && fs.existsSync(selected)) {
+      let token: string | null = null;
+      let writer: Database.Database | null = null;
+      try {
+        token = acquireRebuildOpenToken(selected);
+        writer = new Database(selected, { fileMustExist: true, timeout: 0 });
+        const remove = writer.transaction(() => {
+          for (const id of retiredIds) removeMaintenanceHookAdmission(writer!, id);
+        });
+        remove.immediate();
+      } catch { /* Retention also removes orphan acknowledgements after the event expires. */ }
+      finally { writer?.close(); releaseRebuildOpenToken(token); }
+    }
+    return { count, unverifiedHookRetries, lost };
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT"
-      ? { count: 0, lost: [] } : { count: null, lost: [] };
+      ? { count: 0, unverifiedHookRetries: readUnverifiedHookRetries(home), lost: [] }
+      : { count: null, unverifiedHookRetries: null, lost: [] };
   }
 }
 

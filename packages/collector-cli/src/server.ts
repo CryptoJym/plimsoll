@@ -125,7 +125,7 @@ import {
   scanProducerProcesses,
 } from "./producer-processes";
 import { healthzProof, isHealthzChallenge, summaryPendingStatus } from "./status-summary";
-import { pendingMaintenanceHookEventId, reconcileMaintenanceRebuildRefusals,
+import { pendingMaintenanceHookEventId, readUnverifiedHookRetries, reconcileMaintenanceRebuildRefusals,
   resolveMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 let dashboardHtml: string | undefined;
@@ -1223,6 +1223,8 @@ export function createCollectorServer(
       sessionAttribution: refreshControl ? sessionContextIndexStatus(buffer.database)
         : cachedControl?.sessionAttribution ?? null,
       maintenance,
+      captureRecovery: { unverifiedHookRetries: maintenanceRefusalHome
+        ? readUnverifiedHookRetries(maintenanceRefusalHome) : 0 },
       captureHealth: status.health ?? null,
       historyCoverage,
       captureBaseline: refreshControl ? captureBaselineStatus(buffer.database) : cachedControl?.captureBaseline ?? null,
@@ -1310,6 +1312,8 @@ export function createCollectorServer(
       summaryPending: summaryPendingStatus(buffer.database),
       unlinkableBindCount: countUnlinkableDispatchBindings(currentDispatchCaptureRoots()),
       maintenance: options.maintenanceStatus?.() ?? null,
+      captureRecovery: { unverifiedHookRetries: maintenanceRefusalHome
+        ? readUnverifiedHookRetries(maintenanceRefusalHome) : 0 },
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
       accountAssertions,

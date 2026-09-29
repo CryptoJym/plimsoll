@@ -25,7 +25,7 @@
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:53366100b545d6fecb491267e312608a25ce8b346b90db2df611ebf7ae8fd728"
+      "expectedArtifactDigest": "sha256:a51967a64a17c125b756ff8a2d48a16252356a3f9d7572bc1d01d35015f92133"
     },
     {
       "name": "launch_agent_unload_terminal_truth",
