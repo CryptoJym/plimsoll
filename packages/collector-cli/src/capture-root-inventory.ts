@@ -6,7 +6,6 @@ import { z } from "zod";
 import { accountAssertionContains, accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
 import type { CaptureBaselineFileObservation } from "./capture-baseline";
 import { resolveCollectorHome } from "./collector-home";
-import { codexRolloutIdFromFilename, verifiedCodexRolloutSessionId } from "./codex-rollout-identity";
 import { workClassSchema, workComplexityBandSchema } from "../../shared/src/schemas";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 export const namespacedWorkItemIdSchema=z.string().max(256).regex(
@@ -383,6 +382,40 @@ export function physicalBelowHome(home: string, entry: string): boolean {
     }
     return true;
   } catch { return false; }
+}
+
+/** Discovery and the tailer share the same Codex rollout identity rules. */
+const CODEX_UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CODEX_ROLLOUT_FILE_RE = /^rollout-(?:.+-)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+
+export function isCodexUuid(value: unknown): value is string {
+  return typeof value === "string" && CODEX_UUID_EXACT_RE.test(value);
+}
+
+export function codexRolloutIdFromFilename(file: string): string | undefined {
+  const match = CODEX_ROLLOUT_FILE_RE.exec(path.basename(file));
+  return match && isCodexUuid(match[1]) ? match[1].toLowerCase() : undefined;
+}
+
+export function verifiedCodexSessionMetaId(row: unknown): string | undefined {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return undefined;
+  const record = row as Record<string, unknown>;
+  if (record.type !== "session_meta") return undefined;
+  const payload = record.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const id = (payload as Record<string, unknown>).id;
+  const timestamp = record.timestamp ?? (payload as Record<string, unknown>).timestamp;
+  // Codex rollouts can omit this timestamp; the tailer has always accepted them.
+  if (!isCodexUuid(id) ||
+      (timestamp !== undefined &&
+        (typeof timestamp !== "string" || !Number.isFinite(Date.parse(timestamp))))) return undefined;
+  return id.toLowerCase();
+}
+
+export function verifiedCodexRolloutSessionId(file: string, row: unknown): string | undefined {
+  const filenameId = codexRolloutIdFromFilename(file);
+  const metadataId = verifiedCodexSessionMetaId(row);
+  return filenameId && filenameId === metadataId ? filenameId : undefined;
 }
 
 /** A bounded first-line check, with no rollout body or path exposed in a receipt. */

@@ -3,8 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
-import { codexRolloutIdFromFilename, isCodexUuid, verifiedCodexSessionMetaId } from "./codex-rollout-identity";
+import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, codexRolloutIdFromFilename, isCodexUuid, verifiedCodexSessionMetaId, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import {
