@@ -5,7 +5,7 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline,
   sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
-import { applyCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
+import { applyCaptureHistory, planCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
 import { deriveCaptureRootIdentity, type CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { useFixtureRoot } from "./lib/fixture-root";
 
@@ -80,6 +80,9 @@ async function prove(source: Source, which: Case) {
       from buffered_events where session_id=?`).get(SESSION) as { n: number }).n;
     assert.equal(total(), 150);
     const before = (buffer.database.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
+    const plan = await planCaptureHistory(buffer.database, roots[1]!);
+    assert.equal(plan.missingRows, 0);
+    assert.equal(plan.refusals.length, which === "exact" ? 0 : 1);
     let refusal = "none"; let added = 0;
     try { added = (await applyCaptureHistory(buffer, roots[1]!)).importedRows; }
     catch (error) { refusal = String(error); }
@@ -89,6 +92,7 @@ async function prove(source: Source, which: Case) {
       for (const root of roots) assert.equal((await applyCaptureHistory(buffer, root)).importedRows, 0);
     } else {
       assert.match(refusal, /capture_history_refused:/, `changed ${which} line must refuse`);
+      assert.ok(refusal.includes(plan.refusals[0]!.reason));
     }
     assert.equal(total(), 150); assert.equal(after, before);
     console.log(JSON.stringify({ proof: "copied_byte_prefix", source, which, storedBytes: originalBytes.length,

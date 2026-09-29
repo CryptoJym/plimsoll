@@ -327,6 +327,115 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-r2-symlink_parent_race
 
+      - name: Prove history files three codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-three_codex
+
+      - name: Prove history files three claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-three_claude
+
+      - name: Prove history files one byte codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-one_byte_codex
+
+      - name: Prove history files one byte claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-one_byte_claude
+
+      - name: Prove history files equal counter identical codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_identical_codex
+
+      - name: Prove history files equal counter identical claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_identical_claude
+
+      - name: Prove history files trailing identical codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_identical_codex
+
+      - name: Prove history files trailing identical claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_identical_claude
+
+      - name: Prove history files parent depth 1 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-parent_depth_1
+
+      - name: Prove history files parent depth 3 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-parent_depth_3
+
+      - name: Prove history files linked depth 1 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-linked_depth_1
+
+      - name: Prove history files linked depth 3 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-linked_depth_3
+
+      - name: Prove history files linked root (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-linked_root
+
+      - name: Prove history files short match codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_match_codex
+
+      - name: Prove history files short changed codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_changed_codex
+
+      - name: Prove history files short after usage codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_after_usage_codex
+
+      - name: Prove history files seen suffix codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-seen_suffix_codex
+
+      - name: Prove history files new suffix codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_suffix_codex
+
+      - name: Prove history files missing fingerprint codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_fingerprint_codex
+
+      - name: Prove history files missing record codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_record_codex
+
+      - name: Prove history files short match claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_match_claude
+
+      - name: Prove history files short changed claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_changed_claude
+
+      - name: Prove history files short after usage claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_after_usage_claude
+
+      - name: Prove history files seen suffix claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-seen_suffix_claude
+
+      - name: Prove history files new suffix claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_suffix_claude
+
+      - name: Prove history files missing fingerprint claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_fingerprint_claude
+
+      - name: Prove history files missing record claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_record_claude
+
+
       - name: Prove history WAL pause and resumable reader pin
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-history-import-wal

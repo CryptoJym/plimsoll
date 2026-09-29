@@ -318,8 +318,11 @@ async function main() {
       from buffered_events where session_id=?`).get(claudeSession) as { input: number; output: number };
     check("claude_revisions_import_only_missing_usage", claudeApply.importedRows === 2 &&
       claudeTotal.input === 190 && claudeTotal.output === 19);
+    // This case checks an opaque filename's declared, previously unseen
+    // session. Seen-session fragments are refused by the named F3 proofs.
+    const agentSession = "019d0000-0000-7000-8000-000000000777";
     const agentFile = path.join(claudeDirectory, "agent-opaque.jsonl");
-    fs.writeFileSync(agentFile, `${JSON.stringify({ type: "assistant", sessionId: claudeSession,
+    fs.writeFileSync(agentFile, `${JSON.stringify({ type: "assistant", sessionId: agentSession,
       timestamp: "2026-01-02T00:00:05.000Z", message: { id: "message-c",
         usage: { input_tokens: 20, output_tokens: 2 } } })}\n`, { mode: 0o600 });
     sealExtra(buffer, "claude_code", agentFile);
@@ -327,8 +330,8 @@ async function main() {
     check("claude_agent_file_uses_declared_session", agentPlan.missingRows === 1);
     const agentApply = await applyCaptureHistory(buffer, claudeRoot);
     check("claude_agent_file_imports_once", agentApply.importedRows === 1 &&
-      (buffer.database.prepare(`select sum(input_tokens) as input from buffered_events where session_id=?`)
-        .get(claudeSession) as { input: number }).input === 210);
+      (buffer.database.prepare(`select sum(input_tokens) as input from buffered_events where session_id in (?,?)`)
+        .get(claudeSession, agentSession) as { input: number }).input === 210);
 
     const duplicate = "019d0000-0000-7000-8000-000000000011";
     const original = codexFile(directory, duplicate, [[100, 10], [150, 15]]);

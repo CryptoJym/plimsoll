@@ -34,10 +34,14 @@ type CodexState = { sessionId: string; previous: Amounts; index: number; observe
   reasoningOutput: number; contextOccurrenceIndex: number; model?: string; sessionStartedAt?: string;
   originator?: string; cliVersion?: string; planType?: string };
 type ClaudeRevision = { sessionId: string; messageId: string; messageKey: string; current: Amounts };
-type PrefixCheckpoint = { digest: string; current: Amounts; messageKey?: string; codexState?: CodexState };
+type RecordBytes = { recordIndex: number; byteOffset: number; digest: string };
+type SessionBytes = { length: number; digest: string; records?: RecordBytes[] };
+type PrefixCheckpoint = { digest: string; current: Amounts; recordIndex?: number; byteOffset?: number; messageKey?: string; codexState?: CodexState };
 type ConfinedParent = { path: string; stamp: string };
 type File = { file: string; fileKey: string; limit: number; stamp: string; fencedAt: string;
   parents: ConfinedParent[];
+  sessionId?: string; records?: RecordBytes[]; lineOffset?: number; lineDigest?: () => string;
+  shorterImportedCopy?: boolean; writtenRecordIndex?: number;
   prefixHash?: string; savedPrefixHash?: string; baselineDefined?: boolean;
   initialCodex?: CodexState; finalCodex?: CodexState;
   initialClaude?: Map<string, Amounts>; finalClaude?: Map<string, ClaudeRevision>;
@@ -47,6 +51,7 @@ type File = { file: string; fileKey: string; limit: number; stamp: string; fence
 type Candidate = { event: AiInteractionEvent; sourceId: string; claudeRevision?: ClaudeRevision;
   prefixCheckpoint?: PrefixCheckpoint };
 export type CaptureHistoryPlan = {
+  refusals: Array<{ fileKey: string; reason: string; missingRows: 0 }>;
   status: "capture_roots_history_plan"; rootId: string; source: CaptureRoot["source"];
   dryRun: true; files: number; sessions: number; skippedLiveSessions: number;
   existingRows: number; missingRows: number; firstObservedAt: string | null;
@@ -184,6 +189,7 @@ function* lines(file: File): Generator<string> {
   const fd = openFencedFile(file);
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const hash = crypto.createHash("sha256");
+  const recordHash = crypto.createHash("sha256");
   let offset = 0;
   let pending = Buffer.alloc(0);
   try {
@@ -203,6 +209,9 @@ function* lines(file: File): Generator<string> {
         if (bytes[index] !== 10) continue;
         const line = bytes.subarray(start, index);
         if (line.length > MAX_LINE_BYTES) refusal("record_exceeds_byte_budget");
+        recordHash.update(bytes.subarray(start, index + 1));
+        file.lineOffset = offset - bytes.length + index + 1;
+        file.lineDigest = () => recordHash.copy().digest("hex");
         yield decoder.decode(line);
         start = index + 1;
       }
@@ -335,27 +344,6 @@ function durableCodexState(db: DB, sessionId: string): CodexState | undefined {
     where source='codex' and session_id=?`).get(sessionId) as { state: string } | undefined;
   return row ? decodeCodexState(row.state, sessionId) : undefined;
 }
-function durableClaudeRevision(db: DB, sessionId: string, messageKey: string): Amounts | undefined {
-  if (!table(db, "transcript_usage_revision_state")) return undefined;
-  const row = db.prepare(`select input_tokens as input,cache_read_tokens as cacheRead,
-    cache_creation_tokens as cacheCreation,output_tokens as output
-    from transcript_usage_revision_state where source='claude_code' and session_id=? and message_key=?`)
-    .get(sessionId, messageKey) as Amounts | undefined;
-  return row;
-}
-function durablePrefixCheckpoint(db: DB, source: CaptureRoot["source"], sessionId: string,
-  digest: string, current: Amounts, messageKey?: string): PrefixCheckpoint | undefined {
-  if (!table(db, "capture_history_import_prefixes")) return undefined;
-  const row = db.prepare(`select input_tokens as input,cache_read_tokens as cacheRead,
-    cache_creation_tokens as cacheCreation,output_tokens as output,
-    message_key as messageKey,parser_state_json as parserState
-    from capture_history_import_prefixes where source=? and session_id=? and prefix_digest=?`)
-    .get(source, sessionId, digest) as (Amounts & { messageKey: string | null;
-      parserState: string | null }) | undefined;
-  if (!row || !sameAmounts(row, current) || row.messageKey !== (messageKey ?? null)) return undefined;
-  return { digest, current, ...(messageKey ? { messageKey } : {}),
-    ...(row.parserState ? { codexState: decodeCodexState(row.parserState, sessionId) } : {}) };
-}
 function rememberPrefixCheckpoint(db: DB, source: CaptureRoot["source"], sessionId: string,
   checkpoint: PrefixCheckpoint) {
   db.prepare(`insert or ignore into capture_history_import_prefixes
@@ -365,6 +353,96 @@ function rememberPrefixCheckpoint(db: DB, source: CaptureRoot["source"], session
       checkpoint.current.input, checkpoint.current.cacheRead,
       checkpoint.current.cacheCreation, checkpoint.current.output,
       checkpoint.messageKey ?? null, checkpoint.codexState ? JSON.stringify(checkpoint.codexState) : null);
+}
+
+function importedSessionBytes(db: DB, source: CaptureRoot["source"], sessionId: string) {
+  if (!table(db, "capture_history_session_bytes")) return undefined;
+  return db.prepare(`select imported_length as length,prefix_digest as digest
+    from capture_history_session_bytes where source=? and session_id=?`)
+    .get(source, sessionId) as SessionBytes | undefined;
+}
+function importedSessionWithoutBytes(db: DB, source: CaptureRoot["source"], sessionId: string) {
+  return (table(db, "capture_history_import_prefixes") && Boolean(db.prepare(`select 1
+    from capture_history_import_prefixes where source=? and session_id=? limit 1`).get(source, sessionId))) ||
+    (table(db, "capture_history_session_counters") && Boolean(db.prepare(`select 1
+      from capture_history_session_counters where source=? and session_id=?`).get(source, sessionId)));
+}
+function fingerprintLength(file: File, length: number) {
+  if (length === file.limit) return file.prefixHash!;
+  const fd = openFencedFile(file);
+  const hash = crypto.createHash("sha256");
+  try {
+    for (let offset = 0; offset < length;) {
+      const take = Math.min(READ_BYTES, length - offset);
+      const bytes = Buffer.allocUnsafe(take);
+      if (fs.readSync(fd, bytes, 0, take, offset) !== take) refusal("fenced_prefix_short_read");
+      hash.update(bytes); offset += take;
+    }
+    verifyParents(file);
+    return hash.digest("hex");
+  } finally { fs.closeSync(fd); }
+}
+function verifyImportedBytes(db: DB, root: CaptureRoot, file: File, verified: Map<string, SessionBytes>) {
+  if (!file.sessionId) return;
+  const prior = verified.get(file.sessionId) ?? importedSessionBytes(db, root.source, file.sessionId);
+  if (!prior && importedSessionWithoutBytes(db, root.source, file.sessionId))
+    refusal("imported_prefix_fingerprint_missing");
+  if (prior) {
+    if (!Number.isSafeInteger(prior.length) || prior.length < 0 || !/^[0-9a-f]{64}$/.test(prior.digest))
+      refusal("imported_prefix_fingerprint_missing");
+    if (file.limit >= prior.length) {
+      if (fingerprintLength(file, prior.length) !== prior.digest)
+        // Keep the existing refusal label for unmodified reviewer callers.
+        refusal("counter_regression:copied_prefix_bytes_differ");
+    } else {
+      const last = file.records?.at(-1);
+      if (!last) refusal("copied_prefix_usage_record_missing");
+      const saved = prior.records ? prior.records.find(record => record.recordIndex === last.recordIndex &&
+        record.byteOffset === last.byteOffset) : table(db, "capture_history_record_bytes")
+        ? db.prepare(`select prefix_digest as digest from capture_history_record_bytes
+          where source=? and session_id=? and record_index=? and byte_offset=?`)
+          .get(root.source, file.sessionId, last.recordIndex, last.byteOffset) as { digest: string } | undefined
+        : undefined;
+      if (!saved || !/^[0-9a-f]{64}$/.test(saved.digest)) refusal("copied_prefix_record_fingerprint_missing");
+      if (saved.digest !== last.digest) refusal("counter_regression:copied_prefix_bytes_differ");
+      file.shorterImportedCopy = true;
+    }
+  }
+  if (!prior || file.limit > prior.length) verified.set(file.sessionId,
+    { length: file.limit, digest: file.prefixHash!, records: file.records });
+}
+function rememberRecordBytes(db: DB, source: CaptureRoot["source"], sessionId: string, record: RecordBytes) {
+  db.prepare(`insert or ignore into capture_history_record_bytes
+    (source,session_id,record_index,byte_offset,prefix_digest) values (?,?,?,?,?)`)
+    .run(source, sessionId, record.recordIndex, record.byteOffset, record.digest);
+}
+function rememberSessionBytes(db: DB, source: CaptureRoot["source"], sessionId: string, length: number, digest: string) {
+  db.prepare(`insert into capture_history_session_bytes (source,session_id,imported_length,prefix_digest)
+    values (?,?,?,?) on conflict(source,session_id) do update set
+      imported_length=excluded.imported_length,prefix_digest=excluded.prefix_digest
+    where excluded.imported_length>capture_history_session_bytes.imported_length`)
+    .run(source, sessionId, length, digest);
+}
+function isLiveSession(db: DB, source: CaptureRoot["source"], sessionId: string) {
+  return (db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
+    .get(source, sessionId) as { authority: string } | undefined)?.authority === "live";
+}
+async function rememberRemainingRecordBytes(db: DB, root: CaptureRoot, file: File) {
+  if (!file.sessionId || isLiveSession(db, root.source, file.sessionId)) return;
+  const saved = db.prepare(`select max(record_index) as n from capture_history_record_bytes
+    where source=? and session_id=?`).get(root.source, file.sessionId) as { n: number | null };
+  const remaining = (file.records ?? []).filter(record => record.recordIndex > (saved.n ?? -1));
+  for (let index = 0; index < remaining.length;) {
+    db.transaction(() => {
+      verifyParents(file);
+      if (isLiveSession(db, root.source, file.sessionId!)) { index = remaining.length; return; }
+      const started = performance.now();
+      let rows = 0;
+      do { rememberRecordBytes(db, root.source, file.sessionId!, remaining[index++]!); rows++; }
+      while (index < remaining.length && rows < WRITER_MAX_ROWS && performance.now() - started < WRITER_TARGET_MS);
+    }).immediate();
+    if (index < remaining.length) await new Promise<void>(resolve => setTimeout(resolve, 250));
+  }
 }
 function event(root: CaptureRoot, sourceId: string, sessionId: string, observedAt: string,
   model: string | undefined, delta: Amounts, extra: Record<string, unknown> = {},
@@ -395,22 +473,16 @@ function event(root: CaptureRoot, sourceId: string, sessionId: string, observedA
   });
 }
 
-function* codexEvents(root: CaptureRoot, file: File, db: DB,
-  sessions: Map<string, CodexState>, seenHashes: Map<string, Set<string>>): Generator<Candidate> {
+function* codexEvents(root: CaptureRoot, file: File): Generator<Candidate> {
   const sessionId = path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
   if (!sessionId) refusal("codex_file_session_missing");
-  let state = structuredClone(file.initialCodex ?? sessions.get(sessionId) ??
-    (file.baselineDefined ? undefined : durableCodexState(db, sessionId)) ?? initialCodexState(sessionId));
-  const imported = durableCodexState(db, sessionId);
+  file.sessionId = sessionId;
+  // A file is parsed from its original baseline. Cross-folder recognition is
+  // a separate byte comparison after EOF, independent of these counters.
+  const state = structuredClone(file.initialCodex ?? initialCodexState(sessionId));
   file.initialCodex ??= structuredClone(state);
-  let tokenObservations = 0;
-  let replayingPrefix = false;
-  let matchedPrefix = false;
-  let legacyDuplicate = false;
-  let replayedZero = false;
-  const prefix = crypto.createHash("sha256");
+  file.records = [];
   for (const line of lines(file)) {
-    prefix.update(line).update("\n");
     if (!line.includes('"session_meta"') && !line.includes('"turn_context"') &&
         !line.includes('"token_count"')) continue;
     let parsed: Record<string, any>;
@@ -430,48 +502,10 @@ function* codexEvents(root: CaptureRoot, file: File, db: DB,
     } else if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
       const reported = parsed.payload?.info?.total_token_usage;
       if (!reported) { state.index += 1; continue; }
+      const record: RecordBytes = { recordIndex: file.records.length,
+        byteOffset: file.lineOffset!, digest: file.lineDigest!() };
+      file.records.push(record);
       const current = totals(reported);
-      if (tokenObservations === 0 && belowAmounts(current, state.previous)) {
-        // A copied session restarts its counters. Only records whose rolling
-        // digest was already imported may be skipped; the first new record
-        // after the durable counter is the sole marginal suffix.
-        replayingPrefix = true;
-        file.initialCodex = initialCodexState(sessionId);
-      }
-      tokenObservations += 1;
-      if (replayingPrefix && zero(current)) {
-        // The zero observation still occupies index zero. The legacy
-        // identical-file fallback needs the same parser position as the
-        // ordinary tailer before it sees the first positive counter.
-        state.previous = { ...ZERO_AMOUNTS };
-        state.index = 0;
-        state.observedBaseline = true;
-        state.reasoningOutput = amount(reported.reasoning_output_tokens);
-        replayedZero = true;
-        continue;
-      }
-      if (replayingPrefix && !zero(current)) {
-        const checkpoint = durablePrefixCheckpoint(db, "codex", sessionId,
-          prefix.copy().digest("hex"), current);
-        if (checkpoint?.codexState) {
-          state = structuredClone(checkpoint.codexState);
-          matchedPrefix = true;
-          if (imported && sameAmounts(current, imported.previous)) replayingPrefix = false;
-          continue;
-        }
-        // Two identical files in the current scan may have no durable
-        // checkpoint yet. Retain the original whole-file-digest fallback.
-        if (!seenHashes.get(sessionId)?.size) refusal("counter_regression");
-        legacyDuplicate = true;
-        replayingPrefix = false;
-        if (!replayedZero) {
-          state.previous = { ...ZERO_AMOUNTS };
-          state.index = -1;
-          state.observedBaseline = false;
-          state.reasoningOutput = 0;
-        }
-      }
-      if (replayingPrefix) continue;
       state.index += 1;
       const delta = positiveDelta(current, state.previous);
       const firstUnknown = !state.observedBaseline && !zero(current);
@@ -489,33 +523,19 @@ function* codexEvents(root: CaptureRoot, file: File, db: DB,
         { turnIndex: state.index, ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
           sourceCumulativeInput: current.input, sourceCumulativeCachedInput: current.cacheRead,
           sourceCumulativeOutput: current.output } : {}) }, firstUnknown),
-        prefixCheckpoint: { digest: prefix.copy().digest("hex"), current,
-          codexState: structuredClone(state) } };
+        prefixCheckpoint: { ...record, current, codexState: structuredClone(state) } };
     }
   }
-  if ((replayingPrefix && !matchedPrefix) ||
-      (legacyDuplicate && !seenHashes.get(sessionId)?.has(file.prefixHash ?? "")))
-    refusal("counter_regression");
   file.finalCodex = structuredClone(state);
-  sessions.set(sessionId, structuredClone(state));
-  const hashes = seenHashes.get(sessionId) ?? new Set<string>();
-  hashes.add(file.prefixHash!);
-  seenHashes.set(sessionId, hashes);
 }
 
-function* claudeEvents(root: CaptureRoot, file: File,
-  revisions: Map<string, Map<string, Amounts>>, db: DB): Generator<Candidate> {
+function* claudeEvents(root: CaptureRoot, file: File): Generator<Candidate> {
   let sessionId = path.basename(file.file, ".jsonl").match(UUID_AT_END)?.[0]?.toLowerCase();
-  const firstInFile = new Set<string>();
+  const byMessage = new Map<string, Amounts>();
   file.initialClaude ??= new Map();
   file.finalClaude = new Map();
-  const prefix = crypto.createHash("sha256");
-  let replayingPrefix = false;
-  let matchedPrefix = false;
-  let replayMessageKey: string | undefined;
-  let replayTarget: Amounts | undefined;
+  file.records = [];
   for (const line of lines(file)) {
-    prefix.update(line).update("\n");
     if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
     let parsed: Record<string, any>;
     try { parsed = JSON.parse(line) as Record<string, any>; }
@@ -524,47 +544,18 @@ function* claudeEvents(root: CaptureRoot, file: File,
     const claimed = typeof parsed.sessionId === "string"
       ? parsed.sessionId.match(UUID_AT_END)?.[0]?.toLowerCase() : undefined;
     sessionId ??= claimed;
-    if (!sessionId || (claimed && claimed !== sessionId))
-      refusal("claude_session_mismatch");
-    const byMessage = revisions.get(sessionId) ?? new Map<string, Amounts>();
-    revisions.set(sessionId, byMessage);
+    if (!sessionId || (claimed && claimed !== sessionId)) refusal("claude_session_mismatch");
+    file.sessionId = sessionId;
+    const record: RecordBytes = { recordIndex: file.records.length,
+      byteOffset: file.lineOffset!, digest: file.lineDigest!() };
+    file.records.push(record);
     const messageId = parsed.message?.id;
     if (typeof messageId !== "string" || !messageId) refusal("claude_message_id_missing");
     const messageKey = crypto.createHash("sha256").update(messageId).digest("hex");
     const stateKey = `${sessionId}\0${messageKey}`;
-    if (!firstInFile.has(stateKey)) {
-      firstInFile.add(stateKey);
-      if (file.baselineDefined) {
-        const initial = file.initialClaude.get(stateKey);
-        if (initial) byMessage.set(messageId, initial);
-        else byMessage.delete(messageId);
-      } else {
-        const initial = byMessage.get(messageId) ?? durableClaudeRevision(db, sessionId, messageKey);
-        if (initial) {
-          byMessage.set(messageId, initial);
-          file.initialClaude.set(stateKey, initial);
-        }
-      }
-    }
     const current = totals(parsed.message?.usage);
-    const prior = byMessage.get(messageId);
-    if (!replayingPrefix && !matchedPrefix && prior && belowAmounts(current, prior)) {
-      replayingPrefix = true;
-      replayMessageKey = messageKey;
-      replayTarget = prior;
-    }
-    if (replayingPrefix) {
-      const checkpoint = durablePrefixCheckpoint(db, "claude_code", sessionId,
-        prefix.copy().digest("hex"), current, messageKey);
-      if (!checkpoint) refusal("counter_regression");
-      matchedPrefix = true;
-      byMessage.set(messageId, current);
-      file.finalClaude.set(stateKey, { sessionId, messageId, messageKey, current });
-      if (messageKey === replayMessageKey && replayTarget && sameAmounts(current, replayTarget))
-        replayingPrefix = false;
-      continue;
-    }
-    const delta = positiveDelta(current, prior ?? { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 });
+    const prior = byMessage.get(messageId) ?? file.initialClaude.get(stateKey);
+    const delta = positiveDelta(current, prior ?? ZERO_AMOUNTS);
     byMessage.set(messageId, current);
     const revision = { sessionId, messageId, messageKey, current };
     file.finalClaude.set(stateKey, revision);
@@ -576,9 +567,9 @@ function* claudeEvents(root: CaptureRoot, file: File,
     if (typeof parsed.timestamp !== "string") refusal("claude_timestamp_missing");
     const model = typeof parsed.message?.model === "string" ? parsed.message.model : undefined;
     yield { sourceId: id, event: event(root, id, sessionId, parsed.timestamp, model, delta),
-      claudeRevision: revision,
-      prefixCheckpoint: { digest: prefix.copy().digest("hex"), current, messageKey } };
+      claudeRevision: revision, prefixCheckpoint: { ...record, current, messageKey } };
   }
+  file.sessionId ??= sessionId;
 }
 
 type ScanResult = { plan: CaptureHistoryPlan; files: File[] };
@@ -649,23 +640,28 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   const skippedLive = new Set<string>();
   const seen = new Map<string, string>();
   const matchedReceipts = new Set<string>();
-  const revisions = new Map<string, Map<string, Amounts>>();
-  const codexStates = new Map<string, CodexState>();
-  const codexHashes = new Map<string, Set<string>>();
   let candidateIndex = 0;
   let resumeVerified = !resume?.index;
   const plan: CaptureHistoryPlan = { status: "capture_roots_history_plan", rootId: root.rootId,
-    source: root.source, dryRun: true, files: files.length, sessions: 0, skippedLiveSessions: 0,
+    source: root.source, dryRun: true, refusals: [], files: files.length, sessions: 0, skippedLiveSessions: 0,
     existingRows: 0, missingRows: 0, firstObservedAt: null, lastObservedAt: null,
     tokens: { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 },
     fencedBytes: files.reduce((sum, file) => sum + file.limit, 0), since: options.since ?? null };
+  const verifiedSessions = new Map<string, SessionBytes>();
   for (const file of files) {
-    // A generator checks its prefix digest only when it reaches EOF. Keep
-    // candidates outside the ledger until that check has succeeded, so a
-    // changed file cannot expose a partial import to upload or projection.
+    // Parse into memory; neither planning counts nor publication start until
+    // all bytes have been compared with the imported session's fingerprint.
+    let events: Candidate[];
+    try {
+      events = [...(root.source === "codex" ? codexEvents(root, file) : claudeEvents(root, file))];
+      verifyImportedBytes(db, root, file, verifiedSessions);
+    } catch (error) {
+      const reason = String(error).match(/capture_history_refused:(.+)$/)?.[1];
+      if (!reason || expectedFiles) throw error;
+      plan.refusals.push({ fileKey: file.fileKey, reason, missingRows: 0 });
+      continue;
+    }
     const verifiedCandidates: Array<{ candidate: Candidate; index: number; digest: string }> = [];
-    const events = root.source === "codex" ? codexEvents(root, file, db, codexStates, codexHashes)
-      : claudeEvents(root, file, revisions, db);
     for (const candidate of events) {
       candidateIndex += 1;
       if (resume && candidateIndex === resume.index) {
@@ -675,6 +671,7 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       }
       const e = candidate.event;
       const session = e.sessionId!;
+      if (file.shorterImportedCopy) continue;
       if (options.since && e.observedAt < options.since) continue;
       if (e.observedAt >= file.fencedAt) continue;
       sessions.add(session);
@@ -817,6 +814,13 @@ function ensureImportSchema(db: DB) {
     create table if not exists capture_history_session_counters (
       source text not null,session_id text not null,last_index integer not null,
       state_json text not null,primary key(source,session_id));
+    create table if not exists capture_history_session_bytes (
+      source text not null,session_id text not null,imported_length integer not null,
+      prefix_digest text not null,primary key(source,session_id));
+    create table if not exists capture_history_record_bytes (
+      source text not null,session_id text not null,record_index integer not null,
+      byte_offset integer not null,prefix_digest text not null,
+      primary key(source,session_id,record_index,byte_offset));
     create table if not exists capture_history_import_prefixes (
       source text not null,session_id text not null,prefix_digest text not null,
       input_tokens integer not null,cache_read_tokens integer not null,
@@ -983,6 +987,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
   // imported row would otherwise repeat CREATE TABLE/INDEX work.
   prepareCaptureRootObservationSchema(db);
   const first = await scan(db, root, options);
+  if (first.plan.refusals.length) refusal(first.plan.refusals[0]!.reason);
   const fencedSourceDigest = sourceDigest(first.files, options.since);
   let runId = "";
   let resume: ResumePoint = { index: 0, digest: null };
@@ -1156,6 +1161,14 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
             if (item.candidate.claudeRevision) rememberClaudeRevision(db, item.candidate.claudeRevision);
             if (item.candidate.prefixCheckpoint)
               rememberPrefixCheckpoint(db, root.source, e.sessionId!, item.candidate.prefixCheckpoint);
+            const recordIndex = item.candidate.prefixCheckpoint?.recordIndex;
+            if (recordIndex !== undefined) {
+              for (let index = (sourceFile.writtenRecordIndex ?? -1) + 1; index <= recordIndex; index++)
+                rememberRecordBytes(db, root.source, e.sessionId!, sourceFile.records![index]!);
+              sourceFile.writtenRecordIndex = recordIndex;
+              const record = sourceFile.records![recordIndex]!;
+              rememberSessionBytes(db, root.source, e.sessionId!, record.byteOffset, record.digest);
+            }
           }
           processed += 1;
           writerRowMs = Math.max(writerRowMs, performance.now() - rowStarted);
@@ -1242,6 +1255,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
       db.transaction(() => rememberFileBaseline(db, root, file)).immediate();
     }, async file => {
       while (pending.length) await flush();
+      await rememberRemainingRecordBytes(db, root, file);
       // The normal tailer defers this file until its verified cumulative
       // state and all of its historical rows have reached the ledger.
       if (root.source === "claude_code") {
@@ -1263,7 +1277,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
       }
       db.transaction(() => {
         verifyParents(file);
-        if (file.finalCodex) {
+        if (file.finalCodex && !isLiveSession(db, root.source, file.finalCodex.sessionId)) {
           const final = file.finalCodex;
           const prior = durableCodexState(db, final.sessionId);
           // A shorter verified copy may have a different token-count index.
@@ -1278,6 +1292,8 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
               .run(final.sessionId, final.index, JSON.stringify(final));
           }
         }
+        if (file.sessionId && !isLiveSession(db, root.source, file.sessionId))
+          rememberSessionBytes(db, root.source, file.sessionId, file.limit, file.prefixHash!);
         rememberFileCursor(db, root, file);
         db.prepare(`update capture_history_file_state set handoff_ready=1 where file_key=?`)
           .run(file.fileKey);

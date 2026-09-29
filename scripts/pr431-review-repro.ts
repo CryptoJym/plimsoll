@@ -83,15 +83,16 @@ async function splitCodexSession() {
     seal(fixture.buffer, "codex", files);
     const first = await applyCaptureHistory(fixture.buffer, a);
     const secondPlan = await planCaptureHistory(fixture.buffer.database, b);
-    const second = await applyCaptureHistory(fixture.buffer, b);
+    assert.equal(secondPlan.missingRows, 0);
+    assert.equal(secondPlan.refusals.length, 1);
+    let refusal = "none";
+    try { await applyCaptureHistory(fixture.buffer, b); }
+    catch (error) { refusal = String(error); }
+    assert.ok(refusal.includes(secondPlan.refusals[0]!.reason));
     const actual = inputTotal(fixture.buffer);
-    console.log(JSON.stringify({ case: "split_codex_session", firstImported: first.importedRows,
-      secondPlannedTokens: secondPlan.tokens.input, secondImported: second.importedRows,
-      expectedInputTokens: 150, actualInputTokens: actual }));
-    assert.equal(actual, 150, "a continuing Codex counter must retain the preceding root's baseline");
-    assert.equal((await applyCaptureHistory(fixture.buffer, a)).importedRows, 0);
-    assert.equal((await applyCaptureHistory(fixture.buffer, b)).importedRows, 0);
-    assert.equal(inputTotal(fixture.buffer), 150, "cross-root replay must keep first-seen ordering");
+    console.log(JSON.stringify({ case: "seen_codex_later_records", firstImported: first.importedRows,
+      secondPlannedRows: secondPlan.missingRows, refusal, expectedInputTokens: 100, actualInputTokens: actual }));
+    assert.equal(actual, 100, "later records of a seen session lack the imported bytes and must add nothing");
   } finally { fixture.close(); }
 }
 
@@ -106,17 +107,17 @@ async function splitClaudeSession() {
     fs.writeFileSync(secondFile, `${claudeLine(150, "2026-01-02T00:00:02.000Z")}\n`, { mode: 0o600 });
     seal(fixture.buffer, "claude_code", [firstFile, secondFile]);
     await applyCaptureHistory(fixture.buffer, a);
+    const plan = await planCaptureHistory(fixture.buffer.database, b);
+    assert.equal(plan.missingRows, 0);
+    assert.equal(plan.refusals.length, 1);
     let refusal = "none";
     try { await applyCaptureHistory(fixture.buffer, b); }
     catch (error) { refusal = String(error); }
+    assert.ok(refusal.includes(plan.refusals[0]!.reason));
     const actual = inputTotal(fixture.buffer);
-    console.log(JSON.stringify({ case: "split_claude_session", secondRootRefusal: refusal,
-      expectedInputTokens: 150,
-      actualInputTokens: actual }));
-    assert.equal(actual, 150, "a Claude revision in another root must import its marginal 50 tokens");
-    assert.equal((await applyCaptureHistory(fixture.buffer, a)).importedRows, 0);
-    assert.equal((await applyCaptureHistory(fixture.buffer, b)).importedRows, 0);
-    assert.equal(inputTotal(fixture.buffer), 150, "cross-root replay must keep revision ordering");
+    console.log(JSON.stringify({ case: "seen_claude_later_records", secondRootRefusal: refusal,
+      expectedInputTokens: 100, actualInputTokens: actual }));
+    assert.equal(actual, 100, "later records of a seen session lack the imported bytes and must add nothing");
   } finally { fixture.close(); }
 }
 
