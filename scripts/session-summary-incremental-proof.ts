@@ -130,6 +130,7 @@ async function runIncremental(buffer: LocalEventBuffer, sessionIds: string[]) {
   let fullRecomputes = 0;
   let rowsRead = 0;
   let elapsedMs = 0;
+  const pendingTrace: Array<{ attempt: number; reasons: Record<string, number>; rowsRead: number }> = [];
   const eligibleRows = (buffer.database.prepare(`select count(*) as count from buffered_events
     where session_id in (${sessionIds.map(() => "?").join(",")})`).get(...sessionIds) as { count: number }).count;
   for (let attempt = 1; ; attempt += 1) {
@@ -159,10 +160,19 @@ async function runIncremental(buffer: LocalEventBuffer, sessionIds: string[]) {
     fullRecomputes += result.summaryStats.fullRecomputes;
     rowsRead += result.summaryStats.rowsRead;
     elapsedMs += result.summaryStats.durationMs;
+    if (!result.summaryComplete) {
+      const sent = wire ? JSON.parse(wire).sessions as Array<{ session: { id: string } }> : [];
+      for (const pendingId of result.pendingSummarySessionIds) {
+        assert.ok(!sent.some((row) => row.session.id === pendingId),
+          "a partial accumulator cannot be sent");
+      }
+      pendingTrace.push({ attempt, reasons: result.pendingSummaryReasons,
+        rowsRead: result.summaryStats.rowsRead });
+    }
     const bound = Math.ceil(eligibleRows / SESSION_SUMMARY_DEFAULT_MAX_ROWS) +
       Math.floor(elapsedMs / SESSION_SUMMARY_DEFAULT_MAX_MS) + 1;
     assert.ok(attempt <= bound,
-      JSON.stringify({ attempt, bound, eligibleRows, elapsedMs, pending: result.pendingSummaryReasons }));
+      JSON.stringify({ attempt, bound, eligibleRows, elapsedMs, pendingTrace }));
     if (result.summaryComplete) {
       return {
         result: { ...result, summaryStats: { ...result.summaryStats, fullRecomputes, rowsRead } },
@@ -816,6 +826,12 @@ async function reviewRegressions() {
         buffer.database.prepare("update buffered_events set output_tokens = 42 where id = ?").run(uuid(441));
         const first = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead, maxRows: 1 });
         assert.equal(first.complete, false);
+        const repairCursor = () => {
+          const row = buffer.database.prepare(`select accumulator_json as accumulatorJson
+            from session_sync_summary_state where session_id = ?`).get(sessionId) as { accumulatorJson: string };
+          return JSON.parse(row.accumulatorJson).activeRepair?.cursorRowid as number | undefined;
+        };
+        const firstCursor = repairCursor();
         const unrelatedId = "eeeeeeee-eeee-4eee-8eee-000000000001";
         insertRaw(buffer, {
           id: uuid(470), sessionId: unrelatedId,
@@ -824,7 +840,10 @@ async function reviewRegressions() {
         });
         buffer.database.prepare("update buffered_events set output_tokens = 43 where id = ?").run(uuid(470));
         const second = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead, maxRows: 1 });
-        assert.ok(second.highWater > first.highWater, JSON.stringify({ first, second }));
+        assert.equal(second.fullRecompute, false);
+        assert.equal(second.snapshot, null, "a partial repair cannot be sent");
+        assert.ok(firstCursor !== undefined && (repairCursor() ?? 0) > firstCursor,
+          "the target session repair must advance despite an unrelated revision");
       } else if (name === "retry_erasure") {
         add(1);
         await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
@@ -1041,7 +1060,8 @@ async function reviewRegressions() {
         assert.equal(first.snapshot?.events, 1);
         const later = "2026-10-10T00:00:00.000Z";
         const second = await updateSessionSummary(buffer.database, sessionId, later, { read: directRead });
-        assert.equal(second.fullRecompute, true);
+        assert.equal(second.fullRecompute, false,
+          "a maturing future row repairs its bounded segment");
         assert.deepEqual(second.snapshot, collectSessionSnapshots(buffer.database, {
           until: later, sessionIds: [sessionId],
         })[0]);
@@ -1087,7 +1107,9 @@ async function reviewRegressions() {
         assert.equal(first.highWater, 100);
         sparse(1, 150);
         const resumed = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
-        assert.equal(resumed.fullRecompute, true);
+        assert.equal(resumed.fullRecompute, false,
+          "a sparse backdated insert repairs its segment without restarting");
+        assert.equal(resumed.complete, true);
         assert.deepEqual(resumed.snapshot, collectSessionSnapshots(buffer.database, {
           until, sessionIds: [sessionId],
         })[0]);
@@ -1406,13 +1428,15 @@ async function main() {
     buffer.database.prepare("update buffered_events set input_tokens = 777 where id = ?").run(oldA);
     const edited = await runIncremental(buffer, [sessionA, sessionB]);
     assert.equal(edited.result.summaryComplete, true);
-    assert.ok(edited.result.summaryStats.fullRecomputes >= 1);
+    assert.equal(edited.result.summaryStats.fullRecomputes, 0,
+      "a scanned edit repairs its segment without restarting the session");
     compareExact(buffer, [sessionA, sessionB], edited.sent);
 
     buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(2));
     const deleted = await runIncremental(buffer, [sessionA, sessionB]);
     assert.equal(deleted.result.summaryComplete, true);
-    assert.ok(deleted.result.summaryStats.fullRecomputes >= 1);
+    assert.equal(deleted.result.summaryStats.fullRecomputes, 0,
+      "a scanned erasure repairs its segment without restarting the session");
     compareExact(buffer, [sessionA, sessionB], deleted.sent);
 
     const privacyRow = buffer.database.prepare(
@@ -1423,7 +1447,8 @@ async function main() {
     ), 1);
     const privacy = await runIncremental(buffer, [sessionA, sessionB]);
     assert.equal(privacy.result.summaryComplete, true);
-    assert.ok(privacy.result.summaryStats.fullRecomputes >= 1);
+    assert.equal(privacy.result.summaryStats.fullRecomputes, 0,
+      "a privacy disposition repairs its segment without restarting the session");
     compareExact(buffer, [sessionA, sessionB], privacy.sent);
 
     // A bounded pass persists its HWM before the process is restarted.
@@ -1461,19 +1486,20 @@ async function main() {
       assert.equal(hwmBroken.result.summaryComplete, true);
       assert.ok(hwmBroken.result.summaryStats.fullRecomputes >= 1);
       compareExact(restarted, [sessionC], hwmBroken.sent);
+      const recomputesAfterCorruption = sessionSummaryCounters(restarted.database).fallbackRecomputes;
 
       // Mutation-probe: delete the dirty marker after an edit. The global
-      // mutation revision still forces a safe fallback instead of a wrong
-      // incremental result.
+      // mutation revision and durable segment repair still force an exact
+      // snapshot instead of accepting stale state.
       restarted.database.prepare("update buffered_events set output_tokens = 88 where id = ?").run(uuid(100));
       restarted.database.prepare("delete from session_sync_summary_dirty where session_id = ?").run(sessionC);
       const skippedFallback = await runIncremental(restarted, [sessionC]);
       assert.equal(skippedFallback.result.summaryComplete, true);
-      assert.ok(skippedFallback.result.summaryStats.fullRecomputes >= 1);
+      assert.equal(skippedFallback.result.summaryStats.fullRecomputes, 0);
       compareExact(restarted, [sessionC], skippedFallback.sent);
 
       const counters = sessionSummaryCounters(restarted.database);
-      assert.ok(counters.fallbackRecomputes >= 5);
+      assert.equal(counters.fallbackRecomputes, recomputesAfterCorruption);
 
       // Optional real downgrade lane: a v0.7.37 LocalEventBuffer appends a
       // late row while the summary state is present, then the current code

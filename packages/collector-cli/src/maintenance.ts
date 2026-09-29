@@ -742,9 +742,16 @@ const PROJECTION_CADENCE_SECONDS=60;
 function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projection"]["status"]>){
   const high=status.backfill.highWater??0;
   const metricHigh=status.backfill.metricHighWater??0;
-  return Math.max(0,high-status.backfill.cursor)+
+  const migrationRows = Math.max(0,high-status.backfill.cursor)+
     Math.max(0,high-status.backfill.parityCursor)+
-    Math.max(0,metricHigh-status.backfill.metricCursor);
+    Math.max(0,metricHigh-status.backfill.metricCursor)+
+    (status.backfill.duplicateFactScan.complete ? 0 : Math.max(1,
+      status.backfill.duplicateFactScan.highWater-status.backfill.duplicateFactScan.cursor));
+  // After the scan cursor reaches its high water, its session and snapshot
+  // follow-through still needs a drain. Do not inflate an already pending
+  // rowid migration estimate with that final readiness unit.
+  return migrationRows || (status.parityReady && !status.dirty ? 0 : Math.max(1,
+    Object.values(status.backlog).reduce((sum, count) => sum + count, 0)));
 }
 
 /**
@@ -754,30 +761,46 @@ function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projec
  */
 export async function drainProjectionMigration(
   projection:LocalEventBuffer["projection"],
-  options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number;signal?:AbortSignal;budget?:CaptureWorkBudget}={},
+  options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number|(()=>number);
+    signal?:AbortSignal;budget?:CaptureWorkBudget}={},
 ){
   const maxSlices=Math.max(1,Math.min(options.maxSlices??PROJECTION_DRAIN_MAX_SLICES,100));
   const maxActiveMs=Math.max(1,Math.min(options.maxActiveMs??PROJECTION_DRAIN_MAX_ACTIVE_MS,5_000));
-  const cadenceSeconds=Math.max(1,options.cadenceSeconds??PROJECTION_CADENCE_SECONDS);
   let slices=0,yields=0,migrationRowsVisited=0,activeMs=0;
   let receipt:ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>|undefined;
   while(slices<maxSlices && !options.signal?.aborted && (options.budget?.canStart(5) ?? true)){
     if(slices>0){await new Promise<void>((resolve)=>setImmediate(resolve));yields++;}
     const started=performance.now();
-    receipt=projection.runMaintenance();
+    // The outer active-time limit controls the whole drain. Each synchronous
+    // transaction admits phases for at most 25 ms of that allowance; an
+    // already-admitted bounded unit is allowed to finish before yielding.
+    receipt=projection.runMaintenance(undefined, {maxActiveMs:Math.min(25,
+      Math.max(1,maxActiveMs-activeMs))});
     activeMs+=performance.now()-started;
     slices++;
-    migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+receipt.metricRowsVisited;
+    migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+
+      receipt.metricRowsVisited+receipt.duplicateFactScanRowsVisited;
     const status=projection.status();
-    const stillMigrating=!status.backfill.complete||!status.backfill.parityComplete||!status.backfill.metricComplete;
+    const stillMigrating=!status.parityReady||status.dirty||!status.backfill.complete||
+      !status.backfill.parityComplete||!status.backfill.metricComplete||
+      !status.backfill.duplicateFactScan.complete;
     if(!stillMigrating||activeMs>=maxActiveMs)break;
   }
   const status=projection.status(),remainingRowidUpperBound=projectionMigrationRemaining(status);
-  const capacityPerCadence=1_000*maxSlices;
+  // The active-time allowance may admit fewer than 1,000 rows per slice or
+  // fewer than maxSlices per turn. Quote the rows this turn actually visited
+  // at the interval that will schedule the next turn, including a pending
+  // duplicate scan's faster cadence.
+  const nextCadence=typeof options.cadenceSeconds==="function" ?
+    options.cadenceSeconds() : options.cadenceSeconds;
+  const cadenceSeconds=Math.max(0.25,nextCadence??PROJECTION_CADENCE_SECONDS);
+  const capacityPerCadence=Math.max(1,migrationRowsVisited);
   return {receipt:receipt!,drain:{slices,yields,migrationRowsVisited,
     activeMs:Number(activeMs.toFixed(3)),maxSlices,maxActiveMs,cadenceSeconds,remainingRowidUpperBound,
     estimatedMinutesUpperBound:Math.ceil(remainingRowidUpperBound/capacityPerCadence*cadenceSeconds/60),
-    stillMigrating:!status.backfill.complete||!status.backfill.parityComplete||!status.backfill.metricComplete} satisfies ProjectionDrainResult};
+    stillMigrating:!status.parityReady||status.dirty||!status.backfill.complete||
+      !status.backfill.parityComplete||!status.backfill.metricComplete||
+      !status.backfill.duplicateFactScan.complete} satisfies ProjectionDrainResult};
 }
 
 export class CollectorMaintenance {
@@ -974,8 +997,71 @@ export class CollectorMaintenance {
     // Assigned inside the runRepairs closure below; the typed null initializer keeps
     // the declared union so control-flow narrowing does not reduce it to null.
     let drained = null as Awaited<ReturnType<typeof drainProjectionMigration>> | null;
+    const migrationStatus=this.buffer.projection.status().backfill;
+    const migrationPending=!migrationStatus.complete || !migrationStatus.parityComplete ||
+      !migrationStatus.metricComplete || !migrationStatus.duplicateFactScan.complete;
+    let priorityProjectionRan = false;
+    const executeRepairStage = async (stage: RepairStage) => {
+      const counter = repairService.stages[stage];
+      counter.attempts += 1;
+      saveRepairService();
+      const stageStarted = clock();
+      try {
+        let rows = 0;
+        switch (stage) {
+          case "projection":
+            drained = await drainProjectionMigration(this.buffer.projection, {
+              maxSlices: 1, maxActiveMs: 25, signal: this.signal,
+              cadenceSeconds:()=>{
+                const migration=this.buffer.projection.status().backfill;
+                return !migration.duplicateFactScan.complete ? 0.25 :
+                  !migration.complete || !migration.parityComplete || !migration.metricComplete
+                    ? 1 : 5;
+              },
+            });
+            rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
+              drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
+              drained.receipt.duplicateFactScanRowsVisited +
+              drained.receipt.sessionRepairRowsVisited;
+            projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "reconciliation":
+            reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
+              legacyRowLimit: 64, legacyChunkLimit: 64, contextWindowLimit: 2,
+              contextRowLimit: 64, candidateLimit: 32, freshCandidateLimit: 16,
+              timeLimitMs: 25,
+            });
+            rows = reconciliation.rowsVisited;
+            reconciliationMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "repricing":
+            repricing = runRepricingMaintenance(this.buffer.database, { backfillLimit: 32, candidateLimit: 32 });
+            rows = repricing.rowsVisited;
+            repricingMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "repo_context_suppression":
+            rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
+            break;
+          case "learning_facts":
+            rows = this.buffer.learningFacts.runMaintenance(
+              DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH,
+            ).evicted;
+            break;
+        }
+        counter.completed += 1;
+        counter.rowsVisited += rows;
+        counter.lastSuccessAt = new Date(Date.now()).toISOString();
+      } catch (error) {
+        // A live session send lease refuses this transaction temporarily.
+        // The work remains queued, so this attempt is deferred, not failed.
+        if (isSessionSyncUploadLeaseError(error)) {
+          repairService.next = REPAIR_STAGES.indexOf(stage);
+        } else counter.failures += 1;
+        throw error;
+      } finally { saveRepairService(); }
+    };
     const runRepairs = async () => {
-      const repairStarted = performance.now();
+      const repairStarted = clock();
       // Historical Codex pairs must advance on every admitted repair turn;
       // reconciliation itself rotates with four other repair stages.
       if (!this.signal?.aborted && budget.canStart(15) &&
@@ -989,68 +1075,28 @@ export class CollectorMaintenance {
       }
       for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
         const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
+        // The pending scan already had its bounded slice before capture.
+        // Keep the rotating allowance for the other repair stages.
+        if (priorityProjectionRan && stage === "projection") continue;
         if (this.signal?.aborted || !budget.canStart(5) ||
-            (offset > 0 && performance.now() - repairStarted >= 75)) {
+            (offset > 0 && clock() - repairStarted >= 75)) {
           postCaptureDeferred.push(stage);
           continue;
         }
-        const counter = repairService.stages[stage];
-        counter.attempts += 1;
         // Rotate only admitted repair turns, avoiding a parity lock on stages.
         if (!repairTurnAdvanced) {
-          repairService.next = (firstRepair + 1) % REPAIR_STAGES.length;
+          repairService.next = (REPAIR_STAGES.indexOf(stage) + 1) % REPAIR_STAGES.length;
           repairTurnAdvanced = true;
         }
-        saveRepairService();
-        const stageStarted = clock();
-        try {
-          let rows = 0;
-          switch (stage) {
-            case "projection":
-              drained = await drainProjectionMigration(this.buffer.projection, {
-                maxSlices: 1, maxActiveMs: 25, signal: this.signal,
-              });
-              rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
-                drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
-                drained.receipt.sessionRepairRowsVisited;
-              projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
-              break;
-            case "reconciliation":
-              reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
-                legacyRowLimit: 64, legacyChunkLimit: 64, contextWindowLimit: 2,
-                contextRowLimit: 64, candidateLimit: 32, freshCandidateLimit: 16,
-                timeLimitMs: 25,
-              });
-              rows = reconciliation.rowsVisited;
-              reconciliationMs = Math.max(0, Math.round(clock() - stageStarted));
-              break;
-            case "repricing":
-              repricing = runRepricingMaintenance(this.buffer.database, { backfillLimit: 32, candidateLimit: 32 });
-              rows = repricing.rowsVisited;
-              repricingMs = Math.max(0, Math.round(clock() - stageStarted));
-              break;
-            case "repo_context_suppression":
-              rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
-              break;
-            case "learning_facts":
-              rows = this.buffer.learningFacts.runMaintenance(
-                DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH,
-              ).evicted;
-              break;
-          }
-          counter.completed += 1;
-          counter.rowsVisited += rows;
-          counter.lastSuccessAt = new Date(Date.now()).toISOString();
-        } catch (error) {
-          // A live session send lease refuses this transaction temporarily.
-          // The work remains queued, so this attempt is deferred, not failed.
-          if (isSessionSyncUploadLeaseError(error)) {
-            repairService.next = REPAIR_STAGES.indexOf(stage);
-          } else counter.failures += 1;
-          throw error;
-        } finally { saveRepairService(); }
+        await executeRepairStage(stage);
       }
     };
+    // Every pending projection migration gets one slice per admitted tick.
+    // The other stages retain the 75 ms rotating allowance after that slice.
+    if (migrationPending && !this.signal?.aborted && budget.canStart(5)) {
+      await executeRepairStage("projection");
+      priorityProjectionRan = true;
+    }
     if (!captureFirst) await runRepairs();
     const baselineAtStart = captureBaselineStatus(this.buffer.database);
     // Completed source snapshots stay armed while a per-generation ambiguity
@@ -1444,6 +1490,11 @@ export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOu
 
 export const AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS = 5_000;
 export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
+// A slow host may need several 25 ms writer-safe slices to drain one former
+// 250-row repair batch. Keep upgrade parity within an hour without extending
+// any individual writer transaction.
+export const AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS = 250;
+export const AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS = 1_000;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS = 1_000;
 const AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS = 5_000;
 const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
@@ -1451,7 +1502,8 @@ const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
 export type AutomaticMaintenanceCadenceStatus = {
   accepting: boolean;
   inFlight: boolean;
-  retryClass: "boot" | "startup" | "repair" | "capture" | "storage_busy" | "circuit" | "normal" | null;
+  retryClass: "boot" | "startup" | "repair" | "duplicate_scan" | "projection_migration" |
+    "capture" | "storage_busy" | "circuit" | "normal" | null;
   nextRetryAt: string | null;
   startupIntervalMs: number;
   normalIntervalMs: number;
@@ -1496,7 +1548,9 @@ export class AutomaticMaintenanceCadence<
       startupIntervalMs?: number;
       normalIntervalMs?: number;
       activeBudgetMs?: number;
-      repairProgress?: () => { pending: boolean; units: number };
+      repairProgress?: () => { pending: boolean; units: number;
+        duplicateScan?: { pending: boolean; cursor: number };
+        projectionMigration?: { pending: boolean } };
       retryNotBefore?: () => number | null;
       onError?: (error: unknown) => void;
       timer?: AutomaticMaintenanceCadenceTimer;
@@ -1577,6 +1631,8 @@ export class AutomaticMaintenanceCadence<
     const notBefore = this.options.retryNotBefore?.() ?? null;
     const delay = notBefore !== null && notBefore > now ? notBefore - now
       : retryClass === "normal" ? this.normalIntervalMs()
+        : retryClass === "duplicate_scan" ? AUTOMATIC_DUPLICATE_FACT_SCAN_INTERVAL_MS
+        : retryClass === "projection_migration" ? AUTOMATIC_PROJECTION_MIGRATION_INTERVAL_MS
         : retryClass === "storage_busy"
           ? Math.min(AUTOMATIC_MAINTENANCE_STORAGE_BUSY_MAX_INTERVAL_MS,
             AUTOMATIC_MAINTENANCE_STORAGE_BUSY_INITIAL_INTERVAL_MS *
@@ -1606,8 +1662,12 @@ export class AutomaticMaintenanceCadence<
     let storageBusy = false;
     let discoveryAdvanced = false;
     let baselineBefore: ReturnType<typeof captureBaselineStatus>["progress"] | null = null;
-    let repairBefore: { pending: boolean; units: number } | null = null;
+    let repairBefore: { pending: boolean; units: number;
+      duplicateScan?: { pending: boolean; cursor: number };
+      projectionMigration?: { pending: boolean } } | null = null;
     let repairAdvanced = false;
+    let duplicateScanPending = false;
+    let projectionMigrationPending = false;
     try {
       baselineBefore = this.baselineStatus().progress;
       repairBefore = this.options.repairProgress?.() ?? null;
@@ -1622,6 +1682,13 @@ export class AutomaticMaintenanceCadence<
         : Math.max(0, this.captureFollowups - 1);
       const repairAfter = this.options.repairProgress?.();
       repairAdvanced = Boolean(repairAfter?.pending && repairAfter.units > (repairBefore?.units ?? 0));
+      // Keep a pending one-time scan on the short cadence after its priority
+      // projection slice. Failed and storage-busy turns retain their existing
+      // backoff. The slice stays within the 200 ms capture budget.
+      duplicateScanPending = Boolean(repairAfter?.duplicateScan?.pending &&
+        results.some(result => !isMaintenancePartialOutcome(result)));
+      projectionMigrationPending = Boolean(repairAfter?.projectionMigration?.pending &&
+        results.some(result => !isMaintenancePartialOutcome(result)));
       // Entries actually visited this cadence, never pending candidates the
       // capture path carried over the pending-metadata gate. A mixed turn
       // (one source still baselining, the other gated) must not keep the
@@ -1648,12 +1715,15 @@ export class AutomaticMaintenanceCadence<
     } finally {
       this.inFlight = false;
       if (this.accepting) {
-        let retry: "normal" | "repair" | "startup" | "capture" | "storage_busy" =
+        let retry: "normal" | "repair" | "duplicate_scan" | "projection_migration" |
+          "startup" | "capture" | "storage_busy" =
           storageBusy ? "storage_busy" : "normal";
         try {
           if (!storageBusy) {
             const baselineAfter = this.baselineStatus().progress;
-            if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
+            if (!failed && baselineBefore) retry = duplicateScanPending ? "duplicate_scan"
+              : projectionMigrationPending ? "projection_migration"
+              : repairAdvanced ? "repair"
               : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
                 : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
           }
