@@ -95,8 +95,6 @@ const onlyWalk = new CaptureCoverageWalk({
     let next = 0;
     return {
       read: () => {
-        const until = performance.now() + 0.04;
-        while (performance.now() < until) { /* slow active directory */ }
         return next < 20_000 ? { path: `file-${next++}`, kind: "file" as const } : null;
       },
       unchanged: () => true,
@@ -107,13 +105,21 @@ const onlyWalk = new CaptureCoverageWalk({
   checkLink: () => null,
 });
 const originalStep = onlyWalk.step.bind(onlyWalk);
-onlyWalk.step = (...args) => { steps += 1; const used = originalStep(...args); work += used; return used; };
+onlyWalk.step = (deadline, onBatch, now, maxWork = 4_096) => {
+  steps += 1;
+  // Yield the first share at a fixed work count. The returned share must use
+  // the scheduler's remaining cap, so resetting that cap still fails below.
+  const used = originalStep(deadline, onBatch, now, steps === 1 ? Math.min(maxWork, 2_048) : maxWork);
+  work += used;
+  return used;
+};
 const single = new CollectorMaintenance(singleBuffer,
   { coverageWalk: () => onlyWalk, close: () => undefined } as unknown as RolloutTailer,
   { coverageWalk: () => CaptureCoverageWalk.empty(), close: () => undefined } as unknown as TranscriptTailer,
   undefined,
   { coverageWalk: () => CaptureCoverageWalk.empty(), close: () => undefined } as unknown as GrokUsageTailer,
-  { captureCoverageTurnMs: 250, captureCoverageIntervalMs: 0 });
+  // This checks work accounting; neither share may expire on the wall clock.
+  { captureCoverageTurnMs: Number.POSITIVE_INFINITY, captureCoverageIntervalMs: 0 });
 (single as unknown as { checkCaptureCoverage(): void }).checkCaptureCoverage();
 check("unused_source_shares_are_returned_without_spending_cap_twice",
   steps >= 2 && work <= 4_096, { steps, work, done: onlyWalk.done });

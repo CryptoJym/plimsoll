@@ -1,3 +1,4 @@
+import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
 import fs from "node:fs";
 
@@ -714,7 +715,7 @@ export async function runWorkspaceHistoryUpload(
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
   let ledger: Database.Database;
   try {
-    ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
   } catch (error) {
     throw new Error(
       `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — nothing to backfill.`,
@@ -1197,7 +1198,7 @@ export async function runAttributionRepair(
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
   let ledger: Database.Database;
   try {
-    ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
   } catch (error) {
     throw new Error(
       `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — nothing to repair.`,
