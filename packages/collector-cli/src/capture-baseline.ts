@@ -1883,6 +1883,25 @@ export function captureBaselineExcludedSize(
   return row?.baselineSize ?? null;
 }
 
+/** Read-only evidence for the exact generation fenced by capture-roots add.
+ * The history importer needs the fence instant as well as its byte boundary;
+ * a filename or mtime alone is not enrollment evidence. */
+export function captureBaselineExcludedReceipt(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  observation: CaptureBaselineFileObservation,
+): { baselineSize: number; baselinedAt: string } | null {
+  if (captureBaselineExcludedSize(database, source, observation) === null) return null;
+  const normalized = normalizeObservation(observation);
+  const state = stateRow(database, source);
+  if (!normalized || !state) return null;
+  const row = database.prepare(`select baseline_size as baselineSize, baselined_at as baselinedAt
+    from ${GENERATION_TABLE} where source=? and run_id=? and path_key=? and generation_key=?`)
+    .get(source, state.runId, normalized.pathKey, normalized.generationKey) as
+      { baselineSize: number; baselinedAt: string } | undefined;
+  return row && validTimestamp(row.baselinedAt) ? row : null;
+}
+
 /** A grown excluded generation can start at this recorded enrollment size.
  * The reader must prove a newline or skip the unfinished boundary record. */
 export function captureBaselinePostEnrollmentOffset(

@@ -230,6 +230,7 @@ export class LocalEventBuffer {
   private readonly repoContextQueue: RepoContextRequest[] = [];
   private readonly queuedRepoContextIds = new Set<string>();
   private activeRepoContextCommitScope: RepoContextHandoffBatch | null = null;
+  private historyImportEpoch: string | null = null;
   private childRepoContextRun: ChildRepoContextRun | null = null;
   private repoContextPostCommitAmbiguous = 0;
   readonly delivery: DeliveryOutbox;
@@ -1269,10 +1270,25 @@ export class LocalEventBuffer {
           claimedInstallationEpochId !== trustedInstallationEpochId) return "epoch_mismatch";
       return null;
     }
-    if (Date.parse(observedAt as string) < Date.parse(binding.currentInstallationEpochStartedAt)) return "before_enrollment";
+    if (Date.parse(observedAt as string) < Date.parse(binding.currentInstallationEpochStartedAt) &&
+        !(this.historyImportEpoch && claimedInstallationEpochId === this.historyImportEpoch &&
+          this.historyImportEpoch === binding.currentInstallationEpochId)) return "before_enrollment";
     if (claimedInstallationEpochId !== undefined && claimedInstallationEpochId !== binding.currentInstallationEpochId)
       return "epoch_mismatch";
     return null;
+  }
+
+  /** Scoped exception for a verified, fenced historical file import. It never
+   * changes the persisted epoch or the capture frontier. Only the dedicated
+   * importer invokes this around one bounded SQLite transaction. */
+  withHistoryImportAdmission<T>(installationEpochId: string, action: () => T): T {
+    if (this.historyImportEpoch || this.db.inTransaction ||
+        this.workspaceBinding()?.currentInstallationEpochId !== installationEpochId) {
+      throw new Error("history_import_epoch_not_current");
+    }
+    this.historyImportEpoch = installationEpochId;
+    try { return action(); }
+    finally { this.historyImportEpoch = null; }
   }
 
   workspaceBinding() {
@@ -2602,7 +2618,7 @@ export class LocalEventBuffer {
 
   private appendInCurrentTransaction(
     event: AiInteractionEvent, suppressedFields: string[] = [], project = true,
-    firstReceivedAt?: string,
+    firstReceivedAt?: string, historyImportNoLiveSibling = false,
   ) {
     if (!liveUsageAppendAllowed(this.db, event)) return { appended: false, repoContextRequest: null };
     if (event.dataMode === "evidence") {
@@ -2740,7 +2756,9 @@ export class LocalEventBuffer {
       // The raw row, privacy-safe fact delta, and delivery envelope share the
       // caller's SQLite transaction. Projection failure is contained as a
       // durable repair receipt so capture remains available.
-      if (project) this.projection.tryApplyRawRow(Number(result.lastInsertRowid));
+      if (project) this.projection.tryApplyRawRow(Number(result.lastInsertRowid), new Date(),
+        historyImportNoLiveSibling && this.historyImportEpoch !== null &&
+        (event.eventType === "usage_rollout" || event.eventType === "usage_transcript"));
       // Otherwise the insert trigger's durable repair receipt remains queued.
       // Capture admission never depends on finishing all derived aggregates.
       // Runtime learning facts (#156) promote from the same durable moment.
@@ -2871,12 +2889,12 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields?: string[],
-    options?: { integrityReceipt?: false | undefined },
+    options?: { integrityReceipt?: false | undefined; historyImportNoLiveSibling?: boolean },
   ): boolean;
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] | undefined,
-    options: { integrityReceipt: true; firstReceivedAt?: string },
+    options: { integrityReceipt: true; firstReceivedAt?: string; historyImportNoLiveSibling?: boolean },
   ): {
     appended: boolean;
     deduplicated?: true;
@@ -2886,14 +2904,16 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] = [],
-    options: { integrityReceipt?: boolean; firstReceivedAt?: string } = {},
+    options: { integrityReceipt?: boolean; firstReceivedAt?: string;
+      historyImportNoLiveSibling?: boolean } = {},
   ) {
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
     let result: ReturnType<LocalEventBuffer["appendInCurrentTransaction"]>;
     try {
       const run = () => {
-        const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
+        const appended = this.appendInCurrentTransaction(event, suppressedFields, true,
+          options.firstReceivedAt, options.historyImportNoLiveSibling);
         if(appended.appended && this.deferredClaudeHookIds.has(event.id))
           this.db.prepare(`insert or ignore into claude_replay_hooks(event_id,status,created_at,root_set_json)
             values(?,'pending',?,?)`).run(event.id,new Date().toISOString(),this.claudeReplayRootSetJson);

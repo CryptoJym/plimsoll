@@ -6,6 +6,7 @@ import path from "node:path";
 
 import { bindCaptureInventory, appendRootObservation, currentDispatchBindingSnapshot, inspectCaptureRoots, recordClaudeRootSessionSighting, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage, type DispatchBindingSnapshot } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
+import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
@@ -1000,6 +1001,13 @@ export class TranscriptTailer {
           consumeAutomaticFile(file);
           continue;
         }
+      }
+      if (growthStart !== null && historyGrowthNeedsHandoff(
+        this.buffer.database, rootForFile(this.captureRoots, file), file)) {
+        result.deferredGenerations += 1;
+        consumeAutomaticFile(file);
+        automaticFilesPartial.add(file);
+        continue;
       }
       const storedCursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateTranscriptParserState,

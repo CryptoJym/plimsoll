@@ -1861,7 +1861,7 @@ export class DashboardProjectionStore {
   }
 
   /** Capture calls this inside its raw-event transaction. Failure is isolated and repair is durable. */
-  tryApplyRawRow(rawRowid: number, now = new Date(Date.now())) {
+  tryApplyRawRow(rawRowid: number, now = new Date(Date.now()), historyImportNoLiveSibling = false) {
     if (this.projectionOpenRefused()) return true;
     try {
       this.db.transaction(() => {
@@ -1875,7 +1875,7 @@ export class DashboardProjectionStore {
         // Maintenance drains them as one day-grouped batch; capture never pays
         // one gzip segment per event and the published generation stays stale.
         if (compactable(row) && row.privacyEligible) return;
-        this.applyProjectionRows([row], now, CAPTURE_LIVE_SIBLING_PROBE_ROWS);
+        this.applyProjectionRows([row], now, CAPTURE_LIVE_SIBLING_PROBE_ROWS, historyImportNoLiveSibling);
         this.captureStatement(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(rawRowid);
       })();
       return true;
@@ -1909,7 +1909,8 @@ export class DashboardProjectionStore {
     this.failNextCompactGcAfterRewrite = true;
   }
 
-  private applyProjectionRows(rows: RawProjectionRow[], now: Date, liveSiblingProbeRows?: number) {
+  private applyProjectionRows(rows: RawProjectionRow[], now: Date, liveSiblingProbeRows?: number,
+    historyImportNoLiveSibling = false) {
     // A live-class usage row may arrive after its tailer siblings were already
     // projected (transcript-first ordering). Re-enqueue those siblings so the
     // suppression rule is re-derived and totals converge regardless of the
@@ -1956,7 +1957,12 @@ export class DashboardProjectionStore {
         if (previous) this.removeStoredFact(previous, now);
         compactRows.push(row);
       } else {
-        this.applyFact(factFromRaw(row, backfillUsageSuppressed(this.db, row)), now);
+        // The importer has checked live session authority and raw siblings
+        // outside the writer. Its scoped admission prevents a later live
+        // writer from winning after this tailer row is admitted.
+        const usageSuppressed = historyImportNoLiveSibling && isUsageTailerEventType(row.eventType)
+          ? false : backfillUsageSuppressed(this.db, row);
+        this.applyFact(factFromRaw(row, usageSuppressed), now);
       }
     }
     if (compactRows.length) this.addCompactRows(compactRows);
