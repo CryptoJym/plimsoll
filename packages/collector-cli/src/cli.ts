@@ -666,6 +666,7 @@ function openBuffer(
   diagnostics: {
     databasePath?: string;
     onOpenStep?: LedgerOpenTimingSink;
+    startupBusyDeadlineMs?: number;
   } = {},
 ) {
   ensureCollectorHome();
@@ -687,6 +688,7 @@ function openBuffer(
       limits: config.delivery,
     },
     databaseBusyTimeoutMs,
+    startupBusyDeadlineMs: diagnostics.startupBusyDeadlineMs,
     onOpenStep: diagnostics.onOpenStep,
   });
 }
@@ -3519,10 +3521,25 @@ async function main() {
     });
     console.log(JSON.stringify(startupWalReceipt));
 
-    // This connection owns the HTTP event loop. Never inherit better-sqlite3's
-    // five-second busy wait when the maintenance child briefly owns a writer.
-    const buffer = openBuffer(config, false, 0);
-    const claudeReplayBarrier=startClaudeReplayBarrier(buffer,config.captureRoots??[]);
+    // The first open and prerequisite recovery share one bounded writer wait.
+    // Restore zero before the listener starts: HTTP writes must still fail fast.
+    const startupBusyDeadlineMs = performance.now() + 10_000;
+    const remainingStartupWait = () => Math.max(0, Math.min(10_000,
+      Math.ceil(startupBusyDeadlineMs - performance.now())));
+    const buffer = openBuffer(config, false, 0, { startupBusyDeadlineMs });
+    let claudeReplayBarrier: ReturnType<typeof startClaudeReplayBarrier>;
+    try {
+      buffer.database.pragma(`busy_timeout = ${remainingStartupWait()}`);
+      buffer.recoverRepoContextState();
+      buffer.database.pragma(`busy_timeout = ${remainingStartupWait()}`);
+      claudeReplayBarrier = startClaudeReplayBarrier(buffer, config.captureRoots ?? []);
+    } catch (error) {
+      await buffer.close();
+      throw error;
+    } finally {
+      if (buffer.database.open)
+        buffer.database.pragma(`busy_timeout = ${remainingStartupWait()}`);
+    }
     void claudeReplayBarrier.done.then(receipt=>
       console.log(JSON.stringify({status:"claude_replay_barrier",...receipt})));
     const pairingStatus = codexUsagePairingStatus(buffer.database);
@@ -3546,9 +3563,6 @@ async function main() {
       outcomeTimelineStore.close();
       outcomeTimelineStoreClosed = true;
     };
-    // Runtime ownership is already proven above. Recover ID-only handoff and
-    // inflight receipts once, before intake or the child can create live work.
-    buffer.recoverRepoContextState();
     let scheduler: CoalescingMaintenanceScheduler<MaintenanceAttemptOutcome> | undefined;
     let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceAttemptOutcome> | undefined;
     let enrichmentScheduler: IdleEnrichmentScheduler | undefined;
@@ -3610,6 +3624,7 @@ async function main() {
       termGraceMs: 250,
       killGraceMs: 750,
     });
+    buffer.database.pragma(`busy_timeout = ${remainingStartupWait()}`);
     const budgetSampler = process.env.PLIMSOLL_BUDGET_SAMPLER === "off"
       ? null : new BudgetSampler(buffer.database, collectorBufferPath(), 60_000,
         () => buffer.budgetAttemptedTotal(), () => [
@@ -3652,6 +3667,7 @@ async function main() {
       };
     };
     let starvationCensus = await readStarvationCensus().catch(() => null);
+    buffer.database.pragma(`busy_timeout = ${remainingStartupWait()}`);
     const readStarvationReceipt = () => {
       try {
         return maintenanceStarvationStatus(buffer.database, starvationCensus);
@@ -3745,6 +3761,7 @@ async function main() {
     // across cycles and restarts in maintenance_state. Until one full walk
     // is accepted, each cycle catch-up-walks the ledger so a missed first
     // refresh does not wait for `upload-history --sessions`.
+    buffer.database.pragma(`busy_timeout = ${remainingStartupWait()}`);
     let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
     let legacySummaryRebuild = beginLegacySessionSummaryRebuild(buffer.database);
     let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
@@ -4554,6 +4571,7 @@ async function main() {
         process.exit(1);
       })();
     });
+    buffer.database.pragma("busy_timeout = 0");
     server.listen(config.port, "127.0.0.1", () => {
       try {
         ownership.writePidFile(collectorPidRecord(runtimeIdentity));

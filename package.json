@@ -96,6 +96,7 @@
     "proof:receipt-lineage-scale": "tsx scripts/receipt-lineage-scale-proof.ts",
     "proof:maintenance-worker-ready": "tsx scripts/maintenance-worker-ready-proof.ts",
     "proof:startup-wal-self-heal": "tsx scripts/run-proof.ts --direct-node scripts/startup-wal-self-heal-proof.ts",
+    "proof:startup-schema-race": "tsx scripts/run-proof.ts scripts/startup-schema-race-proof.ts",
     "proof:incremental-capture": "tsx scripts/incremental-capture-proof.ts",
     "proof:account-assertion": "tsx scripts/account-assertion-proof.ts",
     "proof:account-salt": "tsx scripts/account-salt-proof.ts",

@@ -58,6 +58,7 @@ import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCov
 import { CaptureRevisitQueue } from "./capture-revisit-queue";
 import { recordCaptureRecordLoss } from "./capture-record-loss";
 import {
+  DISCOVERY_FIRST_ADMITTED_QUANTUM,
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
 } from "./incremental-jsonl-discovery";
@@ -1472,6 +1473,7 @@ export class RolloutTailer {
         maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP - attempt.pendingFiles.length,
         maxEntries: this.entryAllowance(attempt.discovery.progress().entriesVisited),
         maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
+        minimumSteps: DISCOVERY_FIRST_ADMITTED_QUANTUM,
       });
       attempt.pendingFiles.push(...chunk.files);
       attempt.discoveryDone = chunk.done;
