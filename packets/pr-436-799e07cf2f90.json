@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 436,
+  "headSha": "799e07cf2f90e0b2ad803fb357d9f3bb179a43b6",
+  "reviewedAt": "2026-09-30T20:42:48Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f3ff-79e6-7583-bd9b-f0640bd4b71d",
+    "model": "gpt-6-sol",
+    "host": "studio6"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0f3e3-7188-75b2-9411-75aa94207c10"
+    }
+  ],
+  "summary": "Independent Codex review lane (studio6) of PR #436, the collector 0.7.45 release change on main 1904a69f. The diff touches only the package version, the lifecycle head-version assertion and two support-contract pins (install_doctor, transactional_join). The reviewer's guarded predictor reproduces both new pins, and substituting 0.7.44 reproduces the old pins exactly. The other four pins are unchanged, and the idle count of 24,545 sits inside the version 13 envelope. Typecheck, lifecycle cross-version 15/15, install artifact 13/13, packaged runtime 35/35 and the launch-agent fixture digest pass. APPROVE, with no findings or follow-ups."
+}
