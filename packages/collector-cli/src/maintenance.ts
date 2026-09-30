@@ -925,6 +925,8 @@ export class CollectorMaintenance {
     /** Split A calls this synchronously after each bounded transaction commits. */
     onDurableCommit?: (progress: MaintenanceJobProgress) => boolean;
     clock?: () => number;
+    /** Fixture-only admission clock; production keeps the monotonic default. */
+    budgetClock?: () => number;
   } = {}): Promise<CollectorMaintenanceRunResult> {
     // Monotonic stage timing source. Injectable so fixture proofs can assert
     // exact per-stage durations deterministically (issue #61 first step).
@@ -932,7 +934,7 @@ export class CollectorMaintenance {
     const runStartedAtMs = clock();
     let codexCaptureMs = 0;
     let claudeCaptureMs = 0;
-    const budget = new CaptureWorkBudget();
+    const budget = new CaptureWorkBudget(undefined, null, {}, options.budgetClock);
     // Alternate the order of the two consumers of the shared 200ms allowance.
     // Odd cadences run bounded repairs first (at most 75ms of admitted units);
     // even cadences are capture-first, so one synchronous repair unit that

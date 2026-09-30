@@ -1248,8 +1248,8 @@ async function linkageAndRetentionProof() {
   const pendingOutbox = (buffer.database.prepare(`select count(*) as n from upload_outbox where raw_id = ?`).get(uuid(132)) as { n: number }).n;
   const status = buffer.delivery.status(instant(620));
   record(
-    "retention_expires_pending_raw_but_preserves_outbox",
-    pendingExists === 0 && pendingOutbox === 1 && prunePending.events >= 1 && status.retention.mode === "raw_ttl" && status.retention.rawTtlBlockedBy === null && status.retention.pendingDeliverySurvivesRawExpiry === true,
+    "retention_holds_pending_raw_and_outbox",
+    pendingExists === 1 && pendingOutbox === 1 && status.retention.mode === "raw_ttl" && status.retention.rawTtlBlockedBy === null && status.retention.pendingDeliverySurvivesRawExpiry === true,
     { pendingExists, pendingOutbox, prunedEvents: prunePending.events, retention: status.retention },
   );
   buffer.close();

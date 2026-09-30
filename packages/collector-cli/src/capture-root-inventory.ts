@@ -409,6 +409,18 @@ function ensureRootObservationSchema(database: import("better-sqlite3").Database
   if(!database.inTransaction)
     initializedObservationDatabases.add(database);
 }
+/** Prime the schema cache before a history writer slice acquires SQLite's writer. */
+export function prepareCaptureRootObservationSchema(database: import("better-sqlite3").Database) {
+  ensureRootObservationSchema(database);
+}
+export function captureRootObservationPayloadDigest(value: Pick<import("../../shared/src/schemas").AiInteractionEvent,
+  "source" | "id" | "sessionId" | "observedAt" | "model" | "inputTokens" | "outputTokens" |
+  "cacheReadTokens" | "cacheCreationTokens" | "costUsd">) {
+  return crypto.createHash("sha256").update(JSON.stringify([
+    value.source,value.id,value.sessionId,value.observedAt,value.model,value.inputTokens??null,value.outputTokens??null,
+    value.cacheReadTokens??null,value.cacheCreationTokens??null,value.costUsd??null,
+  ])).digest("hex");
+}
 /** Page the pre-sighting observation ledger before retention can erase its raw
  * session ID. The cursor and inserts commit together, so an interrupted page
  * is simply retried. New observations written by an older binary have larger
@@ -543,10 +555,11 @@ export function recordClaudeRootSessionSighting(buffer: import("./buffer").Local
   return true;
 }
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
-export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined): boolean {
+export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined,carriedBytes = false,historyImportNoLiveSibling=false): boolean {
   const parsedAccount = root?.account ? accountAssertionV1Schema.safeParse(root.account) : null;
-  const trustedEpoch = root && parsedAccount?.success && accountAssertionContains(parsedAccount.data, event.observedAt) &&
-    event.metadata?.installationEpochId===root.installationEpochId ? root.installationEpochId : undefined;
+  const trustedEpoch = root && event.metadata?.installationEpochId===root.installationEpochId &&
+    (carriedBytes || parsedAccount?.success && accountAssertionContains(parsedAccount.data, event.observedAt))
+    ? root.installationEpochId : undefined;
   if (buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId ?? event.metadata?.installationEpochId, trustedEpoch))
     return false;
   if(!root)
@@ -555,10 +568,7 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
   ensureRootObservationSchema(database);
   if(root.source==="claude_code"&&event.sessionId)
     recordClaudeRootSessionSighting(buffer,root,event.sessionId,event.observedAt);
-  const nativeSignature=(value: typeof event) => crypto.createHash("sha256").update(JSON.stringify([
-    value.source,value.id,value.sessionId,value.observedAt,value.model,value.inputTokens??null,value.outputTokens??null,
-    value.cacheReadTokens??null,value.cacheCreationTokens??null,value.costUsd??null,
-  ])).digest("hex");
+  const nativeSignature=captureRootObservationPayloadDigest;
   const payloadDigest=nativeSignature(event),rootDigest=captureRootDigest(root);
   // The sighting is already committed. The raw event and root receipt share
   // one commit; buffer.append uses a nested savepoint inside this transaction.
@@ -582,7 +592,7 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
       let inserted=false;
       if(!alreadyObserved) {
         if(trustedEpoch) captureRootEpochCapabilities.set(event,trustedEpoch);
-        try { inserted=buffer.append(event,[]); }
+        try { inserted=buffer.append(event,[],{historyImportNoLiveSibling}); }
         finally { captureRootEpochCapabilities.delete(event); }
       }
       // Another connection may have enrolled between the first check and append.

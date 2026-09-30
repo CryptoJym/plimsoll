@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -18,9 +19,9 @@ assert.ok(["unchanged", "last-64k", "two-appends"].includes(scenario));
 const now = Date.now();
 const sessionA = crypto.randomUUID();
 const sessionC = crypto.randomUUID();
-const A = {rootId: "claude-a", profileId: "profile-a", installationEpochId: "epoch-a",
+const A = {rootId: "claude-a", profileId: "profile-a", installationEpochId: fixtureEpochId("epoch-a"),
   source: "claude_code" as const, directory: path.join(process.env.HOME!, "claude-a/projects")};
-const B = {rootId: "claude-b", profileId: "profile-b", installationEpochId: "epoch-b",
+const B = {rootId: "claude-b", profileId: "profile-b", installationEpochId: fixtureEpochId("epoch-b"),
   source: "claude_code" as const, directory: path.join(process.env.HOME!, "claude-b/projects")};
 const file = path.join(B.directory, "project/startup.jsonl");
 const record = (sessionId: string, id: string, padding = "") => JSON.stringify({

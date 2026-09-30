@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -14,9 +15,9 @@ import { createProofCompletion } from "./lib/proof-completion";
 
 const home=process.env.HOME!,plimsoll=process.env.PLIMSOLL_HOME!;
 const now=Date.now(),observedAt=new Date(now-60_000).toISOString();
-const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:"epoch-a",
+const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:fixtureEpochId("epoch-a"),
   source:"claude_code" as const,directory:path.join(home,".claude-a","projects")};
-const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:"epoch-b",
+const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:fixtureEpochId("epoch-b"),
   source:"claude_code" as const,directory:path.join(home,".claude-b","projects")};
 for(const root of [A,B]) fs.mkdirSync(root.directory,{recursive:true});
 fs.mkdirSync(plimsoll,{recursive:true});

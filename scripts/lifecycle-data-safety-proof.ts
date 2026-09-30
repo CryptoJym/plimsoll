@@ -609,12 +609,19 @@ async function withCopyFailure<T>(source: string, action: () => Promise<T>) {
 }
 
 /**
- * Only the two ledgers are left: no restore temporary or its sidecars. (The
- * proof's own read-only inspections leave ordinary -wal/-shm files.)
+ * Only the ledgers and, after a guarded open, their required permanent lock
+ * are left: no restore temporary or temporary lock. The proof's own read-only
+ * inspections leave ordinary -wal/-shm files.
  */
-function onlyLedgers(directory: string) {
+function onlyLedgers(directory: string, connectionLock = false) {
   const names = listDirectory(directory).map((name) => name.replace(/-(wal|shm)$/, ""));
-  return same([...new Set(names)], ["ledger.sqlite", "snapshot.sqlite"]);
+  const expected = connectionLock
+    ? ["ledger.sqlite", "ledger.sqlite.connections.lock.sqlite", "snapshot.sqlite"]
+    : ["ledger.sqlite", "snapshot.sqlite"];
+  if (!same([...new Set(names)], expected)) return false;
+  if (!connectionLock) return true;
+  const lock = fs.lstatSync(path.join(directory, "ledger.sqlite.connections.lock.sqlite"));
+  return lock.isFile() && !lock.isSymbolicLink() && lock.nlink === 1 && (lock.mode & 0o777) === 0o600;
 }
 
 async function b2RestoreIsAtomicAndCapacityChecked() {
@@ -668,7 +675,7 @@ async function b2RestoreIsAtomicAndCapacityChecked() {
         .restore({ source: pair.snapshot, destination: pair.live }));
     record(CASES.b2[2],
       damaged !== "ok" && error !== null && exists(pair.live) && rowsDigest(pair.live) === pair.liveDigest &&
-        integrityOf(pair.live) === "ok" && onlyLedgers(pair.directory),
+        integrityOf(pair.live) === "ok" && onlyLedgers(pair.directory, true),
       { damaged, error: error?.message, liveExists: exists(pair.live), files: listDirectory(pair.directory) });
   });
   await runCase([CASES.b2[3]], async (record) => {
@@ -1995,7 +2002,7 @@ async function r3PreexistingDamage() {
         .restore({ source: pair.snapshot, destination: pair.live }));
     record(CASES.r3Damage[1],
       error?.code === "LIFECYCLE_RESTORE_REFUSED" && /integrity_check/.test(error.message) &&
-        fs.readFileSync(pair.live).equals(liveBefore) && onlyLedgers(pair.directory),
+        fs.readFileSync(pair.live).equals(liveBefore) && onlyLedgers(pair.directory, true),
       { error: error?.message, files: listDirectory(pair.directory) });
   });
 }

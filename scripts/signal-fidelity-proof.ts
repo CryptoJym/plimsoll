@@ -2044,7 +2044,7 @@ async function main() {
     "raw account email absent from all upload bodies (lives in account_labels only)",
   );
 
-  // 8. Retention prune: raw rows age out even when they were never uploaded.
+  // 8. Retention prune holds upload-eligible raw rows until acknowledged.
   buffer.append(
     aiInteractionEventSchema.parse({
       id: "prune-survivor-0000",
@@ -2068,19 +2068,35 @@ async function main() {
   const survivorCreatedAt = (buffer.database
     .prepare(`select created_at as createdAt from buffered_events where id = ?`)
     .get("prune-survivor-0000") as { createdAt: string }).createdAt;
-  const pruned = buffer.prune(0, { now: new Date(Date.parse(survivorCreatedAt) + 1) });
+  const retentionNow = new Date(Date.parse(survivorCreatedAt) + 1);
+  buffer.prune(0, { now: retentionNow });
+  const held = buffer.database
+    .prepare(`select count(*) as n from buffered_events where id = ?`)
+    .get("prune-survivor-0000") as { n: number };
+  const pendingDelivery = buffer.database
+    .prepare(`select delivery_id as deliveryId from upload_outbox where raw_id = ?`)
+    .get("prune-survivor-0000") as { deliveryId: string };
+  const deliveryNow = new Date(retentionNow.getTime() + 60_000);
+  const lease = buffer.delivery.lease({ leaseId: "signal-retention-proof", now: deliveryNow });
+  const leased = lease.items.some((item) => item.deliveryId === pendingDelivery.deliveryId);
+  const acknowledged = buffer.delivery.acknowledge(lease.leaseId, [pendingDelivery.deliveryId], deliveryNow);
+  const pruned = buffer.prune(0, { now: deliveryNow });
   const survivor = buffer.database
-    .prepare(`select count(*) as n from buffered_events where uploaded_at is null`)
-    .get() as { n: number };
+    .prepare(`select count(*) as n from buffered_events where id = ?`)
+    .get("prune-survivor-0000") as { n: number };
   const expiryReceipt = buffer.database
     .prepare(`select reason from raw_retention_receipts where event_id = ?`)
     .get("prune-survivor-0000") as { reason: string } | undefined;
   check(
-    "retention_prune_expires_unuploaded_history_with_receipt",
-    pruned.events > 0 && survivor.n === 0 && expiryReceipt?.reason === "retention_window_elapsed",
+    "retention_prune_holds_unacknowledged_history_then_expires_acked_row_with_receipt",
+    held.n === 1 && leased && acknowledged.acknowledged === 1 && acknowledged.markedUploaded === 1 &&
+      pruned.events > 0 && survivor.n === 0 && expiryReceipt?.reason === "retention_window_elapsed",
     JSON.stringify({
+      held: held.n,
+      leased,
+      acknowledged,
       pruned: pruned.events,
-      unuploadedSurvivors: survivor.n,
+      survivors: survivor.n,
       survivorCreatedAt,
       cutoff: pruned.cutoff,
       expiryReceipt,

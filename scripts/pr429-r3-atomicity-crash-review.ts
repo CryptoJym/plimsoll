@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -21,9 +22,9 @@ const makeBinding = (sessionId: string) => dispatchBindingSchema.parse({ session
   parentAttemptId: null, acceptedOutcomeId: null,
   validFrom: new Date(now - 120_000).toISOString(), validUntil: null,
   evidenceRef: "dispatch:r3-atomicity" });
-const rootA = { rootId: "claude-a", profileId: "profile-a", installationEpochId: "epoch-a",
+const rootA = { rootId: "claude-a", profileId: "profile-a", installationEpochId: fixtureEpochId("epoch-a"),
   source: "claude_code" as const, directory: path.join(home, ".claude-a", "projects"), dispatch: [] as ReturnType<typeof makeBinding>[] };
-const rootB = { rootId: "claude-b", profileId: "profile-b", installationEpochId: "epoch-b",
+const rootB = { rootId: "claude-b", profileId: "profile-b", installationEpochId: fixtureEpochId("epoch-b"),
   source: "claude_code" as const, directory: path.join(home, ".claude-b", "projects") };
 for (const root of [rootA, rootB]) fs.mkdirSync(root.directory, { recursive: true });
 fs.mkdirSync(plimsoll, { recursive: true });

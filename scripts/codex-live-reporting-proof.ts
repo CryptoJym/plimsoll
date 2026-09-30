@@ -145,8 +145,16 @@ async function main() {
     const receipts = buffer.database.prepare("select receipt_json from codex_live_receipts order by packet_key").all();
     const pin = buffer.database.prepare("select * from codex_live_pins").get();
     // Synthetic transport completion; do not contact a cloud endpoint.
-    assert.equal(buffer.markUploaded([eventId], now), 1);
-    assert.equal(buffer.prune(0, { maxRows: 64, now: new Date(Date.now() + 86_400_000) }).events, 1);
+    const retentionNow = new Date(Date.now() + 86_400_000);
+    buffer.prune(0, { maxRows: 64, now: retentionNow });
+    assert.equal(count("buffered_events"), 1, "unacknowledged live usage remains in the raw ledger");
+    const lease = buffer.delivery.lease({ leaseId: "live-reporting-retention-proof", now: retentionNow });
+    assert.equal(lease.items.length, 1);
+    assert.equal(lease.items[0].deliveryId, deliveryId);
+    const acknowledged = buffer.delivery.acknowledge(lease.leaseId, [deliveryId], retentionNow);
+    assert.equal(acknowledged.acknowledged, 1);
+    assert.equal(acknowledged.markedUploaded, 1);
+    assert.equal(buffer.prune(0, { maxRows: 64, now: retentionNow }).events, 1);
     assert.equal(count("buffered_events"), 0); assert.equal(count("dashboard_live_usage_retained"), 1);
     await new Promise<void>(resolve => server.close(() => resolve())); buffer.close();
     buffer = new LocalEventBuffer(ledger, options);
