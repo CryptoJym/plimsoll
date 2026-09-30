@@ -223,6 +223,9 @@ export function ingestLiveUsage(buffer: LocalEventBuffer, packet: LivePacket, di
   recheck: () => LiveAuthenticatedBinding): LiveReceipt {
   const db = buffer.database;
   try {
+    // The schema must outlive a rejected receipt transaction. A failed receipt
+    // rolls that transaction back, including any table first created inside it.
+    accountBindings(db);
     return db.transaction(() => buffer.transactionWithRepoContextHandoffs(() => {
       const auth = recheck();
       if (!isAuthenticatedLiveBinding(auth)) throw new HttpBoundaryRejection("producer_token_invalid", 403);
