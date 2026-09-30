@@ -2111,6 +2111,8 @@ export class DeliveryOutbox {
              attempt_count as attemptCount
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= @now
+             and not exists (select 1 from claude_replay_hooks held
+               where held.event_id=upload_outbox.raw_id and held.status='pending')
              -- Fail closed (#163 rework): a null workspace binding claims
              -- ONLY unassigned rows, never rows bound to any workspace.
              and workspace_id is @workspaceId

@@ -3,7 +3,9 @@ import crypto from "node:crypto";
 import { mutateCollectorConfigTransactionally } from "./config";
 import {
   dispatchBindingSchema,
+  dispatchBindingForSession,
   dispatchBindingMetadata,
+  captureRootDigest,
   namespacedWorkItemIdSchema,
   type DispatchBinding,
 } from "./capture-root-inventory";
@@ -159,33 +161,48 @@ export function closeDispatch(args: string[], now = new Date()) {
 export function restampDispatch(args: string[],buffer: LocalEventBuffer,roots: readonly CaptureRoot[]) {
   const value=options(args,RESTAMP_FLAGS);
   const attemptId=dispatchBindingSchema.shape.attemptId.parse(required(value("--attempt-id"),"--attempt-id"));
-  const bySession=new Map<string,{ binding: DispatchBinding;source: CaptureRoot["source"] }>();
+  const bySession=new Map<string,{ binding: DispatchBinding;source: CaptureRoot["source"];rootId: string|null;rootDigest: string|null }>();
   for(const root of roots) for(const binding of root.dispatch??[]) {
     if(binding.attemptId!==attemptId) continue;
-    const key=`${root.source}\u0000${binding.sessionId}`;
+    const rootId=root.source==="claude_code" ? root.rootId : null;
+    const key=`${root.source}\u0000${binding.sessionId}\u0000${rootId??""}`;
     const prior=bySession.get(key);
     if(prior&&JSON.stringify(prior.binding)!==JSON.stringify(binding)) throw new Error("dispatch_restamp_binding_conflict");
-    bySession.set(key,{binding,source:root.source});
+    bySession.set(key,{binding,source:root.source,rootId,
+      rootDigest:root.source==="claude_code"?captureRootDigest(root):null});
   }
   if(!bySession.size) throw new Error("dispatch_attempt_not_found");
   let scanned=0,restamped=0,skipped=0,truncated=false;
-  for(const {binding,source} of bySession.values()) {
+  const hasRootObservations=Boolean(buffer.database.prepare(`select 1 from sqlite_master
+    where type='table' and name='capture_root_observations'`).get());
+  const admittedRoot=hasRootObservations ? buffer.database.prepare(`select 1
+    from capture_root_observations where event_id=? and root_digest=? and state='admitted'`) : null;
+  for(const {binding,source,rootId,rootDigest} of bySession.values()) {
+    const expectedBinding=JSON.stringify(binding);
     const rows=buffer.database.prepare(`select raw.id,raw.payload_json as payloadJson,raw.observed_at as observedAt
       from buffered_events as raw where raw.source=? and raw.session_id=? and raw.observed_at>=?
         and (? is null or raw.observed_at<?) and json_valid(raw.payload_json)=1
         and json_extract(raw.payload_json,'$.metadata.workItemId') is null
+        and (? is null or json_extract(raw.payload_json,'$.metadata.captureRootId')=?)
         and raw.uploaded_at is null and raw.privacy_disposition is null
         and not exists (select 1 from upload_outbox as queued where queued.raw_rowid=raw.rowid
           and queued.raw_id=raw.id and queued.raw_created_at=raw.created_at
           and queued.raw_generation is raw.privacy_generation
           and (queued.attempt_count>0 or queued.sealed_envelope_json is not null or queued.state<>'pending'))
       order by raw.rowid limit 5001`).all(source,binding.sessionId,binding.validFrom,
-        binding.validUntil,binding.validUntil) as Array<{ id:string;payloadJson:string;observedAt:string }>;
+        binding.validUntil,binding.validUntil,rootId,rootId) as Array<{ id:string;payloadJson:string;observedAt:string }>;
     if(rows.length>5000) truncated=true;
     for(const row of rows.slice(0,5000)) {
       scanned++;
       if(Date.parse(row.observedAt)<Date.parse(binding.validFrom) ||
           (binding.validUntil&&Date.parse(row.observedAt)>=Date.parse(binding.validUntil))) { skipped++;continue; }
+      // A root ID can be reused after a profile, directory or installation
+      // changes. Only the admitted receipt proves the row's full root digest.
+      if(source==="claude_code"&&(!rootDigest||!admittedRoot?.get(row.id,rootDigest))) {
+        skipped++;continue;
+      }
+      if(source==="claude_code" && JSON.stringify(dispatchBindingForSession(source,binding.sessionId,
+        row.observedAt,roots))!==expectedBinding) { skipped++;continue; }
       const event=aiInteractionEventSchema.parse(JSON.parse(row.payloadJson));
       const corrected=aiInteractionEventSchema.parse({ ...event,
         metadata: { ...event.metadata,...dispatchBindingMetadata(binding) } });
