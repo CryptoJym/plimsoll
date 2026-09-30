@@ -62,7 +62,7 @@ export function claudePlanLimitWindows(statusLineInput: unknown): PlanLimitWindo
 
 type Observation = {
   source: "codex" | "claude_code";
-  accountKey: string;
+  accountKey?: string;
   observedAt: string;
   window: PlanLimitWindow;
   planLimitSource: "codex_rollout" | "claude_status_line";
@@ -93,13 +93,15 @@ export class PlanLimitEmitter {
 
   observe(input: Observation): boolean {
     const { source, accountKey, window, observedAt } = input;
-    if (!/^sha256:[a-f0-9]{16}$/.test(accountKey) || !Number.isFinite(Date.parse(observedAt))) return false;
+    if (accountKey !== undefined && !/^sha256:[a-f0-9]{16}$/.test(accountKey) ||
+      !Number.isFinite(Date.parse(observedAt))) return false;
     this.ensureSchema();
-    const cacheKey = JSON.stringify([source, accountKey, window.window]);
+    const stateKey = accountKey ?? "";
+    const cacheKey = JSON.stringify([source, stateKey, window.window]);
     if (!this.last.has(cacheKey)) {
       const row = this.buffer.database.prepare(`select used_percent as usedPercent, resets_at as resetsAt,
         observed_at as observedAt from plan_limit_emission_state where source=? and account_key=? and window=?`)
-        .get(source, accountKey, window.window) as LastEmission | undefined;
+        .get(source, stateKey, window.window) as LastEmission | undefined;
       this.last.set(cacheKey, row ?? null);
     }
     const previous = this.last.get(cacheKey);
@@ -111,7 +113,7 @@ export class PlanLimitEmitter {
     const accountField = source === "codex" ? "user.account_id" : "user.account_uuid";
     const metadata: Record<string, unknown> = {
       ...input.metadata,
-      [accountField]: accountKey,
+      ...(accountKey ? { [accountField]: accountKey } : {}),
       planLimitSource: input.planLimitSource,
       planLimitWindow: window.window,
       ...(window.minutes !== undefined ? { planLimitWindowMinutes: window.minutes } : {}),
@@ -121,7 +123,7 @@ export class PlanLimitEmitter {
       ...(input.planLimitId ? { planLimitId: input.planLimitId } : {}),
     };
     const event: AiInteractionEvent = aiInteractionEventSchema.parse({
-      id: deterministicEventId(["plan-limit", source, accountKey, window.window, window.resetsAt,
+      id: deterministicEventId(["plan-limit", source, stateKey, window.window, window.resetsAt,
         String(Math.floor(window.usedPercent)), String(Math.floor(Date.parse(observedAt) / (15 * 60_000)))]),
       source,
       dataMode: "metadata",
@@ -137,7 +139,7 @@ export class PlanLimitEmitter {
       (source,account_key,window,used_percent,resets_at,observed_at) values (?,?,?,?,?,?)
       on conflict(source,account_key,window) do update set
       used_percent=excluded.used_percent,resets_at=excluded.resets_at,observed_at=excluded.observed_at`)
-      .run(source, accountKey, window.window, latest.usedPercent, latest.resetsAt, latest.observedAt);
+      .run(source, stateKey, window.window, latest.usedPercent, latest.resetsAt, latest.observedAt);
     this.last.set(cacheKey, latest);
     return true;
   }

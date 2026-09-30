@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ClaudeAccountKeyCache } from "./local-identity";
+import { AccountBindingHistory, ClaudeAccountKeyCache } from "./local-identity";
 
 import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
@@ -88,9 +88,8 @@ import {
  *    ids, model and timestamps are persisted — never message content.
  *  - Repo linkage is occurrence-bound at capture and resolved only after the
  *    token/cursor commit; raw cwd stays transient.
- *  - Identity: NOT stamped. Claude's local config has no login-window
- *    equivalent of codex's last_refresh, so history stays unattributed
- *    rather than guessed.
+ *  - Identity: a durable observed-account window may bind a timestamped
+ *    message; imported history outside those windows stays unattributed.
  */
 
 export type TranscriptScanResult = {
@@ -352,6 +351,8 @@ function restoreResultMutationSnapshot(
 
 export class TranscriptTailer {
   private readonly accountKeys = new ClaudeAccountKeyCache();
+  private readonly accountBindings: AccountBindingHistory;
+  private accountObservedAtMs = 0;
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
@@ -448,6 +449,7 @@ export class TranscriptTailer {
     if (this.captureRoots.some(root => root.source !== "claude_code")) throw new Error("capture_root_provider_mismatch");
     ensureJsonlScanState(this.buffer.database);
     ensureJsonlContinuationStore(this.buffer.database);
+    this.accountBindings = new AccountBindingHistory(this.buffer.database, "claude_code");
     this.buffer.database.exec(`
       create table if not exists transcript_usage_revision_state (
         source text not null check (source = 'claude_code'),
@@ -652,6 +654,11 @@ export class TranscriptTailer {
       result.deferredGenerations = 1;
       result.automaticBudget = options.automatic?.budget.status() ?? null;
       return result;
+    }
+    this.accountObservedAtMs = scanNow.getTime();
+    for (const directory of this.directories) {
+      this.accountBindings.observe(directory, this.accountKeys.observationFromProjectsDir(directory),
+        this.accountObservedAtMs);
     }
     const now = scanNow;
     const recentCutoff = now.getTime() - 48 * 60 * 60 * 1000;
@@ -1684,7 +1691,8 @@ export class TranscriptTailer {
     const metadata: Record<string, unknown> = { ...rootEventMetadata(this.activeCaptureRoot, previous
       ? deterministicEventId(["claude-transcript-revision", state.sessionId, entry.messageId, String(entry.input), String(entry.cacheRead), String(entry.cacheCreation), String(entry.output)])
       : eventBaseId, observedAt, state.sessionId), usageSource: "transcript" };
-    const accountKey = this.accountKeys.fromProjectsDir(this.activeCaptureRoot?.directory ?? this.projectsDir);
+    const accountKey = this.accountBindings.keyAt(this.activeCaptureRoot?.directory ?? this.projectsDir,
+      clamped.clamped ? undefined : clamped.observedAt, this.accountObservedAtMs);
     if (accountKey) metadata["user.account_uuid"] = accountKey;
     if (priced) {
       metadata.costEstimated = true;

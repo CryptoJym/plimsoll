@@ -20,6 +20,7 @@ const counts = (timestamp: string, input: number, used: number, reset: number, s
   rate_limits: { plan_type: "pro", limit_id: "codex-limit-fixture", primary: { used_percent: used, window_minutes: 300, resets_at: reset },
     ...(secondary ? { secondary: { used_percent: 103.2, window_minutes: 10080, resets_at: reset + 1000 } } : {}) },
 });
+const scanAt = (clock: string) => ({ scope: "full" as const, now: new Date(`2026-09-29T${clock}Z`) });
 const rows = (buffer: LocalEventBuffer) => (buffer.database.prepare("select payload_json from buffered_events order by rowid").all() as Array<{ payload_json: string }>).map(row => JSON.parse(row.payload_json));
 
 async function main() {
@@ -56,6 +57,7 @@ async function main() {
 
     buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
     const tailer = new RolloutTailer(buffer, sessions, () => []);
+    await tailer.scan(scanAt("08:00:00")); // account observed before these later events
     assert.equal((buffer.database.prepare("select count(*) as n from sqlite_master where name='plan_limit_emission_state'")
       .get() as { n: number }).n, 0, "an idle tailer does not create plan-limit state");
     const session = "019e9999-1111-7222-8333-444444444444";
@@ -66,7 +68,7 @@ async function main() {
       line("2026-09-29T09:00:02.000Z", "turn_context", { model: "gpt-6-sol" }) +
       counts("2026-09-29T09:00:03.000Z", 10, 30.8, reset) +
       counts("2026-09-29T09:00:04.000Z", 20, 31.6, reset, false));
-    await tailer.scan({ scope: "full" });
+    await tailer.scan(scanAt("09:00:05"));
     let all = rows(buffer);
     const usage = all.filter(row => row.eventType === "usage_rollout");
     const readings = all.filter(row => row.eventType === "plan_limit_observation");
@@ -79,32 +81,33 @@ async function main() {
       row.metadata.planLimitResetsAt.endsWith("Z") && row.metadata.planType === "pro" && row.metadata.planLimitId === "codex-limit-fixture" &&
       row.inputTokens === undefined && row.outputTokens === undefined && row.cacheReadTokens === undefined));
     assert.equal(readings.find(row => row.metadata.planLimitWindow === "weekly")?.metadata.planLimitUsedPercent, 103.2);
-    await tailer.scan({ scope: "full" });
+    await tailer.scan(scanAt("09:00:06"));
     assert.equal(rows(buffer).length, all.length);
 
     fs.appendFileSync(rollout, counts("2026-09-29T09:20:00.000Z", 20, 32.0, reset, false));
-    await tailer.scan({ scope: "full" });
+    await tailer.scan(scanAt("09:20:01"));
     assert.equal(rows(buffer).filter(row => row.eventType === "plan_limit_observation").length, 4,
       "a later sub-point change emits after 15 minutes");
     fs.appendFileSync(rollout, counts("2026-09-29T09:21:00.000Z", 20, 32.2, reset + 3600, false));
-    await tailer.scan({ scope: "full" });
+    await tailer.scan(scanAt("09:21:01"));
     assert.equal(rows(buffer).filter(row => row.eventType === "plan_limit_observation").length, 5,
       "a reset change emits even when percent changes by less than one point");
 
     buffer.database.prepare("delete from rollout_scan_state").run();
     const beforeReplay = rows(buffer).length;
-    await new RolloutTailer(buffer, sessions, () => []).scan({ scope: "full" });
+    await new RolloutTailer(buffer, sessions, () => []).scan(scanAt("09:21:02"));
     assert.equal(rows(buffer).length, beforeReplay, "a replay does not append duplicate usage or readings");
 
     const secondId = "fixture-codex-account-two";
     writeAuth(secondId, 1_000_000);
+    await tailer.scan(scanAt("09:21:50"));
     fs.appendFileSync(rollout, counts("2026-09-29T09:22:00.000Z", 30, 32.4, reset, false));
-    await tailer.scan({ scope: "full" });
-    assert.equal(rows(buffer).filter(row => row.eventType === "usage_rollout").at(-1)?.metadata["user.account_id"], key,
-      "unchanged mtime does not reread auth");
+    await tailer.scan(scanAt("09:22:05"));
+    assert.equal(rows(buffer).filter(row => row.eventType === "usage_rollout").at(-1)?.metadata["user.account_id"], providerAccountKey(secondId),
+      "a changed auth file is observed even when its mtime is unchanged");
     writeAuth(secondId, 1_000_100);
     fs.appendFileSync(rollout, counts("2026-09-29T09:23:00.000Z", 40, 32.6, reset, false));
-    await tailer.scan({ scope: "full" });
+    await tailer.scan(scanAt("09:23:05"));
     all = rows(buffer);
     assert.equal(all.filter(row => row.eventType === "usage_rollout").at(-1)?.metadata["user.account_id"], providerAccountKey(secondId));
     assert.ok(all.some(row => row.eventType === "plan_limit_observation" && row.metadata["user.account_id"] === providerAccountKey(secondId)));
@@ -112,7 +115,7 @@ async function main() {
     fs.appendFileSync(rollout, line("2026-09-29T09:24:00.000Z", "event_msg", { type: "token_count", rate_limits: {
       primary: { used_percent: 33, window_minutes: 300, resets_at: reset + 7200 },
     } }));
-    await tailer.scan({ scope: "full" });
+    await tailer.scan(scanAt("09:24:05"));
     all = rows(buffer);
     assert.equal(all.filter(row => row.eventType === "usage_rollout").length, usageBeforeLimitOnly);
     assert.ok(all.some(row => row.eventType === "plan_limit_observation" &&
@@ -124,6 +127,8 @@ async function main() {
     const projects = path.join(claudeDir, "projects", "fixture-project");
     fs.mkdirSync(projects, { recursive: true });
     fs.writeFileSync(path.join(claudeDir, ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: claudeId } }));
+    const transcriptTailer = new TranscriptTailer(buffer, path.join(claudeDir, "projects"));
+    await transcriptTailer.scan(scanAt("08:00:00"));
     const claudeSession = "019eaaaa-1111-7222-8333-444444444444";
     fs.writeFileSync(path.join(projects, `${claudeSession}.jsonl`), JSON.stringify({
       type: "assistant", sessionId: claudeSession, timestamp: "2026-09-29T09:00:00.000Z",
@@ -131,7 +136,8 @@ async function main() {
         content: [{ type: "text", text: "fixture" }],
         usage: { input_tokens: 8, cache_read_input_tokens: 2, cache_creation_input_tokens: 0, output_tokens: 3 } },
     }) + "\n");
-    await new TranscriptTailer(buffer, path.join(claudeDir, "projects")).scan({ scope: "full" });
+    await transcriptTailer.scan(scanAt("09:00:05"));
+    transcriptTailer.close();
     const transcript = rows(buffer).find(row => row.eventType === "usage_transcript");
     assert.equal(transcript?.metadata["user.account_uuid"], providerAccountKey(claudeId));
     assert.equal(transcript?.model, "claude-opus-5-5");

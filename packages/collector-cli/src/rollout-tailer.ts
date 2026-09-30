@@ -60,7 +60,7 @@ import {
   maintenanceCandidateHash,
   type MaintenanceProgressStage,
 } from "./maintenance-progress";
-import { CodexAccountKeyCache, readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
+import { AccountBindingHistory, CodexAccountKeyCache, readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
 import { codexPlanLimitWindows, PlanLimitEmitter, type PlanLimitWindow } from "./plan-limit-observation";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import {
@@ -406,6 +406,8 @@ function restoreResultMutationSnapshot(
 
 export class RolloutTailer {
   private readonly accountKeys = new CodexAccountKeyCache();
+  private readonly accountBindings: AccountBindingHistory;
+  private accountObservedAtMs = 0;
   private readonly planLimits: PlanLimitEmitter;
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
@@ -505,6 +507,7 @@ export class RolloutTailer {
     if (this.captureRoots.some(root => root.source !== "codex")) throw new Error("capture_root_provider_mismatch");
     ensureJsonlScanState(this.buffer.database);
     ensureJsonlContinuationStore(this.buffer.database);
+    this.accountBindings = new AccountBindingHistory(this.buffer.database, "codex");
     this.planLimits = new PlanLimitEmitter(this.buffer);
   }
 
@@ -690,6 +693,11 @@ export class RolloutTailer {
       result.deferredGenerations = 1;
       result.automaticBudget = options.automatic?.budget.status() ?? null;
       return result;
+    }
+    this.accountObservedAtMs = scanNow.getTime();
+    for (const directory of this.directories) {
+      this.accountBindings.observe(directory, this.accountKeys.observationFromSessionsDir(directory),
+        this.accountObservedAtMs);
     }
     try {
       this.codexIdentity = this.identityProvider().find((entry) => entry.source === "codex");
@@ -1611,7 +1619,7 @@ export class RolloutTailer {
       repoContext: ActiveContext;
       lineageFirstUnknown?: TokenTotals;
     }> = [];
-    const accountKey = this.accountKeys.fromSessionsDir(this.activeCaptureRoot?.directory ?? this.sessionsDir);
+    const accountHome = this.activeCaptureRoot?.directory ?? this.sessionsDir;
     const planReadings: Array<{ observedAt?: string; window: PlanLimitWindow; planType?: string; limitId?: string }> = [];
     let activeRepoContext: ActiveContext = state.activeRepoContextId
       ? { kind: "persisted", contextId: state.activeRepoContextId }
@@ -1703,14 +1711,14 @@ export class RolloutTailer {
       }
     }
 
-    if (accountKey) {
-      for (const reading of planReadings) {
-        const clamped = clampFutureObservedAt(reading.observedAt, this.receivedAtMs);
-        const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
-        if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
-          window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
-          planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;
-      }
+    for (const reading of planReadings) {
+      const clamped = clampFutureObservedAt(reading.observedAt, this.receivedAtMs);
+      const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
+      const accountKey = this.accountBindings.keyAt(accountHome,
+        clamped.clamped ? undefined : clamped.observedAt, this.accountObservedAtMs);
+      if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
+        window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
+        planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;
     }
 
     const sessionCovered = state.conversationId
@@ -1749,17 +1757,6 @@ export class RolloutTailer {
     if (!state.conversationId || pending.length === 0) return state;
     result.filesParsed += 1;
 
-    // Identity window: only sessions that started at/after the current
-    // login's last_refresh provably ran under this account. History stays
-    // unattributed rather than guessed (issue 0028).
-    const identity = this.captureRoots.length ? undefined : this.codexIdentity;
-    const actorId =
-      identity?.actorHash &&
-      identity.validFrom &&
-      state.sessionStartedAt &&
-      Date.parse(state.sessionStartedAt) >= Date.parse(identity.validFrom)
-        ? identity.actorHash
-        : undefined;
     for (const entry of pending) {
       // Intake clamp (bead eco-6hoxj.73.3). A rollout record can carry any
       // timestamp its writer put there; `last_event_at` is a monotone max, so
@@ -1769,6 +1766,8 @@ export class RolloutTailer {
       // the same rewrite and is counted with it.
       const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
       const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
+      const accountKey = this.accountBindings.keyAt(accountHome,
+        clamped.clamped ? undefined : clamped.observedAt, this.accountObservedAtMs);
       const activeCaptureRoot = this.captureRootAt(this.activeCaptureRoot, observedAt);
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.
@@ -1823,7 +1822,7 @@ export class RolloutTailer {
         dataMode: "metadata",
         eventType: "usage_rollout",
         observedAt,
-        actorId: accountKey ?? (typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : actorId),
+        actorId: accountKey ?? (typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : undefined),
         sessionId: state.conversationId,
         model: entry.model,
         actionClass: "other",
