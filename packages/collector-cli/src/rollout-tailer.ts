@@ -66,7 +66,8 @@ import {
   maintenanceCandidateHash,
   type MaintenanceProgressStage,
 } from "./maintenance-progress";
-import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
+import { AccountBindingHistory, CodexAccountKeyCache, readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
+import { codexPlanLimitWindows, PlanLimitEmitter, type PlanLimitWindow } from "./plan-limit-observation";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
@@ -410,6 +411,10 @@ function restoreResultMutationSnapshot(
 }
 
 export class RolloutTailer {
+  private readonly accountKeys = new CodexAccountKeyCache();
+  private readonly accountBindings: AccountBindingHistory;
+  private accountObservedAtMs = 0;
+  private readonly planLimits: PlanLimitEmitter;
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
@@ -514,6 +519,8 @@ export class RolloutTailer {
     if (this.captureRoots.some(root => root.source !== "codex")) throw new Error("capture_root_provider_mismatch");
     ensureJsonlScanState(this.buffer.database);
     ensureJsonlContinuationStore(this.buffer.database);
+    this.accountBindings = new AccountBindingHistory(this.buffer.database, "codex");
+    this.planLimits = new PlanLimitEmitter(this.buffer);
   }
 
   close() {
@@ -698,6 +705,11 @@ export class RolloutTailer {
       result.deferredGenerations = 1;
       result.automaticBudget = options.automatic?.budget.status() ?? null;
       return result;
+    }
+    this.accountObservedAtMs = scanNow.getTime();
+    for (const directory of this.directories) {
+      this.accountBindings.observe(directory, this.accountKeys.observationFromSessionsDir(directory),
+        this.accountObservedAtMs);
     }
     try {
       this.codexIdentity = this.identityProvider().find((entry) => entry.source === "codex");
@@ -1659,6 +1671,8 @@ export class RolloutTailer {
       repoContext: ActiveContext;
       lineageFirstUnknown?: TokenTotals;
     }> = [];
+    const accountHome = this.activeCaptureRoot?.directory ?? this.sessionsDir;
+    const planReadings: Array<{ observedAt?: string; window: PlanLimitWindow; planType?: string; limitId?: string }> = [];
     let activeRepoContext: ActiveContext = state.activeRepoContextId
       ? { kind: "persisted", contextId: state.activeRepoContextId }
       : undefined;
@@ -1705,15 +1719,24 @@ export class RolloutTailer {
         if (typeof payload.originator === "string") state.originator = payload.originator;
         if (typeof payload.cli_version === "string") state.cliVersion = payload.cli_version;
       } else if (type === "turn_context") {
-        if (typeof payload.model === "string" && payload.model) state.model = payload.model;
+        if (typeof payload.model === "string" && payload.model) {
+          state.model = payload.model;
+          // Codex can report its first token count before turn_context.
+          for (const entry of pending) entry.model ??= state.model;
+        }
         activeRepoContext = observeContext("turn_context", payload.cwd);
       } else if (type === "event_msg" && payload.type === "token_count") {
         state.tokenCountIndex += 1;
         const info = (payload.info ?? {}) as Record<string, unknown>;
         const totals = totalsFrom(info.total_token_usage as Record<string, unknown> | undefined);
-        if (!totals) continue;
         const rateLimits = (payload.rate_limits ?? {}) as Record<string, unknown>;
         if (typeof rateLimits.plan_type === "string") state.planType = rateLimits.plan_type;
+        for (const window of codexPlanLimitWindows(rateLimits)) {
+          planReadings.push({ observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
+            window, planType: state.planType,
+            limitId: typeof rateLimits.limit_id === "string" ? rateLimits.limit_id : undefined });
+        }
+        if (!totals) continue;
         // Issue #153: the lineage's first totals observation diffs against
         // an ASSUMED zero baseline. A nonzero result cannot be attributed to
         // observed marginals — it may be genuine catch-up usage of a young
@@ -1738,6 +1761,16 @@ export class RolloutTailer {
           ...(lineageFirstUnknown ? { lineageFirstUnknown } : {}),
         });
       }
+    }
+
+    for (const reading of planReadings) {
+      const clamped = clampFutureObservedAt(reading.observedAt, this.receivedAtMs);
+      const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
+      const accountKey = this.accountBindings.keyAt(accountHome,
+        clamped.clamped ? undefined : clamped.observedAt, this.accountObservedAtMs);
+      if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
+        window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
+        planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;
     }
 
     const sessionCovered = state.conversationId
@@ -1776,17 +1809,6 @@ export class RolloutTailer {
     if (!state.conversationId || pending.length === 0) return state;
     result.filesParsed += 1;
 
-    // Identity window: only sessions that started at/after the current
-    // login's last_refresh provably ran under this account. History stays
-    // unattributed rather than guessed (issue 0028).
-    const identity = this.captureRoots.length ? undefined : this.codexIdentity;
-    const actorId =
-      identity?.actorHash &&
-      identity.validFrom &&
-      state.sessionStartedAt &&
-      Date.parse(state.sessionStartedAt) >= Date.parse(identity.validFrom)
-        ? identity.actorHash
-        : undefined;
     for (const entry of pending) {
       // Intake clamp (bead eco-6hoxj.73.3). A rollout record can carry any
       // timestamp its writer put there; `last_event_at` is a monotone max, so
@@ -1802,6 +1824,8 @@ export class RolloutTailer {
         result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
         continue;
       }
+      const accountKey = this.accountBindings.keyAt(accountHome,
+        clamped.clamped ? undefined : clamped.observedAt, this.accountObservedAtMs);
       const activeCaptureRoot = this.captureRootAt(this.activeCaptureRoot, observedAt);
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.
@@ -1829,6 +1853,7 @@ export class RolloutTailer {
           this.accountAttributionEnabled()),
         usageSource: "rollout",
         turnIndex: entry.index,
+        ...(accountKey ? { "user.account_id": accountKey } : {}),
       };
       if (state.originator) metadata.originator = state.originator;
       if (state.cliVersion) metadata.cliVersion = state.cliVersion;
@@ -1856,7 +1881,7 @@ export class RolloutTailer {
         dataMode: "metadata",
         eventType: "usage_rollout",
         observedAt,
-        actorId: typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : actorId,
+        actorId: accountKey ?? (typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : undefined),
         sessionId: state.conversationId,
         model: entry.model,
         actionClass: "other",

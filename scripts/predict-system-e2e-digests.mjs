@@ -13,6 +13,11 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const outArg = process.argv.indexOf("--output");
 const output = outArg >= 0 ? path.resolve(process.argv[outArg + 1] ?? "") :
   path.join(repo, "evidence", "system-e2e-pin-candidates.json");
+const onlyArg = process.argv.indexOf("--only");
+const only = onlyArg >= 0 ? process.argv[onlyArg + 1] : undefined;
+const guardArg = process.argv.indexOf("--port-guard");
+const portGuard = guardArg >= 0 ? path.resolve(process.argv[guardArg + 1] ?? "") : undefined;
+if (portGuard) assert.ok(fs.statSync(portGuard).isFile(), "port guard must be a file");
 const checks = path.dirname(output);
 const runLabel = process.env.PIN_RUN_LABEL ?? "pin";
 const proof = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-e2e-pin-predict-"));
@@ -30,9 +35,11 @@ const specs = [
   ["idle_dashboard_resources", "scripts/resource-proof/index.ts", 0, "resource.json"],
   ["launch_agent_unload_terminal_truth", "scripts/launch-agent-unload-proof.ts", 1],
 ];
+if (only) assert.ok(specs.some(([name]) => name === only), `unknown support phase ${only}`);
 const contract = loadSupportContract(supportContractPath(repo));
 const predictions = [];
 for (const [name, script, machine, receiptName] of specs) {
+  if (only && name !== only) continue;
   const committed = contract.phases.find((phase) => phase.name === name);
   assert.ok(committed, `missing committed phase ${name}`);
   if (name === "launch_agent_unload_terminal_truth") {
@@ -49,7 +56,9 @@ for (const [name, script, machine, receiptName] of specs) {
     PATH: process.env.PATH ?? "/usr/bin:/bin", SHELL: "/bin/zsh",
     LANG: "C.UTF-8", LC_ALL: "C.UTF-8", USER: "plimsoll-e2e", LOGNAME: "plimsoll-e2e",
     TERM: "dumb", CI: "1", NO_COLOR: "1", NEXT_TELEMETRY_DISABLED: "1",
-    ...(process.env.NODE_OPTIONS ? { NODE_OPTIONS: process.env.NODE_OPTIONS } : {}),
+    ...((process.env.NODE_OPTIONS || portGuard) ? {
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, portGuard ? `--require=${portGuard}` : ""].filter(Boolean).join(" "),
+    } : {}),
     ...(process.env.PLIMSOLL_FIXTURE_PORT_COUNTER
       ? { PLIMSOLL_FIXTURE_PORT_COUNTER: process.env.PLIMSOLL_FIXTURE_PORT_COUNTER } : {}),
   };

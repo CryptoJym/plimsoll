@@ -33,9 +33,8 @@
  * Cadence: manual refresh only. Nothing here schedules, retries on its own,
  * or runs in the background.
  *
- * Profile scope: the DEFAULT provider profiles only. Alternate
- * CLAUDE_CONFIG_DIR / CODEX_HOME profiles belong to issue #172 and are
- * deliberately unreachable from this module.
+ * The standalone Claude status-line setup command accepts explicit config
+ * directories; the Codex app-server probe remains default-profile only.
  */
 
 import {
@@ -44,17 +43,25 @@ import {
 } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isDeepStrictEqual } from "node:util";
 
-import {
-  applyClaudeSettings,
-  ClaudeConfigError,
-} from "../../collector-config/src/index";
+import { runChainedStatusLineCommand, configureClaudeStatusLineProxy,
+  STATUS_LINE_PROXY_INVOCATION_MARKER, setupClaudeStatusLine, CLAUDE_STATUS_LINE_MAX_STDIN_BYTES,
+  STATUS_LINE_CHAIN_DEFAULT_TIMEOUT_MS, STATUS_LINE_CHAIN_SHUTDOWN_GRACE_MS,
+  STATUS_LINE_CHAIN_MAX_STREAM_BYTES } from "./claude-status-line-command";
+export { configureClaudeStatusLineProxy, STATUS_LINE_PROXY_INVOCATION_MARKER, setupClaudeStatusLine,
+  CLAUDE_STATUS_LINE_MAX_STDIN_BYTES, STATUS_LINE_CHAIN_DEFAULT_TIMEOUT_MS,
+  STATUS_LINE_CHAIN_SHUTDOWN_GRACE_MS, STATUS_LINE_CHAIN_MAX_STREAM_BYTES } from "./claude-status-line-command";
+export type { ClaudeStatusLineConfigureInput, ClaudeStatusLineConfigureResult } from "./claude-status-line-command";
 
 import { PLIMSOLL_VERSION } from "./version";
 import { resolveCollectorHome } from "./collector-home";
+import { providerAccountKey } from "../../shared/src/policy";
+import { claudePlanLimitWindows, PlanLimitEmitter } from "./plan-limit-observation";
+import { LocalEventBuffer } from "./buffer";
+import { collectorBufferPath, ensureCollectorHome } from "./config";
 
 // ---------------------------------------------------------------------------
 // Contract constants
@@ -299,7 +306,6 @@ const ADAPTER_VERSION = isValidAdapterIdentifier(PLIMSOLL_VERSION)
  * payloads are small JSON documents; anything near this bound is hostile and
  * refused before buffering more.
  */
-export const CLAUDE_STATUS_LINE_MAX_STDIN_BYTES = 1024 * 1024;
 
 /**
  * Documented `rate_limits` window labels (Claude Code v2.1+ status-line
@@ -1094,9 +1100,6 @@ function finishCodexProbe(input: {
 // Claude status-line proxy runtime
 // ---------------------------------------------------------------------------
 
-export const STATUS_LINE_CHAIN_DEFAULT_TIMEOUT_MS = 10_000 as const;
-export const STATUS_LINE_CHAIN_SHUTDOWN_GRACE_MS = 2_000 as const;
-export const STATUS_LINE_CHAIN_MAX_STREAM_BYTES = 4 * 1024 * 1024;
 
 export type ClaudeStatusLineProxyOptions = {
   /** Raw Claude Code stdin bytes, already fully buffered by the caller. */
@@ -1223,321 +1226,6 @@ export async function runClaudeStatusLineProxy(
   return { stdout, stderr, exitCode, receipt };
 }
 
-type ChainedRun = {
-  stdout: Buffer;
-  stderr: Buffer;
-  exitCode: number;
-  signal: string | null;
-  bytesWritten: number;
-};
-
-/**
- * Reproduce the operator status line: `/bin/sh -c <command>` with the raw
- * stdin forwarded in memory, bounded stdout/stderr capture, and the classic
- * timeout ladder (deadline → SIGTERM → grace → SIGKILL, exit 124 on timeout,
- * mirroring GNU timeout's convention).
- */
-async function runChainedStatusLineCommand(input: {
-  command: string;
-  stdinBytes: Buffer;
-  timeoutMs: number;
-  shutdownGraceMs: number;
-  maxStreamBytes: number;
-}): Promise<ChainedRun> {
-  return new Promise<ChainedRun>((resolve) => {
-    let child: ChildProcessWithoutNullStreams;
-    try {
-      child = spawn("/bin/sh", ["-c", input.command], {
-        stdio: ["pipe", "pipe", "pipe"],
-        shell: false,
-      }) as ChildProcessWithoutNullStreams;
-    } catch {
-      resolve({
-        stdout: Buffer.alloc(0),
-        stderr: Buffer.alloc(0),
-        exitCode: 126,
-        signal: null,
-        bytesWritten: 0,
-      });
-      return;
-    }
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    let stdoutTotal = 0;
-    let stderrTotal = 0;
-    let settled = false;
-    let timedOut = false;
-
-    const finish = (exitCode: number, signal: string | null, bytesWritten: number) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      clearTimeout(killTimer);
-      resolve({
-        stdout: Buffer.concat(stdoutChunks),
-        stderr: Buffer.concat(stderrChunks),
-        exitCode,
-        signal,
-        bytesWritten,
-      });
-    };
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutTotal += chunk.length;
-      if (stdoutTotal <= input.maxStreamBytes) stdoutChunks.push(chunk);
-      if (stdoutTotal > input.maxStreamBytes || stderrTotal > input.maxStreamBytes) {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already dead
-        }
-        finish(124, "SIGKILL", input.stdinBytes.length);
-      }
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrTotal += chunk.length;
-      if (stderrTotal <= input.maxStreamBytes) stderrChunks.push(chunk);
-      if (stdoutTotal > input.maxStreamBytes || stderrTotal > input.maxStreamBytes) {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already dead
-        }
-        finish(124, "SIGKILL", input.stdinBytes.length);
-      }
-    });
-    child.once("error", () => finish(126, null, 0));
-    child.once("close", (code, closeSignal) => {
-      if (timedOut) {
-        finish(124, closeSignal ?? "SIGTERM", input.stdinBytes.length);
-        return;
-      }
-      finish(code ?? (closeSignal ? 128 + 15 : 1), closeSignal, input.stdinBytes.length);
-    });
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // already dead
-      }
-    }, input.timeoutMs);
-    const killTimer = setTimeout(() => {
-      if (!timedOut) return;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // already dead
-      }
-    }, input.timeoutMs + input.shutdownGraceMs);
-
-    child.stdin.on("error", () => {
-      // EPIPE when the operator command does not read stdin: not fatal.
-    });
-    child.stdin.end(input.stdinBytes);
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Claude status-line configuration (install / chain / block)
-// ---------------------------------------------------------------------------
-
-export const STATUS_LINE_PROXY_INVOCATION_MARKER =
-  "__plimsoll-capacity-statusline-proxy" as const;
-
-export type ClaudeStatusLineConfigureInput = {
-  settingsPath: string;
-  /**
-   * Absolute, shell-safe base command that invokes THIS module's hidden proxy
-   * entry point (everything before the marker argument), e.g.
-   *   tsx /repo/packages/collector-cli/src/provider-capacity-adapters.ts
-   * Callers own resolution; this module never guesses launchers.
-   */
-  baseProxyCommand: string;
-  transactionHooks?: NonNullable<Parameters<typeof applyClaudeSettings>[2]>["transactionHooks"];
-};
-
-export type ClaudeStatusLineConfigureResult =
-  | {
-      outcome: "installed" | "already_installed" | "chained" | "unchanged_chain";
-      changes: string[];
-      backupPath?: string;
-      chainedCommand: string | null;
-    }
-  | { outcome: "blocked_existing_statusline" | "blocked_invalid_settings"; reason: string };
-
-function statusLineEntryFor(chainCommand: string | null, baseProxyCommand: string): Record<string, unknown> {
-  const chainArgument =
-    chainCommand === null ? "-" : Buffer.from(chainCommand, "utf8").toString("base64");
-  return {
-    type: "command",
-    command: `${baseProxyCommand} ${STATUS_LINE_PROXY_INVOCATION_MARKER} ${chainArgument}`,
-  };
-}
-
-function decodeConfiguredChainCommand(command: unknown): string | null | undefined {
-  if (typeof command !== "string") return undefined;
-  const prefix = ` ${STATUS_LINE_PROXY_INVOCATION_MARKER} `;
-  const markerIndex = command.indexOf(prefix);
-  if (markerIndex === -1) return undefined;
-  const argument = command.slice(markerIndex + prefix.length).trim();
-  if (argument === "-") return null;
-  if (!/^[A-Za-z0-9+/=]+$/.test(argument) || argument.length > 8192) return undefined;
-  try {
-    const decoded = Buffer.from(argument, "base64").toString("utf8");
-    return decoded.length > 0 && decoded.length <= 4096 ? decoded : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function looksLikeOperatorStatusLine(value: unknown): { command: string } | null {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const allowedKeys = ["type", "command", "padding", "refreshInterval"];
-  const keys = Object.keys(record);
-  if (keys.some((key) => !allowedKeys.includes(key))) return null;
-  if (record.type !== "command") return null;
-  if (typeof record.command !== "string" || record.command.trim().length === 0) return null;
-  if (record.command.length > 4096) return null;
-  if (
-    record.padding !== undefined &&
-    record.padding !== null &&
-    typeof record.padding !== "number"
-  ) {
-    return null;
-  }
-  return { command: record.command };
-}
-
-function readSettingsSource(settingsPath: string): { source: string; exists: boolean } {
-  try {
-    return { source: fs.readFileSync(settingsPath, "utf8"), exists: true };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { source: "", exists: false };
-    }
-    throw error;
-  }
-}
-
-/**
- * Install (or chain) the capacity status line through the CURRENT atomic
- * settings transaction. Decision matrix:
- *
- * - no `statusLine` key            → install ours (no chain)
- * - ours, identical                → already_installed (no-op)
- * - ours, same embedded chain      → unchanged_chain (no-op)
- * - operator entry (known shape)   → chain: forward raw stdin to it
- * - unrecognized/malicious entry   → blocked_existing_statusline, ZERO mutation
- * - unparsable settings            → blocked_invalid_settings, ZERO mutation
- *
- * Safety is proven before anything is written: a dry-run application plans the
- * merge first, so every rejection happens without touching the file, and a
- * failed/interrupted commit restores the original bytes (transaction-owned).
- */
-export function configureClaudeStatusLineProxy(
-  input: ClaudeStatusLineConfigureInput,
-): ClaudeStatusLineConfigureResult {
-  let currentSource: string;
-  try {
-    currentSource = readSettingsSource(input.settingsPath).source;
-  } catch {
-    return { outcome: "blocked_invalid_settings", reason: "settings_unreadable" };
-  }
-  let currentDocument: Record<string, unknown> = {};
-  if (currentSource.trim().length > 0) {
-    try {
-      const parsed: unknown = JSON.parse(currentSource);
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return { outcome: "blocked_invalid_settings", reason: "settings_root_not_object" };
-      }
-      currentDocument = parsed as Record<string, unknown>;
-    } catch {
-      return { outcome: "blocked_invalid_settings", reason: "settings_malformed_json" };
-    }
-  }
-
-  const foldedKeys = Object.keys(currentDocument).filter(
-    (key) => key !== "statusLine" && key.toLowerCase() === "statusline",
-  );
-  if (foldedKeys.length > 0) {
-    return {
-      outcome: "blocked_existing_statusline",
-      reason: "status_line_key_alias_present",
-    };
-  }
-
-  const existing = currentDocument.statusLine;
-  let chainCommand: string | null = null;
-  if (existing !== undefined) {
-    const oursDecode = decodeConfiguredChainCommand(
-      (existing as Record<string, unknown> | null)?.command,
-    );
-    if (
-      existing !== null &&
-      typeof existing === "object" &&
-      typeof (existing as Record<string, unknown>).command === "string" &&
-      oursDecode !== undefined
-    ) {
-      // Already ours; keep whatever chain is embedded.
-      chainCommand = oursDecode;
-    } else {
-      const operator = looksLikeOperatorStatusLine(existing);
-      if (operator === null) {
-        return {
-          outcome: "blocked_existing_statusline",
-          reason: "unrecognized_existing_entry_shape",
-        };
-      }
-      chainCommand = operator.command;
-    }
-  }
-
-  const desired = statusLineEntryFor(chainCommand, input.baseProxyCommand);
-  if (isDeepStrictEqual(existing ?? undefined, desired)) {
-    return {
-      outcome: chainCommand === null ? "already_installed" : "unchanged_chain",
-      changes: [],
-      chainedCommand: chainCommand,
-    };
-  }
-
-  // Prove the plan first: a dry run executes the full reconciliation (alias
-  // checks, shape checks) WITHOUT writing, so rejection never mutates.
-  try {
-    applyClaudeSettings(input.settingsPath, { env: {}, statusLine: desired }, { dryRun: true });
-  } catch (error) {
-    return {
-      outcome:
-        error instanceof ClaudeConfigError && error.code === "MALFORMED_JSON"
-          ? "blocked_invalid_settings"
-          : "blocked_existing_statusline",
-      reason: error instanceof ClaudeConfigError ? error.code : "planning_failed",
-    };
-  }
-
-  try {
-    const applied = applyClaudeSettings(
-      input.settingsPath,
-      { env: {}, statusLine: desired },
-      { transactionHooks: input.transactionHooks },
-    );
-    return {
-      outcome: chainCommand === null ? "installed" : "chained",
-      changes: applied.changes,
-      backupPath: applied.backupPath,
-      chainedCommand: chainCommand,
-    };
-  } catch (error) {
-    return {
-      outcome: "blocked_existing_statusline",
-      reason: error instanceof ClaudeConfigError ? `commit_${error.code}` : "commit_failed",
-    };
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Direct-invocation command surface (manual refresh only)
 // ---------------------------------------------------------------------------
@@ -1628,6 +1316,34 @@ async function statusLineProxyMain(argv: string[]): Promise<void> {
     stdinBytes,
     chainCommand: chainCommand === null || chainCommand.length === 0 ? null : chainCommand,
   });
+  if (!overBound) {
+    try {
+      const accountFile = process.env.CLAUDE_CONFIG_DIR
+        ? path.join(process.env.CLAUDE_CONFIG_DIR, ".claude.json")
+        : path.join(os.homedir(), ".claude.json");
+      const stat = fs.lstatSync(accountFile);
+      if (stat.isFile() && !stat.isSymbolicLink()) {
+        const identity = JSON.parse(fs.readFileSync(accountFile, "utf8")) as { oauthAccount?: { accountUuid?: unknown } };
+        const id = identity.oauthAccount?.accountUuid;
+        if (typeof id === "string" && id.length > 0) {
+          const payload = JSON.parse(stdinBytes.toString("utf8")) as unknown;
+          const windows = claudePlanLimitWindows(payload);
+          if (windows.length > 0) {
+            ensureCollectorHome();
+            const buffer = new LocalEventBuffer(collectorBufferPath());
+            try {
+              const emitter = new PlanLimitEmitter(buffer);
+              const accountKey = providerAccountKey(id);
+              for (const window of windows) emitter.observe({ source: "claude_code", accountKey,
+                observedAt: result.receipt.observedAt, window, planLimitSource: "claude_status_line" });
+            } finally { buffer.close(); }
+          }
+        }
+      }
+    } catch {
+      // Collection is best-effort; the original status line always gets its output.
+    }
+  }
   if (result.stdout.length > 0) process.stdout.write(result.stdout);
   if (result.stderr.length > 0) process.stderr.write(result.stderr);
   process.exitCode = result.exitCode === 0 ? 0 : result.exitCode;
@@ -1643,6 +1359,7 @@ export function invokedAsCapacityAdaptersCli(
   const knownCommands = [
     "refresh",
     "install-claude-statusline",
+    "setup-claude-status-line",
     STATUS_LINE_PROXY_INVOCATION_MARKER,
   ];
   if (!knownCommands.includes(command)) return false;
@@ -1670,6 +1387,10 @@ export async function capacityAdaptersCliMain(argv: string[]): Promise<void> {
     installClaudeStatuslineCommand(rest);
     return;
   }
+  if (command === "setup-claude-status-line") {
+    printJson({ status: "claude_status_line_setup", results: setupClaudeStatusLine(rest) });
+    return;
+  }
   if (command === STATUS_LINE_PROXY_INVOCATION_MARKER) {
     await statusLineProxyMain(rest);
     return;
@@ -1680,6 +1401,7 @@ export async function capacityAdaptersCliMain(argv: string[]): Promise<void> {
   process.exitCode = 64;
 }
 
-if (invokedAsCapacityAdaptersCli(import.meta.url, process.argv[1], process.argv[2])) {
+if (path.basename(fileURLToPath(import.meta.url)) === "provider-capacity-adapters.ts" &&
+    invokedAsCapacityAdaptersCli(import.meta.url, process.argv[1], process.argv[2])) {
   void capacityAdaptersCliMain(process.argv.slice(2));
 }

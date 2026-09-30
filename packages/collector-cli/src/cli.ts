@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { openLedgerDatabase } from "./ledger-connection";
 import { AutomaticRetentionCadence } from "./retention-cadence";
+import { claudeStatusLineCliMain } from "./claude-status-line-command";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
@@ -461,6 +462,8 @@ Commands:
   generate-config TOOL  Print Claude Code, Codex, Gemini CLI, or Grok config for metadata collection
   setup                 APPLY Claude Code, Gemini CLI, Grok, and Codex telemetry independently
                         (idempotent; --yes, --dry-run)
+  setup claude-status-line [--config-dir DIR]... [--uninstall]
+                        Capture Claude plan-limit readings, chaining the existing status line
   rotate-producer-token --source <claude_code|codex|gemini_cli|grok>
                         Mint a new producer token for one source, rewrite that source's managed
                         surfaces (Claude settings and seats; Codex header file, config.toml and
@@ -2869,6 +2872,15 @@ function readInstallationEpochId(roots: readonly CaptureRoot[]): string | null {
 async function main() {
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
+    return;
+  }
+
+  if (command === "__plimsoll-capacity-statusline-proxy") {
+    await claudeStatusLineCliMain(process.argv.slice(2));
+    return;
+  }
+  if (command === "setup" && process.argv[3] === "claude-status-line") {
+    await claudeStatusLineCliMain(["setup-claude-status-line", ...process.argv.slice(4)]);
     return;
   }
 

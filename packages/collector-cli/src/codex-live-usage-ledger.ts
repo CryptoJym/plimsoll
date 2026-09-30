@@ -3,6 +3,7 @@ import type { LocalEventBuffer } from "./buffer";
 import type { LiveAuthenticatedBinding, LiveSourceContext } from "./codex-live-usage-auth";
 import { isAuthenticatedLiveBinding } from "./codex-live-usage-auth";
 import { currentDispatchRoot,dispatchBindingMetadata,type CaptureRoot } from "./capture-root-inventory";
+import { AccountBindingHistory, CodexAccountKeyCache } from "./local-identity";
 import type { MetricSample } from "./otlp";
 import { HttpBoundaryRejection } from "./http-boundary";
 import { readLiveUsageObservation, type AiInteractionEvent } from "../../shared/src/index";
@@ -11,6 +12,16 @@ import { canonicalJson, hasLiveUsageClaim, LIVE_COUNTERS, LIVE_SCHEMA, liveEvent
   type LiveUsagePacket } from "./codex-live-usage-protocol";
 
 type DB = Database.Database;
+const liveAccountKeys = new CodexAccountKeyCache();
+const liveAccountBindings = new WeakMap<DB, AccountBindingHistory>();
+function accountBindings(db: DB) {
+  let history = liveAccountBindings.get(db);
+  if (!history) {
+    history = new AccountBindingHistory(db, "codex");
+    liveAccountBindings.set(db, history);
+  }
+  return history;
+}
 export function ensureCodexLiveUsageSchema(db: DB) {
   db.exec(`
     create table if not exists codex_live_producers (
@@ -165,7 +176,7 @@ function wholeWindow<T extends { validFrom: string; validUntil: string | null }>
       !contains(previous, newValue) || !contains(current, newValue)) return null;
   return newValue;
 }
-function intervalEvent(auth: LiveAuthenticatedBinding, p: LiveUsagePacket, digest: string,
+function intervalEvent(db: DB, auth: LiveAuthenticatedBinding, p: LiveUsagePacket, digest: string,
   prior: Checkpoint, current: Snapshot, delta: LiveTotals): AiInteractionEvent {
   let account = wholeWindow(prior.snapshot.account, current.account, prior.capturedAt, p.capturedAt);
   let work = wholeWindow(prior.snapshot.work, current.work, prior.capturedAt, p.capturedAt);
@@ -176,6 +187,12 @@ function intervalEvent(auth: LiveAuthenticatedBinding, p: LiveUsagePacket, diges
       Date.parse(w.validFrom) <= Date.parse(p.capturedAt) &&
       (!w.validUntil || Date.parse(w.validUntil) > Date.parse(prior.capturedAt))).length !== 1) work = null;
   const id = liveEventId(p);
+  const seenAt = Date.now();
+  const history = accountBindings(db);
+  history.observe(auth.root.directory, liveAccountKeys.observationFromSessionsDir(auth.root.directory), seenAt);
+  const startKey = history.keyAt(auth.root.directory, prior.capturedAt, seenAt);
+  const accountKey = startKey && startKey === history.keyAt(auth.root.directory, p.capturedAt, seenAt)
+    ? startKey : undefined;
   const metadata: Record<string, unknown> = {
     sourceVersion: LIVE_SCHEMA, sourceEventId: id, logicalSourceEventId: id, sourcePayloadDigest: digest,
     sourceIdentityEvidenceRef: "native_runtime_observed_interval_v1",
@@ -185,6 +202,7 @@ function intervalEvent(auth: LiveAuthenticatedBinding, p: LiveUsagePacket, diges
     liveAttributionState: account && work ? "qualified" : "unresolved", liveFinanceEligibility: "unqualified_observer",
     liveTotalTokens: delta.totalTokens, liveReasoningOutputTokens: delta.reasoningOutputTokens,
     ...(account ? { captureAccountHash: account.actorHash, accountEvidenceRef: account.evidenceRef } : {}),
+    ...(accountKey ? { "user.account_id": accountKey } : {}),
     ...(work ? dispatchBindingMetadata(work) : {}),
   };
   if (!readLiveUsageObservation(metadata, p.capturedAt)) throw new Error("live_interval_invalid");
@@ -205,6 +223,9 @@ export function ingestLiveUsage(buffer: LocalEventBuffer, packet: LivePacket, di
   recheck: () => LiveAuthenticatedBinding): LiveReceipt {
   const db = buffer.database;
   try {
+    // The schema must outlive a rejected receipt transaction. A failed receipt
+    // rolls that transaction back, including any table first created inside it.
+    accountBindings(db);
     return db.transaction(() => buffer.transactionWithRepoContextHandoffs(() => {
       const auth = recheck();
       if (!isAuthenticatedLiveBinding(auth)) throw new HttpBoundaryRejection("producer_token_invalid", 403);
@@ -273,7 +294,7 @@ export function ingestLiveUsage(buffer: LocalEventBuffer, packet: LivePacket, di
       try {
         return db.transaction(() => {
           if (prior && LIVE_COUNTERS.some(k => delta[k] > 0)) {
-            const event = intervalEvent(auth, packet, digest, prior, current, delta);
+            const event = intervalEvent(db, auth, packet, digest, prior, current, delta);
             liveEventCapabilities.set(event, { database: db, auth });
             try {
               const result = buffer.append(event, [], { integrityReceipt: true });
