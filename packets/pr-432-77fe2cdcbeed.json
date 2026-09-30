@@ -1,0 +1,29 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 432,
+  "headSha": "77fe2cdcbeed3b7a9ac3f5f0d1e92f27213be17b",
+  "reviewedAt": "2026-09-30T22:26:08Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0ef60-3a63-7883-b884-e089ee11c5d7",
+    "model": "gpt-6-sol",
+    "host": "studio6"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0ed83-1600-74b1-ab29-82b68afc1fdd"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0edf7-d312-7560-ab34-8792a2ee0eea"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0eec2-915c-7542-8dcf-4b7834a179ba"
+    }
+  ],
+  "summary": "Independent Codex review lane of PR #432 (per-account plan-limit readings and the Claude status line), rounds 1-6 on studio6 (gpt-6-sol max, thread 01a0ef60). Earlier rounds found the account key during a chained status-line command (P1) and uninstall restore races (P2s), all fixed under lead rulings. r5 approved 5b28dbc3 under the 2026-09-30 merge bar; its P2 follow-up is eco-6hoxj.165.99.3. r6, a merge-only review, approves 77fe2cdc: the merge of main 8d7068b0 (collector 0.7.45) resolves only the idle pin, and the follow-on commit re-centers the version-13 metadata envelope at width 16 on this PR's merged count (24,657; main alone 24,545), with the cause named and the edge tests updated."
+}
