@@ -1887,7 +1887,10 @@ export async function runNoChangeConstantWorkContract(
       let finalRun: CollectorMaintenanceRunResult | undefined;
       try {
         for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
-          finalRun = await stableMaintenance.runRecent();
+          // The stable sweep measures bounded metadata work. Keep admission
+          // independent of host speed while the normal boot and restart runs
+          // above and below continue to exercise the real 200 ms clock.
+          finalRun = await stableMaintenance.runRecent({ budgetClock: () => 0 });
           stableRuns.push(finalRun);
           const sweep = source === "codex"
             ? finalRun.rollout.activity.scan
