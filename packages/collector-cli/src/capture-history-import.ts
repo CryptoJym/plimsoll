@@ -10,7 +10,7 @@ import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import { captureBaselineExcludedReceipt, captureBaselineStatus } from "./capture-baseline";
 import { appendRootObservation, captureRootDigest, captureRootObservationPayloadDigest, inspectCaptureRoots,
-  prepareCaptureRootObservationSchema,
+  prepareCaptureRootObservationSchema, recordClaudeRootSessionSighting,
   rootEventMetadata, validateCaptureRoots, type CaptureRoot } from "./capture-root-inventory";
 import { deterministicEventId } from "./normalizer";
 import { ensureJsonlScanState, jsonlScanStateKey, rememberJsonlScanCursor,
@@ -1003,7 +1003,10 @@ function rememberFileCursor(db: DB, root: CaptureRoot, file: File) {
       })) };
   })();
   const c = file.cursor;
-  const read = { ...c, deferredBytes: c.observedSize - c.committedOffset,
+  // The fenced file was read and compared before publication. Its fingerprint
+  // covers exactly this committed offset, including every non-usage line.
+  const read = { ...c, committedPrefixHash: file.prefixHash,
+    deferredBytes: c.observedSize - c.committedOffset,
     workRemaining: c.observedSize > c.committedOffset, unresolvedRecord: null } as JsonlTailRead;
   rememberJsonlScanCursor(db, key, state.parserKind, state.checkpointVersion, read, state);
 }
@@ -1330,6 +1333,11 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
       // This small row preserves the exact initial parser baseline before a
       // crash can leave only some verified candidates committed.
       db.transaction(() => rememberFileBaseline(db, root, file)).immediate();
+      // Main keeps a Claude folder sighting durable before counted rows can
+      // fail or roll back. This callback runs after byte verification and
+      // before any counted-row writer transaction for this file.
+      if (root.source === "claude_code" && file.sessionId && !isLiveSession(db, root.source, file.sessionId))
+        recordClaudeRootSessionSighting(buffer, root, file.sessionId, file.fencedAt);
     }, async file => {
       while (pending.length) await flush();
       await rememberRemainingRecordBytes(db, root, file);

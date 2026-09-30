@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
+import { bindCaptureInventory, appendRootObservation, currentDispatchBindingSnapshot, inspectCaptureRoots, recordClaudeRootSessionSighting, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage, type DispatchBindingSnapshot } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
 import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
@@ -18,6 +18,7 @@ import {
   ensureJsonlScanState,
   jsonlScanStateKey,
   loadJsonlScanCursor,
+  prepareJsonlCommittedPrefixHash,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
   type JsonlTailerIo,
@@ -203,6 +204,9 @@ export type TranscriptScanOptions = {
   quarantine?: { stage: MaintenanceProgressStage; candidateHash: string };
   onProgress?: (progress: { stage: MaintenanceProgressStage; candidateHash: string | null }) => boolean;
   deferredBeforeIo?: boolean;
+  /** Startup replay only: observe the exact bytes whose cursor committed. */
+  onCommittedSourceSpan?: (file: string, span: { offset: number; bytes: Buffer } | null,
+    committedOffset: number) => void;
 };
 
 function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
@@ -354,6 +358,7 @@ export class TranscriptTailer {
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
+  private activeDispatchSnapshot: DispatchBindingSnapshot | undefined;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
   private eligibleDirectories: string[] | null = null;
@@ -505,7 +510,13 @@ export class TranscriptTailer {
   async scan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
     this.retiredProgress = null;
     this.successorInstalled = false;
-    const result = await this.runScan(options);
+    // One config observation per batch; every event uses the same indexed
+    // binding view, and the next scan observes an atomic config replacement.
+    const previousSnapshot=this.activeDispatchSnapshot;
+    this.activeDispatchSnapshot=currentDispatchBindingSnapshot();
+    let result: TranscriptScanResult;
+    try { result=await this.runScan(options); }
+    finally { this.activeDispatchSnapshot=previousSnapshot; }
     // The baseline sweep is a live cursor too. Reading only `captureAttempt`
     // published zeros and a false `sweepComplete` for every cadence of the
     // baseline phase — the long sweep an operator most needs to read.
@@ -1056,6 +1067,7 @@ export class TranscriptTailer {
         let cursor = candidate.cursor;
         let countedFile = candidate.countedFile;
         let pausedWithWork = false;
+        const sightedSessions = new Set<string>();
         while (true) {
           if (options.signal?.aborted) {
             result.aborted = true;
@@ -1145,6 +1157,30 @@ export class TranscriptTailer {
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            if (read.continuation?.action !== "checkpoint") {
+              prepareJsonlCommittedPrefixHash(this.buffer.database,
+                candidate.file, this.cursorKey(candidate.file), cursor, read);
+              read.assertStableForCommit();
+            }
+            // Persist the first known-root session sighting before the raw,
+            // receipt and cursor transaction. A process kill cannot erase it.
+            if(this.activeCaptureRoot && (read.lines.length>0 || initialState.pending)) {
+              let sessionId=initialState.sessionId;
+              if(!sessionId) for(const line of read.lines) {
+                if(!line.includes('"assistant"')||!line.includes('"usage"')) continue;
+                try {
+                  const parsed=JSON.parse(line) as Record<string,unknown>;
+                  if(parsed.type==="assistant"&&typeof parsed.sessionId==="string") {
+                    sessionId=parsed.sessionId.match(UUID_RE)?.[0]?.toLowerCase();
+                    if(sessionId) break;
+                  }
+                } catch { /* The ordinary parser counts malformed records. */ }
+              }
+              if(sessionId&&!sightedSessions.has(sessionId)) {
+                recordClaudeRootSessionSighting(this.buffer,this.activeCaptureRoot,sessionId,fallbackObservedAt.observedAt);
+                sightedSessions.add(sessionId);
+              }
+            }
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();
@@ -1189,6 +1225,8 @@ export class TranscriptTailer {
               );
             });
             committed = true;
+            options.onCommittedSourceSpan?.(candidate.file, read.committedSourceSpan ?? null,
+              read.committedOffset);
             if (read.skippedRecord) {
               result.skippedRecords = (result.skippedRecords ?? 0) + 1;
               result.skippedBytes = (result.skippedBytes ?? 0) + read.skippedRecord.bytes;
@@ -1689,7 +1727,7 @@ export class TranscriptTailer {
     });
     const metadata: Record<string, unknown> = { ...rootEventMetadata(this.activeCaptureRoot, previous
       ? deterministicEventId(["claude-transcript-revision", state.sessionId, entry.messageId, String(entry.input), String(entry.cacheRead), String(entry.cacheCreation), String(entry.output)])
-      : eventBaseId, observedAt, state.sessionId), usageSource: "transcript" };
+      : eventBaseId, observedAt, state.sessionId,true,this.activeDispatchSnapshot), usageSource: "transcript" };
     if (priced) {
       metadata.costEstimated = true;
       metadata.costKind = "estimated";

@@ -75,6 +75,7 @@ import {
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
+import { startClaudeReplayBarrier } from "./claude-replay-barrier";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
@@ -1989,6 +1990,7 @@ async function readDaemonState(
   hookSpool: HookSpoolDaemonReading;
   sync: DaemonSyncReading;
   httpAdmission: RejectionDiagnosticsCounters | "invalid" | null;
+  claudeDispatchSkips: { total:number;conflictingBindings:number;otherRootSeen:number;ambiguousRoot:number } | null;
 }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
@@ -2006,18 +2008,29 @@ async function readDaemonState(
     } catch {
       // Not a Plimsoll-ready service's answer.
     }
+    const skips=body?.claudeDispatchSkips;
+    const skipRecord=skips&&typeof skips==="object"&&!Array.isArray(skips)
+      ? skips as Record<string,unknown> : null;
+    const skipKeys=["total","conflictingBindings","otherRootSeen","ambiguousRoot"] as const;
+    const claudeDispatchSkips=skipRecord&&skipKeys.every(key => Number.isSafeInteger(skipRecord[key])&&
+      (skipRecord[key] as number)>=0)
+      ? Object.fromEntries(skipKeys.map(key => [key,skipRecord[key]])) as {
+          total:number;conflictingBindings:number;otherRootSeen:number;ambiguousRoot:number }
+      : null;
     return {
       hookSpool: hookSpoolReadingFromStatusBody(body, response.ok),
       sync: syncReadingFromStatusBody(body, response.ok),
       // Every row is checked here (review r1 F2): a malformed row is labelled
       // invalid admission, never trusted as counters.
       httpAdmission: response.ok ? readRejectionAdmission(body?.httpAdmission) : null,
+      claudeDispatchSkips: response.ok ? claudeDispatchSkips : null,
     };
   } catch {
     return {
       hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE,
       sync: SYNC_COLLECTOR_UNREACHABLE,
       httpAdmission: null,
+      claudeDispatchSkips: null,
     };
   } finally {
     clearTimeout(timeout);
@@ -3473,6 +3486,9 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    const claudeReplayBarrier=startClaudeReplayBarrier(buffer,config.captureRoots??[]);
+    void claudeReplayBarrier.done.then(receipt=>
+      console.log(JSON.stringify({status:"claude_replay_barrier",...receipt})));
     const pairingStatus = codexUsagePairingStatus(buffer.database);
     if (!pairingStatus.enabled) {
       console.warn(JSON.stringify({ warning: "codex_usage_pairing_disabled", reason: pairingStatus.reason,
@@ -4658,6 +4674,7 @@ async function main() {
           sessionAttribution: sessionContextIndexStatus(buffer.database),
           summaryPending: summaryPendingStatus(buffer.database),
           unlinkableBindCount: countUnlinkableDispatchBindings(config.captureRoots ?? []),
+          claudeDispatchSkips: daemonState.claudeDispatchSkips,
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
           learningFacts: buffer.learningFacts.statusWithWindow(),
