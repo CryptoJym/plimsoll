@@ -72,7 +72,19 @@ fs.openSync = function(file, ...args) {
   return original.open.call(this, file, ...args);
 };
 fs.writeFileSync = function(file, ...args) {
-  if (!firedOnce && stage === 'backup_write_edit' && String(file) === backup) edit();
+  if (!firedOnce && String(file) === backup) {
+    if (stage === 'backup_write_edit') edit();
+    if (stage === 'backup_write_create') {
+      original.write(settings, '{"operatorNewFile":true}');
+      fired();
+    }
+    if (stage === 'backup_write_replace') {
+      original.unlink(settings);
+      original.write(settings, '{"statusLine":{"type":"command","command":"printf replaced"},"operatorEdit":"backup_write_replace"}');
+      fired();
+    }
+    if (stage === 'backup_write_symlink') makeSymlink();
+  }
   if (!firedOnce && stage === 'metadata_write_edit' &&
       String(file).includes('.plimsoll-status-line-original.json.plimsoll-write-')) edit();
   return original.write.call(this, file, ...args);
@@ -91,11 +103,11 @@ function lstat(file) {
     throw error;
   }
 }
-function scratch() {
+function scratch(initiallyMissing = false) {
   fs.rmSync(config, { recursive: true, force: true });
   fs.mkdirSync(config, { recursive: true, mode: 0o700 });
   fs.mkdirSync(env.TMPDIR, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(settings, initial);
+  if (!initiallyMissing) fs.writeFileSync(settings, initial);
   fs.writeFileSync(target, '{"operatorTarget":true}');
   fs.rmSync(marker, { force: true });
 }
@@ -115,16 +127,18 @@ function run(stage) {
 try {
   for (const dir of [home, config, env.TMPDIR]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   for (const stage of ['mkdir_symlink', 'initial_lstat_symlink', 'initial_open_symlink',
-    'backup_write_edit', 'configure_read_edit', 'dryrun_read_edit', 'commit_read_edit',
+    'backup_write_create', 'backup_write_edit', 'backup_write_replace', 'backup_write_symlink',
+    'configure_read_edit', 'dryrun_read_edit', 'commit_read_edit',
     'post_commit_symlink', 'metadata_write_edit', 'final_read_symlink']) {
-    scratch();
+    scratch(stage === 'backup_write_create');
     const response = run(stage);
     const live = lstat(settings);
     const injected = fs.existsSync(marker);
     const observation = { stage, code: response.code, outcome: response.result?.outcome ?? null,
       injected, liveSymlink: Boolean(live?.isSymbolicLink()),
       operatorEditPreserved: Boolean(live?.isFile() &&
-        fs.readFileSync(settings, 'utf8').includes(`"operatorEdit":"${stage}"`)),
+        fs.readFileSync(settings, 'utf8').includes(stage === 'backup_write_create'
+          ? '"operatorNewFile":true' : `"operatorEdit":"${stage}"`)),
       errorReported: /settings_changed|SOURCE_CHANGED/.test(response.stderr) };
     console.log(JSON.stringify(observation));
     assert.equal(injected, true, stage);
@@ -140,5 +154,5 @@ try {
       } else assert.equal(observation.errorReported, true, response.stderr);
     }
   }
-  console.log(JSON.stringify({ proof: 'claude-status-line-r5-install-steps', checks: 10, passed: 10 }));
+  console.log(JSON.stringify({ proof: 'claude-status-line-r5-install-steps', checks: 13, passed: 13 }));
 } finally { fs.rmSync(root, { recursive: true, force: true }); }
