@@ -13,6 +13,7 @@ const loader = path.resolve("node_modules/tsx/dist/loader.mjs");
 const cli = path.resolve("packages/collector-cli/src/cli.ts");
 const env = { ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: path.join(home, ".codex"),
   PLIMSOLL_HOME: path.join(home, ".plimsoll"), CLAUDE_CONFIG_DIR: defaultDir,
+  PLIMSOLL_FIXTURE_ROOT: root,
   XDG_CONFIG_HOME: path.join(home, ".config"), XDG_CACHE_HOME: path.join(home, ".cache"),
   XDG_STATE_HOME: path.join(home, ".local", "state"), TMPDIR: path.join(home, "tmp"),
   NEXT_TELEMETRY_DISABLED: "1" };
