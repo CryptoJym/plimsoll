@@ -52,6 +52,7 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
+import { applyCaptureHistory, planCaptureHistory } from "./capture-history-import";
 import { planFreshLedgerCutover, switchFreshLedger,
   restoreArchivedLedger, assertReplacementRuntimeCompatible, recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { fetchCollectorUrl } from "./http-transport";
@@ -430,6 +431,9 @@ Commands:
                         --allow-scan-errors registers a root whose walk is
                         ambiguous: the entries are named in the receipt and
                         left unfenced (so they are captured, not excluded)
+  capture-roots import-history --root ROOT_ID [--since ISO] [--apply] [--json]
+                        Plan fenced pre-enrollment usage without writing;
+                        --apply admits missing rows in bounded writer slices
   dispatch bind --session-id S --work-item-id beads:eco-ID --project-key sha256:HASH --attempt-id UUIDv4
                 [--parent-attempt-id LEAD_SESSION] [--role author|reviewer|lead]
                 [--work-class C] [--complexity-band B]
@@ -6215,8 +6219,8 @@ async function main() {
   // change an existing root, epoch or enrollment field.
   if (command === "capture-roots") {
     const action = process.argv[3] ?? "";
-    if (!["discover", "epoch-plan", "epoch-switch", "epoch-restore", "add"].includes(action)) {
-      throw new Error("Expected capture-roots discover|epoch-plan|epoch-switch|epoch-restore|add");
+    if (!["discover", "epoch-plan", "epoch-switch", "epoch-restore", "add", "import-history"].includes(action)) {
+      throw new Error("Expected capture-roots discover|epoch-plan|epoch-switch|epoch-restore|add|import-history");
     }
     const home = os.homedir();
     const configuredRoots = configRead?.status === "valid" ? config.captureRoots ?? [] : [];
@@ -6224,6 +6228,75 @@ async function main() {
       console.log(JSON.stringify({ status: "capture_roots_add_refused", reason, ...detail }, null, 2));
       process.exitCode = 1;
     };
+
+    if (action === "import-history") {
+      const attemptId = randomUUID();
+      const writeAttemptReceipt = (value: Record<string, unknown>, suffix = "") => {
+        const receiptDirectory = path.join(collectorHome(), "receipts");
+        fs.mkdirSync(receiptDirectory, { recursive: true, mode: 0o700 });
+        const receiptPath = path.join(receiptDirectory, `capture-history-${attemptId}${suffix}.json`);
+        fs.writeFileSync(receiptPath, `${JSON.stringify(value, null, 2)}\n`,
+          { mode: 0o600, flag: "wx" });
+        return receiptPath;
+      };
+      const refused = (reason: string) => {
+        const value = { status: "capture_roots_history_refused", reason, attemptId };
+        const receiptPath = flag("--apply") ? writeAttemptReceipt(value) : null;
+        console.log(JSON.stringify({ ...value, ...(receiptPath ? { receiptPath } : {}) }, null, 2));
+        process.exitCode = 1;
+      };
+      const args = process.argv.slice(4);
+      const allowed = new Set(["--root", "--since", "--apply", "--json"]);
+      const takesValue = new Set(["--root", "--since"]);
+      if (args.some((value, index) =>
+            (!allowed.has(value) && !(index > 0 && takesValue.has(args[index - 1]!))) ||
+            (takesValue.has(value) && (!args[index + 1] || args[index + 1]!.startsWith("--")))) ||
+          args.filter(value => value === "--root").length !== 1 ||
+          args.filter(value => value === "--since").length > 1 ||
+          args.filter(value => value === "--apply").length > 1 ||
+          args.filter(value => value === "--json").length > 1 ||
+          configRead?.status !== "valid") {
+        refused("arguments_or_config_invalid");
+        return;
+      }
+      const rootId = optionValue("--root");
+      const since = optionValue("--since");
+      if (!rootId || rootId.startsWith("--") ||
+          (since && (Number.isNaN(Date.parse(since)) || new Date(since).toISOString() !== since))) {
+        refused("root_or_since_invalid");
+        return;
+      }
+      const root = configuredRoots.find(candidate => candidate.rootId === rootId);
+      if (!root || !fs.existsSync(collectorBufferPath())) {
+        refused("root_or_ledger_missing");
+        return;
+      }
+      try {
+        if (!flag("--apply")) {
+          const db = openLedgerDatabase(collectorBufferPath(), { readonly: true, fileMustExist: true, timeout: 0 });
+          try { console.log(JSON.stringify(await planCaptureHistory(db, root, { since }), null, 2)); }
+          finally { db.close(); }
+          return;
+        }
+        // This append-only marker survives abrupt process termination. A
+        // terminal receipt with the same attempt ID supersedes it; without
+        // one, the apply was interrupted before its outcome was confirmed.
+        writeAttemptReceipt({ status: "capture_roots_history_attempt_started",
+          reason: "interrupted_if_no_terminal_receipt", attemptId, rootId: root.rootId,
+          startedAt: new Date().toISOString() }, ".started");
+        const buffer = openBuffer(config);
+        let receipt;
+        try { receipt = await applyCaptureHistory(buffer, root, { since, attemptId }); }
+        finally { buffer.close(); }
+        const receiptPath = writeAttemptReceipt(receipt);
+        console.log(JSON.stringify({ ...receipt, receiptPath }, null, 2));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        refused(message.startsWith("capture_history_refused:")
+          ? message.slice("capture_history_refused:".length) : "import_failed");
+      }
+      return;
+    }
 
     if (action === "epoch-restore") {
       const archivePath = optionValue("--archive");
