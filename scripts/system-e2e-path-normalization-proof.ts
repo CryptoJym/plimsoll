@@ -89,11 +89,11 @@ const metadataArtifact = (count: number) => ({
   scenarios: [{ id: "no_change_constant_work", measurements: { filesystemMetadataOperations: count } }],
 });
 const metadataContext = { baseDirectory: repoRoot, roots: [] };
-for (const inside of [24_560, 24_567, 24_568, 24_576]) {
+for (const inside of [24_537, 24_538, 24_545, 24_552, 24_553]) {
   assert.deepEqual(normalizeSupportingArtifact(metadataArtifact(inside), metadataContext),
-    normalizeSupportingArtifact(metadataArtifact(24_567), metadataContext));
+    normalizeSupportingArtifact(metadataArtifact(24_545), metadataContext));
 }
-for (const outside of [24_559, 24_577]) {
+for (const outside of [24_536, 24_554, 24_560]) {
   assert.throws(() => normalizeSupportingArtifact(metadataArtifact(outside), metadataContext),
     /bounded metadata-call envelope/);
 }

@@ -282,11 +282,11 @@ export function normalizeSupportingArtifact(
   if (typeof value === "number" && RESOURCE_METADATA_OPERATIONS_PATH.test(fieldPath)) {
     // Startup discovery still uses the real wall, so the total metadata-call
     // count can vary across runs even though the stable sweep's exact directory
-    // topology and enumeration checks pass. Bound this counter within sixteen
-    // calls of the measured fixture instead of pinning an incidental exact count.
-    assert.ok(Number.isInteger(value) && value >= 24_560 && value <= 24_576,
+    // topology and enumeration checks pass. Keep the sixteen-call span centered
+    // on the merged #434 fixture instead of pinning an incidental exact count.
+    assert.ok(Number.isInteger(value) && value >= 24_537 && value <= 24_553,
       `${key} must stay within the bounded metadata-call envelope; observed=${value}`);
-    return "<bounded-metadata-operations:24560-24576>";
+    return "<bounded-metadata-operations:24537-24553>";
   }
   if (
     typeof value === "number" &&
