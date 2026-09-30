@@ -1,0 +1,37 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 431,
+  "headSha": "5cbf80930eff4a88428e7a0862dff9507cb4b34f",
+  "reviewedAt": "2026-09-30T09:01:00Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0ee3a-13e5-73f3-bb2f-3820ab0c73b2",
+    "model": "gpt-6-sol",
+    "host": "studio6"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0e74e-4d2a-7670-b5ae-55f5b37615de"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0e96f-e5b8-73c2-ada4-97cf02b39cf5"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0edf7-c383-7c31-879d-c85f9b2b2eaa"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0ee8d-49ee-7a11-9485-ab0726be2814"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0ef7d-44a9-7a32-ad5f-9e425e51f39e"
+    }
+  ],
+  "summary": "Independent Codex review lanes of PR #431 (import pre-enrollment history), five rounds. r1 at 5d60d70c: 7 findings (F1-F7) and r2 at 1baaae62: 3 (N1 P1 copied overlapping session across roots, N2 P2 nested symlink swap, N3 P2 strict 23-root gate), all CHANGES_REQUIRED; r3 at 0a3f106a: R3-1 P1 and R3-2 P2, CHANGES_REQUIRED. r4 (studio6, gpt-6-sol max, thread 01a0ee3a) approved bfbf7875 with no P0-P2 finding. r5, same reviewer, is a merge-only review of 5cbf8093 (bfbf7875 plus main 60b74ace): eight conflict hunks and one needed importer call-site edit (capture-history-import.ts:1235 keeps historyImportNoLiveSibling with main's new carriedBytes parameter); no package or workflow command lost; import across a cutover, CLI plan/apply refusal during a switch and retention-held copied history pass; 143/143 local command runs pass. APPROVE, no P0-P2 finding."
+}
