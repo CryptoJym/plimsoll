@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 434,
+  "headSha": "ddbe8ae6706ab72f855de3bdd72fbe69962eef3b",
+  "reviewedAt": "2026-09-30T13:20:35Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f0b1-cbf5-72d2-9887-22724d6bd389",
+    "model": "gpt-6.1-sol",
+    "host": "studio1"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0ef8f-2cf9-7150-b490-e39a55eba420"
+    }
+  ],
+  "summary": "Independent Codex review lane of PR #434 (two processes opening a brand-new ledger at once both succeed), rounds 1-4 on studio1 (thread 01a0f0b1). r1 and r2 found R1-01/R1-02 and R2-01 (WAL retries kept the original ~10 s busy_timeout after the startup deadline was mostly spent; 13.7/18.7 s exits); all fixed. r3 approved 1be07cfe with no findings: WAL escalation 10.49/10.14 s, 100/100 two-process and 30/30 three-process races, lock order with #426's barrier and fences sound, the pin change explained by one fenced WAL pragma stat, all 48 affected workflow steps pass. r4, a merge-only review under the 2026-09-30 merge bar, approves ddbe8ae6 (main 931c48d6 merged; the only manual resolution is the idle_dashboard_resources pin, reproduced by the guarded predictor). No P0-P2 finding remains."
+}
