@@ -158,6 +158,7 @@ export type ClaudeStatusLineConfigureResult =
       outcome: "installed" | "already_installed" | "chained" | "unchanged_chain";
       changes: string[];
       backupPath?: string;
+      retainedClaimPath?: string;
       chainedCommand: string | null;
     }
   | { outcome: "blocked_existing_statusline" | "blocked_invalid_settings"; reason: string };
@@ -324,12 +325,14 @@ export function configureClaudeStatusLineProxy(
     const applied = applyClaudeSettings(
       input.settingsPath,
       { env: {}, statusLine: desired },
-      { transactionHooks: input.transactionHooks, expectedSource: currentSource },
+      { transactionHooks: input.transactionHooks, expectedSource: currentSource,
+        retainClaim: true },
     );
     return {
       outcome: chainCommand === null ? "installed" : "chained",
       changes: applied.changes,
       backupPath: applied.backupPath,
+      retainedClaimPath: applied.retainedClaimPath,
       chainedCommand: chainCommand,
     };
   } catch (error) {
@@ -528,7 +531,7 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
 
 /** Standalone source command; each target preserves its original bytes for uninstall. */
 export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string;
-  retainedPath?: string; metadataRetainedPath?: string }> {
+  retainedPath?: string; retainedClaimPath?: string; metadataRetainedPath?: string }> {
   const defaultDir = process.env.CLAUDE_CONFIG_DIR
     ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : path.join(os.homedir(), ".claude");
   const dirs = [defaultDir];
@@ -542,7 +545,7 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
     throw new Error("usage: setup-claude-status-line [--config-dir <dir>]... [--uninstall]");
   }
   const results: Array<{ configDir: string; outcome: string; retainedPath?: string;
-    metadataRetainedPath?: string }> = [];
+    retainedClaimPath?: string; metadataRetainedPath?: string }> = [];
   for (const dir of [...new Set(dirs)]) {
     const settings = path.join(dir, "settings.json");
     assertManagedConfigTarget(settings);
@@ -614,7 +617,8 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
       installed = JSON.parse(installedBytes.toString("utf8")) as Record<string, unknown>;
     } catch {
       results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
-        ? "settings_is_symlink" : "status_line_changed" });
+        ? "settings_is_symlink" : "status_line_changed",
+        retainedClaimPath: outcome.retainedClaimPath });
       continue;
     }
     const before = saved.existed ? JSON.parse(Buffer.from(saved.bytes, "base64").toString("utf8")) as
@@ -625,13 +629,17 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
       installedOtherKeys: { ...saved.installedOtherKeys, ...installedOtherKeys } });
     try {
       const last = lstatIfPresent(settings);
-      if (last?.isSymbolicLink()) results.push({ configDir: dir, outcome: "settings_is_symlink" });
+      if (last?.isSymbolicLink()) results.push({ configDir: dir,
+        outcome: "settings_is_symlink", retainedClaimPath: outcome.retainedClaimPath });
       else if (!last?.isFile() || !readRegularNoFollow(settings).bytes.equals(installedBytes)) {
-        results.push({ configDir: dir, outcome: "status_line_changed" });
-      } else results.push({ configDir: dir, outcome: outcome.outcome, metadataRetainedPath });
+        results.push({ configDir: dir, outcome: "status_line_changed",
+          retainedClaimPath: outcome.retainedClaimPath });
+      } else results.push({ configDir: dir, outcome: outcome.outcome,
+        retainedClaimPath: outcome.retainedClaimPath, metadataRetainedPath });
     } catch {
       results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
-        ? "settings_is_symlink" : "status_line_changed" });
+        ? "settings_is_symlink" : "status_line_changed",
+        retainedClaimPath: outcome.retainedClaimPath });
     }
   }
   return results;

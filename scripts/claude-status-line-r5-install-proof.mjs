@@ -28,7 +28,8 @@ fs.writeFileSync(hook, String.raw`
 const fs = require('node:fs');
 const original = { mkdir: fs.mkdirSync, lstat: fs.lstatSync,
   open: fs.openSync, write: fs.writeFileSync, rename: fs.renameSync,
-  unlink: fs.unlinkSync, symlink: fs.symlinkSync, readFileSync: fs.readFileSync };
+  unlink: fs.unlinkSync, symlink: fs.symlinkSync, link: fs.linkSync,
+  readFileSync: fs.readFileSync };
 const settings = process.env.R5_SETTINGS;
 const backup = process.env.R5_BACKUP;
 const config = process.env.R5_CONFIG;
@@ -95,6 +96,15 @@ fs.renameSync = function(from, to) {
       String(from).includes('.plimsoll-write-')) metadataCommitted = true;
   return result;
 };
+fs.linkSync = function(from, to) {
+  const result = original.link.call(this, from, to);
+  if (!firedOnce && stage === 'late_claim_edit' && String(to) === settings) {
+    fs.ftruncateSync(3, 0);
+    fs.writeSync(3, '{"lateOperatorEdit":true}', 0, 'utf8');
+    fired();
+  }
+  return result;
+};
 `);
 
 function lstat(file) {
@@ -111,13 +121,15 @@ function scratch(initiallyMissing = false) {
   fs.writeFileSync(target, '{"operatorTarget":true}');
   fs.rmSync(marker, { force: true });
 }
-function run(stage) {
+function run(stage, inheritedFd) {
   const childEnv = { ...env, R5_SETTINGS: settings, R5_BACKUP: backup,
     R5_CONFIG: config, R5_TARGET: target, R5_MARKER: marker, R5_STAGE: stage,
     NODE_OPTIONS: [env.NODE_OPTIONS, '--require=' + hook].filter(Boolean).join(' ') };
   const child = spawnSync(process.execPath,
     ['--import', loader, cli, 'setup', 'claude-status-line'],
-    { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 30_000 });
+    { cwd: repo, env: childEnv, encoding: 'utf8', timeout: 30_000,
+      stdio: inheritedFd === undefined ? ['ignore', 'pipe', 'pipe'] :
+        ['ignore', 'pipe', 'pipe', inheritedFd] });
   let result;
   try { result = JSON.parse(child.stdout).results.find(row => row.configDir === config); }
   catch { result = null; }
@@ -129,9 +141,13 @@ try {
   for (const stage of ['mkdir_symlink', 'initial_lstat_symlink', 'initial_open_symlink',
     'backup_write_create', 'backup_write_edit', 'backup_write_replace', 'backup_write_symlink',
     'configure_read_edit', 'dryrun_read_edit', 'commit_read_edit',
-    'post_commit_symlink', 'metadata_write_edit', 'final_read_symlink']) {
+    'post_commit_symlink', 'metadata_write_edit', 'final_read_symlink',
+    'late_claim_edit']) {
     scratch(stage === 'backup_write_create');
-    const response = run(stage);
+    const descriptor = stage === 'late_claim_edit' ? fs.openSync(settings, 'r+') : undefined;
+    let response;
+    try { response = run(stage, descriptor); }
+    finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
     const live = lstat(settings);
     const injected = fs.existsSync(marker);
     const observation = { stage, code: response.code, outcome: response.result?.outcome ?? null,
@@ -147,6 +163,13 @@ try {
       assert.equal(fs.readlinkSync(settings), target, stage);
       assert.equal(fs.readFileSync(target, 'utf8'), '{"operatorTarget":true}', stage);
       assert.equal(response.result?.outcome, 'settings_is_symlink', response.stderr);
+    } else if (stage === 'late_claim_edit') {
+      assert.equal(response.result?.outcome, 'chained', response.stderr);
+      assert.equal(typeof response.result.retainedClaimPath, 'string');
+      assert.equal(fs.readFileSync(response.result.retainedClaimPath, 'utf8'),
+        '{"lateOperatorEdit":true}');
+      console.log(JSON.stringify({ stage, retainedClaimPathReported: true,
+        lateDescriptorEditPreserved: true }));
     } else {
       assert.equal(observation.operatorEditPreserved, true, stage);
       if (stage === 'metadata_write_edit') {
@@ -154,5 +177,5 @@ try {
       } else assert.equal(observation.errorReported, true, response.stderr);
     }
   }
-  console.log(JSON.stringify({ proof: 'claude-status-line-r5-install-steps', checks: 13, passed: 13 }));
+  console.log(JSON.stringify({ proof: 'claude-status-line-r5-install-steps', checks: 14, passed: 14 }));
 } finally { fs.rmSync(root, { recursive: true, force: true }); }
