@@ -283,10 +283,10 @@ export function normalizeSupportingArtifact(
     // Startup discovery still uses the real wall, so the total metadata-call
     // count can vary across runs even though the stable sweep's exact directory
     // topology and enumeration checks pass. Keep the sixteen-call span centered
-    // on the merged plan-limit fixture instead of pinning an incidental exact count.
-    assert.ok(Number.isInteger(value) && value >= 24_649 && value <= 24_665,
+    // on the merged rebuild fixture instead of pinning an incidental exact count.
+    assert.ok(Number.isInteger(value) && value >= 24_661 && value <= 24_677,
       `${key} must stay within the bounded metadata-call envelope; observed=${value}`);
-    return "<bounded-metadata-operations:24649-24665>";
+    return "<bounded-metadata-operations:24661-24677>";
   }
   if (
     typeof value === "number" &&
