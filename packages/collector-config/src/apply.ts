@@ -22,6 +22,8 @@ export type ApplyResult = {
   /** Secret-free, exhaustive plan for the managed keys owned by this target. */
   plan?: ApplyPlanEntry[];
   backupPath?: string;
+  /** Original inode retained by a caller that must preserve late descriptor writes. */
+  retainedClaimPath?: string;
   /** Set when an existing conflicting config blocks a safe merge. */
   conflict?: string;
 };
@@ -68,6 +70,10 @@ export type ClaudeApplyOptions = {
  */
 export type ClaudeSettingsApplyOptions = ClaudeApplyOptions & {
   managedTarget?: string;
+  /** Refuse a plan based on an earlier status-line read if its bytes changed. */
+  expectedSource?: string;
+  /** Keep and report the claimed preimage after a successful commit. */
+  retainClaim?: boolean;
 };
 
 export class ClaudeConfigError extends Error {
@@ -566,6 +572,7 @@ function writeClaudePlan(
   next: string,
   hooks: NonNullable<ClaudeApplyOptions["transactionHooks"]> = {},
   modeOverride?: number,
+  retainedClaim?: { path?: string },
 ) {
   const snapshot = ensureClaudeParent(initial, hooks.afterParentCreate);
   assertStableClaudePath(snapshot);
@@ -657,11 +664,24 @@ function writeClaudePlan(
     assertVisibleClaudeContent(snapshot, prepared.identity, next);
     if (backup) assertClaudeBackup(snapshot, backup, current);
     if (claim) {
-      unlinkClaudeObject(claim.path, claim.identity);
+      if (retainedClaim) {
+        const claimedStat = claudeLstat(claim.path);
+        if (!claimedStat || claimedStat.isSymbolicLink() || !claimedStat.isFile() ||
+            claimedStat.dev !== claim.identity.device || claimedStat.ino !== claim.identity.inode) {
+          claudeFail("COMMIT_CLAIM_CHANGED");
+        }
+        const retainedPath = path.join(path.dirname(snapshot.absolutePath),
+          `${path.basename(snapshot.absolutePath)}.plimsoll-install-${Date.now()}-${randomUUID()}`);
+        if (claudeLstat(retainedPath)) claudeFail("COMMIT_RETAINED_COLLISION");
+        fs.renameSync(claim.path, retainedPath);
+        retainedClaim.path = retainedPath;
+      } else unlinkClaudeObject(claim.path, claim.identity);
       claim = undefined;
-      fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
-      assertVisibleClaudeContent(snapshot, prepared.identity, next);
-      if (backup) assertClaudeBackup(snapshot, backup, current);
+      if (!retainedClaim) {
+        fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
+        assertVisibleClaudeContent(snapshot, prepared.identity, next);
+        if (backup) assertClaudeBackup(snapshot, backup, current);
+      }
     }
     return backup?.backupPath;
   } finally {
@@ -897,6 +917,9 @@ export function applyClaudeSettings(
   assertManagedConfigTarget(file);
   try {
     const { snapshot, current } = readClaudePreimage(file);
+    if (options.expectedSource !== undefined && current !== options.expectedSource) {
+      claudeFail("SOURCE_CHANGED");
+    }
     const plan = reconcileClaudeDocument(current, generated, options.managedTarget);
     if (plan.changes.length === 0 || options.dryRun) {
       if (snapshot.exists && snapshot.leaf) {
@@ -907,8 +930,11 @@ export function applyClaudeSettings(
       if (plan.changes.length === 0) return { path: file, changed: false, changes: [], plan: plan.plan };
       return { path: file, changed: true, changes: plan.changes, plan: plan.plan };
     }
-    const backupPath = writeClaudePlan(snapshot, current, plan.next, options.transactionHooks);
-    return { path: file, changed: true, changes: plan.changes, plan: plan.plan, backupPath };
+    const retainedClaim = options.retainClaim ? {} as { path?: string } : undefined;
+    const backupPath = writeClaudePlan(snapshot, current, plan.next, options.transactionHooks,
+      undefined, retainedClaim);
+    return { path: file, changed: true, changes: plan.changes, plan: plan.plan,
+      backupPath, retainedClaimPath: retainedClaim?.path };
   } catch (error) {
     if (error instanceof ClaudeConfigError) throw error;
     claudeFail("IO_FAILURE");

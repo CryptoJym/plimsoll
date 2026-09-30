@@ -84,6 +84,7 @@ import {
   ANALYTICAL_METADATA_LIMITS,
   DEFAULT_POLICY,
   hashProtectedValue,
+  providerAccountKey,
   isProtectedMetadataFieldName,
   isSensitiveMetadataSemanticKey,
   protectedMetadataFieldNames,
@@ -2898,7 +2899,10 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   // ...and the reason each declared one is exempt, measured rather than
   // asserted: the ledger keeps the hash OF the value, so an emptied value
   // would persist the hash of `""` instead of the hash of the identity.
-  const hashOfEmpty = hashProtectedValue("");
+  const isProviderAccountName = (name: string) =>
+    ["account_id", "account_uuid", "user.account_id", "user.account_uuid"].includes(name);
+  const expectedHash = (name: string, value: string) =>
+    isProviderAccountName(name) ? providerAccountKey(value) : hashProtectedValue(value);
   const protectedTradeoff = SPOOL_PROTECTED_IDENTITY_KEYS.map((name) => {
     const real = sanitizeForPolicy({ [name]: IDENTITY_CANARY }, DEFAULT_POLICY).value as
       Record<string, unknown>;
@@ -2908,6 +2912,8 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
       name,
       ledgerKeeps: real[name],
       ledgerWouldKeepIfBlanked: emptied[name],
+      expectedReal: expectedHash(name, IDENTITY_CANARY),
+      expectedEmpty: expectedHash(name, ""),
       reason: SPOOL_DERIVATION_INPUT_DISCLOSURE.find((entry) => entry.key === name)?.reason,
     };
   });
@@ -2916,14 +2922,16 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
     SPOOL_PROTECTED_IDENTITY_KEYS.length > 0 &&
       protectedTradeoff.every(
         (row) =>
-          row.ledgerKeeps === hashProtectedValue(IDENTITY_CANARY) &&
-          row.ledgerWouldKeepIfBlanked === hashOfEmpty &&
+          row.ledgerKeeps === row.expectedReal &&
+          row.ledgerWouldKeepIfBlanked === row.expectedEmpty &&
+          row.ledgerKeeps !== row.ledgerWouldKeepIfBlanked &&
           row.reason === "the ledger stores the protected hash of this value",
       ),
     {
       keys: [...SPOOL_PROTECTED_IDENTITY_KEYS],
       hashOfTheIdentity: hashProtectedValue(IDENTITY_CANARY),
-      hashOfAnEmptyValue: hashOfEmpty,
+      hashOfAnEmptyValue: hashProtectedValue(""),
+      providerAccountKey: providerAccountKey(IDENTITY_CANARY),
       sample: protectedTradeoff[0],
     },
   );

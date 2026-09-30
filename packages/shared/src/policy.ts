@@ -126,13 +126,31 @@ export function hashProtectedValue(value: unknown) {
   return `sha256:${crypto.createHash("sha256").update(serialized ?? "").digest("hex").slice(0, 16)}`;
 }
 
-function protectedScalar(value: unknown) {
-  return hashProtectedValue(value);
+/** The OTLP account attribute hashes its serialized AnyValue, not its raw id. */
+export function providerAccountKey(rawId: string): string {
+  return hashProtectedValue({ stringValue: rawId });
 }
 
-function protectedOtelValue(value: unknown) {
+function accountIdFromOtelValue(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const id = (value as Record<string, unknown>).stringValue;
+  return typeof id === "string" ? id : undefined;
+}
+
+function isProviderAccountField(key: string): boolean {
+  return ["accountid", "accountuuid", "useraccountid", "useraccountuuid"].includes(normalizeFieldName(key));
+}
+
+function protectedScalar(value: unknown, key: string) {
+  return isProviderAccountField(key) && typeof value === "string"
+    ? providerAccountKey(value)
+    : hashProtectedValue(value);
+}
+
+function protectedOtelValue(value: unknown, key: string) {
+  const accountId = isProviderAccountField(key) ? accountIdFromOtelValue(value) : undefined;
   return {
-    stringValue: hashProtectedValue(value),
+    stringValue: accountId !== undefined ? providerAccountKey(accountId) : hashProtectedValue(value),
   };
 }
 
@@ -172,7 +190,7 @@ function sanitizeRoutineMetadata(
       suppressed.push(suppressionReceiptForAttributeKey(semanticKey));
       return {
         ...(value as Record<string, unknown>),
-        value: protectedOtelValue((value as Record<string, unknown>).value),
+        value: protectedOtelValue((value as Record<string, unknown>).value, semanticKey),
       };
     }
   }
@@ -191,7 +209,7 @@ function sanitizeRoutineMetadata(
 
     if (isProtectedMetadataFieldName(key)) {
       suppressed.push(currentPath);
-      next[key] = protectedScalar(nestedValue);
+      next[key] = protectedScalar(nestedValue, key);
       continue;
     }
 

@@ -289,6 +289,7 @@ export const aiInteractionEventSchema = z
       "usage_rollout",
       "usage_transcript",
       "usage_live",
+      "plan_limit_observation",
       "unknown",
     ]),
     observedAt: timestampSchema,
@@ -313,6 +314,14 @@ export const aiInteractionEventSchema = z
       path: ["costKind"],
       message: "costKind requires costUsd.",
     },
+  )
+  .refine(
+    (event) => event.eventType !== "plan_limit_observation" || (
+      event.inputTokens === undefined && event.outputTokens === undefined &&
+      event.cacheReadTokens === undefined && event.cacheCreationTokens === undefined &&
+      event.costUsd === undefined && event.costKind === undefined
+    ),
+    { message: "Plan-limit observations cannot carry usage or cost." },
   )
   .refine(
     (event) => event.eventType !== "usage_live" || (

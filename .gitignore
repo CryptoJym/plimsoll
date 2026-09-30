@@ -15,6 +15,7 @@ opencode.json
 
 # Also ignore a local dependency symlink used by isolated worktrees.
 /node_modules
+/ci-home/
 
 # Python rule models beside the lean contract tests leave bytecode caches behind
 __pycache__/

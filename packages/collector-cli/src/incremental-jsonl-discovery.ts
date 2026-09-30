@@ -4,6 +4,9 @@ import path from "node:path";
 import { CaptureWorkBudget } from "./capture-work-budget";
 import { maintenanceCandidateHash } from "./maintenance-progress";
 
+/** A small, finite directory unit that an already admitted capture turn finishes. */
+export const DISCOVERY_FIRST_ADMITTED_QUANTUM = 64;
+
 type Frame = {
   directory: string;
   handle: fs.Dir;
@@ -99,6 +102,8 @@ export class IncrementalJsonlDiscovery {
       maxFiles?: number;
       maxEntries?: number;
       maxWallMs?: number;
+      /** Finish up to this many directory steps once the shared budget admits the collect. */
+      minimumSteps?: number;
       signal?: AbortSignal;
     } = {},
   ): Promise<DiscoveryChunk> {
@@ -113,6 +118,14 @@ export class IncrementalJsonlDiscovery {
       ? Number.POSITIVE_INFINITY
       : Math.max(1, Math.min(options.maxWallMs, 100));
     const collectStartedAt = performance.now();
+    // The local discovery wall may expire before its first loop condition on
+    // a preempted host. An admitted automatic capture turn gets one bounded
+    // filesystem quantum so a hot partial file cannot keep discovery at zero.
+    // Signal, entry and file limits still stop that quantum independently.
+    const minimumSteps = budget.canContinue()
+      ? Math.max(0, Math.min(Math.trunc(options.minimumSteps ?? 0), DISCOVERY_FIRST_ADMITTED_QUANTUM))
+      : 0;
+    let steps = 0;
     let stepsSinceYield = 0;
     let yields = 0;
     let lastYieldAt: string | null = null;
@@ -122,12 +135,13 @@ export class IncrementalJsonlDiscovery {
       !this.paused &&
       files.length < maxFiles &&
       this.visited - startingVisited < maxEntries &&
-      performance.now() - collectStartedAt < maxWallMs &&
       !options.signal?.aborted &&
-      budget.canContinue()
+      (steps < minimumSteps ||
+        (performance.now() - collectStartedAt < maxWallMs && budget.canContinue()))
     ) {
       const file = this.step();
       if (file) files.push(file);
+      steps += 1;
       stepsSinceYield += 1;
       if (stepsSinceYield >= 64 && !this.finished) {
         await new Promise<void>((resolve) => setImmediate(resolve));

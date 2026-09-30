@@ -83,6 +83,21 @@ assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), prev
 assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), currentInstallationEpochId: "invalid" }), /workspace epoch identity invalid/);
 assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), previousWorkspaceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), /previous workspace binding changed/);
 
+// The real-clock boot may add or skip a few metadata calls. Keep a narrow
+// envelope while preserving the exact stable directory topology checks.
+const metadataArtifact = (count: number) => ({
+  scenarios: [{ id: "no_change_constant_work", measurements: { filesystemMetadataOperations: count } }],
+});
+const metadataContext = { baseDirectory: repoRoot, roots: [] };
+for (const inside of [24_649, 24_650, 24_657, 24_664, 24_665]) {
+  assert.deepEqual(normalizeSupportingArtifact(metadataArtifact(inside), metadataContext),
+    normalizeSupportingArtifact(metadataArtifact(24_657), metadataContext));
+}
+for (const outside of [24_648, 24_666, 24_673]) {
+  assert.throws(() => normalizeSupportingArtifact(metadataArtifact(outside), metadataContext),
+    /bounded metadata-call envelope/);
+}
+
 type ActualChildVariant = {
   artifact: unknown;
   context: SupportingNormalizationContext;

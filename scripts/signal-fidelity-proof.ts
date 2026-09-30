@@ -1396,7 +1396,8 @@ async function main() {
   // message content is parsed or persisted.
   const ROLLOUT_SESSION = "019e1111-2222-7333-8444-555555555555";
   const ROLLOUT_SENTINEL = "ROLLOUT_PROMPT_SENTINEL do not persist";
-  const rolloutDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-rollouts-"));
+  const rolloutHome = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-rollouts-"));
+  const rolloutDir = path.join(rolloutHome, "sessions");
   const rolloutDay = path.join(rolloutDir, "2026", "06", "10");
   fs.mkdirSync(rolloutDay, { recursive: true });
   const rolloutLine = (timestamp: string, type: string, payload: Record<string, unknown>) =>
@@ -1482,6 +1483,8 @@ async function main() {
     path.join(identityDir, "auth.json"),
     JSON.stringify({ email: PROOF_EMAIL, last_refresh: "2026-06-10T11:00:00.000Z", tokens: { id_token: proofJwt } }),
   );
+  fs.writeFileSync(path.join(rolloutHome, "auth.json"),
+    JSON.stringify({ tokens: { account_id: PROOF_CHATGPT_ACCOUNT } }));
   const proofIdentities = () =>
     readLocalIdentities({
       claudeConfigPath: path.join(identityDir, "claude.json"),
@@ -1502,7 +1505,9 @@ async function main() {
   );
 
   const tailer = new RolloutTailer(buffer, rolloutDir, proofIdentities);
-  const firstScan = await tailer.scan({ scope: "full" });
+  // The account is first observed after the 10:00 session and before the
+  // later 12:00 usage; last_refresh alone cannot bind historical file rows.
+  const firstScan = await tailer.scan({ scope: "full", now: new Date("2026-06-10T11:30:00.000Z") });
   resolveDeferredRepoContexts(buffer);
   const rolloutRows = buffer.database
     .prepare(
@@ -1774,7 +1779,7 @@ async function main() {
     !codexPersisted.includes(ROLLOUT_SENTINEL) && !codexPersisted.includes("base_instructions"),
     "rollout message/instruction content absent from all persisted codex rows",
   );
-  fs.rmSync(rolloutDir, { recursive: true, force: true });
+  fs.rmSync(rolloutHome, { recursive: true, force: true });
 
   // 13. Config apply mode (issue 0003): surgical, backed-up, idempotent.
   const setupDir = fs.mkdtempSync(path.join(tempDir, "plimsoll-setup-"));

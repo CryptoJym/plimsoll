@@ -9,9 +9,9 @@ jobs:
   proof:
     runs-on: macos-14
     # Allow the measured sequential artifact, repeated E2E and resource gates.
-    # Per-proof deadlines and acceptance thresholds remain unchanged. Main takes
-    # 35-39 minutes and PRs that add proofs 42-45, so 45 cut off healthy runs.
-    timeout-minutes: 60
+    # Per-proof deadlines and acceptance thresholds remain unchanged. A full run
+    # took about 56 minutes on 30 Sep 2026, so 60 cut off healthy runs.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -141,6 +141,10 @@ jobs:
       # test blocks. Not a proof: tests/contracts/lean/README.md.
       - name: Lean contract tests (pending until their beads land)
         run: pnpm contracts:lean
+
+      - name: Prove concurrent first opens of a fresh ledger (eco-6hoxj.163.130)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:startup-schema-race
 
       - name: Reject incomplete proofs and require WAL, authentication and retention receipts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -1207,6 +1211,18 @@ jobs:
         run: |
           pnpm proof:capacity-contract
           pnpm proof:capacity-adapters
+
+      - name: Prove provider account keys and plan-limit readings (eco-6hoxj.165.99.1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:account-plan-limit
+          pnpm proof:account-binding-history
+          pnpm proof:plan-limit-event-id
+          pnpm proof:claude-status-line-account
+          pnpm proof:claude-status-line-edits
+          pnpm proof:claude-status-line-races
+          pnpm proof:claude-status-line-r5-restore
+          pnpm proof:claude-status-line-r5-install
 
       - name: Prove lane receipts, fleet operations and release qualification (#176/#154/#171)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
