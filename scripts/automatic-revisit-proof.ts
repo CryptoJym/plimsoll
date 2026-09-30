@@ -17,6 +17,7 @@ import { rootCursorKey, type CaptureRoot } from "../packages/collector-cli/src/c
 import { maintenanceCandidateHash } from "../packages/collector-cli/src/maintenance-progress";
 import { runUncoveredCatchupCase } from "./uncovered-catchup-case";
 import { installVirtualClock, restoreRealClock, spend } from "./lib/virtual-clock";
+import { proveChargedDiscoveryWiring } from "./charged-discovery-wiring-case";
 
 type Visit = { cadence: number; offset: number; deferred: number; retained?: boolean };
 async function prove(source: CaptureRoot["source"]) {
@@ -286,6 +287,16 @@ async function prove(source: CaptureRoot["source"]) {
   } finally { restoreRealClock(); maintenance.close(); buffer.close(); fs.rmSync(base, { recursive: true, force: true }); }
 }
 async function main() {
+  if (process.argv.includes("--focus-new-file-discovery")) {
+    // Repeat the committed charged-wall integration case under runner load
+    // without rerunning the unrelated oversized and catchup fixtures.
+    const charged = await proveChargedDiscoveryWiring();
+    console.log(JSON.stringify({ schema: "plimsoll.automatic-revisit-focus.v1",
+      namedCase: "new-file discovery progresses despite a hot partial snapshot",
+      ...charged }, null, 2));
+    if (!charged.passed) process.exitCode = 1;
+    return;
+  }
   const proofs = [];
   for (const source of ["codex", "claude_code"] as const) proofs.push(await prove(source));
   const catchupPassed = await runUncoveredCatchupCase();

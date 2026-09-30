@@ -1582,6 +1582,14 @@ async function proveManyRootSweepConvergence() {
 
 async function main() {
   try {
+    if (process.argv.includes("--focus-many-root-sweep")) {
+      // Retain the same 256-entry negative control, 440-file sized collect,
+      // and resume assertions for short serial load repetitions.
+      const manyRootSweepConvergence = await proveManyRootSweepConvergence();
+      console.log(JSON.stringify({ proof: "plimsoll-many-root-sweep-focus",
+        passed: true, manyRootSweepConvergence }, null, 2));
+      return;
+    }
     const rollout = await proveRolloutTailing();
     const transcript = await proveTranscriptTailing();
     const parseFailureDurability = await proveParseFailuresRemainUnresolved();
