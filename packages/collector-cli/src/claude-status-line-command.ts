@@ -1,5 +1,6 @@
 /** Claude status-line command and shared chain/configuration mechanics. */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -367,7 +368,18 @@ function writeStatusLineBackup(file: string, value: StatusLineBackup): void {
   fs.renameSync(temp, file);
 }
 
-function restoreClaudeStatusLine(configDir: string): "restored" | "status_line_changed" {
+type StatusLineRestoreResult = { outcome: "restored" | "status_line_changed";
+  retainedPath?: string };
+
+function linkIfAbsent(from: string, to: string): boolean {
+  try { fs.linkSync(from, to); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   const settings = path.join(configDir, "settings.json");
   const backup = path.join(configDir, STATUS_LINE_BACKUP_NAME);
   const stat = fs.lstatSync(backup);
@@ -375,16 +387,22 @@ function restoreClaudeStatusLine(configDir: string): "restored" | "status_line_c
   const saved = JSON.parse(fs.readFileSync(backup, "utf8")) as Partial<StatusLineBackup>;
   if (typeof saved.existed !== "boolean" || typeof saved.bytes !== "string") throw new Error("status_line_backup_invalid");
   let current: Record<string, unknown>;
+  let observedBytes: Buffer;
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(settings, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "status_line_changed";
+    observedBytes = fs.readFileSync(settings);
+    const parsed: unknown = JSON.parse(observedBytes.toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { outcome: "status_line_changed" };
+    }
     current = parsed as Record<string, unknown>;
-  } catch { return "status_line_changed"; }
+  } catch { return { outcome: "status_line_changed" }; }
   // A marker alone does not prove ownership: the operator may have edited
   // this entry after setup. An older backup without the installed snapshot is
   // also insufficient evidence to restore safely.
   if (saved.installedStatusLine === undefined ||
-      !isDeepStrictEqual(current.statusLine, saved.installedStatusLine)) return "status_line_changed";
+      !isDeepStrictEqual(current.statusLine, saved.installedStatusLine)) {
+    return { outcome: "status_line_changed" };
+  }
   const originalBytes = Buffer.from(saved.bytes, "base64");
   const original = saved.existed ? JSON.parse(originalBytes.toString("utf8")) as Record<string, unknown> : {};
   if (Object.hasOwn(original, "statusLine")) current.statusLine = original.statusLine;
@@ -392,22 +410,42 @@ function restoreClaudeStatusLine(configDir: string): "restored" | "status_line_c
   for (const [key, installedValue] of Object.entries(saved.installedOtherKeys ?? {})) {
     if (!Object.hasOwn(original, key) && isDeepStrictEqual(current[key], installedValue)) delete current[key];
   }
-  if (saved.existed && isDeepStrictEqual(current, original)) {
-    const temp = `${settings}.plimsoll-restore-${process.pid}`;
-    fs.writeFileSync(temp, originalBytes, { mode: 0o600, flag: "wx" });
-    fs.renameSync(temp, settings);
-  } else if (!saved.existed && Object.keys(current).length === 0) fs.rmSync(settings);
-  else {
-    const temp = `${settings}.plimsoll-restore-${process.pid}`;
-    fs.writeFileSync(temp, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-    fs.renameSync(temp, settings);
+  const restoredBytes = saved.existed && isDeepStrictEqual(current, original) ? originalBytes :
+    !saved.existed && Object.keys(current).length === 0 ? null :
+      Buffer.from(`${JSON.stringify(current, null, 2)}\n`);
+  const nonce = `${process.pid}-${randomUUID()}`;
+  const temp = `${settings}.plimsoll-restore-${nonce}`;
+  const side = `${settings}.plimsoll-restore-side-${nonce}`;
+  const changed = (): StatusLineRestoreResult => {
+    // A concurrent writer may have recreated settings.json. A hard link puts
+    // the moved file back only when that name is still free; it never replaces
+    // the writer's file. Keep the side name so any edit is recoverable.
+    linkIfAbsent(side, settings);
+    return { outcome: "status_line_changed", retainedPath: side };
+  };
+  try {
+    if (restoredBytes !== null) fs.writeFileSync(temp, restoredBytes, { mode: 0o600, flag: "wx" });
+    fs.renameSync(settings, side);
+    if (fs.lstatSync(side).isSymbolicLink() ||
+        !fs.readFileSync(side).equals(observedBytes)) return changed();
+    if (restoredBytes !== null) {
+      // link() is the compare-and-swap commit: a new settings.json wins.
+      if (!linkIfAbsent(temp, settings)) return changed();
+    } else if (fs.existsSync(settings)) return changed();
+    // An editor with an already-open descriptor can modify the moved inode.
+    // Detect that too, and retain the changed side copy with its path.
+    if (!fs.readFileSync(side).equals(observedBytes)) return changed();
+    fs.unlinkSync(side);
+    fs.unlinkSync(backup);
+    return { outcome: "restored" };
+  } finally {
+    if (restoredBytes !== null) fs.rmSync(temp, { force: true });
   }
-  fs.rmSync(backup);
-  return "restored";
 }
 
 /** Standalone source command; each target preserves its original bytes for uninstall. */
-export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string }> {
+export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string;
+  retainedPath?: string }> {
   const defaultDir = process.env.CLAUDE_CONFIG_DIR
     ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : path.join(os.homedir(), ".claude");
   const dirs = [defaultDir];
@@ -420,13 +458,13 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
     }
     throw new Error("usage: setup-claude-status-line [--config-dir <dir>]... [--uninstall]");
   }
-  const results: Array<{ configDir: string; outcome: string }> = [];
+  const results: Array<{ configDir: string; outcome: string; retainedPath?: string }> = [];
   for (const dir of [...new Set(dirs)]) {
     const settings = path.join(dir, "settings.json");
     assertManagedConfigTarget(settings);
     const backup = path.join(dir, STATUS_LINE_BACKUP_NAME);
     if (uninstall) {
-      if (fs.existsSync(backup)) results.push({ configDir: dir, outcome: restoreClaudeStatusLine(dir) });
+      if (fs.existsSync(backup)) results.push({ configDir: dir, ...restoreClaudeStatusLine(dir) });
       else results.push({ configDir: dir, outcome: "not_installed" });
       continue;
     }
