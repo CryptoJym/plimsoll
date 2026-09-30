@@ -1,4 +1,5 @@
 import http from "node:http";
+import { performance } from "node:perf_hooks";
 
 import type { CollectorConfig } from "./config";
 import { normalizeForwardedHook } from "./forwarder";
@@ -29,7 +30,7 @@ import { OtlpIntakeSpool } from "./otlp-spool";
 import { readProducerEventIdHeader, PRODUCER_EVENT_ID_HEADER } from "./producer-parity";
 import { markStopWindowProbe, STOP_WINDOW_PROBE_HEADER } from "./stop-window-probe";
 import { finishMaintenanceRebuildPause, markMaintenanceRebuildPause,
-  recordMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
+  recordMaintenanceRebuildRefusalAsync } from "./maintenance-rebuild-pause-state";
 
 export const STOP_WINDOW_RELEASE_PATH = "/api/stop-window/release";
 
@@ -55,6 +56,7 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
   let releasing = false;
   let inFlight = 0;
   const server = http.createServer(async (request, response) => {
+    const arrivedAt = performance.now();
     inFlight += 1;
     try {
       assertAllowedHost(request);
@@ -85,7 +87,7 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         if (!auth) throw new HttpBoundaryRejection("producer_token_invalid", 401);
         authenticatePausedLiveProducer(home, selected.producerId, selected.token, auth);
         const body = await readLiveBody(request, createRequestBudget());
-        recordMaintenanceRebuildRefusal(home, "live", selected.producerId, body);
+        await recordMaintenanceRebuildRefusalAsync(home, "live", selected.producerId, body, { arrivedAt });
         reply(response, 503, { status: "maintenance_rebuild_paused", source: "codex" }, true, true);
         return;
       }
@@ -105,14 +107,15 @@ export async function runStopWindowListener(config: CollectorConfig, home: strin
         const budget = createRequestBudget();
         const body = decodeBoundedRequestBody(request, await readBoundedRequestBody(request, budget));
         if (isOtlpPath(request.url)) {
-          recordMaintenanceRebuildRefusal(home, "otlp",
-            `${source}:${canonicalOtlpTransportPath(request.url)}`, body.text);
+          await recordMaintenanceRebuildRefusalAsync(home, "otlp",
+            `${source}:${canonicalOtlpTransportPath(request.url)}`, body.text, { arrivedAt });
         } else {
           // The client writes the privacy-blanked body into its compatible
           // spool. Key both the pending receipt and later drain to that body.
-          recordMaintenanceRebuildRefusal(home, "hook", source,
+          await recordMaintenanceRebuildRefusalAsync(home, "hook", source,
             blankForbiddenRawContent(body.text)?.text ?? body.text,
-            { eventId: readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]), config });
+            { eventId: readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]),
+              config, arrivedAt });
         }
         reply(response, 503, { status: "maintenance_rebuild_paused", source }, true, true);
         return;

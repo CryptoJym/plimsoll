@@ -39,7 +39,12 @@ export const MISSING_HOOK_RETRY_MS = 600_000;
 // One monotonic budget for schema publication and the refusal boundary. Leave
 // headroom in the three-second HTTP budget for private receipt fsync + response.
 const REFUSAL_WAIT_MS = 2_000;
-function beforeDeadline<T>(deadline: number, action: () => T): T {
+type RefusalWaitMode = "synchronous" | "try" | "unknown";
+function beforeDeadline<T>(deadline: number, action: () => T,
+  mode: RefusalWaitMode = "synchronous"): T {
+  // HTTP requests use one immediate attempt per event-loop turn. Their caller
+  // schedules the retry with a timer, so other admitted requests can proceed.
+  if (mode !== "synchronous") return action();
   const sleep = new Int32Array(new SharedArrayBuffer(4));
   for (;;) {
     try { return action(); }
@@ -169,7 +174,8 @@ type HookBoundary = { highWater: number | null; admissionSequence: number | null
  * durable. During the fenced swap, the post-quiesce marker supplies the exact
  * last admission sequence; an unavailable snapshot remains unknown. */
 function withHookHighWater<T>(home: string, marker: PauseMarker, action: (boundary: HookBoundary) => T,
-  deadline = performance.now() + REFUSAL_WAIT_MS): T {
+  deadline = performance.now() + REFUSAL_WAIT_MS,
+  mode: RefusalWaitMode = "synchronous"): T {
   const ledger = selectedLedger(home, marker);
   const fenced = fs.existsSync(`${ledger}.maintenance-rebuild.lock`);
   if (!fs.existsSync(ledger)) return action(fenced
@@ -189,10 +195,11 @@ function withHookHighWater<T>(home: string, marker: PauseMarker, action: (bounda
     beforeDeadline(deadline, () => {
       ensureMaintenanceEventOrderSchema(db!);
       db!.exec("BEGIN IMMEDIATE");
-    });
+    }, mode);
   } catch (error) {
     db?.close();
     releaseRebuildOpenToken(token);
+    if (mode === "try" && (error as { code?: string }).code === "SQLITE_BUSY") throw error;
     if (fenced || (error instanceof Error && error.message === "maintenance_rebuild_paused")) {
       return action({ highWater: marker.ledgerHighWater ?? null,
         admissionSequence: marker.ledgerAdmissionSequence ?? null,
@@ -309,14 +316,15 @@ function readReceipt(file: string): RefusalReceipt {
  * Acquiring it proves that no cooperating publisher is still writing its temp.
  * Readers of a complete final receipt need no lock: rename publishes all bytes. */
 function withReceiptIdentity<T>(file: string, action: () => T,
-  deadline = performance.now() + REFUSAL_WAIT_MS) {
+  deadline = performance.now() + REFUSAL_WAIT_MS,
+  mode: RefusalWaitMode = "synchronous") {
   const home = path.dirname(path.dirname(file));
   const locks = path.join(home, "maintenance-rebuild-refusal-locks");
   fs.mkdirSync(locks, { mode: 0o700, recursive: true });
   const stat = fs.lstatSync(locks);
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("maintenance_refusals_unsafe");
   return beforeDeadline(deadline, () => withRebuildCoordination(
-    path.join(locks, path.basename(file)), action, 0));
+    path.join(locks, path.basename(file)), action, 0), mode);
 }
 
 function assertNoLegacyReceiptWriter(file: string) {
@@ -334,23 +342,66 @@ function recoverReceiptArtifacts(home: string, file: string, observedTemporaries
   const directory = path.dirname(file);
   const temporaryNames = observedTemporaries ?? fs.readdirSync(directory).filter((name) =>
     name.startsWith(`${path.basename(file)}.`) && /^[a-f0-9]{64}\.receipt\.[0-9a-f-]{36}\.tmp$/.test(name));
-  for (const candidate of [...temporaryNames.map((name) => path.join(directory, name)), file]) {
+  const temporaries = temporaryNames.map((name) => path.join(directory, name));
+  let finalExists = false;
+  let finalValid = false;
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_refusal_unsafe");
+    finalExists = true;
+    try { readReceipt(file); finalValid = true; }
+    catch (error) {
+      if (!(error instanceof SyntaxError) && (error as Error).message !== "maintenance_refusal_unsafe") throw error;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  // A valid final receipt is the obligation. An interrupted metadata update
+  // has no independent loss, even if its temporary reached fsync.
+  if (finalExists && !finalValid) {
+    assertNoLegacyReceiptWriter(file);
+    appendTerminalOutcome(home, { version: 1, receipt: path.basename(file),
+      obligation: path.basename(file), at: new Date().toISOString(), outcome: "malformed_refusal" });
+    fs.unlinkSync(file);
+    fsyncDirectory(directory);
+  }
+  const candidates: Array<{ file: string; valid: boolean }> = [];
+  for (const candidate of temporaries) {
     let stat: fs.Stats;
     try { stat = fs.lstatSync(candidate); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_refusal_unsafe");
-    const temporary = candidate !== file;
-    if (!temporary) {
-      try { readReceipt(file); continue; }
-      catch (error) {
+    assertNoLegacyReceiptWriter(candidate);
+    let valid = false;
+    if (!finalExists) {
+      try {
+        readReceipt(candidate);
+        valid = true;
+      } catch (error) {
         if (!(error instanceof SyntaxError) && (error as Error).message !== "maintenance_refusal_unsafe") throw error;
       }
     }
-    assertNoLegacyReceiptWriter(candidate);
+    candidates.push({ file: candidate, valid });
+  }
+  if (!finalExists && candidates.length > 0 && !candidates.some((entry) => entry.valid)) {
+    // A malformed initial temporary has no trustworthy timestamp or instance
+    // ID. Fsync the path-keyed loss before unlinking any private bytes.
     appendTerminalOutcome(home, { version: 1, receipt: path.basename(file),
-      at: stat.mtime.toISOString(), outcome: temporary ? "abandoned_refusal_temporary" : "malformed_refusal" });
-    fs.unlinkSync(candidate);
-    fsyncDirectory(directory);
+      obligation: path.basename(file), at: new Date().toISOString(),
+      outcome: "abandoned_refusal_temporary" });
+  }
+  let promoted = finalValid;
+  for (const candidate of candidates) {
+    if (!finalExists && !promoted && candidate.valid) {
+      const descriptor = fs.openSync(candidate.file, "r");
+      try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+      fs.renameSync(candidate.file, file);
+      fsyncDirectory(directory);
+      promoted = true;
+    } else {
+      fs.unlinkSync(candidate.file);
+      fsyncDirectory(directory);
+    }
   }
 }
 
@@ -413,7 +464,8 @@ export function pendingMaintenanceHookEventId(home: string, source: string, body
  * listener's exit. Repeated refusals of the same payload share one receipt. */
 export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRoute,
   source: string, body: string | Buffer,
-  options: { eventId?: string; spoolName?: string; config?: CollectorConfig } = {}) {
+  options: { eventId?: string; spoolName?: string; config?: CollectorConfig;
+    deadline?: number; waitMode?: RefusalWaitMode } = {}) {
   const marker = readMaintenanceRebuildPause(home);
   if (!marker) throw new Error("maintenance_pause_marker_missing");
   const directory = refusalDirectory(home);
@@ -426,7 +478,8 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
   const dirStat = fs.lstatSync(directory);
   if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) throw new Error("maintenance_refusals_unsafe");
   const file = existingRefusalPath(home, route, source, body);
-  const deadline = performance.now() + REFUSAL_WAIT_MS;
+  const deadline = options.deadline ?? performance.now() + REFUSAL_WAIT_MS;
+  const waitMode = options.waitMode ?? "synchronous";
   return withReceiptIdentity(file, () => {
     recoverReceiptArtifacts(home, file);
     if (fs.existsSync(file)) {
@@ -471,11 +524,35 @@ export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRout
           ledgerAdmissionSequence: boundary.admissionSequence,
           ledgerAbsentAtRefusal: boundary.ledgerAbsentAtRefusal,
           ...(options.spoolName ? { spoolName: options.spoolName } : {}) });
-      }, deadline);
+      }, deadline, waitMode);
     } else {
       writeReceipt(file, { version: 1, route, at: new Date().toISOString() });
     }
-  }, deadline);
+  }, deadline, waitMode);
+}
+
+/** The listener's budget begins when HTTP admits the request, including body
+ * read and identity-lock queue time. Busy ledger attempts yield to every other
+ * request; at the two-second boundary a durable unknown receipt is published. */
+export async function recordMaintenanceRebuildRefusalAsync(home: string, route: RefusalRoute,
+  source: string, body: string | Buffer,
+  options: { eventId?: string; spoolName?: string; config?: CollectorConfig;
+    arrivedAt: number }) {
+  const deadline = options.arrivedAt + REFUSAL_WAIT_MS;
+  const responseDeadline = options.arrivedAt + 2_850;
+  for (;;) {
+    const waitMode: RefusalWaitMode = performance.now() < deadline ? "try" : "unknown";
+    try {
+      recordMaintenanceRebuildRefusal(home, route, source, body,
+        { ...options, deadline, waitMode });
+      return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "SQLITE_BUSY" ||
+        performance.now() >= responseDeadline) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve,
+        Math.min(10, Math.max(1, deadline - performance.now()))));
+    }
+  }
 }
 
 type AdmissionMatch = "accepted" | "unverified" | "unsequenced" | "unknown" | "none";
@@ -529,7 +606,8 @@ function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt):
 }
 
 type TerminalRecord = { version?: number; receipt?: string; at?: string;
-  outcome?: string; eventId?: string | null; source?: string; kind?: string; spoolName?: string };
+  outcome?: string; obligation?: string; eventId?: string | null;
+  source?: string; kind?: string; spoolName?: string };
 function terminalRecords(home: string): TerminalRecord[] {
   try {
     return fs.readFileSync(path.join(home, TERMINAL), "utf8").split("\n").filter(Boolean)
@@ -559,17 +637,40 @@ function unknownFormatCount(records: TerminalRecord[]) {
     .map((entry) => `${entry.receipt}\0${entry.at}`)).size;
 }
 function unknownFormatLosses(records: TerminalRecord[]) {
-  const unique = new Map(records.filter((entry) => entry.version === 1 &&
-    (entry.outcome === "unknown_receipt_format" ||
-      entry.outcome === "unsequenced_legacy_admission" || entry.outcome === "unknown_admission_order" ||
-      entry.outcome === "abandoned_refusal_temporary" || entry.outcome === "malformed_refusal") &&
-    typeof entry.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(entry.receipt) &&
-    typeof entry.at === "string" && Number.isFinite(Date.parse(entry.at)))
-    .map((entry) => [`${entry.receipt}\0${entry.at}`, entry]));
+  const unique = new Map<string, TerminalRecord>();
+  for (const entry of records) {
+    if (entry.version !== 1 || typeof entry.receipt !== "string" ||
+      !/^[a-f0-9]{64}\.receipt$/.test(entry.receipt)) continue;
+    if (entry.outcome === "accepted_retry") {
+      for (const key of unique.keys()) if (key.startsWith(`${entry.receipt}\0`)) unique.delete(key);
+      continue;
+    }
+    if (entry.outcome !== "unknown_receipt_format" &&
+      entry.outcome !== "unsequenced_legacy_admission" && entry.outcome !== "unknown_admission_order" &&
+      entry.outcome !== "abandoned_refusal_temporary" && entry.outcome !== "malformed_refusal") continue;
+    if (typeof entry.at !== "string" || !Number.isFinite(Date.parse(entry.at))) continue;
+    const obligation = entry.obligation ?? entry.at;
+    unique.set(`${entry.receipt}\0${obligation}`, entry);
+  }
   return [...unique.values()].map((entry) => {
     const at = Date.parse(entry.at!);
     return { fromMs: at, toMs: at, count: 1 };
   });
+}
+const RECEIPT_LOSS_OUTCOMES = new Set([
+  "unknown_receipt_format", "unsequenced_legacy_admission", "unknown_admission_order",
+  "abandoned_refusal_temporary", "malformed_refusal",
+]);
+function retireReceiptLossAfterAcceptance(home: string, file: string, eventId: string) {
+  const receipt = path.basename(file);
+  let pending = false;
+  for (const record of terminalRecords(home)) {
+    if (record.version !== 1 || record.receipt !== receipt) continue;
+    if (record.outcome === "accepted_retry") pending = false;
+    else if (record.outcome && RECEIPT_LOSS_OUTCOMES.has(record.outcome)) pending = true;
+  }
+  if (pending) appendTerminalOutcome(home, { version: 1, receipt, at: new Date().toISOString(),
+    eventId, outcome: "accepted_retry" });
 }
 export function readUnverifiedHookRetries(home: string): number | null {
   try { return unverifiedCount(terminalRecords(home)); }
@@ -657,7 +758,7 @@ export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRou
             value.spoolName === options.spoolName && !!value.eventId && !!hookEventId(body) &&
             sameEventId(value.eventId, hookEventId(body)!);
         });
-      if (matched.length !== 1) return;
+      if (matched.length !== 1) throw error;
       file = matched[0]!;
       receipt = readRecoverableReceipt(file);
     }
@@ -668,6 +769,7 @@ export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRou
         if (!receipt.eventId || !options.acceptedEventId ||
           !sameEventId(options.acceptedEventId, receipt.eventId) || !options.ledger ||
           ledgerAdmissionMatches(options.ledger, receipt) !== "accepted") return;
+        retireReceiptLossAfterAcceptance(home, file, options.acceptedEventId);
       }
       if (options.outcome === "terminal") {
         // Record the exact receipt instance before removing its hold. A crash
@@ -681,6 +783,23 @@ export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRou
     });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (route !== "hook" || options.outcome === "terminal" ||
+      !options.acceptedEventId || !options.ledger) return;
+    if (!fs.existsSync(refusalDirectory(home))) return;
+    // A retry may commit before the first reconciliation has promoted an
+    // interrupted initial publication. Recover it under its identity lock.
+    withReceiptIdentity(file, () => recoverReceiptArtifacts(home, file));
+    if (fs.existsSync(file)) {
+      resolveMaintenanceRebuildRefusal(home, route, source, body, options);
+      return;
+    }
+    const identity = hookReceiptIdentity(home, source, body, options.acceptedEventId);
+    const candidate: RefusalReceipt = { version: 7, route: "hook", at: new Date().toISOString(),
+      source, eventId: options.acceptedEventId, receiptId: randomUUID(),
+      ledgerHighWater: null, ledgerAdmissionSequence: null,
+      ledgerAbsentAtRefusal: false, ...identity };
+    if (ledgerAdmissionMatches(options.ledger, candidate) === "accepted")
+      retireReceiptLossAfterAcceptance(home, file, options.acceptedEventId);
   }
 }
 
@@ -782,6 +901,7 @@ export function reconcileMaintenanceRebuildRefusals(home: string,
               catch { /* An unreadable inventory never proves acceptance. */ }
             }
             if (match === "accepted") {
+              if (receipt.eventId) retireReceiptLossAfterAcceptance(home, file, receipt.eventId);
               fs.unlinkSync(file);
               fsyncDirectory(directory);
               if (receipt.receiptId) retiredIds.push(receipt.receiptId);
