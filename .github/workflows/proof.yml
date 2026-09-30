@@ -61,6 +61,10 @@ jobs:
       - name: Lean contract tests (pending until their beads land)
         run: pnpm contracts:lean
 
+      - name: Prove concurrent first opens of a fresh ledger (eco-6hoxj.163.130)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:startup-schema-race
+
       - name: Reject incomplete proofs and require WAL, authentication and retention receipts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |

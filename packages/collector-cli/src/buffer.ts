@@ -264,8 +264,29 @@ export class LocalEventBuffer {
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
     this.db = new Database(path, { timeout });
-    this.db.pragma("journal_mode = WAL");
+    // A second first opener can see SQLITE_BUSY while the first changes the
+    // file into WAL mode. SQLite does not always apply busy_timeout to this
+    // pragma, so retry only that transient result within the caller's budget.
+    const journalDeadline = performance.now() + timeout;
+    const busyWait = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      try {
+        this.db.pragma("journal_mode = WAL");
+        break;
+      } catch (error) {
+        if ((error as { code?: string }).code !== "SQLITE_BUSY" || performance.now() >= journalDeadline) {
+          this.db.close();
+          throw error;
+        }
+        Atomics.wait(busyWait, 0, 0, 10);
+      }
+    }
     this.deviceId = options.deviceId?.trim() || null;
+    // All open-time schema reads and writes must share one writer lock. On a
+    // first open, another process can otherwise read the same missing column
+    // and lose its ALTER to this process with "duplicate column name".
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
       .get();
@@ -788,6 +809,15 @@ export class LocalEventBuffer {
         : undefined,
     });
     markOpenStep("ledger.projection_schema");
+    this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        if (this.db.inTransaction) this.db.exec("ROLLBACK");
+      } finally {
+        this.db.close();
+      }
+      throw error;
+    }
   }
 
   /**
