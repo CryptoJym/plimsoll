@@ -19,6 +19,7 @@ export type ParserStateValidator<T> = (value: unknown) => T | undefined;
 export type JsonlScanCursor<T> = {
   observedSize: number;
   committedOffset: number | null;
+  committedPrefixHash: string | null;
   deferredBytes: number;
   fileIdentity: string | null;
   headHash: string | null;
@@ -56,8 +57,11 @@ export type JsonlTailRead = {
   continuation?: import("./jsonl-continuation").ContinuationProposal;
   skippedRecord?: CaptureSkippedRecord;
   lines: string[];
+  /** Raw complete-record bytes represented by this cursor advance. */
+  committedSourceSpan?: { offset: number; bytes: Buffer };
   observedSize: number;
   committedOffset: number;
+  committedPrefixHash?: string | null;
   deferredBytes: number;
   fileIdentity: string;
   headHash: string | null;
@@ -115,6 +119,7 @@ export const DEFAULT_JSONL_TAILER_IO: JsonlTailerIo = {
 type RawCursorRow = {
   size: number;
   committedOffset: number | null;
+  committedPrefixHash: string | null;
   deferredBytes: number | null;
   fileIdentity: string | null;
   headHash: string | null;
@@ -170,6 +175,7 @@ export function ensureJsonlScanState(database: Database.Database) {
   );
   const additions = [
     "committed_offset integer",
+    "committed_prefix_hash text",
     "deferred_bytes integer not null default 0",
     "file_identity text",
     "head_hash text",
@@ -257,10 +263,23 @@ export function loadJsonlScanCursor<T>(
   checkpointVersion: number,
   validateParserState: ParserStateValidator<T>,
 ): JsonlScanCursor<T> | undefined {
+  return loadJsonlScanCursorByKey(database, jsonlScanStateKey(file), parserKind,
+    checkpointVersion, validateParserState);
+}
+
+/** Read a pre-hashed cursor key when validating an archived ledger. */
+export function loadJsonlScanCursorByKey<T>(
+  database: Database.Database,
+  fileKey: string,
+  parserKind: string,
+  checkpointVersion: number,
+  validateParserState: ParserStateValidator<T>,
+): JsonlScanCursor<T> | undefined {
   const row = database
     .prepare(
       `select size,
          committed_offset as committedOffset,
+         committed_prefix_hash as committedPrefixHash,
          deferred_bytes as deferredBytes,
          file_identity as fileIdentity,
          head_hash as headHash,
@@ -280,7 +299,7 @@ export function loadJsonlScanCursor<T>(
          parser_state_json as parserStateJson
        from ${STATE_TABLE} where file = ?`,
     )
-    .get(jsonlScanStateKey(file)) as RawCursorRow | undefined;
+    .get(fileKey) as RawCursorRow | undefined;
   if (!row) return undefined;
 
   const legacy =
@@ -292,6 +311,7 @@ export function loadJsonlScanCursor<T>(
     return {
       observedSize: nonnegativeInteger(row.size) ? row.size : 0,
       committedOffset: null,
+      committedPrefixHash: null,
       deferredBytes: 0,
       fileIdentity: null,
       headHash: null,
@@ -324,6 +344,7 @@ export function loadJsonlScanCursor<T>(
     return {
       observedSize: nonnegativeInteger(row.size) ? row.size : 0,
       committedOffset: null,
+      committedPrefixHash: null,
       deferredBytes: 0,
       fileIdentity: row.fileIdentity,
       headHash: null,
@@ -342,6 +363,8 @@ export function loadJsonlScanCursor<T>(
   return {
     observedSize: row.size,
     committedOffset: row.committedOffset,
+    committedPrefixHash: typeof row.committedPrefixHash === "string" && SHA256_RE.test(row.committedPrefixHash)
+      ? row.committedPrefixHash : null,
     deferredBytes: row.deferredBytes!,
     fileIdentity: row.fileIdentity,
     headHash: row.headHash,
@@ -365,21 +388,28 @@ export function rememberJsonlScanCursor<T>(
   read: JsonlTailRead,
   parserState: T,
 ) {
+  // Every cursor writer must first prepare a digest from verified source bytes.
+  // A future caller that omits that step must fail closed at the durable write.
+  if (read.committedOffset > 0 &&
+    (typeof read.committedPrefixHash !== "string" || !SHA256_RE.test(read.committedPrefixHash))) {
+    throw new JsonlSnapshotChangedError();
+  }
   database
     .prepare(
       `insert into ${STATE_TABLE}
-         (file, size, scanned_at, committed_offset, deferred_bytes, file_identity,
+         (file, size, scanned_at, committed_offset, committed_prefix_hash, deferred_bytes, file_identity,
          head_hash, head_bytes, continuity_hash, continuity_bytes, mtime_ms,
           ctime_ms,
           work_remaining, unresolved_kind, unresolved_offset,
           unresolved_observed_bytes, unresolved_available_bytes,
           unresolved_byte_budget, parser_kind, checkpoint_version,
           parser_state_json)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        on conflict(file) do update set
          size = excluded.size,
          scanned_at = excluded.scanned_at,
          committed_offset = excluded.committed_offset,
+         committed_prefix_hash = excluded.committed_prefix_hash,
          deferred_bytes = excluded.deferred_bytes,
          file_identity = excluded.file_identity,
          head_hash = excluded.head_hash,
@@ -403,6 +433,7 @@ export function rememberJsonlScanCursor<T>(
       read.observedSize,
       new Date().toISOString(),
       read.committedOffset,
+      read.committedPrefixHash ?? null,
       read.deferredBytes,
       read.fileIdentity,
       read.headHash,
@@ -421,6 +452,107 @@ export function rememberJsonlScanCursor<T>(
       checkpointVersion,
       JSON.stringify(parserState),
     );
+}
+
+type PrefixHashState = { offset: number; identity: string; hash: crypto.Hash; digest: string };
+const prefixHashStates = new WeakMap<Database.Database, Map<string, PrefixHashState>>();
+
+/** Prepare the digest outside the cursor/event write transaction. Each normal
+ * slice extends the hash already kept for this database and file; hash.copy()
+ * gives the durable digest without ending that running hash. A newly opened
+ * tailer seeds it with one stable read of the old committed prefix. */
+export function prepareJsonlCommittedPrefixHash<T>(
+  database: Database.Database,
+  file: string,
+  cursorKey: string,
+  cursor: JsonlScanCursor<T> | undefined,
+  read: JsonlTailRead,
+) {
+  let states = prefixHashStates.get(database);
+  if (!states) {
+    states = new Map();
+    prefixHashStates.set(database, states);
+  }
+  const key = jsonlScanStateKey(cursorKey);
+  const prior = states.get(key);
+  const span = read.committedSourceSpan;
+  const canExtend = span && span.offset + span.bytes.length === read.committedOffset &&
+    (!read.reset || span.offset === 0);
+  // A reset rebuilds from byte zero. Otherwise any cursor that preserves or
+  // advances the old committed offset must prove its old bytes first, including
+  // continuation completions that have no committed source span.
+  const oldOffset = !read.reset && cursor?.committedOffset !== null &&
+    cursor?.committedOffset !== undefined && cursor.committedOffset > 0 &&
+    read.committedOffset >= cursor.committedOffset ? cursor.committedOffset : 0;
+  const oldDigest = oldOffset > 0 ? cursor?.committedPrefixHash : null;
+  if (oldOffset > 0 && (typeof oldDigest !== "string" || !SHA256_RE.test(oldDigest))) {
+    throw new JsonlSnapshotChangedError();
+  }
+  const oldPrefix = oldOffset > 0 ? {offset: oldOffset, digest: oldDigest!} : undefined;
+  let hash: crypto.Hash;
+  if (canExtend && span.offset === 0 && oldOffset === 0) {
+    hash = crypto.createHash("sha256");
+  } else if (canExtend && prior?.offset === span.offset && span.offset === oldOffset &&
+    prior.identity === read.fileIdentity &&
+    prior.digest === oldDigest) {
+    hash = prior.hash.copy();
+  } else {
+    // One stable descriptor read supplies the final hash and checks the old
+    // digest at its exact offset, even when a continuation supplies no span.
+    hash = captureCommittedPrefixHash(file, canExtend ? span.offset : read.committedOffset,
+      read, oldPrefix);
+  }
+  if (canExtend) hash.update(span.bytes);
+  const digest = hash.copy().digest("hex");
+  read.committedPrefixHash = digest;
+  // If the transaction rolls back, the next call compares this state against
+  // the unchanged durable cursor digest and cannot reuse it.
+  states.set(key, {offset: read.committedOffset, identity: read.fileIdentity, hash, digest});
+}
+
+function captureCommittedPrefixHash(file: string, end: number, read: JsonlTailRead,
+  expectedPrefix?: {offset: number; digest: string}) {
+  if (!nonnegativeInteger(end) || end > read.observedSize ||
+    (expectedPrefix && (!nonnegativeInteger(expectedPrefix.offset) ||
+      expectedPrefix.offset > end || !SHA256_RE.test(expectedPrefix.digest)))) {
+    throw new JsonlSnapshotChangedError();
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      const before = fs.fstatSync(fd, {bigint: true});
+      const pathBefore = fs.lstatSync(file, {bigint: true});
+      if (!before.isFile() || pathBefore.isSymbolicLink() || !pathBefore.isFile() ||
+        fileIdentity(generationSnapshot(before)) !== read.fileIdentity ||
+        before.dev !== pathBefore.dev || before.ino !== pathBefore.ino ||
+        before.size !== BigInt(read.observedSize) ||
+        nanosecondsToMilliseconds(before.ctimeNs) !== read.ctimeMs) continue;
+      const hash = crypto.createHash("sha256");
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let offset = 0;
+      let prefixDigest: string | undefined;
+      while (offset < end) {
+        const boundary = expectedPrefix && offset < expectedPrefix.offset
+          ? expectedPrefix.offset : end;
+        const count = fs.readSync(fd, chunk, 0,
+          Math.min(chunk.length, end - offset, boundary - offset), offset);
+        if (count <= 0) break;
+        hash.update(chunk.subarray(0, count));
+        offset += count;
+        if (expectedPrefix && offset === expectedPrefix.offset) {
+          prefixDigest = hash.copy().digest("hex");
+        }
+      }
+      const after = fs.fstatSync(fd, {bigint: true});
+      const pathAfter = fs.lstatSync(file, {bigint: true});
+      if (offset === end && sameGenerationSnapshot(after, generationSnapshot(before)) &&
+        sameGenerationSnapshot(pathAfter, generationSnapshot(before)) &&
+        (!expectedPrefix || prefixDigest === expectedPrefix.digest)) return hash;
+    } catch { /* A moving source may become stable on another bounded try. */ }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+  }
+  throw new JsonlSnapshotChangedError();
 }
 
 /**
@@ -703,6 +835,7 @@ export function readJsonlTail(
 
     return {
       lines,
+      committedSourceSpan: { offset: start, bytes: bytes.subarray(0, slice.committedBytes) },
       observedSize,
       committedOffset,
       deferredBytes: Math.max(0, observedSize - committedOffset),
@@ -755,6 +888,10 @@ export function truncateJsonlReadToCompleteRecords(bytes: Buffer, maxRecords: nu
 function validCursorEnvelope(row: RawCursorRow) {
   if (!nonnegativeInteger(row.size)) return false;
   if (!nonnegativeInteger(row.committedOffset) || row.committedOffset > row.size) return false;
+  // A pre-digest cursor with committed bytes has no evidence for those bytes.
+  // Rebuild it from byte zero before any later append can advance the cursor.
+  if (row.committedOffset > 0 &&
+    (typeof row.committedPrefixHash !== "string" || !SHA256_RE.test(row.committedPrefixHash))) return false;
   if (!nonnegativeInteger(row.deferredBytes)) return false;
   if (row.committedOffset + row.deferredBytes !== row.size) return false;
   if (typeof row.fileIdentity !== "string" || row.fileIdentity.length === 0) return false;

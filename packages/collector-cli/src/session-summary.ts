@@ -198,11 +198,11 @@ function unscannedRowSql(sessionId: string, rowid: string, observedAt: string): 
       ))`;
 }
 
-function outboxLineageMismatchSql(outbox: string, event: string): string {
+function unresolvedOutboxLineageSql(outbox: string): string {
+  // A complete link to a different incarnation cannot change this raw's
+  // eligibility. Only an incomplete legacy link at the location is unresolved.
   return `(${outbox}.raw_id is null or ${outbox}.raw_created_at is null or
-    ${outbox}.raw_generation is null or ${outbox}.raw_id is not ${event}.id or
-    ${outbox}.raw_created_at is not ${event}.created_at or
-    ${outbox}.raw_generation is not ${event}.privacy_generation)`;
+    ${outbox}.raw_generation is null)`;
 }
 
 /**
@@ -228,8 +228,8 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     "cost_usd", "repo_hash", "branch_hash", "account_hash",
     "privacy_generation", "privacy_disposition",
   ].map((column) => `old.${column} is not new.${column}`).join(" or ");
-  const oldOutboxMismatch = outboxLineageMismatchSql("old", "e");
-  const newOutboxMismatch = outboxLineageMismatchSql("new", "e");
+  const oldOutboxMismatch = unresolvedOutboxLineageSql("old");
+  const newOutboxMismatch = unresolvedOutboxLineageSql("new");
   const oldOutboxChange = `${oldOutboxMismatch} and
     (new.raw_rowid is not old.raw_rowid or not ${newOutboxMismatch})`;
   const newOutboxChange = `${newOutboxMismatch} and
@@ -656,7 +656,13 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   // pre-delivery install may not have them. Raw edits/deletes remain covered.
   if (tableExists(db, "upload_outbox")) {
     db.exec(`
-      create trigger if not exists trg_session_summary_outbox_insert_v42
+      drop trigger if exists trg_session_summary_outbox_insert_v42;
+      drop trigger if exists trg_session_summary_outbox_update_v42;
+      drop trigger if exists trg_session_summary_outbox_delete_v42;
+      drop trigger if exists trg_session_summary_repair_outbox_insert_v1;
+      drop trigger if exists trg_session_summary_repair_outbox_update_v1;
+      drop trigger if exists trg_session_summary_repair_outbox_delete_v1;
+      create trigger if not exists trg_session_summary_outbox_insert_v43
       after insert on upload_outbox
       when new.raw_rowid is not null and exists (
         select 1 from buffered_events e
@@ -678,7 +684,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
-      create trigger if not exists trg_session_summary_outbox_update_v42
+      create trigger if not exists trg_session_summary_outbox_update_v43
       after update of raw_rowid, raw_id, raw_created_at, raw_generation on upload_outbox
       when ${oldOutboxAffects} or ${newOutboxAffects}
       begin
@@ -707,7 +713,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           on conflict(session_id) do update set
             reason = excluded.reason, updated_at = excluded.updated_at;
       end;
-      create trigger if not exists trg_session_summary_outbox_delete_v42
+      create trigger if not exists trg_session_summary_outbox_delete_v43
       after delete on upload_outbox
       when old.raw_rowid is not null and exists (
         select 1 from buffered_events e
@@ -731,20 +737,20 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       end;
     `);
     db.exec(`
-      create trigger if not exists trg_session_summary_repair_outbox_insert_v1
+      create trigger if not exists trg_session_summary_repair_outbox_insert_v2
       after insert on upload_outbox
       when new.raw_rowid is not null and exists (
         select 1 from buffered_events e join session_sync_summary_state s on s.session_id = e.session_id
         where e.rowid = new.raw_rowid and ${newOutboxMismatch})
       begin ${queueLinkedRepair(`e.rowid = new.raw_rowid and ${newOutboxMismatch}`)} end;
-      create trigger if not exists trg_session_summary_repair_outbox_update_v1
+      create trigger if not exists trg_session_summary_repair_outbox_update_v2
       after update of raw_rowid, raw_id, raw_created_at, raw_generation on upload_outbox
       when ${oldOutboxAffects} or ${newOutboxAffects}
       begin
         ${queueLinkedRepair(`e.rowid = old.raw_rowid and ${oldOutboxChange}`)}
         ${queueLinkedRepair(`e.rowid = new.raw_rowid and ${newOutboxChange}`)}
       end;
-      create trigger if not exists trg_session_summary_repair_outbox_delete_v1
+      create trigger if not exists trg_session_summary_repair_outbox_delete_v2
       after delete on upload_outbox
       when old.raw_rowid is not null and exists (
         select 1 from buffered_events e join session_sync_summary_state s on s.session_id = e.session_id

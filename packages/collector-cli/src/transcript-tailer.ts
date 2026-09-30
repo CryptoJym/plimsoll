@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
+import { bindCaptureInventory, appendRootObservation, currentDispatchBindingSnapshot, inspectCaptureRoots, recordClaudeRootSessionSighting, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage, type DispatchBindingSnapshot } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import {
@@ -17,6 +17,7 @@ import {
   ensureJsonlScanState,
   jsonlScanStateKey,
   loadJsonlScanCursor,
+  prepareJsonlCommittedPrefixHash,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
   type JsonlTailerIo,
@@ -35,6 +36,9 @@ import {
   captureBaselineStatus,
   captureBaselineExcludedSize,
   captureBaselinePostEnrollmentOffset,
+  carriedCaptureCursorMatches,
+  carriedCaptureCursorOffset,
+  replacementCaptureBoundary,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -202,9 +206,12 @@ export type TranscriptScanOptions = {
   quarantine?: { stage: MaintenanceProgressStage; candidateHash: string };
   onProgress?: (progress: { stage: MaintenanceProgressStage; candidateHash: string | null }) => boolean;
   deferredBeforeIo?: boolean;
+  /** Startup replay only: observe the exact bytes whose cursor committed. */
+  onCommittedSourceSpan?: (file: string, span: { offset: number; bytes: Buffer } | null,
+    committedOffset: number) => void;
 };
 
-function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
+export function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
   if (!isRecord(value)) return undefined;
   if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git", "pending", "usageRevisions"])) {
     return undefined;
@@ -353,6 +360,9 @@ export class TranscriptTailer {
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
+  private activeCarriedBytes = false;
+  private activeReplacementCutoverAt: string | null = null;
+  private activeDispatchSnapshot: DispatchBindingSnapshot | undefined;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
   private eligibleDirectories: string[] | null = null;
@@ -404,7 +414,11 @@ export class TranscriptTailer {
         if (checked && stat?.isFile() && !checked.fullyRead) {
           const baselineSize = baselineComplete
             ? captureBaselineExcludedSize(this.buffer.database, "claude_code", baselineObservation(file, stat)) : null;
-          if (baselineSize === null || stat.size > baselineSize) this.revisit.offer(file);
+          if (baselineSize === null || stat.size > baselineSize ||
+              carriedCaptureCursorMatches(this.buffer.database, "claude_code",
+                jsonlScanStateKey(this.cursorKey(file)), baselineObservation(file, stat))) {
+            this.revisit.offer(file);
+          }
           else this.revisit.remove(file);
         } else this.revisit.remove(file);
         if (checked) known.checked(checked.key);
@@ -504,7 +518,13 @@ export class TranscriptTailer {
   async scan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
     this.retiredProgress = null;
     this.successorInstalled = false;
-    const result = await this.runScan(options);
+    // One config observation per batch; every event uses the same indexed
+    // binding view, and the next scan observes an atomic config replacement.
+    const previousSnapshot=this.activeDispatchSnapshot;
+    this.activeDispatchSnapshot=currentDispatchBindingSnapshot();
+    let result: TranscriptScanResult;
+    try { result=await this.runScan(options); }
+    finally { this.activeDispatchSnapshot=previousSnapshot; }
     // The baseline sweep is a live cursor too. Reading only `captureAttempt`
     // published zeros and a false `sweepComplete` for every cadence of the
     // baseline phase — the long sweep an operator most needs to read.
@@ -934,7 +954,10 @@ export class TranscriptTailer {
         result.activity.lastActivityAt = mtime;
       }
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
-      if (options.scope === "recent" && !revisitFiles.has(file) && stat.mtime.getTime() < recentCutoff) {
+      const observedBoundary = replacementCaptureBoundary(this.buffer.database, "claude_code",
+        baselineObservation(file, stat, discovered.precise));
+      if (options.scope === "recent" && !revisitFiles.has(file) &&
+          !observedBoundary?.changed && stat.mtime.getTime() < recentCutoff) {
         result.filesSkippedOutsideRecentWindow += 1;
         consumeAutomaticFile(file);
         continue;
@@ -948,7 +971,9 @@ export class TranscriptTailer {
           observation,
           { mode: "automatic", observedAt: scanNow.toISOString() },
         );
-        if (decision.decision === "exclude") {
+        if (decision.decision === "exclude" &&
+            !carriedCaptureCursorMatches(this.buffer.database, "claude_code",
+              jsonlScanStateKey(this.cursorKey(file)), observation)) {
           if (stat.size <= decision.baselineSize) {
             result.excludedGenerations += 1;
             result.excludedBytes += stat.size;
@@ -976,9 +1001,16 @@ export class TranscriptTailer {
           continue;
         }
       }
-      const cursor = loadJsonlScanCursor<TranscriptParserState>(
+      const storedCursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateTranscriptParserState,
       );
+      const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+      // A fenced automatic generation starts at its own byte boundary with
+      // fresh parser state. Other scans retain the old cursor as reset
+      // evidence; the JSONL reader will discard it on generation change.
+      const cursor = (observedBoundary?.changed && storedCursor?.fileIdentity !== identity) ||
+        (growthStart !== null && storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity)
+        ? undefined : storedCursor;
       let initialOffset: number | undefined;
       if (growthStart !== null) {
         if (cursor && (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart)) {
@@ -1048,6 +1080,7 @@ export class TranscriptTailer {
         let cursor = candidate.cursor;
         let countedFile = candidate.countedFile;
         let pausedWithWork = false;
+        const sightedSessions = new Set<string>();
         while (true) {
           if (options.signal?.aborted) {
             result.aborted = true;
@@ -1077,8 +1110,10 @@ export class TranscriptTailer {
                 const observation = baselineObservation(candidate.file, fresh);
                 const decision = classifyCaptureBaselineFile(this.buffer.database, "claude_code", observation,
                   {mode:"automatic", observedAt:scanNow.toISOString()});
-                return decision.decision === "capture" || decision.decision === "exclude" &&
-                  captureBaselinePostEnrollmentOffset(this.buffer.database, "claude_code", observation) !== null;
+                return decision.decision === "capture" || decision.decision === "exclude" && (
+                  captureBaselinePostEnrollmentOffset(this.buffer.database, "claude_code", observation) !== null ||
+                  carriedCaptureCursorMatches(this.buffer.database, "claude_code",
+                    jsonlScanStateKey(this.cursorKey(candidate.file)), observation));
               },
             });
             if (!next) {
@@ -1120,6 +1155,8 @@ export class TranscriptTailer {
           }
           const before = resultMutationSnapshot(result);
           const activeRootBefore = this.activeCaptureRoot;
+          const carriedBytesBefore = this.activeCarriedBytes;
+          const cutoverBefore = this.activeReplacementCutoverAt;
           let parseFailure = false;
           let committed = false;
           let validationDeferred = false;
@@ -1135,8 +1172,44 @@ export class TranscriptTailer {
               throw new Error("maintenance_progress_budget_exhausted");
             }
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
+            const carriedOffset = carriedCaptureCursorOffset(this.buffer.database, "claude_code",
+              jsonlScanStateKey(this.cursorKey(candidate.file)),
+              baselineObservation(candidate.file, candidate.stat));
+            this.activeCarriedBytes = carriedOffset !== null && !read.reset &&
+              cursor?.checkpointStatus === "valid" && cursor.committedOffset !== null &&
+              cursor.committedOffset >= carriedOffset && cursor.fileIdentity === read.fileIdentity;
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            if (read.continuation?.action !== "checkpoint") {
+              prepareJsonlCommittedPrefixHash(this.buffer.database,
+                candidate.file, this.cursorKey(candidate.file), cursor, read);
+              read.assertStableForCommit();
+            }
+            // Persist the first known-root session sighting before the raw,
+            // receipt and cursor transaction. A process kill cannot erase it.
+            if(this.activeCaptureRoot && (read.lines.length>0 || initialState.pending)) {
+              let sessionId=initialState.sessionId;
+              if(!sessionId) for(const line of read.lines) {
+                if(!line.includes('"assistant"')||!line.includes('"usage"')) continue;
+                try {
+                  const parsed=JSON.parse(line) as Record<string,unknown>;
+                  if(parsed.type==="assistant"&&typeof parsed.sessionId==="string") {
+                    sessionId=parsed.sessionId.match(UUID_RE)?.[0]?.toLowerCase();
+                    if(sessionId) break;
+                  }
+                } catch { /* The ordinary parser counts malformed records. */ }
+              }
+              if(sessionId&&!sightedSessions.has(sessionId)) {
+                recordClaudeRootSessionSighting(this.buffer,this.activeCaptureRoot,sessionId,fallbackObservedAt.observedAt);
+                sightedSessions.add(sessionId);
+              }
+            }
+            read.assertStableForCommit();
+            const readObservation = baselineObservation(candidate.file, this.regularFileStat(candidate.file));
+            if (`${readObservation.device}:${readObservation.inode}:${readObservation.birthtimeNs}` !==
+                read.fileIdentity) throw new Error("capture_generation_changed_before_commit");
+            const readBoundary = replacementCaptureBoundary(this.buffer.database, "claude_code", readObservation);
+            this.activeReplacementCutoverAt = readBoundary?.changed ? readBoundary.cutoverAt : null;
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();
@@ -1181,6 +1254,8 @@ export class TranscriptTailer {
               );
             });
             committed = true;
+            options.onCommittedSourceSpan?.(candidate.file, read.committedSourceSpan ?? null,
+              read.committedOffset);
             if (read.skippedRecord) {
               result.skippedRecords = (result.skippedRecords ?? 0) + 1;
               result.skippedBytes = (result.skippedBytes ?? 0) + read.skippedRecord.bytes;
@@ -1207,6 +1282,8 @@ export class TranscriptTailer {
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch {
             this.activeCaptureRoot = activeRootBefore;
+            this.activeCarriedBytes = carriedBytesBefore;
+            this.activeReplacementCutoverAt = cutoverBefore;
             const parseErrors = result.parseErrors - before.parseErrors;
             restoreResultMutationSnapshot(result, before);
             if (parseFailure) {
@@ -1665,9 +1742,16 @@ export class TranscriptTailer {
     // the fallback, and that rewrite is counted with the record-stamp clamp.
     const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
     const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
+    if (this.activeReplacementCutoverAt &&
+        (!entry.observedAt || !Number.isFinite(Date.parse(entry.observedAt)) ||
+         Date.parse(entry.observedAt) < Date.parse(this.activeReplacementCutoverAt))) {
+      result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
+      return;
+    }
     // Preserve the local revision counter above, but never synthesize a
     // managed event timestamp from mtime or from the time the file arrived.
-    if (this.buffer.eventAdmissionReason(clamped.observedAt, this.activeCaptureRoot?.installationEpochId)) {
+    if (this.buffer.eventAdmissionReason(clamped.observedAt, this.activeCaptureRoot?.installationEpochId,
+      this.activeCarriedBytes ? this.activeCaptureRoot?.installationEpochId : undefined)) {
       result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
       return;
     }
@@ -1681,7 +1765,7 @@ export class TranscriptTailer {
     });
     const metadata: Record<string, unknown> = { ...rootEventMetadata(this.activeCaptureRoot, previous
       ? deterministicEventId(["claude-transcript-revision", state.sessionId, entry.messageId, String(entry.input), String(entry.cacheRead), String(entry.cacheCreation), String(entry.output)])
-      : eventBaseId, observedAt, state.sessionId), usageSource: "transcript" };
+      : eventBaseId, observedAt, state.sessionId,true,this.activeDispatchSnapshot), usageSource: "transcript" };
     if (priced) {
       metadata.costEstimated = true;
       metadata.costKind = "estimated";
@@ -1723,7 +1807,7 @@ export class TranscriptTailer {
     if (repoContextId && !attachRepoContextId(event, repoContextId)) {
       throw new Error("transcript_repo_context_binding_failed");
     }
-    const inserted = appendRootObservation(this.buffer, event, this.activeCaptureRoot);
+    const inserted = appendRootObservation(this.buffer, event, this.activeCaptureRoot, this.activeCarriedBytes);
     if (inserted) {
       result.eventsAppended += 1;
       result.tokensAppended.input += delta.input;

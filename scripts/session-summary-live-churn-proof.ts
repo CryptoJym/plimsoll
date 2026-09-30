@@ -482,7 +482,7 @@ async function proveLineageAndErasure() {
     assert.ok(beforeSecond.result?.summaryComplete);
     const delivery = (buffer.database.prepare("select delivery_id as id from upload_outbox where raw_id = ?")
       .get(secondId) as { id: string }).id;
-    // The outbox's immutable lineage now disagrees with its raw row.
+    // The outbox's immutable lineage now belongs to a different incarnation.
     buffer.database.prepare("update buffered_events set id = ? where id = ?")
       .run(eventId(), secondId);
     assert.equal(dirty(buffer, session), "raw_update");
@@ -494,10 +494,12 @@ async function proveLineageAndErasure() {
     assert.deepEqual(excluded.snapshot, collectSessionSnapshots(buffer.database, {
       sessionIds: [session], until: excludedUntil,
     })[0]);
-    assert.equal(excluded.snapshot?.events, 1);
+    assert.equal(excluded.snapshot?.events, 2);
     const beforeDelete = revision(buffer, session);
+    const beforeDeleteControl = sessionSummaryCounters(buffer.database).mutationRevision;
     buffer.database.prepare("delete from upload_outbox where delivery_id = ?").run(delivery);
-    assert.ok(revision(buffer, session) > beforeDelete);
+    assert.equal(revision(buffer, session), beforeDelete);
+    assert.equal(sessionSummaryCounters(buffer.database).mutationRevision, beforeDeleteControl);
     const restoredUntil = new Date().toISOString();
     const restored = await updateSessionSummary(buffer.database, session, restoredUntil, {
       read: proofRead(buffer),
@@ -507,7 +509,7 @@ async function proveLineageAndErasure() {
       sessionIds: [session], until: restoredUntil,
     })[0]);
     assert.equal(restored.snapshot?.events, 2);
-    completion.check("mismatched_lineage_delete_restores_eligibility_exactly");
+    completion.check("mismatched_incarnation_never_changes_summary_eligibility");
 
     buffer.database.prepare("delete from buffered_events where id = ?").run(firstId);
     assert.equal(dirty(buffer, session), "raw_delete");

@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 
+export { deterministicEventId } from "./delivery-id";
+
 import {
   ANALYTICAL_METADATA_LIMITS,
   DEFAULT_POLICY,
@@ -279,20 +281,6 @@ export function isUuid(value: string | undefined) {
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     ),
   );
-}
-
-export function deterministicEventId(parts: Array<string | number | undefined>) {
-  const digest = crypto
-    .createHash("sha256")
-    .update(parts.map((part) => String(part ?? "")).join("|"))
-    .digest("hex");
-  return [
-    digest.slice(0, 8),
-    digest.slice(8, 12),
-    `5${digest.slice(13, 16)}`,
-    `9${digest.slice(17, 20)}`,
-    digest.slice(20, 32),
-  ].join("-");
 }
 
 export function unixNanoToIso(value: string | number) {

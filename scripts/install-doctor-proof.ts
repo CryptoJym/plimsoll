@@ -718,12 +718,27 @@ esac
   );
 
   let tokenSignal = false;
+  const cachedCutoff = "2026-07-01T00:00:00.000Z";
+  let retentionReading = {
+    inspection: "bounded",
+    policy: { retentionDays: config.retentionDays, cutoffAt: cachedCutoff },
+    states: {
+      retained: null, pendingDelivery: null, heldForUpload: 4,
+      quarantined: null, expired: 2, notInspected: 1,
+    },
+    lastPass: {
+      rowsVisited: 6, rowsExpired: 2, hasMore: false,
+      at: "2026-07-02T00:00:00.000Z", heldForUploadExact: true,
+      heldForUploadAsOfCutoff: cachedCutoff,
+    },
+  };
   server.removeAllListeners("request");
   server.on("request", (_request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       ok: true,
       runtimeIdentity,
+      retention: retentionReading,
       stats: { tokenAttributedEvents: tokenSignal ? 1 : 0 },
       health: {
         sources: [
@@ -743,6 +758,40 @@ esac
     { cwd: neutralCwd, env: fixtureEnv },
   );
   const coldReceipt = parseJson(coldDoctor.stdout);
+  check(
+    "doctor_preserves_exact_upload_hold_count_and_cutoff",
+    coldReceipt.retention?.states?.heldForUpload === 4 &&
+      coldReceipt.retention?.lastPass?.heldForUploadExact === true &&
+      coldReceipt.retention?.lastPass?.heldForUploadAsOfCutoff === cachedCutoff,
+    coldReceipt.retention,
+  );
+  retentionReading = {
+    ...retentionReading,
+    policy: { retentionDays: config.retentionDays, cutoffAt: "2026-07-01T00:00:01.000Z" },
+    lastPass: { ...retentionReading.lastPass, heldForUploadExact: false },
+  };
+  const cachedDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: fixtureEnv },
+  );
+  const cachedReceipt = parseJson(cachedDoctor.stdout);
+  check(
+    "doctor_preserves_cached_upload_hold_count_and_older_cutoff",
+    cachedReceipt.retention?.states?.heldForUpload === 4 &&
+      cachedReceipt.retention?.lastPass?.heldForUploadExact === false &&
+      cachedReceipt.retention?.lastPass?.heldForUploadAsOfCutoff === cachedCutoff &&
+      cachedReceipt.retention?.policy?.cutoffAt === "2026-07-01T00:00:01.000Z",
+    cachedReceipt.retention,
+  );
+  check(
+    "doctor_unreachable_retention_has_unknown_upload_hold_count",
+    configuredReceipt.retention?.inspection === "not_inspected" &&
+      configuredReceipt.retention?.states?.heldForUpload === null &&
+      configuredReceipt.retention?.lastPass?.heldForUploadExact === false &&
+      configuredReceipt.retention?.lastPass?.heldForUploadAsOfCutoff === null,
+    configuredReceipt.retention,
+  );
   check(
     "cold_service_is_not_signal_verified",
     coldDoctor.code !== 0 && coldReceipt.ok === false && coldReceipt.readiness === "service_ready",

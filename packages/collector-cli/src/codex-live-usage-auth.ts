@@ -134,7 +134,9 @@ export function currentLiveContext(buffer: LocalEventBuffer, config: CollectorCo
       captureRootDigest(root) !== binding.captureRootDigest ||
       !current?.currentInstallationEpochId || !current.currentDeviceId ||
       current.currentWorkspaceId !== config.tenantId || current.currentDeviceId !== config.deviceId ||
-      buffer.currentDeviceId !== current.currentDeviceId || buffer.eventAdmissionReason(binding.enrolledAt))
+      buffer.currentDeviceId !== current.currentDeviceId ||
+      buffer.eventAdmissionReason(binding.enrolledAt, binding.installationEpochId,
+        binding.installationEpochId))
     throw new HttpBoundaryRejection("source_not_allowed", 403);
   const adapterEnabled = accountAssertionAdapterEnabled(buffer.database, "codex");
   const explicitAssertion = Object.prototype.hasOwnProperty.call(options, "accountAssertion");
