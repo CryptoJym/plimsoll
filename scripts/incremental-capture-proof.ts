@@ -42,6 +42,7 @@ import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
 import { aiInteractionEventSchema, remoteLinkageHash } from "../packages/shared/src/index";
 import { installVirtualClock, restoreRealClock, spend } from "./lib/virtual-clock";
+import { proveChargedDiscoveryWiring } from "./charged-discovery-wiring-case";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-incremental-proof-"));
 const buffer = new LocalEventBuffer(path.join(tempDir, "proof.sqlite"));
@@ -1589,6 +1590,12 @@ async function main() {
     const resolvedTranscriptConflict = await proveResolvedTranscriptConflictIsTerminal();
     const nanosecondGenerationIdentity = proveNanosecondGenerationIdentity();
     const manyRootSweepConvergence = await proveManyRootSweepConvergence();
+    // The direct discovery unit above checks the bounded algorithm. This
+    // control also checks that both production tailers actually request that
+    // unit when a real maintenance cadence spends its shared wall.
+    const chargedDiscoveryWiring = await proveChargedDiscoveryWiring();
+    assert.equal(chargedDiscoveryWiring.passed, true,
+      `automatic discovery wiring under a spent wall: ${JSON.stringify(chargedDiscoveryWiring)}`);
 
     const persistedEvents = JSON.stringify(
       buffer.database.prepare(`select payload_json from buffered_events`).all(),
@@ -1651,6 +1658,7 @@ async function main() {
           resolvedTranscriptConflict,
           nanosecondGenerationIdentity,
           manyRootSweepConvergence,
+          chargedDiscoveryWiring,
           parseFailureDurability,
           privacy: {
             rawContentPersisted: false,

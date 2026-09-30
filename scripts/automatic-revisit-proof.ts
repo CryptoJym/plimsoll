@@ -16,7 +16,7 @@ import { DEFAULT_JSONL_TAILER_IO, jsonlScanStateKey, readJsonlTail } from "../pa
 import { rootCursorKey, type CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { maintenanceCandidateHash } from "../packages/collector-cli/src/maintenance-progress";
 import { runUncoveredCatchupCase } from "./uncovered-catchup-case";
-import { installVirtualClock, restoreRealClock } from "./lib/virtual-clock";
+import { installVirtualClock, restoreRealClock, spend } from "./lib/virtual-clock";
 
 type Visit = { cadence: number; offset: number; deferred: number; retained?: boolean };
 async function prove(source: CaptureRoot["source"]) {
@@ -63,13 +63,23 @@ async function prove(source: CaptureRoot["source"]) {
     buffer = new LocalEventBuffer(path.join(base, "ledger.sqlite"), bufferOptions); maintenance = make(); };
   const cadences: any[] = [];
   let watchedCandidateHash: string | null = null;
+  let chargeFairness = false;
   const run = async (phase: string) => {
-    let frames = 0, lastKey = "";
+    let frames = 0, lastKey = "", chargedDiscoveryWall = false;
     let sourceAdmission: { frames: number; remainingMs: number } | null = null;
     const candidateAdmissions: Array<{ stage: string; admitted: boolean }> = [];
     const result = await maintenance.runRecent({
       onDurableCommit: () => frames < 120 ? (++frames, true) : false,
       onProgress: p => {
+        // Spend the shared wall at the first real discovery step in each
+        // fairness cadence. The callback is inside maintenance/tailer I/O,
+        // so this exercises the automatic production request for a bounded
+        // directory quantum after admission instead of a frozen-clock walk.
+        if (phase === "fairness" && chargeFairness && !chargedDiscoveryWall &&
+            ["discovery_directory", "discovery_read", "candidate_metadata"].includes(p.stage)) {
+          spend(201);
+          chargedDiscoveryWall = true;
+        }
         if (p.stage === "source_scan" && p.source === source) {
           const budget = maintenance.status().budget!;
           sourceAdmission = { frames, remainingMs: budget.maxWallMs - budget.elapsedWallMs };
@@ -95,7 +105,7 @@ async function prove(source: CaptureRoot["source"]) {
     assert(pending.every(p => p.length <= 64));
     assert(budget.bytesRead <= 524288 && budget.recordsParsed <= 512 && budget.eventsAppended <= 512);
     assert(budget.maxWallMs === 200);
-    cadences.push({ phase, frames, sourceAdmission, candidateAdmissions, pending, codex: summary(result.rollout),
+    cadences.push({ phase, frames, chargedDiscoveryWall, sourceAdmission, candidateAdmissions, pending, codex: summary(result.rollout),
       claude: summary(result.transcript), budget });
     return source === "codex" ? result.rollout : result.transcript;
   };
@@ -107,10 +117,10 @@ async function prove(source: CaptureRoot["source"]) {
   const continuation = (file: string) => buffer.database.prepare('select envelope_json from jsonl_continuations where provider=? and file_key=?')
     .get(source === 'codex' ? 'codex' : 'claude', createHash('sha256').update(file).digest('hex')) as { envelope_json: string } | undefined;
   try {
-    // This fixture measures bounded work and cadence progress. Pin the
-    // collector's monotonic admission clock for every phase, so host CPU
-    // contention cannot change how many real filesystem/SQLite units fit in
-    // a cadence. Date.now() and file timestamps remain real.
+    // Use an explicit monotonic fixture clock so CPU contention cannot decide
+    // admission. The fairness phase charges a full wall through the real
+    // maintenance/tailer discovery path; other phases keep their existing
+    // deterministic work ceilings. Date.now() and file timestamps stay real.
     installVirtualClock();
     for (let turn = 0; turn < 64 && captureBaselineStatus(buffer.database).status !== "complete"; turn++) await run("baseline");
     check("both real filesystem baselines complete", captureBaselineStatus(buffer.database).status === "complete");
@@ -213,26 +223,34 @@ async function prove(source: CaptureRoot["source"]) {
     restart(); // Start a fresh real sweep at the first root, retaining durable truth.
     let discoverySentinel = "";
     let hotServices = 0, hotRetiredAfter = 0;
-    let sentinelCadences = 0;
+    let sentinelCadences = 0, chargedFairnessCadences = 0;
     let discoveryWhileHot = false;
     for (let turn = 0; turn < 80; turn++) {
       const hotBefore = cursor(hot)?.committed_offset ?? 0;
       await run("fairness");
+      if (cadences.at(-1).chargedDiscoveryWall) chargedFairnessCadences++;
       if ((cursor(hot)?.committed_offset ?? 0) > hotBefore) hotServices++;
       const hotPending = cadences.at(-1).pending.flat().some((p: any) => p.file === path.relative(base, hot));
       if (!hotRetiredAfter && hotServices > 0 && !hotPending && cursor(hot)?.deferred_bytes > 0) hotRetiredAfter = hotServices;
       if (cursor(hot)?.committed_offset > 0 && !discoverySentinel) {
         discoverySentinel = fileAt(providerRoots.at(-1)!, "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
         fs.writeFileSync(discoverySentinel, encode([...prefix("dddddddd-dddd-4ddd-8ddd-dddddddddddd"), usage(1, "dddddddd-dddd-4ddd-8ddd-dddddddddddd")]));
+        // Warm the hot snapshot through one ordinary cadence, then spend the
+        // wall on every subsequent discovery step while the new file waits.
+        chargeFairness = true;
       }
       if (discoverySentinel) {
         sentinelCadences++;
         discoveryWhileHot ||= cursor(discoverySentinel)?.deferred_bytes === 0 && cursor(hot)?.deferred_bytes > 0;
       }
+      if (sentinelCadences > 32 && !discoveryWhileHot) break;
       if (discoveryWhileHot && hotRetiredAfter > 0) break;
     }
     check("new-file discovery progresses despite a hot partial snapshot", Boolean(discoverySentinel) &&
       discoveryWhileHot && sentinelCadences <= 32);
+    check("discovery fixture spends the shared wall through maintenance", chargedFairnessCadences > 0 &&
+      cadences.some(c => c.phase === "fairness" && c.chargedDiscoveryWall &&
+        c.budget.elapsedWallMs >= 201 && c.budget.exhaustedBy === "wall"));
 
     check("hot snapshot releases its slot within five serviced cadences", hotRetiredAfter > 0 && hotRetiredAfter <= 5);
     fs.appendFileSync(hot, encode([usage(401, hotId, 8192)]));
@@ -264,7 +282,7 @@ async function prove(source: CaptureRoot["source"]) {
     fresh.assertStableForCommit(); fresh.close();
     check("fresh precise metadata retries same physical generation", Boolean(fresh));
     return { source, roots: 20, historicalFiles: 248, baselineCadences, checks, visits, growthVisits, partialAppends, appendRevisits,
-      sentinelCadences, discoveryWhileHot, giantCadences, hotRetiredAfter, privateReadAttempts, maxSliceRecords, finalCursor: cursor(target), cadences, passed: checks.every(c => c.passed) };
+      sentinelCadences, discoveryWhileHot, chargedFairnessCadences, giantCadences, hotRetiredAfter, privateReadAttempts, maxSliceRecords, finalCursor: cursor(target), cadences, passed: checks.every(c => c.passed) };
   } finally { restoreRealClock(); maintenance.close(); buffer.close(); fs.rmSync(base, { recursive: true, force: true }); }
 }
 async function main() {
