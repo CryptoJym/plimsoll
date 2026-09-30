@@ -1,3 +1,4 @@
+import { openLedgerDatabase } from "./ledger-connection";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -180,7 +181,7 @@ export function repoLabelToExternalId(label: string): string | null {
 
 function openReadonlyDatabase(filePath: string): Database.Database | null {
   if (!fs.existsSync(filePath)) return null;
-  return new Database(filePath, { readonly: true, fileMustExist: true });
+  return openLedgerDatabase(filePath, { readonly: true, fileMustExist: true });
 }
 
 function isoWeekId(isoTimestamp: string): string {

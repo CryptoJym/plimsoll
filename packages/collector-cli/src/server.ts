@@ -1302,6 +1302,7 @@ export function createCollectorServer(
         states: {
           retained: null,
           pendingDelivery: null,
+          heldForUpload: null,
           quarantined: null,
           expired: null,
           notInspected: 1,
@@ -1378,6 +1379,7 @@ export function createCollectorServer(
       return false;
     }
   };
+  const stopRetentionHoldRefresh = buffer.onRetentionHoldCountChanged(() => { refreshStatus(); });
   refreshStatus();
   options.registerStatusRefresher?.(refreshStatus);
 
@@ -1501,6 +1503,7 @@ export function createCollectorServer(
               states: {
                 retained: null,
                 pendingDelivery: null,
+                heldForUpload: null,
                 quarantined: null,
                 expired: null,
                 notInspected: 1,
@@ -2263,6 +2266,7 @@ export function createCollectorServer(
   // cost is negligible, and a connection that carries one request cannot be
   // reaped mid-request.
   httpServer.keepAliveTimeout = 0;
+  httpServer.once("close", stopRetentionHoldRefresh);
   const server = httpServer as CollectorServer;
   server.plimsollInstanceId = instanceId;
   // For the status summary writer in this process only.

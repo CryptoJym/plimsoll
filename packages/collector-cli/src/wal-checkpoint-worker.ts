@@ -1,3 +1,4 @@
+import { ledgerConnectionWorkerSource } from "./ledger-connection";
 import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 
@@ -69,7 +70,8 @@ const workerSource = `
   const fs = require('node:fs');
   const { parentPort, workerData } = require('node:worker_threads');
   const Database = require(workerData.sqliteModule);
-  const db = new Database(workerData.ledgerPath, { fileMustExist: true, timeout: 0 });
+  ${ledgerConnectionWorkerSource}
+  const db = openLedgerDatabase(workerData.ledgerPath, { fileMustExist: true, timeout: 0 });
   const walBytes = () => { try { return fs.statSync(workerData.ledgerPath + '-wal').size; } catch { return 0; } };
   const checkpoint = (mode) => db.pragma('wal_checkpoint(' + mode + ')')[0] ?? null;
   parentPort.on('message', () => {

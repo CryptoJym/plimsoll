@@ -1,3 +1,4 @@
+import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
 import fs from "node:fs";
 
@@ -11,7 +12,8 @@ import {
   collectorBufferPath,
   collectorLogPath,
 } from "./config";
-import { deterministicEventId } from "./normalizer";
+import { deterministicEventId, ensureUuidEventId } from "./delivery-id";
+export { ensureUuidEventId, POSTGRES_UUID_RE } from "./delivery-id";
 import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -50,26 +52,31 @@ import {
  *   summed over events that carry a real costUsd.
  */
 
-/**
- * Postgres accepts any RFC-shaped hex UUID for a uuid column regardless of
- * version bits, and the daemon uploads ledger ids verbatim — so passthrough
- * must accept exactly what Postgres accepts. Re-deriving an id the daemon
- * could upload as-is would split one ledger row into two cloud rows.
- */
-const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Stable alternate namespace for a legacy ID whose default UUID is already owned. */
+export function collisionSafeDeliveryId(rawId: string, attempt: number): string {
+  return attempt === 0 ? ensureUuidEventId(rawId).id :
+    ensureUuidEventId(`workspace-backfill-collision|${rawId}|${attempt}`).id;
+}
 
-/**
- * Deterministic UUID for ledger ids the cloud's uuid column would reject
- * (e.g. pre-normalizer hook ids). Same ledger id → same UUID on every run, so
- * the cloud ingest dedupes re-sends; the raw local id is never exported.
- * Reuses the repo's deterministicEventId (sha256 → version-5/variant-9 shape)
- * with a fixed namespace part.
- */
-export function ensureUuidEventId(rawId: string): { id: string; derived: boolean } {
-  if (POSTGRES_UUID_RE.test(rawId)) {
-    return { id: rawId, derived: false };
+/** A reused caller ID gets a namespace tied to its raw incarnation. */
+export function incarnationDeliveryId(rawId: string, createdAt: string,
+  generation: string | null, attempt = 0): string {
+  return deterministicEventId(["collector-raw-incarnation-v1",
+    JSON.stringify([rawId, createdAt, generation, attempt])]);
+}
+
+export function isCollisionSafeDeliveryId(rawId: string, deliveryId: string,
+  createdAt?: string, generation?: string | null): boolean {
+  if (ensureUuidEventId(rawId).id === deliveryId) return true;
+  for (let attempt = 1; attempt < 32; attempt++) {
+    if (collisionSafeDeliveryId(rawId, attempt) === deliveryId) return true;
   }
-  return { id: deterministicEventId(["workspace-backfill", rawId]), derived: true };
+  if (createdAt !== undefined && generation !== undefined) {
+    for (let attempt = 0; attempt < 32; attempt++) {
+      if (incarnationDeliveryId(rawId, createdAt, generation, attempt) === deliveryId) return true;
+    }
+  }
+  return false;
 }
 
 export type LedgerHistoryRow = {
@@ -714,7 +721,7 @@ export async function runWorkspaceHistoryUpload(
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
   let ledger: Database.Database;
   try {
-    ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
   } catch (error) {
     throw new Error(
       `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — nothing to backfill.`,
@@ -1197,7 +1204,7 @@ export async function runAttributionRepair(
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
   let ledger: Database.Database;
   try {
-    ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
   } catch (error) {
     throw new Error(
       `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — nothing to repair.`,

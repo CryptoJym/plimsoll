@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { openLedgerDatabase } from "./ledger-connection";
 import { AutomaticRetentionCadence } from "./retention-cadence";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
-import { openRebuildFencedDatabase } from "./rebuild-open-gate";
+import { openRebuildFencedLedgerDatabase } from "./rebuild-open-gate";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -52,6 +53,8 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
+import { planFreshLedgerCutover, switchFreshLedger,
+  restoreArchivedLedger, assertReplacementRuntimeCompatible, recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
@@ -422,6 +425,12 @@ Commands:
   capture-roots discover [--json]
                         List native capture roots under $HOME with their state
                         (registered | candidate | found_not_recorded | missing); read-only
+  capture-roots epoch-plan [--archive ABSOLUTE-PATH] [--sizes] [--json]
+                        Inspect epoch, cursor, weekly and live cutover state; read-only
+  capture-roots epoch-switch --archive ABSOLUTE-PATH
+                        Hold the old ledger exclusively, archive it and bind a replacement
+  capture-roots epoch-restore --archive ABSOLUTE-PATH --save-fresh ABSOLUTE-PATH
+                        Restore the archive before any older runtime is selected
   capture-roots add --source codex|claude_code --directory DIR [--directory DIR]
                         [--machine LABEL] [--allow-scan-errors] [--dry-run] [--json]
                         Append a newly discovered capture root: derives the
@@ -668,9 +677,15 @@ function openBuffer(
     seed: { deviceId: config.deviceId, keyId: config.keyId },
   });
   recordDeviceSeen();
+  const rootEpochs = new Set((config.captureRoots ?? []).map((root) => root.installationEpochId));
   return new LocalEventBuffer(diagnostics.databasePath ?? collectorBufferPath(), {
     workspaceId: config.tenantId,
     deviceId: identity.deviceId,
+    // A replacement ledger has no cursor or events to relabel. Preserve the
+    // installation identity already stamped on its configured capture roots;
+    // existing ledgers keep their own binding, even if config is stale.
+    freshCaptureRootEpoch: rootEpochs.size === 0 ? undefined :
+      rootEpochs.size === 1 ? [...rootEpochs][0] : null,
     delivery: {
       enabled: Boolean(config.uploadUrl) || deliveryOverride,
       limits: config.delivery,
@@ -2147,6 +2162,10 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
               : Number((retentionStates as Record<string, unknown>).retained),
             pendingDelivery: (retentionStates as Record<string, unknown>).pendingDelivery === null ? null
               : Number((retentionStates as Record<string, unknown>).pendingDelivery),
+            heldForUpload: Number.isSafeInteger((retentionStates as Record<string, unknown>).heldForUpload) &&
+              Number((retentionStates as Record<string, unknown>).heldForUpload) >= 0
+                ? Number((retentionStates as Record<string, unknown>).heldForUpload)
+                : null,
             quarantined: (retentionStates as Record<string, unknown>).quarantined === null ? null
               : Number((retentionStates as Record<string, unknown>).quarantined),
             expired: Number((retentionStates as Record<string, unknown>).expired),
@@ -2159,6 +2178,11 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
             at: typeof (retentionLastPass as Record<string, unknown>).at === "string"
               ? (retentionLastPass as Record<string, unknown>).at as string
               : null,
+            heldForUploadExact: (retentionLastPass as Record<string, unknown>).heldForUploadExact === true,
+            heldForUploadAsOfCutoff:
+              typeof (retentionLastPass as Record<string, unknown>).heldForUploadAsOfCutoff === "string"
+                ? (retentionLastPass as Record<string, unknown>).heldForUploadAsOfCutoff as string
+                : null,
           },
         }
       : null;
@@ -2831,7 +2855,7 @@ function readInstallationEpochId(roots: readonly CaptureRoot[]): string | null {
   const bufferPath = collectorBufferPath();
   if (fs.existsSync(bufferPath)) {
     try {
-      const database = new Database(bufferPath, { readonly: true, fileMustExist: true });
+      const database = openLedgerDatabase(bufferPath, { readonly: true, fileMustExist: true });
       try {
         const row = database
           .prepare("select current_installation_epoch_id as epoch from collector_workspace_binding where singleton = 1")
@@ -2876,7 +2900,7 @@ async function main() {
     // the copy so openBuffer takes the same bound-ledger path as the daemon.
     // This read-only probe is outside the measured open and never touches the
     // source host's config or identity files.
-    const bindingDatabase = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    const bindingDatabase = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
     let rehearsalBinding: { workspaceId: string; deviceId: string | null } | undefined;
     try {
       const hasBindingTable = bindingDatabase.prepare(
@@ -3001,7 +3025,7 @@ async function main() {
       process.exitCode = 64;
       return;
     }
-    const database = openRebuildFencedDatabase(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
+    const database = openRebuildFencedLedgerDatabase(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
     try {
       database.pragma(`busy_timeout = ${Math.max(1, timeoutMs - 250)}`);
       const rows = database.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
@@ -3296,7 +3320,7 @@ async function main() {
     try {
       if (accountAssertionMutation.yes) {
         ensureCollectorHome();
-        database = openRebuildFencedDatabase(databasePath, { timeout: 5_000 });
+        database = openRebuildFencedLedgerDatabase(databasePath, { timeout: 5_000 });
         const state = setAccountAssertionAdapterEnabled(database, accountAssertionMutation.source, accountAssertionMutation.enabled);
         console.log(JSON.stringify({
           status: "account_assertion_adapter_updated",
@@ -3305,7 +3329,7 @@ async function main() {
           stateKey: "account_assertion_adapters_v1",
         }, null, 2));
       } else if (fs.existsSync(databasePath)) {
-        database = new Database(databasePath, { readonly: true, timeout: 5_000 });
+        database = openLedgerDatabase(databasePath, { readonly: true, timeout: 5_000 });
         const hasState = Boolean(database.prepare("select 1 from sqlite_master where type='table' and name='maintenance_state'").get());
         const state = hasState ? readAccountAssertionAdapterState(database) : null;
         console.log(JSON.stringify({
@@ -4734,7 +4758,7 @@ async function main() {
           unavailable: ["ledger_missing"] }, null, 2));
         return;
       }
-      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      const ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
       try {
         console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
           : JSON.stringify({ ...budgetStatus(ledger), daily: budgetDailyRows(ledger) }, null, 2));
@@ -6277,11 +6301,19 @@ async function main() {
             states: {
               retained: null,
               pendingDelivery: null,
+              heldForUpload: null,
               quarantined: null,
               expired: null,
               notInspected: 1,
             },
-            lastPass: null,
+            lastPass: {
+              rowsVisited: null,
+              rowsExpired: null,
+              hasMore: null,
+              at: null,
+              heldForUploadExact: false,
+              heldForUploadAsOfCutoff: null,
+            },
           },
           enrollment: {
             futureOnlyEnrollment: true,
@@ -6310,7 +6342,8 @@ async function main() {
     return;
   }
 
-  // Append-only registration of a native capture root a host gained after
+  // Read-only fresh-ledger epoch preflight, or append-only registration of a
+  // native capture root a host gained after
   // enrollment (bead eco-6hoxj.53). Enrollment mints roots; nothing until now
   // registered one that appeared later, so a new Claude seat, a new Codex
   // profile, or a `~/.claude/projects` an older enrollment skipped stayed
@@ -6319,8 +6352,8 @@ async function main() {
   // change an existing root, epoch or enrollment field.
   if (command === "capture-roots") {
     const action = process.argv[3] ?? "";
-    if (!["discover", "add"].includes(action)) {
-      throw new Error("Expected capture-roots discover|add");
+    if (!["discover", "epoch-plan", "epoch-switch", "epoch-restore", "add"].includes(action)) {
+      throw new Error("Expected capture-roots discover|epoch-plan|epoch-switch|epoch-restore|add");
     }
     const home = os.homedir();
     const configuredRoots = configRead?.status === "valid" ? config.captureRoots ?? [] : [];
@@ -6328,6 +6361,77 @@ async function main() {
       console.log(JSON.stringify({ status: "capture_roots_add_refused", reason, ...detail }, null, 2));
       process.exitCode = 1;
     };
+
+    if (action === "epoch-restore") {
+      const archivePath = optionValue("--archive");
+      const freshAttemptPath = optionValue("--save-fresh");
+      if (!archivePath || !freshAttemptPath) {
+        refuse("archive_and_save_fresh_paths_required");
+        return;
+      }
+      try {
+        const receipt = restoreArchivedLedger({ ledgerPath: collectorBufferPath(),
+          archivePath, freshAttemptPath, authorityRoot: defaultLifecycleAuthorityRoot() });
+        console.log(JSON.stringify({ status: "capture_roots_epoch_restored", ...receipt }, null, 2));
+      } catch (error) {
+        refuse(error instanceof Error ? error.message : "restore_failed");
+      }
+      return;
+    }
+
+    if (action === "epoch-plan" || action === "epoch-switch") {
+      const archivePath = optionValue("--archive");
+      const sizesOnly = action === "epoch-plan" && process.argv.includes("--sizes");
+      if (sizesOnly && !archivePath) {
+        refuse("archive_path_required_for_sizes");
+        return;
+      }
+      if (action === "epoch-switch" && !archivePath) {
+        refuse("archive_path_required");
+        return;
+      }
+      if (archivePath) {
+        if (configRead?.status !== "valid" || config.installKey === "local-dev" || !config.deviceId) {
+          refuse(configRead?.status !== "valid" ? "config_not_valid" : "joined_identity_required");
+          return;
+        }
+        const input = { ledgerPath: collectorBufferPath(), archivePath, config,
+          authorityRoot: defaultLifecycleAuthorityRoot() };
+        const plan = planFreshLedgerCutover(input);
+        if (action === "epoch-plan" || plan.status !== "ready") {
+          console.log(JSON.stringify({ ...plan, sizesOnly, status: plan.status === "ready"
+            ? "capture_roots_epoch_plan" : "capture_roots_epoch_plan_refused" }, null, 2));
+          if (plan.status !== "ready") process.exitCode = 1;
+          return;
+        }
+        try {
+          const switched = switchFreshLedger(input);
+          console.log(JSON.stringify({ ...switched, status: "capture_roots_epoch_switched",
+            readOnly: false }, null, 2));
+        } catch (error) {
+          refuse(error instanceof Error ? error.message : "cutover_failed");
+        }
+        return;
+      }
+      const ledgerPath = collectorBufferPath();
+      const epochs = new Set(configuredRoots.map((root) => root.installationEpochId));
+      const reason = configRead?.status !== "valid" ? "config_not_valid"
+        : config.installKey === "local-dev" || !config.deviceId ? "joined_identity_required"
+          : configuredRoots.length === 0 ? "capture_roots_required"
+            : epochs.size !== 1 ? "capture_root_epochs_conflict"
+              : [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`].some((file) => fs.existsSync(file))
+                ? "ledger_not_archived" : null;
+      if (reason) {
+        console.log(JSON.stringify({ status: "capture_roots_epoch_plan_refused", reason,
+          rootCount: configuredRoots.length }, null, 2));
+        process.exitCode = 1;
+      } else {
+        console.log(JSON.stringify({ status: "capture_roots_epoch_plan", readOnly: true,
+          rootCount: configuredRoots.length, installationEpochId: [...epochs][0],
+          ledgerAbsent: true }, null, 2));
+      }
+      return;
+    }
 
     if (action === "discover") {
       const entries = discoverCaptureRoots(home, configuredRoots, config.port);
@@ -6978,7 +7082,7 @@ async function main() {
           mode: "advisory", startedDay: null, samples: [], daily: [] }, null, 2));
         return;
       }
-      const ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+      const ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
       try {
         console.log(flag("--csv") ? budgetCsv(ledger).trimEnd()
           : JSON.stringify(budgetExport(ledger), null, 2));
@@ -7530,8 +7634,8 @@ async function main() {
           "pairing index upgrade requires every other ledger connection to be stopped");
       }
       const database = apply
-        ? openRebuildFencedDatabase(ledgerPath, { fileMustExist: true, timeout: 0 })
-        : new Database(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
+        ? openRebuildFencedLedgerDatabase(ledgerPath, { fileMustExist: true, timeout: 0 })
+        : openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true, timeout: 0 });
       try {
         const before = codexUsagePairingStatus(database);
         if (!apply) {
@@ -7602,6 +7706,8 @@ async function main() {
         argv: [action, ...process.argv.slice(4)],
         adapter: composeLifecycleAdapter({ keepAll }),
         resolveArtifact,
+        beforeRuntimeSwitch: artifact =>
+          assertReplacementRuntimeCompatible(collectorBufferPath(), artifact.version),
         ...(action === "update" ? { pairingIndexes: buildPairingIndexesAfterUpdate } : {}),
         ...(optionValue("--readiness-timeout-ms") !== undefined && Number.isFinite(readinessTimeoutOption)
           ? { readinessTimeoutMs: readinessTimeoutOption }
@@ -7859,7 +7965,7 @@ async function main() {
       if (listener.kind !== "absent") throw new Error(`purge_requires_closed_listener:${listener.kind}`);
       if (fs.existsSync(ledgerPath)) {
         if (!fs.lstatSync(ledgerPath).isFile()) throw new Error("purge_ledger_not_regular_file");
-        const ledger = openRebuildFencedDatabase(ledgerPath, { fileMustExist: true, timeout: 0 });
+        const ledger = openRebuildFencedLedgerDatabase(ledgerPath, { fileMustExist: true, timeout: 0 });
         try {
           const checkpoint = ledger.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
           if (checkpoint[0]?.busy !== 0) throw new Error("purge_wal_checkpoint_busy");
@@ -8264,6 +8370,14 @@ async function main() {
 }
 
 main().catch((error) => {
+  if (error?.code === "LEDGER_PUBLICATION_INVALID" && typeof error.ledgerPath === "string") {
+    try {
+      recoverInvalidLedgerPublication(error.ledgerPath);
+      console.error("replacement_verification_failed; archive restored; command refused");
+    } catch (recoveryError) { console.error(recoveryError); }
+    process.exitCode = 1;
+    return;
+  }
   console.error(error);
   process.exitCode = 1;
 });

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { openLedgerDatabase, openLedgerCopyDatabase } from "./ledger-connection";
 import { processIdentityIsLive, UTC_PROCESS_START_ALGORITHM } from "./runtime-ownership";
 import { currentRebuildWriterIdentity, rebuildWriterIdentityLiveness } from "./rebuild-writer-identity";
 
@@ -199,6 +200,42 @@ export function openRebuildFencedDatabase(ledgerPath: string, options?: Database
   let db: Database.Database | null = null;
   try {
     db = new Database(ledgerPath, options);
+    const close = db.close.bind(db);
+    Object.defineProperty(db, "close", { value: () => {
+      try { close(); } finally { releaseRebuildOpenToken(token); }
+    } });
+    return db;
+  } catch (error) {
+    try { db?.close(); } finally { releaseRebuildOpenToken(token); }
+    throw error;
+  }
+}
+
+/** Hold the rebuild opener token for the entire connection while the fresh
+ * ledger's publication and inode barriers are enforced by its own opener. */
+export function openRebuildFencedLedgerDatabase(ledgerPath: string,
+  options?: Database.Options, intentionalRename = false) {
+  const token = acquireRebuildOpenToken(ledgerPath);
+  let db: Database.Database | null = null;
+  try {
+    db = openLedgerDatabase(ledgerPath, options, intentionalRename);
+    const close = db.close.bind(db);
+    Object.defineProperty(db, "close", { value: () => {
+      try { close(); } finally { releaseRebuildOpenToken(token); }
+    } });
+    return db;
+  } catch (error) {
+    try { db?.close(); } finally { releaseRebuildOpenToken(token); }
+    throw error;
+  }
+}
+
+export function openRebuildFencedLedgerCopyDatabase(file: string, ledgerPath: string,
+  options?: Database.Options) {
+  const token = acquireRebuildOpenToken(file);
+  let db: Database.Database | null = null;
+  try {
+    db = openLedgerCopyDatabase(file, ledgerPath, options);
     const close = db.close.bind(db);
     Object.defineProperty(db, "close", { value: () => {
       try { close(); } finally { releaseRebuildOpenToken(token); }

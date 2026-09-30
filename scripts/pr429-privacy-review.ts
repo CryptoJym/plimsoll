@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 /** Reviewer privacy challenge for bound Claude hook and OTLP upload envelopes. */
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -20,7 +21,7 @@ const binding = dispatchBindingSchema.parse({ sessionId,
   parentAttemptId: null, acceptedOutcomeId: null,
   validFrom: new Date(now - 120_000).toISOString(), validUntil: null,
   evidenceRef: "dispatch:synthetic-privacy" });
-const root = { rootId: "claude-a", profileId: "claude-a", installationEpochId: "epoch-a",
+const root = { rootId: "claude-a", profileId: "claude-a", installationEpochId: fixtureEpochId("epoch-a"),
   source: "claude_code" as const, directory: path.join(home, ".claude", "projects"), dispatch: [binding] };
 fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });
 fs.mkdirSync(plimsoll, { recursive: true, mode: 0o700 });

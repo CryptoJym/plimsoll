@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 /** PR #429 review fixtures and a deterministic bound on the dispatch hot path. */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -77,7 +78,7 @@ const binding = dispatchBindingSchema.parse({
   evidenceRef: "dispatch:synthetic-hot-path",
 });
 const roots = Array.from({ length: 23 }, (_, index) => ({
-  rootId: `root-${index}`, profileId: `profile-${index}`, installationEpochId: `epoch-${index}`,
+  rootId: `root-${index}`, profileId: `profile-${index}`, installationEpochId: fixtureEpochId(`epoch-${index}`),
   source: "claude_code" as const,
   directory: path.join(home, ".claude-seats", `seat-${index}`, "projects"),
   dispatch: Array.from({ length: 1000 }, (_, offset) => ({ ...binding,

@@ -1270,7 +1270,9 @@ export class DashboardProjectionStore {
           and (parity_ready!=0 or dirty!=1 or degraded_reason is null)`).run();
     }).immediate();
 
-    const deletedPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "old");
+    // Persisted triggers run on SQLite connections without the delivery-ID UDF.
+    const deletedPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "old",
+      { includeUnboundLegacyReceipts: false });
     const hasRetentionReceipts = Boolean(this.db.prepare(
       `select 1 from sqlite_master where type='table' and name='raw_retention_receipts'`,
     ).get());

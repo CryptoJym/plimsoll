@@ -297,6 +297,9 @@ async function uploadStateless(
   const candidateItems = batch.events.map((envelope) => ({
     deliveryId: envelope.event.id,
     rawRowid: null,
+    rawId: null,
+    rawCreatedAt: null,
+    rawGeneration: null,
     envelope,
     envelopeJson: JSON.stringify(envelope),
     attemptCount: 0,
