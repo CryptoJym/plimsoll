@@ -106,6 +106,7 @@ async function main() {
     assert.equal(rows(buffer).filter(row => row.eventType === "usage_rollout").at(-1)?.metadata["user.account_id"], providerAccountKey(secondId),
       "a changed auth file is observed even when its mtime is unchanged");
     writeAuth(secondId, 1_000_100);
+    await tailer.scan(scanAt("09:22:50"));
     fs.appendFileSync(rollout, counts("2026-09-29T09:23:00.000Z", 40, 32.6, reset, false));
     await tailer.scan(scanAt("09:23:05"));
     all = rows(buffer);

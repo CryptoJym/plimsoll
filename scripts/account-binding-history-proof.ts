@@ -65,6 +65,8 @@ const rows = (buffer: LocalEventBuffer) =>
 const first = "019e9999-1111-7222-8333-444444444444";
 const second = "019e9999-1111-7222-8333-555555555555";
 const imported = "019e9999-1111-7222-8333-666666666666";
+const stamped = "019e9999-1111-7222-8333-777777777777";
+const gap = "019e9999-1111-7222-8333-888888888888";
 
 async function main() {
 let buffer: LocalEventBuffer | undefined;
@@ -74,6 +76,15 @@ try {
   writeAccounts(0, "08:00");
   buffer = new LocalEventBuffer(ledger);
   await scanAt("08:10", buffer); // first observed continuous window for account A
+  rollout(stamped, "08:30", 10);
+  transcript(stamped, "019eaaaa-2222-7333-8444-888888888888", "08:30");
+  await scanAt("08:40", buffer);
+  const confirmed = rows(buffer).filter(row => row.sessionId === stamped);
+  assert.ok(confirmed.some(row => row.eventType === "plan_limit_observation"));
+  assert.ok(confirmed.filter(row => row.source === "codex").every(row =>
+    row.metadata["user.account_id"] === providerAccountKey(codexIds[0]!)));
+  assert.ok(confirmed.filter(row => row.source === "claude_code").every(row =>
+    row.metadata["user.account_uuid"] === providerAccountKey(claudeIds[0]!)));
 
   rollout(first, "09:00", 20);
   transcript(first, "019eaaaa-2222-7333-8444-555555555555", "09:00");
@@ -84,10 +95,9 @@ try {
   assert.ok(old.some(row => row.eventType === "usage_rollout"));
   assert.ok(old.some(row => row.eventType === "usage_transcript"));
   assert.ok(old.some(row => row.eventType === "plan_limit_observation"));
-  assert.ok(old.filter(row => row.source === "codex").every(row =>
-    row.metadata["user.account_id"] === providerAccountKey(codexIds[0]!)));
-  assert.ok(old.filter(row => row.source === "claude_code").every(row =>
-    row.metadata["user.account_uuid"] === providerAccountKey(claudeIds[0]!)));
+  assert.ok(old.every(row => row.metadata["user.account_id"] === undefined &&
+    row.metadata["user.account_uuid"] === undefined));
+  assert.deepEqual(all.filter(row => row.sessionId === stamped), confirmed);
 
   rollout(second, "10:10", 40);
   transcript(second, "019eaaaa-2222-7333-8444-666666666666", "10:10");
@@ -99,19 +109,31 @@ try {
   assert.ok(newer.filter(row => row.source === "claude_code").every(row =>
     row.metadata["user.account_uuid"] === providerAccountKey(claudeIds[1]!)));
 
-  const beforeReplay = JSON.stringify(all.filter(row => row.sessionId === first));
+  // An account can switch away and back between scans. Its final key may be
+  // unchanged, but a changed auth-file signature makes the gap unprovable.
+  writeAccounts(0, "10:30");
+  rollout(gap, "10:32", 60);
+  transcript(gap, "019eaaaa-2222-7333-8444-999999999999", "10:32");
+  writeAccounts(1, "10:35");
+  await scanAt("10:40", buffer);
+  all = rows(buffer);
+  const gapRows = all.filter(row => row.sessionId === gap);
+  assert.ok(gapRows.some(row => row.eventType === "plan_limit_observation"));
+  assert.ok(gapRows.every(row => row.metadata["user.account_id"] === undefined &&
+    row.metadata["user.account_uuid"] === undefined));
+
+  const beforeReplay = JSON.stringify(all.filter(row => [stamped, first, second, gap].includes(row.sessionId)));
   const rowCount = all.length;
   buffer.database.prepare("delete from rollout_scan_state").run();
-  await scanAt("10:30", buffer);
+  await scanAt("10:50", buffer);
   all = rows(buffer);
   assert.equal(all.length, rowCount);
-  assert.equal(JSON.stringify(all.filter(row => row.sessionId === first)), beforeReplay);
+  assert.equal(JSON.stringify(all.filter(row => [stamped, first, second, gap].includes(row.sessionId))), beforeReplay);
 
   rollout(imported, "07:00", 80);
   transcript(imported, "019eaaaa-2222-7333-8444-777777777777", "07:00");
   await scanAt("11:00", buffer);
   const history = rows(buffer).filter(row => row.sessionId === imported);
-  assert.ok(history.some(row => row.eventType === "plan_limit_observation"));
   assert.ok(history.some(row => row.eventType === "usage_rollout"));
   assert.ok(history.some(row => row.eventType === "usage_transcript"));
   assert.ok(history.every(row => row.metadata["user.account_id"] === undefined &&
@@ -119,14 +141,16 @@ try {
 
   const windows = buffer.database.prepare("select source, account_key from account_binding_windows").all() as
     Array<{ source: string; account_key: string }>;
-  assert.equal(windows.length, 4);
+  assert.equal(windows.length, 6);
   assert.ok(windows.every(row => /^sha256:[a-f0-9]{16}$/.test(row.account_key)));
-  buffer.close(); buffer = undefined;
   const files = [ledger, `${ledger}-wal`, `${ledger}-shm`].filter(fs.existsSync);
   assert.ok(files.every(file => [...codexIds, ...claudeIds].every(id => !fs.readFileSync(file).includes(id))));
+  const pendingRows = JSON.stringify(buffer.listUnuploaded());
+  assert.ok([...codexIds, ...claudeIds].every(id => !pendingRows.includes(id)));
+  buffer.close(); buffer = undefined;
   console.log(JSON.stringify({ proof: "account-binding-history", delayedScan: true, replay: true,
     historyImport: true, priorKeyPreserved: true, newKeyBound: true, unboundHistoryHasNoKey: true,
-    rawIdsAbsentFromLedger: true, filesScanned: files.length }));
+    unseenReturnToSameKeyUnbound: true, rawIdsAbsentFromLedgerAndPendingRows: true, filesScanned: files.length }));
 } finally {
   buffer?.close();
   fs.rmSync(root, { recursive: true, force: true });

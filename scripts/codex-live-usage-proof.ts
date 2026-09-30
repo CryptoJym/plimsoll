@@ -16,7 +16,7 @@ import { liveUsageDiagnostics, ingestLiveUsage } from "../packages/collector-cli
 import { canonicalJson, parseLivePacket, liveSha256, liveEventId, LIVE_COUNTERS, type LiveUsagePacket } from "../packages/collector-cli/src/codex-live-usage-protocol";
 import { readLiveUsageObservation, type AiInteractionEvent } from "../packages/shared/src/index";
 import { providerAccountKey } from "../packages/shared/src/policy";
-import { AccountBindingHistory } from "../packages/collector-cli/src/local-identity";
+import { AccountBindingHistory, CodexAccountKeyCache } from "../packages/collector-cli/src/local-identity";
 
 const completion = createProofCompletion("codex-live-usage");
 const goldens = JSON.parse(fs.readFileSync(new URL("./fixtures/codex-live-usage-golden-r4.json", import.meta.url), "utf8")).vectors;
@@ -126,8 +126,9 @@ await test("live_usage_does_not_guess_a_historical_account", async f => {
 await test("live_usage_uses_a_prior_observed_account_window", async f => {
   const rawId = "fixture-live-codex-account";
   fs.writeFileSync(path.join(f.home, "auth.json"), JSON.stringify({ tokens: { account_id: rawId } }));
-  new AccountBindingHistory(f.buffer.database, "codex").observe(path.join(f.home, "empty-source"),
-    { key: providerAccountKey(rawId), mtimeMs: null }, Date.parse(baseline.capturedAt) - 1_000);
+  const sessionsDir = path.join(f.home, "empty-source");
+  new AccountBindingHistory(f.buffer.database, "codex").observe(sessionsDir,
+    new CodexAccountKeyCache().observationFromSessionsDir(sessionsDir), Date.parse(baseline.capturedAt) - 1_000);
   await f.send(baseline);
   await f.send(positive);
   assert.equal(f.events()[0]?.metadata["user.account_id"], providerAccountKey(rawId));
