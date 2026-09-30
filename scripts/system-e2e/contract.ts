@@ -280,9 +280,9 @@ export function normalizeSupportingArtifact(
   }
   if (typeof value === "string") return normalizeString(value, key, context);
   if (typeof value === "number" && RESOURCE_METADATA_OPERATIONS_PATH.test(fieldPath)) {
-    // The directory observer counts one additional metadata call on macOS
-    // compared with the Linux CI fixture. Keep the count tightly bounded in
-    // the contract while retaining the resource proof's raw work counters.
+    // The merged history fixture measured 24,567 calls in hosted macOS CI
+    // and 24,568 locally. Keep the count tightly bounded in the contract
+    // while retaining the resource proof's raw work counters.
     assert.ok(Number.isInteger(value) && value >= 24_567 && value <= 24_568,
       `${key} must stay within the observed two-host metadata-call bound`);
     return "<bounded-metadata-operations:24567-24568>";
