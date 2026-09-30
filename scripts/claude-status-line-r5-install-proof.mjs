@@ -178,7 +178,12 @@ try {
       assert.equal(observation.operatorEditPreserved, true, stage);
       if (stage === 'metadata_write_edit') {
         assert.equal(response.result?.outcome, 'status_line_changed', response.stderr);
-      } else assert.equal(observation.errorReported, true, response.stderr);
+      } else {
+        assert.equal(observation.errorReported, true, response.stderr);
+        assert.equal(response.code, 1, stage);
+        assert.equal(response.result?.retainedPaths?.includes(backup), true,
+          `${stage} must disclose its retained uninstall metadata`);
+      }
     }
   }
   console.log(JSON.stringify({ proof: 'claude-status-line-r5-install-steps', checks: 14, passed: 14 }));

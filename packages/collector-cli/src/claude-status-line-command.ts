@@ -408,6 +408,19 @@ function linkMovedObjectNoReplace(side: string, settings: string): void {
   spawnSync("/bin/ln", ["-P", side, settings], { stdio: "ignore", timeout: 5_000 });
 }
 
+function retainedStatusLinePaths(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir).filter(name => name === "settings.json" ||
+      name.startsWith("settings.json.plimsoll-") ||
+      name === STATUS_LINE_BACKUP_NAME ||
+      name.startsWith(`${STATUS_LINE_BACKUP_NAME}.plimsoll-`))
+      .map(name => path.join(dir, name));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
 function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   const settings = path.join(configDir, "settings.json");
   const backup = path.join(configDir, STATUS_LINE_BACKUP_NAME);
@@ -553,7 +566,7 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
 export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string;
   retainedPath?: string; retainedClaimPath?: string; metadataRetainedPath?: string;
   backupPath?: string; statusLineBackupPath?: string; settingsPath?: string;
-  linkCount?: number }> {
+  linkCount?: number; retainedPaths?: string[]; reason?: string }> {
   const defaultDir = process.env.CLAUDE_CONFIG_DIR
     ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : path.join(os.homedir(), ".claude");
   const dirs = [defaultDir];
@@ -569,8 +582,10 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
   const results: Array<{ configDir: string; outcome: string; retainedPath?: string;
     retainedClaimPath?: string; metadataRetainedPath?: string;
     backupPath?: string; statusLineBackupPath?: string; settingsPath?: string;
-    linkCount?: number }> = [];
+    linkCount?: number; retainedPaths?: string[]; reason?: string }> = [];
   for (const dir of [...new Set(dirs)]) {
+    const resultIndex = results.length;
+    try {
     const settings = path.join(dir, "settings.json");
     assertManagedConfigTarget(settings);
     const backup = path.join(dir, STATUS_LINE_BACKUP_NAME);
@@ -669,6 +684,16 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
       results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
         ? "settings_is_symlink" : "status_line_changed",
         ...retainedFiles });
+    }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`${reason}\n`);
+      process.exitCode = 1;
+      results.push({ configDir: dir, outcome: "blocked_existing_statusline", reason });
+    } finally {
+      if (results.length > resultIndex) {
+        results[resultIndex]!.retainedPaths = retainedStatusLinePaths(dir);
+      }
     }
   }
   return results;
