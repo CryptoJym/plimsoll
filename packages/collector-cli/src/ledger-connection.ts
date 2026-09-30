@@ -14,7 +14,7 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
       : paths.join(files.realpathSync(paths.dirname(absolute)), paths.basename(absolute));
     return `${canonical}.connections.lock.sqlite`;
   };
-  const acquire = (file: string, mode: "shared" | "exclusive" = "shared") => {
+  const acquire = (file: string, mode: "shared" | "exclusive" = "shared", waitMs = 0) => {
     const sidecar = lockPath(file);
     try { files.closeSync(files.openSync(sidecar, "wx", 0o600)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
@@ -23,7 +23,7 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
         (process.getuid && before.uid !== process.getuid())) {
       throw new Error("ledger_connection_lock_unsafe");
     }
-    const database = new Sqlite(sidecar, { fileMustExist: true, timeout: 0 });
+    const database = new Sqlite(sidecar, { fileMustExist: true, timeout: waitMs });
     try {
       const after = files.lstatSync(sidecar);
       if (before.dev !== after.dev || before.ino !== after.ino) throw new Error("ledger_connection_lock_changed");
@@ -32,9 +32,9 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
       if (mode === "exclusive") {
         database.pragma("fullfsync = ON");
         database.pragma("synchronous = EXTRA");
-        database.pragma("locking_mode = EXCLUSIVE");
       }
       database.exec(mode === "exclusive" ? "BEGIN EXCLUSIVE" : "BEGIN");
+      if (mode === "exclusive") database.pragma("locking_mode = EXCLUSIVE");
       database.prepare("select name from sqlite_master limit 1").get();
     } catch (error) {
       database.close();

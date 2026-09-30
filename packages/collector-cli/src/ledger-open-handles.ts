@@ -49,4 +49,3 @@ export const otherProcessesWithFilesOpen: OpenHandleCheck = (files) => {
   }
   return null;
 };
-

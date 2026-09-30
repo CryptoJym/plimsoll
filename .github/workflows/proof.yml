@@ -125,6 +125,11 @@ jobs:
           pnpm proof:pr426-r13-startup-marker-recovery
           pnpm proof:pr426-r13-startup-integrity-recovery
 
+      - name: Prove one cutover wins and live collector connections refuse both (PR 426 round 17)
+        run: |
+          pnpm proof:pr426-r17-two-switch-race
+          pnpm proof:pr426-r17-open-collector-two-switch
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit

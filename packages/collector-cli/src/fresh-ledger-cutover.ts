@@ -904,7 +904,10 @@ function restoreRecoveryArtifactsPresent(stage: string, freshAttemptPath: string
  * replace the active pathname. A hard link preserves the quiesced old inode
  * at the archive path without copying the 88 GB history. */
 export function switchFreshLedger(input: CutoverInput): FreshLedgerCutoverPlan {
-  const barrier = acquireLedgerConnectionLock(input.ledgerPath, "exclusive");
+  // A second cutover may begin while the first holds the barrier. Give it a
+  // bounded chance to observe the first cutover's finished publication.
+  // Collector opens still use the zero-timeout shared path and refuse at once.
+  const barrier = acquireLedgerConnectionLock(input.ledgerPath, "exclusive", 5_000);
   let recovery: LedgerPublication | null = null;
   try {
     return switchFreshLedgerUnderBarrier(input, barrier);
