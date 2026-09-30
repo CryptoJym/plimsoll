@@ -344,6 +344,20 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+function currentClaudeAccountKey(): string | undefined {
+  try {
+    const accountFile = process.env.CLAUDE_CONFIG_DIR
+      ? path.join(process.env.CLAUDE_CONFIG_DIR, ".claude.json")
+      : path.join(os.homedir(), ".claude.json");
+    const stat = fs.lstatSync(accountFile);
+    if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+    const identity = JSON.parse(fs.readFileSync(accountFile, "utf8")) as
+      { oauthAccount?: { accountUuid?: unknown } };
+    const id = identity.oauthAccount?.accountUuid;
+    return typeof id === "string" && id.length > 0 ? providerAccountKey(id) : undefined;
+  } catch { return undefined; }
+}
+
 type StatusLineBackup = { existed: boolean; bytes: string; installedStatusLine?: unknown;
   installedOtherKeys?: Record<string, unknown> };
 
@@ -469,6 +483,7 @@ export async function claudeStatusLineCliMain(argv: string[]): Promise<void> {
     else overBound = true;
   }
   const stdinBytes = overBound ? Buffer.concat([...stdinChunks, Buffer.alloc(1)]) : Buffer.concat(stdinChunks);
+  const accountKeyBeforeChain = overBound ? undefined : currentClaudeAccountKey();
   const chained = overBound ? {
     stdout: Buffer.alloc(0), stderr: Buffer.from("plimsoll-capacity-status-line: input_bound_exceeded; status line passthrough skipped\n"),
     exitCode: 0,
@@ -481,27 +496,19 @@ export async function claudeStatusLineCliMain(argv: string[]): Promise<void> {
 
   if (!overBound) {
     try {
-      const accountFile = process.env.CLAUDE_CONFIG_DIR
-        ? path.join(process.env.CLAUDE_CONFIG_DIR, ".claude.json")
-        : path.join(os.homedir(), ".claude.json");
-      const stat = fs.lstatSync(accountFile);
-      if (stat.isFile() && !stat.isSymbolicLink()) {
-        const identity = JSON.parse(fs.readFileSync(accountFile, "utf8")) as { oauthAccount?: { accountUuid?: unknown } };
-        const id = identity.oauthAccount?.accountUuid;
-        if (typeof id === "string" && id.length > 0) {
-          const windows = claudePlanLimitWindows(JSON.parse(stdinBytes.toString("utf8")) as unknown);
-          if (windows.length > 0) {
-            ensureCollectorHome();
-            const buffer = new LocalEventBuffer(collectorBufferPath());
-            try {
-              const emitter = new PlanLimitEmitter(buffer);
-              const accountKey = providerAccountKey(id);
-              const observedAt = new Date().toISOString();
-              for (const window of windows) emitter.observe({ source: "claude_code", accountKey,
-                observedAt, window, planLimitSource: "claude_status_line" });
-            } finally { buffer.close(); }
-          }
-        }
+      const accountKeyAfterChain = currentClaudeAccountKey();
+      const accountKey = accountKeyBeforeChain !== undefined &&
+        accountKeyBeforeChain === accountKeyAfterChain ? accountKeyBeforeChain : undefined;
+      const windows = claudePlanLimitWindows(JSON.parse(stdinBytes.toString("utf8")) as unknown);
+      if (windows.length > 0) {
+        ensureCollectorHome();
+        const buffer = new LocalEventBuffer(collectorBufferPath());
+        try {
+          const emitter = new PlanLimitEmitter(buffer);
+          const observedAt = new Date().toISOString();
+          for (const window of windows) emitter.observe({ source: "claude_code", accountKey,
+            observedAt, window, planLimitSource: "claude_status_line" });
+        } finally { buffer.close(); }
       }
     } catch {
       // Collection is best-effort; the operator's status line keeps its original output.
