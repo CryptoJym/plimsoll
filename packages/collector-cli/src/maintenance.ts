@@ -1113,17 +1113,18 @@ export class CollectorMaintenance {
     // remaining wall is shared among the sources still to run, so one busy
     // source cannot take a whole cadence; unused time flows to the next. An
     // admitted turn is progress, not just admission: its first bounded unit
-    // is admitted on the aggregate clock even past its share, and allowed to
+    // remains admitted if directory discovery spends the wall, and is allowed to
     // finish (`CaptureWorkBudget.unitDeadline`) instead of being abandoned
     // after its slow read was already paid for. Bytes, records and events
     // are not divided: a byte share would starve any Grok usage file larger
-    // than one share. The pre-Grok two-source cadence (callers without a
-    // Grok tailer) keeps its budget unchanged.
-    const scopedCaptureBudget = (sourcesLeft: number, pastSpentWall = false) => this.grokTailer || pastSpentWall
-      ? budget.scoped(this.grokTailer
+    // than one share. The pre-Grok two-source cadence keeps the same aggregate
+    // ceilings without dividing its wall between sources.
+    const scopedCaptureBudget = (sourcesLeft: number, pastSpentWall = false) => budget.scoped(
+      this.grokTailer
         ? { maxWallMs: Math.floor(budget.remainingWallMs() / Math.max(1, sourcesLeft)) }
-        : {}, { progressUnit: true, pastSpentWall })
-      : budget;
+        : {},
+      { progressUnit: true, pastSpentWall, firstUnitAdmitted: budget.canContinue() },
+    );
     const admitted: Partial<Record<CaptureSource, boolean>> = {};
     const startedAt = new Date().toISOString();
     let rollout: RolloutScanResult | undefined;

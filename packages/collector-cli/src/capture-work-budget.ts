@@ -37,6 +37,8 @@ type BudgetScopePolicy = {
    * wall clock (see `unitDeadline`).
    */
   progressUnit?: boolean;
+  /** The source turn was admitted before the aggregate wall was spent. */
+  firstUnitAdmitted?: boolean;
   /**
    * The previous cadence's capture leader never started: the aggregate clock
    * was spent before its turn. This scope's first unit is admitted even if
@@ -55,9 +57,10 @@ type BudgetScopePolicy = {
  *
  * `maxWallMs` is an admission ceiling, not a limit on how long a cadence
  * runs. Once the aggregate clock is spent, neither the root nor any scope
- * admits another unit, with one exception: the first unit of a capture
- * leader whose previous cadence never let it start (`pastSpentWall`), so
- * slow bookkeeping cannot keep capture out on every cadence. A unit that
+ * admits another unit, with two bounded exceptions: the first unit of an
+ * already admitted source turn and the first unit of a capture leader whose
+ * previous cadence never let it start (`pastSpentWall`). Slow discovery or
+ * bookkeeping cannot consume an admitted source's first capture slice. A unit that
  * has started finishes: its reads stop
  * at `unitDeadline`, and the first unit of a progress scope has no wall
  * deadline at all, only its byte and record slice. A cadence therefore ends
@@ -149,13 +152,14 @@ export class CaptureWorkBudget {
   }
 
   canContinue(): boolean {
-    if (!(this.parent?.canContinue() ?? true) && !this.admittedPastSpentWall()) return false;
+    if (!(this.parent?.canContinue() ?? true) && !this.admittedFirstUnitAfterWall()) return false;
     const local = this.localExhaustedBy();
     return local === null || (local === "wall" && this.awaitingFirstUnit());
   }
 
-  private admittedPastSpentWall() {
-    return this.policy.pastSpentWall === true && this.awaitingFirstUnit() &&
+  private admittedFirstUnitAfterWall() {
+    return (this.policy.pastSpentWall === true || this.policy.firstUnitAdmitted === true) &&
+      this.awaitingFirstUnit() &&
       this.parent !== null && !this.parent.spentBesidesWall();
   }
 
