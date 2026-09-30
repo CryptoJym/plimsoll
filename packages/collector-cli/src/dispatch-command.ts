@@ -186,6 +186,8 @@ export function restampDispatch(args: string[],buffer: LocalEventBuffer,roots: r
         and (? is null or json_extract(raw.payload_json,'$.metadata.captureRootId')=?)
         and raw.uploaded_at is null and raw.privacy_disposition is null
         and not exists (select 1 from upload_outbox as queued where queued.raw_rowid=raw.rowid
+          and queued.raw_id=raw.id and queued.raw_created_at=raw.created_at
+          and queued.raw_generation is raw.privacy_generation
           and (queued.attempt_count>0 or queued.sealed_envelope_json is not null or queued.state<>'pending'))
       order by raw.rowid limit 5001`).all(source,binding.sessionId,binding.validFrom,
         binding.validUntil,binding.validUntil,rootId,rootId) as Array<{ id:string;payloadJson:string;observedAt:string }>;

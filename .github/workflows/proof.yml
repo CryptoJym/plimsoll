@@ -150,6 +150,30 @@ jobs:
           pnpm proof:authenticated-ingestion
           pnpm proof:status-http-rollout
           pnpm proof:retention
+          pnpm proof:retention-null-generation-privacy
+          pnpm proof:retention-upgrade-downgrade
+          pnpm proof:retention-reused-id-downgrade
+          pnpm proof:retention-repeated-reuse-downgrade
+          pnpm proof:retention-reused-id-privacy-collision
+          pnpm proof:retention-reused-id-privacy-rowid
+          pnpm proof:retention-repeated-reuse-property
+          pnpm proof:retention-stale-outbox-link
+          pnpm proof:retention-restamp-lineage
+          pnpm proof:retention-v2-trigger-upgrade
+          pnpm proof:retention-lease-lineage-aba
+          pnpm proof:retention-receipt-migration-crash
+          pnpm proof:retention-0739-privacy
+          pnpm proof:retention-0739-delivery
+          pnpm proof:retention-0739-v44-rollback
+          pnpm proof:retention-missing-raw
+          pnpm proof:retention-event-detail-outbox
+          pnpm proof:retention-generation-count
+          pnpm proof:retention-worker-fence
+          pnpm proof:retention-worker-close
+
+      - name: Prove 0.7.44 dead-receipt lineage scale
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:receipt-lineage-scale
 
       - name: Prove event allocation conservation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

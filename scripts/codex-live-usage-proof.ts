@@ -234,7 +234,15 @@ await test("restart_raw_retention_and_immutable_receipts_pins", async f => {
   await f.send(baseline); await f.send(positive);
   const before=f.buffer.database.prepare("select * from codex_live_receipts order by packet_key").all(), pin=f.buffer.database.prepare("select * from codex_live_pins").all();
   await f.restart(); assert.equal((await f.send(positive)).body.replayed,true);
-  f.buffer.prune(1,{now:new Date("2030-01-01T00:00:00.000Z")});
+  const retentionNow=new Date("2030-01-01T00:00:00.000Z");
+  f.buffer.prune(1,{now:retentionNow});
+  assert.equal(f.count("buffered_events"),1,"unacknowledged live usage stays in the raw ledger");
+  const lease=f.buffer.delivery.lease({leaseId:"live-usage-retention-proof",now:retentionNow});
+  assert.equal(lease.items.length,1);
+  const acknowledged=f.buffer.delivery.acknowledge(lease.leaseId,[lease.items[0].deliveryId],retentionNow);
+  assert.equal(acknowledged.acknowledged,1);
+  assert.equal(acknowledged.markedUploaded,1);
+  f.buffer.prune(1,{now:retentionNow});
   assert.equal(f.count("buffered_events"),0); assert.equal((await f.send(positive)).body.replayed,true); assert.equal(f.count("buffered_events"),0);
   assert.deepEqual(f.buffer.database.prepare("select * from codex_live_receipts order by packet_key").all(),before);
   assert.deepEqual(f.buffer.database.prepare("select * from codex_live_pins").all(),pin);

@@ -22,6 +22,8 @@ const event = (n: number) => `10000000-0000-4000-8000-${String(n).padStart(12, "
 const legacyTriggerNames = ["raw_update", "raw_delete", "outbox_insert", "outbox_update",
   "outbox_delete", "receipt_insert", "receipt_update", "receipt_delete"]
   .map((suffix) => `trg_session_summary_${suffix}`);
+const headTriggerName = (legacyName: string) =>
+  `${legacyName}_${legacyName.includes("_outbox_") ? "v43" : "v42"}`;
 
 function put(buffer: LocalEventBuffer, sid: string, n: number): void {
   buffer.database.prepare(`insert into buffered_events
@@ -33,10 +35,21 @@ function put(buffer: LocalEventBuffer, sid: string, n: number): void {
 }
 
 function terminalReceipt(buffer: LocalEventBuffer, n: number): void {
-  buffer.database.prepare(`insert into upload_receipts
-    (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
-    values (?, 'dead', 'local_privacy_violation', 'local', 0, ?, ?)`)
-    .run(event(n), created, created);
+  const hasLineage = (buffer.database.pragma("table_info(upload_receipts)") as Array<{ name: string }>)
+    .some((column) => column.name === "raw_rowid");
+  if (hasLineage) {
+    buffer.database.prepare(`insert into upload_receipts
+      (delivery_id, raw_rowid, raw_id, raw_created_at, raw_generation,
+       terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
+      select id, rowid, id, created_at, privacy_generation,
+        'dead', 'local_privacy_violation', 'local', 0, ?, ?
+      from buffered_events where id = ?`).run(created, created, event(n));
+  } else {
+    buffer.database.prepare(`insert into upload_receipts
+      (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
+      values (?, 'dead', 'local_privacy_violation', 'local', 0, ?, ?)`)
+      .run(event(n), created, created);
+  }
 }
 
 function read(db: LocalEventBuffer["database"]) {
@@ -93,7 +106,7 @@ async function main(): Promise<void> {
       { read: read(head41.database), maxRows: 1, maxMs: 1_000 });
     assert.equal(partial.complete, false);
     const headSql = new Map(legacyTriggerNames.map((name) =>
-      [name, triggerSql(head41.database, `${name}_v42`)]));
+      [name, triggerSql(head41.database, headTriggerName(name))]));
     head41.close();
 
     const old = new buffer41.LocalEventBuffer(file41, { workspaceId: workspace });
@@ -163,7 +176,7 @@ async function main(): Promise<void> {
       assert.ok(headSql.get("trg_session_summary_raw_update")?.includes("summary_scanned_aware_v1"));
       for (const name of legacyTriggerNames) {
         assert.ok(triggerSql(old.database, name), `0.7.41 did not install ${name}`);
-        assert.ok(headSql.get(name), `head did not install ${name}_v42`);
+        assert.ok(headSql.get(name), `head did not install ${headTriggerName(name)}`);
       }
       completion.check("0741_sync_start_installs_legacy_triggers");
       completion.check("0741_terminal_receipt_race_cannot_send");
@@ -201,7 +214,7 @@ async function main(): Promise<void> {
       ensureSessionSummarySchema(again.database);
       for (const name of legacyTriggerNames) {
         assert.equal(triggerSql(again.database, name), null);
-        assert.equal(triggerSql(again.database, `${name}_v42`), headSql.get(name));
+        assert.equal(triggerSql(again.database, headTriggerName(name)), headSql.get(name));
       }
       completion.check("head_reupgrade_removes_0741_triggers_and_keeps_scanned_aware_sql");
     } finally { again.close(); }
@@ -295,8 +308,11 @@ async function main(): Promise<void> {
       assert.equal(injected, true);
       assert.ok(revisionDelta > 0, "eligibility retarget must advance the 0.7.41 revision fence");
       assert.equal(raced.complete, false, "0.7.41 must reject the stale read");
-      assert.equal(collectSessionSnapshots(retargetOld.database,
+      assert.equal(sync41.collectSessionSnapshots(retargetOld.database,
         { until, sessionIds: [retargetSession] })[0]?.events, 2);
+      assert.equal(collectSessionSnapshots(retargetOld.database,
+        { until, sessionIds: [retargetSession] })[0]?.events, 1,
+        "the upgraded lineage rule must keep the retargeted receipt tied to its raw row");
     } finally { retargetOld.close(); }
 
     const retargetAgain = new LocalEventBuffer(retargetFile, { workspaceId: workspace });
@@ -321,7 +337,8 @@ async function main(): Promise<void> {
         assert.equal(actual, scratch);
         wireEvents.push(actual);
       }
-      assert.deepEqual(wireEvents, [2, 2, 2]);
+      assert.deepEqual(wireEvents, [1, 1, 1],
+        "re-upgrade must keep the raw privacy exclusion despite a delivery-ID retarget");
       console.log(JSON.stringify({ case: "0741-receipt-retarget-reupgrade", wireEvents }));
       completion.check("0741_receipt_retarget_reupgrade_sends_full_count_on_three_horizons");
     } finally { retargetAgain.close(); }
