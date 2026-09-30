@@ -16,6 +16,7 @@ import { DEFAULT_JSONL_TAILER_IO, jsonlScanStateKey, readJsonlTail } from "../pa
 import { rootCursorKey, type CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { maintenanceCandidateHash } from "../packages/collector-cli/src/maintenance-progress";
 import { runUncoveredCatchupCase } from "./uncovered-catchup-case";
+import { installVirtualClock, restoreRealClock } from "./lib/virtual-clock";
 
 type Visit = { cadence: number; offset: number; deferred: number; retained?: boolean };
 async function prove(source: CaptureRoot["source"]) {
@@ -106,6 +107,11 @@ async function prove(source: CaptureRoot["source"]) {
   const continuation = (file: string) => buffer.database.prepare('select envelope_json from jsonl_continuations where provider=? and file_key=?')
     .get(source === 'codex' ? 'codex' : 'claude', createHash('sha256').update(file).digest('hex')) as { envelope_json: string } | undefined;
   try {
+    // This fixture measures bounded work and cadence progress. Pin the
+    // collector's monotonic admission clock for every phase, so host CPU
+    // contention cannot change how many real filesystem/SQLite units fit in
+    // a cadence. Date.now() and file timestamps remain real.
+    installVirtualClock();
     for (let turn = 0; turn < 64 && captureBaselineStatus(buffer.database).status !== "complete"; turn++) await run("baseline");
     check("both real filesystem baselines complete", captureBaselineStatus(buffer.database).status === "complete");
     check("248 historical generations excluded without body reads", captureBaselineStatus(buffer.database).sources.reduce((n, s) => n + s.excludedGenerations, 0) === 248 && bodyReads === 0);
@@ -208,6 +214,7 @@ async function prove(source: CaptureRoot["source"]) {
     let discoverySentinel = "";
     let hotServices = 0, hotRetiredAfter = 0;
     let sentinelCadences = 0;
+    let discoveryWhileHot = false;
     for (let turn = 0; turn < 80; turn++) {
       const hotBefore = cursor(hot)?.committed_offset ?? 0;
       await run("fairness");
@@ -218,11 +225,14 @@ async function prove(source: CaptureRoot["source"]) {
         discoverySentinel = fileAt(providerRoots.at(-1)!, "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
         fs.writeFileSync(discoverySentinel, encode([...prefix("dddddddd-dddd-4ddd-8ddd-dddddddddddd"), usage(1, "dddddddd-dddd-4ddd-8ddd-dddddddddddd")]));
       }
-      if (discoverySentinel) sentinelCadences++;
-      if (cursor(discoverySentinel)?.deferred_bytes === 0 && hotRetiredAfter > 0) break;
+      if (discoverySentinel) {
+        sentinelCadences++;
+        discoveryWhileHot ||= cursor(discoverySentinel)?.deferred_bytes === 0 && cursor(hot)?.deferred_bytes > 0;
+      }
+      if (discoveryWhileHot && hotRetiredAfter > 0) break;
     }
     check("new-file discovery progresses despite a hot partial snapshot", Boolean(discoverySentinel) &&
-      cursor(discoverySentinel)?.deferred_bytes === 0 && cursor(hot)?.deferred_bytes > 0 && sentinelCadences <= 32);
+      discoveryWhileHot && sentinelCadences <= 32);
 
     check("hot snapshot releases its slot within five serviced cadences", hotRetiredAfter > 0 && hotRetiredAfter <= 5);
     fs.appendFileSync(hot, encode([usage(401, hotId, 8192)]));
@@ -254,8 +264,8 @@ async function prove(source: CaptureRoot["source"]) {
     fresh.assertStableForCommit(); fresh.close();
     check("fresh precise metadata retries same physical generation", Boolean(fresh));
     return { source, roots: 20, historicalFiles: 248, baselineCadences, checks, visits, growthVisits, partialAppends, appendRevisits,
-      sentinelCadences, giantCadences, hotRetiredAfter, privateReadAttempts, maxSliceRecords, finalCursor: cursor(target), cadences, passed: checks.every(c => c.passed) };
-  } finally { maintenance.close(); buffer.close(); fs.rmSync(base, { recursive: true, force: true }); }
+      sentinelCadences, discoveryWhileHot, giantCadences, hotRetiredAfter, privateReadAttempts, maxSliceRecords, finalCursor: cursor(target), cadences, passed: checks.every(c => c.passed) };
+  } finally { restoreRealClock(); maintenance.close(); buffer.close(); fs.rmSync(base, { recursive: true, force: true }); }
 }
 async function main() {
   const proofs = [];

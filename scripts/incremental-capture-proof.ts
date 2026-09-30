@@ -28,7 +28,7 @@ import {
   completeAutomaticCaptureBaseline,
 } from "../packages/collector-cli/src/capture-baseline";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
-import { IncrementalJsonlDiscovery } from "../packages/collector-cli/src/incremental-jsonl-discovery";
+import { DISCOVERY_FIRST_ADMITTED_QUANTUM, IncrementalJsonlDiscovery } from "../packages/collector-cli/src/incremental-jsonl-discovery";
 import type { CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import {
   historyCoverageStatus,
@@ -41,6 +41,7 @@ import { runRepoEnrichmentMaintenance } from "../packages/collector-cli/src/main
 import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
 import { aiInteractionEventSchema, remoteLinkageHash } from "../packages/shared/src/index";
+import { installVirtualClock, restoreRealClock, spend } from "./lib/virtual-clock";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-incremental-proof-"));
 const buffer = new LocalEventBuffer(path.join(tempDir, "proof.sqlite"));
@@ -1390,30 +1391,64 @@ async function proveManyRootSweepConvergence() {
   assert.equal(sized, MANY_ROOTS * AUTOMATIC_DISCOVERY_ENTRIES_PER_ROOT);
   assert.ok(observed > AUTOMATIC_DISCOVERY_ENTRY_CAP);
   assert.ok(observed <= AUTOMATIC_DISCOVERY_ENTRY_CAP_MAX);
+  // Fix the proof's admission clock while keeping the real directory walk.
+  // The comparison is about the entry allowance, not runner CPU scheduling.
+  const collectWithFixtureClock = async (discovery: IncrementalJsonlDiscovery, maxEntries: number) => {
+    installVirtualClock();
+    try {
+      return await discovery.collect(new CaptureWorkBudget(), {
+        maxFiles: 1_024, maxEntries, maxWallMs: 100,
+      });
+    } finally { restoreRealClock(); }
+  };
   // Negative control: the pre-.73.1 constant cannot finish this tree in one
   // collect call, because 22×20 files plus their directories exceed 256.
   const constantCapDiscovery = new IncrementalJsonlDiscovery(
     roots.map((root) => root.directory),
     { recursive: true, matches: (name) => name.endsWith(".jsonl"), maxEntries: 100_000 },
   );
-  const constantChunk = await constantCapDiscovery.collect(new CaptureWorkBudget(), {
-    maxFiles: 1_024,
-    maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
-    maxWallMs: 100,
-  });
+  const constantChunk = await collectWithFixtureClock(constantCapDiscovery, AUTOMATIC_DISCOVERY_ENTRY_CAP);
   assert.equal(constantChunk.done, false, "negative control: 256-entry cap does not finish 22 roots");
   constantCapDiscovery.close();
   const sizedDiscovery = new IncrementalJsonlDiscovery(
     roots.map((root) => root.directory),
     { recursive: true, matches: (name) => name.endsWith(".jsonl"), maxEntries: 100_000 },
   );
-  const sizedChunk = await sizedDiscovery.collect(new CaptureWorkBudget(), {
-    maxFiles: 1_024,
-    maxEntries: sized,
-    maxWallMs: 100,
-  });
+  const sizedChunk = await collectWithFixtureClock(sizedDiscovery, sized);
   assert.equal(sizedChunk.done, true, "sized allowance finishes 22 roots in one collect when the wall allows");
+  assert.equal(sizedChunk.files.length, MANY_ROOTS * FILES_PER_ROOT);
   sizedDiscovery.close();
+
+  // A capture turn admitted before a wall-clock preemption must finish its
+  // first bounded discovery unit. Without minimumSteps this collects nothing.
+  const quantumDiscovery = new IncrementalJsonlDiscovery([roots[0]!.directory], {
+    recursive: true, matches: name => name.endsWith(".jsonl"), maxEntries: 100_000,
+  });
+  const originalPerformanceNow = Object.getOwnPropertyDescriptor(performance, "now");
+  let clockCalls = 0;
+  Object.defineProperty(performance, "now", { configurable: true, value: () => (++clockCalls <= 3 ? 0 : 1_000) });
+  try {
+    const quantum = await quantumDiscovery.collect(new CaptureWorkBudget(), {
+      maxFiles: 64, maxEntries: 64, maxWallMs: 50,
+      minimumSteps: DISCOVERY_FIRST_ADMITTED_QUANTUM,
+    });
+    assert.equal(quantum.done, true, "admitted discovery finishes a bounded unit after the wall expires");
+    assert.equal(quantum.files.length, FILES_PER_ROOT);
+  } finally {
+    if (originalPerformanceNow) Object.defineProperty(performance, "now", originalPerformanceNow);
+    else delete (performance as { now?: () => number }).now;
+    quantumDiscovery.close();
+  }
+
+  installVirtualClock();
+  try {
+    const shared = new CaptureWorkBudget();
+    const admitted = shared.scoped({}, { progressUnit: true, firstUnitAdmitted: true });
+    spend(201);
+    assert.equal(admitted.canContinue(), true, "admitted source keeps its first capture slice after discovery spends the wall");
+    admitted.recordSlice({ bytesRead: 2_048, recordsParsed: 1, eventsAppended: 1 });
+    assert.equal(admitted.canContinue(), false, "one admitted slice does not extend the spent wall");
+  } finally { restoreRealClock(); }
 
   const originDiscovery = new IncrementalJsonlDiscovery(
     roots.map((root) => root.directory),
