@@ -166,6 +166,7 @@ try {
     } else if (stage === 'late_claim_edit') {
       assert.equal(response.result?.outcome, 'chained', response.stderr);
       assert.equal(typeof response.result.retainedClaimPath, 'string');
+      assert.match(response.result.retainedClaimPath, /settings\.json\.plimsoll-install-/);
       assert.equal(fs.readFileSync(response.result.retainedClaimPath, 'utf8'),
         '{"lateOperatorEdit":true}');
       console.log(JSON.stringify({ stage, retainedClaimPathReported: true,

@@ -664,8 +664,18 @@ function writeClaudePlan(
     assertVisibleClaudeContent(snapshot, prepared.identity, next);
     if (backup) assertClaudeBackup(snapshot, backup, current);
     if (claim) {
-      if (retainedClaim) retainedClaim.path = claim.path;
-      else unlinkClaudeObject(claim.path, claim.identity);
+      if (retainedClaim) {
+        const claimedStat = claudeLstat(claim.path);
+        if (!claimedStat || claimedStat.isSymbolicLink() || !claimedStat.isFile() ||
+            claimedStat.dev !== claim.identity.device || claimedStat.ino !== claim.identity.inode) {
+          claudeFail("COMMIT_CLAIM_CHANGED");
+        }
+        const retainedPath = path.join(path.dirname(snapshot.absolutePath),
+          `${path.basename(snapshot.absolutePath)}.plimsoll-install-${Date.now()}-${randomUUID()}`);
+        if (claudeLstat(retainedPath)) claudeFail("COMMIT_RETAINED_COLLISION");
+        fs.renameSync(claim.path, retainedPath);
+        retainedClaim.path = retainedPath;
+      } else unlinkClaudeObject(claim.path, claim.identity);
       claim = undefined;
       if (!retainedClaim) {
         fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
