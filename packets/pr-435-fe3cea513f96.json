@@ -1,0 +1,25 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 435,
+  "headSha": "fe3cea513f96be104674d578749a9d3417ca26a7",
+  "reviewedAt": "2026-09-30T19:19:17Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f3ad-b728-7ce1-a87e-e29b7cd0c714",
+    "model": "gpt-6.1-sol",
+    "host": "studio1"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0ef90-443f-7d82-a088-e1e0ffdd8b98"
+    },
+    {
+      "runtime": "claude-code",
+      "session": "f4023139-6838-412e-a325-7fdbdcf61a0a"
+    }
+  ],
+  "summary": "PR #435 (collector discovery keeps moving on a busy host; revisit and 22-root proofs charge the wall through the real path). Code reviewed by an independent Codex lane on studio4 (thread 01a0f15f): r1 found R1-F1 (the frozen fixture clock missed wall starvation); r2 approved 8f9e78d4 (the wiring mutant turns both committed proofs red); r3 approved 975142bf (main f2afd08b merge plus the re-centered version-13 idle envelope, same 16-call span; P2 R3-F1 filed under eco-6hoxj.163.134). GitHub CI on 975142bf was cancelled at the 60-minute job limit during the system-e2e step after all earlier steps passed. The lead added 92274c59 (proof job timeout-minutes 60 -> 90) and fe3cea51 (the timing comment). This final head was reviewed by a separate Codex lane on studio1 (thread 01a0f3ad): the diff from 975142bf touches only the timeout and its comment, with no step, deadline or assertion change. APPROVE."
+}
