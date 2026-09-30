@@ -7,7 +7,7 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
-import { currentDispatchCaptureRoots } from "./capture-root-inventory";
+import { claudeDispatchSkipStatus, currentDispatchCaptureRoots } from "./capture-root-inventory";
 import { countUnlinkableDispatchBindings } from "./dispatch-command";
 import { readJevAnalysis, type JevAnalysisSnapshot } from "./jev-analysis";
 import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
@@ -1278,6 +1278,7 @@ export function createCollectorServer(
       const body = read.snapshot.status as Record<string, unknown>;
       body.summaryPending = summaryPendingStatus(buffer.database);
       body.unlinkableBindCount = countUnlinkableDispatchBindings(currentDispatchCaptureRoots());
+      body.claudeDispatchSkips = claudeDispatchSkipStatus();
       lastCoherentStatus = {
         body,
         generation: read.snapshot.generation,
@@ -1319,6 +1320,7 @@ export function createCollectorServer(
       sessionAttribution: sessionContextIndexStatus(buffer.database),
       summaryPending: summaryPendingStatus(buffer.database),
       unlinkableBindCount: countUnlinkableDispatchBindings(currentDispatchCaptureRoots()),
+      claudeDispatchSkips: claudeDispatchSkipStatus(),
       maintenance: options.maintenanceStatus?.() ?? null,
       captureRecovery: captureRecoveryStatus(),
       historyCoverage: historyCoverageStatus(buffer.database),
@@ -1576,6 +1578,7 @@ export function createCollectorServer(
               reason: "outcome_coverage_watermark_unavailable" },
           };
           body.statusRefreshCounters = { ...statusRefreshCounters };
+          body.claudeDispatchSkips = claudeDispatchSkipStatus();
           body.httpAdmission = rejectionDiagnostics.counters();
           body.producerParity = { counters: { ...producerCounters } };
           // Bead eco-6hoxj.153: an open `source_required` /
@@ -1984,6 +1987,7 @@ export function createCollectorServer(
         const exploded = explodeOtlpPayload(parsedEnvelope, {
           policy: config.policy,
           source,
+          buffer,
           transportPath,
           onRepoLabel: (hash, label) => repoLabels.push({ hash, label }),
         });

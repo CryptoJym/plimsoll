@@ -8,6 +8,9 @@ import {
 import { sealOutboundEvent } from "./outbound-envelope";
 import { attachRepoContextSidecar, extractRepoContextCwd } from "./repo-context";
 import { recordMaintenanceHookAdmission } from "./maintenance-hook-admission";
+import { claudeBindingForUnrootedEvent, countClaudeReplayTimeout, currentDispatchBindingSnapshot,
+  dispatchBindingMetadata, durableClaudeRootSessionSightings,
+  type DispatchBindingSnapshot } from "./capture-root-inventory";
 
 type ForwardedHookOptions = {
   config: CollectorConfig;
@@ -20,6 +23,8 @@ type ForwardedHookOptions = {
   fallbackEventId?: string;
   /** Raw caller body before spool replay supplies a receive-time alias. */
   originalHookPayload?: unknown;
+  buffer?: LocalEventBuffer;
+  dispatchSnapshot?: DispatchBindingSnapshot;
 };
 
 export function appendForwardedHook(
@@ -47,6 +52,18 @@ export function normalizeForwardedHook(payload: unknown, options: ForwardedHookO
     producerEventId: options.producerEventId,
     fallbackEventId: options.fallbackEventId,
   });
+  if (options.source === "claude_code" && normalized.event.sessionId) {
+    const replay=options.buffer?.claudeReplayBarrierState();
+    if(replay==="pending") options.buffer!.deferClaudeHookUntilReplay(normalized.event.id);
+    if(replay==="timed_out") countClaudeReplayTimeout();
+    const binding = replay==="pending"||replay==="timed_out" ? null
+      : claudeBindingForUnrootedEvent(normalized.event.sessionId,
+        normalized.event.observedAt,options.dispatchSnapshot??currentDispatchBindingSnapshot(),
+        options.buffer ? durableClaudeRootSessionSightings(options.buffer.database,normalized.event.sessionId) : undefined);
+    if (binding) normalized.event.metadata = {
+      ...normalized.event.metadata, ...dispatchBindingMetadata(binding),
+    };
+  }
   // Successful hook/fallback responses are public proof surfaces before the
   // durable outbox runs. Include the same deterministic local-only omissions
   // the outbound sealer will add later so response, ledger and wire receipts
