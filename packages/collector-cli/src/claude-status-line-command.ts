@@ -159,10 +159,12 @@ export type ClaudeStatusLineConfigureResult =
     }
   | { outcome: "blocked_existing_statusline" | "blocked_invalid_settings"; reason: string };
 
-function statusLineEntryFor(chainCommand: string | null, baseProxyCommand: string): Record<string, unknown> {
+function statusLineEntryFor(chainCommand: string | null, baseProxyCommand: string,
+  existing?: Record<string, unknown>): Record<string, unknown> {
   const chainArgument =
     chainCommand === null ? "-" : Buffer.from(chainCommand, "utf8").toString("base64");
   return {
+    ...existing,
     type: "command",
     command: `${baseProxyCommand} ${STATUS_LINE_PROXY_INVOCATION_MARKER} ${chainArgument}`,
   };
@@ -287,7 +289,9 @@ export function configureClaudeStatusLineProxy(
     }
   }
 
-  const desired = statusLineEntryFor(chainCommand, input.baseProxyCommand);
+  const desired = statusLineEntryFor(chainCommand, input.baseProxyCommand,
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? existing as Record<string, unknown> : undefined);
   if (isDeepStrictEqual(existing ?? undefined, desired)) {
     return {
       outcome: chainCommand === null ? "already_installed" : "unchanged_chain",
@@ -340,24 +344,52 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function restoreClaudeStatusLine(configDir: string): void {
+type StatusLineBackup = { existed: boolean; bytes: string; installedStatusLine?: unknown;
+  installedOtherKeys?: Record<string, unknown> };
+
+function writeStatusLineBackup(file: string, value: StatusLineBackup): void {
+  const temp = `${file}.plimsoll-write-${process.pid}`;
+  fs.writeFileSync(temp, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+  fs.renameSync(temp, file);
+}
+
+function restoreClaudeStatusLine(configDir: string): "restored" | "status_line_changed" {
   const settings = path.join(configDir, "settings.json");
   const backup = path.join(configDir, STATUS_LINE_BACKUP_NAME);
   const stat = fs.lstatSync(backup);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("status_line_backup_invalid");
-  const current = JSON.parse(fs.readFileSync(settings, "utf8")) as Record<string, unknown>;
-  const command = (current.statusLine as Record<string, unknown> | undefined)?.command;
-  if (typeof command !== "string" || !command.includes(STATUS_LINE_PROXY_INVOCATION_MARKER)) {
-    throw new Error("status_line_not_owned");
-  }
-  const saved = JSON.parse(fs.readFileSync(backup, "utf8")) as { existed?: boolean; bytes?: string };
+  const saved = JSON.parse(fs.readFileSync(backup, "utf8")) as Partial<StatusLineBackup>;
   if (typeof saved.existed !== "boolean" || typeof saved.bytes !== "string") throw new Error("status_line_backup_invalid");
-  if (saved.existed) {
+  let current: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(settings, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "status_line_changed";
+    current = parsed as Record<string, unknown>;
+  } catch { return "status_line_changed"; }
+  // A marker alone does not prove ownership: the operator may have edited
+  // this entry after setup. An older backup without the installed snapshot is
+  // also insufficient evidence to restore safely.
+  if (saved.installedStatusLine === undefined ||
+      !isDeepStrictEqual(current.statusLine, saved.installedStatusLine)) return "status_line_changed";
+  const originalBytes = Buffer.from(saved.bytes, "base64");
+  const original = saved.existed ? JSON.parse(originalBytes.toString("utf8")) as Record<string, unknown> : {};
+  if (Object.hasOwn(original, "statusLine")) current.statusLine = original.statusLine;
+  else delete current.statusLine;
+  for (const [key, installedValue] of Object.entries(saved.installedOtherKeys ?? {})) {
+    if (!Object.hasOwn(original, key) && isDeepStrictEqual(current[key], installedValue)) delete current[key];
+  }
+  if (saved.existed && isDeepStrictEqual(current, original)) {
     const temp = `${settings}.plimsoll-restore-${process.pid}`;
-    fs.writeFileSync(temp, Buffer.from(saved.bytes, "base64"), { mode: 0o600, flag: "wx" });
+    fs.writeFileSync(temp, originalBytes, { mode: 0o600, flag: "wx" });
     fs.renameSync(temp, settings);
-  } else fs.rmSync(settings);
+  } else if (!saved.existed && Object.keys(current).length === 0) fs.rmSync(settings);
+  else {
+    const temp = `${settings}.plimsoll-restore-${process.pid}`;
+    fs.writeFileSync(temp, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temp, settings);
+  }
   fs.rmSync(backup);
+  return "restored";
 }
 
 /** Standalone source command; each target preserves its original bytes for uninstall. */
@@ -380,7 +412,7 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
     assertManagedConfigTarget(settings);
     const backup = path.join(dir, STATUS_LINE_BACKUP_NAME);
     if (uninstall) {
-      if (fs.existsSync(backup)) { restoreClaudeStatusLine(dir); results.push({ configDir: dir, outcome: "restored" }); }
+      if (fs.existsSync(backup)) results.push({ configDir: dir, outcome: restoreClaudeStatusLine(dir) });
       else results.push({ configDir: dir, outcome: "not_installed" });
       continue;
     }
@@ -399,6 +431,14 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
       if (newBackup) fs.rmSync(backup);
       throw new Error(`claude_status_line_${outcome.outcome}:${outcome.reason}`);
     }
+    const saved = JSON.parse(fs.readFileSync(backup, "utf8")) as StatusLineBackup;
+    const installed = JSON.parse(fs.readFileSync(settings, "utf8")) as Record<string, unknown>;
+    const before = saved.existed ? JSON.parse(Buffer.from(saved.bytes, "base64").toString("utf8")) as
+      Record<string, unknown> : {};
+    const installedOtherKeys = newBackup ? Object.fromEntries(Object.entries(installed).filter(([key]) =>
+      key !== "statusLine" && !Object.hasOwn(before, key))) : {};
+    writeStatusLineBackup(backup, { ...saved, installedStatusLine: installed.statusLine,
+      installedOtherKeys: { ...saved.installedOtherKeys, ...installedOtherKeys } });
     results.push({ configDir: dir, outcome: outcome.outcome });
   }
   return results;

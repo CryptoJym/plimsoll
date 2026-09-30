@@ -584,8 +584,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
           pnpm proof:account-plan-limit
+          pnpm proof:account-binding-history
           pnpm proof:plan-limit-event-id
           pnpm proof:claude-status-line-account
+          pnpm proof:claude-status-line-edits
 
       - name: Prove lane receipts, fleet operations and release qualification (#176/#154/#171)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
