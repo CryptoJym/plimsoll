@@ -1,0 +1,25 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 426,
+  "headSha": "e4e3f62b53692b403d28d3e26838458598b5a06f",
+  "reviewedAt": "2026-09-30T03:28:33Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0ef5f-7a6c-7bf1-91e3-1464fd807e0b",
+    "model": "gpt-6-sol",
+    "host": "studio3"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0e58a-77c0-7e41-bbf2-bb32454462f9"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0eb0f-ea57-7072-b488-a2c1fa1f5cb0"
+    }
+  ],
+  "summary": "Independent Codex review lane (studio3, gpt-6-sol max, thread 01a0ef5f) of the final head e4e3f62b, round 10 after rounds 8-9. R9-F1 (simultaneous cutovers could both refuse) is fixed by taking BEGIN EXCLUSIVE on the sidecar before persistent exclusive locking with a bounded cutover-only wait: the unchanged two-switch race gives exactly one winner, the reviewer's contention variants pass, and a held-open real collector still refuses both cutovers. R9-F2 (same-millisecond swap fixture) stays fixed. The b3fa0a0b merge keeps #429's committed-prefix verification and Claude root sighting before this PR's generation fence; the UUID fixture mapping changes no product validation; pins moved only as main explains. The round 13 proofs, fairness, retention, scenario 7's digest, typecheck, dashboard and integrated resource scenarios pass. No P0-P2 finding remains."
+}
