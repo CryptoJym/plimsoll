@@ -7,7 +7,8 @@ import { performance } from "node:perf_hooks";
 import Database from "better-sqlite3";
 import { z } from "zod";
 import { advanceCaptureBaselineEnrollment } from "./capture-baseline";
-import { captureRootEventInstallationEpoch } from "./capture-root-inventory";
+import { captureRootEventInstallationEpoch, promoteClaudeRootSightingsForRaw,
+  promoteLegacyClaudeRootSightings } from "./capture-root-inventory";
 
 import {
   canonicalizeSuppressionReceipts,
@@ -211,6 +212,9 @@ const enrollmentTimestampSchema = z.string().datetime({ offset: true });
 const installationEpochIdSchema = z.string().uuid();
 
 export class LocalEventBuffer {
+  private claudeReplayState: "inactive"|"pending"|"ready"|"timed_out"="inactive";
+  private claudeReplayRootSetJson="[]";
+  private readonly deferredClaudeHookIds=new Set<string>();
   private readonly db: Database.Database;
   private readonly enrollmentNow: () => Date;
   private workspaceId: string | null = null;
@@ -343,6 +347,16 @@ export class LocalEventBuffer {
         value text not null,
         updated_at text not null
       );
+      create table if not exists claude_replay_hooks (
+        event_id text primary key,
+        status text not null check(status in ('pending','timed_out')),
+        created_at text not null,
+        root_set_json text
+      );
+      create trigger if not exists trg_claude_replay_raw_delete
+      after delete on buffered_events begin
+        delete from claude_replay_hooks where event_id=old.id;
+      end;
       create table if not exists raw_retention_receipts (
         event_id text primary key,
         raw_rowid integer not null,
@@ -475,6 +489,12 @@ export class LocalEventBuffer {
       ) without rowid;
     `);
     markOpenStep("ledger.core_schema");
+    const replayHookColumns = new Set(
+      (this.db.pragma("table_info(claude_replay_hooks)") as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!replayHookColumns.has("root_set_json"))
+      this.db.exec("alter table claude_replay_hooks add column root_set_json text");
     const retentionControlColumns = new Set(
       (this.db.pragma("table_info(raw_retention_control)") as Array<{ name: string }>)
         .map((column) => column.name),
@@ -2622,6 +2642,9 @@ export class LocalEventBuffer {
     try {
       const run = () => {
         const appended = this.appendInCurrentTransaction(event, suppressedFields, true, options.firstReceivedAt);
+        if(appended.appended && this.deferredClaudeHookIds.has(event.id))
+          this.db.prepare(`insert or ignore into claude_replay_hooks(event_id,status,created_at,root_set_json)
+            values(?,'pending',?,?)`).run(event.id,new Date().toISOString(),this.claudeReplayRootSetJson);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
           handoffs,
@@ -2638,6 +2661,7 @@ export class LocalEventBuffer {
       };
       result = ownsHandoffs ? this.db.transaction(run).immediate() : run();
     } finally {
+      this.deferredClaudeHookIds.delete(event.id);
       takeRepoContextSidecar(event);
       takeRepoContextId(event);
     }
@@ -2651,6 +2675,22 @@ export class LocalEventBuffer {
         : {}),
       ...(result.enrollmentRejected ? { enrollmentRejected: result.enrollmentRejected } : {}),
     };
+  }
+
+  /** The daemon activates this before accepting hooks. Fixture buffers remain
+   * on the ordinary hot path unless a replay is explicitly started. */
+  beginClaudeReplayBarrier(rootDigests:readonly string[]=[]) {
+    this.claudeReplayRootSetJson=JSON.stringify([...rootDigests].sort());
+    this.claudeReplayState="pending";
+  }
+  finishClaudeReplayBarrier(reached: boolean) {
+    this.claudeReplayState=reached ? "ready":"timed_out";
+  }
+  claudeReplayBarrierState() { return this.claudeReplayState; }
+  deferClaudeHookUntilReplay(eventId: string) {
+    if(this.claudeReplayState!=="pending") return false;
+    this.deferredClaudeHookIds.add(eventId);
+    return true;
   }
 
   appendMany(
@@ -3044,6 +3084,14 @@ export class LocalEventBuffer {
     const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
     const now = options.now ?? new Date();
     const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1_000).toISOString();
+    // A bounded upgrade page runs before the first raw deletion. If it has
+    // more observations, defer this pass; the next call resumes at its durable
+    // cursor. Every deletion also promotes its own observation atomically.
+    const promotion=promoteLegacyClaudeRootSightings(this.db,maxRows);
+    if(!promotion.complete) return {
+      cutoff,events:0,metricSamples:0,eventRowsVisited:0,
+      migrationProtectedRows:0,metricRowsVisited:0,hasMore:true,
+    };
     // Seek through a bounded raw candidate page BEFORE checking migration.
     // A protected prefix must neither cause a full scan nor hide later rows.
     const scanKey = "raw_retention_scan_v1";
@@ -3084,6 +3132,8 @@ export class LocalEventBuffer {
       let events = 0;
       for (const row of candidates) {
         if (row.migrationProtected) { migrationProtectedRows += 1; continue; }
+        if(row.source==="claude_code")
+          promoteClaudeRootSightingsForRaw(this.db,row.eventId);
         recordExpiry.run({
           eventId: row.eventId,
           rawRowid: row.rawRowid,

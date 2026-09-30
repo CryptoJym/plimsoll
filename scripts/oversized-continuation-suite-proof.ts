@@ -31,7 +31,7 @@ for (const file of subProofs) {
       assert(summary.results.every((r: any) => r.passed));
     } else {
       assert.equal(summary.status, 'PASS');
-      if (name === 'oversized-continuation-state-proof') { assert.equal(summary.checks.length, 10); assert.equal(summary.columns.length, 21); }
+      if (name === 'oversized-continuation-state-proof') { assert.equal(summary.checks.length, 10); assert.equal(summary.columns.length, 22); assert(summary.columns.includes('committed_prefix_hash')); }
       else if (name === 'jsonl-read-generation-proof') { assert.equal(summary.checks, 12); assert.equal(summary.receipts.length, 12); }
       else assert.equal(summary.receipts.length, 2);
     }
