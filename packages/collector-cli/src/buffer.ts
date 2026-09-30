@@ -340,6 +340,9 @@ export class LocalEventBuffer {
       const busyWait = new Int32Array(new SharedArrayBuffer(4));
       for (;;) {
         try {
+          // A DELETE-mode writer may escalate to EXCLUSIVE during this pragma.
+          // Limit SQLite's native wait to the budget left for this attempt.
+          this.db.pragma(`busy_timeout = ${Math.max(0, Math.min(10_000, Math.ceil(journalDeadline - performance.now())))}`);
           this.db.pragma("journal_mode = WAL");
           break;
         } catch (error) {
