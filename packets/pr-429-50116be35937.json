@@ -1,0 +1,29 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 429,
+  "headSha": "50116be35937102f98fad18cd144dc6d361ce017",
+  "reviewedAt": "2026-09-30T00:33:13Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0ee1d-e04b-7181-a7c8-c4bab67eaa4d",
+    "model": "gpt-6-sol",
+    "host": "studio5"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0e7de-6b24-7290-9a3e-21dc1a23a636"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0eb24-42ec-7fc0-9af3-053430441f43"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0eec1-5738-77f2-b141-31d79559c143"
+    }
+  ],
+  "summary": "Independent Codex review lane (studio5, gpt-6-sol max, thread 01a0ee1d) of the final head 50116be3, after review rounds 1-11. R8-1 (oversized continuation adopting a new digest) is red on 5ecdf08d and green on 50116be3 with the reviewer's unchanged fixture; the author's three oversized cases and four independent closed-ledger cases pass; R7-1, R6, R5, R4, R2/R3, fanout 14/14, cross-root 5/5, dispatch 18/18, outbox 70/70, work-ref 5/5, coverage 132/132, typecheck and the 0.7.44 ledger open pass; paired hook median +0.084 ms (< +0.2 ms) and alternating waiting-CPU median 1.077x on the head. R9-1 (live same-inode mid-file rewrite) is a documented limitation under the lead's ruling, stated in the PR description, with follow-up bead eco-6hoxj.163.131; R10-1 (PR text recovery claim) resolved in round 11. CI proof green on 50116be3 (run 36648138949)."
+}
