@@ -68,6 +68,8 @@ export type ClaudeApplyOptions = {
  */
 export type ClaudeSettingsApplyOptions = ClaudeApplyOptions & {
   managedTarget?: string;
+  /** Refuse a plan based on an earlier status-line read if its bytes changed. */
+  expectedSource?: string;
 };
 
 export class ClaudeConfigError extends Error {
@@ -897,6 +899,9 @@ export function applyClaudeSettings(
   assertManagedConfigTarget(file);
   try {
     const { snapshot, current } = readClaudePreimage(file);
+    if (options.expectedSource !== undefined && current !== options.expectedSource) {
+      claudeFail("SOURCE_CHANGED");
+    }
     const plan = reconcileClaudeDocument(current, generated, options.managedTarget);
     if (plan.changes.length === 0 || options.dryRun) {
       if (snapshot.exists && snapshot.leaf) {

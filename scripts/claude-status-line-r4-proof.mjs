@@ -81,13 +81,14 @@ const raceHook = String.raw`
 const fs = require('node:fs');
 const original = {
   readFileSync: fs.readFileSync, writeFileSync: fs.writeFileSync,
-  renameSync: fs.renameSync, linkSync: fs.linkSync,
+  renameSync: fs.renameSync, lstatSync: fs.lstatSync, openSync: fs.openSync,
 };
 const settings = process.env.R4_SETTINGS;
 const stage = process.env.R4_STAGE;
 const marker = process.env.R4_MARKER;
 let side;
 let fired = false;
+let settingsLstats = 0;
 function edit(file) {
   const doc = fs.existsSync(file) ? JSON.parse(original.readFileSync(file, 'utf8')) : {};
   doc.concurrentOperatorEdit = stage;
@@ -95,27 +96,30 @@ function edit(file) {
   original.writeFileSync(marker, stage);
   fired = true;
 }
-fs.writeFileSync = function(file, ...args) {
-  if (!fired && stage === 'before_temp_write' && String(file).includes('.plimsoll-restore-')) edit(settings);
-  return original.writeFileSync.call(this, file, ...args);
+fs.lstatSync = function(file, ...args) {
+  if (String(file) === settings) {
+    settingsLstats++;
+    if (!fired && stage === 'before_temp_write' && settingsLstats === 2) edit(settings);
+  }
+  return original.lstatSync.call(this, file, ...args);
 };
 fs.renameSync = function(from, to) {
-  const movingSettings = String(from) === settings && String(to).includes('.plimsoll-restore-side-');
+  const movingSettings = String(from) === settings && String(to).includes('.plimsoll-uninstall-');
   if (movingSettings && stage === 'before_rename') edit(settings);
   const result = original.renameSync.call(this, from, to);
   if (movingSettings) side = String(to);
   if (movingSettings && stage === 'after_rename') edit(settings);
   return result;
 };
-fs.readFileSync = function(file, ...args) {
-  if (!fired && stage === 'before_side_compare' && String(file).includes('.plimsoll-restore-side-')) edit(String(file));
-  return original.readFileSync.call(this, file, ...args);
+fs.openSync = function(file, ...args) {
+  if (!fired && stage === 'before_side_compare' && String(file) === side) edit(side);
+  return original.openSync.call(this, file, ...args);
 };
-fs.linkSync = function(from, to) {
-  const linkingRestore = String(from).includes('.plimsoll-restore-') && String(to) === settings;
-  if (!fired && linkingRestore && stage === 'before_restore_link') edit(settings);
-  const result = original.linkSync.call(this, from, to);
-  if (!fired && linkingRestore && stage === 'after_restore_link_side_edit') edit(side);
+fs.writeFileSync = function(file, ...args) {
+  const restoring = String(file) === settings;
+  if (!fired && restoring && stage === 'before_restore_link') edit(settings);
+  const result = original.writeFileSync.call(this, file, ...args);
+  if (!fired && restoring && stage === 'after_restore_link_side_edit') edit(side);
   return result;
 };
 `;
@@ -137,15 +141,17 @@ function checkRestoreRaces() {
       R4_MARKER: marker, NODE_OPTIONS: `${env.NODE_OPTIONS ?? ''} --require=${hook}` });
     assert.equal(fs.existsSync(marker), true, `injection did not fire: ${stage}`);
     assert.equal(result.outcome, 'status_line_changed', stage);
-    assert.equal(typeof result.retainedPath, 'string', stage);
-    assert.equal(fs.existsSync(result.retainedPath), true, stage);
+    if (stage !== 'before_temp_write') {
+      assert.equal(typeof result.retainedPath, 'string', stage);
+      assert.equal(fs.existsSync(result.retainedPath), true, stage);
+    }
     const live = fs.existsSync(settings) ? fs.readFileSync(settings, 'utf8') : '';
-    const retained = fs.readFileSync(result.retainedPath, 'utf8');
+    const retained = result.retainedPath ? fs.readFileSync(result.retainedPath, 'utf8') : '';
     assert.ok(live.includes(`"concurrentOperatorEdit":"${stage}"`) ||
       retained.includes(`"concurrentOperatorEdit":"${stage}"`), stage);
     assert.equal(fs.existsSync(path.join(config, '.plimsoll-status-line-original.json')), true, stage);
     console.log(JSON.stringify({ case: stage, operatorEditPreserved: true,
-      retainedPathReported: true }));
+      retainedPathReported: Boolean(result.retainedPath) }));
   }
   fs.rmSync(config, { recursive: true, force: true });
   fs.mkdirSync(config, { recursive: true, mode: 0o700 });
@@ -153,7 +159,7 @@ function checkRestoreRaces() {
   assert.equal(cliResult([]).outcome, 'chained');
   assert.equal(cliResult(['--uninstall']).outcome, 'restored');
   assert.ok(fs.readFileSync(settings).equals(initial));
-  assert.equal(fs.readdirSync(config).some(name => name.includes('.plimsoll-restore-side-')), false);
+  assert.equal(fs.readdirSync(config).filter(name => name.startsWith('settings.json.plimsoll-uninstall-')).length, 1);
   console.log(JSON.stringify({ proof: 'claude-status-line-r4-restore-races',
     raceStages: stages.length, noRaceOriginalBytesRestored: true }));
 }

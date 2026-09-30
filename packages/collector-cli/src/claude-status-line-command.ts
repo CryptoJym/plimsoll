@@ -148,6 +148,8 @@ export type ClaudeStatusLineConfigureInput = {
    * Callers own resolution; this module never guesses launchers.
    */
   baseProxyCommand: string;
+  /** Snapshot captured before setup creates its uninstall record. */
+  expectedSource?: string;
   transactionHooks?: NonNullable<Parameters<typeof applyClaudeSettings>[2]>["transactionHooks"];
 };
 
@@ -207,14 +209,13 @@ function looksLikeOperatorStatusLine(value: unknown): { command: string } | null
 }
 
 function readSettingsSource(settingsPath: string): { source: string; exists: boolean } {
-  try {
-    return { source: fs.readFileSync(settingsPath, "utf8"), exists: true };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { source: "", exists: false };
-    }
-    throw error;
-  }
+  const first = lstatIfPresent(settingsPath);
+  if (first?.isSymbolicLink()) throw new Error("settings_is_symlink");
+  if (first && !first.isFile()) throw new Error("settings_not_regular");
+  if (!first) return { source: "", exists: false };
+  const read = readRegularNoFollow(settingsPath);
+  if (!sameFile(first, read.stat)) throw new Error("settings_changed");
+  return { source: read.bytes.toString("utf8"), exists: true };
 }
 
 /**
@@ -240,6 +241,9 @@ export function configureClaudeStatusLineProxy(
     currentSource = readSettingsSource(input.settingsPath).source;
   } catch {
     return { outcome: "blocked_invalid_settings", reason: "settings_unreadable" };
+  }
+  if (input.expectedSource !== undefined && currentSource !== input.expectedSource) {
+    return { outcome: "blocked_existing_statusline", reason: "settings_changed" };
   }
   let currentDocument: Record<string, unknown> = {};
   if (currentSource.trim().length > 0) {
@@ -304,7 +308,8 @@ export function configureClaudeStatusLineProxy(
   // Prove the plan first: a dry run executes the full reconciliation (alias
   // checks, shape checks) WITHOUT writing, so rejection never mutates.
   try {
-    applyClaudeSettings(input.settingsPath, { env: {}, statusLine: desired }, { dryRun: true });
+    applyClaudeSettings(input.settingsPath, { env: {}, statusLine: desired },
+      { dryRun: true, expectedSource: currentSource });
   } catch (error) {
     return {
       outcome:
@@ -319,7 +324,7 @@ export function configureClaudeStatusLineProxy(
     const applied = applyClaudeSettings(
       input.settingsPath,
       { env: {}, statusLine: desired },
-      { transactionHooks: input.transactionHooks },
+      { transactionHooks: input.transactionHooks, expectedSource: currentSource },
     );
     return {
       outcome: chainCommand === null ? "installed" : "chained",
@@ -368,15 +373,28 @@ function writeStatusLineBackup(file: string, value: StatusLineBackup): void {
   fs.renameSync(temp, file);
 }
 
-type StatusLineRestoreResult = { outcome: "restored" | "status_line_changed";
+type StatusLineRestoreResult = { outcome: "restored" | "status_line_changed" | "settings_is_symlink";
   retainedPath?: string };
 
-function linkIfAbsent(from: string, to: string): boolean {
-  try { fs.linkSync(from, to); return true; }
+function lstatIfPresent(file: string): fs.Stats | null {
+  try { return fs.lstatSync(file); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+}
+
+function readRegularNoFollow(file: string): { bytes: Buffer; stat: fs.Stats } {
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error("settings_not_regular");
+    return { bytes: fs.readFileSync(descriptor), stat };
+  } finally { fs.closeSync(descriptor); }
+}
+
+function sameFile(left: fs.Stats, right: fs.Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
@@ -384,18 +402,26 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   const backup = path.join(configDir, STATUS_LINE_BACKUP_NAME);
   const stat = fs.lstatSync(backup);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("status_line_backup_invalid");
-  const saved = JSON.parse(fs.readFileSync(backup, "utf8")) as Partial<StatusLineBackup>;
+  const saved = JSON.parse(readRegularNoFollow(backup).bytes.toString("utf8")) as Partial<StatusLineBackup>;
   if (typeof saved.existed !== "boolean" || typeof saved.bytes !== "string") throw new Error("status_line_backup_invalid");
+  const firstStat = lstatIfPresent(settings);
+  if (firstStat?.isSymbolicLink()) return { outcome: "settings_is_symlink" };
+  if (!firstStat?.isFile()) return { outcome: "status_line_changed" };
   let current: Record<string, unknown>;
   let observedBytes: Buffer;
   try {
-    observedBytes = fs.readFileSync(settings);
+    const read = readRegularNoFollow(settings);
+    if (!sameFile(firstStat, read.stat)) return { outcome: "status_line_changed" };
+    observedBytes = read.bytes;
     const parsed: unknown = JSON.parse(observedBytes.toString("utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { outcome: "status_line_changed" };
     }
     current = parsed as Record<string, unknown>;
-  } catch { return { outcome: "status_line_changed" }; }
+  } catch {
+    return { outcome: lstatIfPresent(settings)?.isSymbolicLink()
+      ? "settings_is_symlink" : "status_line_changed" };
+  }
   // A marker alone does not prove ownership: the operator may have edited
   // this entry after setup. An older backup without the installed snapshot is
   // also insufficient evidence to restore safely.
@@ -413,39 +439,96 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   const restoredBytes = saved.existed && isDeepStrictEqual(current, original) ? originalBytes :
     !saved.existed && Object.keys(current).length === 0 ? null :
       Buffer.from(`${JSON.stringify(current, null, 2)}\n`);
-  const nonce = `${process.pid}-${randomUUID()}`;
-  const temp = `${settings}.plimsoll-restore-${nonce}`;
-  const side = `${settings}.plimsoll-restore-side-${nonce}`;
-  const changed = (): StatusLineRestoreResult => {
-    // A concurrent writer may have recreated settings.json. A hard link puts
-    // the moved file back only when that name is still free; it never replaces
-    // the writer's file. Keep the side name so any edit is recoverable.
-    linkIfAbsent(side, settings);
-    return { outcome: "status_line_changed", retainedPath: side };
-  };
+  const side = `${settings}.plimsoll-uninstall-${Date.now()}-${process.pid}-${randomUUID()}`;
+  const report = (outcome: StatusLineRestoreResult["outcome"]): StatusLineRestoreResult =>
+    ({ outcome, retainedPath: side });
+  // The original inode remains at this named path, including edits through a
+  // descriptor opened before uninstall. Never unlink it or its backup record.
+  const beforeMove = lstatIfPresent(settings);
+  if (beforeMove?.isSymbolicLink()) return { outcome: "settings_is_symlink" };
+  if (!beforeMove || !sameFile(firstStat, beforeMove)) return { outcome: "status_line_changed" };
   try {
-    if (restoredBytes !== null) fs.writeFileSync(temp, restoredBytes, { mode: 0o600, flag: "wx" });
-    fs.renameSync(settings, side);
-    if (fs.lstatSync(side).isSymbolicLink() ||
-        !fs.readFileSync(side).equals(observedBytes)) return changed();
-    if (restoredBytes !== null) {
-      // link() is the compare-and-swap commit: a new settings.json wins.
-      if (!linkIfAbsent(temp, settings)) return changed();
-    } else if (fs.existsSync(settings)) return changed();
-    // An editor with an already-open descriptor can modify the moved inode.
-    // Detect that too, and retain the changed side copy with its path.
-    if (!fs.readFileSync(side).equals(observedBytes)) return changed();
-    fs.unlinkSync(side);
-    fs.unlinkSync(backup);
-    return { outcome: "restored" };
-  } finally {
-    if (restoredBytes !== null) fs.rmSync(temp, { force: true });
+    const reread = readRegularNoFollow(settings);
+    if (!sameFile(firstStat, reread.stat) || !reread.bytes.equals(observedBytes)) {
+      return { outcome: "status_line_changed" };
+    }
+  } catch {
+    return { outcome: lstatIfPresent(settings)?.isSymbolicLink()
+      ? "settings_is_symlink" : "status_line_changed" };
   }
+  try { fs.renameSync(settings, side); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return { outcome: lstatIfPresent(settings)?.isSymbolicLink()
+      ? "settings_is_symlink" : "status_line_changed" };
+  }
+  const movedStat = lstatIfPresent(side);
+  if (movedStat?.isSymbolicLink()) {
+    // A swap made at the rename boundary moved the operator's symlink. Put
+    // its target back at the vacant name with O_EXCL symlink creation, while
+    // retaining the original symlink beside it. A newer live entry wins.
+    if (lstatIfPresent(settings) === null) {
+      try { fs.symlinkSync(fs.readlinkSync(side), settings); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+    return report("settings_is_symlink");
+  }
+  if (!movedStat?.isFile()) return report("status_line_changed");
+  let moved: ReturnType<typeof readRegularNoFollow>;
+  try { moved = readRegularNoFollow(side); }
+  catch { return report("status_line_changed"); }
+  const live = lstatIfPresent(settings);
+  if (live?.isSymbolicLink()) return report("settings_is_symlink");
+  if (live || !sameFile(firstStat, moved.stat) || !moved.bytes.equals(observedBytes)) {
+    // If the original changed before the move, recreate its current bytes
+    // only when the live name is still vacant. The retained inode is the
+    // authoritative copy even if another edit lands during this copy.
+    if (!live) {
+      try { fs.writeFileSync(settings, moved.bytes, { mode: 0o600, flag: "wx" }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        return report(lstatIfPresent(settings)?.isSymbolicLink()
+          ? "settings_is_symlink" : "status_line_changed");
+      }
+    }
+    return report(lstatIfPresent(settings)?.isSymbolicLink()
+      ? "settings_is_symlink" : "status_line_changed");
+  }
+  if (restoredBytes !== null) {
+    try { fs.writeFileSync(settings, restoredBytes, { mode: 0o600, flag: "wx" }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      return report(lstatIfPresent(settings)?.isSymbolicLink()
+        ? "settings_is_symlink" : "status_line_changed");
+    }
+  }
+  const finalLive = lstatIfPresent(settings);
+  if (finalLive?.isSymbolicLink()) return report("settings_is_symlink");
+  try {
+    if (restoredBytes === null ? finalLive !== null :
+        !finalLive?.isFile() || !readRegularNoFollow(settings).bytes.equals(restoredBytes)) {
+      return report(lstatIfPresent(settings)?.isSymbolicLink()
+        ? "settings_is_symlink" : "status_line_changed");
+    }
+  } catch {
+    return report(lstatIfPresent(settings)?.isSymbolicLink()
+      ? "settings_is_symlink" : "status_line_changed");
+  }
+  let finalSide: ReturnType<typeof readRegularNoFollow>;
+  try { finalSide = readRegularNoFollow(side); }
+  catch { return report("status_line_changed"); }
+  if (!sameFile(firstStat, finalSide.stat) || !finalSide.bytes.equals(observedBytes)) {
+    return report("status_line_changed");
+  }
+  if (lstatIfPresent(settings)?.isSymbolicLink()) return report("settings_is_symlink");
+  return report("restored");
 }
 
 /** Standalone source command; each target preserves its original bytes for uninstall. */
 export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string;
-  retainedPath?: string }> {
+  retainedPath?: string; metadataRetainedPath?: string }> {
   const defaultDir = process.env.CLAUDE_CONFIG_DIR
     ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : path.join(os.homedir(), ".claude");
   const dirs = [defaultDir];
@@ -458,40 +541,98 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
     }
     throw new Error("usage: setup-claude-status-line [--config-dir <dir>]... [--uninstall]");
   }
-  const results: Array<{ configDir: string; outcome: string; retainedPath?: string }> = [];
+  const results: Array<{ configDir: string; outcome: string; retainedPath?: string;
+    metadataRetainedPath?: string }> = [];
   for (const dir of [...new Set(dirs)]) {
     const settings = path.join(dir, "settings.json");
     assertManagedConfigTarget(settings);
     const backup = path.join(dir, STATUS_LINE_BACKUP_NAME);
     if (uninstall) {
-      if (fs.existsSync(backup)) results.push({ configDir: dir, ...restoreClaudeStatusLine(dir) });
+      if (lstatIfPresent(backup)) results.push({ configDir: dir, ...restoreClaudeStatusLine(dir) });
       else results.push({ configDir: dir, outcome: "not_installed" });
       continue;
     }
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const existed = fs.existsSync(settings);
-    const newBackup = !fs.existsSync(backup);
+    const first = lstatIfPresent(settings);
+    if (first?.isSymbolicLink()) {
+      results.push({ configDir: dir, outcome: "settings_is_symlink" });
+      continue;
+    }
+    let source: { source: string; exists: boolean };
+    try { source = readSettingsSource(settings); }
+    catch {
+      results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
+        ? "settings_is_symlink" : "status_line_changed" });
+      continue;
+    }
+    const existed = source.exists;
+    let newBackup = !lstatIfPresent(backup);
+    let metadataRetainedPath: string | undefined;
+    if (!newBackup) {
+      // A completed uninstall keeps the original settings inode and its
+      // metadata. A later install must snapshot the settings as they are now,
+      // including any edits made after that uninstall.
+      try {
+        const prior = JSON.parse(readRegularNoFollow(backup).bytes.toString("utf8")) as
+          Partial<StatusLineBackup>;
+        const document = source.source.trim() ? JSON.parse(source.source) as
+          Record<string, unknown> : {};
+        if (prior.installedStatusLine === undefined ||
+            !isDeepStrictEqual(document.statusLine, prior.installedStatusLine)) {
+          metadataRetainedPath = `${backup}.plimsoll-uninstall-${Date.now()}-${process.pid}-${randomUUID()}`;
+          fs.renameSync(backup, metadataRetainedPath);
+          newBackup = true;
+        }
+      } catch {
+        results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
+          ? "settings_is_symlink" : "status_line_changed" });
+        continue;
+      }
+    }
     if (newBackup) {
-      const bytes = existed ? fs.readFileSync(settings) : Buffer.alloc(0);
+      const bytes = Buffer.from(source.source);
       fs.writeFileSync(backup, JSON.stringify({ existed, bytes: bytes.toString("base64") }), { flag: "wx", mode: 0o600 });
     }
     const command = ["env", dir === path.join(os.homedir(), ".claude") && !process.env.CLAUDE_CONFIG_DIR
       ? "-u CLAUDE_CONFIG_DIR" : `CLAUDE_CONFIG_DIR=${shellQuote(dir)}`,
       shellQuote(process.execPath), ...process.execArgv.map(shellQuote), shellQuote(path.resolve(process.argv[1]!))].join(" ");
-    const outcome = configureClaudeStatusLineProxy({ settingsPath: settings, baseProxyCommand: command });
+    const outcome = configureClaudeStatusLineProxy({ settingsPath: settings,
+      baseProxyCommand: command, expectedSource: source.source });
     if ("reason" in outcome) {
-      if (newBackup) fs.rmSync(backup);
+      if (lstatIfPresent(settings)?.isSymbolicLink()) {
+        results.push({ configDir: dir, outcome: "settings_is_symlink" });
+        continue;
+      }
       throw new Error(`claude_status_line_${outcome.outcome}:${outcome.reason}`);
     }
-    const saved = JSON.parse(fs.readFileSync(backup, "utf8")) as StatusLineBackup;
-    const installed = JSON.parse(fs.readFileSync(settings, "utf8")) as Record<string, unknown>;
+    let saved: StatusLineBackup;
+    let installedBytes: Buffer;
+    let installed: Record<string, unknown>;
+    try {
+      saved = JSON.parse(readRegularNoFollow(backup).bytes.toString("utf8")) as StatusLineBackup;
+      installedBytes = readRegularNoFollow(settings).bytes;
+      installed = JSON.parse(installedBytes.toString("utf8")) as Record<string, unknown>;
+    } catch {
+      results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
+        ? "settings_is_symlink" : "status_line_changed" });
+      continue;
+    }
     const before = saved.existed ? JSON.parse(Buffer.from(saved.bytes, "base64").toString("utf8")) as
       Record<string, unknown> : {};
     const installedOtherKeys = newBackup ? Object.fromEntries(Object.entries(installed).filter(([key]) =>
       key !== "statusLine" && !Object.hasOwn(before, key))) : {};
     writeStatusLineBackup(backup, { ...saved, installedStatusLine: installed.statusLine,
       installedOtherKeys: { ...saved.installedOtherKeys, ...installedOtherKeys } });
-    results.push({ configDir: dir, outcome: outcome.outcome });
+    try {
+      const last = lstatIfPresent(settings);
+      if (last?.isSymbolicLink()) results.push({ configDir: dir, outcome: "settings_is_symlink" });
+      else if (!last?.isFile() || !readRegularNoFollow(settings).bytes.equals(installedBytes)) {
+        results.push({ configDir: dir, outcome: "status_line_changed" });
+      } else results.push({ configDir: dir, outcome: outcome.outcome, metadataRetainedPath });
+    } catch {
+      results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
+        ? "settings_is_symlink" : "status_line_changed" });
+    }
   }
   return results;
 }

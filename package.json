@@ -268,6 +268,8 @@
     "proof:claude-status-line-account": "tsx scripts/claude-status-line-account-proof.ts",
     "proof:claude-status-line-edits": "tsx scripts/claude-status-line-edits-proof.ts",
     "proof:claude-status-line-races": "node --import tsx scripts/claude-status-line-r4-proof.mjs",
+    "proof:claude-status-line-r5-restore": "node --import tsx scripts/claude-status-line-r5-proof.mjs",
+    "proof:claude-status-line-r5-install": "node --import tsx scripts/claude-status-line-r5-install-proof.mjs",
     "proof:release-qualification": "tsx scripts/release-qualification-proof.ts",
     "proof:privacy-spec": "tsx scripts/privacy-spec-proof.ts",
     "docs:privacy": "tsx scripts/privacy-spec.ts",
