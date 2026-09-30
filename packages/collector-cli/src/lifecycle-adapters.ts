@@ -1,3 +1,6 @@
+import { otherProcessesWithFilesOpen, type OpenHandleCheck } from "./ledger-open-handles";
+export { otherProcessesWithFilesOpen, type OpenHandleCheck } from "./ledger-open-handles";
+import { openLedgerDatabase, openLedgerCopyDatabase, ledgerConnectionWorkerSource } from "./ledger-connection";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -362,7 +365,7 @@ function openLedgerReadOnly(homeDir?: string): InstanceType<typeof Database> | n
     if (!fs.existsSync(databasePath)) return null;
     const stat = fs.lstatSync(databasePath);
     if (!stat.isFile()) return null;
-    return new Database(databasePath, { readonly: true, fileMustExist: true });
+    return openLedgerDatabase(databasePath, { readonly: true, fileMustExist: true });
   } catch {
     return null;
   }
@@ -372,7 +375,7 @@ function ledgerIsCompatible(homeDir?: string): boolean {
   const databasePath = collectorBufferPath(homeDir);
   try {
     if (!fs.existsSync(databasePath)) return true;
-    const db = new Database(databasePath, { readonly: true, fileMustExist: true });
+    const db = openLedgerDatabase(databasePath, { readonly: true, fileMustExist: true });
     try {
       db.prepare("select count(*) as n from sqlite_master").get();
       return true;
@@ -852,18 +855,21 @@ export type LedgerIntegrity =
   | { status: "unreadable"; code: string };
 
 /** Checks one ledger file; long checks must keep the operation's lease alive. */
-export type LedgerIntegrityCheck = (file: string, guard?: LifecycleFenceGuard) => Promise<LedgerIntegrity>;
+export type LedgerIntegrityCheck = (file: string, guard?: LifecycleFenceGuard, ledgerPath?: string) => Promise<LedgerIntegrity>;
 
 const MAX_INTEGRITY_COMPLAINTS = 1000;
 /** better-sqlite3 as this module loads it, so a helper process opens files the same way. */
 const BETTER_SQLITE3_ENTRY = createRequire(import.meta.url).resolve("better-sqlite3");
 const INTEGRITY_CHECK_SCRIPT = `
-const [entry, file, limit] = process.argv.slice(1);
+const [entry, file, limit, ledgerPath] = process.argv.slice(1);
 let db = null;
 let result;
 try {
   const Database = require(entry);
-  db = new Database(file, { fileMustExist: true, timeout: 0 });
+  ${ledgerConnectionWorkerSource}
+  db = ledgerPath
+      ? openLedgerCopyDatabase(file, ledgerPath, { fileMustExist: true, timeout: 0 })
+      : openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
   db.pragma("locking_mode = EXCLUSIVE");
   const rows = db.pragma("integrity_check(" + (Number(limit) + 1) + ")").map((row) => String(Object.values(row)[0]));
   const complaints = rows.flatMap((row) => row.split("\\n")).map((line) => line.trim())
@@ -885,10 +891,12 @@ function integrityComplaints(rows: unknown[]) {
 }
 
 /** The same check in this process: the fallback when no helper process can start. */
-function integrityCheckInProcess(file: string): LedgerIntegrity {
+function integrityCheckInProcess(file: string, ledgerPath?: string): LedgerIntegrity {
   let db: InstanceType<typeof Database> | null = null;
   try {
-    db = new Database(file, { fileMustExist: true, timeout: 0 });
+    db = ledgerPath
+      ? openLedgerCopyDatabase(file, ledgerPath, { fileMustExist: true, timeout: 0 })
+      : openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
     db.pragma("locking_mode = EXCLUSIVE");
     const complaints = integrityComplaints(db.pragma(`integrity_check(${MAX_INTEGRITY_COMPLAINTS + 1})`) as unknown[]);
     return complaints.length === 0
@@ -941,16 +949,16 @@ export function whileKeepingLease<T>(guard: LifecycleFenceGuard | undefined, wor
  * helper process so this process stays free to renew the operation's lease
  * while it runs; a lost fence stops the check and the restore.
  */
-export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
+export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard, ledgerPath) => {
   let child: ReturnType<typeof spawn>;
   try {
-    child = spawn(process.execPath, ["-e", INTEGRITY_CHECK_SCRIPT, BETTER_SQLITE3_ENTRY, file, String(MAX_INTEGRITY_COMPLAINTS)], {
+    child = spawn(process.execPath, ["-e", INTEGRITY_CHECK_SCRIPT, BETTER_SQLITE3_ENTRY, file, String(MAX_INTEGRITY_COMPLAINTS), ledgerPath ?? ""], {
       env: { PATH: "/usr/bin:/bin" },
       stdio: ["ignore", "pipe", "ignore"],
     });
   } catch {
     guard?.keepAlive();
-    return Promise.resolve(integrityCheckInProcess(file));
+    return Promise.resolve(integrityCheckInProcess(file, ledgerPath));
   }
   const checked = new Promise<LedgerIntegrity>((resolve) => {
     let stdout = "";
@@ -964,7 +972,7 @@ export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
       settled = true;
       // The helper could not start: check here instead (the caller renews the
       // lease before and verifies the fence after).
-      resolve(integrityCheckInProcess(file));
+      resolve(integrityCheckInProcess(file, ledgerPath));
     });
     child.once("close", (code) => {
       if (settled) return;
@@ -990,8 +998,10 @@ export const integrityCheckOffThread: LedgerIntegrityCheck = (file, guard) => {
  * the WAL index in heap memory and never creates a -shm file; the lock is
  * held until close.
  */
-function openExclusive(file: string) {
-  const connection = new Database(file, { fileMustExist: true, timeout: 0 });
+function openExclusive(file: string, ledgerPath?: string) {
+  const connection = ledgerPath
+    ? openLedgerCopyDatabase(file, ledgerPath, { fileMustExist: true, timeout: 0 })
+    : openLedgerDatabase(file, { fileMustExist: true, timeout: 0 }, true);
   try {
     connection.pragma("locking_mode = EXCLUSIVE");
     connection.exec("BEGIN EXCLUSIVE");
@@ -1002,47 +1012,6 @@ function openExclusive(file: string) {
     throw error;
   }
 }
-
-const LSOF = "/usr/sbin/lsof";
-/** A handle probe is advisory; a hung system utility must fail closed quickly. */
-const LSOF_TIMEOUT_MS = 60_000;
-
-/**
- * Other processes that have any of `files` open; null when that cannot be
- * established. SQLite's locks only show connections that have used the
- * ledger: one opened but not yet used holds no lock, and after a swap it
- * would pair the replaced file with the new ledger's -wal/-shm by name.
- */
-export type OpenHandleCheck = (files: readonly string[]) => number[] | null;
-
-/** lsof over the ledger and its sidecars, ignoring this process. */
-export const otherProcessesWithFilesOpen: OpenHandleCheck = (files) => {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const present = files.filter((file) => lstatIfPresent(file));
-    if (present.length === 0) return [];
-    let result = spawnSync(LSOF, ["-S", "2", "-t", "-w", "--", ...present], {
-      encoding: "utf8",
-      env: { PATH: "/usr/bin:/bin:/usr/sbin" },
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: LSOF_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-      maxBuffer: 1024 * 1024,
-    });
-    if (result.error || (result.status !== 0 && result.status !== 1)) return null;
-    const pids = (result.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean).map(Number);
-    if (pids.some((pid) => !Number.isSafeInteger(pid) || pid <= 0)) return null;
-    const others = [...new Set(pids)].filter((pid) => pid !== process.pid);
-    if (others.length > 0) return others;
-    // lsof exits 1 both when nobody has the files open and on errors, and
-    // this process always has the ledger open while it checks: an error about
-    // any file means it is unknown who has that file open.
-    if ((result.stderr ?? "").trim() === "") return [];
-    // A sidecar that vanished between listing and lsof: look again once.
-    if (!present.every((file) => lstatIfPresent(file))) continue;
-    return null;
-  }
-  return null;
-};
 
 /** In use unless proven otherwise: another process has the ledger, its -wal or its -shm open. */
 function openElsewhere(ledger: string, openHandles: OpenHandleCheck): "ledger_in_use" | "quiescence_unproven" | null {
@@ -1193,7 +1162,7 @@ async function restoreLedger(
     fs.chmodSync(temporary, 0o600);
     fsyncFile(temporary);
     let integrity: "ok" | "preexisting_damage" = "ok";
-    const copyCheck = await options.integrityCheck(temporary, guard);
+    const copyCheck = await options.integrityCheck(temporary, guard, input.destination);
     if (copyCheck.status !== "ok") {
       // A snapshot of a ledger that was already damaged carries that damage.
       // Restoring it is no worse than keeping the live ledger when the live
@@ -1211,7 +1180,7 @@ async function restoreLedger(
     guard?.keepAlive();
     // Held until the swap is done, so nothing can open the restored ledger
     // under its final name before the replaced one is released.
-    restored = openExclusive(temporary);
+    restored = openExclusive(temporary, input.destination);
     live = lockLiveLedger(input.destination, options.openHandles);
     // The last moment to stop: nothing live has changed yet.
     guard?.assertCurrent();
@@ -1306,7 +1275,7 @@ function quiesceLedger(source: string, openHandles: OpenHandleCheck):
   | { fallback: LifecycleCloneFallback } {
   let connection: InstanceType<typeof Database>;
   try {
-    connection = new Database(source, { fileMustExist: true, timeout: 0 });
+    connection = openLedgerDatabase(source, { fileMustExist: true, timeout: 0 }, true);
   } catch {
     return { fallback: "quiescence_unproven" };
   }
@@ -1482,7 +1451,7 @@ export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
       fs.rmSync(input.destination, { force: true });
       fs.rmSync(`${input.destination}-wal`, { force: true });
       fs.rmSync(`${input.destination}-shm`, { force: true });
-      const db = new Database(input.source, { readonly: true, fileMustExist: true });
+      const db = openLedgerDatabase(input.source, { readonly: true, fileMustExist: true });
       try {
         // A full copy of a large ledger takes minutes: keep the lease alive between steps.
         await db.backup(input.destination, input.guard

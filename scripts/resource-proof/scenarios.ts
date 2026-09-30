@@ -766,13 +766,19 @@ function writeFirstBootFixtures(sandbox: ResourceSandbox) {
   fs.writeFileSync(recentRollout, `${rollout.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
     mode: 0o600,
   });
+  // Partial discovery receipts include the newest mtime in each chunk. Give
+  // these fixed recent inputs one fixture timestamp: write timing must not
+  // decide whether successive receipts dirty a snapshot (and guard a write).
+  fs.utimesSync(recentRollout, now, now);
   for (let index = 0; index < RECENT_BASELINE_CODEX_FILES; index += 1) {
     const sessionId = `019e6100-0000-7000-8000-${String(index).padStart(12, "0")}`;
+    const file = path.join(rolloutDay, `rollout-baseline-${sessionId}.jsonl`);
     fs.writeFileSync(
-      path.join(rolloutDay, `rollout-baseline-${sessionId}.jsonl`),
+      file,
       `${JSON.stringify({ type: "response_item", payload: { baselineFixture: index } })}\n`,
       { mode: 0o600 },
     );
+    fs.utimesSync(file, now, now);
   }
 
   const oldRolloutDay = path.join(sandbox.codexSessions, "2020", "01", "01");
@@ -815,6 +821,7 @@ function writeFirstBootFixtures(sandbox: ResourceSandbox) {
     })}\n`,
     { mode: 0o600 },
   );
+  fs.utimesSync(recentTranscript, now, now);
 
   const oldTranscriptDirectory = path.join(sandbox.claudeProjects, "old-history");
   fs.mkdirSync(oldTranscriptDirectory, { recursive: true, mode: 0o700 });
@@ -1880,7 +1887,10 @@ export async function runNoChangeConstantWorkContract(
       let finalRun: CollectorMaintenanceRunResult | undefined;
       try {
         for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
-          finalRun = await stableMaintenance.runRecent();
+          // The stable sweep measures bounded metadata work. Keep admission
+          // independent of host speed while the normal boot and restart runs
+          // above and below continue to exercise the real 200 ms clock.
+          finalRun = await stableMaintenance.runRecent({ budgetClock: () => 0 });
           stableRuns.push(finalRun);
           const sweep = source === "codex"
             ? finalRun.rollout.activity.scan

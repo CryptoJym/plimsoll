@@ -1024,10 +1024,12 @@ function assertReadiness(readiness: LifecycleReadiness, version: string) {
 export class LifecycleManager {
   private readonly readinessTimeoutMs: number;
   private readonly pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord>;
+  private readonly beforeRuntimeSwitch?: (artifact: RuntimeArtifact) => void;
 
   constructor(
     private readonly adapter: LifecycleAdapter,
-    options: { readinessTimeoutMs?: number; pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord> } = {},
+    options: { readinessTimeoutMs?: number; pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord>;
+      beforeRuntimeSwitch?: (artifact: RuntimeArtifact) => void } = {},
   ) {
     const requested = options.readinessTimeoutMs ?? 10_000;
     if (!Number.isSafeInteger(requested) || requested < 10 || requested > 60_000) {
@@ -1035,6 +1037,7 @@ export class LifecycleManager {
     }
     this.readinessTimeoutMs = requested;
     this.pairingIndexes = options.pairingIndexes;
+    this.beforeRuntimeSwitch = options.beforeRuntimeSwitch;
   }
 
   private async assertFreshOperation(operationId: string) {
@@ -1222,6 +1225,9 @@ export class LifecycleManager {
 
     let journal: LifecycleJournal | null = null;
     try {
+      // The cutover uses this same mutation authority. Check the active
+      // ledger only after acquiring it, so it cannot change before switchTo.
+      this.beforeRuntimeSwitch?.(artifact);
       const existing = await this.adapter.readJournal();
       const fromVersion = await this.adapter.installedVersion();
       if (existing) {

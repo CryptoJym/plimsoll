@@ -68,6 +68,7 @@ export async function runLifecycleCommand(input: {
   argv: readonly string[];
   adapter: LifecycleAdapter;
   resolveArtifact: LifecycleArtifactResolver;
+  beforeRuntimeSwitch?: (artifact: RuntimeArtifact) => void;
   readinessTimeoutMs?: number;
   pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord>;
 }) {
@@ -76,6 +77,7 @@ export async function runLifecycleCommand(input: {
   const manager = new LifecycleManager(input.adapter, {
     ...(input.readinessTimeoutMs !== undefined ? { readinessTimeoutMs: input.readinessTimeoutMs } : {}),
     ...(action === "update" && input.pairingIndexes ? { pairingIndexes: input.pairingIndexes } : {}),
+    ...(input.beforeRuntimeSwitch ? { beforeRuntimeSwitch: input.beforeRuntimeSwitch } : {}),
   });
   if (action === "update" || action === "rollback") {
     const reference = option(input.argv, "--artifact");

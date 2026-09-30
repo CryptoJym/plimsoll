@@ -269,10 +269,19 @@ function s2DeadLettersAreBoundedGaps() {
   buffer.delivery.acknowledge(lease.leaseId, [current.id]);
   // A deliberate local refusal: the privacy policy keeps it on this machine.
   buffer.database.prepare(`delete from upload_outbox where delivery_id = ?`).run(refused.id);
+  const refusedLineage = buffer.database.prepare(`select rowid as rawRowid,
+    id as rawId,created_at as rawCreatedAt,privacy_generation as rawGeneration
+    from buffered_events where id=?`).get(refused.id) as {
+      rawRowid: number; rawId: string; rawCreatedAt: string; rawGeneration: string | null;
+    };
   buffer.database.prepare(
-    `insert into upload_receipts (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
-     values (?, 'dead', 'local_privacy_violation', 'local', 0, ?, ?)`,
-  ).run(refused.id, iso(now - 60_000), iso(now - 60_000));
+    `insert into upload_receipts
+     (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,
+      terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+     values (?,?,?,?,?,'dead','local_privacy_violation','local',0,?,?)`,
+  ).run(refused.id, refusedLineage.rawRowid, refusedLineage.rawId,
+    refusedLineage.rawCreatedAt, refusedLineage.rawGeneration,
+    refusedLineage.rawCreatedAt, iso(now));
   const attestedAt = now - HOUR;
   attestThrough(buffer, attestedAt);
   const claim = claimOf(buffer, []);

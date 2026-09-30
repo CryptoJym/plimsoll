@@ -70,7 +70,7 @@ type BudgetScopePolicy = {
  * KILL), not this budget.
  */
 export class CaptureWorkBudget {
-  private readonly startedAt = performance.now();
+  private readonly startedAt: number;
   private bytesRead = 0;
   private recordsParsed = 0;
   private eventsAppended = 0;
@@ -81,7 +81,8 @@ export class CaptureWorkBudget {
     private readonly limits: CaptureBudgetLimits = AUTOMATIC_CAPTURE_LIMITS,
     private readonly parent: CaptureWorkBudget | null = null,
     private readonly policy: BudgetScopePolicy = {},
-  ) {}
+    private readonly now: () => number = () => performance.now(),
+  ) { this.startedAt = now(); }
 
   /**
    * Create a source-local view of this budget.
@@ -125,7 +126,7 @@ export class CaptureWorkBudget {
       maxWallMs,
       sliceBytes,
       sliceRecords,
-    }, this, policy);
+    }, this, policy, this.now);
   }
 
   remainingSlice(retryOversizedRecord = false) {
@@ -208,11 +209,11 @@ export class CaptureWorkBudget {
   }
 
   elapsedWallMs(): number {
-    return this.parent?.elapsedWallMs() ?? Math.max(0, performance.now() - this.startedAt);
+    return this.parent?.elapsedWallMs() ?? Math.max(0, this.now() - this.startedAt);
   }
 
   remainingWallMs(): number {
-    const local = Math.max(0, this.limits.maxWallMs - (performance.now() - this.startedAt));
+    const local = Math.max(0, this.limits.maxWallMs - (this.now() - this.startedAt));
     return Math.min(local, this.parent?.remainingWallMs() ?? local);
   }
 
@@ -285,7 +286,7 @@ export class CaptureWorkBudget {
     if (this.limits.maxBytes - this.bytesRead < 2_048) return "bytes";
     if (this.recordsParsed >= this.limits.maxRecords) return "records";
     if (this.eventsAppended >= this.limits.maxEvents) return "events";
-    if (performance.now() - this.startedAt >= this.limits.maxWallMs) return "wall";
+    if (this.now() - this.startedAt >= this.limits.maxWallMs) return "wall";
     return null;
   }
 }

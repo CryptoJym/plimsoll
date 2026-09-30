@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, codexRolloutIdFromFilename, isCodexUuid, verifiedCodexSessionMetaId, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
 import { priceForModel } from "../../shared/src/pricing";
+import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
@@ -16,6 +17,7 @@ import {
   ensureJsonlScanState,
   jsonlScanStateKey,
   loadJsonlScanCursor,
+  prepareJsonlCommittedPrefixHash,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
   type JsonlTailerIo,
@@ -34,6 +36,9 @@ import {
   captureBaselineStatus,
   captureBaselineExcludedSize,
   captureBaselinePostEnrollmentOffset,
+  carriedCaptureCursorMatches,
+  carriedCaptureCursorOffset,
+  replacementCaptureBoundary,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
@@ -248,7 +253,7 @@ function diff(current: TokenTotals, previous: TokenTotals): TokenTotals {
   };
 }
 
-function validateRolloutParserState(value: unknown): RolloutParserState | undefined {
+export function validateRolloutParserState(value: unknown): RolloutParserState | undefined {
   if (!isRecord(value)) return undefined;
   if (
     !hasOnlyKeys(value, [
@@ -408,6 +413,8 @@ export class RolloutTailer {
   private readonly revisit = new CaptureRevisitQueue();
   private readonly coverageDirectoryCache = new CaptureCoverageDirectoryCache();
   private activeCaptureRoot: CaptureRoot | undefined;
+  private activeCarriedBytes = false;
+  private activeReplacementCutoverAt: string | null = null;
   private readonly captureRoots: CaptureRoot[];
   private readonly inventoryConfigured: boolean;
   private eligibleDirectories: string[] | null = null;
@@ -458,7 +465,11 @@ export class RolloutTailer {
         if (checked && stat?.isFile() && !checked.fullyRead) {
           const baselineSize = baselineComplete
             ? captureBaselineExcludedSize(this.buffer.database, "codex", baselineObservation(file, stat)) : null;
-          if (baselineSize === null || stat.size > baselineSize) this.revisit.offer(file);
+          if (baselineSize === null || stat.size > baselineSize ||
+              carriedCaptureCursorMatches(this.buffer.database, "codex",
+                jsonlScanStateKey(this.cursorKey(file)), baselineObservation(file, stat))) {
+            this.revisit.offer(file);
+          }
           else this.revisit.remove(file);
         } else this.revisit.remove(file);
         if (checked) known.checked(checked.key);
@@ -985,7 +996,9 @@ export class RolloutTailer {
           observation,
           { mode: "automatic", observedAt: scanNow.toISOString() },
         );
-        if (decision.decision === "exclude") {
+        if (decision.decision === "exclude" &&
+            !carriedCaptureCursorMatches(this.buffer.database, "codex",
+              jsonlScanStateKey(this.cursorKey(file)), observation)) {
           if (stat.size <= decision.baselineSize) {
             result.excludedGenerations += 1;
             result.excludedBytes += stat.size;
@@ -1013,9 +1026,24 @@ export class RolloutTailer {
           continue;
         }
       }
-      const cursor = loadJsonlScanCursor<RolloutParserState>(
+      if (growthStart !== null && historyGrowthNeedsHandoff(
+        this.buffer.database, rootForFile(this.captureRoots, file), file)) {
+        result.deferredGenerations += 1;
+        consumeAutomaticFile(file);
+        automaticFilesPartial.add(file);
+        continue;
+      }
+      const storedCursor = loadJsonlScanCursor<RolloutParserState>(
         this.buffer.database, this.cursorKey(file), PARSER_KIND, CHECKPOINT_VERSION, validateRolloutParserState,
       );
+      const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+      // A fenced automatic generation starts at its own byte boundary with
+      // fresh parser state. Other scans retain the old cursor as reset
+      // evidence; the JSONL reader will discard it on generation change.
+      const boundary = replacementCaptureBoundary(this.buffer.database, "codex", observation);
+      const cursor = (boundary?.changed && storedCursor?.fileIdentity !== identity) ||
+        (growthStart !== null && storedCursor?.fileIdentity && storedCursor.fileIdentity !== identity)
+        ? undefined : storedCursor;
       let initialOffset: number | undefined;
       if (growthStart !== null) {
         if (cursor && (cursor.checkpointStatus !== "valid" || cursor.committedOffset === null || cursor.committedOffset < growthStart)) {
@@ -1111,8 +1139,10 @@ export class RolloutTailer {
                 const observation = baselineObservation(candidate.file, fresh);
                 const decision = classifyCaptureBaselineFile(this.buffer.database, "codex", observation,
                   {mode:"automatic", observedAt:scanNow.toISOString()});
-                return decision.decision === "capture" || decision.decision === "exclude" &&
-                  captureBaselinePostEnrollmentOffset(this.buffer.database, "codex", observation) !== null;
+                return decision.decision === "capture" || decision.decision === "exclude" && (
+                  captureBaselinePostEnrollmentOffset(this.buffer.database, "codex", observation) !== null ||
+                  carriedCaptureCursorMatches(this.buffer.database, "codex",
+                    jsonlScanStateKey(this.cursorKey(candidate.file)), observation));
               },
             });
             if (!next) {
@@ -1158,6 +1188,8 @@ export class RolloutTailer {
           }
           const before = resultMutationSnapshot(result);
           const activeRootBefore = this.activeCaptureRoot;
+          const carriedBytesBefore = this.activeCarriedBytes;
+          const cutoverBefore = this.activeReplacementCutoverAt;
           let parseFailure = false;
           let committed = false;
           let validationDeferred = false;
@@ -1173,8 +1205,24 @@ export class RolloutTailer {
               throw new Error("maintenance_progress_budget_exhausted");
             }
             this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
+            const carriedOffset = carriedCaptureCursorOffset(this.buffer.database, "codex",
+              jsonlScanStateKey(this.cursorKey(candidate.file)),
+              baselineObservation(candidate.file, candidate.stat));
+            this.activeCarriedBytes = carriedOffset !== null && !read.reset &&
+              cursor?.checkpointStatus === "valid" && cursor.committedOffset !== null &&
+              cursor.committedOffset >= carriedOffset && cursor.fileIdentity === read.fileIdentity;
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            if (read.continuation?.action !== "checkpoint") {
+              prepareJsonlCommittedPrefixHash(this.buffer.database,
+                candidate.file, this.cursorKey(candidate.file), cursor, read);
+              read.assertStableForCommit();
+            }
+            const readObservation = baselineObservation(candidate.file, this.regularFileStat(candidate.file));
+            if (`${readObservation.device}:${readObservation.inode}:${readObservation.birthtimeNs}` !==
+                read.fileIdentity) throw new Error("capture_generation_changed_before_commit");
+            const readBoundary = replacementCaptureBoundary(this.buffer.database, "codex", readObservation);
+            this.activeReplacementCutoverAt = readBoundary?.changed ? readBoundary.cutoverAt : null;
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();
@@ -1251,6 +1299,8 @@ export class RolloutTailer {
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch {
             this.activeCaptureRoot = activeRootBefore;
+            this.activeCarriedBytes = carriedBytesBefore;
+            this.activeReplacementCutoverAt = cutoverBefore;
             const parseErrors = result.parseErrors - before.parseErrors;
             restoreResultMutationSnapshot(result, before);
             if (parseFailure) {
@@ -1746,11 +1796,18 @@ export class RolloutTailer {
       // the same rewrite and is counted with it.
       const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
       const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
+      if (this.activeReplacementCutoverAt &&
+          (!entry.observedAt || !Number.isFinite(Date.parse(entry.observedAt)) ||
+           Date.parse(entry.observedAt) < Date.parse(this.activeReplacementCutoverAt))) {
+        result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
+        continue;
+      }
       const activeCaptureRoot = this.captureRootAt(this.activeCaptureRoot, observedAt);
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.
       if (this.buffer.eventAdmissionReason(observedAt, activeCaptureRoot?.installationEpochId,
-          activeCaptureRoot?.account && "schema" in activeCaptureRoot.account ? activeCaptureRoot.installationEpochId : undefined)) {
+          this.activeCarriedBytes || activeCaptureRoot?.account && "schema" in activeCaptureRoot.account
+            ? activeCaptureRoot?.installationEpochId : undefined)) {
         result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
         continue;
       }
@@ -1818,7 +1875,7 @@ export class RolloutTailer {
       if (repoContextId && !attachRepoContextId(event, repoContextId)) {
         throw new Error("rollout_repo_context_binding_failed");
       }
-      const inserted = appendRootObservation(this.buffer, event, activeCaptureRoot);
+      const inserted = appendRootObservation(this.buffer, event, activeCaptureRoot, this.activeCarriedBytes);
       if (inserted) {
         result.eventsAppended += 1;
         result.tokensAppended.input += marginal.input;

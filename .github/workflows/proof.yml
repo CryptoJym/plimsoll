@@ -9,8 +9,9 @@ jobs:
   proof:
     runs-on: macos-14
     # Allow the measured sequential artifact, repeated E2E and resource gates.
-    # Per-proof deadlines and acceptance thresholds remain unchanged.
-    timeout-minutes: 45
+    # Per-proof deadlines and acceptance thresholds remain unchanged. Main takes
+    # 35-39 minutes and PRs that add proofs 42-45, so 45 cut off healthy runs.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,6 +51,86 @@ jobs:
         # Run through the isolated proof wrapper, not pnpm, so pnpm config cannot skip the gate.
         run: node ./node_modules/tsx/dist/cli.mjs scripts/run-proof.ts scripts/ci-coverage-proof.ts
 
+      - name: Prove Studio0 replacement ledger cutover safety (PR 426 round 6)
+        run: |
+          pnpm proof:pr426-r6-cutover-append-race
+          pnpm proof:pr426-r6-archive-permissions
+          pnpm proof:pr426-r6-min-version-045
+          pnpm proof:pr426-r6-older-week-backlog
+          pnpm proof:pr426-r6-unseen-file-clock-skew
+          pnpm proof:pr426-r6-rollback-weekly-total
+          pnpm proof:pr426-r6-read-only-preflight-sidecars
+          pnpm proof:pr426-r6-archive-query-plans
+          pnpm proof:pr426-r6-carry-budget
+          pnpm proof:pr426-r6-crash-mid-carry
+          pnpm proof:pr426-r6-stale-generation-growth
+
+      - name: Prove replacement and restore recovery boundaries (PR 426 round 7)
+        run: |
+          pnpm proof:pr426-r7-replaced-during-switch
+          pnpm proof:pr426-r7-append-before-first-scan
+          pnpm proof:pr426-r7-replace-after-rename
+          pnpm proof:pr426-r7-restore-weekly-control
+          pnpm proof:pr426-r7-plan-open-refusal-sidecars
+          pnpm proof:pr426-r7-restore-rerun
+
+      - name: Prove post-swap fence and restore stage provenance (PR 426 round 8)
+        run: |
+          pnpm proof:pr426-r8-swap-replacement-race
+          pnpm proof:pr426-r8-same-generation-append
+          pnpm proof:pr426-r8-foreign-restore-stage
+          pnpm proof:pr426-r8-restore-sidecar-inventory
+          pnpm proof:pr426-r8-restore-sidecar-checkpoint
+
+      - name: Prove read-time generation admission and archive-only restore retries (PR 426 round 9)
+        run: |
+          pnpm proof:pr426-r9-untracked-swap-race
+          pnpm proof:pr426-r9-carried-post-stat-race
+          pnpm proof:pr426-r9-rename-fsync-record
+          pnpm proof:pr426-r9-restore-content-reclone
+          pnpm proof:pr426-r9-restore-clone-fsync-retry
+          pnpm proof:pr426-r9-restore-journal-fsync-retry
+          pnpm proof:pr426-r9-restore-nonce-reclone
+          pnpm proof:pr426-r10-new-path-after-rename
+          pnpm proof:pr426-r10-new-session-restart
+          pnpm proof:pr426-r10-untimestamped-new-path
+          pnpm proof:pr426-r10-rename-delay-report
+          pnpm proof:pr426-r10-epoch-fixture
+
+      - name: Prove forward-skew records occur exactly once across archive and fresh ledger (PR 426 round 11)
+        run: |
+          pnpm proof:pr426-r11-review-pre-rename-missed
+          pnpm proof:pr426-r11-review-during-rename
+          pnpm proof:pr426-r11-review-future-skew
+          pnpm proof:pr426-r11-review-future-skew-only
+          pnpm proof:pr426-r11-review-stamp-boundary
+          pnpm proof:pr426-r11-review-backward-skew
+          pnpm proof:pr426-r11-review-hook-first
+          pnpm proof:pr426-r11-review-crash-markers
+          pnpm proof:pr426-r11-exactly-once
+          pnpm proof:pr426-r11-window-measurement
+
+      - name: Prove ledger connection fencing and conservative forward window (PR 426 round 13)
+        run: |
+          pnpm proof:pr426-r13-real-collector-opener
+          pnpm proof:pr426-r13-raw-old-handle
+          pnpm proof:pr426-r13-forward-window-bound
+          pnpm proof:pr426-r13-cutover-recovery
+          pnpm proof:pr426-r13-cli-refusal
+          pnpm proof:pr426-r13-supervised-restart
+          pnpm proof:pr426-r13-shared-lifetime
+          pnpm proof:pr426-r13-old-connection
+          pnpm proof:pr426-r13-missing-marker-recovery
+          pnpm proof:pr426-r13-integrity-recovery
+          pnpm proof:pr426-r13-post-check-raw-handle
+          pnpm proof:pr426-r13-startup-marker-recovery
+          pnpm proof:pr426-r13-startup-integrity-recovery
+
+      - name: Prove one cutover wins and live collector connections refuse both (PR 426 round 17)
+        run: |
+          pnpm proof:pr426-r17-two-switch-race
+          pnpm proof:pr426-r17-open-collector-two-switch
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit
@@ -69,6 +150,30 @@ jobs:
           pnpm proof:authenticated-ingestion
           pnpm proof:status-http-rollout
           pnpm proof:retention
+          pnpm proof:retention-null-generation-privacy
+          pnpm proof:retention-upgrade-downgrade
+          pnpm proof:retention-reused-id-downgrade
+          pnpm proof:retention-repeated-reuse-downgrade
+          pnpm proof:retention-reused-id-privacy-collision
+          pnpm proof:retention-reused-id-privacy-rowid
+          pnpm proof:retention-repeated-reuse-property
+          pnpm proof:retention-stale-outbox-link
+          pnpm proof:retention-restamp-lineage
+          pnpm proof:retention-v2-trigger-upgrade
+          pnpm proof:retention-lease-lineage-aba
+          pnpm proof:retention-receipt-migration-crash
+          pnpm proof:retention-0739-privacy
+          pnpm proof:retention-0739-delivery
+          pnpm proof:retention-0739-v44-rollback
+          pnpm proof:retention-missing-raw
+          pnpm proof:retention-event-detail-outbox
+          pnpm proof:retention-generation-count
+          pnpm proof:retention-worker-fence
+          pnpm proof:retention-worker-close
+
+      - name: Prove 0.7.44 dead-receipt lineage scale
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:receipt-lineage-scale
 
       - name: Prove event allocation conservation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -199,9 +304,459 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-roots-add
 
+      - name: Prove fenced pre-enrollment history import (eco-6hoxj.163.89)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import
+
+      - name: Prove bounded and resumable history writer slices (eco-6hoxj.163.89 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-slices
+
+      - name: Prove history writer handoff to concurrent intake (eco-6hoxj.163.89 r3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-writer-handoff
+
+      - name: Prove history writer has no per-row schema work (eco-6hoxj.163.89 r4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-writer-schema
+
+      - name: Prove history prefix verification before publication (F1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f1
+
+      - name: Prove history parser handoff to tailers (F2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f2
+
+      - name: Prove history cross-root session continuity (F3)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f3
+
+      - name: Prove exclusive history import lock (F4)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f4
+
+      - name: Prove outbound history provenance marker (F5)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f5
+
+      - name: Prove unique history apply receipts (F6)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f6
+
+      - name: Prove history file swap refusal (F7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-f7
+
+      - name: Prove copied Codex prefix imports only its suffix (N1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-overlap_codex
+
+      - name: Prove copied Claude prefix imports only its suffix (N1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-overlap_claude
+
+      - name: Prove exchanged history parent cannot escape the root (N2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-symlink_parent_race
+
+      - name: Prove copied history rejects claude changed message id (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-claude_changed_message_id
+
+      - name: Prove copied history rejects equal counter byte codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_byte_codex
+
+      - name: Prove copied history rejects equal counter byte claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_byte_claude
+
+      - name: Prove copied history rejects trailing byte codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_byte_codex
+
+      - name: Prove copied history rejects trailing byte claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_byte_claude
+
+      - name: Prove copied history byte boundary first codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_first_codex
+
+      - name: Prove copied history byte boundary middle codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_middle_codex
+
+      - name: Prove copied history byte boundary last codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_last_codex
+
+      - name: Prove copied history byte boundary exact codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_exact_codex
+
+      - name: Prove copied history byte boundary nonusage codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_nonusage_codex
+
+      - name: Prove copied history byte boundary first claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_first_claude
+
+      - name: Prove copied history byte boundary middle claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_middle_claude
+
+      - name: Prove copied history byte boundary last claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_last_claude
+
+      - name: Prove copied history byte boundary exact claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_exact_claude
+
+      - name: Prove copied history byte boundary nonusage claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-byte_nonusage_claude
+
+      - name: Prove original reviewer Codex overlap (r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-r2-overlap_codex
+
+      - name: Prove original reviewer Claude overlap (r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-r2-overlap_claude
+
+      - name: Prove original reviewer parent race (r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-r2-symlink_parent_race
+
+      - name: Prove history file bytes short invalid after usage codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_invalid_after_usage_codex
+
+      - name: Prove history file bytes invalid prefix codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-invalid_prefix_codex
+
+      - name: Prove history file bytes new invalid codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_invalid_codex
+
+      - name: Prove history file bytes short invalid after usage claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_invalid_after_usage_claude
+
+      - name: Prove history file bytes invalid prefix claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-invalid_prefix_claude
+
+      - name: Prove history file bytes new invalid claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_invalid_claude
+
+
+      - name: Prove history files three codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-three_codex
+
+      - name: Prove history files three claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-three_claude
+
+      - name: Prove history files one byte codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-one_byte_codex
+
+      - name: Prove history files one byte claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-one_byte_claude
+
+      - name: Prove history files equal counter identical codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_identical_codex
+
+      - name: Prove history files equal counter identical claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-equal_counter_identical_claude
+
+      - name: Prove history files trailing identical codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_identical_codex
+
+      - name: Prove history files trailing identical claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-trailing_identical_claude
+
+      - name: Prove history files parent depth 1 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-parent_depth_1
+
+      - name: Prove history files parent depth 3 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-parent_depth_3
+
+      - name: Prove history files linked depth 1 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-linked_depth_1
+
+      - name: Prove history files linked depth 3 (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-linked_depth_3
+
+      - name: Prove history files linked root (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-linked_root
+
+      - name: Prove history files short match codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_match_codex
+
+      - name: Prove history files short changed codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_changed_codex
+
+      - name: Prove history files short after usage codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_after_usage_codex
+
+      - name: Prove history files seen suffix codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-seen_suffix_codex
+
+      - name: Prove history files new suffix codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_suffix_codex
+
+      - name: Prove history files missing fingerprint codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_fingerprint_codex
+
+      - name: Prove history files missing record codex (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_record_codex
+
+      - name: Prove history files short match claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_match_claude
+
+      - name: Prove history files short changed claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_changed_claude
+
+      - name: Prove history files short after usage claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_after_usage_claude
+
+      - name: Prove history files seen suffix claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-seen_suffix_claude
+
+      - name: Prove history files new suffix claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-new_suffix_claude
+
+      - name: Prove history files missing fingerprint claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_fingerprint_claude
+
+      - name: Prove history files missing record claude (r7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-missing_record_claude
+
+
+      - name: Prove zero-token usage records stay within writer counts (Codex)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-record-gaps_codex
+
+      - name: Prove zero-token usage records stay within writer counts (Claude)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-record-gaps_claude
+
+      - name: Prove history WAL pause and resumable reader pin
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-wal
+
+      - name: Prove a shorter Codex file needs a usage fingerprint
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_no_usage_codex
+
+      - name: Prove a shorter Claude file needs a usage fingerprint
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_no_usage_claude
+
+      - name: Prove broken Codex usage in a shorter file is refused
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_bad_usage_codex
+
+      - name: Prove broken Claude usage in a shorter file is refused
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-short_bad_usage_claude
+
+      - name: Prove a Codex copy only counts bytes after the imported length
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-seen_prefix_codex
+
+      - name: Prove a Claude copy only counts bytes after the imported length
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-seen_prefix_claude
+
+      - name: Prove imported Codex files retain main sighting and cursor bytes (r7 merge)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-main-handoff-codex
+
+      - name: Prove imported Claude files retain main sighting and cursor bytes (r7 merge)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-history-import-main-handoff-claude
+
       - name: Prove dispatch binding and stamped capture paths (eco-6hoxj.165.3)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding
+
+      - name: Prove Claude dispatch stamping across hook, OTLP and usage (eco-6hoxj.165.97)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:claude-dispatch-stamping
+
+      - name: Prove Claude dispatch root safety and indexed intake (PR #429 review)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:claude-dispatch-review
+
+      - name: Prove Claude fanout window copies agree (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-window-divergence
+
+      - name: Prove Claude known-root sighting survives a caught raw intake failure (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-sighting-atomicity
+
+      - name: Prove Claude restamp requires full root identity (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-restamp-root-reuse
+
+      - name: Prove Claude fanout edge controls (PR #429 round two)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r2-edge-controls
+
+      - name: Prove consecutive Claude dispatch attempts retain attribution (PR #429 round three)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r3-sequential-bind-cli
+
+      - name: Prove a SIGKILL leaves the known-root veto durable (PR #429 round three)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r3-atomicity-crash
+
+      - name: Prove a Claude file records one sighting before its raw rows (PR #429 round three)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r3-tailer-sighting-first
+
+      - name: Prove a pre-insert crash holds the rootless hook until replay (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-first-sighting-before-insert
+
+      - name: Prove an uncommitted sighting cannot stamp an early hook (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-first-sighting-uncommitted
+
+      - name: Prove legacy prune and interrupted promotion preserve the veto (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-legacy-promotion
+
+      - name: Prove pending hooks are held and replay timeout stays unbound (PR #429 round four)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r4-replay-barrier
+
+      - name: Prove timeout release commits after a transient SQLite writer lock (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-timeout-release-busy
+
+      - name: Prove replay timeout uses a monotonic clock (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-clock-skew-reconcile
+
+      - name: Prove removed roots release held hooks unbound after restart (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-held-root-removal-restart
+
+      - name: Prove unchanged roots still replay held hooks after restart (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-held-restart-same-roots
+
+      - name: Prove live file growth cannot move the startup EOF target (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-startup-eof-growth
+
+      - name: Prove large legacy rowids cannot poison promotion (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-promotion-rowid-overflow
+
+      - name: Prove malformed legacy cursors recover without manual repair (PR #429 round five)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r5-promotion-cursor-corruption
+
+      - name: Prove same-size startup transcript rewrite cannot stamp a held hook (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-truncate-regrow
+
+      - name: Prove larger startup transcript regrowth remains unvouched (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-larger-regrowth
+
+      - name: Prove a rewrite between replay reads remains unvouched (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-between-reads
+
+      - name: Prove identical startup transcript bytes remain vouched (PR #429 round six)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r6-startup-eof-identical-rewrite
+
+      - name: Prove a committed EOF cursor cannot vouch rewritten bytes (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-committed-eof
+
+      - name: Prove a changed prefix is caught with its last 64 KiB preserved (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-preserve-last-64k
+
+      - name: Prove identical bytes with a new ctime retain the correct veto (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-identical-ctime
+
+      - name: Prove a legacy cursor without a digest cannot stamp a held hook (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-legacy-no-digest
+
+      - name: Prove changed committed bytes remain unvouched when later bytes grow (PR #429 round seven)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r7-middle-appended
+
+      - name: Prove legacy committed bytes rebuild before an append (PR #429 round nine)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r9-legacy-resume-append
+
+      - name: Prove changed committed bytes cannot be rehashed by an append (PR #429 round nine)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r9-changed-resume-append
+
+      - name: Prove reviewer oversized continuation cannot adopt a rewritten prefix (PR #429 round eight)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-continuation-prefix-rewrite
+
+      - name: Prove reviewer normal append still rejects a rewritten prefix (PR #429 round eight)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-normal-append-control
+
+      - name: Prove oversized continuation with unchanged prefix still stamps (PR #429 round ten)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-oversized-unchanged
+
+      - name: Prove oversized continuation catches a change in the last 64 KiB (PR #429 round ten)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-oversized-last-64k
+
+      - name: Prove two oversized appends cannot adopt a changed old prefix (PR #429 round ten)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:pr429-r8-oversized-two-appends
 
       - name: Prove canonical dispatch binds and visible legacy unlinkable binds (eco-6hoxj.163.104)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

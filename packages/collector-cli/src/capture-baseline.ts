@@ -13,6 +13,8 @@ const STATE_TABLE = "automatic_capture_baseline_state";
 const GENERATION_TABLE = "automatic_capture_baseline_generations";
 const PENDING_GENERATION_TABLE = "automatic_capture_baseline_pending_generations";
 const ERROR_TABLE = "automatic_capture_baseline_observation_errors";
+const REPLACEMENT_FENCE_TABLE = "replacement_unseen_file_fences";
+const REPLACEMENT_BOUNDARY_TABLE = "replacement_file_boundaries";
 const SCHEMA_VERSION = 2;
 const initializedDatabases = new WeakSet<object>();
 
@@ -1447,6 +1449,11 @@ export function stageAutomaticCaptureBaselineObservation(
     });
     return false;
   }
+  // A pathname missing from the switch inventory is new since cutover. Its
+  // first baseline may observe bytes written while the collector was stopped;
+  // those bytes must be judged by record time, never fenced at their size.
+  const baselineSize = replacementCaptureBoundary(database, source, input.observation)?.changed
+    ? 0 : normalized.size;
   let insertedGeneration = false;
   database.transaction(() => {
     const current = stateRow(database, source);
@@ -1484,9 +1491,9 @@ export function stageAutomaticCaptureBaselineObservation(
       input.runId,
       normalized.pathKey,
       normalized.generationKey,
+      baselineSize,
       normalized.size,
-      normalized.size,
-      normalized.size,
+      baselineSize,
       input.observedAt,
       input.observedAt,
     );
@@ -1505,9 +1512,9 @@ export function stageAutomaticCaptureBaselineObservation(
          where source = ? and run_id = ? and generation_key = ?`,
       ).run(
         normalized.pathKey,
+        baselineSize,
         normalized.size,
-        normalized.size,
-        normalized.size,
+        baselineSize,
         input.observedAt,
         source,
         input.runId,
@@ -1655,6 +1662,7 @@ export function classifyCaptureBaselineFile(
       historyInvalidated: false,
     };
   }
+  const replacementFence = replacementUnseenFileFence(database, source, normalized);
 
   // Classification is the per-file hot path. Read the two keyed state rows
   // directly; aggregate COUNT/SUM status is reserved for public snapshots and
@@ -1686,6 +1694,31 @@ export function classifyCaptureBaselineFile(
       matchedExcludedGeneration: false,
       observedGrowth: false,
       historyInvalidated: false,
+    };
+  }
+  // A path seen at cutover may subsequently name a different file. Its old
+  // generation's byte fence cannot apply to the replacement: read complete
+  // records from byte zero and admit them by their own timestamps instead.
+  const replacementBoundary = replacementCaptureBoundary(database, source, observation);
+  if (options.mode === "automatic" && replacementBoundary?.changed) {
+    if (unresolvedError) return {
+      decision: "block", reason: CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+      matchedExcludedGeneration: false, observedGrowth: false, historyInvalidated: false,
+    };
+    return {
+      decision: "capture", reason: "generation_not_baselined",
+      matchedExcludedGeneration: false, observedGrowth: false, historyInvalidated: false,
+    };
+  }
+  if (options.mode === "automatic" && replacementFence !== null) {
+    if (unresolvedError || normalized.size < replacementFence) return {
+      decision: "block", reason: CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+      matchedExcludedGeneration: true, observedGrowth: false, historyInvalidated: false,
+    };
+    return {
+      decision: "exclude", reason: "preexisting_generation",
+      matchedExcludedGeneration: true, baselineSize: replacementFence,
+      observedGrowth: normalized.size > replacementFence, historyInvalidated: false,
     };
   }
 
@@ -1834,6 +1867,11 @@ export function captureBaselineExcludedSize(
     where type='table' and name in (?,?,?)`).get(STATE_TABLE, GENERATION_TABLE, ERROR_TABLE) as {n:number};
   if (schema.n !== 3) return null;
   const normalized = normalizeObservation(observation);
+  if (replacementCaptureBoundary(database, source, observation)?.changed) return null;
+  if (normalized) {
+    const replacementFence = replacementUnseenFileFence(database, source, normalized);
+    if (replacementFence !== null) return replacementFence;
+  }
   const state = stateRow(database, source);
   if (!normalized || !state || !stateIsValid(state) || state.status !== "complete") return null;
   if (database.prepare(`select 1 from ${ERROR_TABLE} where source=? and path_key=? and resolved_at is null limit 1`)
@@ -1845,6 +1883,25 @@ export function captureBaselineExcludedSize(
   return row?.baselineSize ?? null;
 }
 
+/** Read-only evidence for the exact generation fenced by capture-roots add.
+ * The history importer needs the fence instant as well as its byte boundary;
+ * a filename or mtime alone is not enrollment evidence. */
+export function captureBaselineExcludedReceipt(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  observation: CaptureBaselineFileObservation,
+): { baselineSize: number; baselinedAt: string } | null {
+  if (captureBaselineExcludedSize(database, source, observation) === null) return null;
+  const normalized = normalizeObservation(observation);
+  const state = stateRow(database, source);
+  if (!normalized || !state) return null;
+  const row = database.prepare(`select baseline_size as baselineSize, baselined_at as baselinedAt
+    from ${GENERATION_TABLE} where source=? and run_id=? and path_key=? and generation_key=?`)
+    .get(source, state.runId, normalized.pathKey, normalized.generationKey) as
+      { baselineSize: number; baselinedAt: string } | undefined;
+  return row && validTimestamp(row.baselinedAt) ? row : null;
+}
+
 /** A grown excluded generation can start at this recorded enrollment size.
  * The reader must prove a newline or skip the unfinished boundary record. */
 export function captureBaselinePostEnrollmentOffset(
@@ -1854,6 +1911,147 @@ export function captureBaselinePostEnrollmentOffset(
 ): number | null {
   const size = captureBaselineExcludedSize(database, source, observation);
   return size !== null && observation.size > size ? size : null;
+}
+
+const carriedCursorTablePresent = new WeakMap<object, boolean>();
+const replacementFenceTablePresent = new WeakMap<object, boolean>();
+const replacementBoundaryTablePresent = new WeakMap<object, boolean>();
+const replacementCutoverAt = new WeakMap<object, string | null>();
+
+/** The pending marker blocks collector opens. Once cleared, its timestamp is
+ * immutable for this database handle and is the one record-time boundary for
+ * both replaced generations and paths absent from the switch inventory. */
+function durableReplacementCutoverAt(database: Database.Database): string | null {
+  const cached = replacementCutoverAt.get(database);
+  if (cached !== undefined) return cached;
+  const present = database.prepare(`select 1 from sqlite_master where type='table'
+    and name='collector_replacement_ledger'`).get();
+  if (!present) {
+    replacementCutoverAt.set(database, null);
+    return null;
+  }
+  const row = database.prepare(`select switched_at as switchedAt,
+    post_switch_fence_pending as pending from collector_replacement_ledger where singleton=1`)
+    .get() as { switchedAt: string; pending: number } | undefined;
+  if (!row || row.pending !== 0 || !Number.isFinite(Date.parse(row.switchedAt))) {
+    throw new Error("replacement_post_switch_fence_pending");
+  }
+  replacementCutoverAt.set(database, row.switchedAt);
+  return row.switchedAt;
+}
+
+/** The swap's durable path identity. An unchanged generation uses its cursor
+ * or size fence; a replacement uses the cutover time for each record. */
+export function replacementCaptureBoundary(database: Database.Database,
+  source: HistoryCoverageSource, observation: CaptureBaselineFileObservation):
+  { changed: boolean; cutoverAt: string } | null {
+  const cutoverAt = durableReplacementCutoverAt(database);
+  if (cutoverAt === null) return null;
+  let present = replacementBoundaryTablePresent.get(database);
+  if (present === undefined) {
+    present = Boolean(database.prepare(`select 1 from sqlite_master where type='table' and name=?`)
+      .get(REPLACEMENT_BOUNDARY_TABLE));
+    replacementBoundaryTablePresent.set(database, present);
+  }
+  if (!present) throw new Error("replacement_file_boundaries_missing");
+  const normalized = normalizeObservation(observation);
+  if (!normalized) return null;
+  const row = database.prepare(`select generation_key as generationKey
+    from ${REPLACEMENT_BOUNDARY_TABLE} where source=? and path_key=?`)
+    .get(source, normalized.pathKey) as { generationKey: string } | undefined;
+  return { changed: !row || row.generationKey !== normalized.generationKey, cutoverAt };
+}
+
+/** Called under the switch lease for every observed root path, before rename.
+ * The cutover instant lives once in the replacement ledger marker. */
+export function recordReplacementFileBoundaries(database: Database.Database,
+  source: HistoryCoverageSource, observations: readonly CaptureBaselineFileObservation[]): number {
+  database.exec(`create table if not exists ${REPLACEMENT_BOUNDARY_TABLE} (
+    source text not null, path_key text not null, generation_key text not null,
+    primary key(source,path_key)
+  ) without rowid`);
+  replacementBoundaryTablePresent.set(database, true);
+  const insert = database.prepare(`insert into ${REPLACEMENT_BOUNDARY_TABLE}
+    (source,path_key,generation_key) values(?,?,?)`);
+  for (const observation of observations) {
+    const normalized = normalizeObservation(observation);
+    if (!normalized) throw new Error("replacement_file_stat_ambiguous");
+    insert.run(source, normalized.pathKey, normalized.generationKey);
+  }
+  return observations.length;
+}
+
+/** An archive cursor is allowed through the replacement's baseline only for
+ * the exact file generation that committed it. New generations retain the
+ * ordinary baseline rule. The marker contains no source path. */
+export function carriedCaptureCursorMatches(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  fileKey: string,
+  observation: CaptureBaselineFileObservation,
+): boolean {
+  return carriedCaptureCursorOffset(database, source, fileKey, observation) !== null;
+}
+
+/** The immutable archive byte boundary for this exact file generation. */
+export function carriedCaptureCursorOffset(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  fileKey: string,
+  observation: CaptureBaselineFileObservation,
+): number | null {
+  let present = carriedCursorTablePresent.get(database);
+  if (present === undefined) {
+    present = Boolean(database.prepare(`select 1 from sqlite_master
+      where type='table' and name='replacement_capture_cursors'`).get());
+    carriedCursorTablePresent.set(database, present);
+  }
+  if (!present) return null;
+  const identity = `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
+  const row = database.prepare(`select committed_offset as committedOffset from replacement_capture_cursors
+    where source=? and file_key=? and file_identity=?`).get(source, fileKey, identity) as
+    { committedOffset: number } | undefined;
+  return row?.committedOffset ?? null;
+}
+
+/** Stat-only switch snapshot. A file absent from the archive cursor set is
+ * excluded through its observed byte size, regardless of host clock or birth
+ * timestamp. The row is keyed by opaque path and generation digests. */
+export function recordReplacementUnseenFileFences(database: Database.Database,
+  source: HistoryCoverageSource, observations: readonly CaptureBaselineFileObservation[]): number {
+  database.exec(`create table if not exists ${REPLACEMENT_FENCE_TABLE} (
+    source text not null, path_key text not null, generation_key text not null,
+    baseline_size integer not null check(baseline_size>=0),
+    primary key(source,path_key,generation_key)
+  ) without rowid`);
+  replacementFenceTablePresent.set(database, true);
+  const insert = database.prepare(`insert into ${REPLACEMENT_FENCE_TABLE}
+    (source,path_key,generation_key,baseline_size) values(?,?,?,?)
+    on conflict(source,path_key,generation_key) do update set
+    baseline_size=max(baseline_size,excluded.baseline_size)`);
+  let count = 0;
+  for (const observation of observations) {
+    const normalized = normalizeObservation(observation);
+    if (!normalized) throw new Error("replacement_unseen_file_stat_ambiguous");
+    insert.run(source, normalized.pathKey, normalized.generationKey, normalized.size);
+    count += 1;
+  }
+  return count;
+}
+
+function replacementUnseenFileFence(database: Database.Database, source: HistoryCoverageSource,
+  observation: NormalizedObservation): number | null {
+  let present = replacementFenceTablePresent.get(database);
+  if (present === undefined) {
+    present = Boolean(database.prepare(`select 1 from sqlite_master where type='table' and name=?`)
+      .get(REPLACEMENT_FENCE_TABLE));
+    replacementFenceTablePresent.set(database, present);
+  }
+  if (!present) return null;
+  const row = database.prepare(`select baseline_size as baselineSize from ${REPLACEMENT_FENCE_TABLE}
+    where source=? and path_key=? and generation_key=?`).get(source, observation.pathKey,
+      observation.generationKey) as { baselineSize: number } | undefined;
+  return row?.baselineSize ?? null;
 }
 
 /**
