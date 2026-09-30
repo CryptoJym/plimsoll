@@ -165,12 +165,15 @@ try {
       assert.equal(response.result?.outcome, 'settings_is_symlink', response.stderr);
     } else if (stage === 'late_claim_edit') {
       assert.equal(response.result?.outcome, 'chained', response.stderr);
+      assert.match(response.result.backupPath, /settings\.json\.plimsoll-backup-/);
+      assert.equal(fs.lstatSync(response.result.backupPath).isFile(), true);
+      assert.equal(response.result.statusLineBackupPath, backup);
       assert.equal(typeof response.result.retainedClaimPath, 'string');
       assert.match(response.result.retainedClaimPath, /settings\.json\.plimsoll-install-/);
       assert.equal(fs.readFileSync(response.result.retainedClaimPath, 'utf8'),
         '{"lateOperatorEdit":true}');
       console.log(JSON.stringify({ stage, retainedClaimPathReported: true,
-        lateDescriptorEditPreserved: true }));
+        backupPathReported: true, lateDescriptorEditPreserved: true }));
     } else {
       assert.equal(observation.operatorEditPreserved, true, stage);
       if (stage === 'metadata_write_edit') {

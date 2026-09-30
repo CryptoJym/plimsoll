@@ -1,5 +1,5 @@
 /** Claude status-line command and shared chain/configuration mechanics. */
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -377,7 +377,7 @@ function writeStatusLineBackup(file: string, value: StatusLineBackup): void {
 }
 
 type StatusLineRestoreResult = { outcome: "restored" | "status_line_changed" | "settings_is_symlink";
-  retainedPath?: string };
+  retainedPath?: string; settingsPath?: string; linkCount?: number };
 
 function lstatIfPresent(file: string): fs.Stats | null {
   try { return fs.lstatSync(file); }
@@ -400,6 +400,14 @@ function sameFile(left: fs.Stats, right: fs.Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
+/** Atomically add the original inode at a vacant live name, without following a symlink. */
+function linkMovedObjectNoReplace(side: string, settings: string): void {
+  // macOS link(2), including Node's linkSync, follows a source symlink. ln -P
+  // uses linkat without that traversal; creation is exclusive, so a new live
+  // occupant wins. Keep side as the reported backup in either case.
+  spawnSync("/bin/ln", ["-P", side, settings], { stdio: "ignore", timeout: 5_000 });
+}
+
 function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   const settings = path.join(configDir, "settings.json");
   const backup = path.join(configDir, STATUS_LINE_BACKUP_NAME);
@@ -410,11 +418,18 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   const firstStat = lstatIfPresent(settings);
   if (firstStat?.isSymbolicLink()) return { outcome: "settings_is_symlink" };
   if (!firstStat?.isFile()) return { outcome: "status_line_changed" };
+  const hardlinkKept = (links: number): StatusLineRestoreResult =>
+    ({ outcome: "status_line_changed", retainedPath: settings,
+      settingsPath: settings, linkCount: links });
+  if (firstStat.nlink > 1) return hardlinkKept(firstStat.nlink);
   let current: Record<string, unknown>;
   let observedBytes: Buffer;
   try {
     const read = readRegularNoFollow(settings);
-    if (!sameFile(firstStat, read.stat)) return { outcome: "status_line_changed" };
+    if (!sameFile(firstStat, read.stat) || read.stat.nlink > 1) {
+      return read.stat.nlink > 1 ? hardlinkKept(read.stat.nlink) :
+        { outcome: "status_line_changed" };
+    }
     observedBytes = read.bytes;
     const parsed: unknown = JSON.parse(observedBytes.toString("utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -450,10 +465,13 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   const beforeMove = lstatIfPresent(settings);
   if (beforeMove?.isSymbolicLink()) return { outcome: "settings_is_symlink" };
   if (!beforeMove || !sameFile(firstStat, beforeMove)) return { outcome: "status_line_changed" };
+  if (beforeMove.nlink > 1) return hardlinkKept(beforeMove.nlink);
   try {
     const reread = readRegularNoFollow(settings);
-    if (!sameFile(firstStat, reread.stat) || !reread.bytes.equals(observedBytes)) {
-      return { outcome: "status_line_changed" };
+    if (!sameFile(firstStat, reread.stat) || !reread.bytes.equals(observedBytes) ||
+        reread.stat.nlink > 1) {
+      return reread.stat.nlink > 1 ? hardlinkKept(reread.stat.nlink) :
+        { outcome: "status_line_changed" };
     }
   } catch {
     return { outcome: lstatIfPresent(settings)?.isSymbolicLink()
@@ -467,18 +485,20 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
   }
   const movedStat = lstatIfPresent(side);
   if (movedStat?.isSymbolicLink()) {
-    // A swap made at the rename boundary moved the operator's symlink. Put
-    // its target back at the vacant name with O_EXCL symlink creation, while
-    // retaining the original symlink beside it. A newer live entry wins.
-    if (lstatIfPresent(settings) === null) {
-      try { fs.symlinkSync(fs.readlinkSync(side), settings); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-    }
-    return report("settings_is_symlink");
+    // The rename boundary can race with an operator symlink swap. Add the
+    // *same* link inode back at the live name, exclusively. The backup remains
+    // named and reported; a new live occupant is never replaced.
+    linkMovedObjectNoReplace(side, settings);
+    return { ...report("settings_is_symlink"), settingsPath: settings };
   }
   if (!movedStat?.isFile()) return report("status_line_changed");
+  if (movedStat.nlink > 1) {
+    // A hard link may have arrived at the rename boundary. Restore its exact
+    // inode at the live name if vacant; never detach the operator's links.
+    linkMovedObjectNoReplace(side, settings);
+    return { ...report("status_line_changed"), settingsPath: settings,
+      linkCount: movedStat.nlink };
+  }
   let moved: ReturnType<typeof readRegularNoFollow>;
   try { moved = readRegularNoFollow(side); }
   catch { return report("status_line_changed"); }
@@ -531,7 +551,9 @@ function restoreClaudeStatusLine(configDir: string): StatusLineRestoreResult {
 
 /** Standalone source command; each target preserves its original bytes for uninstall. */
 export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string; outcome: string;
-  retainedPath?: string; retainedClaimPath?: string; metadataRetainedPath?: string }> {
+  retainedPath?: string; retainedClaimPath?: string; metadataRetainedPath?: string;
+  backupPath?: string; statusLineBackupPath?: string; settingsPath?: string;
+  linkCount?: number }> {
   const defaultDir = process.env.CLAUDE_CONFIG_DIR
     ? path.resolve(process.env.CLAUDE_CONFIG_DIR) : path.join(os.homedir(), ".claude");
   const dirs = [defaultDir];
@@ -545,13 +567,16 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
     throw new Error("usage: setup-claude-status-line [--config-dir <dir>]... [--uninstall]");
   }
   const results: Array<{ configDir: string; outcome: string; retainedPath?: string;
-    retainedClaimPath?: string; metadataRetainedPath?: string }> = [];
+    retainedClaimPath?: string; metadataRetainedPath?: string;
+    backupPath?: string; statusLineBackupPath?: string; settingsPath?: string;
+    linkCount?: number }> = [];
   for (const dir of [...new Set(dirs)]) {
     const settings = path.join(dir, "settings.json");
     assertManagedConfigTarget(settings);
     const backup = path.join(dir, STATUS_LINE_BACKUP_NAME);
     if (uninstall) {
-      if (lstatIfPresent(backup)) results.push({ configDir: dir, ...restoreClaudeStatusLine(dir) });
+      if (lstatIfPresent(backup)) results.push({ configDir: dir,
+        statusLineBackupPath: backup, ...restoreClaudeStatusLine(dir) });
       else results.push({ configDir: dir, outcome: "not_installed" });
       continue;
     }
@@ -603,11 +628,15 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
       baseProxyCommand: command, expectedSource: source.source });
     if ("reason" in outcome) {
       if (lstatIfPresent(settings)?.isSymbolicLink()) {
-        results.push({ configDir: dir, outcome: "settings_is_symlink" });
+        results.push({ configDir: dir, outcome: "settings_is_symlink",
+          statusLineBackupPath: backup, metadataRetainedPath });
         continue;
       }
       throw new Error(`claude_status_line_${outcome.outcome}:${outcome.reason}`);
     }
+    const retainedFiles = { backupPath: outcome.backupPath,
+      retainedClaimPath: outcome.retainedClaimPath, metadataRetainedPath,
+      statusLineBackupPath: backup };
     let saved: StatusLineBackup;
     let installedBytes: Buffer;
     let installed: Record<string, unknown>;
@@ -618,7 +647,7 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
     } catch {
       results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
         ? "settings_is_symlink" : "status_line_changed",
-        retainedClaimPath: outcome.retainedClaimPath });
+        ...retainedFiles });
       continue;
     }
     const before = saved.existed ? JSON.parse(Buffer.from(saved.bytes, "base64").toString("utf8")) as
@@ -630,16 +659,16 @@ export function setupClaudeStatusLine(argv: string[]): Array<{ configDir: string
     try {
       const last = lstatIfPresent(settings);
       if (last?.isSymbolicLink()) results.push({ configDir: dir,
-        outcome: "settings_is_symlink", retainedClaimPath: outcome.retainedClaimPath });
+        outcome: "settings_is_symlink", ...retainedFiles });
       else if (!last?.isFile() || !readRegularNoFollow(settings).bytes.equals(installedBytes)) {
         results.push({ configDir: dir, outcome: "status_line_changed",
-          retainedClaimPath: outcome.retainedClaimPath });
+          ...retainedFiles });
       } else results.push({ configDir: dir, outcome: outcome.outcome,
-        retainedClaimPath: outcome.retainedClaimPath, metadataRetainedPath });
+        ...retainedFiles });
     } catch {
       results.push({ configDir: dir, outcome: lstatIfPresent(settings)?.isSymbolicLink()
         ? "settings_is_symlink" : "status_line_changed",
-        retainedClaimPath: outcome.retainedClaimPath });
+        ...retainedFiles });
     }
   }
   return results;

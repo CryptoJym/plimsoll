@@ -71,14 +71,25 @@ function fired() { original.write(marker, stage); }
 fs.renameSync = function(from, to) {
   const moving = String(from) === settings && String(to).includes('.plimsoll-uninstall-');
   if (moving && (stage === 'symlink_before_rename' ||
-      stage === 'dangling_symlink_before_rename')) {
+      stage === 'dangling_symlink_before_rename' ||
+      stage === 'symlink_and_new_file_at_rename')) {
     original.unlink(settings);
     original.symlink(stage === 'dangling_symlink_before_rename' ?
       target + '-missing' : target, settings);
     fired();
   }
+  if (moving && stage === 'hardlink_before_rename') {
+    const installed = fs.readFileSync(settings);
+    original.write(target, installed);
+    original.unlink(settings);
+    fs.linkSync(target, settings);
+    fired();
+  }
   const result = original.rename.call(this, from, to);
   if (moving) side = String(to);
+  if (moving && stage === 'symlink_and_new_file_at_rename') {
+    original.write(settings, '{"operatorNewFile":true}');
+  }
   if (moving && stage === 'new_file_after_move') {
     original.write(settings, '{"operatorNewFile":true}');
     fired();
@@ -132,7 +143,8 @@ fs.closeSync = function(descriptor) {
 
 function checkRestoreAdversarial() {
   for (const stage of ['normal', 'new_file_after_move', 'symlink_before_rename',
-    'dangling_symlink_before_rename', 'dangling_symlink_after_move_initially_missing',
+    'dangling_symlink_before_rename', 'symlink_and_new_file_at_rename',
+    'hardlink_before_rename', 'dangling_symlink_after_move_initially_missing',
     'late_side_edit', 'symlink_after_final_side_read',
     'symlink_before_restore_write', 'symlink_before_repair_write']) {
     scratch(stage === 'dangling_symlink_after_move_initially_missing');
@@ -167,6 +179,19 @@ function checkRestoreAdversarial() {
     } else if (stage === 'late_side_edit') {
       assert.equal(response.result?.outcome, 'status_line_changed');
       assert.equal(observation.lateEditRetained, true);
+    } else if (stage === 'hardlink_before_rename') {
+      assert.equal(response.result?.outcome, 'status_line_changed');
+      assert.equal(response.result?.settingsPath, settings);
+      assert.equal(lstat(settings).ino, lstat(target).ino);
+      assert.equal(lstat(side).ino, lstat(target).ino);
+      assert.ok(fs.readFileSync(settings).equals(fs.readFileSync(target)));
+    } else if (stage === 'symlink_and_new_file_at_rename') {
+      assert.equal(response.result?.outcome, 'settings_is_symlink');
+      assert.equal(response.result?.settingsPath, settings);
+      assert.equal(observation.sideSymlink, true);
+      assert.equal(fs.readFileSync(settings, 'utf8'), '{"operatorNewFile":true}');
+      assert.equal(fs.readlinkSync(side), target);
+      assert.equal(fs.readFileSync(target, 'utf8'), '{"operatorTarget":true}');
     } else {
       assert.equal(response.result?.outcome, 'settings_is_symlink');
       assert.equal(observation.liveSymlink, true);
@@ -174,11 +199,34 @@ function checkRestoreAdversarial() {
       if (stage.endsWith('before_rename')) {
         assert.equal(observation.sideSymlink, true);
         assert.equal(fs.readlinkSync(settings), fs.readlinkSync(side));
+        assert.equal(lstat(settings).ino, lstat(side).ino,
+          'the operator symlink inode must be preserved');
       }
       assert.equal(fs.readFileSync(target, 'utf8'), '{"operatorTarget":true}');
     }
   }
-  console.log(JSON.stringify({ proof: 'claude-status-line-r5-adversarial', checks: 9, passed: 9 }));
+  console.log(JSON.stringify({ proof: 'claude-status-line-r5-adversarial', checks: 11, passed: 11 }));
+}
+
+function checkHardlinkUntouched() {
+  scratch();
+  const installed = fs.readFileSync(settings);
+  fs.writeFileSync(target, installed);
+  fs.unlinkSync(settings);
+  fs.linkSync(target, settings);
+  const before = lstat(settings);
+  const response = cliResult(true);
+  assert.equal(response.code, 0, response.stderr);
+  assert.equal(response.result?.outcome, 'status_line_changed');
+  assert.equal(response.result?.linkCount, 2);
+  assert.equal(response.result?.retainedPath, settings);
+  assert.equal(lstat(settings).ino, before.ino);
+  assert.equal(lstat(settings).nlink, before.nlink);
+  assert.ok(fs.readFileSync(settings).equals(installed));
+  assert.equal(fs.readdirSync(config).filter(name =>
+    name.startsWith('settings.json.plimsoll-uninstall-')).length, 0);
+  console.log(JSON.stringify({ proof: 'claude-status-line-hardlink-untouched',
+    inodeKept: true, linkCountKept: true, moved: false, changeReported: true }));
 }
 
 function checkReinstallAfterUninstall() {
@@ -220,6 +268,7 @@ function checkPreMoveSymlinks() {
 try {
   for (const dir of [home, config, env.TMPDIR]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   checkRestoreAdversarial();
+  checkHardlinkUntouched();
   checkPreMoveSymlinks();
   checkReinstallAfterUninstall();
 } finally { fs.rmSync(root, { recursive: true, force: true }); }
