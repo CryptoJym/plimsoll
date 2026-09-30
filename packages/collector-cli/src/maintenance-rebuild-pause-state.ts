@@ -365,43 +365,27 @@ function recoverReceiptArtifacts(home: string, file: string, observedTemporaries
     fs.unlinkSync(file);
     fsyncDirectory(directory);
   }
-  const candidates: Array<{ file: string; valid: boolean }> = [];
+  const candidates: string[] = [];
   for (const candidate of temporaries) {
     let stat: fs.Stats;
     try { stat = fs.lstatSync(candidate); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_refusal_unsafe");
     assertNoLegacyReceiptWriter(candidate);
-    let valid = false;
-    if (!finalExists) {
-      try {
-        readReceipt(candidate);
-        valid = true;
-      } catch (error) {
-        if (!(error instanceof SyntaxError) && (error as Error).message !== "maintenance_refusal_unsafe") throw error;
-      }
-    }
-    candidates.push({ file: candidate, valid });
+    candidates.push(candidate);
   }
-  if (!finalExists && candidates.length > 0 && !candidates.some((entry) => entry.valid)) {
-    // A malformed initial temporary has no trustworthy timestamp or instance
-    // ID. Fsync the path-keyed loss before unlinking any private bytes.
+  if (!finalExists && candidates.length > 0) {
+    // Even a valid temporary is an unpublished receipt: promoting it could
+    // hold capture claims forever if the writer died before rename. All
+    // temporaries for this receipt represent one obligation. Journal that one
+    // path-keyed loss before unlinking their private bytes.
     appendTerminalOutcome(home, { version: 1, receipt: path.basename(file),
       obligation: path.basename(file), at: new Date().toISOString(),
       outcome: "abandoned_refusal_temporary" });
   }
-  let promoted = finalValid;
   for (const candidate of candidates) {
-    if (!finalExists && !promoted && candidate.valid) {
-      const descriptor = fs.openSync(candidate.file, "r");
-      try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
-      fs.renameSync(candidate.file, file);
-      fsyncDirectory(directory);
-      promoted = true;
-    } else {
-      fs.unlinkSync(candidate.file);
-      fsyncDirectory(directory);
-    }
+    fs.unlinkSync(candidate);
+    fsyncDirectory(directory);
   }
 }
 
@@ -786,7 +770,7 @@ export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRou
     if (route !== "hook" || options.outcome === "terminal" ||
       !options.acceptedEventId || !options.ledger) return;
     if (!fs.existsSync(refusalDirectory(home))) return;
-    // A retry may commit before the first reconciliation has promoted an
+    // A retry may commit before the first reconciliation journals an
     // interrupted initial publication. Recover it under its identity lock.
     withReceiptIdentity(file, () => recoverReceiptArtifacts(home, file));
     if (fs.existsSync(file)) {
