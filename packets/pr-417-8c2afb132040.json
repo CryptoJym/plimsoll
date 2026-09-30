@@ -1,0 +1,33 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 417,
+  "headSha": "8c2afb13204b004d2aba5be01a0c733754cb5cf7",
+  "reviewedAt": "2026-09-30T05:47:04Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0ef5d-fbed-7ab1-8351-e66414ec28b2",
+    "model": "gpt-6-sol",
+    "host": "studio6"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0e3dd-413d-7fc0-a49c-c937998f000d"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0eb0f-fa61-7af1-bebf-c5f42ac40d33"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0edf7-b39a-7040-9a88-bc9fe638bc83"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0ef83-ca56-7b60-9ae0-fe6fd371ddba"
+    }
+  ],
+  "summary": "Independent Codex review lane (studio6, gpt-6-sol max, thread 01a0ef5d) of the final head 8c2afb13, rounds 5-8. Round 6 approved 9dea83ba: F3 (repo-enrichment trigger linked outbox copies by rowid only) fixed with the full incarnation and a v3 trigger replacing v2 on upgrade; the restamp gate uses the exact lineage; the eeeb5339 and b3fa0a0b merges keep both sides. Round 7 reviewed the b2a6c27e merge (b094f072) and found one P2: the retention count worker bypassed #426's connection and publication fences. Round 8 approves 8c2afb13: the worker opens through the fenced opener, a refusal is 'count unavailable', and close awaits the worker's exit with no open ledger handle left; the reviewer's connection probe refuses both fenced states. Retention, F1/F2/F3, rollback and #426's cutover gates pass. No P0-P2 finding remains."
+}
