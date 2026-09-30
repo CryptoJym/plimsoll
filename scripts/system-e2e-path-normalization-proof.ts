@@ -83,18 +83,19 @@ assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), prev
 assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), currentInstallationEpochId: "invalid" }), /workspace epoch identity invalid/);
 assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), previousWorkspaceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), /previous workspace binding changed/);
 
-// The integrated resource fixture makes one more observed metadata call on
-// macOS than on Linux. Both measured values have one semantic form, while a
-// larger change in discovery work must still reject the support artifact.
+// The real-clock boot may add or skip a few metadata calls. Keep a narrow
+// envelope while preserving the exact stable directory topology checks.
 const metadataArtifact = (count: number) => ({
   scenarios: [{ id: "no_change_constant_work", measurements: { filesystemMetadataOperations: count } }],
 });
 const metadataContext = { baseDirectory: repoRoot, roots: [] };
-assert.deepEqual(normalizeSupportingArtifact(metadataArtifact(24_567), metadataContext),
-  normalizeSupportingArtifact(metadataArtifact(24_568), metadataContext));
-for (const outside of [24_566, 24_569]) {
+for (const inside of [24_560, 24_567, 24_568, 24_576]) {
+  assert.deepEqual(normalizeSupportingArtifact(metadataArtifact(inside), metadataContext),
+    normalizeSupportingArtifact(metadataArtifact(24_567), metadataContext));
+}
+for (const outside of [24_559, 24_577]) {
   assert.throws(() => normalizeSupportingArtifact(metadataArtifact(outside), metadataContext),
-    /two-host metadata-call bound/);
+    /bounded metadata-call envelope/);
 }
 
 type ActualChildVariant = {

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 12 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 13 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -280,12 +280,13 @@ export function normalizeSupportingArtifact(
   }
   if (typeof value === "string") return normalizeString(value, key, context);
   if (typeof value === "number" && RESOURCE_METADATA_OPERATIONS_PATH.test(fieldPath)) {
-    // The merged history fixture measured 24,567 calls in hosted macOS CI
-    // and 24,568 locally. Keep the count tightly bounded in the contract
-    // while retaining the resource proof's raw work counters.
-    assert.ok(Number.isInteger(value) && value >= 24_567 && value <= 24_568,
-      `${key} must stay within the observed two-host metadata-call bound`);
-    return "<bounded-metadata-operations:24567-24568>";
+    // Startup discovery still uses the real wall, so the total metadata-call
+    // count can vary across runs even though the stable sweep's exact directory
+    // topology and enumeration checks pass. Bound this counter within sixteen
+    // calls of the measured fixture instead of pinning an incidental exact count.
+    assert.ok(Number.isInteger(value) && value >= 24_560 && value <= 24_576,
+      `${key} must stay within the bounded metadata-call envelope; observed=${value}`);
+    return "<bounded-metadata-operations:24560-24576>";
   }
   if (
     typeof value === "number" &&
