@@ -51,6 +51,86 @@ jobs:
         # Run through the isolated proof wrapper, not pnpm, so pnpm config cannot skip the gate.
         run: node ./node_modules/tsx/dist/cli.mjs scripts/run-proof.ts scripts/ci-coverage-proof.ts
 
+      - name: Prove Studio0 replacement ledger cutover safety (PR 426 round 6)
+        run: |
+          pnpm proof:pr426-r6-cutover-append-race
+          pnpm proof:pr426-r6-archive-permissions
+          pnpm proof:pr426-r6-min-version-045
+          pnpm proof:pr426-r6-older-week-backlog
+          pnpm proof:pr426-r6-unseen-file-clock-skew
+          pnpm proof:pr426-r6-rollback-weekly-total
+          pnpm proof:pr426-r6-read-only-preflight-sidecars
+          pnpm proof:pr426-r6-archive-query-plans
+          pnpm proof:pr426-r6-carry-budget
+          pnpm proof:pr426-r6-crash-mid-carry
+          pnpm proof:pr426-r6-stale-generation-growth
+
+      - name: Prove replacement and restore recovery boundaries (PR 426 round 7)
+        run: |
+          pnpm proof:pr426-r7-replaced-during-switch
+          pnpm proof:pr426-r7-append-before-first-scan
+          pnpm proof:pr426-r7-replace-after-rename
+          pnpm proof:pr426-r7-restore-weekly-control
+          pnpm proof:pr426-r7-plan-open-refusal-sidecars
+          pnpm proof:pr426-r7-restore-rerun
+
+      - name: Prove post-swap fence and restore stage provenance (PR 426 round 8)
+        run: |
+          pnpm proof:pr426-r8-swap-replacement-race
+          pnpm proof:pr426-r8-same-generation-append
+          pnpm proof:pr426-r8-foreign-restore-stage
+          pnpm proof:pr426-r8-restore-sidecar-inventory
+          pnpm proof:pr426-r8-restore-sidecar-checkpoint
+
+      - name: Prove read-time generation admission and archive-only restore retries (PR 426 round 9)
+        run: |
+          pnpm proof:pr426-r9-untracked-swap-race
+          pnpm proof:pr426-r9-carried-post-stat-race
+          pnpm proof:pr426-r9-rename-fsync-record
+          pnpm proof:pr426-r9-restore-content-reclone
+          pnpm proof:pr426-r9-restore-clone-fsync-retry
+          pnpm proof:pr426-r9-restore-journal-fsync-retry
+          pnpm proof:pr426-r9-restore-nonce-reclone
+          pnpm proof:pr426-r10-new-path-after-rename
+          pnpm proof:pr426-r10-new-session-restart
+          pnpm proof:pr426-r10-untimestamped-new-path
+          pnpm proof:pr426-r10-rename-delay-report
+          pnpm proof:pr426-r10-epoch-fixture
+
+      - name: Prove forward-skew records occur exactly once across archive and fresh ledger (PR 426 round 11)
+        run: |
+          pnpm proof:pr426-r11-review-pre-rename-missed
+          pnpm proof:pr426-r11-review-during-rename
+          pnpm proof:pr426-r11-review-future-skew
+          pnpm proof:pr426-r11-review-future-skew-only
+          pnpm proof:pr426-r11-review-stamp-boundary
+          pnpm proof:pr426-r11-review-backward-skew
+          pnpm proof:pr426-r11-review-hook-first
+          pnpm proof:pr426-r11-review-crash-markers
+          pnpm proof:pr426-r11-exactly-once
+          pnpm proof:pr426-r11-window-measurement
+
+      - name: Prove ledger connection fencing and conservative forward window (PR 426 round 13)
+        run: |
+          pnpm proof:pr426-r13-real-collector-opener
+          pnpm proof:pr426-r13-raw-old-handle
+          pnpm proof:pr426-r13-forward-window-bound
+          pnpm proof:pr426-r13-cutover-recovery
+          pnpm proof:pr426-r13-cli-refusal
+          pnpm proof:pr426-r13-supervised-restart
+          pnpm proof:pr426-r13-shared-lifetime
+          pnpm proof:pr426-r13-old-connection
+          pnpm proof:pr426-r13-missing-marker-recovery
+          pnpm proof:pr426-r13-integrity-recovery
+          pnpm proof:pr426-r13-post-check-raw-handle
+          pnpm proof:pr426-r13-startup-marker-recovery
+          pnpm proof:pr426-r13-startup-integrity-recovery
+
+      - name: Prove one cutover wins and live collector connections refuse both (PR 426 round 17)
+        run: |
+          pnpm proof:pr426-r17-two-switch-race
+          pnpm proof:pr426-r17-open-collector-two-switch
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit
@@ -70,6 +150,30 @@ jobs:
           pnpm proof:authenticated-ingestion
           pnpm proof:status-http-rollout
           pnpm proof:retention
+          pnpm proof:retention-null-generation-privacy
+          pnpm proof:retention-upgrade-downgrade
+          pnpm proof:retention-reused-id-downgrade
+          pnpm proof:retention-repeated-reuse-downgrade
+          pnpm proof:retention-reused-id-privacy-collision
+          pnpm proof:retention-reused-id-privacy-rowid
+          pnpm proof:retention-repeated-reuse-property
+          pnpm proof:retention-stale-outbox-link
+          pnpm proof:retention-restamp-lineage
+          pnpm proof:retention-v2-trigger-upgrade
+          pnpm proof:retention-lease-lineage-aba
+          pnpm proof:retention-receipt-migration-crash
+          pnpm proof:retention-0739-privacy
+          pnpm proof:retention-0739-delivery
+          pnpm proof:retention-0739-v44-rollback
+          pnpm proof:retention-missing-raw
+          pnpm proof:retention-event-detail-outbox
+          pnpm proof:retention-generation-count
+          pnpm proof:retention-worker-fence
+          pnpm proof:retention-worker-close
+
+      - name: Prove 0.7.44 dead-receipt lineage scale
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:receipt-lineage-scale
 
       - name: Prove event allocation conservation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

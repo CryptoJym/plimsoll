@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 /** Removing and replacing a root must not lend its old rows the new root's bind. */
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -23,13 +24,13 @@ const binding = dispatchBindingSchema.parse({ sessionId,
   companyRef: null, attemptId, parentAttemptId: null, acceptedOutcomeId: null,
   validFrom: new Date(now - 120_000).toISOString(), validUntil: null,
   evidenceRef: "dispatch:root-reuse-review" });
-const old = { rootId: "claude-a", profileId: "old-profile", installationEpochId: "old-epoch",
+const old = { rootId: "claude-a", profileId: "old-profile", installationEpochId: fixtureEpochId("old-epoch"),
   source: "claude_code" as const, directory: path.join(home, ".claude-old", "projects"),
   dispatch: [binding] };
-const sibling = { rootId: "claude-b", profileId: "sibling-profile", installationEpochId: "sibling-epoch",
+const sibling = { rootId: "claude-b", profileId: "sibling-profile", installationEpochId: fixtureEpochId("sibling-epoch"),
   source: "claude_code" as const, directory: path.join(home, ".claude-b", "projects"),
   dispatch: [binding] };
-const replacement = { ...old, profileId: "new-profile", installationEpochId: "new-epoch",
+const replacement = { ...old, profileId: "new-profile", installationEpochId: fixtureEpochId("new-epoch"),
   directory: path.join(home, ".claude-new", "projects") };
 for (const root of [old, sibling, replacement])
   fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });

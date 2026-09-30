@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -19,7 +20,7 @@ const sessionId = "r3-sequential-cli-bind";
 const oldWork = "beads:eco-6hoxj.165.96";
 const newWork = "beads:eco-6hoxj.165.97";
 const roots = Array.from({ length: 3 }, (_, i) => ({ rootId: `claude-${i}`,
-  profileId: `profile-${i}`, installationEpochId: `epoch-${i}`, source: "claude_code" as const,
+  profileId: `profile-${i}`, installationEpochId: fixtureEpochId(`epoch-${i}`), source: "claude_code" as const,
   directory: path.join(home, `.claude-${i}`, "projects") }));
 for (const root of roots) fs.mkdirSync(root.directory, { recursive: true });
 fs.mkdirSync(plimsoll, { recursive: true });

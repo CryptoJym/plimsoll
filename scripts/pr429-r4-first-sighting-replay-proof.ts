@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -16,9 +17,9 @@ import { createProofCompletion } from "./lib/proof-completion";
 const home=process.env.HOME!,plimsoll=process.env.PLIMSOLL_HOME!;
 const now=Date.now(),observedAt=new Date(now-60_000).toISOString();
 const sessionId="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:"epoch-a",
+const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:fixtureEpochId("epoch-a"),
   source:"claude_code" as const,directory:path.join(home,".claude-a","projects")};
-const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:"epoch-b",
+const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:fixtureEpochId("epoch-b"),
   source:"claude_code" as const,directory:path.join(home,".claude-b","projects")};
 const binding=dispatchBindingSchema.parse({sessionId,workItemId:"beads:eco-6hoxj.165.97",
   projectKey:`sha256:${"a".repeat(64)}`,companyRef:null,

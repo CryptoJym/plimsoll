@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 /** Reviewer regression: a later Claude root must not inherit another root's work. */
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -24,9 +25,9 @@ const binding = dispatchBindingSchema.parse({
   validUntil: new Date(Date.now() + 120_000).toISOString(), evidenceRef: "dispatch:synthetic-review",
 });
 const roots = [
-  { rootId: "claude-a", profileId: "claude-a", installationEpochId: "epoch-a",
+  { rootId: "claude-a", profileId: "claude-a", installationEpochId: fixtureEpochId("epoch-a"),
     source: "claude_code" as const, directory: path.join(home, ".claude", "projects"), dispatch: [binding] },
-  { rootId: "claude-b", profileId: "claude-b", installationEpochId: "epoch-b",
+  { rootId: "claude-b", profileId: "claude-b", installationEpochId: fixtureEpochId("epoch-b"),
     source: "claude_code" as const, directory: path.join(home, ".claude-seats", "seat-b", "projects") },
 ];
 for (const root of roots) fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });

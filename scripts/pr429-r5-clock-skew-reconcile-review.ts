@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -12,9 +13,9 @@ import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
 async function main() {
   const home=process.env.HOME!,plimsoll=process.env.PLIMSOLL_HOME!;
   const realStart=Date.now(),frozenNow=realStart,sessionId=crypto.randomUUID();
-  const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:"epoch-a",
+  const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:fixtureEpochId("epoch-a"),
     source:"claude_code" as const,directory:path.join(home,"claude-a","projects")};
-  const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:"epoch-b",
+  const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:fixtureEpochId("epoch-b"),
     source:"claude_code" as const,directory:path.join(home,"claude-b","projects")};
   fs.mkdirSync(A.directory,{recursive:true});
   fs.mkdirSync(B.directory,{recursive:true});

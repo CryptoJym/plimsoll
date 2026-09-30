@@ -314,9 +314,12 @@ async function runFenceErasureCase(kind: "delete" | "privacy" | "receipt") {
     : kind === "privacy"
       ? markRawPrivacyDisposition(external, rowid, "local_privacy_violation", new Date().toISOString())
       : external.prepare(`insert into upload_receipts
-          (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
-          values (?, 'dead', 'local_privacy_violation', 'local', 0, ?, ?)`)
-        .run(eventId, until, until).changes;
+          (delivery_id, raw_rowid, raw_id, raw_created_at, raw_generation,
+           terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
+          select ?, rowid, id, created_at, privacy_generation,
+            'dead', 'local_privacy_violation', 'local', 0, ?, ?
+          from buffered_events where id = ?`)
+        .run(eventId, until, until, eventId).changes;
   let firstBody = "";
   let erasureAttempt = "not_attempted";
   try {
@@ -927,9 +930,12 @@ async function reviewRegressions() {
           if (!changed && queries.some((query) => /order by (?:e\.observed_at, e\.rowid|scan\.sort_observed_at, scan\.raw_rowid) asc/.test(query.sql))) {
             changed = true;
             buffer.database.prepare(`insert into upload_receipts
-              (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
-              values (?, 'dead', 'local_privacy_violation', 'local', 0, ?, ?)`).run(
-              uuid(481), "2026-09-20T02:00:00.000Z", "2026-09-20T02:00:00.000Z",
+              (delivery_id, raw_rowid, raw_id, raw_created_at, raw_generation,
+               terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
+              select ?, rowid, id, created_at, privacy_generation,
+                'dead', 'local_privacy_violation', 'local', 0, ?, ?
+              from buffered_events where id = ?`).run(
+              uuid(481), "2026-09-20T02:00:00.000Z", "2026-09-20T02:00:00.000Z", uuid(481),
             );
           }
           return rows;

@@ -555,10 +555,11 @@ export function recordClaudeRootSessionSighting(buffer: import("./buffer").Local
   return true;
 }
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
-export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined,historyImportNoLiveSibling=false): boolean {
+export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined,carriedBytes = false,historyImportNoLiveSibling=false): boolean {
   const parsedAccount = root?.account ? accountAssertionV1Schema.safeParse(root.account) : null;
-  const trustedEpoch = root && parsedAccount?.success && accountAssertionContains(parsedAccount.data, event.observedAt) &&
-    event.metadata?.installationEpochId===root.installationEpochId ? root.installationEpochId : undefined;
+  const trustedEpoch = root && event.metadata?.installationEpochId===root.installationEpochId &&
+    (carriedBytes || parsedAccount?.success && accountAssertionContains(parsedAccount.data, event.observedAt))
+    ? root.installationEpochId : undefined;
   if (buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId ?? event.metadata?.installationEpochId, trustedEpoch))
     return false;
   if(!root)

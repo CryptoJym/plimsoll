@@ -1232,7 +1232,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
           // were read; session authority is checked again under the writer.
           const authority = db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
             .get(root.source, e.sessionId) as { authority: string } | undefined;
-          if (authority?.authority !== "live" && appendRootObservation(buffer, e, root, true)) {
+          if (authority?.authority !== "live" && appendRootObservation(buffer, e, root, false, true)) {
             rows += 1;
             counts.input += e.inputTokens ?? 0;
             counts.output += e.outputTokens ?? 0;

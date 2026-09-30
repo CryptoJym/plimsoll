@@ -1,8 +1,12 @@
+import { openLedgerDatabase } from "./ledger-connection";
+import { recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallationEpoch,
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
+import type { Worker } from "node:worker_threads";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
@@ -27,6 +31,8 @@ import {
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
+import { ensureUuidEventId, registerRetentionDeliveryId } from "./delivery-id";
+import { countRetentionHoldsOffThread } from "./retention-hold-count";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
@@ -34,7 +40,7 @@ import { promoteRuntimeLearningFacts } from "./runtime-facts";
 import { ensureWeeklyToolStatsSchema } from "./weekly-tool-stats";
 import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFinancePublicationDirty,
   advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
-import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import { legacyNullLineageReceiptMatchSql, terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
 import {
   canonicalRepoContextCwd,
@@ -90,6 +96,7 @@ export type RawRetentionStatus = {
   states: {
     retained: number;
     pendingDelivery: number;
+    heldForUpload: number;
     quarantined: number;
     expired: number;
     notInspected: 0;
@@ -231,6 +238,17 @@ export class LocalEventBuffer {
   readonly learningFacts: LearningFactStore;
   private insertEventStatement?: Database.Statement;
   private budgetAttemptedRows = 0;
+  private retentionHoldCount: {
+    count: number; cutoffAt: string; measuredAtMonotonic: number;
+    revision: number; generation: number; retentionDays: number;
+  } | null = null;
+  private retentionHoldTask: { worker: Worker; result: Promise<number>; exited: Promise<void> } | null = null;
+  private readonly retentionHoldWorkers = new Set<{ worker: Worker; exited: Promise<void> }>();
+  private retentionHoldClose: Promise<void> | null = null;
+  private retentionHoldCountDirty = false;
+  private retentionHoldCountClosed = false;
+  private retentionHoldGeneration = 0;
+  private retentionHoldCountChanged: (() => void) | null = null;
 
   constructor(
     path: string,
@@ -243,6 +261,9 @@ export class LocalEventBuffer {
       };
       workspaceId?: string;
       deviceId?: string;
+      /** An epoch-unbound ledger may inherit the agreed epoch of configured
+       * capture roots. null means roots disagree and binding must refuse. */
+      freshCaptureRootEpoch?: string | null;
       /** Clock seam for deterministic enrollment fixtures; never replaces a persisted cutoff. */
       enrollmentNow?: () => Date;
       learningFacts?: { limits?: Partial<LearningFactLimits> };
@@ -268,7 +289,44 @@ export class LocalEventBuffer {
     };
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
-    this.db = new Database(path, { timeout });
+    if (options.freshCaptureRootEpoch !== undefined && options.freshCaptureRootEpoch !== null &&
+        !installationEpochIdSchema.safeParse(options.freshCaptureRootEpoch).success) {
+      throw new Error("installation_epoch_id_invalid");
+    }
+    // A mixed-root replacement must not leave an empty SQLite file or WAL
+    // sidecar behind. An existing bound ledger decides from its durable epoch
+    // inside useWorkspace's transaction, regardless of stale root config.
+    if (options.freshCaptureRootEpoch === null && !fs.existsSync(path)) {
+      throw new Error("fresh_ledger_capture_root_epochs_conflict");
+    }
+    try { this.db = openLedgerDatabase(path, { timeout }); }
+    catch (error) {
+      if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
+        recoverInvalidLedgerPublication(path);
+        throw new Error("replacement_verification_failed; archive restored; collector start refused", { cause: error });
+      }
+      throw error;
+    }
+    // An interrupted rename must not admit a first scan before the post-swap
+    // file-generation fences are durable. Restore can still open it directly.
+    try {
+      const replacement = this.db.prepare(`select 1 from sqlite_master
+        where type='table' and name='collector_replacement_ledger'`).get();
+      if (replacement) {
+        const columns = this.db.pragma("table_info(collector_replacement_ledger)") as
+          Array<{ name: string }>;
+        const pending = columns.some(column => column.name === "post_switch_fence_pending")
+          ? this.db.prepare(`select post_switch_fence_pending as pending
+            from collector_replacement_ledger where singleton=1`).get() as
+              { pending: number } | undefined
+          : undefined;
+        if (pending?.pending !== 0) throw new Error("replacement_post_switch_fence_pending");
+      }
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+    registerRetentionDeliveryId(this.db);
     this.db.pragma("journal_mode = WAL");
     this.deviceId = options.deviceId?.trim() || null;
     const newLedger = !this.db
@@ -359,7 +417,7 @@ export class LocalEventBuffer {
         delete from claude_replay_hooks where event_id=old.id;
       end;
       create table if not exists raw_retention_receipts (
-        event_id text primary key,
+        event_id text not null,
         raw_rowid integer not null,
         raw_created_at text not null,
         raw_generation text,
@@ -490,6 +548,48 @@ export class LocalEventBuffer {
       ) without rowid;
     `);
     markOpenStep("ledger.core_schema");
+    // Released collectors insert expiry receipts with INSERT OR IGNORE. Keep
+    // that statement valid after rollback while allowing a later incarnation
+    // of the same caller-controlled event ID to record its own expiry.
+    // The fast path avoids taking a writer lock on every subsequent open.
+    // Recheck under the writer lock so concurrent upgraders cannot both rebuild.
+    const oldReceiptKey = () => (this.db.pragma("table_info(raw_retention_receipts)") as
+      Array<{ name: string; pk: number }>).some((column) =>
+        column.name === "event_id" && column.pk !== 0);
+    const hasIncarnationIndex = () => Boolean(this.db.prepare(`select 1 from sqlite_master
+      where type='index' and name='idx_raw_retention_incarnation'`).get());
+    if (oldReceiptKey() || !hasIncarnationIndex()) this.db.transaction(() => {
+      if (oldReceiptKey()) {
+        const dependentTriggers = this.db.prepare(`select name,sql from sqlite_master
+          where type='trigger' and sql like '%raw_retention_receipts%'`).all() as
+          Array<{ name: string; sql: string }>;
+        for (const trigger of dependentTriggers) {
+          this.db.exec(`drop trigger "${trigger.name.replaceAll('"', '""')}"`);
+        }
+        this.db.exec(`
+          create table raw_retention_receipts_by_incarnation (
+            event_id text not null,
+            raw_rowid integer not null,
+            raw_created_at text not null,
+            raw_generation text,
+            expired_at text not null,
+            reason text not null check (reason = 'retention_window_elapsed')
+          );
+          insert into raw_retention_receipts_by_incarnation
+            (event_id,raw_rowid,raw_created_at,raw_generation,expired_at,reason)
+          select event_id,raw_rowid,raw_created_at,raw_generation,expired_at,reason
+          from raw_retention_receipts;
+          drop table raw_retention_receipts;
+          alter table raw_retention_receipts_by_incarnation rename to raw_retention_receipts;
+        `);
+        for (const trigger of dependentTriggers) this.db.exec(trigger.sql);
+      }
+      // The two expression terms distinguish NULL from an empty generation.
+      this.db.exec(`create unique index if not exists idx_raw_retention_incarnation
+        on raw_retention_receipts
+          (event_id,raw_rowid,raw_created_at,(raw_generation is null),coalesce(raw_generation,''))`);
+    }).immediate();
+    markOpenStep("ledger.retention_receipt_schema");
     const replayHookColumns = new Set(
       (this.db.pragma("table_info(claude_replay_hooks)") as Array<{ name: string }>)
         .map((column) => column.name),
@@ -594,8 +694,71 @@ export class LocalEventBuffer {
     this.delivery = new DeliveryOutbox(this.db, {
       ...(options.delivery ?? {}),
       deviceId: options.deviceId,
+      onHoldChange: () => this.invalidateRetentionHoldCount(),
     });
     markOpenStep("ledger.delivery_schema");
+    // The revision is durable so every writer, including legacy repair and
+    // direct ledger mutations, fences an in-flight read-only count worker.
+    // No historical rows are scanned or rewritten when these triggers land.
+    this.db.exec(`
+      create table if not exists retention_hold_revision (
+        singleton integer primary key check (singleton = 1),
+        revision integer not null default 0
+      );
+      insert or ignore into retention_hold_revision (singleton,revision) values (1,0);
+      create trigger if not exists trg_retention_hold_raw_insert
+      after insert on buffered_events begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_raw_delete
+      after delete on buffered_events begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      drop trigger if exists trg_retention_hold_raw_update;
+      create trigger trg_retention_hold_raw_update
+      after update of id,created_at,data_mode,uploaded_at,privacy_disposition,
+        privacy_generation,usage_duplicate_reason,workspace_id,device_id on buffered_events begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_outbox_insert
+      after insert on upload_outbox begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_outbox_delete
+      after delete on upload_outbox begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_outbox_lineage
+      after update of delivery_id,raw_rowid,raw_id on upload_outbox begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_receipt_insert
+      after insert on upload_receipts begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      drop trigger if exists trg_retention_hold_receipt_update;
+      create trigger trg_retention_hold_receipt_update
+      after update of delivery_id,terminal_state,reason,raw_rowid,raw_id,
+        raw_created_at,raw_generation on upload_receipts begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_receipt_delete
+      after delete on upload_receipts begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_binding_insert
+      after insert on collector_workspace_binding begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_binding_update
+      after update of current_workspace_id,current_device_id on collector_workspace_binding begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+      create trigger if not exists trg_retention_hold_binding_delete
+      after delete on collector_workspace_binding begin
+        update retention_hold_revision set revision=revision+1 where singleton=1;
+      end;
+    `);
     // A 0.7.40 ledger can still hold an unexpired upload lease. Remove its
     // insert fence before the daemon accepts the first intake request.
     // Other ledgers keep the lazy session-summary schema initialization.
@@ -606,7 +769,8 @@ export class LocalEventBuffer {
       ensureSessionSummarySchema(this.db);
       markOpenStep("ledger.session_summary_schema");
     }
-    if (options.workspaceId) this.useWorkspace(options.workspaceId);
+    if (options.workspaceId) this.useWorkspace(options.workspaceId, this.deviceId,
+      undefined, options.freshCaptureRootEpoch);
     markOpenStep("ledger.workspace_binding");
     this.db.exec(`
       create index if not exists idx_events_upload on buffered_events (uploaded_at, created_at);
@@ -749,11 +913,19 @@ export class LocalEventBuffer {
           updated_at = excluded.updated_at;
       end;
 
-      -- Repo enrichment may discover linkage after capture. The delivery
-      -- copy accepts fill-only hashes until its first seal; retries never
-      -- change the bytes already attempted.
+    `);
+    // Replace the installed rowid-only trigger atomically on upgrade. Repo
+    // enrichment may fill an unsealed copy only for this exact raw incarnation.
+    const linkageTriggers = this.db.prepare(`select name from sqlite_master
+      where type='trigger' and name in ('trg_events_outbox_linkage_update',
+        'trg_events_outbox_linkage_update_v2', 'trg_events_outbox_linkage_update_v3')`)
+      .all() as Array<{ name: string }>;
+    if (linkageTriggers.length !== 1 ||
+        linkageTriggers[0].name !== "trg_events_outbox_linkage_update_v3") {
+      this.db.transaction(() => this.db.exec(`
       drop trigger if exists trg_events_outbox_linkage_update;
-      create trigger if not exists trg_events_outbox_linkage_update_v2
+      drop trigger if exists trg_events_outbox_linkage_update_v2;
+      create trigger if not exists trg_events_outbox_linkage_update_v3
       after update of repo_hash, branch_hash on buffered_events
       when (
         length(trim(new.repo_hash)) = 71 and
@@ -779,10 +951,13 @@ export class LocalEventBuffer {
               lower(substr(trim(new.branch_hash), 8)) not glob '*[^0-9a-f]*'
             then lower(trim(new.branch_hash)) end),
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        where raw_rowid = new.rowid
+        where raw_rowid = new.rowid and raw_id = new.id
+          and raw_created_at = new.created_at
+          and raw_generation is new.privacy_generation
           and sealed_envelope_json is null and attempt_count = 0;
       end;
-    `);
+      `)).immediate();
+    }
     markOpenStep("ledger.raw_indexes_and_triggers");
     // Empty on first upgrade; maintenance backfills older rows in bounded batches.
     ensureSessionContextIndexSchema(this.db);
@@ -809,6 +984,10 @@ export class LocalEventBuffer {
         : undefined,
     });
     markOpenStep("ledger.projection_schema");
+    // Small upgrades finish at open; large ledgers advance in bounded upload
+    // and retention turns, independently of the completed raw cursor.
+    this.delivery.backfillLegacyReceiptLineage({ maxRows: 16, maxWriterMs: 50 });
+    markOpenStep("ledger.receipt_lineage_slice");
   }
 
   /**
@@ -825,7 +1004,8 @@ export class LocalEventBuffer {
    * returns. Binding ANY managed/joined workspace must never adopt
    * unassigned rows: that relabel is the exact leak class #163 quarantines.
    */
-  useWorkspace(workspaceId: string, deviceId = this.deviceId, installationEpochId?: string) {
+  useWorkspace(workspaceId: string, deviceId = this.deviceId, installationEpochId?: string,
+    freshCaptureRootEpoch?: string | null) {
     const requested = workspaceId.trim();
     if (!requested) throw new Error("Workspace binding requires a non-empty workspace id.");
     let requestedDevice = deviceId?.trim() || null;
@@ -835,11 +1015,13 @@ export class LocalEventBuffer {
         .prepare(
           `select current_workspace_id as currentWorkspaceId,
              previous_workspace_id as previousWorkspaceId,
-             current_device_id as currentDeviceId
+             current_device_id as currentDeviceId,
+             current_installation_epoch_id as currentInstallationEpochId
            from collector_workspace_binding where singleton = 1`,
         )
         .get() as
-        | { currentWorkspaceId: string; previousWorkspaceId: string | null; currentDeviceId: string | null }
+        | { currentWorkspaceId: string; previousWorkspaceId: string | null; currentDeviceId: string | null;
+            currentInstallationEpochId: string | null }
         | undefined;
       if (binding && binding.currentWorkspaceId !== requested) {
         throw new Error(
@@ -857,6 +1039,13 @@ export class LocalEventBuffer {
       // device, inherit that binding rather than creating new unbound rows.
       if (!requestedDevice && binding?.currentDeviceId) {
         requestedDevice = binding.currentDeviceId;
+      }
+      // Use the root epoch only until an epoch binding is durable. The check
+      // and the binding write share this transaction, so a crash before commit
+      // leaves the next open eligible, and a competing binder cannot be
+      // overwritten by a stale pre-transaction new-file observation.
+      if (!binding?.currentInstallationEpochId && freshCaptureRootEpoch === null) {
+        throw new Error("fresh_ledger_capture_root_epochs_conflict");
       }
       if (!binding) {
         this.db
@@ -896,7 +1085,9 @@ export class LocalEventBuffer {
             .run(requestedDevice, LOCAL_TENANT_ID);
         }
       }
-      selectedEpochId = this.ensureCurrentInstallationEpoch(requested, installationEpochId);
+      selectedEpochId = this.ensureCurrentInstallationEpoch(requested,
+        installationEpochId ?? (!binding?.currentInstallationEpochId
+          ? freshCaptureRootEpoch ?? undefined : undefined));
       // Deliberately no backfill for managed workspaces here or in any later
       // selection: once a managed workspace is selected, unassigned history is
       // permanently ineligible for that audience (lease and list filters are
@@ -1921,7 +2112,8 @@ export class LocalEventBuffer {
        order by suppressed_at, context_id limit 1`,
     );
     const selectRows = this.db.prepare(
-      `select l.event_id as eventId, e.rowid
+      `select l.event_id as eventId, e.rowid,
+         e.created_at as createdAt,e.privacy_generation as generation
        from repo_context_event_links l indexed by idx_repo_context_event_links_cleanup
        left join buffered_events e on e.id = l.event_id
        where l.context_id = ? and l.suppression_cleaned = 0
@@ -1929,7 +2121,9 @@ export class LocalEventBuffer {
     );
     const clearOutbox = this.db.prepare(
       `update upload_outbox set repo_hash = null, branch_hash = null, updated_at = ?
-       where raw_rowid = ? and sealed_envelope_json is null and attempt_count = 0`,
+       where raw_rowid = ? and raw_id = ? and raw_created_at = ?
+         and raw_generation is ?
+         and sealed_envelope_json is null and attempt_count = 0`,
     );
     const clearRow = this.db.prepare(
       `update buffered_events set repo_hash = null, branch_hash = null, head_sha = null
@@ -1962,10 +2156,13 @@ export class LocalEventBuffer {
       const rows = selectRows.all(context.contextId, bounded - rowsVisited) as Array<{
         eventId: string;
         rowid: number | null;
+        createdAt: string | null;
+        generation: string | null;
       }>;
       for (const row of rows) {
         rowsVisited += 1;
-        if (row.rowid !== null) clearOutbox.run(now, row.rowid);
+        if (row.rowid !== null) clearOutbox.run(now, row.rowid,
+          row.eventId, row.createdAt, row.generation);
         rowsCleared += clearRow.run(row.eventId).changes;
         markCleaned.run(row.eventId, context.contextId);
       }
@@ -3096,6 +3293,69 @@ export class LocalEventBuffer {
     return run(ids);
   }
 
+  /** Keep active and unacknowledged deliveries; old uploaded_at-only rows may expire. */
+  private rawRetentionUploadHoldSql() {
+    // Lease uses this same durable audience. A previous audience cannot make
+    // progress after a binding change and must not hold raw retention open.
+    const activeAudience = `(e.workspace_id is (
+      select current_workspace_id from collector_workspace_binding where singleton = 1
+    ) and e.device_id is (
+      select current_device_id from collector_workspace_binding where singleton = 1
+    ))`;
+    // Pre-raw_id rows retain raw_rowid; only fully unlinked legacy rows use
+    // the derived delivery id. A linked row can share that id with another raw.
+    const activeOutbox = `(exists (
+      select 1 from upload_outbox o
+      where o.raw_rowid = e.rowid and (o.raw_id is null or
+        (o.raw_id = e.id and o.raw_created_at = e.created_at
+          and o.raw_generation is e.privacy_generation))
+    ) or exists (
+      select 1 from upload_outbox o where o.delivery_id = retention_delivery_id(e.id)
+        and o.raw_rowid is null and o.raw_id is null
+    ))`;
+    const outboxEligible = this.rawRetentionOutboxEligibleSql();
+    if (!this.delivery.isEnabled()) return `(${activeAudience} and ${outboxEligible} and ${activeOutbox})`;
+    return `(${activeAudience} and ((${outboxEligible} and ${activeOutbox}) or (
+      e.data_mode = 'metadata'
+      and e.privacy_disposition is null
+      and e.usage_duplicate_reason is null
+      and not exists (
+        select 1 from upload_receipts local_receipt
+        where local_receipt.raw_rowid = e.rowid
+          and local_receipt.raw_id = e.id
+          and local_receipt.raw_created_at = e.created_at
+          and local_receipt.raw_generation is e.privacy_generation
+          and local_receipt.terminal_state = 'dead'
+          and local_receipt.reason in (
+            'local_evidence_quarantined', 'local_payload_unparseable',
+            'local_schema_invalid', 'local_privacy_violation',
+            'local_item_oversize', 'local_usage_duplicate'
+          )
+      )
+      and (e.uploaded_at is null or exists (
+        select 1 from upload_receipts unacknowledged
+        where unacknowledged.raw_rowid = e.rowid
+          and unacknowledged.raw_id = e.id
+          and unacknowledged.raw_created_at = e.created_at
+          and unacknowledged.raw_generation is e.privacy_generation
+          and unacknowledged.terminal_state = 'dead'
+      ) or exists (
+        -- Until the bounded lineage repair proves an owner, a legacy remote
+        -- rejection can only add a hold. It must never waive one.
+        select 1 from upload_receipts legacy_unacknowledged
+        where ${legacyNullLineageReceiptMatchSql("e", "legacy_unacknowledged")}
+          and legacy_unacknowledged.terminal_state = 'dead'
+          and legacy_unacknowledged.reason in
+            ('remote_validation_rejected', 'remote_rejected_exhausted')
+      ))
+    )))`;
+  }
+
+  private rawRetentionOutboxEligibleSql() {
+    return `(e.data_mode = 'metadata' and e.privacy_disposition is null
+      and e.usage_duplicate_reason is null)`;
+  }
+
   prune(
     retentionDays = 90,
     options: { maxRows?: number; now?: Date } = {},
@@ -3104,6 +3364,10 @@ export class LocalEventBuffer {
     const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
     const now = options.now ?? new Date();
     const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1_000).toISOString();
+    // The ordinary retention cadence starts immediately and follows hasMore.
+    // Keep repairing dead receipts between upload intervals without extending
+    // any one writer turn beyond its existing 100 ms limit.
+    const lineageRepair = this.delivery.backfillLegacyReceiptLineage({ maxRows: 256, maxWriterMs: 100 });
     // A bounded upgrade page runs before the first raw deletion. If it has
     // more observations, defer this pass; the next call resumes at its durable
     // cursor. Every deletion also promotes its own observation atomically.
@@ -3111,16 +3375,12 @@ export class LocalEventBuffer {
     if(!promotion.complete) return {
       cutoff,events:0,metricSamples:0,eventRowsVisited:0,
       migrationProtectedRows:0,metricRowsVisited:0,hasMore:true,
+      madeProgress:promotion.visited>0 || lineageRepair.visited>0,
     };
     // Seek through a bounded raw candidate page BEFORE checking migration.
     // A protected prefix must neither cause a full scan nor hide later rows.
     const scanKey = "raw_retention_scan_v1";
-    const deliveryProtection = this.delivery.isEnabled()
-      ? `case when e.uploaded_at is not null or exists (
-           select 1 from upload_outbox o
-           where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
-         ) then 0 else 1 end`
-      : "0";
+    const deliveryProtection = `case when ${this.rawRetentionUploadHoldSql()} then 1 else 0 end`;
     const run = this.db.transaction(() => {
       const stored = this.db.prepare(`select value from maintenance_state where key=?`).get(scanKey) as {value:string}|undefined;
       const scan = stored ? JSON.parse(stored.value) as {at:string;id:string;metricsFirst:boolean} :
@@ -3132,14 +3392,21 @@ export class LocalEventBuffer {
       const candidates = rawLimit === 0 ? [] : this.db.prepare(
         `select e.rowid as rawRowid, e.id as eventId,
            e.created_at as rawCreatedAt, e.privacy_generation as rawGeneration,
-           e.source, e.workspace_id as workspaceId, e.installation_epoch_id as installationEpochId, e.observed_at as observedAt,
+           e.source, e.workspace_id as workspaceId, e.device_id as deviceId,
+           e.data_mode as dataMode, e.privacy_disposition as privacyDisposition,
+           e.usage_duplicate_reason as usageDuplicateReason,
+           case when ${this.rawRetentionOutboxEligibleSql()} then 1 else 0 end as uploadEligible,
+           e.installation_epoch_id as installationEpochId, e.observed_at as observedAt,
            ${deliveryProtection} as migrationProtected
          from buffered_events e indexed by idx_events_retention
          where e.created_at < ? and (e.created_at,e.id) > (?,?)
          order by e.created_at,e.id limit ?`,
       ).all(cutoff,scan.at,scan.id,rawLimit) as Array<{
         rawRowid:number;eventId:string;rawCreatedAt:string;rawGeneration:string|null;migrationProtected:number;
-        source:string;workspaceId:string|null;installationEpochId:string|null;observedAt:string;
+        source:string;workspaceId:string|null;deviceId:string|null;
+        dataMode:string;privacyDisposition:string|null;usageDuplicateReason:string|null;
+        uploadEligible:number;
+        installationEpochId:string|null;observedAt:string;
       }>;
       let migrationProtectedRows = 0;
       const recordExpiry = this.db.prepare(
@@ -3150,10 +3417,30 @@ export class LocalEventBuffer {
       );
       const removeRaw = this.db.prepare(`delete from buffered_events where rowid = ?`);
       let events = 0;
+      let retirementPending = false;
+      const expiredCandidates: typeof candidates = [];
       for (const row of candidates) {
         if (row.migrationProtected) { migrationProtectedRows += 1; continue; }
-        if(row.source==="claude_code")
-          promoteClaudeRootSightingsForRaw(this.db,row.eventId);
+        if (row.workspaceId !== this.workspaceId || row.deviceId !== this.deviceId) {
+          // Close one linked delivery per visit. A raw row with more than one
+          // legacy delivery is revisited by the bounded retention cursor.
+          if (this.delivery.retirePriorAudienceRaw(row.rawRowid, row.eventId,
+            row.rawCreatedAt, row.rawGeneration, row.workspaceId, row.deviceId,
+            now.toISOString())) {
+            retirementPending = true;
+            continue;
+          }
+        }
+        if (!row.uploadEligible) {
+          if (this.delivery.retireIneligibleRaw(row.rawRowid, row.eventId,
+            row.rawCreatedAt, row.rawGeneration, row.dataMode,
+            row.privacyDisposition, row.usageDuplicateReason, now.toISOString())) {
+            retirementPending = true;
+            continue;
+          }
+        }
+        if (row.source === "claude_code")
+          promoteClaudeRootSightingsForRaw(this.db, row.eventId);
         recordExpiry.run({
           eventId: row.eventId,
           rawRowid: row.rawRowid,
@@ -3162,8 +3449,9 @@ export class LocalEventBuffer {
           expiredAt: now.toISOString(),
         });
         events += removeRaw.run(row.rawRowid).changes;
+        expiredCandidates.push(row);
       }
-      advanceFinanceRetentionWatermarks(this.db, candidates.filter(row => !row.migrationProtected) as FinanceCoverageMutationRow[], now.toISOString());
+      advanceFinanceRetentionWatermarks(this.db, expiredCandidates as FinanceCoverageMutationRow[], now.toISOString());
       const remainingBudget = Math.max(0, maxRows - candidates.length);
       const metricRows = remainingBudget === 0
         ? []
@@ -3174,10 +3462,20 @@ export class LocalEventBuffer {
       let metricSamples = 0;
       const removeMetric = this.db.prepare(`delete from metric_samples where rowid = ?`);
       for (const row of metricRows) metricSamples += removeMetric.run(row.rowid).changes;
-      // A full page is a conservative continuation, never an exact backlog count.
-      const rawHasMore = rawLimit === 0 || candidates.length === rawLimit;
-      const hasMore = rawHasMore || (remainingBudget > 0 && metricRows.length === remainingBudget);
       const last = candidates.at(-1);
+      // A full page alone does not prove more work. Probe just beyond its
+      // cursor so an idle ledger does not enter the five-second cadence.
+      const rawHasMore = (rawLimit === 0 || candidates.length === rawLimit) &&
+        Boolean(this.db.prepare(`select 1 from buffered_events e indexed by idx_events_retention
+          where e.created_at < ? and (e.created_at,e.id) > (?,?) limit 1`)
+          .get(cutoff, last?.rawCreatedAt ?? scan.at, last?.eventId ?? scan.id));
+      const metricHasMore = metricsPending && Boolean(this.db.prepare(
+        `select 1 from metric_samples indexed by idx_metrics_observed
+         where created_at < ? limit 1`,
+      ).get(cutoff));
+      const hasMore = !lineageRepair.complete || retirementPending || rawHasMore || metricHasMore;
+      const madeProgress = lineageRepair.visited > 0 || retirementPending ||
+        candidates.length > 0 || metricRows.length > 0;
       const next = rawLimit === 0 ? scan : rawHasMore && last
         ? {at:last.rawCreatedAt,id:last.eventId,metricsFirst:scan.metricsFirst}
         : {at:"",id:"",metricsFirst:scan.metricsFirst};
@@ -3203,8 +3501,10 @@ export class LocalEventBuffer {
         metricSamples,
         metricRowsVisited: metricRows.length,
         hasMore,
+        madeProgress,
       };
     }).immediate();
+    if (run.events > 0) this.invalidateRetentionHoldCount();
     return {
       cutoff,
       events: run.events,
@@ -3213,10 +3513,22 @@ export class LocalEventBuffer {
       migrationProtectedRows: run.migrationProtectedRows,
       metricRowsVisited: run.metricRowsVisited,
       hasMore: run.hasMore,
+      madeProgress: run.madeProgress,
     };
   }
 
-  /** Constant-size maintenance receipt; never count the retained raw ledger. */
+  private invalidateRetentionHoldCount() {
+    this.retentionHoldGeneration += 1;
+    this.retentionHoldCountDirty = true;
+  }
+
+  private retentionHoldRevision() {
+    return (this.db.prepare(
+      `select revision from retention_hold_revision where singleton=1`,
+    ).get() as { revision: number }).revision;
+  }
+
+  /** Bound the synchronous sample; a worker supplies the exact large-ledger count. */
   retentionProgressStatus(retentionDays = 90, now = new Date()) {
     const pass = this.db.prepare(`select last_rows_visited as rowsVisited,
       last_rows_expired as rowsExpired,last_has_more as hasMore,last_run_at as at,
@@ -3224,13 +3536,103 @@ export class LocalEventBuffer {
         rowsVisited:number;rowsExpired:number;hasMore:number;at:string|null;expired:number;
       };
     const scan = this.db.prepare(`select value from maintenance_state where key='raw_retention_scan_v1'`).get() as {value:string}|undefined;
+    const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
+    const revision = this.retentionHoldRevision();
+    const generation = this.retentionHoldGeneration;
+    const cached = this.retentionHoldCount;
+    const fresh = cached && !this.retentionHoldCountDirty &&
+      cached.revision === revision && cached.generation === generation &&
+      cached.retentionDays === retentionDays && cutoffAt >= cached.cutoffAt &&
+      performance.now() >= cached.measuredAtMonotonic &&
+      performance.now() - cached.measuredAtMonotonic < 60_000;
+    let heldForUpload: number;
+    let heldForUploadExact: boolean;
+    if (fresh) {
+      heldForUpload = cached.count;
+      // Exactness describes the completed count at its own cutoff, even when
+      // this status refresh has advanced the policy cutoff by milliseconds.
+      heldForUploadExact = true;
+    } else {
+      // Never walk an offline backlog on the collector's event loop. A small
+      // ledger is exact here; the read-only worker counts a larger one.
+      const sample = this.db.prepare(
+        `select case when ${this.rawRetentionUploadHoldSql()} then 1 else 0 end as held
+         from buffered_events e indexed by idx_events_retention
+         where e.created_at < ? order by e.created_at,e.id limit 513`,
+      ).all(cutoffAt) as Array<{ held: number }>;
+      heldForUpload = sample.reduce((count, row) => count + row.held, 0);
+      heldForUploadExact = sample.length < 513 &&
+        revision === this.retentionHoldRevision() && generation === this.retentionHoldGeneration;
+      if (heldForUploadExact) {
+        this.retentionHoldCount = { count: heldForUpload, cutoffAt, measuredAtMonotonic: performance.now(),
+          revision, generation, retentionDays };
+        this.retentionHoldCountDirty = false;
+      } else {
+        if (cached?.retentionDays === retentionDays && cutoffAt >= cached.cutoffAt)
+          heldForUpload = cached.count;
+        if (!this.db.memory) {
+          try { void this.refreshRetentionHoldCount(retentionDays, now).catch(() => undefined); }
+          catch { /* retain the bounded observation for this refresh */ }
+        }
+      }
+    }
     return {
       inspection: "bounded" as const,
-      policy: {retentionDays,cutoffAt:new Date(now.getTime()-retentionDays*86_400_000).toISOString()},
-      states: {retained:null,pendingDelivery:null,quarantined:null,expired:pass.expired,notInspected:1},
+      policy: {retentionDays,cutoffAt},
+      states: {retained:null,pendingDelivery:null,heldForUpload,quarantined:null,expired:pass.expired,notInspected:1},
       lastPass: {rowsVisited:pass.rowsVisited,rowsExpired:pass.rowsExpired,
         hasMore:Boolean(pass.hasMore),at:pass.at,
+        heldForUploadExact,
+        heldForUploadAsOfCutoff: fresh ? cached.cutoffAt :
+          heldForUploadExact ? cutoffAt :
+            cached?.retentionDays === retentionDays && cutoffAt >= cached.cutoffAt ? cached.cutoffAt : null,
         migrationProtectedRows:scan ? Number(JSON.parse(scan.value).migrationProtectedRows ?? 0) : 0},
+    };
+  }
+
+  /** Exact large-ledger count on a read-only worker; callers never wait on the intake loop. */
+  refreshRetentionHoldCount(retentionDays = 90, now = new Date()): Promise<number> {
+    if (this.retentionHoldCountClosed) return Promise.reject(new Error("retention_hold_count_closed"));
+    if (this.retentionHoldTask) return this.retentionHoldTask.result;
+    const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
+    const revision = this.retentionHoldRevision();
+    const generation = this.retentionHoldGeneration;
+    if (this.db.memory) {
+      const count = (this.db.prepare(
+        `select count(*) as n from buffered_events e indexed by idx_events_retention
+         where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
+      ).get(cutoffAt) as { n: number }).n;
+      if (revision === this.retentionHoldRevision() && generation === this.retentionHoldGeneration) {
+        this.retentionHoldCount = { count, cutoffAt, measuredAtMonotonic: performance.now(),
+          revision, generation, retentionDays };
+        this.retentionHoldCountDirty = false;
+      }
+      return Promise.resolve(count);
+    }
+    const { worker, result, exited } = countRetentionHoldsOffThread(this.db, cutoffAt, this.rawRetentionUploadHoldSql());
+    const liveWorker = { worker, exited };
+    this.retentionHoldWorkers.add(liveWorker);
+    void exited.then(() => this.retentionHoldWorkers.delete(liveWorker));
+    const settled = result.then((count) => {
+      if (!this.retentionHoldCountClosed && generation === this.retentionHoldGeneration &&
+          revision === this.retentionHoldRevision()) {
+        this.retentionHoldCount = { count, cutoffAt, measuredAtMonotonic: performance.now(),
+          revision, generation, retentionDays };
+        this.retentionHoldCountDirty = false;
+        this.retentionHoldCountChanged?.();
+      }
+      return count;
+    }).finally(() => {
+      if (this.retentionHoldTask?.worker === worker) this.retentionHoldTask = null;
+    });
+    this.retentionHoldTask = { worker, result: settled, exited };
+    return settled;
+  }
+
+  onRetentionHoldCountChanged(listener: () => void) {
+    this.retentionHoldCountChanged = listener;
+    return () => {
+      if (this.retentionHoldCountChanged === listener) this.retentionHoldCountChanged = null;
     };
   }
 
@@ -3261,6 +3663,10 @@ export class LocalEventBuffer {
          where state in ('pending','retry','in_flight')`,
       ).get() as { n: number }
     ).n;
+    const heldForUpload = (this.db.prepare(
+      `select count(*) as n from buffered_events e indexed by idx_events_retention
+       where e.created_at < ? and ${this.rawRetentionUploadHoldSql()}`,
+    ).get(cutoffAt) as { n: number }).n;
     const pass = this.db.prepare(
       `select last_rows_visited as rowsVisited,last_rows_expired as rowsExpired,
          last_has_more as hasMore,last_run_at as at,expired_total as expired
@@ -3279,6 +3685,7 @@ export class LocalEventBuffer {
       states: {
         retained,
         pendingDelivery,
+        heldForUpload,
         quarantined,
         expired: pass.expired,
         notInspected: 0,
@@ -3357,6 +3764,38 @@ export class LocalEventBuffer {
   }
 
   close() {
-    this.db.close();
+    if (this.retentionHoldCountClosed) return this.retentionHoldClose ?? undefined;
+    this.retentionHoldCountClosed = true;
+    this.retentionHoldCountChanged = null;
+    const workers = [...this.retentionHoldWorkers];
+    if (workers.length === 0) {
+      this.db.close();
+      return;
+    }
+    // A count can settle before its worker exits, and a later recount can start
+    // another worker. Keep the parent barrier until all of them have exited.
+    this.retentionHoldClose = (async () => {
+      await Promise.all(workers.map(async (task) => {
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const outcome = await Promise.race([
+            task.exited.then(() => "exited" as const),
+            new Promise<"timeout">((resolve) => {
+              timeout = setTimeout(() => resolve("timeout"), 1_000);
+            }),
+          ]);
+          if (outcome === "timeout") {
+            await task.worker.terminate();
+            await task.exited;
+          }
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+      }));
+      this.db.close();
+    })();
+    // Legacy callers may ignore close's return value; still observe failures.
+    void this.retentionHoldClose.catch(() => undefined);
+    return this.retentionHoldClose;
   }
 }

@@ -14,9 +14,9 @@ import { TranscriptTailer } from "../../../work/plimsoll-r5/packages/collector-c
 const mode=process.argv[2]??"oversized";
 assert.ok(mode==="oversized"||mode==="normal");
 const now=Date.now(),sessionA=crypto.randomUUID(),sessionC=crypto.randomUUID();
-const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:"epoch-a",
+const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:"48b5605a-6991-4eae-88c8-b565aa25a61a",
   source:"claude_code" as const,directory:path.join(process.env.HOME!,"claude-a","projects")};
-const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:"epoch-b",
+const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:"6b0519c3-601f-4fd3-876f-28d197e7cbf4",
   source:"claude_code" as const,directory:path.join(process.env.HOME!,"claude-b","projects")};
 const file=path.join(B.directory,"project","startup.jsonl");
 fs.mkdirSync(A.directory,{recursive:true});

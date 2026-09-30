@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -14,9 +15,9 @@ import { createProofCompletion } from "./lib/proof-completion";
 const scenario=process.argv[2]??"same-size";
 assert.ok(["same-size","larger","between-reads","identical"].includes(scenario));
 const now=Date.now(),sessionA=crypto.randomUUID(),sessionC=crypto.randomUUID();
-const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:"epoch-a",
+const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:fixtureEpochId("epoch-a"),
   source:"claude_code" as const,directory:path.join(process.env.HOME!,"claude-a","projects")};
-const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:"epoch-b",
+const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:fixtureEpochId("epoch-b"),
   source:"claude_code" as const,directory:path.join(process.env.HOME!,"claude-b","projects")};
 // A non-UUID basename makes the session identity come from the transcript.
 const file=path.join(B.directory,"project","startup.jsonl");

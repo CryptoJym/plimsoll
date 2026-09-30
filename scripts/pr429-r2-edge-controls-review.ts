@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 /** Focused F1' controls for missing copies, sightings, torn config and bind races. */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -25,7 +26,7 @@ const binding = (sessionId: string) => dispatchBindingSchema.parse({ sessionId,
   validFrom: at(-120), validUntil: at(120), evidenceRef: "dispatch:edge-controls-review" });
 const bareRoots = ["a", "b", "c"].map(letter => ({
   rootId: `claude-${letter}`, profileId: `claude-${letter}`,
-  installationEpochId: `epoch-${letter}`, source: "claude_code" as const,
+  installationEpochId: fixtureEpochId(`epoch-${letter}`), source: "claude_code" as const,
   directory: path.join(home, `.claude-${letter}`, "projects"),
 }));
 for (const root of bareRoots) fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });
