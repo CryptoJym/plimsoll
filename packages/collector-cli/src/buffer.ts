@@ -1,6 +1,9 @@
+import { openLedgerDatabase } from "./ledger-connection";
+import { recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallationEpoch,
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
 import type { Worker } from "node:worker_threads";
@@ -255,6 +258,9 @@ export class LocalEventBuffer {
       };
       workspaceId?: string;
       deviceId?: string;
+      /** An epoch-unbound ledger may inherit the agreed epoch of configured
+       * capture roots. null means roots disagree and binding must refuse. */
+      freshCaptureRootEpoch?: string | null;
       /** Clock seam for deterministic enrollment fixtures; never replaces a persisted cutoff. */
       enrollmentNow?: () => Date;
       learningFacts?: { limits?: Partial<LearningFactLimits> };
@@ -280,7 +286,43 @@ export class LocalEventBuffer {
     };
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
-    this.db = new Database(path, { timeout });
+    if (options.freshCaptureRootEpoch !== undefined && options.freshCaptureRootEpoch !== null &&
+        !installationEpochIdSchema.safeParse(options.freshCaptureRootEpoch).success) {
+      throw new Error("installation_epoch_id_invalid");
+    }
+    // A mixed-root replacement must not leave an empty SQLite file or WAL
+    // sidecar behind. An existing bound ledger decides from its durable epoch
+    // inside useWorkspace's transaction, regardless of stale root config.
+    if (options.freshCaptureRootEpoch === null && !fs.existsSync(path)) {
+      throw new Error("fresh_ledger_capture_root_epochs_conflict");
+    }
+    try { this.db = openLedgerDatabase(path, { timeout }); }
+    catch (error) {
+      if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
+        recoverInvalidLedgerPublication(path);
+        throw new Error("replacement_verification_failed; archive restored; collector start refused", { cause: error });
+      }
+      throw error;
+    }
+    // An interrupted rename must not admit a first scan before the post-swap
+    // file-generation fences are durable. Restore can still open it directly.
+    try {
+      const replacement = this.db.prepare(`select 1 from sqlite_master
+        where type='table' and name='collector_replacement_ledger'`).get();
+      if (replacement) {
+        const columns = this.db.pragma("table_info(collector_replacement_ledger)") as
+          Array<{ name: string }>;
+        const pending = columns.some(column => column.name === "post_switch_fence_pending")
+          ? this.db.prepare(`select post_switch_fence_pending as pending
+            from collector_replacement_ledger where singleton=1`).get() as
+              { pending: number } | undefined
+          : undefined;
+        if (pending?.pending !== 0) throw new Error("replacement_post_switch_fence_pending");
+      }
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
     registerRetentionDeliveryId(this.db);
     this.db.pragma("journal_mode = WAL");
     this.deviceId = options.deviceId?.trim() || null;
@@ -724,7 +766,8 @@ export class LocalEventBuffer {
       ensureSessionSummarySchema(this.db);
       markOpenStep("ledger.session_summary_schema");
     }
-    if (options.workspaceId) this.useWorkspace(options.workspaceId);
+    if (options.workspaceId) this.useWorkspace(options.workspaceId, this.deviceId,
+      undefined, options.freshCaptureRootEpoch);
     markOpenStep("ledger.workspace_binding");
     this.db.exec(`
       create index if not exists idx_events_upload on buffered_events (uploaded_at, created_at);
@@ -958,7 +1001,8 @@ export class LocalEventBuffer {
    * returns. Binding ANY managed/joined workspace must never adopt
    * unassigned rows: that relabel is the exact leak class #163 quarantines.
    */
-  useWorkspace(workspaceId: string, deviceId = this.deviceId, installationEpochId?: string) {
+  useWorkspace(workspaceId: string, deviceId = this.deviceId, installationEpochId?: string,
+    freshCaptureRootEpoch?: string | null) {
     const requested = workspaceId.trim();
     if (!requested) throw new Error("Workspace binding requires a non-empty workspace id.");
     let requestedDevice = deviceId?.trim() || null;
@@ -968,11 +1012,13 @@ export class LocalEventBuffer {
         .prepare(
           `select current_workspace_id as currentWorkspaceId,
              previous_workspace_id as previousWorkspaceId,
-             current_device_id as currentDeviceId
+             current_device_id as currentDeviceId,
+             current_installation_epoch_id as currentInstallationEpochId
            from collector_workspace_binding where singleton = 1`,
         )
         .get() as
-        | { currentWorkspaceId: string; previousWorkspaceId: string | null; currentDeviceId: string | null }
+        | { currentWorkspaceId: string; previousWorkspaceId: string | null; currentDeviceId: string | null;
+            currentInstallationEpochId: string | null }
         | undefined;
       if (binding && binding.currentWorkspaceId !== requested) {
         throw new Error(
@@ -990,6 +1036,13 @@ export class LocalEventBuffer {
       // device, inherit that binding rather than creating new unbound rows.
       if (!requestedDevice && binding?.currentDeviceId) {
         requestedDevice = binding.currentDeviceId;
+      }
+      // Use the root epoch only until an epoch binding is durable. The check
+      // and the binding write share this transaction, so a crash before commit
+      // leaves the next open eligible, and a competing binder cannot be
+      // overwritten by a stale pre-transaction new-file observation.
+      if (!binding?.currentInstallationEpochId && freshCaptureRootEpoch === null) {
+        throw new Error("fresh_ledger_capture_root_epochs_conflict");
       }
       if (!binding) {
         this.db
@@ -1029,7 +1082,9 @@ export class LocalEventBuffer {
             .run(requestedDevice, LOCAL_TENANT_ID);
         }
       }
-      selectedEpochId = this.ensureCurrentInstallationEpoch(requested, installationEpochId);
+      selectedEpochId = this.ensureCurrentInstallationEpoch(requested,
+        installationEpochId ?? (!binding?.currentInstallationEpochId
+          ? freshCaptureRootEpoch ?? undefined : undefined));
       // Deliberately no backfill for managed workspaces here or in any later
       // selection: once a managed workspace is selected, unassigned history is
       // permanently ineligible for that audience (lease and list filters are

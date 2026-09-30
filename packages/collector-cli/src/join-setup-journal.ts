@@ -2,7 +2,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import Database from "better-sqlite3";
+import type Database from "better-sqlite3";
+import { openLedgerDatabase } from "./ledger-connection";
 
 import { unsealCaptureBaselineGenerations, type CaptureBaselineSealResult } from "./capture-baseline";
 import { collectorConfigSchema, withCollectorConfigMutationLock } from "./config";
@@ -329,6 +330,6 @@ export function restoreJoinConfigBytes(obligation: JoinRestartObligation, afterC
 
 export function withJoinRootJournal<T>(ledgerPath: string, action: (database: Database.Database) => T): T | null {
   if (!fs.existsSync(ledgerPath)) return null;
-  const database = new Database(ledgerPath, { fileMustExist: true, timeout: 5_000 });
+  const database = openLedgerDatabase(ledgerPath, { fileMustExist: true, timeout: 5_000 });
   try { return action(database); } finally { database.close(); }
 }

@@ -1,3 +1,4 @@
+import { openLedgerDatabase } from "./ledger-connection";
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -83,7 +84,7 @@ export async function syncAccountActorSalt(options: {
   if (fs.existsSync(ledgerPath)) {
     // A separate bounded writer records only the tenant/version maintenance
     // receipt; the raw salt remains solely in its owner-only file.
-    const db = new Database(ledgerPath, { timeout: 5_000 });
+    const db = openLedgerDatabase(ledgerPath, { timeout: 5_000 });
     try { recordAccountAssertionSalt(db, options.tenantId, parsed.data.saltVersion); } finally { db.close(); }
   }
   return { synced: true, tenantId: options.tenantId, saltVersion: parsed.data.saltVersion, reason: "synced" };

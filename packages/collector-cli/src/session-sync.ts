@@ -1,3 +1,4 @@
+import { openLedgerDatabase, ledgerConnectionWorkerSource } from "./ledger-connection";
 import { buildWorkspaceEconomics } from "../../shared/src/economics/service";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
 import type { Period,UsageFact } from "../../shared/src/economics/contracts";
@@ -114,7 +115,8 @@ export function ensureUuidSessionId(rawId: string): { id: string; derived: boole
 const sessionReadWorkerSource = `
   const { parentPort, workerData } = require('node:worker_threads');
   const Database = require(workerData.sqliteModule);
-  const db = new Database(workerData.ledgerPath, { readonly: true, fileMustExist: true });
+  ${ledgerConnectionWorkerSource}
+  const db = openLedgerDatabase(workerData.ledgerPath, { readonly: true, fileMustExist: true });
   ${RETENTION_DELIVERY_ID_WORKER_SOURCE}
   parentPort.on('message', (message) => {
     let timer;
@@ -1292,7 +1294,7 @@ export async function runSessionSync(
   if (!ledger) {
     const ledgerPath = options.ledgerPath ?? collectorBufferPath();
     try {
-      ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+      ledger = openLedgerDatabase(ledgerPath, { readonly: true, fileMustExist: true });
       ownsLedger = true;
     } catch (error) {
       throw new Error(

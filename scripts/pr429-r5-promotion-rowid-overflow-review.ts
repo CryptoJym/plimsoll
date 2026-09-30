@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -10,7 +11,7 @@ import { aiInteractionEventSchema } from "../packages/shared/src/schemas";
 
 const home=process.env.HOME!,plimsoll=process.env.PLIMSOLL_HOME!;
 const now=Date.now(),sessionId=crypto.randomUUID(),id=crypto.randomUUID();
-const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:"epoch-b",
+const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:fixtureEpochId("epoch-b"),
   source:"claude_code" as const,directory:path.join(home,"missing-claude-b","projects")};
 const config=collectorConfigSchema.parse({deviceId:"dev-r5-overflow-rowid",
   uploadUrl:"http://127.0.0.1:1/unused",captureRoots:[B]});
