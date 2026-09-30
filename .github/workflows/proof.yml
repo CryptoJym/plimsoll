@@ -9,8 +9,8 @@ jobs:
   proof:
     runs-on: macos-14
     # Allow the measured sequential artifact, repeated E2E and resource gates.
-    # Per-proof deadlines and acceptance thresholds remain unchanged. Main takes
-    # 35-39 minutes and PRs that add proofs 42-45, so 45 cut off healthy runs.
+    # Per-proof deadlines and acceptance thresholds remain unchanged. A full run
+    # took about 56 minutes on 30 Sep 2026, so 60 cut off healthy runs.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
