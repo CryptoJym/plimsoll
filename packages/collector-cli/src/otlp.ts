@@ -19,8 +19,10 @@ import {
 
 import { resolveGitContext } from "./git-context";
 import { attachRepoContextSidecar } from "./repo-context";
-import { currentDispatchCaptureRoots, dispatchBindingForSession, dispatchBindingMetadata,
-  type CaptureRoot } from "./capture-root-inventory";
+import { claudeBindingForUnrootedEvent, currentDispatchBindingSnapshot,
+  dispatchBindingForSession, dispatchBindingMetadata, durableClaudeRootSessionSightings,
+  type DispatchBindingSnapshot } from "./capture-root-inventory";
+import type { LocalEventBuffer } from "./buffer";
 import {
   asRecord,
   classifyEventType,
@@ -75,6 +77,7 @@ type ExplodeOptions = {
   resolveGit?: boolean;
   /** Receives (repoHash, label) for local-only repo_labels recording. */
   onRepoLabel?: (repoHash: string, label: string) => void;
+  buffer?: LocalEventBuffer;
 };
 
 function flattenOtelAttributes(attributes: unknown): Record<string, unknown> {
@@ -290,7 +293,8 @@ function buildLogEvent(
     containerSuppressedFields?: string[];
     resolveGit?: boolean;
     onRepoLabel?: (repoHash: string, label: string) => void;
-    dispatchRoots?: readonly CaptureRoot[];
+    dispatchSnapshot?: DispatchBindingSnapshot;
+    durableSightings?: (sessionId: string) => ReadonlySet<string> | undefined;
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const repoContextCwd = workdirFromRawRecord(record);
@@ -362,8 +366,12 @@ function buildLogEvent(
   const traceId = validatedTraceId.accepted && typeof validatedTraceId.value === "string"
     ? validatedTraceId.value
     : undefined;
-  const dispatchBinding = context.source === "codex" && sessionId
-    ? dispatchBindingForSession("codex", sessionId, observedAt, context.dispatchRoots)
+  const dispatchBinding = sessionId && context.dispatchSnapshot
+    ? context.source === "claude_code"
+      ? claudeBindingForUnrootedEvent(sessionId,observedAt,context.dispatchSnapshot,
+          context.durableSightings?.(sessionId))
+      : context.source === "codex"
+        ? dispatchBindingForSession("codex",sessionId,observedAt,context.dispatchSnapshot.roots) : null
     : null;
 
   const event = aiInteractionEventSchema.parse({
@@ -438,6 +446,8 @@ function buildSpanEvent(
     serviceName?: string;
     serviceVersion?: string;
     containerSuppressedFields?: string[];
+    dispatchSnapshot?: DispatchBindingSnapshot;
+    durableSightings?: (sessionId: string) => ReadonlySet<string> | undefined;
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const repoContextCwd = workdirFromRawRecord(span);
@@ -453,6 +463,10 @@ function buildSpanEvent(
     : undefined;
   const observedAt = recordTimestamp(safeSpan, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
+  const dispatchBinding = context.source === "claude_code" && sessionId && context.dispatchSnapshot
+    ? claudeBindingForUnrootedEvent(sessionId,observedAt,context.dispatchSnapshot,
+        context.durableSightings?.(sessionId))
+    : null;
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
   const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
@@ -561,6 +575,7 @@ function buildSpanEvent(
     ...(costUsd !== undefined && costUsd >= 0 ? { costUsd, costKind } : {}),
     metadata: {
       ...metadataAttrs.attrs,
+      ...(dispatchBinding ? dispatchBindingMetadata(dispatchBinding) : {}),
       ...(costEstimated ? { costEstimated: true } : {}),
       ...(spanName ? { otelEventName: spanName } : {}),
       ...(toolName ? { toolName } : {}),
@@ -675,7 +690,17 @@ export function explodeOtlpPayload(
 ): ExplodedOtlp {
   const policy = options.policy ?? DEFAULT_POLICY;
   const source = options.source ?? "unknown";
-  const dispatchRoots = source === "codex" ? currentDispatchCaptureRoots() : [];
+  const dispatchSnapshot = source === "codex" || source === "claude_code"
+    ? currentDispatchBindingSnapshot() : undefined;
+  const seenBySession=new Map<string,ReadonlySet<string>>();
+  const durableSightings=options.buffer ? (sessionId: string) => {
+    let seen=seenBySession.get(sessionId);
+    if(!seen) {
+      seen=durableClaudeRootSessionSightings(options.buffer!.database,sessionId);
+      seenBySession.set(sessionId,seen);
+    }
+    return seen;
+  } : undefined;
   const root = asRecord(payload);
   const result: ExplodedOtlp = {
     events: [],
@@ -714,7 +739,7 @@ export function explodeOtlpPayload(
               // attribution is an explicit offline-only compatibility path.
               resolveGit: options.resolveGit ?? false,
               onRepoLabel: options.onRepoLabel,
-              dispatchRoots,
+              dispatchSnapshot,durableSightings,
             }),
           );
         } catch {
@@ -746,6 +771,7 @@ export function explodeOtlpPayload(
                 ...resource.suppressedFields,
                 ...scopeReceipts,
               ],
+              dispatchSnapshot,durableSightings,
             });
           const decision = decideOtlpSpanAdmission(entry.event);
           if (decision.admitted) {

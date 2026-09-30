@@ -16,6 +16,7 @@ import {
   ensureJsonlScanState,
   jsonlScanStateKey,
   loadJsonlScanCursor,
+  prepareJsonlCommittedPrefixHash,
   rememberJsonlScanCursor,
   type JsonlScanCursor,
   type JsonlTailerIo,
@@ -1203,6 +1204,11 @@ export class RolloutTailer {
               cursor.committedOffset >= carriedOffset && cursor.fileIdentity === read.fileIdentity;
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
+            if (read.continuation?.action !== "checkpoint") {
+              prepareJsonlCommittedPrefixHash(this.buffer.database,
+                candidate.file, this.cursorKey(candidate.file), cursor, read);
+              read.assertStableForCommit();
+            }
             const readObservation = baselineObservation(candidate.file, this.regularFileStat(candidate.file));
             if (`${readObservation.device}:${readObservation.inode}:${readObservation.birthtimeNs}` !==
                 read.fileIdentity) throw new Error("capture_generation_changed_before_commit");
