@@ -3769,7 +3769,16 @@ export class LocalEventBuffer {
     const closeDatabase = () => {
       try {
         if (this.rebuildWriterLease) {
-          releaseRebuildWriterLeases(this.db, this.rebuildWriterLease);
+          // The fresh-ledger inode guard closes a displaced handle before it
+          // raises LEDGER_REPLACED. Never issue lease SQL through that closed
+          // (or newly displaced) handle during shutdown; its owner exits and
+          // the old archive's dead lease is reaped by rebuild recovery.
+          if (this.db.open) {
+            try { releaseRebuildWriterLeases(this.db, this.rebuildWriterLease); }
+            catch (error) {
+              if ((error as { code?: string }).code !== "LEDGER_REPLACED") throw error;
+            }
+          }
           this.rebuildWriterLease = null;
         }
       } finally {
