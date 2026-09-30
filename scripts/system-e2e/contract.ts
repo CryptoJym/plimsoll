@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 11 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 12 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -227,6 +227,8 @@ const VOLATILE_NUMBER_KEYS = /^(?:pid|port|unreachablePort|standInDefaultPort|du
 // keep totals and unchanged counters in the semantic artifact.
 const RESOURCE_VOLATILE_NUMBER_PATH =
   /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|stableRuns|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata|startupFilesystemEntriesScanned|startupFilesystemEnumerationCalls|baselineFilesystemEntriesScanned|baselineFilesystemEnumerationCalls)))$/;
+const RESOURCE_METADATA_OPERATIONS_PATH =
+  /^root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.measurements\.filesystemMetadataOperations$/;
 
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
@@ -277,6 +279,14 @@ export function normalizeSupportingArtifact(
     );
   }
   if (typeof value === "string") return normalizeString(value, key, context);
+  if (typeof value === "number" && RESOURCE_METADATA_OPERATIONS_PATH.test(fieldPath)) {
+    // The directory observer counts one additional metadata call on macOS
+    // compared with the Linux CI fixture. Keep the count tightly bounded in
+    // the contract while retaining the resource proof's raw work counters.
+    assert.ok(Number.isInteger(value) && value >= 24_567 && value <= 24_568,
+      `${key} must stay within the observed two-host metadata-call bound`);
+    return "<bounded-metadata-operations:24567-24568>";
+  }
   if (
     typeof value === "number" &&
     (VOLATILE_NUMBER_KEYS.test(key) || RESOURCE_VOLATILE_NUMBER_PATH.test(fieldPath))
