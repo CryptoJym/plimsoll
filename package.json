@@ -90,6 +90,8 @@
     "proof:retention-missing-raw": "tsx scripts/retention-missing-raw-proof.ts",
     "proof:retention-event-detail-outbox": "tsx scripts/retention-event-detail-outbox-proof.ts",
     "proof:retention-generation-count": "tsx scripts/retention-generation-count-proof.ts",
+    "proof:retention-worker-fence": "tsx scripts/retention-worker-fence-proof.ts",
+    "proof:retention-worker-close": "tsx scripts/retention-worker-close-proof.ts",
     "proof:receipt-lineage-scale": "tsx scripts/receipt-lineage-scale-proof.ts",
     "proof:maintenance-worker-ready": "tsx scripts/maintenance-worker-ready-proof.ts",
     "proof:startup-wal-self-heal": "tsx scripts/run-proof.ts --direct-node scripts/startup-wal-self-heal-proof.ts",

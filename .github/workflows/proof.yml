@@ -168,6 +168,8 @@ jobs:
           pnpm proof:retention-missing-raw
           pnpm proof:retention-event-detail-outbox
           pnpm proof:retention-generation-count
+          pnpm proof:retention-worker-fence
+          pnpm proof:retention-worker-close
 
       - name: Prove 0.7.44 dead-receipt lineage scale
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

@@ -241,7 +241,9 @@ export class LocalEventBuffer {
     count: number; cutoffAt: string; measuredAtMonotonic: number;
     revision: number; generation: number; retentionDays: number;
   } | null = null;
-  private retentionHoldTask: { worker: Worker; result: Promise<number> } | null = null;
+  private retentionHoldTask: { worker: Worker; result: Promise<number>; exited: Promise<void> } | null = null;
+  private readonly retentionHoldWorkers = new Set<{ worker: Worker; exited: Promise<void> }>();
+  private retentionHoldClose: Promise<void> | null = null;
   private retentionHoldCountDirty = false;
   private retentionHoldCountClosed = false;
   private retentionHoldGeneration = 0;
@@ -3587,7 +3589,10 @@ export class LocalEventBuffer {
       }
       return Promise.resolve(count);
     }
-    const { worker, result } = countRetentionHoldsOffThread(this.db, cutoffAt, this.rawRetentionUploadHoldSql());
+    const { worker, result, exited } = countRetentionHoldsOffThread(this.db, cutoffAt, this.rawRetentionUploadHoldSql());
+    const liveWorker = { worker, exited };
+    this.retentionHoldWorkers.add(liveWorker);
+    void exited.then(() => this.retentionHoldWorkers.delete(liveWorker));
     const settled = result.then((count) => {
       if (!this.retentionHoldCountClosed && generation === this.retentionHoldGeneration &&
           revision === this.retentionHoldRevision()) {
@@ -3597,8 +3602,10 @@ export class LocalEventBuffer {
         this.retentionHoldCountChanged?.();
       }
       return count;
-    }).finally(() => { this.retentionHoldTask = null; });
-    this.retentionHoldTask = { worker, result: settled };
+    }).finally(() => {
+      if (this.retentionHoldTask?.worker === worker) this.retentionHoldTask = null;
+    });
+    this.retentionHoldTask = { worker, result: settled, exited };
     return settled;
   }
 
@@ -3737,9 +3744,38 @@ export class LocalEventBuffer {
   }
 
   close() {
+    if (this.retentionHoldCountClosed) return this.retentionHoldClose ?? undefined;
     this.retentionHoldCountClosed = true;
     this.retentionHoldCountChanged = null;
-    if (this.retentionHoldTask) void this.retentionHoldTask.worker.terminate();
-    this.db.close();
+    const workers = [...this.retentionHoldWorkers];
+    if (workers.length === 0) {
+      this.db.close();
+      return;
+    }
+    // A count can settle before its worker exits, and a later recount can start
+    // another worker. Keep the parent barrier until all of them have exited.
+    this.retentionHoldClose = (async () => {
+      await Promise.all(workers.map(async (task) => {
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const outcome = await Promise.race([
+            task.exited.then(() => "exited" as const),
+            new Promise<"timeout">((resolve) => {
+              timeout = setTimeout(() => resolve("timeout"), 1_000);
+            }),
+          ]);
+          if (outcome === "timeout") {
+            await task.worker.terminate();
+            await task.exited;
+          }
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+      }));
+      this.db.close();
+    })();
+    // Legacy callers may ignore close's return value; still observe failures.
+    void this.retentionHoldClose.catch(() => undefined);
+    return this.retentionHoldClose;
   }
 }
