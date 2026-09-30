@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -17,10 +18,10 @@ fs.mkdirSync(plimsoll,{recursive:true});
 function setup(label:string,missingRoot=false) {
   const sessionId=crypto.randomUUID();
   const A={rootId:`a-${label}`,profileId:`profile-a-${label}`,
-    installationEpochId:`epoch-a-${label}`,source:"claude_code" as const,
+    installationEpochId:fixtureEpochId(`epoch-a-${label}`),source:"claude_code" as const,
     directory:path.join(home,`a-${label}`,"projects")};
   const B={rootId:`b-${label}`,profileId:`profile-b-${label}`,
-    installationEpochId:`epoch-b-${label}`,source:"claude_code" as const,
+    installationEpochId:fixtureEpochId(`epoch-b-${label}`),source:"claude_code" as const,
     directory:path.join(home,`b-${label}`,"projects")};
   fs.mkdirSync(A.directory,{recursive:true});
   if(!missingRoot) fs.mkdirSync(B.directory,{recursive:true});

@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 /** A different held validity window must veto anonymous Claude attribution. */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -23,12 +24,12 @@ const binding = dispatchBindingSchema.parse({
   evidenceRef: "dispatch:window-divergence-review",
 });
 const roots = [
-  { rootId: "claude-a", profileId: "claude-a", installationEpochId: "epoch-a",
+  { rootId: "claude-a", profileId: "claude-a", installationEpochId: fixtureEpochId("epoch-a"),
     source: "claude_code" as const, directory: path.join(home, ".claude-a", "projects"), dispatch: [binding] },
-  { rootId: "claude-b", profileId: "claude-b", installationEpochId: "epoch-b",
+  { rootId: "claude-b", profileId: "claude-b", installationEpochId: fixtureEpochId("epoch-b"),
     source: "claude_code" as const, directory: path.join(home, ".claude-b", "projects"),
     dispatch: [{ ...binding, validUntil: at(-30) }] },
-  { rootId: "claude-c", profileId: "claude-c", installationEpochId: "epoch-c",
+  { rootId: "claude-c", profileId: "claude-c", installationEpochId: fixtureEpochId("epoch-c"),
     source: "claude_code" as const, directory: path.join(home, ".claude-c", "projects"), dispatch: [binding] },
 ];
 for (const root of roots) fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });

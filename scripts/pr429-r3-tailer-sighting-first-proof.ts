@@ -1,3 +1,4 @@
+import { fixtureEpochId } from "./lib/fixture-epoch-id";
 /** A known-root transcript persists one sighting before its first raw row. */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -17,7 +18,7 @@ const plimsoll = process.env.PLIMSOLL_HOME!;
 const now = Date.now();
 const observedAt = new Date(now - 60_000).toISOString();
 const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-const root = { rootId: "claude-b", profileId: "profile-b", installationEpochId: "epoch-b",
+const root = { rootId: "claude-b", profileId: "profile-b", installationEpochId: fixtureEpochId("epoch-b"),
   source: "claude_code" as const, directory: path.join(home, ".claude-b", "projects") };
 const project = path.join(root.directory, "-synthetic-project");
 fs.mkdirSync(project, { recursive: true, mode: 0o700 });
