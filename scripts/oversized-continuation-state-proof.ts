@@ -18,7 +18,8 @@ async function main(){
  const original=row();
  database.prepare(`update rollout_scan_state set parser_state_json=?,scanned_at=?,work_remaining=0,size=committed_offset+37,deferred_bytes=37,
  unresolved_kind='record_exceeds_byte_budget',unresolved_offset=?,unresolved_observed_bytes=37,unresolved_available_bytes=37,unresolved_byte_budget=2048 where file=?`).run(JSON.stringify(JSON.parse(original.parser_state_json),null,2),'2026-09-08T00:00:01.001Z',original.committed_offset,key);
- const frozen=JSON.stringify(row()),frozenDigest=jsonlCursorDigest(database,file); assert(row().committed_offset>0);assert.equal(Object.keys(row()).length,21);
+ const frozen=JSON.stringify(row()),frozenDigest=jsonlCursorDigest(database,file); assert(row().committed_offset>0);assert.equal(Object.keys(row()).length,22);
+ assert.equal(row().committed_prefix_hash,crypto.createHash('sha256').update(prior).digest('hex'));
  fs.appendFileSync(file,JSON.stringify({ignored:'X'.repeat(900*1024)})+'\n');
  let reads=0;const native=fs.readSync;fs.readSync=((...args:any[])=>{reads++;return (native as any)(...args);}) as typeof native;
  const cursor=()=>{const r=row();return loadJsonlScanCursor(database,file,r.parser_kind,r.checkpoint_version,x=>x as any);};
@@ -29,7 +30,7 @@ async function main(){
  const commit=(r:JsonlTailRead)=>{try{r.assertStableForCommit();database.transaction(()=>r.continuation!.applyCheckpoint())();}finally{r.close();}assert.equal(JSON.stringify(row()),frozen);};
  const checks:string[]=[]; const ok=(s:string)=>checks.push(s);
  try{
-   assert.equal(cursor()?.checkpointStatus,"valid");const seed=read(); assert.equal(seed.continuation?.action,'checkpoint');commit(seed);ok('initial partial preserves all 21 cursor columns and exact JSON');
+   assert.equal(cursor()?.checkpointStatus,"valid");const seed=read(); assert.equal(seed.continuation?.action,'checkpoint');commit(seed);ok('initial partial preserves all 22 cursor columns and exact JSON');
    const a=read(4095),b=read(4095);commit(a);assert.throws(()=>database.transaction(()=>b.continuation!.applyCheckpoint())(),/stale_continuation/);b.close();ok('concurrent checkpoint CAS rejects stale proposal');
    const saved=raw()!;assert(Buffer.byteLength(saved)<=MAX_ENVELOPE_BYTES);assert(!saved.includes(dir));
    const e=JSON.parse(saved);assert.equal(e.prefix.end-e.prefix.start,4095);

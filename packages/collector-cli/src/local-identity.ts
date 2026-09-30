@@ -111,9 +111,10 @@ export class AccountBindingHistory {
   }
 }
 
-/** Reads a Codex home's auth file once per observed mtime, retaining only its key. */
+/** Reads a Codex home's auth file once per stat signature, retaining only its key. */
 export class CodexAccountKeyCache {
-  private readonly entries = new Map<string, { signature: string | null; observation: AccountKeyObservation }>();
+  private readonly entries = new Map<string, { signature: string | null; observation: AccountKeyObservation;
+    missingParentMtimeNs?: string }>();
 
   fromSessionsDir(sessionsDir: string): string | undefined {
     return this.observationFromSessionsDir(sessionsDir).key;
@@ -121,6 +122,13 @@ export class CodexAccountKeyCache {
 
   observationFromSessionsDir(sessionsDir: string): AccountKeyObservation {
     const file = path.join(path.dirname(sessionsDir), "auth.json");
+    const old = this.entries.get(file);
+    if (old?.signature === null && old.missingParentMtimeNs !== undefined) {
+      try {
+        const parent = fs.lstatSync(path.dirname(file), { bigint: true });
+        if (parent.isDirectory() && String(parent.mtimeNs) === old.missingParentMtimeNs) return old.observation;
+      } catch { /* Parent changed or disappeared: retry the auth path. */ }
+    }
     let mtimeMs: number | null = null;
     let signature: string | null = null;
     try {
@@ -130,8 +138,7 @@ export class CodexAccountKeyCache {
         signature = `${stat.mtimeNs}:${stat.ctimeNs}:${stat.size}`;
       }
     } catch { /* Missing or unreadable auth stays unattributed. */ }
-    const old = this.entries.get(file);
-    if (old?.signature === signature) return old.observation;
+    if (signature !== null && old?.signature === signature) return old.observation;
     let key: string | undefined;
     if (mtimeMs !== null) {
       const auth = readJson(file);
@@ -141,14 +148,22 @@ export class CodexAccountKeyCache {
       if (typeof id === "string" && id.length > 0) key = providerAccountKey(id);
     }
     const observation = { key, mtimeMs };
-    this.entries.set(file, { signature, observation });
+    let missingParentMtimeNs: string | undefined;
+    if (signature === null) {
+      try {
+        const parent = fs.lstatSync(path.dirname(file), { bigint: true });
+        if (parent.isDirectory()) missingParentMtimeNs = String(parent.mtimeNs);
+      } catch { /* Missing parent stays unattributed. */ }
+    }
+    this.entries.set(file, { signature, observation, missingParentMtimeNs });
     return observation;
   }
 }
 
 /** Claude config roots use .claude.json; the default profile keeps it beside .claude. */
 export class ClaudeAccountKeyCache {
-  private readonly entries = new Map<string, { signature: string | null; observation: AccountKeyObservation }>();
+  private readonly entries = new Map<string, { signature: string | null; observation: AccountKeyObservation;
+    missingParentMtimeNs?: string }>();
 
   fromProjectsDir(projectsDir: string): string | undefined {
     return this.observationFromProjectsDir(projectsDir).key;
@@ -159,6 +174,13 @@ export class ClaudeAccountKeyCache {
     const explicitDir = process.env.CLAUDE_CONFIG_DIR && path.resolve(process.env.CLAUDE_CONFIG_DIR) === path.resolve(configDir);
     const file = !explicitDir && path.resolve(configDir) === path.join(os.homedir(), ".claude")
       ? path.join(os.homedir(), ".claude.json") : path.join(configDir, ".claude.json");
+    const old = this.entries.get(file);
+    if (old?.signature === null && old.missingParentMtimeNs !== undefined) {
+      try {
+        const parent = fs.lstatSync(path.dirname(file), { bigint: true });
+        if (parent.isDirectory() && String(parent.mtimeNs) === old.missingParentMtimeNs) return old.observation;
+      } catch { /* Parent changed or disappeared: retry the account path. */ }
+    }
     let mtimeMs: number | null = null;
     let signature: string | null = null;
     try {
@@ -168,8 +190,7 @@ export class ClaudeAccountKeyCache {
         signature = `${stat.mtimeNs}:${stat.ctimeNs}:${stat.size}`;
       }
     } catch { /* Missing or unreadable account stays unattributed. */ }
-    const old = this.entries.get(file);
-    if (old?.signature === signature) return old.observation;
+    if (signature !== null && old?.signature === signature) return old.observation;
     let key: string | undefined;
     if (mtimeMs !== null) {
       const config = readJson(file);
@@ -179,7 +200,14 @@ export class ClaudeAccountKeyCache {
       if (typeof id === "string" && id.length > 0) key = providerAccountKey(id);
     }
     const observation = { key, mtimeMs };
-    this.entries.set(file, { signature, observation });
+    let missingParentMtimeNs: string | undefined;
+    if (signature === null) {
+      try {
+        const parent = fs.lstatSync(path.dirname(file), { bigint: true });
+        if (parent.isDirectory()) missingParentMtimeNs = String(parent.mtimeNs);
+      } catch { /* Missing parent stays unattributed. */ }
+    }
+    this.entries.set(file, { signature, observation, missingParentMtimeNs });
     return observation;
   }
 }
