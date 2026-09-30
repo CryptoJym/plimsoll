@@ -271,6 +271,9 @@ export class LocalEventBuffer {
        * workers may use a short bounded wait. The better-sqlite3 default is
        * five seconds, which is never appropriate on the listener event loop. */
       databaseBusyTimeoutMs?: number;
+      /** Daemon-only deadline for first-open migration and recovery. The
+       * connection returns to databaseBusyTimeoutMs before construction ends. */
+      startupBusyDeadlineMs?: number;
       /** Optional diagnostic sink used by the copied-ledger rehearsal tool. */
       onOpenStep?: LedgerOpenTimingSink;
     } = {},
@@ -289,6 +292,9 @@ export class LocalEventBuffer {
     };
     this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
+    const remainingOpenWait = () => options.startupBusyDeadlineMs === undefined
+      ? timeout
+      : Math.max(0, Math.min(10_000, Math.ceil(options.startupBusyDeadlineMs - performance.now())));
     if (options.freshCaptureRootEpoch !== undefined && options.freshCaptureRootEpoch !== null &&
         !installationEpochIdSchema.safeParse(options.freshCaptureRootEpoch).success) {
       throw new Error("installation_epoch_id_invalid");
@@ -299,7 +305,7 @@ export class LocalEventBuffer {
     if (options.freshCaptureRootEpoch === null && !fs.existsSync(path)) {
       throw new Error("fresh_ledger_capture_root_epochs_conflict");
     }
-    try { this.db = openLedgerDatabase(path, { timeout }); }
+    try { this.db = openLedgerDatabase(path, { timeout: remainingOpenWait() }); }
     catch (error) {
       if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
         recoverInvalidLedgerPublication(path);
@@ -326,9 +332,37 @@ export class LocalEventBuffer {
       this.db.close();
       throw error;
     }
-    registerRetentionDeliveryId(this.db);
-    this.db.pragma("journal_mode = WAL");
+    try {
+      registerRetentionDeliveryId(this.db);
+      // A second first opener can see SQLITE_BUSY while the first changes the
+      // file into WAL mode. SQLite does not always apply busy_timeout to this
+      // pragma, so retry only that transient result within the startup budget.
+      const journalDeadline = options.startupBusyDeadlineMs ?? performance.now() + timeout;
+      const busyWait = new Int32Array(new SharedArrayBuffer(4));
+      for (;;) {
+        try {
+          // A DELETE-mode writer may escalate to EXCLUSIVE during this pragma.
+          // Limit SQLite's native wait to the budget left for this attempt.
+          this.db.pragma(`busy_timeout = ${Math.max(0, Math.min(10_000, Math.ceil(journalDeadline - performance.now())))}`);
+          this.db.pragma("journal_mode = WAL");
+          break;
+        } catch (error) {
+          if ((error as { code?: string }).code !== "SQLITE_BUSY" || performance.now() >= journalDeadline)
+            throw error;
+          Atomics.wait(busyWait, 0, 0, 10);
+        }
+      }
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
     this.deviceId = options.deviceId?.trim() || null;
+    // All open-time schema reads and writes must share one writer lock. On a
+    // first open, another process can otherwise read the same missing column
+    // and lose its ALTER to this process with "duplicate column name".
+    try {
+    this.db.pragma(`busy_timeout = ${remainingOpenWait()}`);
+    this.db.exec("BEGIN IMMEDIATE");
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
       .get();
@@ -984,10 +1018,28 @@ export class LocalEventBuffer {
         : undefined,
     });
     markOpenStep("ledger.projection_schema");
-    // Small upgrades finish at open; large ledgers advance in bounded upload
-    // and retention turns, independently of the completed raw cursor.
-    this.delivery.backfillLegacyReceiptLineage({ maxRows: 16, maxWriterMs: 50 });
-    markOpenStep("ledger.receipt_lineage_slice");
+    this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        if (this.db.inTransaction) this.db.exec("ROLLBACK");
+      } finally {
+        this.db.close();
+      }
+      throw error;
+    }
+    try {
+      // Small upgrades finish at open; large ledgers advance in bounded upload
+      // and retention turns, independently of the completed raw cursor.
+      if (options.startupBusyDeadlineMs !== undefined)
+        this.db.pragma(`busy_timeout = ${remainingOpenWait()}`);
+      this.delivery.backfillLegacyReceiptLineage({ maxRows: 16, maxWriterMs: 50 });
+      markOpenStep("ledger.receipt_lineage_slice");
+      if (options.startupBusyDeadlineMs !== undefined)
+        this.db.pragma(`busy_timeout = ${timeout}`);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   /**
@@ -1940,6 +1992,9 @@ export class LocalEventBuffer {
   }
 
   recoverRepoContextState() {
+    // Recovery reads a count before deleting rows. Begin as a writer so a
+    // concurrent hook cannot turn that read snapshot into SQLITE_BUSY when
+    // the deferred transaction tries to upgrade at the first delete.
     const recovered = this.db.transaction(() => {
       const unresolved = this.db
         .prepare(
@@ -1957,7 +2012,7 @@ export class LocalEventBuffer {
       this.db.prepare(`delete from repo_context_handoffs`).run();
       this.db.prepare(`delete from repo_context_inflight`).run();
       return unresolved.count;
-    })();
+    }).immediate();
     this.repoContextQueue.splice(0);
     this.queuedRepoContextIds.clear();
     return recovered;
