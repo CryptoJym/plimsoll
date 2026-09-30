@@ -1973,6 +1973,9 @@ export class LocalEventBuffer {
   }
 
   recoverRepoContextState() {
+    // Recovery reads a count before deleting rows. Begin as a writer so a
+    // concurrent hook cannot turn that read snapshot into SQLITE_BUSY when
+    // the deferred transaction tries to upgrade at the first delete.
     const recovered = this.db.transaction(() => {
       const unresolved = this.db
         .prepare(
@@ -1990,7 +1993,7 @@ export class LocalEventBuffer {
       this.db.prepare(`delete from repo_context_handoffs`).run();
       this.db.prepare(`delete from repo_context_inflight`).run();
       return unresolved.count;
-    })();
+    }).immediate();
     this.repoContextQueue.splice(0);
     this.queuedRepoContextIds.clear();
     return recovered;
