@@ -222,12 +222,16 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       'trg_session_sync_upload_lease_dirty_update')`).all() as Array<{ name: string; sql: string }>;
   const oldUnscanned = unscannedRowSql("old.session_id", "old.rowid", "old.observed_at");
   const newUnscanned = unscannedRowSql("new.session_id", "new.rowid", "new.observed_at");
-  const rawSummaryChanged = [
+  // Parenthesize the OR chain before combining it with the session/state
+  // guards below. Without this, SQLite's AND precedence lets a changed
+  // nullable-session column enter the repair trigger even when the guarded
+  // session is NULL, and the NOT NULL repair key rejects the whole write.
+  const rawSummaryChanged = `(${[
     "id", "source", "data_mode", "observed_at", "created_at", "session_id",
     "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
     "cost_usd", "repo_hash", "branch_hash", "account_hash",
     "privacy_generation", "privacy_disposition",
-  ].map((column) => `old.${column} is not new.${column}`).join(" or ");
+  ].map((column) => `old.${column} is not new.${column}`).join(" or ")})`;
   const oldOutboxMismatch = unresolvedOutboxLineageSql("old");
   const newOutboxMismatch = unresolvedOutboxLineageSql("new");
   const oldOutboxChange = `${oldOutboxMismatch} and

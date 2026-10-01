@@ -11,6 +11,7 @@ import { claudeDispatchSkipStatus, currentDispatchCaptureRoots } from "./capture
 import { countUnlinkableDispatchBindings } from "./dispatch-command";
 import { readJevAnalysis, type JevAnalysisSnapshot } from "./jev-analysis";
 import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
+import { STATUS_SUMMARY_INTERVAL_MS } from "./status-summary";
 import { automaticRepairServiceStatus } from "./maintenance";
 import {
   assertCollectorPrivacyMode,
@@ -699,6 +700,12 @@ export function createCollectorServer(
     /** Registers a refresh callable for startup/child-receipt points only. */
     registerStatusRefresher?: (refresh: (failure?: "maintenance_failed") => boolean) => void;
     /**
+     * Refreshes the cached /status snapshot independently of maintenance.
+     * Maintenance failures remain visible as `last_coherent`, while the cache
+     * timestamp continues to advance for the availability gate.
+     */
+    statusRefreshIntervalMs?: number;
+    /**
      * Injectable clock for rejection-diagnostics windows (proof fixtures).
      * Production defaults to wall-clock time.
      */
@@ -1342,6 +1349,11 @@ export function createCollectorServer(
   const stopRetentionHoldRefresh = buffer.onRetentionHoldCountChanged(() => { refreshStatus(); });
   refreshStatus();
   options.registerStatusRefresher?.(refreshStatus);
+  const statusRefreshIntervalMs = options.statusRefreshIntervalMs ?? STATUS_SUMMARY_INTERVAL_MS;
+  const statusRefreshTimer = setInterval(() => {
+    refreshStatus(lastStatusRefreshError === "maintenance_failed" ? "maintenance_failed" : undefined);
+  }, statusRefreshIntervalMs);
+  statusRefreshTimer.unref();
 
   const httpServer = http.createServer(async (request, response) => {
     const budget = createRequestBudget(options.requestBudgetNow);
@@ -2185,6 +2197,7 @@ export function createCollectorServer(
   // reaped mid-request.
   httpServer.keepAliveTimeout = 0;
   httpServer.once("close", stopRetentionHoldRefresh);
+  httpServer.once("close", () => clearInterval(statusRefreshTimer));
   const server = httpServer as CollectorServer;
   server.plimsollInstanceId = instanceId;
   // For the status summary writer in this process only.

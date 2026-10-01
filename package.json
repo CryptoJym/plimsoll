@@ -182,6 +182,8 @@
     "proof:session-summary-trigger-writer-burst": "tsx scripts/run-proof.ts scripts/session-summary-trigger-writer-burst-proof.ts",
     "proof:session-summary-v3-upgrade-gate": "tsx scripts/run-proof.ts scripts/session-summary-v3-upgrade-gate-proof.ts",
     "proof:session-summary-queued-append-repair": "tsx scripts/run-proof.ts scripts/session-summary-queued-append-repair-proof.ts",
+    "proof:session-summary-repair-null-session": "tsx scripts/run-proof.ts scripts/session-summary-repair-null-session-proof.ts",
+    "proof:session-summary-0747-rollback": "tsx scripts/run-proof.ts scripts/session-summary-0747-rollback-proof.ts",
     "proof:session-summary-checkpoint-erasure": "tsx scripts/run-proof.ts scripts/session-summary-checkpoint-erasure-proof.ts",
     "proof:session-summary-historical-repair": "tsx scripts/run-proof.ts scripts/session-summary-historical-repair-proof.ts",
     "proof:session-summary-future-maturity": "tsx scripts/run-proof.ts scripts/session-summary-future-maturity-proof.ts",
