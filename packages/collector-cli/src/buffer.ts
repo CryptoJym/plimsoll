@@ -1,4 +1,4 @@
-import { openLedgerDatabase } from "./ledger-connection";
+import { openLedgerDatabase, openLedgerDatabaseForStartup } from "./ledger-connection";
 import { recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallationEpoch,
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
@@ -305,9 +305,15 @@ export class LocalEventBuffer {
     if (options.freshCaptureRootEpoch === null && !fs.existsSync(path)) {
       throw new Error("fresh_ledger_capture_root_epochs_conflict");
     }
-    try { this.db = openLedgerDatabase(path, { timeout: remainingOpenWait() }); }
+    try {
+      this.db = options.startupBusyDeadlineMs === undefined
+        ? openLedgerDatabase(path, { timeout: remainingOpenWait() })
+        : openLedgerDatabaseForStartup(path, { timeout: remainingOpenWait() }, options.startupBusyDeadlineMs);
+    }
     catch (error) {
       if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
+        // A known foreign handle cannot be made safe by retrying or restoring.
+        if ((error as { cause?: { code?: string } }).cause?.code === "LEDGER_ARCHIVE_HANDLE_IN_USE") throw error;
         recoverInvalidLedgerPublication(path);
         throw new Error("replacement_verification_failed; archive restored; collector start refused", { cause: error });
       }
