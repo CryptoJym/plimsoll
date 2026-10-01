@@ -28,7 +28,13 @@ import { createProofCompletion } from "./lib/proof-completion";
  * unparenthesized OR expression inserts NULL into its NOT NULL repair key.
  */
 const otlpOnly = process.argv.includes("--otlp-only");
-const completion = createProofCompletion("session-summary-repair-null-session", otlpOnly ? 1 : 9);
+const historicalOnly = process.argv.includes("--historical-only");
+const statusFailureOnly = process.argv.includes("--status-failure-only");
+const heartbeatOnly = process.argv.includes("--heartbeat-only");
+const completion = createProofCompletion(
+  "session-summary-repair-null-session",
+  otlpOnly || statusFailureOnly || heartbeatOnly ? 1 : historicalOnly ? 2 : 9,
+);
 const root = process.env.PLIMSOLL_PROOF_ROOT!;
 const workspace = "00000000-0000-4000-8000-000000000747";
 const session = "00000000-0000-4000-8000-000000000701";
@@ -453,6 +459,25 @@ async function main() {
   if (otlpOnly) {
     await codexOtlpProof();
     completion.check("codex_otlp_pairing_accepts_orphan_rows");
+    completion.complete();
+    return;
+  }
+  if (historicalOnly) {
+    await historicalUpgradeProof();
+    completion.check("v0745_upgrade_replaces_old_repair_triggers");
+    completion.check("v0746_upgrade_replaces_old_repair_triggers");
+    completion.complete();
+    return;
+  }
+  if (statusFailureOnly) {
+    await statusReadFailureRecoveryProof();
+    completion.check("status_read_failure_preserves_maintenance_latch");
+    completion.complete();
+    return;
+  }
+  if (heartbeatOnly) {
+    await heartbeatLatencyProof();
+    completion.check("bounded_heartbeat_does_not_block_queued_otlp_intake");
     completion.complete();
     return;
   }
