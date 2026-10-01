@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import type Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline,
   sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
@@ -46,6 +47,78 @@ async function main() {
     deviceId: "dev_0d1c2b3a-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
   });
   let probe: ChildProcess | null = null;
+  const slicePhases: Array<{
+    slice: number; requestedAtMs: number; beginAcquiredAtMs?: number;
+    rowLoopStartedAtMs?: number; rowLoopEndedAtMs?: number;
+    commitStartedAtMs?: number; commitEndedAtMs?: number;
+    handoffStartedAtMs?: number; handoffEndedAtMs?: number;
+    walSampledAtMs?: number; walBytes?: number;
+  }> = [];
+  const traceStarted = performance.now();
+  const at = () => performance.now() - traceStarted;
+  const originalTransaction = buffer.database.transaction;
+  const originalPrepare = buffer.database.prepare;
+  const originalHandoffs = buffer.transactionWithRepoContextHandoffs;
+  let activeSlice: typeof slicePhases[number] | null = null;
+  // Observe the existing transaction boundaries without moving any work or
+  // changing SQLite settings. The callback begins after BEGIN IMMEDIATE;
+  // transaction return is after COMMIT; handoff return includes finalization.
+  buffer.database.transaction = function <T extends (...args: any[]) => any>(this: Database.Database, work: T) {
+    const transaction = originalTransaction.call(this, work) as Database.Transaction<T>;
+    if (!activeSlice) return transaction;
+    const immediate = transaction.immediate;
+    const observedImmediate = function (this: unknown, ...args: Parameters<typeof immediate>): ReturnType<T> {
+      const result = Reflect.apply(immediate, this, args) as ReturnType<T>;
+      if (activeSlice) {
+        activeSlice.commitEndedAtMs = at();
+        activeSlice.handoffStartedAtMs = activeSlice.commitEndedAtMs;
+      }
+      return result;
+    };
+    // The ledger opener preserves the native read-only transaction variants.
+    // Copy their descriptors onto a new callable; never mutate the original.
+    const observed = function (this: unknown, ...args: Parameters<typeof transaction>): ReturnType<T> {
+      return Reflect.apply(transaction, this, args) as ReturnType<T>;
+    };
+    Object.defineProperties(observed, {
+      ...Object.getOwnPropertyDescriptors(transaction),
+      immediate: { ...Object.getOwnPropertyDescriptor(transaction, "immediate"), value: observedImmediate },
+    });
+    return observed as Database.Transaction<T>;
+  } as typeof originalTransaction;
+  buffer.database.prepare = function (this: Database.Database, sql: string) {
+    // The authority read is the first statement in each row iteration.
+    if (activeSlice && sql.includes("select authority from session_usage_authority where source=? and session_id=?"))
+      activeSlice.rowLoopStartedAtMs ??= at();
+    // The progress receipt is written immediately after the row loop.
+    if (activeSlice && sql.includes("update capture_history_import_runs set imported_rows="))
+      activeSlice.rowLoopEndedAtMs = at();
+    return originalPrepare.call(this, sql);
+  } as typeof originalPrepare;
+  buffer.transactionWithRepoContextHandoffs = function <T>(work: () => T): T {
+    const phase: typeof slicePhases[number] = { slice: slicePhases.length + 1, requestedAtMs: at() };
+    slicePhases.push(phase);
+    activeSlice = phase;
+    try {
+      const result = originalHandoffs.call(this, () => {
+        phase.beginAcquiredAtMs = at();
+        const value = work();
+        phase.commitStartedAtMs = at();
+        return value;
+      }) as T;
+      phase.handoffEndedAtMs = at();
+      // flush() measures elapsed immediately after this method returns.
+      // Defer stat until its next await so filesystem timing stays outside
+      // that writer measurement, before another import slice can start.
+      queueMicrotask(() => {
+        phase.walSampledAtMs = at();
+        phase.walBytes = fs.statSync(`${ledger}-wal`).size;
+      });
+      return result;
+    } finally {
+      activeSlice = null;
+    }
+  };
   try {
     const epoch = buffer.workspaceBinding()!.currentInstallationEpochId!;
     const captureRoot: CaptureRoot = { ...deriveCaptureRootIdentity("fixture", "codex", directory),
@@ -124,11 +197,18 @@ async function main() {
     console.log(JSON.stringify({ checks: 8, importedRows: receipt.importedRows,
       writerSlices: receipt.writerSlices, maxWriterSliceMs: receipt.maxWriterSliceMs,
       intake: result }));
+  } catch (error) {
+    console.error(JSON.stringify({ proof: "history_writer_handoff", phaseClock: "ms_since_trace_start",
+      slicePhases }));
+    throw error;
   } finally {
     if (probe && probe.exitCode === null && probe.signalCode === null) {
       probe.kill("SIGTERM");
       await new Promise<void>(resolve => probe!.once("close", () => resolve()));
     }
+    buffer.database.transaction = originalTransaction;
+    buffer.database.prepare = originalPrepare;
+    buffer.transactionWithRepoContextHandoffs = originalHandoffs;
     buffer.close(); fixture.restore(); fs.rmSync(root, { recursive: true, force: true });
   }
 }
