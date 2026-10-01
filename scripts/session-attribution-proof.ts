@@ -8,6 +8,10 @@ import {
   type SessionRepoContext,
 } from "../packages/collector-cli/src/session-attribution";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
+import {
+  normalizeHistoryEvent,
+  prepareHistoryEvent,
+} from "../packages/collector-cli/src/upload-history";
 import type { AiInteractionEvent } from "../packages/shared/src/index";
 
 const REPO_A = `sha256:${"a".repeat(64)}`;
@@ -194,6 +198,26 @@ function main() {
   assert.equal(attributedRollout.event.projectKey, REPO_A);
   assert.equal(attributedRollout.basis, "session_inherited");
 
+  // History upload must plan the same lookup before its page is sealed.
+  // Its row repo is the turn cwd; the preceding tool is the work location.
+  const historyRow = {
+    payloadJson: JSON.stringify({ ...rollout, id: "00000000-0000-4000-8000-000000000103" }),
+    suppressedFieldsJson: "[]",
+    repoHash: REPO_B,
+    branchHash: null,
+  };
+  const preparedHistory = prepareHistoryEvent(historyRow);
+  assert.equal(preparedHistory.ok, true, JSON.stringify(preparedHistory));
+  if (!preparedHistory.ok || !preparedHistory.event) throw new Error("history row did not parse");
+  const historyAttribution = new SessionAttributionBatch(ledger.database, [
+    { event: preparedHistory.event, repoHash: historyRow.repoHash },
+  ]);
+  const history = normalizeHistoryEvent({ ...historyRow, attribution: historyAttribution });
+  assert.equal(history.ok, true);
+  if (!history.ok) throw new Error("history row did not seal");
+  assert.equal(history.envelope.event.projectKey, REPO_A);
+  assert.equal(history.envelope.event.metadata.projectBasis, "session_inherited");
+
   const previousTurnTool = applyProjectAttribution(rollout, {
     repoHash: REPO_B,
     sessionContexts: [
@@ -257,7 +281,7 @@ function main() {
   const stable = applyProjectAttribution(single.event, { sessionContexts: [context(2, "2026-09-23T11:59:00.000Z", REPO_A)] });
   assert.deepEqual(stable.event, single.event);
   ledger.close();
-  console.log(JSON.stringify({ status: "PASS", checks: 21, fixture: "otel-assistant_response-tool_result-session" }));
+  console.log(JSON.stringify({ status: "PASS", checks: 25, fixture: "otel-assistant_response-tool_result-session" }));
 }
 
 main();
