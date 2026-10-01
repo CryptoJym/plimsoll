@@ -348,6 +348,8 @@ function verifyMeasurements(
   assert.equal(integer(firstBoot.replayTranscriptFilesRead, "replay transcript reads"), 1);
   assert.equal(integer(firstBoot.replayEventsAppended, "replay appended events"), 0);
   assert.equal(integer(firstBoot.replayRawEventWrites, "replay raw event writes"), 0);
+  assert.equal(integer(firstBoot.sqliteWritesDuringIdle, "idle SQLite writes"), 0);
+  assert.equal(integer(firstBoot.walBytesDeltaDuringIdle, "idle WAL byte delta"), 0);
   assert.equal(integer(firstBoot.replayEventMutationsInserted, "replay inserted mutations"), 0);
   assert.ok(integer(firstBoot.baselineCodexGenerations, "baseline Codex generations") >= 200);
   assert.ok(integer(firstBoot.baselineClaudeGenerations, "baseline Claude generations") >= 1_200);

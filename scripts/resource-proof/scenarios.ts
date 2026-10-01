@@ -1,4 +1,5 @@
 import { acceptedFixtureDelivery } from "../lib/delivery-fixture";
+import { hasRequiredSchemaTables } from "../system-e2e/contract";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -407,9 +408,7 @@ export function runEmptyLedgerContract(sandbox: ResourceSandbox): ScenarioReceip
       noEvents: stats.count === 0 && stats.unuploadedCount === 0,
       noMetrics: stats.metricSampleCount === 0,
       integrityOk: integrity.length === 1 && integrity[0]?.integrity_check === "ok",
-      expectedSchemaPresent:
-        tables.some((row) => row.name === "buffered_events") &&
-        tables.some((row) => row.name === "metric_samples"),
+      expectedSchemaPresent: hasRequiredSchemaTables(tables.map((row) => row.name)),
     };
     const passed = Object.values(checks).every(Boolean);
     return {
@@ -2045,6 +2044,19 @@ export async function runNoChangeConstantWorkContract(
       restartMutations.inserted === 0 &&
       restartMutations.updated === 0 &&
       restartMutations.deleted === 0;
+    // Let the isolated, restarted ledger sit with no requested work. A new
+    // background writer may leave event counters at zero while still growing
+    // the WAL, so measure both connection writes and physical WAL bytes.
+    const connectionChanges = () =>
+      (buffer!.database.prepare("select total_changes() as n").get() as { n: number }).n;
+    const walBytes = () =>
+      fs.statSync(`${sandbox.ledger}-wal`, { throwIfNoEntry: false })?.size ?? 0;
+    const idleConnectionChangesBefore = connectionChanges();
+    const idleWalBytesBefore = walBytes();
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    const sqliteWritesDuringIdle = connectionChanges() - idleConnectionChangesBefore;
+    const walBytesDeltaDuringIdle = walBytes() - idleWalBytesBefore;
+    const idleQuiescent = sqliteWritesDuringIdle === 0 && walBytesDeltaDuringIdle === 0;
 
     // The baseline excludes old bytes, but a later append must be captured
     // from that exact byte boundary. Its first Codex cumulative total has no
@@ -2707,6 +2719,7 @@ export async function runNoChangeConstantWorkContract(
       setupFilesystemEnumerationCalls === fixture.expectedSetupFilesystemEnumerationCalls &&
       recentDidNotPromote &&
       restartZeroWork &&
+      idleQuiescent &&
       preinstallGrowthRecovered &&
       appendedExactlyOnce &&
       durableReceiptCounters &&
@@ -2788,6 +2801,8 @@ export async function runNoChangeConstantWorkContract(
           0,
         ),
         replayRawEventWrites: replayRuns.reduce((total, run) => total + run.rawEventWrites, 0),
+        sqliteWritesDuringIdle,
+        walBytesDeltaDuringIdle,
         replayEventMutationsInserted: replayMutations.inserted,
         recentPromotionRejected,
         statusSeparatesCurrentFromHistory,

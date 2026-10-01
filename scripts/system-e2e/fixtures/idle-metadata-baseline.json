@@ -1,0 +1,6 @@
+{
+  "schema": "plimsoll.system-e2e-idle-metadata-baseline.v1",
+  "sourceCommit": "20866273d4a55b174a41f855786ead6b70cb4e88",
+  "measuredOn": "2026-09-30",
+  "filesystemMetadataOperations": 24640
+}
