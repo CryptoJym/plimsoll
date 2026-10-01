@@ -1013,6 +1013,9 @@ jobs:
           pnpm proof:session-attribution
           pnpm proof:session-attribution-bounded
           pnpm proof:session-context-index
+          pnpm proof:session-attribution-review-r2
+          pnpm proof:session-attribution-review-r2-budget
+          pnpm proof:ordinary-repo-lease
 
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

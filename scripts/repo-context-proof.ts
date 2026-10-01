@@ -19,6 +19,7 @@ import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import {
   attachRepoContextId,
   attachRepoContextSidecar,
+  extractRepoContextCwd,
   peekRepoContextSidecar,
   REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
@@ -86,6 +87,24 @@ try {
   const cwdA = repo(root, privateCwdSentinel, "https://example.invalid/team/repo-a.git");
   const cwdB = repo(root, "repo-b", "https://example.invalid/team/repo-b.git");
   const cfg = collectorConfigSchema.parse({});
+  const coordinatorCwd = path.join(root, "coordinator");
+  check("tool_workdir_overrides_session_cwd_in_hook", extractRepoContextCwd({
+    cwd: coordinatorCwd,
+    arguments: JSON.stringify({ workdir: cwdA }),
+  }) === cwdA);
+  const toolOtlp = explodeOtlpPayload({ resourceLogs: [{
+    resource: { attributes: [{ key: "service.name", value: { stringValue: "codex_exec" } }] },
+    scopeLogs: [{ logRecords: [{
+      timeUnixNano: "1784541600000000000",
+      attributes: [
+        { key: "cwd", value: { stringValue: coordinatorCwd } },
+        { key: "arguments", value: { stringValue: JSON.stringify({ workdir: cwdA }) } },
+        { key: "session.id", value: { stringValue: "otlp-tool-workdir" } },
+      ],
+    }] }],
+  }] }, { policy: cfg.policy, source: "codex", transportPath: "/v1/logs" });
+  check("tool_workdir_overrides_session_cwd_in_otlp",
+    peekRepoContextSidecar(toolOtlp.events[0]!.event)?.cwd === cwdA);
   const ledger = path.join(root, "ledger.sqlite");
   const bufferA = new LocalEventBuffer(ledger, { delivery: { enabled: true } });
   const bufferB = new LocalEventBuffer(ledger, { delivery: { enabled: true } });
@@ -322,7 +341,8 @@ try {
   );
 
   const hookA = appendForwardedHook(
-    { id: "hook-a", event_type: "UserPromptSubmit", session_id: "multi-repo", cwd: cwdA },
+    { id: "hook-a", event_type: "UserPromptSubmit", session_id: "multi-repo",
+      cwd: coordinatorCwd, arguments: JSON.stringify({ workdir: cwdA }) },
     { config: cfg, buffer: bufferA, source: "codex" },
   );
   const hookB = appendForwardedHook(

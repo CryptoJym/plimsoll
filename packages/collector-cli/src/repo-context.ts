@@ -196,6 +196,7 @@ export function extractRepoContextCwd(value: unknown): string | undefined {
   const pending: unknown[] = [value];
   const seen = new Set<object>();
   let visited = 0;
+  let fallbackCwd: string | undefined;
 
   while (pending.length > 0 && visited < MAX_EXTRACTION_NODES) {
     const current = pending.shift();
@@ -211,16 +212,25 @@ export function extractRepoContextCwd(value: unknown): string | undefined {
     if (seen.has(current)) continue;
     seen.add(current);
 
-    for (const key of CWD_KEYS) {
+    // A tool's explicit workdir can be nested in its arguments while the
+    // enclosing hook carries the coordinator's session cwd. Keep the latter
+    // only as a fallback after the bounded traversal.
+    for (const key of ["workdir", "working_directory"] as const) {
       const candidate = otlpScalar(current[key]);
       const canonical = canonicalRepoContextCwd(candidate);
       if (canonical) return canonical;
+    }
+    for (const key of ["cwd", "current_working_directory"] as const) {
+      fallbackCwd ??= canonicalRepoContextCwd(otlpScalar(current[key]));
     }
 
     if (typeof current.key === "string" && CWD_KEYS.has(current.key)) {
       const candidate = otlpScalar(current.value);
       const canonical = canonicalRepoContextCwd(candidate);
-      if (canonical) return canonical;
+      if (canonical) {
+        if (current.key === "workdir" || current.key === "working_directory") return canonical;
+        fallbackCwd ??= canonical;
+      }
     }
 
     if (typeof current.key === "string" && ARGUMENT_KEYS.has(current.key)) {
@@ -251,7 +261,7 @@ export function extractRepoContextCwd(value: unknown): string | undefined {
     }
   }
 
-  return undefined;
+  return fallbackCwd;
 }
 
 export function validRepoContextId(value: unknown): value is string {

@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import Database from "better-sqlite3";
 
-import { BoundedSqlReadError } from "../packages/collector-cli/src/bounded-sql-read";
+import { BOUNDED_SQL_READ_PREDICATE, BoundedSqlReadError } from "../packages/collector-cli/src/bounded-sql-read";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { emptyDaemonSessionSyncState, planDaemonSessionSync } from "../packages/collector-cli/src/session-sync";
-import { ensureSessionSummarySchema, listSessionSummaryPendingIds, updateSessionSummary,
-  type SessionReadQuery, type SessionSummaryRead } from "../packages/collector-cli/src/session-summary";
+import { ensureSessionSummarySchema, listSessionSummaryPendingIds, SESSION_SUMMARY_QUEUED_ROWS_PENDING_SQL,
+  updateSessionSummary, type SessionReadQuery, type SessionSummaryRead } from "../packages/collector-cli/src/session-summary";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
 
@@ -152,12 +152,42 @@ async function plannerToleratesLedgerWithoutPendingTable() {
   } finally { buffer.close(); }
 }
 
+async function queuedRowsPendingReadStartsFromTheQueue() {
+  const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa47";
+  const buffer = new LocalEventBuffer(path.join(root, "queued-rows-plan.sqlite"));
+  try {
+    appendOne(buffer, sessionId, "00000000-0000-4000-8000-000000000147");
+    ensureSessionSummarySchema(buffer.database);
+    const initial = await updateSessionSummary(buffer.database, sessionId, new Date().toISOString(),
+      { read: directRead(buffer.database) });
+    assert.equal(initial.complete, true, JSON.stringify(initial));
+    // A later row in a summarized session is queued by the insert trigger.
+    appendOne(buffer, sessionId, "00000000-0000-4000-8000-000000000148");
+    const queued = buffer.database.prepare(`select count(*) as count from session_sync_summary_rows
+      where session_id = ?`).get(sessionId) as { count: number };
+    assert.equal(queued.count, 1);
+    const until = new Date().toISOString();
+    assert.ok(listSessionSummaryPendingIds(buffer.database, until).includes(sessionId));
+    // eco-6hoxj.163.135: the queue must drive the join. Walking buffered_events
+    // runs the bounded-read check once per event and misses its deadline on a
+    // large ledger, which sends every session on every cycle.
+    const plan = (buffer.database.prepare(`explain query plan
+      ${SESSION_SUMMARY_QUEUED_ROWS_PENDING_SQL.replace(BOUNDED_SQL_READ_PREDICATE, "1")}`)
+      .all({ until }) as Array<{ detail: string }>).map((row) => row.detail);
+    assert.match(plan[0] ?? "", /^(?:SCAN|SEARCH) r\b/, JSON.stringify(plan));
+    assert.ok(plan.some((detail) => /^SEARCH e USING INTEGER PRIMARY KEY/.test(detail)), JSON.stringify(plan));
+    completion.check("queued_rows_pending_read_starts_from_the_queue");
+  } finally { buffer.close(); }
+}
+
 async function main() {
   const selected = process.argv.find((arg) => arg.startsWith("--case="))?.slice("--case=".length);
-  if (selected && selected !== "planner" && selected !== "completion" && selected !== "upgrade") throw new Error("unknown proof case");
+  if (selected && selected !== "planner" && selected !== "completion" && selected !== "upgrade" &&
+      selected !== "queue-plan") throw new Error("unknown proof case");
   if (!selected || selected === "planner") await pendingReasonReplansCompleteSummary();
   if (!selected || selected === "completion") await latePendingReasonClearsOnCompletion();
   if (!selected || selected === "upgrade") await plannerToleratesLedgerWithoutPendingTable();
+  if (!selected || selected === "queue-plan") await queuedRowsPendingReadStartsFromTheQueue();
   completion.complete();
 }
 

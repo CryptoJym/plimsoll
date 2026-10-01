@@ -53,6 +53,7 @@ export type SessionRepoContext = {
   sessionId: string;
   observedAt: string;
   repoHash: string;
+  eventType?: string;
 };
 
 export type SessionRepoContextScan = {
@@ -92,7 +93,7 @@ export type SessionAttributionStats = {
   integrityFailures: number;
 };
 
-type SessionContextEvent = Pick<AiInteractionEvent, "sessionId" | "observedAt"> &
+type SessionContextEvent = Pick<AiInteractionEvent, "sessionId" | "observedAt" | "eventType"> &
   Partial<Pick<AiInteractionEvent, "projectKey" | TokenField>>;
 
 export type ProjectAttributionResult = {
@@ -185,30 +186,38 @@ function inheritedRepo(
   event: AiInteractionEvent,
   contexts: readonly SessionRepoContext[],
   truncated: boolean,
+  turnCwdFallback = false,
 ) {
   if (!event.sessionId || truncated) return null;
-  const sorted = sortedContexts(event, contexts);
-  const distinctRepos = [...new Set(sorted.map((context) => context.repoHash))];
-  if (distinctRepos.length === 1) return distinctRepos[0]!;
-  if (distinctRepos.length < 2) return null;
-  // Multi-repo sessions use only the nearest preceding resolved context;
-  // future context is intentionally not used to guess an event's project.
-  const eventAt = parseObservedAt(event.observedAt)!;
-  const preceding = sorted
-    .filter((context) => context.at <= eventAt)
-    .sort((left, right) => right.at - left.at || right.rowid - left.rowid)[0];
-  return preceding?.repoHash ?? null;
+  const eventAt = parseObservedAt(event.observedAt);
+  if (eventAt === null) return null;
+  const preceding = sortedContexts(event, contexts)
+    .filter((context) => context.at < eventAt)
+    .sort((left, right) => right.at - left.at || right.rowid - left.rowid);
+  if (!turnCwdFallback) return preceding[0]?.repoHash ?? null;
+
+  // A rollout/transcript row's own repo is its turn/message cwd. Only tool
+  // work since the previous usage observation can displace that fallback;
+  // an older turn's tool must not claim this turn's usage.
+  const priorUsage = preceding.find((context) =>
+    context.eventType === "usage_rollout" || context.eventType === "usage_transcript");
+  const tool = preceding.find((context) =>
+    (context.eventType === "tool_use" || context.eventType === "tool_result") &&
+    (!priorUsage || context.at > priorUsage.at ||
+      (context.at === priorUsage.at && context.rowid > priorUsage.rowid)));
+  return tool?.repoHash ?? null;
 }
 
 function needsSessionLookup(event: SessionContextEvent, repoHash?: string | null) {
-  // Most buffered rows are spans/tool results without tokens.  Do not even
-  // issue a session query for them (or for a row that already has a project);
-  // this keeps millions of ordinary `otel_span` rows out of the attribution
-  // path while retaining the indexed bounded lookup for token rows.
+  // Most buffered rows are spans/tool results without tokens. Only token rows
+  // lacking a project need a lookup, including rollout/transcript rows whose
+  // own repo is the turn/message cwd fallback. This keeps ordinary spans out
+  // of the indexed attribution path.
   return Boolean(
     event.sessionId &&
     !event.projectKey &&
-    !canonicalLinkage(repoHash) &&
+    (!canonicalLinkage(repoHash) || event.eventType === "usage_rollout" ||
+      event.eventType === "usage_transcript") &&
     isTokenBearing(event),
   );
 }
@@ -261,9 +270,9 @@ const COUNT_SESSION_ENTRIES =
    )`;
 const READ_SESSION_CONTEXTS =
   `select rowid, session_id as sessionId, observed_at as observedAt,
-     repo_hash as repoHash
+     repo_hash as repoHash, event_type as eventType
    from (
-     select rowid, session_id, observed_at, repo_hash, data_mode,
+     select rowid, session_id, observed_at, repo_hash, event_type, data_mode,
        privacy_disposition
      from buffered_events indexed by idx_events_session
      where session_id = ? and observed_at >= ? and observed_at <= ?
@@ -279,6 +288,7 @@ const READ_SESSION_CONTEXTS =
 const READ_INDEXED_CONTEXTS =
   `select c.source_rowid as rowid, c.session_id as sessionId,
      c.observed_at as observedAt, c.repo_hash as repoHash,
+     (select e.event_type from buffered_events e where e.rowid = c.source_rowid) as eventType,
      exists (
        select 1 from buffered_events e where e.rowid = c.source_rowid
          and e.session_id is c.session_id and e.observed_at is c.observed_at
@@ -298,7 +308,8 @@ type IndexedSessionRepoContext = SessionRepoContext & { sourceValid: number };
  * copies its rows once.
  */
 function plainContexts(rows: readonly SessionRepoContext[]): SessionRepoContext[] {
-  return rows.map(({ rowid, sessionId, observedAt, repoHash }) => ({ rowid, sessionId, observedAt, repoHash }));
+  return rows.map(({ rowid, sessionId, observedAt, repoHash, eventType }) =>
+    ({ rowid, sessionId, observedAt, repoHash, eventType }));
 }
 
 type SessionLookup = {
@@ -517,8 +528,9 @@ export class SessionAttributionBatch {
 }
 
 /**
- * Apply direct repo linkage first, then bounded session inheritance.  Explicit
- * payload projects always win.  A prior generated marker is reusable only when
+ * Apply tool workdir linkage before a rollout/transcript cwd fallback, then
+ * bounded session inheritance. Explicit payload projects always win. A prior
+ * generated marker is reusable only when
  * the current verified evidence agrees with its key; otherwise it is treated
  * as explicit and is never overwritten.
  */
@@ -528,16 +540,25 @@ export function applyProjectAttribution(
 ): ProjectAttributionResult {
   const basis = eventBasis(event);
   const ownRepo = canonicalLinkage(options.repoHash);
+  const sessionEvidenceRequired = event.eventType === "usage_rollout" || event.eventType === "usage_transcript";
+  const incompleteSessionLookup = sessionEvidenceRequired && options.sessionContextsTruncated === true;
   const replaceable = basis === "repo_context" || basis === "session_inherited";
   // An event that carries a project without one of the collector's generated
   // markers is explicit. Return before touching any supplied session slice.
   if (event.projectKey && !replaceable) {
     return { event: withBasis(event, "explicit", event.projectKey), basis: "explicit" };
   }
+  // A generated project from a prior attribution pass is no stronger than the
+  // session evidence that produced it. If this lookup is incomplete, clear
+  // that stale fallback before considering the row's own starting folder.
+  if (event.projectKey && incompleteSessionLookup && replaceable) {
+    return { event: withBasis(event, "unallocated"), basis: "unallocated" };
+  }
   const inherited = inheritedRepo(
     event,
     options.sessionContexts ?? [],
     options.sessionContextsTruncated ?? false,
+    Boolean(ownRepo && sessionEvidenceRequired),
   );
   if (event.projectKey) {
     // A producer-owned project always wins. A generated marker is reusable
@@ -554,7 +575,10 @@ export function applyProjectAttribution(
   }
 
   const branchHash = canonicalLinkage(options.branchHash);
-  if (ownRepo) {
+  if (ownRepo && inherited && sessionEvidenceRequired) {
+    return { event: withBasis(event, "session_inherited", inherited), basis: "session_inherited" };
+  }
+  if (ownRepo && !incompleteSessionLookup) {
     return { event: withOwnRepoContext(event, ownRepo, branchHash), basis: "repo_context" };
   }
 

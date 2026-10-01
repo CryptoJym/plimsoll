@@ -14,10 +14,11 @@
  *
  * This proof drives continuous intake through LocalEventBuffer.appendMany (the
  * OTLP route's own commit, retried on SQLITE_BUSY as the route retries) with
- * the worker started exactly as the daemon starts it and nothing else
- * checkpointing, and requires the WAL file to stay under WAL_LIMIT_MIB. With
- * the hard bound turned off, the worker alone must keep the WAL under that
- * bound, so its checkpoint need not run inside a commit. A reader that holds
+ * the worker started exactly as the daemon starts it and requires the WAL
+ * file to stay under WAL_LIMIT_MIB. With the hard bound turned off, repeated
+ * worker FULL passes must rewind the WAL, whose peak is bounded by the
+ * measured intake between completed passes, rather than by runner speed.
+ * A reader that holds
  * the WAL past the bound must not hand its backlog to that checkpoint when it
  * lets go: the worker copies it instead.
  *
@@ -25,6 +26,7 @@
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import Database from "better-sqlite3";
@@ -49,6 +51,9 @@ const INTAKE_CAP_MS = 240_000;
 const EVENTS_PER_COMMIT = 16;
 /** Waits only bound how long a failure takes to show; a slow runner needs them long. */
 const WAIT_MS = 60_000;
+const WORKER_ALONE_FULL_PASSES = 3;
+/** Disk guard for a broken worker, not an acceptance bound. */
+const WORKER_ALONE_DISK_CAP_BYTES = 512 * 1_048_576;
 
 const root = process.env.TMPDIR;
 assert.ok(root && fs.realpathSync(root) === root && root.startsWith(process.env.HOME + path.sep),
@@ -90,6 +95,32 @@ const walBytes = (buffer: LocalEventBuffer) => {
   }
 };
 const mib = (bytes: number) => Math.round((bytes / 1_048_576) * 10) / 10;
+
+/**
+ * Read SQLite's two WalIndexHdr copies after our commit. Only this connection
+ * writes; the checkpoint worker changes nBackfill, outside these headers.
+ * mxFrame is at byte 16, szPage at 14, and the WAL salts at 32 (native endian).
+ * Unlike file size, mxFrame reveals reuse of the allocated WAL after FULL.
+ * Reading this does not perform a checkpoint or hold a reader snapshot.
+ */
+function walPosition(buffer: LocalEventBuffer) {
+  const header = Buffer.alloc(96);
+  const fd = fs.openSync(`${buffer.database.name}-shm`, "r");
+  try {
+    assert.equal(fs.readSync(fd, header, 0, header.length, 0), header.length);
+  } finally {
+    fs.closeSync(fd);
+  }
+  assert.equal(header[12], 1, "WAL index is not initialized");
+  assert.ok(header.subarray(0, 48).equals(header.subarray(48)), "WAL index headers disagree");
+  const littleEndian = os.endianness() === "LE";
+  const pageSize = littleEndian ? header.readUInt16LE(14) : header.readUInt16BE(14);
+  return {
+    frames: littleEndian ? header.readUInt32LE(16) : header.readUInt32BE(16),
+    salt: header.subarray(32, 40).toString("hex"),
+    frameBytes: (pageSize === 1 ? 65_536 : pageSize) + 24,
+  };
+}
 let eventNumber = 0;
 let busyRetries = 0;
 
@@ -227,26 +258,86 @@ async function main() {
       assert.equal(typeof WAL_TARGET_FRAMES, "number",
         "no target: nothing but the hard bound's checkpoint, inside a commit, rewinds the WAL");
       assert.equal(walCheckpoint.start(), true);
-      // Turn the hard bound off so that only the worker can bound the WAL: it
-      // must, so the hard bound's checkpoint never has to run inside a commit.
+      // Only the worker may checkpoint. Check this throughout intake: pace()
+      // must not silently restore the valve and let it prove the bound for us.
       buffer.database.pragma("wal_autocheckpoint = 0");
-      // The hard bound's size, with room for a runner ~10x slower than a Mac Studio.
-      const limit = 1.5 * WAL_AUTOCHECKPOINT_VALVE_FRAMES * 4_120;
-      let walMax = 0;
+      const initial = walPosition(buffer);
+      const initialWalBytes = walBytes(buffer);
+      let previous = initial;
+      let walMax = initialWalBytes;
+      let maxCommitBytes = 0;
+      let intakeBytes = 0;
+      let rewinds = 0;
+      let commits = 0;
+      let completed = 0;
+      let lastFullCommit = 0;
+      const completedPasses: Array<{ commits: number; gapCommits: number }> = [];
+      const started = performance.now();
+      const observeFull = () => {
+        const fullCompleted = walCheckpoint.status().fullCompleted;
+        if (fullCompleted > completed) {
+          completedPasses.push({ commits, gapCommits: commits - lastFullCommit });
+          lastFullCommit = commits;
+          completed = fullCompleted;
+        }
+      };
+      const minimumCompletedWork = () => Math.max(INTAKE_COMMITS / 2,
+        3 * (Math.max(0, ...completedPasses.map(pass => pass.gapCommits)) + 2));
       // Dense enough that commits land during the worker's passes, so PASSIVE
-      // alone never rewinds the WAL (it passes 150 MiB), with the writer lock
-      // free between commits, as intake leaves it, for FULL to take.
-      for (let commits = 0; commits < INTAKE_COMMITS / 2; commits += 1) {
+      // cannot be relied on to rewind it. Do not pause intake to wait for FULL:
+      // finish a completed pass beyond the counted workload, with repeated
+      // completions AND rewinds. An arbitrarily slow final pass gets the same
+      // opportunity as earlier passes, while intake continues throughout it.
+      // The time/disk caps only bound failure cleanup.
+      while ((lastFullCommit < minimumCompletedWork() ||
+        completed < WORKER_ALONE_FULL_PASSES ||
+        rewinds < WORKER_ALONE_FULL_PASSES) && performance.now() - started < INTAKE_CAP_MS) {
+        observeFull();
         await commit(buffer, chunk());
+        commits += 1;
+        const position = walPosition(buffer);
+        assert.equal(position.frameBytes, initial.frameBytes);
+        const rewound = position.salt !== previous.salt;
+        if (rewound) rewinds += 1;
+        const addedFrames = rewound ? position.frames : position.frames - previous.frames;
+        assert.ok(addedFrames > 0, "intake did not add WAL frames");
+        const addedBytes = addedFrames * position.frameBytes;
+        maxCommitBytes = Math.max(maxCommitBytes, addedBytes);
+        intakeBytes += addedBytes;
+        previous = position;
         walMax = Math.max(walMax, walBytes(buffer));
-        if (walMax > 2 * limit) break;
+        assert.equal(buffer.database.pragma("wal_autocheckpoint", { simple: true }), 0,
+          "the hard bound was restored during the worker-alone check");
+        if (walMax > WORKER_ALONE_DISK_CAP_BYTES) break;
         await new Promise((resolve) => setTimeout(resolve, 2));
+        observeFull();
       }
       const status = walCheckpoint.status();
-      measurements.workerAlone = { walMaxMiB: mib(walMax), fullRuns: status.fullRuns, fullCompleted: status.fullCompleted };
-      assert.ok(status.fullCompleted > 0, "the worker never completed a FULL pass");
+      const maxGapCommits = Math.max(0, ...completedPasses.map(pass => pass.gapCommits));
+      const tailCommits = commits - lastFullCommit;
+      // A FULL can finish just before the next write rewinds, with its reply
+      // delivered just after that write. One boundary commit at either end
+      // accounts for that observation lag. Finish on a completed pass, so an
+      // unfinished tail cannot enlarge its own acceptance bound.
+      const limit = initialWalBytes + (maxGapCommits + 2) * maxCommitBytes;
+      measurements.workerAlone = {
+        commits, seconds: Math.round((performance.now() - started) / 100) / 10,
+        walMaxMiB: mib(walMax), walLimitMiB: mib(limit), initialWalMiB: mib(initialWalBytes),
+        maxCommitKiB: Math.round(maxCommitBytes / 1024), intakeMiB: mib(intakeBytes),
+        fullRuns: status.fullRuns, fullCompleted: status.fullCompleted, rewinds,
+        maxGapCommits, tailCommits, completedPasses,
+      };
+      assert.ok(commits >= INTAKE_COMMITS / 2, `only ${commits} intake commits`);
+      assert.ok(status.fullCompleted >= WORKER_ALONE_FULL_PASSES,
+        `the worker completed only ${status.fullCompleted} FULL passes; need ${WORKER_ALONE_FULL_PASSES}`);
+      assert.ok(rewinds >= WORKER_ALONE_FULL_PASSES, `the WAL rewound only ${rewinds} times`);
+      assert.ok(lastFullCommit >= minimumCompletedWork(),
+        `no completed FULL beyond the counted workload (${lastFullCommit}/${minimumCompletedWork()} commits)`);
+      assert.ok(tailCommits <= 2, `intake ended ${tailCommits} commits past its final completed FULL`);
       assert.ok(walMax <= limit,
-        `with only the worker checkpointing the WAL reached ${mib(walMax)} MiB (limit ${mib(limit)} MiB)`);
+        `worker-alone WAL reached ${mib(walMax)} MiB (limit ${mib(limit)} MiB for ${maxGapCommits} commits per completed FULL)`);
+      assert.ok(intakeBytes > 2 * limit,
+        `only ${mib(intakeBytes)} MiB of intake against a ${mib(limit)} MiB bound: too little WAL reuse proved`);
       return measurements.workerAlone;
     } finally {
       await walCheckpoint.stop();

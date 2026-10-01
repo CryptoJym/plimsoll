@@ -8,6 +8,10 @@ import Database from "better-sqlite3";
  * opener and inode checks as the daemon and CLI. */
 function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, paths: typeof path,
   children: typeof childProcess) {
+  // Keep this single value-free allowlist inside the factory so serialized
+  // workers have exactly the same probe diagnostics and retries as the daemon.
+  const PROBE_ERROR_CODES = new Set(["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS", "EAGAIN", "EINTR",
+    "EMFILE", "ENFILE", "ENOMEM"]);
   const lockPath = (file: string) => {
     const absolute = paths.resolve(file);
     const canonical = files.existsSync(absolute) ? files.realpathSync(absolute)
@@ -56,7 +60,7 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
   };
 
   const open = (file: string, options: Database.Options = {},
-    intentionalRename = false, barrierFile = file): Database.Database => {
+    intentionalRename = false, barrierFile = file, startupDeadlineMs?: number): Database.Database => {
     if (file === ":memory:" || file === "") return new Sqlite(file, options);
     file = paths.resolve(file);
     barrierFile = paths.resolve(barrierFile);
@@ -101,16 +105,57 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
             database.pragma("integrity_check", { simple: true }) !== "ok") {
           throw new Error("replacement_verification_failed: integrity or replacement marker");
         }
-        const oldFiles = [publication.marker.archivePath, `${publication.marker.archivePath}-wal`,
-          `${publication.marker.archivePath}-shm`].filter(name => files.existsSync(name));
-        if (!oldFiles.includes(publication.marker.archivePath)) throw new Error("replacement archive is missing");
-        const handles = children.spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...oldFiles],
-          { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024,
-            env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"] });
-        const pids = handles.stdout?.trim().split(/\s+/).filter(Boolean).map(Number) ?? [];
-        if (handles.error || (handles.status !== 0 && handles.status !== 1) || handles.stderr?.trim() ||
-            pids.some(pid => !Number.isSafeInteger(pid) || pid !== process.pid)) {
-          throw new Error("replacement_verification_failed: old inode or sidecar handle");
+        let archiveClear = false;
+        let diagnostic: { stage: "archive_handle_probe"; attempts: number; exitStatus: number | null;
+          signal: string | null; stderr: boolean; errorCode: string | null } | null = null;
+        // Startup gives each probe its whole remaining deadline, preserving a
+        // slow but conclusive first probe. Only quick uncertainty is retried:
+        // at most one second spent, with more than one second still available.
+        // Startup timeouts never retry; foreign PIDs always refuse immediately.
+        // Lifecycle mutations retain three 10-second probes; ordinary opens one.
+        const probeAttempts = intentionalRename || startupDeadlineMs !== undefined ? 3 : 1;
+        for (let attempt = 0; attempt < probeAttempts; attempt += 1) {
+          const oldFiles = [publication.marker.archivePath, `${publication.marker.archivePath}-wal`,
+            `${publication.marker.archivePath}-shm`].filter(name => files.existsSync(name));
+          if (!oldFiles.includes(publication.marker.archivePath)) throw new Error("replacement archive is missing");
+          const probeStarted = performance.now();
+          const remainingMs = startupDeadlineMs === undefined ? 10_000
+            : Math.floor(startupDeadlineMs - probeStarted);
+          if (remainingMs <= 0) break;
+          const handles = children.spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...oldFiles],
+            { encoding: "utf8", timeout: remainingMs,
+              ...(startupDeadlineMs === undefined ? {} : { killSignal: "SIGKILL" as const }), maxBuffer: 1024 * 1024,
+              env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"] });
+          const lines = (handles.stdout ?? "").trim().split(/\s+/).filter(Boolean);
+          const invalidPid = lines.some(pid => !/^[0-9]+$/.test(pid) || !Number.isSafeInteger(Number(pid)) || Number(pid) <= 0);
+          if (lines.some(pid => /^[0-9]+$/.test(pid) && Number.isSafeInteger(Number(pid)) &&
+              Number(pid) > 0 && Number(pid) !== process.pid)) {
+            throw Object.assign(new Error("replacement_verification_failed: old inode or sidecar handle"),
+              { code: "LEDGER_ARCHIVE_HANDLE_IN_USE" });
+          }
+          if (!handles.error && (handles.status === 0 || handles.status === 1) &&
+              !(handles.stderr ?? "").trim() && !invalidPid &&
+              (startupDeadlineMs === undefined || performance.now() < startupDeadlineMs)) {
+            archiveClear = true;
+            break;
+          }
+          const code = (handles.error as NodeJS.ErrnoException | undefined)?.code;
+          diagnostic = { stage: "archive_handle_probe", attempts: attempt + 1,
+            exitStatus: handles.status, signal: handles.signal,
+            stderr: Boolean((handles.stderr ?? "").trim()),
+            errorCode: typeof code === "string" ? (PROBE_ERROR_CODES.has(code) ? code : "OTHER") : null };
+          if (attempt < probeAttempts - 1) {
+            if (startupDeadlineMs !== undefined) {
+              const finished = performance.now();
+              if (code === "ETIMEDOUT" || finished - probeStarted > 1_000 ||
+                  startupDeadlineMs - finished <= 1_000) break;
+            }
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+          }
+        }
+        if (!archiveClear) {
+          throw Object.assign(new Error("replacement_verification_failed: archive handle probe inconclusive"),
+            { code: "LEDGER_ARCHIVE_HANDLE_UNPROVEN", diagnostic });
         }
       }
     } catch (error) {
@@ -195,12 +240,17 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
   // of its own and must not leave a temporary lock inode behind.
   const openCopy = (file: string, ledgerPath: string, options: Database.Options = {}) =>
     open(file, options, true, ledgerPath);
-  return { acquire, open, openCopy, lockPath };
+  // Only the daemon's first open may spend its remaining startup budget on
+  // inconclusive admission probes before LocalEventBuffer restores an archive.
+  const openForStartup = (file: string, options: Database.Options, deadlineMs: number) =>
+    open(file, options, false, file, deadlineMs);
+  return { acquire, open, openCopy, openForStartup, lockPath };
 }
 
 const runtime = ledgerConnectionRuntime(Database, fs, path, childProcess);
 export const acquireLedgerConnectionLock = runtime.acquire;
 export const openLedgerDatabase = runtime.open;
+export const openLedgerDatabaseForStartup = runtime.openForStartup;
 export const openLedgerCopyDatabase = runtime.openCopy;
 export const ledgerConnectionLockPath = runtime.lockPath;
 export type LedgerConnectionLock = ReturnType<typeof acquireLedgerConnectionLock>;

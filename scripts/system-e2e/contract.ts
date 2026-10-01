@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 13 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 14 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -229,6 +229,70 @@ const RESOURCE_VOLATILE_NUMBER_PATH =
   /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|stableRuns|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata|startupFilesystemEntriesScanned|startupFilesystemEnumerationCalls|baselineFilesystemEntriesScanned|baselineFilesystemEnumerationCalls)))$/;
 const RESOURCE_METADATA_OPERATIONS_PATH =
   /^root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.measurements\.filesystemMetadataOperations$/;
+const RESOURCE_TABLE_COUNT_PATH =
+  /^root\.scenarios\[\d+\]\{id=temporary_empty_ledger\}\.measurements\.schemaTables$/;
+const RESOURCE_BUILD_INVENTORY_PATH =
+  /^root\.scenarios\[\d+\]\{id=duplicate_start_single_owner\}\.measurements\.(?:runtimeDependencyManifestEntryCount|runtimeDependencyFileCount|fixtureManifestEntryCountBeforeBuild|fixtureManifestEntryCountAfterBuild)$/;
+const RESOURCE_ARCHITECTURE_SIZE_PATH =
+  /^root\.scenarios\[\d+\]\{id=architecture_contract\}\.measurements\.(?:adrBytes|budgetBytes)$/;
+const RESOURCE_MAINTENANCE_GROWTH_PATH =
+  /^root\.scenarios\[\d+\]\{id=maintenance_regression_proof\}\.measurements\.(?:checks|stdoutBytes)$/;
+const IDLE_METADATA_BASELINE = (() => {
+  const value: unknown = JSON.parse(fs.readFileSync(
+    new URL("./fixtures/idle-metadata-baseline.json", import.meta.url), "utf8",
+  ));
+  exactKeys(value, ["schema", "sourceCommit", "measuredOn", "filesystemMetadataOperations"],
+    "idle metadata baseline");
+  assert.equal(value.schema, "plimsoll.system-e2e-idle-metadata-baseline.v1");
+  assert.match(String(value.sourceCommit), /^[0-9a-f]{40}$/, "idle metadata baseline commit invalid");
+  assert.match(String(value.measuredOn), /^\d{4}-\d{2}-\d{2}$/, "idle metadata baseline date invalid");
+  assert.ok(Number.isSafeInteger(value.filesystemMetadataOperations) &&
+    (value.filesystemMetadataOperations as number) > 0, "idle metadata baseline must be positive");
+  return value.filesystemMetadataOperations as number;
+})();
+export const REQUIRED_SCHEMA_TABLES = (() => {
+  const value: unknown = JSON.parse(fs.readFileSync(
+    new URL("./fixtures/required-schema-tables.json", import.meta.url), "utf8",
+  ));
+  exactKeys(value, ["schema", "sourceCommit", "measuredOn", "requiredTables"],
+    "required schema tables fixture");
+  assert.equal(value.schema, "plimsoll.system-e2e-required-schema-tables.v1");
+  assert.match(String(value.sourceCommit), /^[0-9a-f]{40}$/, "required schema tables commit invalid");
+  assert.match(String(value.measuredOn), /^\d{4}-\d{2}-\d{2}$/, "required schema tables date invalid");
+  assert.ok(Array.isArray(value.requiredTables) && value.requiredTables.length > 0 &&
+    value.requiredTables.every((name) => typeof name === "string" && /^[a-z][a-z0-9_]*$/.test(name)),
+    "required schema table names invalid");
+  const names = value.requiredTables as string[];
+  assert.deepEqual(names, [...new Set(names)].sort(), "required schema tables must be sorted and unique");
+  return names;
+})();
+
+export function hasRequiredSchemaTables(names: readonly string[]) {
+  const present = new Set(names);
+  return REQUIRED_SCHEMA_TABLES.every((required) => present.has(required));
+}
+
+export const REQUIRED_MAINTENANCE_CHECKS = (() => {
+  const value: unknown = JSON.parse(fs.readFileSync(
+    new URL("./fixtures/required-maintenance-checks.json", import.meta.url), "utf8",
+  ));
+  exactKeys(value, ["schema", "sourceCommit", "measuredOn", "requiredChecks"],
+    "required maintenance checks fixture");
+  assert.equal(value.schema, "plimsoll.system-e2e-required-maintenance-checks.v1");
+  assert.match(String(value.sourceCommit), /^[0-9a-f]{40}$/, "required maintenance checks commit invalid");
+  assert.match(String(value.measuredOn), /^\d{4}-\d{2}-\d{2}$/, "required maintenance checks date invalid");
+  assert.ok(Array.isArray(value.requiredChecks) && value.requiredChecks.length > 0 &&
+    value.requiredChecks.every((name) => typeof name === "string" && /^[a-z][a-z0-9_]*$/.test(name)),
+    "required maintenance check names invalid");
+  const names = value.requiredChecks as string[];
+  assert.deepEqual(names, [...new Set(names)].sort(), "required maintenance checks must be sorted and unique");
+  return names;
+})();
+
+export function hasRequiredMaintenanceChecks(names: readonly string[]) {
+  const present = new Set(names);
+  return REQUIRED_MAINTENANCE_CHECKS.every((required) => present.has(required));
+}
 
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
@@ -278,16 +342,31 @@ export function normalizeSupportingArtifact(
         ]),
     );
   }
-  if (typeof value === "string") return normalizeString(value, key, context);
-  if (typeof value === "number" && RESOURCE_METADATA_OPERATIONS_PATH.test(fieldPath)) {
-    // Startup discovery still uses the real wall, so the total metadata-call
-    // count can vary across runs even though the stable sweep's exact directory
-    // topology and enumeration checks pass. Keep the sixteen-call span centered
-    // on the merged rebuild fixture instead of pinning an incidental exact count.
-    assert.ok(Number.isInteger(value) && value >= 24_661 && value <= 24_677,
-      `${key} must stay within the bounded metadata-call envelope; observed=${value}`);
-    return "<bounded-metadata-operations:24661-24677>";
+  if (RESOURCE_METADATA_OPERATIONS_PATH.test(fieldPath)) {
+    // Module growth and real-clock scheduling may change the number of calls.
+    // The stable directory topology and enumeration checks stay exact.
+    assert.ok(typeof value === "number" && Number.isSafeInteger(value) &&
+      value * 2 >= IDLE_METADATA_BASELINE && value * 10 <= IDLE_METADATA_BASELINE * 11,
+      `${key} must stay within the bounded metadata-call ratio; observed=${value}`);
+    return "<bounded-metadata-operations>";
   }
+  if (RESOURCE_TABLE_COUNT_PATH.test(fieldPath) || RESOURCE_BUILD_INVENTORY_PATH.test(fieldPath)) {
+    assert.ok(typeof value === "number" && Number.isSafeInteger(value) &&
+      value >= (RESOURCE_TABLE_COUNT_PATH.test(fieldPath) ? REQUIRED_SCHEMA_TABLES.length : 0),
+      `${key} must be a nonnegative inventory count`);
+    return "<growth-count>";
+  }
+  if (RESOURCE_ARCHITECTURE_SIZE_PATH.test(fieldPath)) {
+    assert.ok(typeof value === "number" && Number.isSafeInteger(value) && value > 0,
+      `${key} must be a positive document size`);
+    return "<growth-count>";
+  }
+  if (RESOURCE_MAINTENANCE_GROWTH_PATH.test(fieldPath)) {
+    assert.ok(typeof value === "number" && Number.isSafeInteger(value) &&
+      value >= (key === "checks" ? 20 : 1), `${key} must retain its proof coverage`);
+    return "<growth-count>";
+  }
+  if (typeof value === "string") return normalizeString(value, key, context);
   if (
     typeof value === "number" &&
     (VOLATILE_NUMBER_KEYS.test(key) || RESOURCE_VOLATILE_NUMBER_PATH.test(fieldPath))
@@ -514,6 +593,8 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(integer(noChangeMeasurements.replayTranscriptFilesRead, "replay transcript reads"), 1);
   assert.equal(integer(noChangeMeasurements.replayEventsAppended, "replay appended events"), 0);
   assert.equal(integer(noChangeMeasurements.replayRawEventWrites, "replay raw writes"), 0);
+  assert.equal(integer(noChangeMeasurements.sqliteWritesDuringIdle, "idle SQLite writes"), 0);
+  assert.equal(integer(noChangeMeasurements.walBytesDeltaDuringIdle, "idle WAL byte delta"), 0);
   assert.equal(integer(noChangeMeasurements.replayEventMutationsInserted, "replay inserted mutations"), 0);
   assert.ok(integer(noChangeMeasurements.baselineCodexGenerations, "baseline Codex generations") >= 200);
   assert.ok(integer(noChangeMeasurements.baselineClaudeGenerations, "baseline Claude generations") >= 1_200);

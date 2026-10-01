@@ -1,4 +1,4 @@
-import { openLedgerDatabase } from "./ledger-connection";
+import { openLedgerDatabase, openLedgerDatabaseForStartup } from "./ledger-connection";
 import { recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallationEpoch,
   liveUsageMetricAllowed } from "./codex-live-usage-ledger";
@@ -314,9 +314,16 @@ export class LocalEventBuffer {
     this.rebuildOpenToken = acquireRebuildOpenToken(path);
     let openedDb: Database.Database | null = null;
     try {
-      try { this.db = openedDb = openLedgerDatabase(path, { timeout: remainingOpenWait() }); }
+      try {
+        this.db = openedDb = options.startupBusyDeadlineMs === undefined
+          ? openLedgerDatabase(path, { timeout: remainingOpenWait() })
+          : openLedgerDatabaseForStartup(path, { timeout: remainingOpenWait() }, options.startupBusyDeadlineMs);
+      }
       catch (error) {
         if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
+          // A known foreign handle cannot be made safe by retrying or restoring.
+          // The outer cleanup releases the open token for this refusal.
+          if ((error as { cause?: { code?: string } }).cause?.code === "LEDGER_ARCHIVE_HANDLE_IN_USE") throw error;
           releaseRebuildOpenToken(this.rebuildOpenToken);
           this.rebuildOpenToken = null;
           recoverInvalidLedgerPublication(path);

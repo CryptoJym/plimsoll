@@ -52,21 +52,24 @@ try {
     assert.notEqual(current.at, prior.at);
     assert.notEqual(current.generation, prior.generation);
     const newHash = `sha256:${"a".repeat(64)}`;
-    db.prepare("update buffered_events set repo_hash=? where rowid=?").run(
-      newHash, current.rowid);
+    assert.equal(db.prepare("update buffered_events set repo_hash=? where rowid=?").run(
+      newHash, current.rowid).changes, 1);
     const after = db.prepare("select repo_hash as repoHash from upload_outbox where delivery_id=?")
       .get(id) as { repoHash: string | null };
     reused.delivery.configure({ enabled: true });
     const at = new Date(now.getTime() + 3_600_000);
     const lease = reused.delivery.lease({ now: at });
     const validated = reused.delivery.revalidateLeaseItems(lease.leaseId, lease.items, at);
-    const leakedHash = validated.items.find((item) => item.deliveryId === id)
-      ?.envelope.event.projectKey ?? null;
+    assert.equal(lease.items.length, 1, "the older queued event must still be leased");
+    assert.equal(validated.items.length, 1, "the older queued event must still validate");
+    const olderItem = validated.items.find((item) => item.deliveryId === id);
+    assert.ok(olderItem, "the validated item must be the older queued event");
+    const leakedHash = olderItem.envelope.event.projectKey ?? null;
     console.log(JSON.stringify({ case: "new_raw_updates_older_copy", prior, current,
       after, leased: lease.items.length, validated: validated.items.length,
       leakedHash, unrelatedLineage: true }));
-    assert.equal(leakedHash, newHash,
-      "the older queued event would be uploaded with the newer raw's repo hash");
+    assert.equal(leakedHash, null,
+      "the older queued event must not inherit the newer raw's repo hash");
     assert.equal(after.repoHash, prior.repoHash,
       "repo linkage from a new incarnation must not alter an older queued copy");
   } finally { reused.close(); }
