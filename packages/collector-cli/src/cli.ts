@@ -8334,7 +8334,8 @@ async function main() {
 }
 
 main().catch((error) => {
-  if (error?.code === "LEDGER_PUBLICATION_INVALID" && typeof error.ledgerPath === "string") {
+  if (error?.code === "LEDGER_PUBLICATION_INVALID" &&
+      error.cause?.code !== "LEDGER_ARCHIVE_HANDLE_IN_USE" && typeof error.ledgerPath === "string") {
     try {
       recoverInvalidLedgerPublication(error.ledgerPath);
       console.error("replacement_verification_failed; archive restored; command refused");

@@ -67,6 +67,45 @@ async function withArchiveLsofFault(archive: string, failures: number, action: (
   return { calls, injected };
 }
 
+// Fault only the admission probe. Recovery's separate check of both live and
+// archived files still runs real lsof before it is allowed to restore.
+function withStartupProbeFault(ledger: string, archive: string, failures: number,
+  action: () => void, consumeTimeout = false) {
+  const children = require("node:child_process") as { spawnSync: typeof spawnSync };
+  const nativeSpawnSync = children.spawnSync;
+  let calls = 0, recoveryCalls = 0;
+  const timeouts: number[] = [], starts: number[] = [], ends: number[] = [];
+  children.spawnSync = ((...args: unknown[]) => {
+    if (args[0] === "/usr/sbin/lsof" && Array.isArray(args[1]) && args[1].includes(archive)) {
+      if (args[1].includes(ledger)) recoveryCalls += 1;
+      else {
+        calls += 1;
+        assert.ok(calls <= 3, "startup admission attempted a fourth probe");
+        const timeout = (args[2] as { timeout: number }).timeout;
+        timeouts.push(timeout);
+        starts.push(performance.now());
+        if (calls <= failures) {
+          if (consumeTimeout) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, timeout);
+          ends.push(performance.now());
+          return { status: null, signal: null, stdout: "", stderr: "fixture private path/account/ledger details",
+            error: { code: "EPRIVATE_ACCOUNT_LEDGER" }, pid: process.pid, output: [null, "", ""] };
+        }
+        const result = Reflect.apply(nativeSpawnSync, children, args);
+        ends.push(performance.now());
+        return result;
+      }
+    }
+    return Reflect.apply(nativeSpawnSync, children, args);
+  }) as typeof spawnSync;
+  syncBuiltinESMExports();
+  try { action(); }
+  finally { children.spawnSync = nativeSpawnSync; syncBuiltinESMExports(); }
+  return { calls, recoveryCalls, timeouts, starts, ends };
+}
+
+const startupProbeCases = ["transient", "two-transient", "persistent", "budget", "deadline",
+  "foreign-unused", "foreign-used", "foreign-after-transient", "ordinary"];
+
 const mode = process.argv[2];
 if (mode === "--join-journal-child") {
   try {
@@ -80,6 +119,7 @@ if (mode === "--join-journal-child") {
   process.once("SIGTERM", () => { clearInterval(timer); copy.close(); });
 } else if (mode === "--raw-child") {
   const raw = new Database(process.argv[3]!, { fileMustExist: true });
+  if (process.argv[5] === "used") raw.prepare("select name from sqlite_master limit 1").get();
   fs.writeFileSync(path.join(process.argv[4]!, "raw-ready"), String(process.pid));
   const timer = setInterval(() => {}, 1_000);
   process.once("SIGTERM", () => { clearInterval(timer); raw.close(); });
@@ -120,8 +160,15 @@ if (mode === "--join-journal-child") {
 }
 
 async function main(variant: string) {
+  if (variant === "startup-probes") {
+    for (const test of startupProbeCases) await main(`startup-probe-${test}`);
+    return;
+  }
+  // Keep these regressions in an existing CI proof without changing its gates.
+  if (variant === "startup-marker") await main("startup-probes");
   assert.ok(["cli", "supervised-restart", "shared-lifetime", "old-connection", "missing-marker",
-    "integrity", "post-check-raw", "startup-marker", "startup-integrity"].includes(variant));
+    "integrity", "post-check-raw", "startup-marker", "startup-integrity",
+    ...startupProbeCases.map(test => `startup-probe-${test}`)].includes(variant));
   const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r13-connection-")));
   const home = path.join(fixture, "home"), data = path.join(home, ".plimsoll");
   const archiveDir = path.join(fixture, "archive"), root = path.join(home, "sessions");
@@ -149,7 +196,104 @@ async function main(variant: string) {
     const invoke = (args: string[]) => spawnSync(process.execPath, ["--import", loader, ...args],
       { env, encoding: "utf8", timeout: 30_000 });
 
-    if (variant === "cli" || variant === "supervised-restart") {
+    if (variant.startsWith("startup-probe-")) {
+      switchFreshLedger(input);
+      const freshInode = fs.statSync(ledger).ino;
+      const archiveBefore = fs.readFileSync(archive);
+      const fresh = new LocalEventBuffer(ledger, options);
+      fresh.database.prepare("insert into maintenance_state(key,value,updated_at) values('startup-fresh-control','kept',?)")
+        .run(new Date().toISOString());
+      fresh.close();
+      const test = variant.slice("startup-probe-".length);
+      if (test.startsWith("foreign-")) {
+        child = spawn(process.execPath, ["--import", loader, self, "--raw-child", archive, fixture,
+          test === "foreign-used" ? "used" : "unused"], { env, stdio: "ignore" });
+        await waitFor(() => fs.existsSync(path.join(fixture, "raw-ready")), "real foreign archive connection is open");
+      }
+      const failures = test === "two-transient" ? 2
+        : ["persistent", "budget", "deadline"].includes(test) ? Infinity
+        : test === "foreign-used" || test === "foreign-unused" ? 0 : 1;
+      const deadline = performance.now() + (test === "deadline" ? 250 : 10_000);
+      let refusal: (Error & { code?: string; cause?: { code?: string; diagnostic?: unknown } }) | undefined;
+      const probes = withStartupProbeFault(ledger, archive, failures, () => {
+        try {
+          if (test === "ordinary") openLedgerDatabase(ledger, { fileMustExist: true, timeout: 0 }).close();
+          else {
+            const started = new LocalEventBuffer(ledger, { ...options, startupBusyDeadlineMs: deadline });
+            try {
+              assert.equal((started.database.prepare("select value from maintenance_state where key='startup-fresh-control'")
+                .get() as { value: string }).value, "kept");
+            } finally { started.close(); }
+          }
+        } catch (error) { refusal = error as typeof refusal; }
+      }, test === "budget" || test === "deadline");
+      const lock = acquireLedgerConnectionLock(ledger, "exclusive");
+      let receipt;
+      try { receipt = readLedgerPublication(lock)!; } finally { lock.release(); }
+      if (test === "transient" || test === "two-transient") {
+        assert.equal(refusal, undefined, "a transient startup probe must start on the fresh ledger without restoring");
+        assert.equal(probes.calls, failures + 1);
+        assert.equal(probes.recoveryCalls, 0);
+        assert.equal(receipt.state, "ready");
+        assert.equal(receipt.freshAttemptPath, undefined);
+        assert.equal(fs.statSync(ledger).ino, freshInode);
+      } else if (test.startsWith("foreign-") || test === "ordinary") {
+        assert.equal(refusal?.code, "LEDGER_PUBLICATION_INVALID");
+        assert.equal(refusal?.cause?.code, test === "ordinary"
+          ? "LEDGER_ARCHIVE_HANDLE_UNPROVEN" : "LEDGER_ARCHIVE_HANDLE_IN_USE");
+        assert.equal(probes.calls, test === "foreign-after-transient" ? 2 : 1);
+        assert.equal(probes.recoveryCalls, 0, "a reported foreign PID refuses immediately, without another probe");
+        assert.equal(receipt.state, "ready");
+        assert.equal(fs.statSync(ledger).ino, freshInode);
+        if (test === "ordinary") assert.deepEqual(probes.timeouts, [10_000]);
+        else {
+          // The outer CLI handler must preserve the same immediate refusal.
+          // Fault injection makes any attempted recovery probe unmistakable.
+          const preload = path.join(fixture, "refuse-recovery.cjs");
+          fs.writeFileSync(preload, `
+            const children = require('node:child_process');
+            const native = children.spawnSync;
+            children.spawnSync = function (command, args, options) {
+              if (command === '/usr/sbin/lsof' && args.includes(${JSON.stringify(ledger)}) &&
+                  args.includes(${JSON.stringify(archive)})) throw new Error('unexpected_recovery_probe');
+              return native(command, args, options);
+            };
+            require('node:module').syncBuiltinESMExports();
+          `);
+          const cliRefusal = invoke(["--require", preload, cli, "export", "--budget"]);
+          assert.equal(cliRefusal.status, 1, cliRefusal.stderr);
+          assert.match(cliRefusal.stderr, /old inode or sidecar handle/);
+          assert.doesNotMatch(cliRefusal.stderr, /unexpected_recovery_probe/);
+          assert.equal(fs.statSync(ledger).ino, freshInode);
+        }
+      } else {
+        assert.match(String(refusal), /replacement_verification_failed; archive restored; collector start refused/);
+        assert.equal(probes.calls, test === "deadline" ? 1 : 3, "startup admission attempts are bounded");
+        assert.equal(receipt.state, "restored");
+        assert.ok(receipt.freshAttemptPath);
+        assert.equal(fs.statSync(receipt.freshAttemptPath).ino, freshInode);
+        assert.notEqual(fs.statSync(ledger).ino, freshInode);
+        const restored = new LocalEventBuffer(ledger, options);
+        try {
+          assert.equal(restored.database.prepare("select value from maintenance_state where key='startup-fresh-control'").get(), undefined);
+          assert.equal((restored.database.prepare("select value from maintenance_state where key='r13-archive-control'")
+            .get() as { value: string }).value, "kept");
+        } finally { restored.close(); }
+        const diagnostic = (refusal?.cause as { cause?: { diagnostic?: unknown } })?.cause?.diagnostic;
+        assert.deepEqual(diagnostic, { stage: "archive_handle_probe", attempts: probes.calls,
+          exitStatus: null, signal: null, stderr: true, errorCode: "OTHER" }, "diagnostics contain only allowlisted values");
+      }
+      if (test !== "ordinary") {
+        assert.ok(probes.timeouts.every(timeout => timeout > 0 && timeout <= 3_000));
+        assert.ok(probes.timeouts.reduce((sum, timeout) => sum + timeout, 0) + (probes.calls - 1) * 100 <= 9_200);
+        for (let i = 1; i < probes.calls; i += 1) assert.ok(probes.starts[i]! - probes.ends[i - 1]! >= 90);
+        if (test === "deadline") assert.ok(probes.timeouts[0]! <= 250, "remaining startup budget caps lsof timeout");
+      }
+      assert.deepEqual(fs.readFileSync(archive), archiveBefore, "archive content is unchanged");
+      console.log(JSON.stringify({ variant, admissionProbes: probes.calls, recoveryProbes: probes.recoveryCalls,
+        timeouts: probes.timeouts, admissionElapsedMs: probes.ends.at(-1)! - probes.starts[0]!,
+        publicationState: receipt.state, passed: true }));
+    } else if (variant === "cli" || variant === "supervised-restart") {
       const args = variant === "cli" ? [cli, "export", "--budget"] : [self, "--open-child", ledger, fixture];
       let refused = false;
       switchFreshLedger({ ...input, onStep(step) {
@@ -245,8 +389,8 @@ async function main(variant: string) {
       assert.deepEqual(persistentDiagnostic, { stage: "archive_handle_probe", attempts: 3,
         exitStatus: 1, signal: null, stderr: true, errorCode: null });
       assert.equal(fs.statSync(ledger).ino, beforeRestore, "unknown archive handles cannot change live inode");
-      // An ordinary open (the daemon's startup opener) keeps main's single probe:
-      // one inconclusive answer refuses at once instead of spending the startup budget.
+      // An ordinary open outside startup recovery keeps main's single probe:
+      // one inconclusive answer refuses at once.
       const ordinary = await withArchiveLsofFault(archive, 1, async () => {
         assert.throws(() => openLedgerDatabase(ledger, { fileMustExist: true, timeout: 0 }),
           (error: unknown) => (error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID");

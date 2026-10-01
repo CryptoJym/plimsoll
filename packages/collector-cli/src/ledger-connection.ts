@@ -60,7 +60,7 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
   };
 
   const open = (file: string, options: Database.Options = {},
-    intentionalRename = false, barrierFile = file): Database.Database => {
+    intentionalRename = false, barrierFile = file, startupDeadlineMs?: number): Database.Database => {
     if (file === ":memory:" || file === "") return new Sqlite(file, options);
     file = paths.resolve(file);
     barrierFile = paths.resolve(barrierFile);
@@ -109,18 +109,22 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
         let diagnostic: { stage: "archive_handle_probe"; attempts: number; exitStatus: number | null;
           signal: string | null; stderr: boolean; errorCode: string | null } | null = null;
         // A runner can give one inconclusive lsof result (for example, a
-        // timed-out stat). Lifecycle mutations (restore, discard, quiesce) retry
-        // that uncertainty, never a reported foreign PID: three 10-second probes
-        // plus two short pauses bound their preflight. Ordinary opens, the
-        // daemon's startup among them, keep one probe so the caller's startup
-        // budget holds.
-        const probeAttempts = intentionalRename ? 3 : 1;
+        // timed-out stat). Retry only that uncertainty, never a foreign PID.
+        // Lifecycle mutations retain three 10-second probes. Startup admission
+        // has at most 3 * 3 seconds + 2 * 100 ms = 9.2 seconds, clipped further
+        // to its existing deadline so recovery never starts a new retry budget.
+        // Ordinary opens still have exactly one 10-second probe.
+        const probeAttempts = intentionalRename || startupDeadlineMs !== undefined ? 3 : 1;
         for (let attempt = 0; attempt < probeAttempts; attempt += 1) {
+          const remainingMs = startupDeadlineMs === undefined ? 10_000
+            : Math.floor(startupDeadlineMs - performance.now());
+          if (remainingMs <= 0) break;
           const oldFiles = [publication.marker.archivePath, `${publication.marker.archivePath}-wal`,
             `${publication.marker.archivePath}-shm`].filter(name => files.existsSync(name));
           if (!oldFiles.includes(publication.marker.archivePath)) throw new Error("replacement archive is missing");
           const handles = children.spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...oldFiles],
-            { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024,
+            { encoding: "utf8", timeout: Math.min(remainingMs, startupDeadlineMs === undefined ? 10_000 : 3_000),
+              ...(startupDeadlineMs === undefined ? {} : { killSignal: "SIGKILL" as const }), maxBuffer: 1024 * 1024,
               env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"] });
           const lines = (handles.stdout ?? "").trim().split(/\s+/).filter(Boolean);
           const invalidPid = lines.some(pid => !/^[0-9]+$/.test(pid) || !Number.isSafeInteger(Number(pid)) || Number(pid) <= 0);
@@ -130,7 +134,8 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
               { code: "LEDGER_ARCHIVE_HANDLE_IN_USE" });
           }
           if (!handles.error && (handles.status === 0 || handles.status === 1) &&
-              !(handles.stderr ?? "").trim() && !invalidPid) {
+              !(handles.stderr ?? "").trim() && !invalidPid &&
+              (startupDeadlineMs === undefined || performance.now() < startupDeadlineMs)) {
             archiveClear = true;
             break;
           }
@@ -139,7 +144,10 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
             exitStatus: handles.status, signal: handles.signal,
             stderr: Boolean((handles.stderr ?? "").trim()),
             errorCode: typeof code === "string" ? (PROBE_ERROR_CODES.has(code) ? code : "OTHER") : null };
-          if (attempt < probeAttempts - 1) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+          if (attempt < probeAttempts - 1) {
+            if (startupDeadlineMs !== undefined && startupDeadlineMs - performance.now() <= 100) break;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+          }
         }
         if (!archiveClear) {
           throw Object.assign(new Error("replacement_verification_failed: archive handle probe inconclusive"),
@@ -228,12 +236,17 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
   // of its own and must not leave a temporary lock inode behind.
   const openCopy = (file: string, ledgerPath: string, options: Database.Options = {}) =>
     open(file, options, true, ledgerPath);
-  return { acquire, open, openCopy, lockPath };
+  // Only the daemon's first open may spend its remaining startup budget on
+  // inconclusive admission probes before LocalEventBuffer restores an archive.
+  const openForStartup = (file: string, options: Database.Options, deadlineMs: number) =>
+    open(file, options, false, file, deadlineMs);
+  return { acquire, open, openCopy, openForStartup, lockPath };
 }
 
 const runtime = ledgerConnectionRuntime(Database, fs, path, childProcess);
 export const acquireLedgerConnectionLock = runtime.acquire;
 export const openLedgerDatabase = runtime.open;
+export const openLedgerDatabaseForStartup = runtime.openForStartup;
 export const openLedgerCopyDatabase = runtime.openCopy;
 export const ledgerConnectionLockPath = runtime.lockPath;
 export type LedgerConnectionLock = ReturnType<typeof acquireLedgerConnectionLock>;
