@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 444,
+  "headSha": "2f069625a09f46e1eb664eb520f8610965814437",
+  "reviewedAt": "2026-10-01T10:01:40Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f6d3-8ae3-7ca3-8fdd-9e14ca0bf43d",
+    "model": "gpt-6-astra",
+    "host": "studio4"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0f687-cd55-7992-a35d-19565007f3a2"
+    }
+  ],
+  "summary": "PR #444 (eco-6hoxj.165.98): the collector sends an install heartbeat and exchanges the machine name with the cloud. Independent review r1 APPROVE at db1fa511: no P0/P1; collector typecheck, packaged build, join E2E/isolation, heartbeat, outbound envelope, upload timer and privacy proofs pass; P2 follow-ups (receipt validation before join, initial name, bounded startup pause, Unicode edges) are bead eco-6hoxj.165.104. Since review: 43e832a7 wires proof:install-contact into proof.yml; 710c0b1f and f3571bf2 fix CI fixtures only (lean helper expectation, delivery-ack fixture, lifecycle guard 0.7.46, install-contact fixture, three system-e2e pins); lead merged main 09e8e555 at 2f069625 with no conflicts. Lead verified the post-review diff touches only proof wiring, fixtures and pins. CI proof on 2f069625 is required green before merge."
+}
