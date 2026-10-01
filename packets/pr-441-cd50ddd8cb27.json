@@ -1,0 +1,29 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 441,
+  "headSha": "cd50ddd8cb27e4606d9ee5f2c34595ed8bb0bcc2",
+  "reviewedAt": "2026-10-01T10:24:33Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f681-64f8-7383-80ca-cb3bc3451729",
+    "model": "gpt-6-astra",
+    "host": "studio4"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0f611"
+    },
+    {
+      "runtime": "codex",
+      "session": "01a0f6cc-d019-7562-b8c7-d4451fea6282"
+    },
+    {
+      "runtime": "claude-code",
+      "session": "f4023139-6838-412e-a325-7fdbdcf61a0a"
+    }
+  ],
+  "summary": "PR #441 (eco-6hoxj.165.103.1): a usage event's project comes from its own tool's repository, then only strictly earlier same-session context, then its own folder. Review r1 REQUEST_CHANGES (P1: a capped/incomplete lookup credited the starting folder). Author r2 (397bbdb1, 00aa8578): incomplete lookups give unallocated; reviewer's bounds fixture 32/32; default budget 256 B / 244 unallocated in all four combinations. Author r3 (8b798baa): the roundfive-stale-outbox-link review test characterized main's leak of a newer raw's repo hash into a stale outbox row; the head closes the leak and ordinary own-repo events are byte-identical to main; the test now asserts no leak. Delta review r2: P1 closed, leak correction verified, only blocker the CI wiring of three new proofs, fixed by the lead at cd50ddd8 (package scripts + proof.yml), proven by CI proof SUCCESS on cd50ddd8 (ci-coverage uncovered [])."
+}
