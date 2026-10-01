@@ -30,8 +30,9 @@ function event(id: string, observedAt: string, options: Partial<AiInteractionEve
   };
 }
 
-function context(rowid: number, observedAt: string, repoHash: string, sessionId = "session-fixture"): SessionRepoContext {
-  return { rowid, sessionId, observedAt, repoHash };
+function context(rowid: number, observedAt: string, repoHash: string,
+  sessionId = "session-fixture", eventType?: string): SessionRepoContext {
+  return { rowid, sessionId, observedAt, repoHash, eventType };
 }
 
 function otelAttr(key: string, value: string | number) {
@@ -168,6 +169,48 @@ function main() {
   assert.equal(multi.event.projectKey, REPO_B);
   assert.equal(multi.event.metadata.projectBasis, "session_inherited");
 
+  const futureOnly = applyProjectAttribution(
+    event("future-token", "2026-09-23T12:00:00.000Z"),
+    { sessionContexts: [context(5, "2026-09-23T12:01:00.000Z", REPO_A)] },
+  );
+  assert.equal(futureOnly.event.projectKey, undefined);
+  assert.equal(futureOnly.basis, "unallocated");
+
+  const sameTimestamp = applyProjectAttribution(
+    event("same-time-token", "2026-09-23T12:00:00.000Z"),
+    { sessionContexts: [context(6, "2026-09-23T12:00:00.000Z", REPO_A)] },
+  );
+  assert.equal(sameTimestamp.event.projectKey, undefined);
+  assert.equal(sameTimestamp.basis, "unallocated");
+
+  // Rollout context is the turn's starting folder. A tool result from that
+  // turn is stronger evidence for where the usage was spent.
+  const rollout = event("rollout-token", "2026-09-23T12:00:00.000Z", {
+    eventType: "usage_rollout",
+  });
+  const attributedRollout = new SessionAttributionBatch(ledger.database, [
+    { event: rollout, repoHash: REPO_B },
+  ]).attribute(rollout, { repoHash: REPO_B });
+  assert.equal(attributedRollout.event.projectKey, REPO_A);
+  assert.equal(attributedRollout.basis, "session_inherited");
+
+  const previousTurnTool = applyProjectAttribution(rollout, {
+    repoHash: REPO_B,
+    sessionContexts: [
+      context(10, "2026-09-23T11:57:00.000Z", REPO_A, "session-fixture", "tool_result"),
+      context(11, "2026-09-23T11:59:00.000Z", REPO_B, "session-fixture", "usage_rollout"),
+    ],
+  });
+  assert.equal(previousTurnTool.event.projectKey, REPO_B);
+  assert.equal(previousTurnTool.basis, "repo_context");
+
+  const directWorkdir = applyProjectAttribution(
+    event("direct-token", "2026-09-23T12:00:00.000Z"),
+    { repoHash: REPO_B, sessionContexts: [context(2, "2026-09-23T11:59:00.000Z", REPO_A)] },
+  );
+  assert.equal(directWorkdir.event.projectKey, REPO_B);
+  assert.equal(directWorkdir.basis, "repo_context");
+
   const noRepo = applyProjectAttribution(
     event("none-token", "2026-09-23T12:00:00.000Z"),
     { sessionContexts: [] },
@@ -214,7 +257,7 @@ function main() {
   const stable = applyProjectAttribution(single.event, { sessionContexts: [context(2, "2026-09-23T11:59:00.000Z", REPO_A)] });
   assert.deepEqual(stable.event, single.event);
   ledger.close();
-  console.log(JSON.stringify({ status: "PASS", checks: 16, fixture: "otel-assistant_response-tool_result-session" }));
+  console.log(JSON.stringify({ status: "PASS", checks: 21, fixture: "otel-assistant_response-tool_result-session" }));
 }
 
 main();
