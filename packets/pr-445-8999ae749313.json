@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 445,
+  "headSha": "8999ae749313d617ed32ee7f74bc4e28197c7bae",
+  "reviewedAt": "2026-10-01T14:28:16Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f7ce-abf8-7152-b835-721e226e2a40",
+    "model": "gpt-6-astra",
+    "host": "studio4"
+  },
+  "authors": [
+    {
+      "runtime": "claude",
+      "session": "f4023139-6838-412e-a325-7fdbdcf61a0a"
+    }
+  ],
+  "summary": "PR #445 (eco-6hoxj.165.108): live-coverage discovery accepts the fleet OpenTelemetry relay endpoint (127.0.0.1:4318) as well as the collector's own port. Independent review r1 APPROVE / PASS at 8999ae74, no P0/P1: typecheck; capture-roots-add 72/72; live proof (9 assertions; base matcher fails as expected, restored head passes); a 19-case matrix including fully configured port controls and Codex trace/log relay cases; join review 14; install contact; ci-coverage 132/132; system E2E 6 pinned artifacts. P2 (accepted, documented): live coverage is configuration evidence, so a down or non-relaying 4318 could qualify; callers verified not to suppress join/add enrollment, doctor's candidate list, or the 0.7.46 ledger-based heartbeat captureState. End-to-end on Studio0: a Claude Code session through the relay delivered 96 log records and 9 metric points to the collector with zero send failures."
+}
