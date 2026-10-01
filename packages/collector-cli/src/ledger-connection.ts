@@ -6,12 +6,12 @@ import Database from "better-sqlite3";
 /** This factory is also embedded in the two plain-JavaScript worker threads.
  * Keep its runtime dependencies explicit so packaged workers use the same
  * opener and inode checks as the daemon and CLI. */
-/** Value-free spawn error codes the archive probe may report; anything else is "OTHER". */
-const PROBE_ERROR_CODES = new Set(["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS", "EAGAIN", "EINTR",
-  "EMFILE", "ENFILE", "ENOMEM"]);
-
 function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, paths: typeof path,
   children: typeof childProcess) {
+  // Keep this single value-free allowlist inside the factory so serialized
+  // workers have exactly the same probe diagnostics and retries as the daemon.
+  const PROBE_ERROR_CODES = new Set(["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS", "EAGAIN", "EINTR",
+    "EMFILE", "ENFILE", "ENOMEM"]);
   const lockPath = (file: string) => {
     const absolute = paths.resolve(file);
     const canonical = files.existsSync(absolute) ? files.realpathSync(absolute)

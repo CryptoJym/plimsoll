@@ -4,9 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { openLedgerDatabase } from "../packages/collector-cli/src/ledger-connection";
+import { ledgerConnectionWorkerSource, openLedgerDatabase } from "../packages/collector-cli/src/ledger-connection";
 import { SqliteLedgerSnapshotAdapter } from "../packages/collector-cli/src/lifecycle-adapters";
 import { LifecycleRestoreRefusal } from "../packages/collector-cli/src/lifecycle";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
@@ -106,6 +107,55 @@ function withStartupProbeFault(ledger: string, archive: string, failures: number
 const startupProbeCases = ["transient", "two-transient", "persistent", "budget", "deadline",
   "foreign-unused", "foreign-used", "foreign-after-transient", "ordinary"];
 
+async function workerProbeChecks(ledger: string) {
+  const cases = ["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS", "EAGAIN", "EINTR",
+    "EMFILE", "ENFILE", "ENOMEM", "EPRIVATE_ACCOUNT_LEDGER"].map(code =>
+    ({ code, failures: 3, intentionalRename: false }));
+  cases.push({ code: "EAGAIN", failures: 1, intentionalRename: true },
+    { code: "EPRIVATE_ACCOUNT_LEDGER", failures: 3, intentionalRename: true });
+  for (const test of cases) {
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const children = require('node:child_process');
+      const native = children.spawnSync;
+      let calls = 0;
+      children.spawnSync = (...args) => {
+        if (args[0] === '/usr/sbin/lsof' && ++calls <= workerData.failures)
+          return { error: { code: workerData.code }, status: null, signal: null, stdout: '', stderr: '' };
+        return native(...args);
+      };
+      const Database = require(workerData.sqliteModule);
+      ${ledgerConnectionWorkerSource}
+      try {
+        const opened = openLedgerDatabase(workerData.ledger, { fileMustExist: true }, workerData.intentionalRename);
+        opened.close();
+        parentPort.postMessage({ ok: true, calls });
+      } catch (error) {
+        parentPort.postMessage({ ok: false, calls, code: error.code ?? null,
+          cause: error.cause?.code ?? null, diagnostic: error.cause?.diagnostic ?? null });
+      }
+    `, { eval: true, execArgv: [], workerData: { ...test, ledger, sqliteModule: require.resolve("better-sqlite3") } });
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const reply = await new Promise<unknown>((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+        timer = setTimeout(() => reject(new Error("worker_archive_probe_timeout")), 15_000);
+      });
+      if (test.intentionalRename && test.failures === 1) {
+        assert.deepEqual(reply, { ok: true, calls: 2 }, "serialized lifecycle opener retries an inconclusive probe");
+      } else {
+        const attempts = test.intentionalRename ? 3 : 1;
+        assert.deepEqual(reply, { ok: false, calls: attempts, code: "LEDGER_PUBLICATION_INVALID",
+          cause: "LEDGER_ARCHIVE_HANDLE_UNPROVEN", diagnostic: { stage: "archive_handle_probe",
+            attempts, exitStatus: null, signal: null, stderr: false,
+            errorCode: test.code === "EPRIVATE_ACCOUNT_LEDGER" ? "OTHER" : test.code } });
+      }
+      console.log(JSON.stringify({ variant: "worker-probe", intentionalRename: test.intentionalRename, reply }));
+    } finally { if (timer) clearTimeout(timer); await worker.terminate(); }
+  }
+}
+
 const mode = process.argv[2];
 if (mode === "--join-journal-child") {
   try {
@@ -167,7 +217,7 @@ async function main(variant: string) {
   // Keep these regressions in an existing CI proof without changing its gates.
   if (variant === "startup-marker") await main("startup-probes");
   assert.ok(["cli", "supervised-restart", "shared-lifetime", "old-connection", "missing-marker",
-    "integrity", "post-check-raw", "startup-marker", "startup-integrity",
+    "integrity", "post-check-raw", "startup-marker", "startup-integrity", "worker-probes",
     ...startupProbeCases.map(test => `startup-probe-${test}`)].includes(variant));
   const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r13-connection-")));
   const home = path.join(fixture, "home"), data = path.join(home, ".plimsoll");
@@ -196,7 +246,10 @@ async function main(variant: string) {
     const invoke = (args: string[]) => spawnSync(process.execPath, ["--import", loader, ...args],
       { env, encoding: "utf8", timeout: 30_000 });
 
-    if (variant.startsWith("startup-probe-")) {
+    if (variant === "worker-probes") {
+      switchFreshLedger(input);
+      await workerProbeChecks(ledger);
+    } else if (variant.startsWith("startup-probe-")) {
       switchFreshLedger(input);
       const freshInode = fs.statSync(ledger).ino;
       const archiveBefore = fs.readFileSync(archive);
@@ -407,6 +460,7 @@ async function main(variant: string) {
       assert.ok(readReplacementLedgerMarker(ledger), "the verified fresh snapshot remains active");
       resumed.close();
       assert.equal(fs.statSync(sidecar).ino, lockInode);
+      await workerProbeChecks(ledger);
       console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true,
         publicationCommitKeepsExclusive: true, privateCopyHoldsDestinationLock: true, noTemporaryLock: true,
         stableLockInode: true, readOnlyStatementsDoNotStat: true, validFreshSnapshotRestarts: true,
