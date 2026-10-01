@@ -101,16 +101,41 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
             database.pragma("integrity_check", { simple: true }) !== "ok") {
           throw new Error("replacement_verification_failed: integrity or replacement marker");
         }
-        const oldFiles = [publication.marker.archivePath, `${publication.marker.archivePath}-wal`,
-          `${publication.marker.archivePath}-shm`].filter(name => files.existsSync(name));
-        if (!oldFiles.includes(publication.marker.archivePath)) throw new Error("replacement archive is missing");
-        const handles = children.spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...oldFiles],
-          { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024,
-            env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"] });
-        const pids = handles.stdout?.trim().split(/\s+/).filter(Boolean).map(Number) ?? [];
-        if (handles.error || (handles.status !== 0 && handles.status !== 1) || handles.stderr?.trim() ||
-            pids.some(pid => !Number.isSafeInteger(pid) || pid !== process.pid)) {
-          throw new Error("replacement_verification_failed: old inode or sidecar handle");
+        let archiveClear = false;
+        let diagnostic: { stage: "archive_handle_probe"; attempts: number; exitStatus: number | null;
+          signal: string | null; stderr: boolean; errorCode: string | null } | null = null;
+        // A runner can give one inconclusive lsof result (for example, a
+        // timed-out stat). Retry uncertainty, never a reported foreign PID.
+        // Three 10-second probes plus two short pauses bound this preflight.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const oldFiles = [publication.marker.archivePath, `${publication.marker.archivePath}-wal`,
+            `${publication.marker.archivePath}-shm`].filter(name => files.existsSync(name));
+          if (!oldFiles.includes(publication.marker.archivePath)) throw new Error("replacement archive is missing");
+          const handles = children.spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...oldFiles],
+            { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024,
+              env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"] });
+          const lines = (handles.stdout ?? "").trim().split(/\s+/).filter(Boolean);
+          const invalidPid = lines.some(pid => !/^[0-9]+$/.test(pid) || !Number.isSafeInteger(Number(pid)) || Number(pid) <= 0);
+          if (lines.some(pid => /^[0-9]+$/.test(pid) && Number.isSafeInteger(Number(pid)) &&
+              Number(pid) > 0 && Number(pid) !== process.pid)) {
+            throw Object.assign(new Error("replacement_verification_failed: old inode or sidecar handle"),
+              { code: "LEDGER_ARCHIVE_HANDLE_IN_USE" });
+          }
+          if (!handles.error && (handles.status === 0 || handles.status === 1) &&
+              !(handles.stderr ?? "").trim() && !invalidPid) {
+            archiveClear = true;
+            break;
+          }
+          const code = (handles.error as NodeJS.ErrnoException | undefined)?.code;
+          diagnostic = { stage: "archive_handle_probe", attempts: attempt + 1,
+            exitStatus: handles.status, signal: handles.signal,
+            stderr: Boolean((handles.stderr ?? "").trim()),
+            errorCode: typeof code === "string" && /^E[A-Z0-9_]+$/.test(code) ? code : null };
+          if (attempt < 2) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+        if (!archiveClear) {
+          throw Object.assign(new Error("replacement_verification_failed: archive handle probe inconclusive"),
+            { code: "LEDGER_ARCHIVE_HANDLE_UNPROVEN", diagnostic });
         }
       }
     } catch (error) {

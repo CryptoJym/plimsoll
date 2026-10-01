@@ -3,10 +3,11 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { SqliteLedgerSnapshotAdapter } from "../packages/collector-cli/src/lifecycle-adapters";
+import { LifecycleRestoreRefusal } from "../packages/collector-cli/src/lifecycle";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { readReplacementLedgerMarker, restoreArchivedLedger, switchFreshLedger } from "../packages/collector-cli/src/fresh-ledger-cutover";
 import { withJoinRootJournal } from "../packages/collector-cli/src/join-setup-journal";
@@ -41,6 +42,30 @@ function syncWait(file: string) {
   assert.ok(fs.existsSync(file), "fixture child reached its boundary");
 }
 
+async function withArchiveLsofFault(archive: string, failures: number, action: () => Promise<void>) {
+  const children = require("node:child_process") as { spawnSync: typeof spawnSync };
+  const nativeSpawnSync = children.spawnSync;
+  let calls = 0, injected = 0;
+  children.spawnSync = ((...args: unknown[]) => {
+    if (args[0] === "/usr/sbin/lsof" && Array.isArray(args[1]) && args[1].includes(archive)) {
+      calls += 1;
+      if (injected < failures) {
+        injected += 1;
+        return { status: 1, signal: null, stdout: "", stderr: "lsof: synthetic kernel timeout\n",
+          pid: process.pid, output: [null, "", ""] };
+      }
+    }
+    return Reflect.apply(nativeSpawnSync, children, args);
+  }) as typeof spawnSync;
+  syncBuiltinESMExports();
+  try { await action(); }
+  finally {
+    children.spawnSync = nativeSpawnSync;
+    syncBuiltinESMExports();
+  }
+  return { calls, injected };
+}
+
 const mode = process.argv[2];
 if (mode === "--join-journal-child") {
   try {
@@ -52,6 +77,11 @@ if (mode === "--join-journal-child") {
   fs.writeFileSync(path.join(process.argv[5]!, "copy-ready"), String(process.pid));
   const timer = setInterval(() => {}, 1_000);
   process.once("SIGTERM", () => { clearInterval(timer); copy.close(); });
+} else if (mode === "--raw-child") {
+  const raw = new Database(process.argv[3]!, { fileMustExist: true });
+  fs.writeFileSync(path.join(process.argv[4]!, "raw-ready"), String(process.pid));
+  const timer = setInterval(() => {}, 1_000);
+  process.once("SIGTERM", () => { clearInterval(timer); raw.close(); });
 } else if (mode === "--open-child" || mode === "--held-child") {
   const ledger = process.argv[3]!, fixture = process.argv[4]!;
   let buffer: LocalEventBuffer | undefined;
@@ -188,7 +218,36 @@ async function main(variant: string) {
       const snapshots = new SqliteLedgerSnapshotAdapter();
       await snapshots.snapshot({ source: ledger, destination: snapshot });
       const beforeRestore = fs.statSync(ledger).ino;
-      await snapshots.restore({ source: snapshot, destination: ledger });
+      child = spawn(process.execPath, ["--import", loader, self, "--raw-child", archive, fixture], { env, stdio: "ignore" });
+      await waitFor(() => fs.existsSync(path.join(fixture, "raw-ready")), "raw archive handle is open");
+      await assert.rejects(snapshots.restore({ source: snapshot, destination: ledger }), (error: unknown) =>
+        error instanceof LifecycleRestoreRefusal && error.refusal.reason === "quiescence_unproven");
+      assert.equal(fs.statSync(ledger).ino, beforeRestore, "foreign archive handle cannot change live inode");
+      await stop(child); child = null;
+      fs.rmSync(path.join(fixture, "raw-ready"));
+      child = spawn(process.execPath, ["--import", loader, self, "--raw-child", ledger, fixture], { env, stdio: "ignore" });
+      await waitFor(() => fs.existsSync(path.join(fixture, "raw-ready")), "raw live handle is open");
+      await assert.rejects(snapshots.restore({ source: snapshot, destination: ledger }), (error: unknown) =>
+        error instanceof LifecycleRestoreRefusal && error.refusal.reason === "ledger_in_use");
+      assert.equal(fs.statSync(ledger).ino, beforeRestore, "foreign live handle cannot change live inode");
+      await stop(child); child = null;
+      let persistentDiagnostic: LifecycleRestoreRefusal["diagnostic"];
+      const persistent = await withArchiveLsofFault(archive, Number.POSITIVE_INFINITY, async () => {
+        await assert.rejects(snapshots.restore({ source: snapshot, destination: ledger }), (error: unknown) => {
+          assert.ok(error instanceof LifecycleRestoreRefusal);
+          assert.equal(error.refusal.reason, "quiescence_unproven");
+          persistentDiagnostic = error.diagnostic;
+          return true;
+        });
+      });
+      assert.deepEqual(persistent, { calls: 3, injected: 3 }, "archive lsof retry is bounded");
+      assert.deepEqual(persistentDiagnostic, { stage: "archive_handle_probe", attempts: 3,
+        exitStatus: 1, signal: null, stderr: true, errorCode: null });
+      assert.equal(fs.statSync(ledger).ino, beforeRestore, "unknown archive handles cannot change live inode");
+      const transient = await withArchiveLsofFault(archive, 1, async () => {
+        await snapshots.restore({ source: snapshot, destination: ledger });
+      });
+      assert.deepEqual(transient, { calls: 2, injected: 1 }, "one transient archive lsof error is retried");
       assert.notEqual(fs.statSync(ledger).ino, beforeRestore, "a valid snapshot restore replaces the inode");
       const resumed = new LocalEventBuffer(ledger, options);
       assert.equal((resumed.database.prepare("select value from maintenance_state where key='r13-fresh-control'").get() as { value: string }).value, "kept");
@@ -197,7 +256,9 @@ async function main(variant: string) {
       assert.equal(fs.statSync(sidecar).ino, lockInode);
       console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true,
         publicationCommitKeepsExclusive: true, privateCopyHoldsDestinationLock: true, noTemporaryLock: true,
-        stableLockInode: true, readOnlyStatementsDoNotStat: true, validFreshSnapshotRestarts: true }));
+        stableLockInode: true, readOnlyStatementsDoNotStat: true, validFreshSnapshotRestarts: true,
+        foreignArchiveAndLiveHandlesRefuseRestore: true, archiveProbeRetryBounded: true,
+        transientArchiveProbeRecovered: true }));
     } else if (variant === "old-connection") {
       for (const action of ["statement", "transaction", "returning"]) {
         for (const name of ["ready", "go", "result.json"]) fs.rmSync(path.join(fixture, name), { force: true });
