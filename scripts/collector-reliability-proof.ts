@@ -105,7 +105,13 @@ async function main() {
   await check("failed_refresh_and_clock_rollback_are_consistently_stale", async () => {
     const buffer = fixture("refresh-failure"); buffer.append(event()); settle(buffer);
     let refresh!: (failure?: "maintenance_failed") => boolean;
-    const http = await serve(buffer, {registerStatusRefresher: callback => { refresh = callback; }});
+    let markMaintenanceSuccess!: () => void;
+    const http = await serve(buffer, {
+      registerStatusRefresher: (callback, markSuccess) => {
+        refresh = callback;
+        markMaintenanceSuccess = markSuccess;
+      },
+    });
     try {
       const good = await http.get("/status");
       assert.equal(refresh("maintenance_failed"), true);
@@ -117,6 +123,7 @@ async function main() {
       assert.equal(snapshot.projection.parityReady, false);
       assert.equal(snapshot.status.projection.parityReady, false);
       assert.equal(refresh(), true);
+      markMaintenanceSuccess();
       Date.now = () => now - 1_000;
       const backwards = await http.get("/status");
       assert.equal(backwards.statusFreshness.state, "expired");
