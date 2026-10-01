@@ -1,5 +1,5 @@
 import { acceptedFixtureDelivery } from "../lib/delivery-fixture";
-import { hasRequiredSchemaTables } from "../system-e2e/contract";
+import { hasRequiredMaintenanceChecks, hasRequiredSchemaTables } from "../system-e2e/contract";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -626,6 +626,8 @@ export function runMaintenanceRegressionContract(
     receipt.status === "pass" &&
     typeof receipt.checks === "number" &&
     receipt.checks === names.length &&
+    new Set(names).size === names.length &&
+    hasRequiredMaintenanceChecks(names) &&
     exactPendingIdentityProved &&
     stalledCadenceBackoffProved;
   const failureDetail = result.error

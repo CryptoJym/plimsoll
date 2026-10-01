@@ -13,7 +13,9 @@ import {
   digest,
   exactKeys,
   loadSupportContract,
+  hasRequiredMaintenanceChecks,
   hasRequiredSchemaTables,
+  REQUIRED_MAINTENANCE_CHECKS,
   normalizeSupportingArtifact,
   parseSupportingArtifact,
   supportContractPath,
@@ -163,6 +165,15 @@ const maintenanceArtifact = (addedChecks: number) => ({ scenarios: [{
 }] });
 assert.deepEqual(normalizeSupportingArtifact(maintenanceArtifact(0), metadataContext),
   normalizeSupportingArtifact(maintenanceArtifact(1), metadataContext));
+
+// The count may grow, but dropping a baseline assertion must fail the resource
+// wrapper before its receipt can reach normalization.
+assert.equal(REQUIRED_MAINTENANCE_CHECKS.length, 37);
+assert.equal(hasRequiredMaintenanceChecks(REQUIRED_MAINTENANCE_CHECKS), true);
+assert.equal(hasRequiredMaintenanceChecks([...REQUIRED_MAINTENANCE_CHECKS, "zz_new_assertion"]), true);
+assert.equal(hasRequiredMaintenanceChecks(REQUIRED_MAINTENANCE_CHECKS.filter(
+  (name) => name !== "integrated_unchanged_cycle_has_zero_parse_write_and_row_visits",
+)), false);
 
 type ActualChildVariant = {
   artifact: unknown;

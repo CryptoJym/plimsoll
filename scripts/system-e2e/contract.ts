@@ -272,6 +272,28 @@ export function hasRequiredSchemaTables(names: readonly string[]) {
   return REQUIRED_SCHEMA_TABLES.every((required) => present.has(required));
 }
 
+export const REQUIRED_MAINTENANCE_CHECKS = (() => {
+  const value: unknown = JSON.parse(fs.readFileSync(
+    new URL("./fixtures/required-maintenance-checks.json", import.meta.url), "utf8",
+  ));
+  exactKeys(value, ["schema", "sourceCommit", "measuredOn", "requiredChecks"],
+    "required maintenance checks fixture");
+  assert.equal(value.schema, "plimsoll.system-e2e-required-maintenance-checks.v1");
+  assert.match(String(value.sourceCommit), /^[0-9a-f]{40}$/, "required maintenance checks commit invalid");
+  assert.match(String(value.measuredOn), /^\d{4}-\d{2}-\d{2}$/, "required maintenance checks date invalid");
+  assert.ok(Array.isArray(value.requiredChecks) && value.requiredChecks.length > 0 &&
+    value.requiredChecks.every((name) => typeof name === "string" && /^[a-z][a-z0-9_]*$/.test(name)),
+    "required maintenance check names invalid");
+  const names = value.requiredChecks as string[];
+  assert.deepEqual(names, [...new Set(names)].sort(), "required maintenance checks must be sorted and unique");
+  return names;
+})();
+
+export function hasRequiredMaintenanceChecks(names: readonly string[]) {
+  const present = new Set(names);
+  return REQUIRED_MAINTENANCE_CHECKS.every((required) => present.has(required));
+}
+
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
  * volatile values. Unknown/missing fields therefore change the committed
