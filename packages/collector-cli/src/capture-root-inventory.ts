@@ -833,8 +833,17 @@ function nativeConfig(home: string, directory: string, file: string): string | n
   } catch { return null; }
 }
 
+/**
+ * The fleet's standard OpenTelemetry relay listens on the OTLP/HTTP port and
+ * forwards every request to this collector unchanged, with the agent's own
+ * x-plimsoll-* headers (eco-6hoxj.165.108). An agent that reports through it
+ * reports live to this collector.
+ */
+export const FLEET_OTLP_RELAY_PORT = 4318;
+
 function loopbackEndpoint(value: unknown, port: number, suffix: string) {
-  return value === `http://127.0.0.1:${port}${suffix}`;
+  return value === `http://127.0.0.1:${port}${suffix}` ||
+    value === `http://127.0.0.1:${FLEET_OTLP_RELAY_PORT}${suffix}`;
 }
 
 /** A read-only diagnostic; only names of matched sections/keys leave here. */
