@@ -194,22 +194,10 @@ export function prepareHistoryEvent(row: HistoryRowInput): PreparedHistoryEvent 
     }
   }
 
-  // Project attribution parity (issue 0036): forward the ledger's repo
-  // linkage as projectKey, exactly like the live sync path (upload.ts
-  // attachRepoLinkage). Never overwrites a payload-supplied projectKey.
-  if (row.repoHash && !candidate.projectKey) {
-    candidate.projectKey = row.repoHash;
-    const metadata =
-      candidate.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata)
-        ? (candidate.metadata as Record<string, unknown>)
-        : {};
-    candidate.metadata = {
-      ...metadata,
-      ...(row.branchHash ? { branchHash: row.branchHash } : {}),
-      projectBasis: "repo_context",
-    };
-  }
-
+  // Leave the ledger's repo linkage out of the candidate until attribution.
+  // A usage row's cwd may be the turn's starting folder, while a preceding
+  // tool in that turn has stronger repository evidence. Pre-filling a project
+  // here would make it look producer-owned and skip the session lookup.
   const parsedCandidate = aiInteractionEventSchema.safeParse(candidate);
   return {
     ok: true,
