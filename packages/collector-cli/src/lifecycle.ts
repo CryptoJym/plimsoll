@@ -554,14 +554,21 @@ const RESTORE_REFUSAL_MESSAGES: Record<Exclude<LifecycleRestoreRefusalRecord["re
 };
 
 /** Thrown by a ledger restore that changed nothing live; the rollback stays resumable. */
+export type LifecycleRestoreDiagnostic =
+  | { stage: "open_exclusive"; errorCode: string | null }
+  | { stage: "archive_handle_probe"; attempts: number; exitStatus: number | null;
+      signal: string | null; stderr: boolean; errorCode: string | null };
+
 export class LifecycleRestoreRefusal extends Error {
   readonly code = "LIFECYCLE_RESTORE_REFUSED";
+  declare readonly diagnostic?: LifecycleRestoreDiagnostic;
 
-  constructor(readonly refusal: LifecycleRestoreRefusalRecord) {
+  constructor(readonly refusal: LifecycleRestoreRefusalRecord, diagnostic?: LifecycleRestoreDiagnostic) {
     super(`ledger restore refused before any change: ${refusal.reason === "insufficient_free_space"
       ? `the snapshot could not be cloned and a byte copy needs ${refusal.requiredFreeBytes} bytes free beside ` +
         `the live ledger but ${refusal.freeBytes} are free`
       : RESTORE_REFUSAL_MESSAGES[refusal.reason]}`);
+    if (diagnostic) Object.assign(this, { diagnostic });
   }
 }
 
