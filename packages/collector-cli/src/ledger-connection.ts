@@ -6,6 +6,10 @@ import Database from "better-sqlite3";
 /** This factory is also embedded in the two plain-JavaScript worker threads.
  * Keep its runtime dependencies explicit so packaged workers use the same
  * opener and inode checks as the daemon and CLI. */
+/** Value-free spawn error codes the archive probe may report; anything else is "OTHER". */
+const PROBE_ERROR_CODES = new Set(["ETIMEDOUT", "ENOENT", "EACCES", "EPERM", "ENOBUFS", "EAGAIN", "EINTR",
+  "EMFILE", "ENFILE", "ENOMEM"]);
+
 function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, paths: typeof path,
   children: typeof childProcess) {
   const lockPath = (file: string) => {
@@ -105,9 +109,13 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
         let diagnostic: { stage: "archive_handle_probe"; attempts: number; exitStatus: number | null;
           signal: string | null; stderr: boolean; errorCode: string | null } | null = null;
         // A runner can give one inconclusive lsof result (for example, a
-        // timed-out stat). Retry uncertainty, never a reported foreign PID.
-        // Three 10-second probes plus two short pauses bound this preflight.
-        for (let attempt = 0; attempt < 3; attempt += 1) {
+        // timed-out stat). Lifecycle mutations (restore, discard, quiesce) retry
+        // that uncertainty, never a reported foreign PID: three 10-second probes
+        // plus two short pauses bound their preflight. Ordinary opens, the
+        // daemon's startup among them, keep one probe so the caller's startup
+        // budget holds.
+        const probeAttempts = intentionalRename ? 3 : 1;
+        for (let attempt = 0; attempt < probeAttempts; attempt += 1) {
           const oldFiles = [publication.marker.archivePath, `${publication.marker.archivePath}-wal`,
             `${publication.marker.archivePath}-shm`].filter(name => files.existsSync(name));
           if (!oldFiles.includes(publication.marker.archivePath)) throw new Error("replacement archive is missing");
@@ -130,8 +138,8 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
           diagnostic = { stage: "archive_handle_probe", attempts: attempt + 1,
             exitStatus: handles.status, signal: handles.signal,
             stderr: Boolean((handles.stderr ?? "").trim()),
-            errorCode: typeof code === "string" && /^E[A-Z0-9_]+$/.test(code) ? code : null };
-          if (attempt < 2) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+            errorCode: typeof code === "string" ? (PROBE_ERROR_CODES.has(code) ? code : "OTHER") : null };
+          if (attempt < probeAttempts - 1) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
         }
         if (!archiveClear) {
           throw Object.assign(new Error("replacement_verification_failed: archive handle probe inconclusive"),

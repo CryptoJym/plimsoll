@@ -244,6 +244,13 @@ async function main(variant: string) {
       assert.deepEqual(persistentDiagnostic, { stage: "archive_handle_probe", attempts: 3,
         exitStatus: 1, signal: null, stderr: true, errorCode: null });
       assert.equal(fs.statSync(ledger).ino, beforeRestore, "unknown archive handles cannot change live inode");
+      // An ordinary open (the daemon's startup path) keeps main's single probe:
+      // one inconclusive answer refuses at once instead of spending the startup budget.
+      const ordinary = await withArchiveLsofFault(archive, 1, async () => {
+        assert.throws(() => new LocalEventBuffer(ledger, options));
+      });
+      assert.deepEqual(ordinary, { calls: 1, injected: 1 }, "an ordinary open does not retry the archive probe");
+      assert.equal(fs.statSync(ledger).ino, beforeRestore, "a refused ordinary open changes nothing");
       const transient = await withArchiveLsofFault(archive, 1, async () => {
         await snapshots.restore({ source: snapshot, destination: ledger });
       });
@@ -257,7 +264,7 @@ async function main(variant: string) {
       console.log(JSON.stringify({ variant, idleConnectionBlocksSwitch: true, exitedOwnerReleasesLock: true,
         publicationCommitKeepsExclusive: true, privateCopyHoldsDestinationLock: true, noTemporaryLock: true,
         stableLockInode: true, readOnlyStatementsDoNotStat: true, validFreshSnapshotRestarts: true,
-        foreignArchiveAndLiveHandlesRefuseRestore: true, archiveProbeRetryBounded: true,
+        foreignArchiveAndLiveHandlesRefuseRestore: true, archiveProbeRetryBounded: true, ordinaryOpenProbesOnce: true,
         transientArchiveProbeRecovered: true }));
     } else if (variant === "old-connection") {
       for (const action of ["statement", "transaction", "returning"]) {
