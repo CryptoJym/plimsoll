@@ -1,0 +1,25 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 443,
+  "headSha": "fb3857a4f20e080973423abd8611e7ef8df284e9",
+  "reviewedAt": "2026-10-01T10:33:17Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f6d2-9b3e-7733-afac-bf6fcf1ccd05",
+    "model": "gpt-6-sol",
+    "host": "studio1"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0f688-6627-7163-8f0a-c6dc798d0fa2"
+    },
+    {
+      "runtime": "claude-code",
+      "session": "f4023139-6838-412e-a325-7fdbdcf61a0a"
+    }
+  ],
+  "summary": "PR #443 (eco-6hoxj.163.141 + .163.142). One inconclusive lsof archive probe at startup after a fresh-ledger cutover no longer restores the archived ledger and refuses start. Startup admission retries only fast inconclusive answers inside the existing deadline; the first probe keeps the whole remaining deadline, a timeout is not retried, a reported foreign PID refuses at once, and three fast inconclusive probes still refuse and restore. Workers share the one PROBE_ERROR_CODES definition. Review r1 (studio1) REQUEST_CHANGES: P1 slow lsof (4.5 s base starts, head restored), P1 private ledger path in the foreign-handle CLI refusal. Author r2 (0f7b0fb8, fb3857a4) fixed both. Review r2 APPROVE fb3857a4: own slow and stuck controls match base, refusal is value-free, used and unused foreign handles refuse, both mutants caught, typecheck and 19 CI-layout proofs pass."
+}
