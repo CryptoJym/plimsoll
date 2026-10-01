@@ -30,6 +30,7 @@ import {
 } from "./device-identity";
 import { assertNoRedirect, fetchCollectorUrl, postJson, validatedTransportUrl } from "./http-transport";
 import { syncAccountActorSalt } from "./account-salt";
+import { buildInstallContactPayload, postInstallContact, type InstallContactResult } from "./install-contact";
 
 /**
  * Fleet join is transactional: redeem into memory, prove only a fresh
@@ -71,6 +72,7 @@ const joinGrantSchema = z.object({
   deviceId: z.string().uuid().optional(),
   installKey: z.string().trim().min(1),
   uploadUrl: z.string().url(),
+  installContactEndpoint: z.string().url().optional(),
   ingestKey: z.string().trim().min(1).optional(),
   uploadSigningSecret: z.string().trim().min(16).optional(),
   keyId: z.string().trim().regex(JOIN_KEY_ID_PATTERN).optional(),
@@ -90,6 +92,7 @@ const pendingJoinSchema = z.object({
   /** Persisted activation identity, distinct for each native join; resumes reuse it. */
   installationEpochId: z.string().uuid().optional(),
   handshakeEventId: z.string().trim().min(1).optional(),
+  contactResponse: z.unknown().optional(),
   contactReplayBatch: aiWorkIngestBatchSchema.optional(),
   stagedConfig: collectorConfigSchema,
   accountActorSaltEndpoint: z.string().url().optional(),
@@ -136,8 +139,8 @@ export type JoinResult =
         admissionCutoffAt: string | null;
       };
       handshake: {
-        uploadedEvents: 1;
-        selfTestEventId: string;
+        uploadedEvents: 0 | 1;
+        selfTestEventId: string | null;
         signedUpload: boolean;
         response: unknown;
       };
@@ -228,6 +231,7 @@ function stageGrant(
     workspaceName: _staleWorkspaceName,
     uploadSigningSecret: _staleSigningSecret,
     uploadUrl: _staleUploadUrl,
+    installContactEndpoint: _staleInstallContactEndpoint,
     accountActorSaltEndpoint: _staleAccountActorSaltEndpoint,
     deviceId: _staleDeviceId,
     cloudDeviceId: _staleCloudDeviceId,
@@ -245,6 +249,7 @@ function stageGrant(
     keyId: grant.keyId ?? identity.keyId,
     installKey: grant.installKey,
     uploadUrl: grant.uploadUrl,
+    ...(grant.installContactEndpoint ? { installContactEndpoint: grant.installContactEndpoint } : {}),
     ...(grant.accountActorSaltEndpoint ? { accountActorSaltEndpoint: grant.accountActorSaltEndpoint } : {}),
     policy: grant.policyVersion
       ? { ...existing.policy, tenantId: grant.tenantId, version: grant.policyVersion }
@@ -443,10 +448,10 @@ function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult 
       installationEpochId: enrollment.currentInstallationEpochId,
       admissionCutoffAt: enrollment.currentInstallationEpochStartedAt },
     handshake: {
-      uploadedEvents: 1,
-      selfTestEventId: pending.handshakeEventId ?? pending.probeSourceId,
+      uploadedEvents: pending.contactResponse === undefined ? 1 : 0,
+      selfTestEventId: pending.contactResponse === undefined ? pending.handshakeEventId ?? pending.probeSourceId : null,
       signedUpload: Boolean(pending.stagedConfig.uploadSigningSecret),
-      response: { status: "already_activated" },
+      response: pending.contactResponse ?? { status: "already_activated" },
     },
     contactReplayBatch: pending.contactReplayBatch,
   };
@@ -566,54 +571,90 @@ async function activatePendingJoin(
   };
   const removeSignalCleanup = installSignalCleanup(cleanupTemporaryState);
   let selfTestEventId = "";
-  let handshakeAcknowledged = false;
+  let handshakeAcknowledged = pending.contactResponse !== undefined;
   let activeConfigActivated = false;
+  // An accepted non-event handshake is journaled before activation. A resume
+  // must honor that receipt and never fall back to the synthetic event lane.
+  let contactHandshake = pending.contactResponse !== undefined;
+  let contactResponse: unknown = pending.contactResponse ?? null;
+  let uploaded: Awaited<ReturnType<typeof uploadBufferedEvents>> | null = null;
   try {
-    buffer = new LocalEventBuffer(temporaryLedgerPath, {
-      workspaceId: pending.stagedConfig.tenantId,
-      deviceId: identity.deviceId,
-      delivery: { enabled: true, limits: pending.stagedConfig.delivery },
-    });
-    const normalized = appendForwardedHook(
-      {
-        id: pending.probeSourceId,
-        source: "claude_code",
-        event_type: "UserPromptSubmit",
-      },
-      { config: pending.stagedConfig, buffer, source: "claude_code" },
-    );
-    selfTestEventId = normalized.event.id;
-
-    const handshakeFetch = (async (input, init) => {
-      const requestedUrl = inputUrl(input);
-      if (requestedUrl.href !== uploadUrl.href) {
-        throw new Error("Handshake upload attempted an unexpected URL.");
+    if (!contactHandshake) {
+      // New clouds acknowledge the install without entering the event lane.
+      // Older clouds answer 404 (or are unreachable), so retain the existing
+      // isolated synthetic-event proof as the compatibility path.
+      const contactBuffer = new LocalEventBuffer(temporaryLedgerPath, {
+        workspaceId: pending.stagedConfig.tenantId,
+        deviceId: identity.deviceId,
+        delivery: { enabled: false, limits: pending.stagedConfig.delivery },
+      });
+      let contactPayload;
+      try {
+        contactPayload = buildInstallContactPayload(pending.stagedConfig, contactBuffer.database, {
+          appVersion: pending.appVersion,
+        });
+      } finally {
+        contactBuffer.close();
       }
-      const uploadResponse = await fetchCollectorUrl(requestedUrl, { ...init, redirect: "manual" }, options.fetchImpl);
-      assertNoRedirect(uploadResponse, "Handshake upload", uploadUrl.origin);
-      return uploadResponse;
-    }) as typeof fetch;
-
-    const uploaded = await uploadBufferedEvents(pending.stagedConfig, buffer, {
-      appVersion: pending.appVersion,
-      fetchImpl: handshakeFetch,
-    });
-    const uploadedEvent = uploaded.batch?.events[0]?.event.id;
-    const accepted =
-      uploaded.response && typeof uploaded.response === "object"
-        ? (uploaded.response as { accepted?: unknown }).accepted
-        : undefined;
-    if (
-      uploaded.uploadedEvents !== 1 ||
-      uploaded.batch?.events.length !== 1 ||
-      uploadedEvent !== selfTestEventId ||
-      (accepted !== true && accepted !== 1)
-    ) {
-      throw new Error("Join handshake did not explicitly acknowledge exactly its one synthetic probe.");
+      const contact: InstallContactResult = await postInstallContact({
+        config: pending.stagedConfig,
+        payload: contactPayload,
+        fetchImpl: options.fetchImpl,
+      });
+      if (contact.kind === "accepted") {
+        contactHandshake = true;
+        handshakeAcknowledged = true;
+        contactResponse = contact.response.body;
+        pending = pendingJoinSchema.parse({ ...pending, contactResponse });
+      }
     }
-    handshakeAcknowledged = true;
-    pending = pendingJoinSchema.parse({ ...pending, handshakeEventId: selfTestEventId,
-      contactReplayBatch: uploaded.batch });
+    if (!contactHandshake) {
+      buffer = new LocalEventBuffer(temporaryLedgerPath, {
+        workspaceId: pending.stagedConfig.tenantId,
+        deviceId: identity.deviceId,
+        delivery: { enabled: true, limits: pending.stagedConfig.delivery },
+      });
+      const normalized = appendForwardedHook(
+        {
+          id: pending.probeSourceId,
+          source: "claude_code",
+          event_type: "UserPromptSubmit",
+        },
+        { config: pending.stagedConfig, buffer, source: "claude_code" },
+      );
+      selfTestEventId = normalized.event.id;
+
+      const handshakeFetch = (async (input, init) => {
+        const requestedUrl = inputUrl(input);
+        if (requestedUrl.href !== uploadUrl.href) {
+          throw new Error("Handshake upload attempted an unexpected URL.");
+        }
+        const uploadResponse = await fetchCollectorUrl(requestedUrl, { ...init, redirect: "manual" }, options.fetchImpl);
+        assertNoRedirect(uploadResponse, "Handshake upload", uploadUrl.origin);
+        return uploadResponse;
+      }) as typeof fetch;
+
+      uploaded = await uploadBufferedEvents(pending.stagedConfig, buffer, {
+        appVersion: pending.appVersion,
+        fetchImpl: handshakeFetch,
+      });
+      const uploadedEvent = uploaded.batch?.events[0]?.event.id;
+      const accepted =
+        uploaded.response && typeof uploaded.response === "object"
+          ? (uploaded.response as { accepted?: unknown }).accepted
+          : undefined;
+      if (
+        uploaded.uploadedEvents !== 1 ||
+        uploaded.batch?.events.length !== 1 ||
+        uploadedEvent !== selfTestEventId ||
+        (accepted !== true && accepted !== 1)
+      ) {
+        throw new Error("Join handshake did not explicitly acknowledge exactly its one synthetic probe.");
+      }
+      handshakeAcknowledged = true;
+      pending = pendingJoinSchema.parse({ ...pending, handshakeEventId: selfTestEventId,
+        contactReplayBatch: uploaded.batch });
+    }
     replacePendingJoin(pending, options.pendingFile);
 
     cleanupTemporaryState();
@@ -724,12 +765,12 @@ async function activatePendingJoin(
         admissionCutoffAt: enrollment.currentInstallationEpochStartedAt,
       },
       handshake: {
-        uploadedEvents: 1,
-        selfTestEventId,
-        signedUpload: uploaded.signedUpload,
-        response: uploaded.response,
+        uploadedEvents: contactHandshake ? 0 : 1,
+        selfTestEventId: contactHandshake ? null : selfTestEventId,
+        signedUpload: contactHandshake ? Boolean(pending.stagedConfig.uploadSigningSecret) : uploaded!.signedUpload,
+        response: contactHandshake ? contactResponse : uploaded!.response,
       },
-      contactReplayBatch: uploaded.batch!,
+      ...(contactHandshake ? {} : { contactReplayBatch: uploaded!.batch! }),
       accountSaltSynced,
     };
   } catch (error) {
@@ -884,6 +925,12 @@ export async function performJoin(options: {
       validatedTransportUrl(grant.accountActorSaltEndpoint, "Granted account salt endpoint").origin !== joinUrl.origin
     ) {
       throw new Error("Granted account salt endpoint must use the same origin as the workspace join URL.");
+    }
+    if (
+      grant.installContactEndpoint &&
+      validatedTransportUrl(grant.installContactEndpoint, "Granted install contact endpoint").origin !== joinUrl.origin
+    ) {
+      throw new Error("Granted install contact endpoint must use the same origin as the workspace join URL.");
     }
     if (
       isManagedOrUploadEnabled(existingConfig) &&

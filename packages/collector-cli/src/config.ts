@@ -54,10 +54,14 @@ export const collectorConfigSchema = z
     ingestKey: z.string().trim().min(1).optional(),
     uploadSigningSecret: z.string().trim().min(16).optional(),
     uploadUrl: z.string().url().optional(),
+    /** Authenticated non-event contact endpoint advertised by newer clouds. */
+    installContactEndpoint: z.string().url().optional(),
     accountActorSaltEndpoint: z.string().url().optional(),
     tenantId: z.string().trim().min(1).default(LOCAL_TENANT_ID),
     workspaceName: z.string().trim().min(1).max(200).optional(),
     installKey: z.string().trim().min(1).default("local-dev"),
+    /** Report the bounded macOS computer name in install contacts. */
+    reportMachineName: z.boolean().default(true),
     /** Stable local activation identity; never replaced by a hosted id. */
     deviceId: z.string().trim().min(1).optional(),
     /** Hosted DeviceInstall UUID used only by the tenant salt endpoint. */

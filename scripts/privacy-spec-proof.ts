@@ -300,6 +300,21 @@ check(
   },
 );
 
+check(
+  "install_contact_wire_declares_bounded_machine_name",
+  false,
+  () => {
+    const model = collectPrivacySpecModel();
+    assert.deepEqual(model.installContactWireFields, [
+      "tenantId", "deviceId", "installKey", "appVersion", "lastActivityAt", "captureState", "machineName",
+    ]);
+    const rendered = renderPrivacySpec(model);
+    assert.match(rendered, /install contact heartbeat/);
+    assert.match(rendered, /`machineName`/);
+    assert.match(rendered, /reportMachineName=false/);
+  },
+);
+
 console.log(`privacy spec proof: ${checks.length}/${checks.length} checks passed`);
 for (const entry of checks) {
   console.log(`  ✓${entry.adversarial ? " [adversarial]" : ""} ${entry.name}`);

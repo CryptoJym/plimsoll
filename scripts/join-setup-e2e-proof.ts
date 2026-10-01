@@ -184,6 +184,13 @@ async function cloud(mode: "ack" | "no_ack" | "refuse" | "timeout_once") {
           uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest` }));
         return;
       }
+      // This fixture cloud predates install-contact, so keep the compatibility
+      // branch explicit instead of trying to parse a heartbeat as an event batch.
+      if (request.url?.endsWith("/install-contact")) {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, error: "not_found" }));
+        return;
+      }
       if (!body) {
         response.writeHead(404, { "content-type": "application/json" });
         response.end(JSON.stringify({ ok: false, route: request.url ?? null }));
