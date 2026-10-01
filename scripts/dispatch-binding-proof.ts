@@ -285,18 +285,21 @@ assert.equal(JSON.parse(closed.stdout).pruned, 2);
 const afterClose = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
 assert.ok(afterClose.captureRoots?.every(captureRoot => captureRoot.dispatch?.every(binding => binding.attemptId !== "old-lane")));
 assert.ok(afterClose.captureRoots?.every(captureRoot => captureRoot.dispatch?.find(binding => binding.attemptId === "lane-1")?.validUntil));
-assert.equal(rootEventMetadata(roots[0], "after-close", "2026-10-01T00:00:00.000Z", "codex-session").workItemId, undefined);
+// An event after the close: stamped from the clock, since close ends the binding at the current time.
+assert.equal(rootEventMetadata(roots[0], "after-close", new Date(Date.now() + 60_000).toISOString(), "codex-session").workItemId, undefined);
 proof.check("close_ends_attempt_and_prunes_closed_bindings_older_than_seven_days");
 
+// A window that is still open when the proof runs, so close has something to shorten.
+const scheduledUntil = new Date(Date.now() + 7 * 86_400_000).toISOString();
 const scheduled = cli(["dispatch", "bind", "--session-id", "scheduled-session", "--work-item-id", "beads:scheduled",
   "--project-key", key, "--attempt-id", "scheduled-lane", "--valid-from", "2026-09-25T00:00:00.000Z",
-  "--valid-until", "2026-10-01T00:00:00.000Z"]);
+  "--valid-until", scheduledUntil]);
 assert.equal(scheduled.code, 0, scheduled.stderr);
 const scheduledClose = cli(["dispatch", "close", "--attempt-id", "scheduled-lane"]);
 assert.equal(scheduledClose.code, 0, scheduledClose.stderr);
 const end = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8"))).captureRoots![0].dispatch!
   .find(binding => binding.attemptId === "scheduled-lane")!.validUntil!;
-assert.ok(Date.parse(end) < Date.parse("2026-10-01T00:00:00.000Z"), end);
+assert.ok(Date.parse(end) < Date.parse(scheduledUntil), end);
 proof.check("close_shortens_a_scheduled_validity_window");
 
 const atCap = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
