@@ -1,0 +1,11 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 440,
+  "headSha": "1ef03b2bb596f66db0ef282c858497418f83878a",
+  "reviewedAt": "2026-10-01T06:03:06Z",
+  "reviewer": {"runtime": "codex", "session": "01a0f5ed-f7fd-7e22-acfb-c003502febcf", "model": "gpt-6-sol", "host": "studio1"},
+  "authors": [{"runtime": "codex", "session": "01a0f5ca-b26f-71c2-915b-44cf1b819a53"}, {"runtime": "claude-code", "session": "f4023139-6838-412e-a325-7fdbdcf61a0a"}],
+  "summary": "PR #440 (an inconclusive archive lsof probe no longer turns a valid snapshot restore into quiescence_unproven; the CI flake in PR 426 r13 shared-lifetime). Author lane on studio4 (r1, 48b9ec99) located the refusal at openExclusive's archive handle probe and added a bounded, fail-closed retry with a value-free diagnostic. Review r1 (studio1) REQUEST_CHANGES: P1 the retry sat in the shared opener and could stall ordinary startup past its 10-second budget; P2 allowlist the diagnostic code. The lead's 5fe85c96 limits the retry to lifecycle opens (restore, discard, quiesce) and keeps one probe for every ordinary open; 1ef03b2b checks that at openLedgerDatabase. Review r2 APPROVEs 1ef03b2b: the r1 P1 is closed, real foreign handles still refuse, lifecycle retries stay bounded; one worker-only P2 filed."
+}
