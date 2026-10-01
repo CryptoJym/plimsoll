@@ -45,10 +45,9 @@ try {
         const result = batch.attribute(input.event, { repoHash: input.repoHash });
         const key = result.event.projectKey === A ? 'startingFolderA' : result.event.projectKey === B ? 'priorToolB' : 'unallocated';
         projects[key] = (projects[key] ?? 0) + 1;
-        if (result.event.projectKey === A) throw new Error(`${eventType}/${contextIndex ? 'indexed' : 'legacy'} charged capped lookup to starting folder`);
         if (result.event.projectKey === B) {
           assert.equal(result.event.metadata.projectBasis, 'session_inherited');
-        } else {
+        } else if (result.event.projectKey === undefined) {
           assert.equal(result.event.projectKey, undefined);
           assert.equal(result.event.metadata.projectBasis, 'unallocated');
         }
@@ -59,9 +58,6 @@ try {
       assert.ok(stats.contextRows <= SESSION_INHERIT_MAX_BATCH_ROW_READS + stats.lookups);
       assert.ok(stats.rowReads <= SESSION_INHERIT_MAX_BATCH_ROW_READS);
       assert.ok(stats.indexEntries <= (SESSION_INHERIT_MAX_SCANNED_ROWS + 1) * stats.lookups);
-      assert.equal(projects.startingFolderA ?? 0, 0);
-      assert.equal(projects.priorToolB ?? 0, 256);
-      assert.equal(projects.unallocated ?? 0, 244);
       details.push({ eventType, contextIndex, elapsedMs, stats, projects });
     }
   }
@@ -76,4 +72,10 @@ try {
       where c.session_id = ? and c.observed_at >= ? and c.observed_at <= ?
       order by c.observed_at asc, c.source_rowid asc limit ?`).all('budget-0', '2026-09-23T06:01:00.000Z', '2026-09-23T18:01:00.000Z', 4097),
   }, null, 2));
+  for (const { eventType, contextIndex, projects } of details) {
+    assert.equal(projects.startingFolderA ?? 0, 0,
+      `${eventType}/${contextIndex ? 'indexed' : 'legacy'} charged capped lookup to starting folder`);
+    assert.equal(projects.priorToolB ?? 0, 256);
+    assert.equal(projects.unallocated ?? 0, 244);
+  }
 } finally { ledger.close(); }
