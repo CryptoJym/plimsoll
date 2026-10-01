@@ -21,7 +21,8 @@ import { createProofCompletion } from "./lib/proof-completion";
  * updates that orphan row. On 0.7.46 the summary repair UPDATE trigger's
  * unparenthesized OR expression inserts NULL into its NOT NULL repair key.
  */
-const completion = createProofCompletion("session-summary-repair-null-session", 5);
+const otlpOnly = process.argv.includes("--otlp-only");
+const completion = createProofCompletion("session-summary-repair-null-session", otlpOnly ? 1 : 5);
 const root = process.env.PLIMSOLL_PROOF_ROOT!;
 const workspace = "00000000-0000-4000-8000-000000000747";
 const session = "00000000-0000-4000-8000-000000000701";
@@ -178,6 +179,12 @@ async function codexOtlpProof() {
 }
 
 async function main() {
+  if (otlpOnly) {
+    await codexOtlpProof();
+    completion.check("codex_otlp_pairing_accepts_orphan_rows");
+    completion.complete();
+    return;
+  }
   const buffer = await makeLedger("null-session-repair");
   try {
     const trigger = buffer.database.prepare(
