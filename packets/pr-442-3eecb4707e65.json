@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 442,
+  "headSha": "3eecb4707e65e05b0e8482e1330aef9b9494e7c9",
+  "reviewedAt": "2026-10-01T09:40:00Z",
+  "reviewer": {
+    "runtime": "claude-code",
+    "session": "f4023139-6838-412e-a325-7fdbdcf61a0a",
+    "model": "claude-opus-5-5",
+    "host": "studio0"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0f675-7c46-7ab0-a3a2-89dbbfbe236f"
+    }
+  ],
+  "summary": "PR #442 (eco-6hoxj.163.143, .163.140), proof scripts only. The wal-checkpoint-bound worker-alone check failed #439 on a slow runner (121.9 vs 117.9 MiB; main 48.7-81.1 MiB): the fixed byte limit measured runner speed. The check now requires at least 3 completed FULL passes and 3 real WAL rewinds (WAL-index salts) and bounds the peak by intake measured between completed passes, ending intake on a completed pass, with the hard bound off throughout. Five mutants fail it (never FULL, FULL never completes, PASSIVE only, stops after first pass, first FULL then stopped); 30/30 under per-core contention and 10/10 idle. The history writer handoff proof now prints per-slice phase timestamps on failure with the 250 ms bound kept. Lead review (independent of the Codex author): APPROVE; no runtime change."
+}
