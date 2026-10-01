@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 439,
+  "headSha": "6eb1cc538033dc1f4d67c6fe43c8a972525131cd",
+  "reviewedAt": "2026-10-01T03:31:22Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f531-d4ca-7072-a5a0-d8337e49dcd6",
+    "model": "gpt-6-sol",
+    "host": "studio6"
+  },
+  "authors": [
+    {
+      "runtime": "codex",
+      "session": "01a0f4aa-de63-7a03-b30f-fde74789527c"
+    }
+  ],
+  "summary": "PR #439 (normalization v14: the idle resource pin stops moving when code or tables are added). Review r1 found one P1: the maintenance checks count left the digest unguarded. Round 2 added a required list of the 37 maintenance check names, plus a test that removes the unchanged-cycle assertion and fails the gate. Review r2 APPROVEs 9eed6210 (1343e4fb plus a clean merge of main e308aa92). The drop reproducer fails v14 on the head and passed on 72ff1ffa; module and table growth keep the pin; the 10x metadata, idle-writer and idle-scan mutants fail. Lead refresh: main merged at 6eb1cc53 (only #442's WAL proof change came in, no conflicts); CI proof SUCCESS on 6eb1cc53."
+}
