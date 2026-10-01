@@ -305,6 +305,17 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
         'trg_session_summary_receipt_update', 'trg_session_summary_receipt_delete')`)
       .all() as Array<{ name: string }>;
     for (const trigger of legacySummaryTriggers) db.exec(`drop trigger ${trigger.name}`);
+    // These generated triggers predate the parenthesized nullable-session
+    // guard. CREATE TRIGGER IF NOT EXISTS cannot converge an upgraded ledger:
+    // the old definition would remain active and repricing would still try to
+    // insert a NULL repair key. Replace all three definitions in this same
+    // immediate schema transaction so an upgrade never leaves old and new
+    // versions installed together.
+    for (const trigger of [
+      "trg_session_summary_raw_update_v42",
+      "trg_session_summary_repair_update_old_v1",
+      "trg_session_summary_repair_update_new_v1",
+    ]) db.exec(`drop trigger if exists ${trigger}`);
     db.exec(`
     create table if not exists session_sync_summary_control (
       singleton integer primary key check (singleton = 1),
