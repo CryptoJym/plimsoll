@@ -540,17 +540,25 @@ export function applyProjectAttribution(
 ): ProjectAttributionResult {
   const basis = eventBasis(event);
   const ownRepo = canonicalLinkage(options.repoHash);
+  const sessionEvidenceRequired = event.eventType === "usage_rollout" || event.eventType === "usage_transcript";
+  const incompleteSessionLookup = sessionEvidenceRequired && options.sessionContextsTruncated === true;
   const replaceable = basis === "repo_context" || basis === "session_inherited";
   // An event that carries a project without one of the collector's generated
   // markers is explicit. Return before touching any supplied session slice.
   if (event.projectKey && !replaceable) {
     return { event: withBasis(event, "explicit", event.projectKey), basis: "explicit" };
   }
+  // A generated project from a prior attribution pass is no stronger than the
+  // session evidence that produced it. If this lookup is incomplete, clear
+  // that stale fallback before considering the row's own starting folder.
+  if (event.projectKey && incompleteSessionLookup && replaceable) {
+    return { event: withBasis(event, "unallocated"), basis: "unallocated" };
+  }
   const inherited = inheritedRepo(
     event,
     options.sessionContexts ?? [],
     options.sessionContextsTruncated ?? false,
-    Boolean(ownRepo && (event.eventType === "usage_rollout" || event.eventType === "usage_transcript")),
+    Boolean(ownRepo && sessionEvidenceRequired),
   );
   if (event.projectKey) {
     // A producer-owned project always wins. A generated marker is reusable
@@ -567,11 +575,10 @@ export function applyProjectAttribution(
   }
 
   const branchHash = canonicalLinkage(options.branchHash);
-  if (ownRepo && inherited &&
-      (event.eventType === "usage_rollout" || event.eventType === "usage_transcript")) {
+  if (ownRepo && inherited && sessionEvidenceRequired) {
     return { event: withBasis(event, "session_inherited", inherited), basis: "session_inherited" };
   }
-  if (ownRepo) {
+  if (ownRepo && !incompleteSessionLookup) {
     return { event: withOwnRepoContext(event, ownRepo, branchHash), basis: "repo_context" };
   }
 
