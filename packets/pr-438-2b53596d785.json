@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 438,
+  "headSha": "2b53596d785850e39bf809d5e37c50ff2f94336b",
+  "reviewedAt": "2026-10-01T01:50:58Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f4fb-e336-7240-b08d-727cc3fd4d5a",
+    "model": "gpt-6-sol",
+    "host": "jamess-macbook-pro-2"
+  },
+  "authors": [
+    {
+      "runtime": "claude",
+      "session": "f4023139-6838-412e-a325-7fdbdcf61a0a"
+    }
+  ],
+  "summary": "Independent Codex review of PR #438 (two proofs stop depending on the date; they broke at 2026-10-01T00:00Z on unchanged main). Base fails both target proofs, and the head passes both now and with the Node clock shifted to 2035. Four mutants fail at the expected assertions (a horizon before now for the lease-intake case; close no longer ending or shortening a binding). One P2 follow-up: older fixture dates still break the proofs under a backdated clock (filed separately). No findings."
+}
