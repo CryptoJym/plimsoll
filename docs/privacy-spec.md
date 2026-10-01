@@ -244,6 +244,20 @@ Named sentinel checks enforcing this section:
 - `allowed_metadata_and_top_level_string_value_matrix_fails_closed` — `scripts/outbox-proof.ts`
 - `upload_watermark_drains` — `scripts/signal-fidelity-proof.ts`
 
+## Collected plain — install contact heartbeat
+
+While a joined collector is running, the bounded authenticated install-contact exchange sends only these fields; it never carries an event, path, user name, serial number, or usage row:
+
+1. `tenantId`
+2. `deviceId`
+3. `installKey`
+4. `appVersion`
+5. `lastActivityAt`
+6. `captureState`
+7. `machineName`
+
+The optional `machineName` is the sanitized macOS ComputerName (or hostname fallback), capped at 64 characters; setting `reportMachineName=false` omits the field entirely. The credential fields authenticate the request and are not machine identity.
+
 ## Where captured data rests on disk
 
 Captured data rests in three places on the machine, all inside the one

@@ -36,6 +36,11 @@ import {
 import { collectSessionSnapshots } from "../packages/collector-cli/src/session-sync";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import {
+  buildInstallContactPayload,
+  INSTALL_CONTACT_WIRE_FIELDS,
+  reportedMachineName,
+} from "../packages/collector-cli/src/install-contact";
+import {
   isCollisionSafeDeliveryId,
   runAttributionRepair,
   runWorkspaceHistoryUpload,
@@ -145,6 +150,31 @@ async function main() {
   if (fixture.schemaVersion !== 1 || fixture.prefixLength < 8) {
     throw new Error("Privacy sentinel fixture is invalid.");
   }
+
+  const heartbeatConfig = collectorConfigSchema.parse({
+    tenantId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    deviceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    cloudDeviceId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    installKey: "pli_privacy_contact_fixture",
+    uploadUrl: "https://cloud.example.test/api/work-intelligence/ingest",
+    reportMachineName: false,
+  });
+  const heartbeatLedger = new LocalEventBuffer(path.join(root, "heartbeat.sqlite"), {
+    delivery: { enabled: false },
+  });
+  const heartbeatPayload = buildInstallContactPayload(heartbeatConfig, heartbeatLedger.database, {
+    appVersion: "0.7.46",
+    machineName: "Studio 8",
+  });
+  heartbeatLedger.close();
+  record(
+    "install_contact_privacy_wire_is_bounded_and_opt_out_omits_machine_name",
+    Object.keys(heartbeatPayload).sort().join(",") === "appVersion,captureState,deviceId,installKey,lastActivityAt,tenantId" &&
+      INSTALL_CONTACT_WIRE_FIELDS.includes("machineName") &&
+      reportedMachineName({ platform: "darwin", runScutil: () => "Studio 8\u0000" }) === "Studio 8" &&
+      reportedMachineName({ platform: "other", hostname: "studio8.local" }) === "studio8",
+    { fields: Object.keys(heartbeatPayload).sort(), wireFields: INSTALL_CONTACT_WIRE_FIELDS },
+  );
 
   const evidencePolicy = policyConfigSchema.parse(
     JSON.parse(

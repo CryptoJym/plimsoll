@@ -42,6 +42,7 @@ import {
   type SpoolDerivationInputDisclosure,
 } from "../packages/collector-cli/src/hook-spool";
 import { OTLP_SPOOL_DIRECTORY, OTLP_SPOOL_LIMITS } from "../packages/collector-cli/src/otlp-spool";
+import { INSTALL_CONTACT_WIRE_FIELDS } from "../packages/collector-cli/src/install-contact";
 import { DEFAULT_LEARNING_FACT_LIMITS } from "../packages/collector-cli/src/learning-facts";
 import {
   SPOOL_UNSPLIT_PROTECTED_SPELLINGS,
@@ -75,6 +76,7 @@ export type PrivacySpecModel = {
   hashedExample: { input: string; output: string };
   batchEnvelopeFields: FieldNote[];
   eventFields: FieldNote[];
+  installContactWireFields: string[];
   suppressedReceiptFieldName: string;
   spoolDirectory: string;
   spoolDerivationInputs: SpoolDerivationInputDisclosure[];
@@ -269,6 +271,7 @@ export function collectPrivacySpecModel(): PrivacySpecModel {
     },
     batchEnvelopeFields,
     eventFields: fieldNotesFromShape(eventWrapper.shape.event.shape),
+    installContactWireFields: [...INSTALL_CONTACT_WIRE_FIELDS],
     suppressedReceiptFieldName: Object.keys(eventWrapper.shape).find(
       (key) => key !== "event",
     ) as string,
@@ -474,6 +477,14 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`unknown keys default to local-only.`);
   lines.push(``);
   lines.push(...renderGuaranteesSection(["plain_envelope"], found));
+  lines.push(`## Collected plain — install contact heartbeat`);
+  lines.push(``);
+  lines.push(`While a joined collector is running, the bounded authenticated install-contact exchange sends only these fields; it never carries an event, path, user name, serial number, or usage row:`);
+  lines.push(``);
+  model.installContactWireFields.forEach((field, index) => lines.push(`${index + 1}. \`${field}\``));
+  lines.push(``);
+  lines.push(`The optional \`machineName\` is the sanitized macOS ComputerName (or hostname fallback), capped at 64 characters; setting \`reportMachineName=false\` omits the field entirely. The credential fields authenticate the request and are not machine identity.`);
+  lines.push(``);
   lines.push(`## Where captured data rests on disk`);
   lines.push(``);
   lines.push(`Captured data rests in three places on the machine, all inside the one`);

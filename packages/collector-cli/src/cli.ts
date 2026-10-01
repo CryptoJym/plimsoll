@@ -236,6 +236,7 @@ import {
 import { PURGE_CONFIRMATION } from "./lifecycle";
 import { startStatusSummaryWriter, summaryPendingStatus, type StatusSummaryWriter } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
+import { reportedMachineName, startInstallContactScheduler, type InstallContactScheduler } from "./install-contact";
 import {
   applyCodexConfig,
   applyCodexHookHeaderFile,
@@ -3753,6 +3754,7 @@ async function main() {
     const timers: NodeJS.Timeout[] = [];
     /** eco-6hoxj.163.34: stopped with the timers; shutdown waits for a write in progress. */
     let statusSummaryWriter: StatusSummaryWriter | null = null;
+    let installContactScheduler: InstallContactScheduler | null = null;
     /** The managed-config reconcile cadence reschedules itself, so it owns one live handle. */
     let managedConfigReconcileTimer: NodeJS.Timeout | undefined;
     let syncInFlight = false;
@@ -4375,6 +4377,7 @@ async function main() {
       enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       const summaryStopped = statusSummaryWriter?.stop() ?? Promise.resolve();
+      installContactScheduler?.stop();
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
       otlpSpool.stopDrain();
@@ -4429,6 +4432,7 @@ async function main() {
       // A summary write in progress finishes (or its temp file is removed)
       // before the process exits.
       const summaryStopped = statusSummaryWriter?.stop() ?? Promise.resolve();
+      installContactScheduler?.stop();
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
       otlpSpool.stopDrain();
@@ -4613,6 +4617,14 @@ async function main() {
         port: config.port,
         stats: server.plimsollCachedStats,
       });
+      if (config.uploadUrl && config.deviceId && config.cloudDeviceId && config.installKey !== "local-dev") {
+        installContactScheduler = startInstallContactScheduler({
+          config,
+          database: buffer.database,
+          appVersion: PLIMSOLL_VERSION,
+          machineName: config.reportMachineName ? reportedMachineName() : undefined,
+        });
+      }
       console.log(
         JSON.stringify({
           status: "active",

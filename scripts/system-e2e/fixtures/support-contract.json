@@ -5,17 +5,17 @@
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:d9e71dd25a2ef2cadca07b211384e7ad4f604296040ba3582256e4fcaebb75f8"
+      "expectedArtifactDigest": "sha256:db222b59ca99be4d39d2c36c5acd8c1e970e87a9a51b233b05dbc9ebe2b8e3d3"
     },
     {
       "name": "transactional_join",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:d955953f962b8aa035d369c1890532cf85f10c76cc683804faa0b2e990f13205"
+      "expectedArtifactDigest": "sha256:ba07bc8dcf536d7d074b29ce12f54ebc6f53c46417de2ffa45918e48e104b0f1"
     },
     {
       "name": "metadata_only_privacy",
       "kind": "line_summary_with_receipt",
-      "expectedArtifactDigest": "sha256:6f00dfdd022faf8705fbde0065cf6ea2889b14fb450612619eed99f7a24cbbfa"
+      "expectedArtifactDigest": "sha256:4887f814fecea2c916a01cb3d3a262411871cc17827afb54dad7836bce638768"
     },
     {
       "name": "canonical_lifecycle",

@@ -1197,6 +1197,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-setup-e2e
 
+      - name: Prove the install heartbeat and machine name exchange (eco-6hoxj.165.98)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:install-contact
+
       - name: Prove join privacy and machine-label review regressions
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-review-regressions
