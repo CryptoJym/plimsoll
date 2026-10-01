@@ -168,20 +168,22 @@ function eventSourceFor(fallback: ToolSource, serviceSource: ToolSource | undefi
 
 function workdirFromRawRecord(record: Record<string, unknown>): string | undefined {
   const rawAttrs = flattenOtelAttributes(record.attributes);
-  const direct = stringField(rawAttrs, ["cwd", "workdir", "working_directory"]);
-  if (direct) return direct;
+  const directWorkdir = stringField(rawAttrs, ["workdir", "working_directory"]);
+  if (directWorkdir) return directWorkdir;
 
   const argumentsBlob = rawAttrs.arguments;
-  if (typeof argumentsBlob === "string" && argumentsBlob.includes("workdir")) {
+  if (typeof argumentsBlob === "string" &&
+      /workdir|working_directory|cwd/.test(argumentsBlob)) {
     try {
       const parsed = asRecord(JSON.parse(argumentsBlob));
-      return stringField(parsed, ["workdir", "cwd", "working_directory"]);
+      const toolCwd = stringField(parsed, ["workdir", "working_directory", "cwd"]);
+      if (toolCwd) return toolCwd;
     } catch {
-      return undefined;
+      // A malformed argument blob cannot hide a valid direct cwd.
     }
   }
 
-  return undefined;
+  return stringField(rawAttrs, ["cwd", "current_working_directory"]);
 }
 
 function looksLikePathOrUrl(value: string) {
