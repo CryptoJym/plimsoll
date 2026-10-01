@@ -59,8 +59,9 @@ async function main() {
     const codexLive = path.join(home, ".codex-profiles/live/sessions");
     const claudeHooks = path.join(home, ".claude-seats/hooks/projects");
     const claudeOtel = path.join(home, ".claude-seats/otel/projects");
+    const claudeRelay = path.join(home, ".claude-seats/relay/projects");
     const gap = path.join(home, ".claude-seats/gap/projects");
-    for (const directory of [registered, codexLive, claudeHooks, claudeOtel, gap, data]) {
+    for (const directory of [registered, codexLive, claudeHooks, claudeOtel, claudeRelay, gap, data]) {
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     }
     fs.writeFileSync(path.join(home, ".codex-profiles/live/config.toml"),
@@ -75,6 +76,12 @@ async function main() {
         OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: `http://127.0.0.1:${port}/v1/logs`,
         OTEL_EXPORTER_OTLP_HEADERS: "x-plimsoll-source=claude_code,x-plimsoll-token=never-print-this-token" },
     }), { mode: 0o600 });
+    // A seat that reports through the fleet's OTLP relay (127.0.0.1:4318) is live.
+    fs.writeFileSync(path.join(home, ".claude-seats/relay/settings.json"), JSON.stringify({
+      env: { CLAUDE_CODE_ENABLE_TELEMETRY: "1", OTEL_LOGS_EXPORTER: "otlp",
+        OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://127.0.0.1:4318/v1/logs",
+        OTEL_EXPORTER_OTLP_HEADERS: "x-plimsoll-source=claude_code,x-plimsoll-token=never-print-this-token" },
+    }), { mode: 0o600 });
     fs.writeFileSync(path.join(home, ".claude-seats/gap/settings.json"), JSON.stringify({
       env: { OTEL_LOGS_EXPORTER: "otlp", OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://127.0.0.1:1/v1/logs" },
     }), { mode: 0o600 });
@@ -83,7 +90,7 @@ async function main() {
       `rollout-2026-09-27T00-00-00-${evidenceSession}.jsonl`),
       `${JSON.stringify({ type: "session_meta", timestamp: "2026-09-27T00:00:00.000Z",
         payload: { id: evidenceSession, originator: "codex_exec" } })}\n`, { mode: 0o600 });
-    for (const directory of [claudeHooks, claudeOtel, gap])
+    for (const directory of [claudeHooks, claudeOtel, claudeRelay, gap])
       fs.writeFileSync(path.join(directory, `${evidenceSession}.jsonl`),
         '{"type":"user","message":{}}\n', { mode: 0o600 });
 
@@ -114,10 +121,10 @@ async function main() {
       return { code: result.status, payload, stderr: result.stderr };
     };
     const discovered = run(["capture-roots", "discover", "--json"]);
-    check("discover_separates_three_live_paths_from_one_gap",
+    check("discover_separates_four_live_paths_from_one_gap",
       discovered.code === 0 && discovered.payload.counts?.candidate === 1 &&
-      discovered.payload.counts?.liveCovered === 3 &&
-      discovered.payload.liveCovered?.length === 3 &&
+      discovered.payload.counts?.liveCovered === 4 &&
+      discovered.payload.liveCovered?.length === 4 &&
       discovered.payload.roots?.filter((entry: any) => entry.state === "candidate").length === 1 &&
       discovered.payload.roots?.some((entry: any) => entry.directory === ".claude-seats/gap/projects"),
       discovered.payload);
@@ -129,6 +136,8 @@ async function main() {
         entry.evidence.includes("hooks.Stop.hooks.url")) &&
       live.some((entry) => entry.directory === ".claude-seats/otel/projects" &&
         entry.evidence.includes("env.OTEL_EXPORTER_OTLP_HEADERS")) &&
+      live.some((entry) => entry.directory === ".claude-seats/relay/projects" &&
+        entry.evidence.includes("env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")) &&
       !JSON.stringify(live).includes("never-print-this-token") &&
       !JSON.stringify(live).includes(`127.0.0.1:${port}`), live);
 
@@ -147,7 +156,7 @@ async function main() {
     const after = run(["capture-roots", "discover", "--json"]);
     check("enrolled_live_home_moves_to_registered_without_new_gap",
       after.code === 0 && after.payload.counts?.registered === 2 &&
-      after.payload.counts?.liveCovered === 2 && after.payload.counts?.candidate === 1,
+      after.payload.counts?.liveCovered === 3 && after.payload.counts?.candidate === 1,
       after.payload.counts);
     // Use the root written by add, the existing ledger, and the 0.7.42
     // rollout tailer. The unchanged pairing proofs below cover the two OTLP
