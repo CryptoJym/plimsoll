@@ -3644,6 +3644,7 @@ async function main() {
       detectedIdentities = [];
     }
     let refreshStatusSnapshot: (failure?: "maintenance_failed") => boolean = () => false;
+    let markMaintenanceSuccess: () => void = () => {};
     let retentionCadence: AutomaticRetentionCadence | undefined;
     // The starvation census counts two queue tables (~280k pending links on
     // the Studio0 ledger, ~0.8 s cold), so it runs on a read-only worker
@@ -3740,7 +3741,8 @@ async function main() {
       }),
       detectedIdentities: () => detectedIdentities,
       outcomePerformance: (days, asOf) => outcomeTimelineStore.performanceSummary(days, asOf),
-      registerStatusRefresher: (refresh) => {
+      registerStatusRefresher: (refresh, acknowledgeMaintenanceSuccess) => {
+        markMaintenanceSuccess = acknowledgeMaintenanceSuccess;
         refreshStatusSnapshot = (failure) => {
           cachedStarvationReceipt = readStarvationReceipt();
           refreshStarvationCensus();
@@ -4160,6 +4162,7 @@ async function main() {
         // Keep the last coherent parent snapshot; the child receipt remains
         // authoritative for whether this generation completed.
       }
+      markMaintenanceSuccess();
       refreshStatusSnapshot();
       const { rollout, transcript, reconciliation, repricing, enrichment } = result;
       if (rollout.eventsAppended > 0 || rollout.parseErrors > 0) {

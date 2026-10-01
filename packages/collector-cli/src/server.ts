@@ -697,8 +697,11 @@ export function createCollectorServer(
     outcomePerformance?: (days: number, asOf: string) => Record<string, unknown>;
     /** Existing local Jev receipts; read only, with no model or network call. */
     jevDatabasePath?: string;
-    /** Registers a refresh callable for startup/child-receipt points only. */
-    registerStatusRefresher?: (refresh: (failure?: "maintenance_failed") => boolean) => void;
+    /** Registers refresh and explicit successful-maintenance callbacks. */
+    registerStatusRefresher?: (
+      refresh: (failure?: "maintenance_failed") => boolean,
+      markMaintenanceSuccess: () => void,
+    ) => void;
     /**
      * Refreshes the cached /status snapshot independently of maintenance.
      * Maintenance failures remain visible as `last_coherent`, while the cache
@@ -1212,7 +1215,7 @@ export function createCollectorServer(
         "label account <sha256:hash> remains a local-only display label; it never changes assertions or history",
     });
     const cacheAge = evidenceAge(lastCoherentStatus?.cachedAt);
-    const invalidReason = refreshControl ? null : lastStatusRefreshError ??
+    const invalidReason = refreshControl ? null : statusFailureReason() ??
       (cacheAge === null || cacheAge > STATUS_MAX_AGE_MS ? "status_cache_expired" : null);
     if (invalidReason) {
       invalidateStatus(status, invalidReason);
@@ -1237,9 +1240,11 @@ export function createCollectorServer(
     generation: number | null;
     cachedAt: string;
   } | null = null;
-  let lastStatusRefreshError: "database_busy" | "status_refresh_failed" | "maintenance_failed" | null = null;
+  let lastStatusRefreshError: "database_busy" | "status_refresh_failed" | null = null;
+  let maintenanceFailureLatched = false;
   let lastGoodAt: string | null = null;
   const statusRefreshCounters = { attempts: 0, failures: 0, expiredResponses: 0 };
+  const statusFailureReason = () => maintenanceFailureLatched ? "maintenance_failed" as const : lastStatusRefreshError;
   const currentStatus = () => {
     const read = snapshotResponse(30, true);
     if (read.kind === "ready") {
@@ -1325,10 +1330,11 @@ export function createCollectorServer(
   // through to the bounded minimal status below rather than waiting seconds.
   const refreshStatus = (failure?: "maintenance_failed") => {
     statusRefreshCounters.attempts += 1;
+    if (failure === "maintenance_failed") maintenanceFailureLatched = true;
     try {
       currentStatus();
       if (lastCoherentStatus) lastCoherentStatus.body.repairService = automaticRepairServiceStatus(buffer.database);
-      lastStatusRefreshError = failure ?? null;
+      lastStatusRefreshError = null;
       if (failure) statusRefreshCounters.failures += 1;
       else if (lastCoherentStatus &&
           (lastCoherentStatus.body.projection as { parityReady?: boolean })?.parityReady === true) {
@@ -1346,12 +1352,34 @@ export function createCollectorServer(
       return false;
     }
   };
+  // The heartbeat only republishes the existing coherent snapshot. It never
+  // reruns projection, pending-summary, dashboard, or outcome queries on the
+  // intake event loop; full reads remain tied to startup and maintenance.
+  const refreshStatusHeartbeat = () => {
+    statusRefreshCounters.attempts += 1;
+    try {
+      if (!lastCoherentStatus) return refreshStatus();
+      lastCoherentStatus = {
+        ...lastCoherentStatus,
+        cachedAt: new Date(Date.now()).toISOString(),
+      };
+      lastStatusRefreshError = null;
+      return true;
+    } catch {
+      statusRefreshCounters.failures += 1;
+      lastStatusRefreshError = "status_refresh_failed";
+      return false;
+    }
+  };
+  const markMaintenanceSuccess = () => {
+    maintenanceFailureLatched = false;
+  };
   const stopRetentionHoldRefresh = buffer.onRetentionHoldCountChanged(() => { refreshStatus(); });
   refreshStatus();
-  options.registerStatusRefresher?.(refreshStatus);
+  options.registerStatusRefresher?.(refreshStatus, markMaintenanceSuccess);
   const statusRefreshIntervalMs = options.statusRefreshIntervalMs ?? STATUS_SUMMARY_INTERVAL_MS;
   const statusRefreshTimer = setInterval(() => {
-    refreshStatus(lastStatusRefreshError === "maintenance_failed" ? "maintenance_failed" : undefined);
+    refreshStatusHeartbeat();
   }, statusRefreshIntervalMs);
   statusRefreshTimer.unref();
 
@@ -1423,14 +1451,14 @@ export function createCollectorServer(
           const cached = lastCoherentStatus;
           const ageMs = evidenceAge(cached?.cachedAt);
           const expired = cached !== null && (ageMs === null || ageMs > STATUS_MAX_AGE_MS);
-          const invalidReason = lastStatusRefreshError ?? (expired ? "status_cache_expired" : null);
+          const invalidReason = statusFailureReason() ?? (expired ? "status_cache_expired" : null);
           if (expired) statusRefreshCounters.expiredResponses += 1;
           const body: Record<string, unknown> = cached
             ? {
                 ...cached.body,
                 maintenance: options.maintenanceStatus?.() ?? null,
                 statusFreshness: {
-                  state: expired ? "expired" : lastStatusRefreshError ? "last_coherent" : "coherent",
+                  state: expired ? "expired" : statusFailureReason() ? "last_coherent" : "coherent",
                   reason: invalidReason,
                   lastGoodAt,
                   maxAgeMs: STATUS_MAX_AGE_MS,
@@ -1500,7 +1528,7 @@ export function createCollectorServer(
             },
             statusFreshness: {
               state: "unavailable",
-              reason: lastStatusRefreshError ?? "coherent_snapshot_not_established",
+              reason: statusFailureReason() ?? "coherent_snapshot_not_established",
               cachedAt: null,
               lastGoodAt,
               maxAgeMs: STATUS_MAX_AGE_MS,
