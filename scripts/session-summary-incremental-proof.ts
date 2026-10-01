@@ -119,14 +119,14 @@ function insertRaw(
   );
 }
 
-function expectedSessions(buffer: LocalEventBuffer, sessionIds: string[]) {
-  return collectSessionSnapshots(buffer.database, { until, sessionIds })
+function expectedSessions(buffer: LocalEventBuffer, sessionIds: string[], horizon = until) {
+  return collectSessionSnapshots(buffer.database, { until: horizon, sessionIds })
     .map(buildSessionSyncRow)
     .flatMap((row) => row.ok ? [row.row] : [])
     .sort((a, b) => a.session.id.localeCompare(b.session.id));
 }
 
-async function runIncremental(buffer: LocalEventBuffer, sessionIds: string[]) {
+async function runIncremental(buffer: LocalEventBuffer, sessionIds: string[], horizon = until) {
   let fullRecomputes = 0;
   let rowsRead = 0;
   let elapsedMs = 0;
@@ -148,7 +148,7 @@ async function runIncremental(buffer: LocalEventBuffer, sessionIds: string[]) {
       ledgerDb: buffer.database,
       incremental: true,
       sessionIds,
-      until,
+      until: horizon,
       fetchImpl,
       sleep: async () => undefined,
       delayMs: 0,
@@ -400,9 +400,12 @@ async function runLeaseSafeIntakeCase() {
   let spooled = 0;
   let erasure = "not_attempted";
   const intakeRowsVisible: number[] = [];
+  // Intake rows are stamped with the wall clock, so this case needs a horizon after now; the
+  // fixed `until` made it pass only before 2026-10-01T00:00Z.
+  const leaseUntil = new Date(Date.now() + 3_600_000).toISOString();
   try {
     const first = await runSessionSync(config, {
-      ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+      ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until: leaseUntil,
       delayMs: 0, maxAttemptsPerBatch: 1,
       fetchImpl: (async (_input, init) => {
         firstBody = String(init?.body ?? "");
@@ -456,10 +459,10 @@ async function runLeaseSafeIntakeCase() {
     assert.equal(first.ok, false, JSON.stringify(first));
     assert.ok(first.pendingSummarySessionIds.includes(sessionId), JSON.stringify(first));
     assert.equal(external.prepare("delete from buffered_events where id = ?").run(originalId).changes, 1);
-    const second = await runIncremental(buffer, [sessionId]);
+    const second = await runIncremental(buffer, [sessionId], leaseUntil);
     assert.equal(second.result.ok, true, JSON.stringify(second.result));
     assert.equal(second.sent[0]?.totals.events, 3);
-    compareExact(buffer, [sessionId], second.sent);
+    compareExact(buffer, [sessionId], second.sent, leaseUntil);
     return { spooled, intakeRowsVisible, erasure,
       firstBodyEvents: 1, nextBodyEvents: second.sent[0]?.totals.events };
   } finally {
@@ -659,13 +662,13 @@ async function runStaleBeforePostCase() {
   }
 }
 
-function compareExact(buffer: LocalEventBuffer, sessionIds: string[], sent: unknown[]) {
+function compareExact(buffer: LocalEventBuffer, sessionIds: string[], sent: unknown[], horizon = until) {
   assert.deepEqual(
     sent.slice().sort((a, b) =>
       (a as { session: { id: string } }).session.id.localeCompare(
         (b as { session: { id: string } }).session.id,
       )),
-    expectedSessions(buffer, sessionIds),
+    expectedSessions(buffer, sessionIds, horizon),
   );
 }
 
