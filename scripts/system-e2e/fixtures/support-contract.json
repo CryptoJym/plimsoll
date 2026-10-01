@@ -5,7 +5,7 @@
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:d9e71dd25a2ef2cadca07b211384e7ad4f604296040ba3582256e4fcaebb75f8"
+      "expectedArtifactDigest": "sha256:db222b59ca99be4d39d2c36c5acd8c1e970e87a9a51b233b05dbc9ebe2b8e3d3"
     },
     {
       "name": "transactional_join",

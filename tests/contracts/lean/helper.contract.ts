@@ -135,7 +135,7 @@ test("helper guard (round 4): join.ts activation completes on today's code with 
     }) as typeof fetch);
     const result = await join.performJoin({ target: "https://cloud.example#pljt_lean-contract-token", homeDir, reassign: true, fetchImpl: cloud, temporaryRoot: path.join(homeDir, "handshake-tmp") });
     assert.equal(result.joined, true, JSON.stringify(result));
-    assert.deepEqual(requests, ["/api/work-intelligence/join", "/api/work-intelligence/ingest"], "the token is redeemed, then the one-event handshake runs");
+    assert.deepEqual(requests, ["/api/work-intelligence/join", "/api/work-intelligence/install-contact"], "the token is redeemed, then the non-event contact handshake runs");
     const activated = config.collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
     assert.deepEqual([activated.cloudDeviceId, activated.installKey], [INSTALL_Z, "pli_new_install_key_z"], "the grant replaced the hosted credential set");
     const ledger = new LocalEventBuffer(config.collectorBufferPath(homeDir));

@@ -8,6 +8,8 @@ export function acknowledgingFetch(impl: typeof fetch): typeof fetch {
   return async (input, init) => {
     const response = await impl(input, init);
     if (!response.ok) return response;
+    const requestedUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (new URL(requestedUrl).pathname.endsWith("/install-contact")) return response;
     const body = await response.clone().json().catch(() => null);
     if (!body || typeof body !== "object" || typeof body.accepted !== "number" || body.ack !== undefined) return response;
     const rawBody = String(init?.body ?? "");

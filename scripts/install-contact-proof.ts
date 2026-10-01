@@ -96,7 +96,7 @@ async function main() {
     const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
     const joined = await performJoin({
       target: "pljt_contact_fixture", baseUrl: CLOUD, homeDir: path.join(root, "join-home"),
-      temporaryRoot: path.join(root, "join-tmp"), appVersion: "0.7.46",
+      temporaryRoot: path.join(root, "join-tmp"), appVersion: "0.7.46", reassign: true,
       fetchImpl: async (input, init) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
