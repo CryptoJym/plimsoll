@@ -1,0 +1,21 @@
+{
+  "schema": "plimsoll-review-packet/v1",
+  "verdict": "approve",
+  "repository": "CryptoJym/plimsoll",
+  "pullNumber": 437,
+  "headSha": "c8b37a43e3d62a5341fb7d7940ba1be108580e20",
+  "reviewedAt": "2026-10-01T02:12:00Z",
+  "reviewer": {
+    "runtime": "codex",
+    "session": "01a0f531-0a0b-7130-8bb2-88d5cf6a07e4",
+    "model": "gpt-6-sol",
+    "host": "jamess-macbook-pro-2"
+  },
+  "authors": [
+    {
+      "runtime": "claude",
+      "session": "f4023139-6838-412e-a325-7fdbdcf61a0a"
+    }
+  ],
+  "summary": "PR #437 (the pending-summary check reads the queue, not every event; stops per-pass full re-sends on large ledgers). Review r1 (studio6, thread 01a0f4ca) found no product-code issue: the old query ran the bounded predicate 400,003 times against 3 for the new one on a 400,005-event fixture, the ID sets were identical, and the new proof case catches the old join. Its one P1 was the expired fixed horizon in proof:session-summary-incremental, fixed on main by #438. Review r2 (MacBook, thread 01a0f531) APPROVEs c8b37a43, a clean merge of main c67a50c9 whose diffs equal #438 and #437 byte for byte. After the old cutoff: session-summary-incremental 34/34, pending-review 4/4, dispatch-binding 18/18."
+}
