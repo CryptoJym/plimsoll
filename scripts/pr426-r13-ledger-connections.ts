@@ -6,6 +6,7 @@ import path from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { openLedgerDatabase } from "../packages/collector-cli/src/ledger-connection";
 import { SqliteLedgerSnapshotAdapter } from "../packages/collector-cli/src/lifecycle-adapters";
 import { LifecycleRestoreRefusal } from "../packages/collector-cli/src/lifecycle";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
@@ -244,10 +245,11 @@ async function main(variant: string) {
       assert.deepEqual(persistentDiagnostic, { stage: "archive_handle_probe", attempts: 3,
         exitStatus: 1, signal: null, stderr: true, errorCode: null });
       assert.equal(fs.statSync(ledger).ino, beforeRestore, "unknown archive handles cannot change live inode");
-      // An ordinary open (the daemon's startup path) keeps main's single probe:
+      // An ordinary open (the daemon's startup opener) keeps main's single probe:
       // one inconclusive answer refuses at once instead of spending the startup budget.
       const ordinary = await withArchiveLsofFault(archive, 1, async () => {
-        assert.throws(() => new LocalEventBuffer(ledger, options));
+        assert.throws(() => openLedgerDatabase(ledger, { fileMustExist: true, timeout: 0 }),
+          (error: unknown) => (error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID");
       });
       assert.deepEqual(ordinary, { calls: 1, injected: 1 }, "an ordinary open does not retry the archive probe");
       assert.equal(fs.statSync(ledger).ino, beforeRestore, "a refused ordinary open changes nothing");
