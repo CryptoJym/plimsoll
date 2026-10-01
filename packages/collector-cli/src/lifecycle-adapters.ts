@@ -39,6 +39,7 @@ import {
 import {
   LIFECYCLE_SCHEMA_VERSION,
   LifecycleRestoreRefusal,
+  type LifecycleRestoreDiagnostic,
   LifecycleSnapshotRefusal,
   snapshotHeadroomBytes,
   validateRuntimeArtifact,
@@ -1046,11 +1047,17 @@ function lockLiveLedger(destination: string, openHandles: OpenHandleCheck): Live
   try {
     connection = openExclusive(destination);
   } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    const nested = (error as { cause?: { code?: unknown; diagnostic?: LifecycleRestoreDiagnostic } }).cause;
+    const diagnostic = nested?.code === "LEDGER_ARCHIVE_HANDLE_UNPROVEN" &&
+      nested.diagnostic?.stage === "archive_handle_probe" ? nested.diagnostic
+      : { stage: "open_exclusive" as const,
+        errorCode: typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : null };
     throw new LifecycleRestoreRefusal({
       reason: sqliteBusy(error) ? "ledger_in_use" : "quiescence_unproven",
       requiredFreeBytes: null,
       freeBytes: null,
-    });
+    }, diagnostic);
   }
   let descriptor: number | null = null;
   try {
