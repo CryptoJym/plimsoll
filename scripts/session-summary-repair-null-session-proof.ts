@@ -187,11 +187,6 @@ async function main() {
   }
   const buffer = await makeLedger("null-session-repair");
   try {
-    const trigger = buffer.database.prepare(
-      "select sql from sqlite_master where type='trigger' and name='trg_session_summary_repair_update_old_v1'",
-    ).get() as { sql: string } | undefined;
-    assert.ok(trigger?.sql, "the additive repair trigger must exist");
-    assert.match(trigger.sql, /when\s+\(/i);
     let failure: unknown = null;
     try {
       runRepricingMaintenance(buffer.database);
@@ -207,6 +202,11 @@ async function main() {
     assert.equal(orphan.cost_kind, "estimated");
     const repairs = buffer.database.prepare("select session_id from session_sync_summary_repairs").all() as Array<{ session_id: string | null }>;
     assert.ok(repairs.every((row) => row.session_id !== null));
+    const trigger = buffer.database.prepare(
+      "select sql from sqlite_master where type='trigger' and name='trg_session_summary_repair_update_old_v1'",
+    ).get() as { sql: string } | undefined;
+    assert.ok(trigger?.sql, "the additive repair trigger must exist");
+    assert.match(trigger.sql, /when\s+\(/i);
     completion.check("repricing_orphan_usage_row_never_inserts_null_repair_key");
   } finally {
     buffer.close();
