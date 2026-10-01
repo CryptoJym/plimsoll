@@ -108,22 +108,22 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
         let archiveClear = false;
         let diagnostic: { stage: "archive_handle_probe"; attempts: number; exitStatus: number | null;
           signal: string | null; stderr: boolean; errorCode: string | null } | null = null;
-        // A runner can give one inconclusive lsof result (for example, a
-        // timed-out stat). Retry only that uncertainty, never a foreign PID.
-        // Lifecycle mutations retain three 10-second probes. Startup admission
-        // has at most 3 * 3 seconds + 2 * 100 ms = 9.2 seconds, clipped further
-        // to its existing deadline so recovery never starts a new retry budget.
-        // Ordinary opens still have exactly one 10-second probe.
+        // Startup gives each probe its whole remaining deadline, preserving a
+        // slow but conclusive first probe. Only quick uncertainty is retried:
+        // at most one second spent, with more than one second still available.
+        // Startup timeouts never retry; foreign PIDs always refuse immediately.
+        // Lifecycle mutations retain three 10-second probes; ordinary opens one.
         const probeAttempts = intentionalRename || startupDeadlineMs !== undefined ? 3 : 1;
         for (let attempt = 0; attempt < probeAttempts; attempt += 1) {
-          const remainingMs = startupDeadlineMs === undefined ? 10_000
-            : Math.floor(startupDeadlineMs - performance.now());
-          if (remainingMs <= 0) break;
           const oldFiles = [publication.marker.archivePath, `${publication.marker.archivePath}-wal`,
             `${publication.marker.archivePath}-shm`].filter(name => files.existsSync(name));
           if (!oldFiles.includes(publication.marker.archivePath)) throw new Error("replacement archive is missing");
+          const probeStarted = performance.now();
+          const remainingMs = startupDeadlineMs === undefined ? 10_000
+            : Math.floor(startupDeadlineMs - probeStarted);
+          if (remainingMs <= 0) break;
           const handles = children.spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...oldFiles],
-            { encoding: "utf8", timeout: Math.min(remainingMs, startupDeadlineMs === undefined ? 10_000 : 3_000),
+            { encoding: "utf8", timeout: remainingMs,
               ...(startupDeadlineMs === undefined ? {} : { killSignal: "SIGKILL" as const }), maxBuffer: 1024 * 1024,
               env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"] });
           const lines = (handles.stdout ?? "").trim().split(/\s+/).filter(Boolean);
@@ -145,7 +145,11 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
             stderr: Boolean((handles.stderr ?? "").trim()),
             errorCode: typeof code === "string" ? (PROBE_ERROR_CODES.has(code) ? code : "OTHER") : null };
           if (attempt < probeAttempts - 1) {
-            if (startupDeadlineMs !== undefined && startupDeadlineMs - performance.now() <= 100) break;
+            if (startupDeadlineMs !== undefined) {
+              const finished = performance.now();
+              if (code === "ETIMEDOUT" || finished - probeStarted > 1_000 ||
+                  startupDeadlineMs - finished <= 1_000) break;
+            }
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
           }
         }

@@ -71,7 +71,8 @@ async function withArchiveLsofFault(archive: string, failures: number, action: (
 // Fault only the admission probe. Recovery's separate check of both live and
 // archived files still runs real lsof before it is allowed to restore.
 function withStartupProbeFault(ledger: string, archive: string, failures: number,
-  action: () => void, consumeTimeout = false) {
+  action: () => void, behavior: { consumeTimeout?: boolean; delayMs?: number;
+    delayAfterFailures?: boolean; errorCode?: string } = {}) {
   const children = require("node:child_process") as { spawnSync: typeof spawnSync };
   const nativeSpawnSync = children.spawnSync;
   let calls = 0, recoveryCalls = 0;
@@ -85,11 +86,17 @@ function withStartupProbeFault(ledger: string, archive: string, failures: number
         const timeout = (args[2] as { timeout: number }).timeout;
         timeouts.push(timeout);
         starts.push(performance.now());
-        if (calls <= failures) {
-          if (consumeTimeout) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, timeout);
+        const delayMs = behavior.consumeTimeout ? timeout
+          : behavior.delayAfterFailures && calls <= failures ? 0 : behavior.delayMs ?? 0;
+        // The review's slow-lsof model: honor the supplied timeout, and run
+        // real lsof if the delayed process would have survived that timeout.
+        if (delayMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(delayMs, timeout));
+        const timedOut = behavior.consumeTimeout || delayMs > timeout;
+        if (calls <= failures || timedOut) {
           ends.push(performance.now());
           return { status: null, signal: null, stdout: "", stderr: "fixture private path/account/ledger details",
-            error: { code: "EPRIVATE_ACCOUNT_LEDGER" }, pid: process.pid, output: [null, "", ""] };
+            error: { code: timedOut ? "ETIMEDOUT" : behavior.errorCode ?? "EPRIVATE_ACCOUNT_LEDGER" },
+            pid: process.pid, output: [null, "", ""] };
         }
         const result = Reflect.apply(nativeSpawnSync, children, args);
         ends.push(performance.now());
@@ -105,6 +112,7 @@ function withStartupProbeFault(ledger: string, archive: string, failures: number
 }
 
 const startupProbeCases = ["transient", "two-transient", "persistent", "budget", "deadline",
+  "slow", "stuck", "slow-after-transient", "fast-timeout", "slow-inconclusive", "near-deadline",
   "foreign-unused", "foreign-used", "foreign-after-transient", "ordinary"];
 
 async function workerProbeChecks(ledger: string) {
@@ -264,9 +272,9 @@ async function main(variant: string) {
         await waitFor(() => fs.existsSync(path.join(fixture, "raw-ready")), "real foreign archive connection is open");
       }
       const failures = test === "two-transient" ? 2
-        : ["persistent", "budget", "deadline"].includes(test) ? Infinity
-        : test === "foreign-used" || test === "foreign-unused" ? 0 : 1;
-      const deadline = performance.now() + (test === "deadline" ? 250 : 10_000);
+        : ["persistent", "budget", "deadline", "fast-timeout", "slow-inconclusive", "near-deadline"].includes(test) ? Infinity
+        : ["foreign-used", "foreign-unused", "slow", "stuck"].includes(test) ? 0 : 1;
+      const deadline = performance.now() + (test === "deadline" ? 250 : test === "near-deadline" ? 750 : 10_000);
       let refusal: (Error & { code?: string; cause?: { code?: string; diagnostic?: unknown } }) | undefined;
       const probes = withStartupProbeFault(ledger, archive, failures, () => {
         try {
@@ -279,11 +287,15 @@ async function main(variant: string) {
             } finally { started.close(); }
           }
         } catch (error) { refusal = error as typeof refusal; }
-      }, test === "budget" || test === "deadline");
+      }, { consumeTimeout: test === "budget" || test === "deadline",
+        delayMs: test === "slow" || test === "slow-after-transient" ? 4_500
+          : test === "stuck" ? 12_000 : test === "slow-inconclusive" ? 1_500 : 0,
+        delayAfterFailures: test === "slow-after-transient",
+        errorCode: test === "fast-timeout" ? "ETIMEDOUT" : undefined });
       const lock = acquireLedgerConnectionLock(ledger, "exclusive");
       let receipt;
       try { receipt = readLedgerPublication(lock)!; } finally { lock.release(); }
-      if (test === "transient" || test === "two-transient") {
+      if (["transient", "two-transient", "slow", "slow-after-transient"].includes(test)) {
         assert.equal(refusal, undefined, "a transient startup probe must start on the fresh ledger without restoring");
         assert.equal(probes.calls, failures + 1);
         assert.equal(probes.recoveryCalls, 0);
@@ -321,7 +333,7 @@ async function main(variant: string) {
         }
       } else {
         assert.match(String(refusal), /replacement_verification_failed; archive restored; collector start refused/);
-        assert.equal(probes.calls, test === "deadline" ? 1 : 3, "startup admission attempts are bounded");
+        assert.equal(probes.calls, test === "persistent" ? 3 : 1, "only fast inconclusive probes are retried");
         assert.equal(receipt.state, "restored");
         assert.ok(receipt.freshAttemptPath);
         assert.equal(fs.statSync(receipt.freshAttemptPath).ino, freshInode);
@@ -334,11 +346,17 @@ async function main(variant: string) {
         } finally { restored.close(); }
         const diagnostic = (refusal?.cause as { cause?: { diagnostic?: unknown } })?.cause?.diagnostic;
         assert.deepEqual(diagnostic, { stage: "archive_handle_probe", attempts: probes.calls,
-          exitStatus: null, signal: null, stderr: true, errorCode: "OTHER" }, "diagnostics contain only allowlisted values");
+          exitStatus: null, signal: null, stderr: true,
+          errorCode: ["budget", "deadline", "stuck", "fast-timeout"].includes(test) ? "ETIMEDOUT" : "OTHER" },
+        "diagnostics contain only allowlisted values");
       }
       if (test !== "ordinary") {
-        assert.ok(probes.timeouts.every(timeout => timeout > 0 && timeout <= 3_000));
-        assert.ok(probes.timeouts.reduce((sum, timeout) => sum + timeout, 0) + (probes.calls - 1) * 100 <= 9_200);
+        for (let i = 0; i < probes.calls; i += 1) {
+          assert.ok(probes.timeouts[i]! > 0 && probes.timeouts[i]! <= 10_000);
+          // Every probe gets the whole remaining deadline, never a new budget
+          // or a shorter per-attempt cap. Allow only call/setup rounding here.
+          assert.ok(Math.abs(probes.timeouts[i]! - (deadline - probes.starts[i]!)) < 20);
+        }
         for (let i = 1; i < probes.calls; i += 1) assert.ok(probes.starts[i]! - probes.ends[i - 1]! >= 90);
         if (test === "deadline") assert.ok(probes.timeouts[0]! <= 250, "remaining startup budget caps lsof timeout");
       }
