@@ -348,6 +348,8 @@ function verifyMeasurements(
   assert.equal(integer(firstBoot.replayTranscriptFilesRead, "replay transcript reads"), 1);
   assert.equal(integer(firstBoot.replayEventsAppended, "replay appended events"), 0);
   assert.equal(integer(firstBoot.replayRawEventWrites, "replay raw event writes"), 0);
+  assert.equal(integer(firstBoot.sqliteWritesDuringIdle, "idle SQLite writes"), 0);
+  assert.equal(integer(firstBoot.walBytesDeltaDuringIdle, "idle WAL byte delta"), 0);
   assert.equal(integer(firstBoot.replayEventMutationsInserted, "replay inserted mutations"), 0);
   assert.ok(integer(firstBoot.baselineCodexGenerations, "baseline Codex generations") >= 200);
   assert.ok(integer(firstBoot.baselineClaudeGenerations, "baseline Claude generations") >= 1_200);
@@ -381,7 +383,9 @@ function verifyMeasurements(
     "maintenance regression measurements",
   );
   assert.equal(integer(maintenance.exitCode, "maintenance proof exit code"), 0);
-  assert.ok(integer(maintenance.checks, "maintenance proof checks") >= 20);
+  // Support normalization v14 (contract.ts) stores the check count as a growth marker. It does so only
+  // after assertResourceReceipt and normalizeSupportingArtifact have each asserted the raw count is >= 20.
+  assert.equal(maintenance.checks, "<growth-count>", "maintenance proof checks must carry the v14 growth marker");
   assert.equal(maintenance.exactPendingIdentityProved, true);
   assert.equal(maintenance.stalledCadenceBackoffProved, true);
   const ownershipScenario = resourceScenarios

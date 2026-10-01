@@ -6,11 +6,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+
 import {
   canonicalBytes,
   digest,
   exactKeys,
   loadSupportContract,
+  hasRequiredMaintenanceChecks,
+  hasRequiredSchemaTables,
+  REQUIRED_MAINTENANCE_CHECKS,
   normalizeSupportingArtifact,
   parseSupportingArtifact,
   supportContractPath,
@@ -83,20 +88,92 @@ assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), prev
 assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), currentInstallationEpochId: "invalid" }), /workspace epoch identity invalid/);
 assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), previousWorkspaceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), /previous workspace binding changed/);
 
-// The real-clock boot may add or skip a few metadata calls. Keep a narrow
-// envelope while preserving the exact stable directory topology checks.
+// A module may add bounded metadata work without changing the idle behavior.
+// The checked-in 20866273 baseline is 24,640 calls.
 const metadataArtifact = (count: number) => ({
   scenarios: [{ id: "no_change_constant_work", measurements: { filesystemMetadataOperations: count } }],
 });
 const metadataContext = { baseDirectory: repoRoot, roots: [] };
-for (const inside of [24_649, 24_650, 24_657, 24_664, 24_665]) {
+for (const inside of [12_320, 24_640, 24_752, 27_104]) {
   assert.deepEqual(normalizeSupportingArtifact(metadataArtifact(inside), metadataContext),
-    normalizeSupportingArtifact(metadataArtifact(24_657), metadataContext));
+    normalizeSupportingArtifact(metadataArtifact(24_640), metadataContext));
 }
-for (const outside of [24_648, 24_666, 24_673]) {
+for (const outside of [12_319, 27_105, 246_400]) {
   assert.throws(() => normalizeSupportingArtifact(metadataArtifact(outside), metadataContext),
-    /bounded metadata-call envelope/);
+    /bounded metadata-call ratio/);
 }
+
+// Required tables are pinned by name, while additive tables and inventory
+// counts do not move the resource digest.
+const tableNames = (() => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-required-table-proof-"));
+  try {
+    const buffer = new LocalEventBuffer(path.join(root, "table-list.sqlite"));
+    try {
+      return (buffer.database.prepare("select name from sqlite_master where type = 'table' order by name")
+        .all() as Array<{ name: string }>).map((row) => row.name);
+    } finally {
+      buffer.close();
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+})();
+const tableArtifact = (count: number) => ({
+  scenarios: [{ id: "temporary_empty_ledger", measurements: {
+    expectedSchemaPresent: true, schemaTables: count,
+  } }],
+});
+const addedTableNames = [...tableNames, "zz_new_module_table"].sort();
+assert.equal(hasRequiredSchemaTables(tableNames), true);
+assert.equal(hasRequiredSchemaTables(addedTableNames), true);
+assert.equal(hasRequiredSchemaTables(tableNames.slice(1)), false);
+assert.deepEqual(normalizeSupportingArtifact(tableArtifact(tableNames.length), metadataContext),
+  normalizeSupportingArtifact(tableArtifact(addedTableNames.length), metadataContext));
+
+const buildArtifact = (addedFiles: number) => ({ scenarios: [{
+  id: "duplicate_start_single_owner", measurements: {
+    runtimeDependencyManifestExact: true,
+    packagedOutputFixtureManifestExact: true,
+    runtimeDependencyManifestEntryCount: 30 + addedFiles,
+    runtimeDependencyFileCount: 22 + addedFiles,
+    fixtureManifestEntryCountBeforeBuild: 3065 + addedFiles,
+    fixtureManifestEntryCountAfterBuild: 3098 + addedFiles,
+  },
+}] });
+assert.deepEqual(normalizeSupportingArtifact(buildArtifact(0), metadataContext),
+  normalizeSupportingArtifact(buildArtifact(1), metadataContext));
+
+const architectureArtifact = (addedBytes: number) => ({ scenarios: [{
+  id: "architecture_contract", measurements: {
+    adrBytes: 26_190 + addedBytes,
+    budgetBytes: 22_828 + addedBytes,
+    requiredSections: 16,
+    missingSections: 0,
+  },
+}] });
+assert.deepEqual(normalizeSupportingArtifact(architectureArtifact(0), metadataContext),
+  normalizeSupportingArtifact(architectureArtifact(50), metadataContext));
+
+const maintenanceArtifact = (addedChecks: number) => ({ scenarios: [{
+  id: "maintenance_regression_proof", measurements: {
+    exitCode: 0,
+    checks: 37 + addedChecks,
+    stdoutBytes: 2498 + addedChecks * 80,
+    stderrBytes: 0,
+  },
+}] });
+assert.deepEqual(normalizeSupportingArtifact(maintenanceArtifact(0), metadataContext),
+  normalizeSupportingArtifact(maintenanceArtifact(1), metadataContext));
+
+// The count may grow, but dropping a baseline assertion must fail the resource
+// wrapper before its receipt can reach normalization.
+assert.equal(REQUIRED_MAINTENANCE_CHECKS.length, 37);
+assert.equal(hasRequiredMaintenanceChecks(REQUIRED_MAINTENANCE_CHECKS), true);
+assert.equal(hasRequiredMaintenanceChecks([...REQUIRED_MAINTENANCE_CHECKS, "zz_new_assertion"]), true);
+assert.equal(hasRequiredMaintenanceChecks(REQUIRED_MAINTENANCE_CHECKS.filter(
+  (name) => name !== "integrated_unchanged_cycle_has_zero_parse_write_and_row_visits",
+)), false);
 
 type ActualChildVariant = {
   artifact: unknown;
