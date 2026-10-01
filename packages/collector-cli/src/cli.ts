@@ -8334,8 +8334,15 @@ async function main() {
 }
 
 main().catch((error) => {
+  if (error?.code === "LEDGER_PUBLICATION_INVALID" && error.cause?.code === "LEDGER_ARCHIVE_HANDLE_IN_USE") {
+    // The internal error carries a private recovery path. Known foreign handles
+    // refuse without recovery or serializing that error into CLI/daemon logs.
+    console.error("replacement_verification_failed: old inode or sidecar handle; command refused");
+    process.exitCode = 1;
+    return;
+  }
   if (error?.code === "LEDGER_PUBLICATION_INVALID" &&
-      error.cause?.code !== "LEDGER_ARCHIVE_HANDLE_IN_USE" && typeof error.ledgerPath === "string") {
+      typeof error.ledgerPath === "string") {
     try {
       recoverInvalidLedgerPublication(error.ledgerPath);
       console.error("replacement_verification_failed; archive restored; command refused");

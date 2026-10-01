@@ -227,7 +227,8 @@ async function main(variant: string) {
   assert.ok(["cli", "supervised-restart", "shared-lifetime", "old-connection", "missing-marker",
     "integrity", "post-check-raw", "startup-marker", "startup-integrity", "worker-probes",
     ...startupProbeCases.map(test => `startup-probe-${test}`)].includes(variant));
-  const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "r13-connection-")));
+  const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),
+    variant.startsWith("startup-probe-foreign-") ? "PRIVATE_LEDGER_PATH_443-" : "r13-connection-")));
   const home = path.join(fixture, "home"), data = path.join(home, ".plimsoll");
   const archiveDir = path.join(fixture, "archive"), root = path.join(home, "sessions");
   fs.mkdirSync(data, { recursive: true, mode: 0o700 });
@@ -313,23 +314,63 @@ async function main(variant: string) {
         if (test === "ordinary") assert.deepEqual(probes.timeouts, [10_000]);
         else {
           // The outer CLI handler must preserve the same immediate refusal.
-          // Fault injection makes any attempted recovery probe unmistakable.
+          // Capture every console status/log as well as stdout/stderr. Neither
+          // the private error property nor raw lsof stderr may cross that boundary.
+          const cliDevice = "dev_PRIVATE_REFUSAL_443", cliKey = "key_PRIVATE_REFUSAL_443";
+          const seed = invoke(["-e", `require('./packages/collector-cli/src/device-identity.ts')
+            .loadOrCreateDeviceIdentity(undefined, { seed: ${JSON.stringify({ deviceId: cliDevice, keyId: cliKey })} });`]);
+          assert.equal(seed.status, 0, "seed a valid device identity for the real daemon start");
           const preload = path.join(fixture, "refuse-recovery.cjs");
+          const consoleLog = path.join(fixture, "console.jsonl");
           fs.writeFileSync(preload, `
+            const fs = require('node:fs');
+            const util = require('node:util');
+            for (const method of ['log', 'error', 'warn', 'info', 'debug', 'dir']) {
+              const original = console[method];
+              console[method] = function (...args) {
+                fs.appendFileSync(${JSON.stringify(consoleLog)}, JSON.stringify({
+                  method, text: util.format(...args) }) + '\\n');
+                return Reflect.apply(original, console, args);
+              };
+            }
+            require('node:net').Server.prototype.listen = function () {
+              throw new Error('unexpected_listener_before_foreign_handle_refusal');
+            };
             const children = require('node:child_process');
+            for (const method of ['spawn', 'spawnSync', 'execFile', 'execFileSync']) {
+              const original = children[method];
+              children[method] = function (command, ...args) {
+                if (/(^|\\/)launchctl$/.test(String(command))) throw new Error('unexpected_launchctl');
+                return Reflect.apply(original, this, [command, ...args]);
+              };
+            }
             const native = children.spawnSync;
             children.spawnSync = function (command, args, options) {
               if (command === '/usr/sbin/lsof' && args.includes(${JSON.stringify(ledger)}) &&
                   args.includes(${JSON.stringify(archive)})) throw new Error('unexpected_recovery_probe');
-              return native(command, args, options);
+              const result = native(command, args, options);
+              if (command === '/usr/sbin/lsof' && args.includes(${JSON.stringify(archive)}))
+                result.stderr = ${JSON.stringify(`PRIVATE_LSOF_STDERR_443 ${ledger} ${receipt.marker.archiveIdentity}`)};
+              return result;
             };
             require('node:module').syncBuiltinESMExports();
           `);
-          const cliRefusal = invoke(["--require", preload, cli, "export", "--budget"]);
-          assert.equal(cliRefusal.status, 1, cliRefusal.stderr);
-          assert.match(cliRefusal.stderr, /old inode or sidecar handle/);
-          assert.doesNotMatch(cliRefusal.stderr, /unexpected_recovery_probe/);
-          assert.equal(fs.statSync(ledger).ino, freshInode);
+          for (const command of [["export", "--budget"], ["start"]]) {
+            fs.writeFileSync(consoleLog, "");
+            const cliRefusal = invoke(["--require", preload, cli, ...command]);
+            assert.equal(cliRefusal.status, 1);
+            const logged = fs.readFileSync(consoleLog, "utf8");
+            const output = cliRefusal.stdout + cliRefusal.stderr + logged;
+            assert.equal([fixture, ledger, archive, receipt.marker.archiveIdentity, workspace, device, epoch, cliDevice, cliKey,
+              "PRIVATE_LEDGER_PATH_443", "PRIVATE_LSOF_STDERR_443", "ledgerPath:"].some(value => output.includes(value)),
+            false, "foreign-handle stdout, stderr, status and logs must be value-free");
+            assert.match(cliRefusal.stderr, /old inode or sidecar handle/);
+            assert.doesNotMatch(output, /unexpected_recovery_probe|unexpected_listener|unexpected_launchctl/);
+            const errors = logged.trim().split("\n").map(line => JSON.parse(line))
+              .filter(row => row.method === "error").map(row => row.text);
+            assert.deepEqual(errors, ["replacement_verification_failed: old inode or sidecar handle; command refused"]);
+            assert.equal(fs.statSync(ledger).ino, freshInode);
+          }
         }
       } else {
         assert.match(String(refusal), /replacement_verification_failed; archive restored; collector start refused/);
