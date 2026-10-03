@@ -321,6 +321,7 @@ export function captureCodexModel(
         : "claude_model_evidence_missing",
     );
   if (!row) return gap("capture_row_missing");
+  if (!row.workspace || !row.epoch) return gap("capture_identity_missing");
   const at = Date.parse(event.observedAt),
     end = Date.parse(String(event.metadata.otelSpanEndAt ?? event.observedAt));
   if (
@@ -433,14 +434,25 @@ export function captureCodexModel(
   ) {
     const names = db
       .prepare(
-        `select model from codex_turn_model_evidence where
-      workspace_id=? and device_id is ? and installation_epoch_id=? and session_id=? and turn_id=? limit 2`,
+        `select model, case when count(distinct nullif(account_key,''))=1 then min(nullif(account_key,'')) end as account from codex_turn_model_evidence where
+      workspace_id=? and device_id is ? and installation_epoch_id=? and session_id=? and turn_id=? group by model limit 2`,
       )
       .all(row.workspace, row.device, row.epoch, session, turn) as Array<{
       model: string;
+      account: string | null;
     }>;
     for (const name of names)
-      local.push({ event: { ...event, model: name.model }, pairedId: null });
+      local.push({
+        event: {
+          ...event,
+          model: name.model,
+          metadata: {
+            ...event.metadata,
+            ...(name.account ? { "user.account_id": name.account } : {}),
+          },
+        },
+        pairedId: null,
+      });
   }
   const localModels = unique(local, (e) => text(e.model));
   if (localModels.length > 1) return gap("ambiguous_local_turn_model");
@@ -455,6 +467,7 @@ export function recordCodexTurnModel(
   sessionId: string,
   turnId: string,
   model: string,
+  accountKey?: string,
 ) {
   if (
     !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(sessionId) ||
@@ -473,10 +486,10 @@ export function recordCodexTurnModel(
   if (!binding?.epoch) return;
   db.exec(`create table if not exists codex_turn_model_evidence (
     workspace_id text not null,device_id text,installation_epoch_id text not null,
-    session_id text not null,turn_id text not null,model text not null,
-    primary key(workspace_id,installation_epoch_id,session_id,turn_id,model)) without rowid`);
+    session_id text not null,turn_id text not null,model text not null,account_key text not null,
+    primary key(workspace_id,installation_epoch_id,session_id,turn_id,model,account_key)) without rowid`);
   db.prepare(
-    `insert or ignore into codex_turn_model_evidence values (?,?,?,?,?,?)`,
+    `insert or ignore into codex_turn_model_evidence values (?,?,?,?,?,?,?)`,
   ).run(
     binding.workspace,
     binding.device,
@@ -484,5 +497,6 @@ export function recordCodexTurnModel(
     sessionId,
     turnId,
     model,
+    accountKey && /^sha256:[0-9a-f]{16}$/.test(accountKey) ? accountKey : "",
   );
 }

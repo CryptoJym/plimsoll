@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("codex-model-capture", 26);
+const completion = createProofCompletion("codex-model-capture", 29);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,7 +7,10 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
-import { captureCodexModel } from "../packages/collector-cli/src/codex-model-capture";
+import {
+  captureCodexModel,
+  recordCodexTurnModel,
+} from "../packages/collector-cli/src/codex-model-capture";
 import { captureFrontier } from "../packages/collector-cli/src/capture-frontier";
 import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
 import { runWorkspaceHistoryUpload } from "../packages/collector-cli/src/upload-history";
@@ -444,16 +447,27 @@ async function main() {
         b.close();
       }
     }
-    {
+    for (const namedClass2 of [false, true]) {
       let now = new Date(at + 2000);
-      const b = new LocalEventBuffer(path.join(root, "legacy-sealed.sqlite"), {
-        workspaceId: session,
-        deviceId: "fixture-device",
-        enrollmentNow: () => new Date(at - 1000),
-        delivery: { enabled: true, now: () => now },
-      });
+      const b = new LocalEventBuffer(
+        path.join(
+          root,
+          namedClass2 ? "legacy-named-class2.sqlite" : "legacy-sealed.sqlite",
+        ),
+        {
+          workspaceId: session,
+          deviceId: "fixture-device",
+          enrollmentNow: () => new Date(at - 1000),
+          delivery: { enabled: true, now: () => now },
+        },
+      );
       try {
         const target = span();
+        if (namedClass2) {
+          target.source = "claude_code";
+          target.model = "gpt-6-astra";
+          target.metadata.serviceName = "Codex_Desktop";
+        }
         b.append(target);
         const rawBefore = (
           b.database
@@ -500,7 +514,9 @@ async function main() {
         assert.equal(gap.envelope.event.metadata.captureGap, true);
         assert.equal(
           gap.envelope.event.metadata.modelGapReason,
-          "legacy_sealed_model_missing",
+          namedClass2
+            ? "legacy_sealed_source_mismatch"
+            : "legacy_sealed_model_missing",
         );
         assert.equal(gap.envelope.event.inputTokens, undefined);
         assert.ok(gap.envelope.event.metadata.installationEpochId);
@@ -523,7 +539,11 @@ async function main() {
           "local_model_capture_gap",
         );
         checks++;
-        completion.check("legacy-sealed-gap-replacement");
+        completion.check(
+          namedClass2
+            ? "legacy-sealed-class2-gap"
+            : "legacy-sealed-gap-replacement",
+        );
       } finally {
         b.close();
       }
@@ -723,6 +743,44 @@ async function main() {
         b.close();
       }
     }
+    {
+      const b = new LocalEventBuffer(
+        path.join(root, "unbound-evidence.sqlite"),
+      );
+      try {
+        b.append(log("gpt-6-astra", true));
+        const target = span();
+        b.append(target);
+        const captured = captureCodexModel(b.database, target);
+        assert.equal(captured.model, undefined);
+        assert.equal(captured.inputTokens, undefined);
+        assert.equal(
+          captured.metadata.modelGapReason,
+          "capture_identity_missing",
+        );
+        checks++;
+        completion.check("unbound-evidence-is-not-a-model");
+      } finally {
+        b.close();
+      }
+    }
+    await run(
+      "local-turn-account-preserved",
+      (b) => {
+        recordCodexTurnModel(
+          b.database,
+          session,
+          "turn-account",
+          "gpt-6.1-sol",
+          account,
+        );
+        return span([
+          attr("conversation.id", session),
+          attr("turn.id", "turn-account"),
+        ]);
+      },
+      "gpt-6.1-sol",
+    );
     completion.complete();
     console.log(
       JSON.stringify({ proof: "codex-model-capture", checks, status: "PASS" }),

@@ -1732,7 +1732,8 @@ export class RolloutTailer {
         state.model = undefined;
         if (typeof payload.model === "string" && payload.model) {
           state.model = payload.model;
-          if (state.conversationId && state.turnId) recordCodexTurnModel(this.buffer.database,state.conversationId,state.turnId,state.model);
+          if (state.conversationId && state.turnId) recordCodexTurnModel(this.buffer.database,state.conversationId,state.turnId,state.model,
+            this.accountBindings.keyAt(accountHome,typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,this.accountObservedAtMs) ?? undefined);
           // Codex can report its first token count before turn_context.
           for (const entry of pending) if (entry.turnId && entry.turnId === state.turnId) entry.model ??= state.model;
         }

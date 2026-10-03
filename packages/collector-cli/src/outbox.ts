@@ -1,5 +1,5 @@
 import type { AiInteractionEvent } from "../../shared/src/index";
-import { captureCodexModel, codexModelGap, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -2262,7 +2262,8 @@ export class DeliveryOutbox {
             continue;
           }
           const gap = sealOutboundEnvelope({...outboundEnvelope,event:{
-            ...codexModelGap(this.db,prior,"legacy_sealed_model_missing"),id:gapId}});
+            ...codexModelGap(this.db,prior,codexMisfiledUnderClaude(prior) ? "legacy_sealed_source_mismatch" :
+              prior.model ? "legacy_sealed_model_evidence_conflict" : "legacy_sealed_model_missing"),id:gapId}});
           if (!gap.ok) {
             locallyDead += this.deadActive(row.deliveryId,"local_schema_invalid",nowIso,disposedRawRowids);
             continue;
