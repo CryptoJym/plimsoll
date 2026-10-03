@@ -1460,7 +1460,11 @@ export class DeliveryOutbox {
           event.source === "codex" && event.eventType === "assistant_response" && (event.metadata?.otelEventName === "codex.sse_event" ||
             event.metadata?.otelEventName === "handle_responses") ||
           unresolvedCapture(event as AiInteractionEvent))) {
-        nextAttemptAt = new Date(nowDate.getTime() + CODEX_MODEL_WAIT_MS).toISOString();
+        // Repaired/re-enqueued history already waited at capture. Preserve
+        // that elapsed wait, while an injected clock bounds a future stamp.
+        const capturedAt = Math.min(Date.parse(row.createdAt), nowDate.getTime());
+        nextAttemptAt = new Date(Math.max(nowDate.getTime(),
+          (Number.isFinite(capturedAt) ? capturedAt : nowDate.getTime()) + CODEX_MODEL_WAIT_MS)).toISOString();
       }
     } catch {
       // prepareDelivery already validates the payload; this is only a grace
