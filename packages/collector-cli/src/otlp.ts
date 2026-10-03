@@ -396,7 +396,9 @@ function buildLogEvent(
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
     id: deterministicEventId([
-      context.source,
+      // A named Codex exporter may use another valid producer credential.
+      // Keep its existing Codex identity across credential changes.
+      context.serviceSource === "codex" ? "codex" : context.source,
       otelEventName,
       sessionId,
       observedAt,
@@ -569,7 +571,7 @@ function buildSpanEvent(
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
     id: deterministicEventId([
-      context.source,
+      context.serviceSource === "codex" ? "codex" : context.source,
       "span",
       spanName,
       sessionId,

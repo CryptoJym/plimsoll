@@ -161,13 +161,19 @@ async function main() {
         for (let repeat = 0; repeat < 2; repeat += 1) {
           const classified = await post("/v1/logs", logPayload, "claude_code", auth.claudeCodeProducer, classifiedPort);
           assert.equal(classified.status, 202);
+          const codex = await post("/v1/logs", logPayload, "codex", auth.codexProducer, classifiedPort);
+          assert.equal(codex.status, 202);
         }
         const classifiedRows = classifiedBuffer.database.prepare(
           "select payload_json as payloadJson from buffered_events",
         ).all() as Array<{ payloadJson: string }>;
         assert.equal(classifiedRows.length, 1);
         assert.equal(JSON.parse(classifiedRows[0]!.payloadJson).source, "codex");
-        proof.check("valid_claude_credential_admits_codex_desktop_as_codex_once");
+        assert.equal(JSON.parse(classifiedRows[0]!.payloadJson).id, log.event.id);
+        assert.deepEqual(classifiedBuffer.database.prepare(`select sum(input_tokens) as input,
+          sum(output_tokens) as output, sum(cache_read_tokens) as cached from buffered_events`).get(),
+          { input: 24261, output: 1902, cached: 1190 });
+        proof.check("valid_credential_switch_keeps_one_codex_desktop_row_and_usage_total");
         assert.equal(warnings.length, 1);
         assert.deepEqual(JSON.parse(warnings[0]!), {
           status: "otlp_service_source_mismatch",

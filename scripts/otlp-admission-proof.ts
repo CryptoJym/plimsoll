@@ -950,10 +950,11 @@ async function main() {
         (event.metadata as Record<string, unknown>).serviceName === serviceName &&
         event.inputTokens === 1000 + index);
       check(`codex_service_${serviceName}_source_classification`,
-        wrong.status === 202 && right.status === 202 && named.length === 2 &&
-        named.every(event => event.source === "codex" && event.outputTokens === 17) &&
-        named[0]?.id !== named[1]?.id,
-        { wrong, right, sources: named.map((event) => event.source) });
+        wrong.status === 202 && right.status === 202 && named.length === 1 &&
+        named[0]?.source === "codex" && named[0]?.inputTokens === 1000 + index &&
+        named[0]?.outputTokens === 17,
+        { wrong, right, rows: named.length, inputTokens: named[0]?.inputTokens,
+          outputTokens: named[0]?.outputTokens, sources: named.map((event) => event.source) });
     }
 
     const unknownService = { resourceSpans: [{
