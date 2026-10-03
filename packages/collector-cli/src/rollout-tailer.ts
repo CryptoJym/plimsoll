@@ -126,6 +126,8 @@ export type RolloutScanResult = {
   bytesDeferred: number;
   sessionsSkippedOtlpCovered: number;
   eventsAppended: number;
+  /** Plan readings with no account at their observation time; never queued. */
+  planLimitReadingsSkippedNoAccount?: number;
   enrollmentExcludedEvents?: number;
   /**
    * Admitted rewrites whose rollout record timestamp or file-mtime fallback sat
@@ -392,6 +394,7 @@ function resultMutationSnapshot(result: RolloutScanResult) {
     tokensUnvalidated: { ...(result.tokensUnvalidated ?? { input: 0, cachedInput: 0, output: 0 }) },
     enrollmentExcludedEvents: result.enrollmentExcludedEvents,
     futureTimestampClampedEvents: result.futureTimestampClampedEvents,
+    planLimitReadingsSkippedNoAccount: result.planLimitReadingsSkippedNoAccount ?? 0,
   };
 }
 
@@ -408,6 +411,37 @@ function restoreResultMutationSnapshot(
   result.tokensUnvalidated = { ...snapshot.tokensUnvalidated };
   result.enrollmentExcludedEvents = snapshot.enrollmentExcludedEvents;
   result.futureTimestampClampedEvents = snapshot.futureTimestampClampedEvents;
+  result.planLimitReadingsSkippedNoAccount = snapshot.planLimitReadingsSkippedNoAccount;
+}
+
+/** Error text can contain source values. Preserve known code/schema diagnostics
+ * and hash other messages rather than putting private values in collector logs. */
+function rolloutCommitDiagnostic(error: unknown) {
+  const candidate = error && typeof error === "object"
+    ? error as { constructor?: { name?: string }; code?: unknown; message?: unknown;
+      issues?: Array<{ code?: unknown; path?: unknown[] }> } : undefined;
+  const name = candidate?.constructor?.name ?? "UnknownError";
+  const errorClass = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "UnknownError";
+  const rawMessage = typeof candidate?.message === "string" ? candidate.message
+    : typeof error === "string" ? error : errorClass;
+  let message = "[redacted error message]";
+  if (/^(?:capture|jsonl|rollout|repo_context|maintenance|account_binding)_[a-z0-9_]{1,160}$/.test(rawMessage) ||
+      /^(?:no such (?:table|column): [A-Za-z_][A-Za-z0-9_.]*|(?:NOT NULL|UNIQUE) constraint failed: [A-Za-z_][A-Za-z0-9_.]*(?:, [A-Za-z_][A-Za-z0-9_.]*)*|database (?:is locked|table is locked))$/.test(rawMessage)) {
+    message = rawMessage;
+  } else if (errorClass === "ZodError" && Array.isArray(candidate?.issues)) {
+    const fields = new Set(["id", "sessionId", "tenantId", "actorId", "source", "dataMode", "eventType",
+      "observedAt", "model", "actionClass", "inputTokens", "outputTokens", "cacheReadTokens",
+      "cacheCreationTokens", "costUsd", "costKind", "metadata"]);
+    message = "schema validation failed: " + candidate.issues.slice(0, 8).map(issue => {
+      const code = typeof issue.code === "string" && /^[a-z_]{1,40}$/.test(issue.code) ? issue.code : "invalid";
+      const field = issue.path?.[0];
+      return `${code} at ${typeof field === "string" && fields.has(field) ? field : "[field]"}`;
+    }).join("; ");
+  }
+  return { errorClass, message,
+    messageHash: maintenanceCandidateHash(rawMessage),
+    ...(typeof candidate?.code === "string" && /^SQLITE_[A-Z_]{1,64}$/.test(candidate.code)
+      ? { errorCode: candidate.code } : {}) };
 }
 
 export class RolloutTailer {
@@ -657,6 +691,7 @@ export class RolloutTailer {
       bytesDeferred: 0,
       sessionsSkippedOtlpCovered: 0,
       eventsAppended: 0,
+      planLimitReadingsSkippedNoAccount: 0,
       tokensAppended: { input: 0, cachedInput: 0, output: 0 },
       unvalidatedFirstRows: 0,
       tokensUnvalidated: { input: 0, cachedInput: 0, output: 0 },
@@ -1309,7 +1344,10 @@ export class RolloutTailer {
             result.recordsCommitted = (result.recordsCommitted ?? 0) + read.lines.length;
             result.slicesCommitted += 1;
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
-          } catch {
+          } catch (error) {
+            console.error(JSON.stringify({ status: "rollout_commit_error",
+              ...rolloutCommitDiagnostic(error), fileHandleHash: maintenanceCandidateHash(candidate.file),
+              offset: read.committedSourceSpan?.offset ?? cursor?.committedOffset ?? 0 }));
             this.activeCaptureRoot = activeRootBefore;
             this.activeCarriedBytes = carriedBytesBefore;
             this.activeReplacementCutoverAt = cutoverBefore;
@@ -1768,6 +1806,10 @@ export class RolloutTailer {
       const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
       const accountKey = this.accountBindings.keyAt(accountHome,
         clamped.clamped ? undefined : clamped.observedAt, this.accountObservedAtMs);
+      if (!accountKey) {
+        result.planLimitReadingsSkippedNoAccount = (result.planLimitReadingsSkippedNoAccount ?? 0) + 1;
+        continue;
+      }
       if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
         window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
         planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;

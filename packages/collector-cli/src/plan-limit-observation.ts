@@ -93,10 +93,10 @@ export class PlanLimitEmitter {
 
   observe(input: Observation): boolean {
     const { source, accountKey, window, observedAt } = input;
-    if (accountKey !== undefined && !/^sha256:[a-f0-9]{16}$/.test(accountKey) ||
+    if (!accountKey || !/^sha256:[a-f0-9]{16}$/.test(accountKey) ||
       !Number.isFinite(Date.parse(observedAt))) return false;
     this.ensureSchema();
-    const stateKey = accountKey ?? "";
+    const stateKey = accountKey;
     const cacheKey = JSON.stringify([source, stateKey, window.window]);
     if (!this.last.has(cacheKey)) {
       const row = this.buffer.database.prepare(`select used_percent as usedPercent, resets_at as resetsAt,
