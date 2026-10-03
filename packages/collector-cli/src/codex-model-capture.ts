@@ -13,15 +13,18 @@ const MAX_EVIDENCE_ROWS = 128;
 const text = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value : undefined;
 export function codexHasUsage(event: AiInteractionEvent): boolean {
+  // Native runtime intervals deliberately carry no per-request model and are
+  // unqualified observers; cloud excludes them from financial usage.
   return (
+    event.eventType !== "usage_live" &&
     (event.source === "codex" || event.source === "claude_code") &&
     ([
       event.inputTokens,
       event.outputTokens,
       event.cacheReadTokens,
       event.cacheCreationTokens,
-    ].some((value) => value !== undefined && value > 0) ||
-      (event.costUsd ?? 0) > 0)
+    ].some((value) => value !== undefined) ||
+      event.costUsd !== undefined)
   );
 }
 

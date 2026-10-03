@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("codex-model-capture", 24);
+const completion = createProofCompletion("codex-model-capture", 26);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -7,6 +7,7 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
+import { captureCodexModel } from "../packages/collector-cli/src/codex-model-capture";
 import { captureFrontier } from "../packages/collector-cli/src/capture-frontier";
 import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
 import { runWorkspaceHistoryUpload } from "../packages/collector-cli/src/upload-history";
@@ -666,6 +667,58 @@ async function main() {
         );
         checks++;
         completion.check("readonly-history-gap");
+      } finally {
+        b.close();
+      }
+    }
+    {
+      const b = new LocalEventBuffer(path.join(root, "zero-token.sqlite"), {
+        workspaceId: session,
+        deviceId: "fixture-device",
+        enrollmentNow: () => new Date(at - 1000),
+      });
+      try {
+        const event = {
+          ...span(),
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+        };
+        b.append(event);
+        const result = buildIngestBatch(
+          collectorConfigSchema.parse({
+            tenantId: session,
+            deviceId: "fixture-device",
+            installKey: "fixture-install",
+          }),
+          b,
+          { now: () => new Date(Date.now() + 61000) },
+        );
+        assert.equal(result.batch?.events[0]?.event.metadata.captureGap, true);
+        assert.equal(result.batch?.events[0]?.event.inputTokens, undefined);
+        assert.equal(
+          result.batch?.events[0]?.event.metadata.modelGapInputTokens,
+          0,
+        );
+        checks++;
+        completion.check("zero-token-model-gap");
+      } finally {
+        b.close();
+      }
+    }
+    {
+      const b = new LocalEventBuffer(
+        path.join(root, "nonfinancial-observer.sqlite"),
+      );
+      try {
+        const observer = { ...span(), eventType: "usage_live" as const };
+        assert.equal(
+          captureCodexModel(b.database, observer),
+          observer,
+          "nonfinancial runtime intervals never acquire a per-request model",
+        );
+        checks++;
+        completion.check("unqualified-observer-preserved");
       } finally {
         b.close();
       }
