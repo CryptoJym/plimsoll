@@ -23,6 +23,7 @@ import {
   type CaptureGap,
 } from "./capture-frontier";
 import type { CaptureSpoolState } from "./capture-spool-state";
+import { captureDeadLetterCensus, type CaptureDeadLetter, type CaptureDeadLetterInterval } from "./capture-dead-letters";
 
 export const DEFAULT_DELIVERY_LIMITS = {
   maxActiveRows: 50_000,
@@ -228,7 +229,7 @@ export type DeliveryCaptureClaim = {
   /** Deliveries kept local by design (privacy violation, evidence quarantine); not gaps. */
   withheld: number;
   /** At most CAPTURE_CLAIM_MAX_GAPS closed intervals in which data is known to be missing. */
-  gaps: Array<{ from: string; to: string }>;
+  gaps: Array<{ from: string; to: string; deadLetters?: CaptureDeadLetter[] }>;
 };
 
 /** Why a claim attests nothing (review r2 B3): the cloud withdraws what it held. */
@@ -652,7 +653,7 @@ export class DeliveryOutbox {
       const cursor = (this.db
         .prepare(`select capture_claim_sequence as cursor from upload_control where singleton = 1`)
         .get() as { cursor: number }).cursor;
-      return {
+      const claim: DeliveryCaptureClaim = {
         v: 1 as const,
         epoch: frontier.installationEpochId,
         epochStartedAt,
@@ -662,8 +663,21 @@ export class DeliveryOutbox {
         pending: pending.count + (spool?.pendingFiles ?? 0),
         dead: lost.dead + spoolLosses.reduce((total, loss) => total + loss.count, 0),
         withheld: lost.withheld,
-        gaps: gaps.map((gap) => ({ from: new Date(gap.fromMs).toISOString(), to: new Date(gap.toMs).toISOString() })),
+        gaps: gaps.map((gap) => {
+          const complete = lost.censuses.find(interval =>
+            interval.fromMs === gap.fromMs && interval.toMs === gap.toMs);
+          const otherLoss = [...frontier.gaps, ...spoolLosses.map(loss => ({
+            fromMs: Math.max(epochStartMs, loss.fromMs - CAPTURE_WRITE_LAG_MS), toMs: loss.toMs,
+          }))].some(other => other.fromMs <= gap.toMs && other.toMs >= gap.fromMs);
+          return { from: new Date(gap.fromMs).toISOString(), to: new Date(gap.toMs).toISOString(),
+            ...(complete && !otherLoss ? { deadLetters: complete.deadLetters } : {}),
+          };
+        }),
       };
+      // The existing v1 header bound is 1024 characters, including the census.
+      // Keep known gaps when complete summaries cannot fit that wire contract.
+      if (JSON.stringify(claim).length > 1024) claim.gaps = claim.gaps.map(({ from, to }) => ({ from, to }));
+      return claim;
     });
     return run.immediate();
   }
@@ -680,6 +694,7 @@ export class DeliveryOutbox {
     dead: number;
     withheld: number;
     gaps: CaptureGap[];
+    censuses: CaptureDeadLetterInterval[];
   } {
     const version = (this.db
       .prepare(`select capture_dead_version as version from upload_control where singleton = 1`)
@@ -691,7 +706,11 @@ export class DeliveryOutbox {
       )
       .get() as { version: number; epochStartedAt: string; summary: string } | undefined;
     if (cached && cached.version === version && cached.epochStartedAt === epochStartedAt) {
-      return JSON.parse(cached.summary) as { dead: number; withheld: number; gaps: CaptureGap[] };
+      const parsed = JSON.parse(cached.summary) as {
+        schema?: number; dead: number; withheld: number; gaps: CaptureGap[];
+        censuses?: CaptureDeadLetterInterval[];
+      };
+      if (parsed.schema === 2 && Array.isArray(parsed.censuses)) return { ...parsed, censuses: parsed.censuses };
     }
     const counts = this.db
       .prepare(
@@ -718,7 +737,13 @@ export class DeliveryOutbox {
       const fromMs = Math.max(epochStartMs, Math.floor(day.fromSeconds * 1000));
       gaps.push({ fromMs, toMs: Math.max(fromMs, toMs) });
     }
-    const summary = { dead: counts.total - counts.withheld, withheld: counts.withheld, gaps: mergeCaptureGaps(gaps) };
+    const merged = mergeCaptureGaps(gaps);
+    const censuses = merged.flatMap(interval => {
+      const deadLetters = captureDeadLetterCensus(this.db, epochStartedAt, interval);
+      return deadLetters ? [{ ...interval, deadLetters }] : [];
+    });
+    const summary = { schema: 2, dead: counts.total - counts.withheld,
+      withheld: counts.withheld, gaps: merged, censuses };
     this.db
       .prepare(
         `insert into capture_dead_summary (singleton, dead_version, epoch_started_at, summary_json)
