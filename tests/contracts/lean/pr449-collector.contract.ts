@@ -22,6 +22,7 @@ const legacyCodexIds = {
 };
 
 test("one_OTLP_response_keeps_one_usage_total_across_valid_credential_switch", async () => {
+  const allMismatchWarnings: unknown[] = [];
   for (const fixture of reviewCodexPayloads) {
     const legacyId = legacyCodexIds[fixture.kind];
     assert.equal(explodeOtlpPayload(fixture.payload, { source: "codex" }).events[0]?.event.id, legacyId,
@@ -68,10 +69,7 @@ test("one_OTLP_response_keeps_one_usage_total_across_valid_credential_switch", a
         const row = buffer.database.prepare("select id, source, usage_duplicate_reason as duplicateReason from buffered_events").get();
         assert.deepEqual(row, { id: legacyId, source: "codex", duplicateReason: null });
         const mismatchWarnings = warnings.filter(line => line.includes('"status":"otlp_service_source_mismatch"'));
-        assert.equal(mismatchWarnings.length, 1);
-        assert.deepEqual(JSON.parse(mismatchWarnings[0]), {
-          status: "otlp_service_source_mismatch", credentialSource: "claude_code", serviceSource: "codex",
-        });
+        allMismatchWarnings.push(...mismatchWarnings.map(line => JSON.parse(line)));
       } finally {
         console.warn = originalWarn;
         try {
@@ -83,6 +81,10 @@ test("one_OTLP_response_keeps_one_usage_total_across_valid_credential_switch", a
       }
     }
   }
+  // The native warning latch is process-wide, including all four fixture servers.
+  assert.deepEqual(allMismatchWarnings, [{
+    status: "otlp_service_source_mismatch", credentialSource: "claude_code", serviceSource: "codex",
+  }]);
 });
 
 test("diagnostic_never_copies_an_arbitrary_error_message", async () => {
