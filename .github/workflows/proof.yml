@@ -1397,6 +1397,25 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Isolate every proof home and provider root
+        shell: bash
+        run: |
+          proof_home="${RUNNER_TEMP}/plimsoll-ci-home"
+          mkdir -p "$proof_home/.plimsoll" "$proof_home/.codex" "$proof_home/.claude" "$proof_home/tmp"
+          chmod 700 "$proof_home" "$proof_home/.plimsoll"
+          {
+            echo "HOME=$proof_home"
+            echo "USERPROFILE=$proof_home"
+            echo "PLIMSOLL_HOME=$proof_home/.plimsoll"
+            echo "CODEX_HOME=$proof_home/.codex"
+            echo "CLAUDE_CONFIG_DIR=$proof_home/.claude"
+            echo "XDG_CONFIG_HOME=$proof_home/.config"
+            echo "XDG_CACHE_HOME=$proof_home/.cache"
+            echo "XDG_STATE_HOME=$proof_home/.local/state"
+            echo "TMPDIR=$proof_home/tmp"
+          } >> "$GITHUB_ENV"
+
       - name: Build and test the macOS menubar app (#12)
         env:
           DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
