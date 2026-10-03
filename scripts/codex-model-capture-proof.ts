@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("codex-model-capture", 31);
+const completion = createProofCompletion("codex-model-capture", 36);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -12,7 +12,10 @@ import {
   recordCodexTurnModel,
 } from "../packages/collector-cli/src/codex-model-capture";
 import { captureFrontier } from "../packages/collector-cli/src/capture-frontier";
-import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
+import {
+  deterministicEventId,
+  normalizeHookPayload,
+} from "../packages/collector-cli/src/normalizer";
 import { runWorkspaceHistoryUpload } from "../packages/collector-cli/src/upload-history";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
@@ -165,7 +168,10 @@ async function run(
       assert.equal(result.metadata.modelGapReason, reason);
       assert.equal(result.metadata.modelGapInputTokens, 5555);
       if (target.metadata["user.account_id"]) {
-        assert.equal(result.metadata["user.account_id"], target.metadata["user.account_id"]);
+        assert.equal(
+          result.metadata["user.account_id"],
+          target.metadata["user.account_id"],
+        );
         assert.equal(result.metadata.accountIdentityState, "reported");
       }
       b.delivery.acknowledge(
@@ -195,6 +201,70 @@ async function main() {
       () => span(),
       null,
       "model_evidence_missing",
+    );
+    await run(
+      "conflicting-peer-with-clean-trace-log",
+      (b) => {
+        const peer = log("gpt-6.1-sol", true);
+        peer.id = deterministicEventId([peer.id, "conflicting-trace-peer"]);
+        peer.metadata["gen_ai.request.model"] = "gpt-6-astra";
+        b.append(peer);
+        b.append(log("gpt-6.1-sol", true));
+        return span();
+      },
+      null,
+      "conflicting_trace_model_evidence",
+    );
+    await run(
+      "conflicting-exact-pair-peer",
+      (b) => {
+        const peer = log("gpt-6.1-sol", false, true);
+        peer.id = deterministicEventId([peer.id, "conflicting-pair-peer"]);
+        // Exercise the fallback on an older typed shape before the durable
+        // pairer can retire the span. Both logs retain their native SSE name.
+        peer.eventType = "unknown";
+        peer.metadata["gen_ai.request.model"] = "gpt-6-astra";
+        b.append(peer);
+        const clean = log("gpt-6.1-sol", false, true);
+        clean.eventType = "unknown";
+        b.append(clean);
+        return span();
+      },
+      null,
+      "conflicting_pair_model_evidence",
+    );
+    await run(
+      "conflicting-local-peer-with-clean-context",
+      (b) => {
+        recordCodexTurnModel(
+          b.database,
+          session,
+          "turn-conflict-peer",
+          "gpt-6.1-sol",
+          account,
+        );
+        const peer = {
+          ...span(),
+          eventType: "otel_span" as const,
+          sessionId: session,
+          model: "gpt-6.1-sol",
+          inputTokens: undefined,
+          outputTokens: undefined,
+          cacheReadTokens: undefined,
+          metadata: {
+            usageSource: "codex_local_turn",
+            codexTurnId: "turn-conflict-peer",
+            "gen_ai.request.model": "gpt-6-astra",
+          },
+        };
+        b.append(peer);
+        return span([
+          attr("conversation.id", session),
+          attr("turn.id", "turn-conflict-peer"),
+        ]);
+      },
+      null,
+      "conflicting_local_model_evidence",
     );
     await run(
       "session-span-only",
@@ -788,7 +858,13 @@ async function main() {
     await run(
       "local-turn-account-conflict",
       (b) => {
-        recordCodexTurnModel(b.database, session, "turn-conflict", "gpt-6-astra", account);
+        recordCodexTurnModel(
+          b.database,
+          session,
+          "turn-conflict",
+          "gpt-6-astra",
+          account,
+        );
         return span([
           attr("conversation.id", session),
           attr("turn.id", "turn-conflict"),
@@ -807,7 +883,45 @@ async function main() {
         return span();
       },
       null,
-      "model_evidence_missing",
+      "conflicting_trace_model_evidence",
+    );
+    await run(
+      "one-trace-model-two-accounts",
+      (b) => {
+        b.append(log("gpt-6.1-sol", true));
+        const peer = log("gpt-6.1-sol", true);
+        peer.id = deterministicEventId([peer.id, "second-account"]);
+        peer.metadata["user.account_id"] = "sha256:fedcba9876543210";
+        b.append(peer);
+        return span();
+      },
+      null,
+      "ambiguous_trace_identity",
+    );
+    await run(
+      "one-local-turn-model-two-accounts",
+      (b) => {
+        recordCodexTurnModel(
+          b.database,
+          session,
+          "turn-two-accounts",
+          "gpt-6.1-sol",
+          account,
+        );
+        recordCodexTurnModel(
+          b.database,
+          session,
+          "turn-two-accounts",
+          "gpt-6.1-sol",
+          "sha256:fedcba9876543210",
+        );
+        return span([
+          attr("conversation.id", session),
+          attr("turn.id", "turn-two-accounts"),
+        ]);
+      },
+      null,
+      "ambiguous_local_turn_identity",
     );
     completion.complete();
     console.log(

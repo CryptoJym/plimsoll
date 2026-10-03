@@ -362,12 +362,12 @@ export function captureCodexModel(
       return [];
     }
   });
-  const native = peers.filter(
-    (p) =>
-      !p.event.metadata.modelCaptureSource &&
-      p.event.metadata.modelEvidenceConflict !== true &&
-      nativeModels(p.event).size <= 1,
-  );
+  const native = peers.filter((p) => !p.event.metadata.modelCaptureSource);
+  const conflicts = (p: Peer) =>
+    p.event.metadata.modelEvidenceConflict === true ||
+    nativeModels(p.event).size > 1;
+  // An internally conflicting peer remains evidence of ambiguity. Dropping
+  // it before counting models could leave one clean log and select its model.
   const logs = native.filter(
     (p) => p.event.metadata.otelEventName === "codex.sse_event",
   );
@@ -381,6 +381,7 @@ export function captureCodexModel(
         Math.abs(Date.parse(p.event.observedAt) - end),
       ) <= 30_000,
   );
+  if (pair.some(conflicts)) return gap("conflicting_pair_model_evidence");
   const pairModels = unique(pair, (e) => text(e.model));
   if (pairModels.length > 1) return gap("ambiguous_pair_model");
   const competingSpans = peers.filter(
@@ -399,8 +400,14 @@ export function captureCodexModel(
   const traced = traceId
     ? logs.filter((p) => p.event.metadata.traceId === traceId)
     : [];
+  if (traced.some(conflicts)) return gap("conflicting_trace_model_evidence");
   const traceModels = unique(traced, (e) => text(e.model));
   if (traceModels.length > 1) return gap("ambiguous_trace_model");
+  if (
+    unique(traced, (e) => text(e.metadata["user.account_id"])).length > 1 ||
+    unique(traced, (e) => trustedSession(e)).length > 1
+  )
+    return gap("ambiguous_trace_identity");
   if (
     traceModels.length === 1 &&
     traced.every((p) => compatible(event, p.event))
@@ -418,10 +425,10 @@ export function captureCodexModel(
             (p.event.metadata.usageSource === "codex_local_turn" ||
               p.event.metadata.usageSource === "rollout") &&
             p.event.sessionId === session &&
-            p.event.metadata.codexTurnId === turn &&
-            compatible(event, p.event),
+            p.event.metadata.codexTurnId === turn,
         )
       : [];
+  if (local.some(conflicts)) return gap("conflicting_local_model_evidence");
   // Keep context-only records already read by the native tailer. Token rows
   // may be suppressed by the existing OTLP deduper without losing this evidence.
   if (
@@ -435,13 +442,17 @@ export function captureCodexModel(
   ) {
     const names = db
       .prepare(
-        `select model, case when count(distinct nullif(account_key,''))=1 then min(nullif(account_key,'')) end as account from codex_turn_model_evidence where
+        `select model, count(distinct nullif(account_key,'')) as accounts,
+      min(nullif(account_key,'')) as account from codex_turn_model_evidence where
       workspace_id=? and device_id is ? and installation_epoch_id=? and session_id=? and turn_id=? group by model limit 2`,
       )
       .all(row.workspace, row.device, row.epoch, session, turn) as Array<{
       model: string;
       account: string | null;
+      accounts: number;
     }>;
+    if (names.some((name) => name.accounts > 1))
+      return gap("ambiguous_local_turn_identity");
     for (const name of names)
       local.push({
         event: {
@@ -457,7 +468,12 @@ export function captureCodexModel(
   }
   const localModels = unique(local, (e) => text(e.model));
   if (localModels.length > 1) return gap("ambiguous_local_turn_model");
-  if (localModels.length === 1 && !local.every((p) => compatible(event, p.event)))
+  if (unique(local, (e) => text(e.metadata["user.account_id"])).length > 1)
+    return gap("ambiguous_local_turn_identity");
+  if (
+    localModels.length === 1 &&
+    !local.every((p) => compatible(event, p.event))
+  )
     return gap("local_turn_identity_conflict");
   if (localModels.length === 1)
     return capture(event, local, "local_session_turn");
