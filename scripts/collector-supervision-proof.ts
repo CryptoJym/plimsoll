@@ -34,6 +34,12 @@ import {
   type CollectorRuntimeIdentity,
 } from "../packages/collector-cli/src/runtime-ownership";
 
+// Refuse unless the operator confirms a Mac with no live Plimsoll collector: this proof drives the
+// real launchd/collector supervision. Our CI runners run a live collector (eco-6hoxj.165.179).
+if (process.env.PLIMSOLL_ISOLATED_LAUNCHD_HOST !== "1") {
+  throw new Error("refusing: set PLIMSOLL_ISOLATED_LAUNCHD_HOST=1 only on a Mac with no live Plimsoll collector");
+}
+
 async function availablePort() {
   const server = net.createServer();
   await new Promise<void>((resolve, reject) => {

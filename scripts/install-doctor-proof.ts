@@ -172,9 +172,21 @@ async function main() {
     gate,
     workflowCommands.filter((command) => command === gate).length,
   ]));
+  // A gate may leave proof.yml only as a reviewed, unexpired local-only entry
+  // (eco-6hoxj.165.179: the live-launchd proof cannot run on runners with a live collector).
+  const localOnlyGateScripts: Record<string, string> = {
+    "pnpm proof:launch-agent": "scripts/launch-agent-transaction-proof.ts",
+  };
+  const localOnly = (JSON.parse(fs.readFileSync(path.join(root, "scripts", "proof-local-only.json"), "utf8")) as {
+    localOnly?: Record<string, { expires?: string }>;
+  }).localOnly ?? {};
+  const reviewedLocalOnly = (gate: string) => {
+    const entry = localOnlyGateScripts[gate] ? localOnly[localOnlyGateScripts[gate]] : undefined;
+    return Boolean(entry?.expires) && Date.parse(`${entry!.expires}T23:59:59Z`) >= Date.now();
+  };
   check(
     "ci_workflow_runs_every_required_standalone_gate_once",
-    Object.values(gateCounts).every((count) => count === 1),
+    Object.entries(gateCounts).every(([gate, count]) => count === 1 || (count === 0 && reviewedLocalOnly(gate))),
     { workflow: proofWorkflow, gateCounts },
   );
 
