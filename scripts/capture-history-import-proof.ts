@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { estimateCostUsd } from "../packages/shared/src/index";
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline,
   sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
 import { captureFrontier, ensureCaptureFrontierSchema, CAPTURE_FRONTIER_SOURCES } from "../packages/collector-cli/src/capture-frontier";
@@ -31,6 +32,7 @@ function codexFile(directory: string, id: string, amounts: Array<[number, number
   fs.mkdirSync(day, { recursive: true, mode: 0o700 });
   const file = path.join(day, `rollout-2026-01-02T00-00-00-${id}.jsonl`);
   const lines = [JSON.stringify({ type: "session_meta", timestamp: "2026-01-02T00:00:00.000Z", payload: { id } }),
+    JSON.stringify({ type: "turn_context", timestamp: "2026-01-02T00:00:00.500Z", payload: { turn_id: "turn-a", model: "gpt-6-sol" } }),
     JSON.stringify({ type: "event_msg", timestamp: "2026-01-02T00:00:01.000Z", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 0, output_tokens: 0 } } } }),
     ...amounts.map(([input, output], index) => JSON.stringify({
       type: "event_msg", timestamp: `2026-01-02T00:00:${String(index + 2).padStart(2, "0")}.000Z`,
@@ -80,15 +82,17 @@ function priorTailerRow(buffer: LocalEventBuffer, session: string) {
   const id = deterministicEventId(["codex-rollout", session, "1"]);
   buffer.database.prepare(`insert into buffered_events
     (id, source, event_type, data_mode, observed_at, payload_json,
-     suppressed_fields_json, created_at, session_id, input_tokens, output_tokens, uploaded_at)
+     suppressed_fields_json, created_at, session_id, model, input_tokens, output_tokens, uploaded_at)
     values (?, 'codex', 'usage_rollout', 'metadata', '2026-01-02T00:00:02.000Z', '{}', '[]',
-      '2026-01-02T00:00:03.000Z', ?, 100, 10, '2026-01-02T00:00:04.000Z')`).run(id, session);
+      '2026-01-02T00:00:03.000Z', ?, 'gpt-6-sol', 100, 10, '2026-01-02T00:00:04.000Z')`).run(id, session);
   buffer.database.prepare(`insert into session_usage_authority values ('codex', ?, 'tailer', '2026-01-02T00:00:03.000Z')`).run(session);
 }
 function codexSightingDigest(session: string, id: string) {
   return captureRootObservationPayloadDigest({ source: "codex", id, sessionId: session,
     observedAt: "2026-01-02T00:00:02.000Z", inputTokens: 100, outputTokens: 10,
-    cacheReadTokens: 0 });
+    model: "gpt-6-sol", cacheReadTokens: 0,
+    costUsd: estimateCostUsd({ model: "gpt-6-sol", inputTokens: 100, outputTokens: 10,
+      cacheReadTokens: 0 })?.costUsd });
 }
 async function main() {
   const home = path.join(root, "home");
