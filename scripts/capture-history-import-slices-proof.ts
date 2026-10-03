@@ -76,7 +76,7 @@ async function main() {
     const receipt = await applyCaptureHistory(buffer, captureRoot);
     assert.equal(receipt.importedRows, 508);
     assert.ok(receipt.timeBudgetStops > 0, "writer deadline was exercised");
-    assert.ok(receipt.maxWriterSliceMs < 250, "writer slice exceeded 250 ms");
+    assert.ok(receipt.maxWriterSliceMs < 250, `writer slice exceeded 250 ms: max ${receipt.maxWriterSliceMs} ms over ${receipt.writerSlices} slices, histogram ${JSON.stringify(receipt.writerSliceHistogram)}`);
     assert.ok(receipt.writerSlices > 1);
     assert.equal(Object.values(receipt.writerSliceHistogram).reduce((a, b) => a + b, 0), receipt.writerSlices);
     const totals = buffer.database.prepare(`select count(*) as rows,sum(input_tokens) as input,
