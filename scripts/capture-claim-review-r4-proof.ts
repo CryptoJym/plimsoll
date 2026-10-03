@@ -98,7 +98,7 @@ function event(observedMs: number) {
   return aiInteractionEventSchema.parse({
     id: `00000000-0000-4000-8000-${String(710_000 + eventIndex).padStart(12, "0")}`,
     sessionId: `00000000-0000-4000-8000-${String(610_000 + eventIndex).padStart(12, "0")}`,
-    source: "codex", dataMode: "metadata", eventType: "assistant_response", observedAt: iso(observedMs),
+    source: "codex", model: "gpt-6-sol", dataMode: "metadata", eventType: "assistant_response", observedAt: iso(observedMs),
     actionClass: "other", inputTokens: 3, outputTokens: 1, metadata: { proof: "capture-claim-review-r4" },
   });
 }
