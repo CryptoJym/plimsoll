@@ -126,6 +126,8 @@ export type RolloutScanResult = {
   bytesDeferred: number;
   sessionsSkippedOtlpCovered: number;
   eventsAppended: number;
+  /** Plan readings with no account at their observation time; never queued. */
+  planLimitReadingsSkippedNoAccount?: number;
   enrollmentExcludedEvents?: number;
   /**
    * Admitted rewrites whose rollout record timestamp or file-mtime fallback sat
@@ -392,6 +394,7 @@ function resultMutationSnapshot(result: RolloutScanResult) {
     tokensUnvalidated: { ...(result.tokensUnvalidated ?? { input: 0, cachedInput: 0, output: 0 }) },
     enrollmentExcludedEvents: result.enrollmentExcludedEvents,
     futureTimestampClampedEvents: result.futureTimestampClampedEvents,
+    planLimitReadingsSkippedNoAccount: result.planLimitReadingsSkippedNoAccount ?? 0,
   };
 }
 
@@ -408,6 +411,30 @@ function restoreResultMutationSnapshot(
   result.tokensUnvalidated = { ...snapshot.tokensUnvalidated };
   result.enrollmentExcludedEvents = snapshot.enrollmentExcludedEvents;
   result.futureTimestampClampedEvents = snapshot.futureTimestampClampedEvents;
+  result.planLimitReadingsSkippedNoAccount = snapshot.planLimitReadingsSkippedNoAccount;
+}
+
+const ROLLOUT_COMMIT_ERROR_CLASSES = new Set([
+  "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError",
+  "URIError", "AggregateError", "ZodError", "SqliteError",
+]);
+const ROLLOUT_COMMIT_MESSAGE_CODES = new Set([
+  "rollout_slice_parse_failed", "maintenance_progress_budget_exhausted",
+  "capture_generation_changed_before_commit", "rollout_repo_context_binding_failed",
+]);
+
+/** Error text can contain source values. Only finite, exact internal codes may
+ * be copied; all other messages remain represented by their hash. */
+function rolloutCommitDiagnostic(error: unknown) {
+  const candidate = error && typeof error === "object"
+    ? error as { constructor?: { name?: string }; message?: unknown } : undefined;
+  const name = candidate?.constructor?.name ?? "UnknownError";
+  const errorClass = ROLLOUT_COMMIT_ERROR_CLASSES.has(name) ? name : "UnknownError";
+  const rawMessage = typeof candidate?.message === "string" ? candidate.message
+    : typeof error === "string" ? error : errorClass;
+  const message = ROLLOUT_COMMIT_MESSAGE_CODES.has(rawMessage) ? rawMessage : "[redacted error message]";
+  return { errorClass, message,
+    messageHash: maintenanceCandidateHash(rawMessage) };
 }
 
 export class RolloutTailer {
@@ -657,6 +684,7 @@ export class RolloutTailer {
       bytesDeferred: 0,
       sessionsSkippedOtlpCovered: 0,
       eventsAppended: 0,
+      planLimitReadingsSkippedNoAccount: 0,
       tokensAppended: { input: 0, cachedInput: 0, output: 0 },
       unvalidatedFirstRows: 0,
       tokensUnvalidated: { input: 0, cachedInput: 0, output: 0 },
@@ -1309,7 +1337,10 @@ export class RolloutTailer {
             result.recordsCommitted = (result.recordsCommitted ?? 0) + read.lines.length;
             result.slicesCommitted += 1;
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
-          } catch {
+          } catch (error) {
+            console.error(JSON.stringify({ status: "rollout_commit_error",
+              ...rolloutCommitDiagnostic(error), fileHandleHash: maintenanceCandidateHash(candidate.file),
+              offset: read.committedSourceSpan?.offset ?? cursor?.committedOffset ?? 0 }));
             this.activeCaptureRoot = activeRootBefore;
             this.activeCarriedBytes = carriedBytesBefore;
             this.activeReplacementCutoverAt = cutoverBefore;
@@ -1768,6 +1799,10 @@ export class RolloutTailer {
       const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
       const accountKey = this.accountBindings.keyAt(accountHome,
         clamped.clamped ? undefined : clamped.observedAt, this.accountObservedAtMs);
+      if (!accountKey) {
+        result.planLimitReadingsSkippedNoAccount = (result.planLimitReadingsSkippedNoAccount ?? 0) + 1;
+        continue;
+      }
       if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
         window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
         planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;

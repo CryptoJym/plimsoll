@@ -620,9 +620,27 @@ export function runMaintenanceRegressionContract(
   const stalledCadenceBackoffProved = names.includes(
     "successful_stalled_baseline_returns_to_normal_cadence",
   );
+  // This fixture deliberately exhausts one rollout commit budget. Retain the
+  // diagnostic and admit only its exact content-free six-field contract.
+  let expectedCommitDiagnostic = false;
+  try {
+    const lines = (result.stderr ?? "").trim().split("\n");
+    const diagnostic = lines.length === 1 ? JSON.parse(lines[0]) as Record<string, unknown> : null;
+    const code = "maintenance_progress_budget_exhausted";
+    expectedCommitDiagnostic = Boolean(diagnostic &&
+      Object.keys(diagnostic).sort().join(",") === "errorClass,fileHandleHash,message,messageHash,offset,status" &&
+      diagnostic.status === "rollout_commit_error" && diagnostic.errorClass === "Error" &&
+      diagnostic.message === code && diagnostic.messageHash === "sha256:" + createHash("sha256")
+        .update("plimsoll-maintenance-candidate-v1\0").update(code).digest("hex") &&
+      typeof diagnostic.fileHandleHash === "string" && /^sha256:[a-f0-9]{64}$/.test(diagnostic.fileHandleHash) &&
+      Number.isSafeInteger(diagnostic.offset) && (diagnostic.offset as number) >= 0);
+  } catch {
+    // Unexpected stderr fails this required scenario; never normalize it away.
+  }
   const passed =
     result.status === 0 &&
     !result.error &&
+    expectedCommitDiagnostic &&
     receipt.status === "pass" &&
     typeof receipt.checks === "number" &&
     receipt.checks === names.length &&
