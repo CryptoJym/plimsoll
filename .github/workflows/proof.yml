@@ -9,17 +9,16 @@ concurrency:
   group: proof-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  TZ: UTC
+
+# Self-hosted runner labels don't imply a shell, so name it: bash with errexit, as on GitHub's macOS image.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   proof:
     # James, 3 Oct 2026 12:05 MDT: no CI on GitHub's cloud; every check runs on our own machines.
     runs-on: [self-hosted, macOS, ARM64, plimsoll]
-    env:
-      # These runner hosts also run a LIVE Plimsoll collector. The two proofs that drive the real
-      # launchd/collector supervision are skipped here with a visible notice (the lanes' live-host rule).
-      PLIMSOLL_CI_LIVE_COLLECTOR_HOST: "1"
     # Allow the measured sequential artifact, repeated E2E and resource gates.
     # Per-proof deadlines and acceptance thresholds remain unchanged. A full run
     # took about 56 minutes on 30 Sep 2026, so 60 cut off healthy runs.
@@ -245,15 +244,6 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:doctor-stale-producers
 
-      - name: Prove atomic no-follow LaunchAgent manifest lifecycle
-        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        run: |
-          if [ -n "${PLIMSOLL_CI_LIVE_COLLECTOR_HOST:-}" ]; then
-            echo "::notice title=Skipped on a live-collector host::proof:launch-agent drives the real launchd; it needs an isolated runner"
-          else
-            pnpm proof:launch-agent
-          fi
-
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:packaged-runtime
@@ -270,11 +260,6 @@ jobs:
         run: |
           pnpm --dir packages/collector-cli build
           pnpm proof:launch-agent-unload
-          if [ -n "${PLIMSOLL_CI_LIVE_COLLECTOR_HOST:-}" ]; then
-            echo "::notice title=Skipped on a live-collector host::proof:collector-supervision drives the real collector supervision; it needs an isolated runner"
-          else
-            pnpm proof:collector-supervision
-          fi
 
       - name: Prove lifecycle receipts separate wrapper ownership and collector readiness (#148)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -1419,6 +1404,4 @@ jobs:
       - name: Build and test the macOS menubar app (#12)
         env:
           DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
-        run: |
-          xcodebuild -version
-          pnpm proof:mac-menubar
+        run: pnpm proof:mac-menubar

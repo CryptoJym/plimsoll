@@ -13,6 +13,12 @@ import {
   type LaunchAgentOptions,
 } from "../packages/collector-cli/src/launch-agent";
 
+// Refuse unless the operator confirms a Mac with no live Plimsoll collector: this proof drives the
+// real launchd/collector supervision. Our CI runners run a live collector (eco-6hoxj.165.179).
+if (process.env.PLIMSOLL_ISOLATED_LAUNCHD_HOST !== "1") {
+  throw new Error("refusing: set PLIMSOLL_ISOLATED_LAUNCHD_HOST=1 only on a Mac with no live Plimsoll collector");
+}
+
 type Check = { name: string; passed: true; details: Record<string, unknown> };
 
 const checks: Check[] = [];
