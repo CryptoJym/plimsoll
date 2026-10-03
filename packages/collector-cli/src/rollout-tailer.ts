@@ -414,34 +414,27 @@ function restoreResultMutationSnapshot(
   result.planLimitReadingsSkippedNoAccount = snapshot.planLimitReadingsSkippedNoAccount;
 }
 
-/** Error text can contain source values. Preserve known code/schema diagnostics
- * and hash other messages rather than putting private values in collector logs. */
+const ROLLOUT_COMMIT_ERROR_CLASSES = new Set([
+  "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError",
+  "URIError", "AggregateError", "ZodError", "SqliteError",
+]);
+const ROLLOUT_COMMIT_MESSAGE_CODES = new Set([
+  "rollout_slice_parse_failed", "maintenance_progress_budget_exhausted",
+  "capture_generation_changed_before_commit", "rollout_repo_context_binding_failed",
+]);
+
+/** Error text can contain source values. Only finite, exact internal codes may
+ * be copied; all other messages remain represented by their hash. */
 function rolloutCommitDiagnostic(error: unknown) {
   const candidate = error && typeof error === "object"
-    ? error as { constructor?: { name?: string }; code?: unknown; message?: unknown;
-      issues?: Array<{ code?: unknown; path?: unknown[] }> } : undefined;
+    ? error as { constructor?: { name?: string }; message?: unknown } : undefined;
   const name = candidate?.constructor?.name ?? "UnknownError";
-  const errorClass = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "UnknownError";
+  const errorClass = ROLLOUT_COMMIT_ERROR_CLASSES.has(name) ? name : "UnknownError";
   const rawMessage = typeof candidate?.message === "string" ? candidate.message
     : typeof error === "string" ? error : errorClass;
-  let message = "[redacted error message]";
-  if (/^(?:capture|jsonl|rollout|repo_context|maintenance|account_binding)_[a-z0-9_]{1,160}$/.test(rawMessage) ||
-      /^(?:no such (?:table|column): [A-Za-z_][A-Za-z0-9_.]*|(?:NOT NULL|UNIQUE) constraint failed: [A-Za-z_][A-Za-z0-9_.]*(?:, [A-Za-z_][A-Za-z0-9_.]*)*|database (?:is locked|table is locked))$/.test(rawMessage)) {
-    message = rawMessage;
-  } else if (errorClass === "ZodError" && Array.isArray(candidate?.issues)) {
-    const fields = new Set(["id", "sessionId", "tenantId", "actorId", "source", "dataMode", "eventType",
-      "observedAt", "model", "actionClass", "inputTokens", "outputTokens", "cacheReadTokens",
-      "cacheCreationTokens", "costUsd", "costKind", "metadata"]);
-    message = "schema validation failed: " + candidate.issues.slice(0, 8).map(issue => {
-      const code = typeof issue.code === "string" && /^[a-z_]{1,40}$/.test(issue.code) ? issue.code : "invalid";
-      const field = issue.path?.[0];
-      return `${code} at ${typeof field === "string" && fields.has(field) ? field : "[field]"}`;
-    }).join("; ");
-  }
+  const message = ROLLOUT_COMMIT_MESSAGE_CODES.has(rawMessage) ? rawMessage : "[redacted error message]";
   return { errorClass, message,
-    messageHash: maintenanceCandidateHash(rawMessage),
-    ...(typeof candidate?.code === "string" && /^SQLITE_[A-Z_]{1,64}$/.test(candidate.code)
-      ? { errorCode: candidate.code } : {}) };
+    messageHash: maintenanceCandidateHash(rawMessage) };
 }
 
 export class RolloutTailer {

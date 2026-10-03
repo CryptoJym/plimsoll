@@ -102,7 +102,11 @@ export const rolloutTokenCountCases: Array<{ name: string; run: () => Promise<vo
     const diagnostic = JSON.parse(logs[0]);
     assert.equal(diagnostic.status, "rollout_commit_error");
     assert.equal(diagnostic.errorClass, "SqliteError");
-    assert.equal(diagnostic.errorCode, "SQLITE_CONSTRAINT_TRIGGER");
+    assert.deepEqual(Object.keys(diagnostic).sort(),
+      ["errorClass", "fileHandleHash", "message", "messageHash", "offset", "status"]);
+    assert.equal(diagnostic.message, "[redacted error message]");
+    assert.equal(diagnostic.messageHash, "sha256:" + crypto.createHash("sha256")
+      .update("plimsoll-maintenance-candidate-v1\0" + sentinel).digest("hex"));
     assert.equal(diagnostic.offset, 0);
     assert.equal(diagnostic.fileHandleHash, "sha256:" + crypto.createHash("sha256")
       .update("plimsoll-maintenance-candidate-v1\0" + file).digest("hex"));
