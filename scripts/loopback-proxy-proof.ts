@@ -105,7 +105,7 @@ function seedUpload(home: string, uploadUrl?: string) {
     uploadSigningSecret: "fixture-loopback-signing-secret-0123456789", ...(uploadUrl ? { uploadUrl } : {}) }), { mode: 0o600 });
   const buffer = new LocalEventBuffer(path.join(collectorHome, "work-ledger.sqlite"), { workspaceId: tenantId });
   try {
-    buffer.append(aiInteractionEventSchema.parse({ id: uuid(100), sessionId: uuid(101), source: "codex",
+    buffer.append(aiInteractionEventSchema.parse({ id: uuid(100), sessionId: uuid(101), source: "codex", model: "gpt-6-sol",
       eventType: "assistant_response", observedAt: new Date().toISOString(), inputTokens: 7 }));
   } finally {
     buffer.close();
