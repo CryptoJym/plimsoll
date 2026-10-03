@@ -72,9 +72,10 @@ test("helper guard: the ladder test's premise (receipts-and-ladder 2): three row
     const lineage = db.prepare("select e.id as id, e.created_at as createdAt, o.raw_created_at as rawCreatedAt from buffered_events e join upload_outbox o on o.raw_id = e.id order by e.rowid").all() as Array<{ id: string; createdAt: string; rawCreatedAt: string }>;
     assert.equal(lineage.length, 4, "every appended row has an outbox row");
     assert.deepEqual(lineage.slice(0, 3).map((r) => [r.createdAt, r.rawCreatedAt]), old.map(() => [EPOCH_STARTED_AT, EPOCH_STARTED_AT]), "the old rows are old by created_at and the outbox lineage agrees");
-    const lease = buffer.delivery.lease({ leaseId: "lean-contract-lease", now: new Date() });
+    const afterPairWait = new Date(Date.now() + 61_000);
+    const lease = buffer.delivery.lease({ leaseId: "lean-contract-lease", now: afterPairWait });
     assert.deepEqual([lease.items.length, lease.locallyDead], [4, 0], "all four lease; none is dead-lettered as a lineage violation");
-    const ack = buffer.delivery.acknowledge(lease.leaseId, [old[0].id, old[1].id, recent.id], new Date());
+    const ack = buffer.delivery.acknowledge(lease.leaseId, [old[0].id, old[1].id, recent.id], afterPairWait);
     assert.deepEqual([ack.acknowledged, ack.markedUploaded], [3, 3]);
     assert.equal((db.prepare("select count(*) as n from upload_receipts where terminal_state = 'acknowledged'").get() as { n: number }).n, 3);
     assert.equal((db.prepare("select count(*) as n from buffered_events where uploaded_at is not null").get() as { n: number }).n, 3);
@@ -87,9 +88,10 @@ test("helper guard: the retention test's premise (conversion-rejects 2): a raw r
     const db = buffer.database;
     const x1 = event({ eventType: "usage_rollout", observedAt: "2026-09-26T00:00:00.000Z" });
     assert.equal(buffer.append(x1), true);
-    const lease = buffer.delivery.lease({ leaseId: "lean-contract-lease", now: new Date() });
+    const afterPairWait = new Date(Date.now() + 61_000);
+    const lease = buffer.delivery.lease({ leaseId: "lean-contract-lease", now: afterPairWait });
     assert.equal(lease.items.length, 1);
-    assert.equal(buffer.delivery.acknowledge(lease.leaseId, [x1.id], new Date()).acknowledged, 1);
+    assert.equal(buffer.delivery.acknowledge(lease.leaseId, [x1.id], afterPairWait).acknowledged, 1);
     const row = db.prepare("select uploaded_at as uploadedAt from buffered_events where id = ?").get(x1.id) as { uploadedAt: string | null };
     assert.ok(row.uploadedAt, "uploaded_at is set");
     const receipt = db.prepare("select terminal_state as state from upload_receipts where delivery_id = ?").get(x1.id) as { state: string } | undefined;
