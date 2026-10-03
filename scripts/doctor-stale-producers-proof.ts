@@ -727,6 +727,8 @@ async function main() {
     check("one_shot_status_names_the_stale_producer_count", valid.code === 0 &&
       withoutDefaultHomeNote(validJson.captureHealth.staleProducers) === "3 producer process(es) older than their managed config" + doctorHint &&
       !valid.stdout.includes(outsideCodexHome) && !valid.stdout.includes(CANARY), { code: valid.code, captureHealth: validJson.captureHealth });
+    check("one_shot_status_writer_identity_ignores_shadowed_ps", !fs.existsSync(stubLog),
+      fs.existsSync(stubLog) ? fs.readFileSync(stubLog, "utf8") : null);
     const attribution = { homeSource: "default", count: 1, of: 3 };
     const liveBody = liveDefaultHome.body.captureHealth as typeof liveDefaultHome.body.captureHealth & { staleProducerAttribution?: unknown };
     check("status_reason_discloses_default_home_attribution",

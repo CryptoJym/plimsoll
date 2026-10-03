@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 
 import type Database from "better-sqlite3";
+import { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
 
 import type { WalCheckpointCounts } from "./startup-wal-self-heal";
 
@@ -197,7 +198,11 @@ export class WalCheckpointWorker {
   }
 
   private spawn() {
-    const worker = new Worker(workerSource, {
+    // Reserve before the independent worker can open SQLite. A rebuild sees
+    // this token even if it scans lsof before the worker's open completes.
+    const openToken = acquireRebuildOpenToken(this.database.name);
+    let worker: Worker;
+    try { worker = new Worker(workerSource, {
       eval: true,
       execArgv: [],
       workerData: {
@@ -207,13 +212,14 @@ export class WalCheckpointWorker {
         heldFrames: WAL_HELD_FRAMES,
         fullBusyTimeoutMs: FULL_BUSY_TIMEOUT_MS,
       },
-    });
+    }); } catch (error) { releaseRebuildOpenToken(openToken); throw error; }
     worker.unref();
     worker.on("message", (reply: PassReply) => this.record(reply));
     worker.once("error", () => {
       if (this.worker === worker) this.replace("error");
     });
     worker.once("exit", () => {
+      releaseRebuildOpenToken(openToken);
       if (this.worker === worker && this.timer) this.replace("exit");
     });
     return worker;

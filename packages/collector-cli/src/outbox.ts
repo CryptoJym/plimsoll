@@ -229,10 +229,14 @@ export type DeliveryCaptureClaim = {
   withheld: number;
   /** At most CAPTURE_CLAIM_MAX_GAPS closed intervals in which data is known to be missing. */
   gaps: Array<{ from: string; to: string }>;
+  /** Visible older-binary retries retired without exact digest evidence. */
+  unverifiedHookRetries?: number;
+  unknownHookReceiptFormats?: number;
 };
 
 /** Why a claim attests nothing (review r2 B3): the cloud withdraws what it held. */
 export type CaptureUnattestedReason =
+  | "maintenance_rebuild"
   | "migration_incomplete"
   | "over_row_budget"
   | "spool_unreadable"
@@ -620,7 +624,8 @@ export class DeliveryOutbox {
       const spoolLosses = (spool?.losses ?? []).filter((loss) => loss.toMs >= epochStartMs);
       const receiptLineageComplete = this.receiptLineageComplete();
       const unattested: CaptureUnattestedReason | null =
-        control.migrationComplete !== 1 || !receiptLineageComplete ? "migration_incomplete"
+        spool?.maintenanceRebuildPending ? "maintenance_rebuild"
+          : control.migrationComplete !== 1 || !receiptLineageComplete ? "migration_incomplete"
           : overBudget ? "over_row_budget"
             : spool === null || spool.unreadable ? "spool_unreadable"
               : frontier.capturedThrough === null ? "frontier_unknown"
@@ -663,6 +668,10 @@ export class DeliveryOutbox {
         dead: lost.dead + spoolLosses.reduce((total, loss) => total + loss.count, 0),
         withheld: lost.withheld,
         gaps: gaps.map((gap) => ({ from: new Date(gap.fromMs).toISOString(), to: new Date(gap.toMs).toISOString() })),
+        ...((spool?.unverifiedHookRetries ?? 0) > 0
+          ? { unverifiedHookRetries: spool!.unverifiedHookRetries } : {}),
+        ...((spool?.unknownHookReceiptFormats ?? 0) > 0
+          ? { unknownHookReceiptFormats: spool!.unknownHookReceiptFormats } : {}),
       };
     });
     return run.immediate();

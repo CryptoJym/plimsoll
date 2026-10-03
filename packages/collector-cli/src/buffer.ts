@@ -5,11 +5,14 @@ import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallati
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { performance } from "node:perf_hooks";
 import type { Worker } from "node:worker_threads";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
+import { acquireRebuildOpenToken, acquireRebuildWriterLeases,
+  releaseRebuildOpenToken, releaseRebuildWriterLeases } from "./maintenance-rebuild";
 import { advanceCaptureBaselineEnrollment } from "./capture-baseline";
 import { captureRootEventInstallationEpoch, promoteClaudeRootSightingsForRaw,
   promoteLegacyClaudeRootSightings } from "./capture-root-inventory";
@@ -42,6 +45,7 @@ import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFin
   advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
 import { legacyNullLineageReceiptMatchSql, terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
+import { ensureMaintenanceHookAdmissionSchema, pruneRetiredMaintenanceHookAdmissions } from "./maintenance-hook-admission";
 import {
   canonicalRepoContextCwd,
   peekRepoContextSidecar,
@@ -223,6 +227,8 @@ export class LocalEventBuffer {
   private claudeReplayRootSetJson="[]";
   private readonly deferredClaudeHookIds=new Set<string>();
   private readonly db: Database.Database;
+  private rebuildWriterLease: string | null = null;
+  private rebuildOpenToken: string | null = null;
   private readonly enrollmentNow: () => Date;
   private workspaceId: string | null = null;
   private deviceId: string | null = null;
@@ -305,23 +311,28 @@ export class LocalEventBuffer {
     if (options.freshCaptureRootEpoch === null && !fs.existsSync(path)) {
       throw new Error("fresh_ledger_capture_root_epochs_conflict");
     }
+    this.rebuildOpenToken = acquireRebuildOpenToken(path);
+    let openedDb: Database.Database | null = null;
     try {
-      this.db = options.startupBusyDeadlineMs === undefined
-        ? openLedgerDatabase(path, { timeout: remainingOpenWait() })
-        : openLedgerDatabaseForStartup(path, { timeout: remainingOpenWait() }, options.startupBusyDeadlineMs);
-    }
-    catch (error) {
-      if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
-        // A known foreign handle cannot be made safe by retrying or restoring.
-        if ((error as { cause?: { code?: string } }).cause?.code === "LEDGER_ARCHIVE_HANDLE_IN_USE") throw error;
-        recoverInvalidLedgerPublication(path);
-        throw new Error("replacement_verification_failed; archive restored; collector start refused", { cause: error });
+      try {
+        this.db = openedDb = options.startupBusyDeadlineMs === undefined
+          ? openLedgerDatabase(path, { timeout: remainingOpenWait() })
+          : openLedgerDatabaseForStartup(path, { timeout: remainingOpenWait() }, options.startupBusyDeadlineMs);
       }
-      throw error;
-    }
-    // An interrupted rename must not admit a first scan before the post-swap
-    // file-generation fences are durable. Restore can still open it directly.
-    try {
+      catch (error) {
+        if ((error as { code?: string }).code === "LEDGER_PUBLICATION_INVALID") {
+          // A known foreign handle cannot be made safe by retrying or restoring.
+          // The outer cleanup releases the open token for this refusal.
+          if ((error as { cause?: { code?: string } }).cause?.code === "LEDGER_ARCHIVE_HANDLE_IN_USE") throw error;
+          releaseRebuildOpenToken(this.rebuildOpenToken);
+          this.rebuildOpenToken = null;
+          recoverInvalidLedgerPublication(path);
+          throw new Error("replacement_verification_failed; archive restored; collector start refused", { cause: error });
+        }
+        throw error;
+      }
+      // An interrupted rename must not admit a first scan before the post-swap
+      // file-generation fences are durable. Restore can still open it directly.
       const replacement = this.db.prepare(`select 1 from sqlite_master
         where type='table' and name='collector_replacement_ledger'`).get();
       if (replacement) {
@@ -334,11 +345,6 @@ export class LocalEventBuffer {
           : undefined;
         if (pending?.pending !== 0) throw new Error("replacement_post_switch_fence_pending");
       }
-    } catch (error) {
-      this.db.close();
-      throw error;
-    }
-    try {
       registerRetentionDeliveryId(this.db);
       // A second first opener can see SQLITE_BUSY while the first changes the
       // file into WAL mode. SQLite does not always apply busy_timeout to this
@@ -358,10 +364,6 @@ export class LocalEventBuffer {
           Atomics.wait(busyWait, 0, 0, 10);
         }
       }
-    } catch (error) {
-      this.db.close();
-      throw error;
-    }
     this.deviceId = options.deviceId?.trim() || null;
     // All open-time schema reads and writes must share one writer lock. On a
     // first open, another process can otherwise read the same missing column
@@ -731,6 +733,7 @@ export class LocalEventBuffer {
       end;
     `);
     markOpenStep("ledger.privacy_schema");
+    ensureMaintenanceHookAdmissionSchema(this.db);
     this.delivery = new DeliveryOutbox(this.db, {
       ...(options.delivery ?? {}),
       deviceId: options.deviceId,
@@ -1026,24 +1029,25 @@ export class LocalEventBuffer {
     markOpenStep("ledger.projection_schema");
     this.db.exec("COMMIT");
     } catch (error) {
-      try {
-        if (this.db.inTransaction) this.db.exec("ROLLBACK");
-      } finally {
-        this.db.close();
-      }
+      if (this.db.inTransaction) this.db.exec("ROLLBACK");
       throw error;
     }
-    try {
-      // Small upgrades finish at open; large ledgers advance in bounded upload
-      // and retention turns, independently of the completed raw cursor.
-      if (options.startupBusyDeadlineMs !== undefined)
-        this.db.pragma(`busy_timeout = ${remainingOpenWait()}`);
-      this.delivery.backfillLegacyReceiptLineage({ maxRows: 16, maxWriterMs: 50 });
-      markOpenStep("ledger.receipt_lineage_slice");
-      if (options.startupBusyDeadlineMs !== undefined)
-        this.db.pragma(`busy_timeout = ${timeout}`);
+    // Small upgrades finish at open; large ledgers advance in bounded upload
+    // and retention turns, independently of the completed raw cursor.
+    if (options.startupBusyDeadlineMs !== undefined)
+      this.db.pragma(`busy_timeout = ${remainingOpenWait()}`);
+    this.delivery.backfillLegacyReceiptLineage({ maxRows: 16, maxWriterMs: 50 });
+    markOpenStep("ledger.receipt_lineage_slice");
+    // Keep the startup deadline through the rebuild writer lease. Another
+    // first opener may still hold its schema transaction after our commit.
+    this.rebuildWriterLease = acquireRebuildWriterLeases(this.db, path);
+    if (options.startupBusyDeadlineMs !== undefined)
+      this.db.pragma(`busy_timeout = ${timeout}`);
     } catch (error) {
-      this.db.close();
+      try { if (openedDb?.inTransaction) openedDb.exec("ROLLBACK"); } catch { /* cleanup must continue */ }
+      try { openedDb?.close(); } catch { /* the open may already have failed */ }
+      releaseRebuildOpenToken(this.rebuildOpenToken);
+      this.rebuildOpenToken = null;
       throw error;
     }
   }
@@ -2900,7 +2904,8 @@ export class LocalEventBuffer {
   append(
     event: AiInteractionEvent,
     suppressedFields: string[] | undefined,
-    options: { integrityReceipt: true; firstReceivedAt?: string; historyImportNoLiveSibling?: boolean },
+    options: { integrityReceipt: true; firstReceivedAt?: string; historyImportNoLiveSibling?: boolean;
+      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent, inserted: boolean) => void },
   ): {
     appended: boolean;
     deduplicated?: true;
@@ -2911,7 +2916,8 @@ export class LocalEventBuffer {
     event: AiInteractionEvent,
     suppressedFields: string[] = [],
     options: { integrityReceipt?: boolean; firstReceivedAt?: string;
-      historyImportNoLiveSibling?: boolean } = {},
+      historyImportNoLiveSibling?: boolean;
+      onCommittedAppend?: (db: Database.Database, event: AiInteractionEvent, inserted: boolean) => void } = {},
   ) {
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
@@ -2923,6 +2929,8 @@ export class LocalEventBuffer {
         if(appended.appended && this.deferredClaudeHookIds.has(event.id))
           this.db.prepare(`insert or ignore into claude_replay_hooks(event_id,status,created_at,root_set_json)
             values(?,'pending',?,?)`).run(event.id,new Date().toISOString(),this.claudeReplayRootSetJson);
+        if (appended.appended || appended.deduplicated)
+          options.onCommittedAppend?.(this.db, event, appended.appended);
         const reserved = this.reserveRepoContextHandoff(
           appended.repoContextRequest,
           handoffs,
@@ -3500,6 +3508,7 @@ export class LocalEventBuffer {
             continue;
           }
         }
+        pruneRetiredMaintenanceHookAdmissions(this.db, path.dirname(this.db.name), row.eventId);
         if (row.source === "claude_code")
           promoteClaudeRootSightingsForRaw(this.db, row.eventId);
         recordExpiry.run({
@@ -3828,32 +3837,58 @@ export class LocalEventBuffer {
     if (this.retentionHoldCountClosed) return this.retentionHoldClose ?? undefined;
     this.retentionHoldCountClosed = true;
     this.retentionHoldCountChanged = null;
+    const closeDatabase = () => {
+      try {
+        if (this.rebuildWriterLease) {
+          // The fresh-ledger inode guard closes a displaced handle before it
+          // raises LEDGER_REPLACED. Never issue lease SQL through that closed
+          // (or newly displaced) handle during shutdown; its owner exits and
+          // the old archive's dead lease is reaped by rebuild recovery.
+          if (this.db.open) {
+            try { releaseRebuildWriterLeases(this.db, this.rebuildWriterLease); }
+            catch (error) {
+              if ((error as { code?: string }).code !== "LEDGER_REPLACED") throw error;
+            }
+          }
+          this.rebuildWriterLease = null;
+        }
+      } finally {
+        try { this.db.close(); }
+        finally {
+          releaseRebuildOpenToken(this.rebuildOpenToken);
+          this.rebuildOpenToken = null;
+        }
+      }
+    };
     const workers = [...this.retentionHoldWorkers];
     if (workers.length === 0) {
-      this.db.close();
+      closeDatabase();
       return;
     }
     // A count can settle before its worker exits, and a later recount can start
     // another worker. Keep the parent barrier until all of them have exited.
     this.retentionHoldClose = (async () => {
-      await Promise.all(workers.map(async (task) => {
-        let timeout: ReturnType<typeof setTimeout> | undefined;
-        try {
-          const outcome = await Promise.race([
-            task.exited.then(() => "exited" as const),
-            new Promise<"timeout">((resolve) => {
-              timeout = setTimeout(() => resolve("timeout"), 1_000);
-            }),
-          ]);
-          if (outcome === "timeout") {
-            await task.worker.terminate();
-            await task.exited;
+      try {
+        await Promise.all(workers.map(async (task) => {
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const outcome = await Promise.race([
+              task.exited.then(() => "exited" as const),
+              new Promise<"timeout">((resolve) => {
+                timeout = setTimeout(() => resolve("timeout"), 1_000);
+              }),
+            ]);
+            if (outcome === "timeout") {
+              await task.worker.terminate();
+              await task.exited;
+            }
+          } finally {
+            if (timeout) clearTimeout(timeout);
           }
-        } finally {
-          if (timeout) clearTimeout(timeout);
-        }
-      }));
-      this.db.close();
+        }));
+      } finally {
+        closeDatabase();
+      }
     })();
     // Legacy callers may ignore close's return value; still observe failures.
     void this.retentionHoldClose.catch(() => undefined);

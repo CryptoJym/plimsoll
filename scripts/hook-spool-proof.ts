@@ -44,6 +44,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { hookBodyDigest } from "../packages/collector-cli/src/maintenance-hook-fingerprint";
 import {
   collectorConfigSchema,
   saveCollectorConfig,
@@ -1774,9 +1775,13 @@ function canaryHookBody(sessionId: string) {
 /**
  * Columns that cannot match between two rows and say nothing about the change:
  * `id` and `privacy_generation` are fresh UUIDs per append, `created_at` is
- * arrival time. Everything else is compared value for value.
+ * arrival time. The immutable body digest binds each row to its own caller
+ * body, including its different client-minted ID; compare that separately.
+ * Every preexisting ledger column remains in the parity comparison.
  */
-const ARRIVAL_ONLY_COLUMNS = new Set(["id", "created_at", "privacy_generation"]);
+const ARRIVAL_ONLY_COLUMNS = new Set([
+  "id", "created_at", "privacy_generation", "maintenance_hook_body_digest",
+]);
 
 function comparableRow(row: Record<string, unknown>) {
   const comparable: Record<string, unknown> = {};
@@ -1880,6 +1885,20 @@ async function casePrivacyBlankingKeepsTheLedgerIdentical() {
     const recoveredRow = rows[1] ? comparableRow(rows[1]) : {};
     const differing = Object.keys(liveRow).filter(
       (column) => JSON.stringify(liveRow[column]) !== JSON.stringify(recoveredRow[column]),
+    );
+    const rawLive = rows[0]!;
+    const rawRecovered = rows[1]!;
+    const liveOrigin = { ...(JSON.parse(body) as Record<string, unknown>), id: rawLive.id };
+    const spoolOrigin = spooledBody;
+    check(
+      "p_each_row_keeps_its_own_immutable_caller_body_digest",
+      typeof rawLive.maintenance_hook_body_digest === "string" &&
+        rawLive.maintenance_hook_body_digest === hookBodyDigest(liveOrigin) &&
+        typeof rawRecovered.maintenance_hook_body_digest === "string" &&
+        spoolOrigin !== null &&
+        rawRecovered.maintenance_hook_body_digest === hookBodyDigest(spoolOrigin),
+      { liveDigest: rawLive.maintenance_hook_body_digest,
+        recoveredDigest: rawRecovered.maintenance_hook_body_digest },
     );
     // The parity table is a deliverable: print it whatever the verdict, so a
     // mismatch names the exact column rather than hiding behind a boolean.

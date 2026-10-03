@@ -698,6 +698,15 @@ function json<T>(value: string): T {
 }
 
 export class DashboardProjectionStore {
+  /** Read-only rebuild check: compute the published snapshot from retained
+   * projection rows without running the constructor's schema migrations. */
+  static regenerateForRebuildVerification(db: Database.Database, days: number,
+    generation: number, publishedAt: Date) {
+    const reader = Object.create(DashboardProjectionStore.prototype) as DashboardProjectionStore;
+    Object.defineProperty(reader, "db", { value: db });
+    Object.defineProperty(reader, "captureStatements", { value: new Map<string, Database.Statement>() });
+    return reader.buildSnapshot(days, generation, publishedAt).snapshot;
+  }
   /** Set at open when the stored schema version is newer than this binary's. */
   private schemaNewerThanBinary = false;
   /** Set at open when the control table exists but its singleton row does not. */

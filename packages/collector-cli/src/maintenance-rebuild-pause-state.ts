@@ -1,0 +1,1077 @@
+import fs from "node:fs";
+import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import Database from "better-sqlite3";
+import { collectorConfigSchema, type CollectorConfig } from "./config";
+import { normalizeForwardedHook } from "./forwarder";
+import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
+import { classifyEventType, isUuid } from "./normalizer";
+import { withRebuildCoordination } from "./rebuild-coordination";
+import { acquireRebuildOpenToken, releaseRebuildOpenToken } from "./rebuild-open-gate";
+import { HOOK_ACK_LOOKUP_SQL, HOOK_ROW_LOOKUP_SQL, HOOK_ROW_LEGACY_LOOKUP_SQL,
+  ensureMaintenanceEventOrderSchema, ledgerAdmissionSequence, originalHookTimestampDigest,
+  removeMaintenanceHookAdmission,
+  sameHookIdentityPart } from "./maintenance-hook-admission";
+import { hookBodyDigest, hookBodyFromWire, hookReceiptFileName } from "./maintenance-hook-fingerprint";
+
+const MARKER = "maintenance-rebuild-pause.json";
+const REFUSALS = "maintenance-rebuild-refusals";
+const TERMINAL = "maintenance-rebuild-terminal.jsonl";
+type PauseMarker = { version: 1; at: string; pid?: number; endedAt?: string;
+  ledgerName?: "work-ledger.sqlite" | "ledger.sqlite"; ledgerHighWater?: number | null;
+  ledgerAdmissionSequence?: number | null; ledgerExistedAtPause?: boolean };
+
+type RefusalRoute = "hook" | "otlp" | "live";
+type RefusalReceipt = { version: number; route: RefusalRoute; at: string;
+  source?: string; eventId?: string; kind?: string; ledgerHighWater?: number | null;
+  eventDigest?: string | null; receiveClockFallback?: boolean;
+  receiptId?: string; sessionId?: string | null; originalTimestampDigest?: string | null;
+  bodyDigest?: string | null;
+  tenantId?: string; ledgerAdmissionSequence?: number | null;
+  ledgerAbsentAtRefusal?: boolean;
+  spoolName?: string; unknownAt?: string };
+/** The client writes its retry immediately after the response; the spool's
+ * ten-minute stale-pending diagnostic is our conservative missing-retry
+ * threshold. A durable receipt remains so later exact acceptance can heal it. */
+export const MISSING_HOOK_RETRY_MS = 600_000;
+// One monotonic budget for schema publication and the refusal boundary. Leave
+// headroom in the three-second HTTP budget for private receipt fsync + response.
+const REFUSAL_WAIT_MS = 2_000;
+type RefusalWaitMode = "synchronous" | "try" | "unknown";
+function beforeDeadline<T>(deadline: number, action: () => T,
+  mode: RefusalWaitMode = "synchronous"): T {
+  // HTTP requests use one immediate attempt per event-loop turn. Their caller
+  // schedules the retry with a timer, so other admitted requests can proceed.
+  if (mode !== "synchronous") return action();
+  const sleep = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    try { return action(); }
+    catch (error) {
+      if ((error as { code?: string }).code !== "SQLITE_BUSY" || performance.now() >= deadline) throw error;
+      Atomics.wait(sleep, 0, 0, Math.min(10, Math.max(0, deadline - performance.now())));
+    }
+  }
+}
+const SPOOL_NAME = /^\d{13,}-\d+-[0-9a-f]{6}\.json$/;
+function refusalDirectory(home: string) { return path.join(home, REFUSALS); }
+function refusalPath(home: string, route: RefusalRoute, source: string, body: string | Buffer) {
+  if (route === "hook") {
+    try {
+      return path.join(refusalDirectory(home), hookReceiptFileName(source, hookBodyDigest(hookBodyFromWire(body))));
+    } catch { /* Invalid JSON still has a terminal receipt keyed by its wire bytes. */ }
+  }
+  const digest = createHash("sha256").update(`${route}\0${source}\0`).update(body).digest("hex");
+  return path.join(refusalDirectory(home), `${digest}.receipt`);
+}
+function existingRefusalPath(home: string, route: RefusalRoute, source: string, body: string | Buffer) {
+  const current = refusalPath(home, route, source, body);
+  if (fs.existsSync(current) || route !== "hook") return current;
+  const legacyName = createHash("sha256").update(`${route}\0${source}\0`).update(body).digest("hex");
+  const legacy = path.join(refusalDirectory(home), `${legacyName}.receipt`);
+  return fs.existsSync(legacy) ? legacy : current;
+}
+function fsyncDirectory(directory: string) {
+  const descriptor = fs.openSync(directory, "r");
+  try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+}
+function sameEventId(left: string, right: string) {
+  return isUuid(left) && isUuid(right)
+    ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+function stableJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([key, entry]) => [key, stableJson(entry)]));
+}
+/** The payload_json column is JSON.stringify(canonical.event). Canonicalize
+ * object order and UUID spelling before hashing, so older drain versions and
+ * mixed-case producer UUIDs compare the same normalized event. A hook with no
+ * usable time alias gets its observedAt from the receiver clock; that clock
+ * is the one field a retry cannot repeat. Its sentinel is part of the digest
+ * basis, while every caller-controlled normalized field remains exact. */
+function normalizedEventDigest(event: Record<string, unknown>, receiveClockFallback: boolean) {
+  const comparable = { ...event,
+    id: typeof event.id === "string" && isUuid(event.id) ? event.id.toLowerCase() : event.id,
+    ...(receiveClockFallback ? { observedAt: "<receive-clock>" } : {}) };
+  return createHash("sha256").update(JSON.stringify(stableJson(comparable))).digest("hex");
+}
+function hookReceiptIdentity(home: string, source: string, body: string | Buffer,
+  eventId: string, config?: CollectorConfig) {
+  try {
+    const payload: unknown = JSON.parse(String(body));
+    const storedConfig = config ?? (() => {
+      try {
+        return collectorConfigSchema.parse(JSON.parse(fs.readFileSync(path.join(home, "collector.config.json"), "utf8")));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return collectorConfigSchema.parse({});
+        throw error;
+      }
+    })();
+    const options = { config: storedConfig,
+      source: source as Parameters<typeof normalizeForwardedHook>[1]["source"],
+      producerEventId: eventId };
+    const atMs = Date.now();
+    const event = normalizeForwardedHook(payload, { ...options, now: () => atMs }).event;
+    const next = normalizeForwardedHook(payload, { ...options, now: () => atMs + 1_000 }).event;
+    const receiveClockFallback = event.observedAt !== next.observedAt;
+    return { kind: event.eventType,
+      sessionId: event.sessionId ?? null,
+      tenantId: event.tenantId,
+      bodyDigest: hookBodyDigest(payload),
+      originalTimestampDigest: originalHookTimestampDigest(payload),
+      eventDigest: normalizedEventDigest(event as Record<string, unknown>, receiveClockFallback),
+      receiveClockFallback };
+  } catch {
+    // Malformed or unnormalizable requests are still refused. Their receipt
+    // can settle only on the exact terminal outcome, never on a ledger guess.
+    let tenantId = config?.policy.tenantId;
+    if (!tenantId) {
+      try {
+        tenantId = collectorConfigSchema.parse(JSON.parse(
+          fs.readFileSync(path.join(home, "collector.config.json"), "utf8"))).policy.tenantId;
+      } catch { tenantId = collectorConfigSchema.parse({}).policy.tenantId; }
+    }
+    return { kind: hookEventKind(body), sessionId: null, tenantId,
+      bodyDigest: null,
+      originalTimestampDigest: null, eventDigest: null, receiveClockFallback: false };
+  }
+}
+function ledgerName(home: string): "work-ledger.sqlite" | "ledger.sqlite" {
+  return fs.existsSync(path.join(home, "work-ledger.sqlite")) ? "work-ledger.sqlite" : "ledger.sqlite";
+}
+function selectedLedger(home: string, marker?: PauseMarker) {
+  return path.join(home, marker?.ledgerName ?? ledgerName(home));
+}
+function ledgerHighWater(db: Database.Database) {
+  const exists = db.prepare("select 1 from sqlite_master where type='table' and name='buffered_events'").get();
+  if (!exists) return 0;
+  const row = db.prepare("select coalesce(max(rowid), 0) as highWater from buffered_events")
+    .get() as { highWater: number };
+  if (!Number.isSafeInteger(row.highWater) || row.highWater < 0) throw new Error("maintenance_ledger_rowid_unsafe");
+  return row.highWater;
+}
+function observedLedgerHighWater(file: string): number | null {
+  if (!fs.existsSync(file)) return 0;
+  try {
+    const db = new Database(file, { readonly: true, fileMustExist: true, timeout: 0 });
+    try { return ledgerHighWater(db); } finally { db.close(); }
+  } catch { return null; }
+}
+function observedLedgerAdmissionSequence(file: string): number | null {
+  if (!fs.existsSync(file)) return 0;
+  try {
+    const db = new Database(file, { readonly: true, fileMustExist: true, timeout: 0 });
+    try { return ledgerAdmissionSequence(db); } finally { db.close(); }
+  } catch { return null; }
+}
+type HookBoundary = { highWater: number | null; admissionSequence: number | null;
+  ledgerAbsentAtRefusal: boolean };
+/** Before quiescence, BEGIN IMMEDIATE holds writers until the receipt is
+ * durable. During the fenced swap, the post-quiesce marker supplies the exact
+ * last admission sequence; an unavailable snapshot remains unknown. */
+function withHookHighWater<T>(home: string, marker: PauseMarker, action: (boundary: HookBoundary) => T,
+  deadline = performance.now() + REFUSAL_WAIT_MS,
+  mode: RefusalWaitMode = "synchronous"): T {
+  const ledger = selectedLedger(home, marker);
+  const fenced = fs.existsSync(`${ledger}.maintenance-rebuild.lock`);
+  if (!fs.existsSync(ledger)) return action(fenced
+    ? { highWater: marker.ledgerHighWater ?? null,
+      admissionSequence: marker.ledgerAdmissionSequence ?? null,
+      ledgerAbsentAtRefusal: marker.ledgerExistedAtPause === false }
+    : { highWater: marker.ledgerHighWater === 0 ? 0 : null,
+      admissionSequence: marker.ledgerAdmissionSequence === 0 ? 0 : null,
+      ledgerAbsentAtRefusal: marker.ledgerExistedAtPause === false });
+  let token: string | null = null;
+  let db: Database.Database | null = null;
+  try {
+    token = acquireRebuildOpenToken(ledger);
+    db = new Database(ledger, { fileMustExist: true, timeout: 0 });
+    // Publish the complete schema first. A marker or receipt must never be
+    // fsynced against a sequence table whose transaction can still roll back.
+    beforeDeadline(deadline, () => {
+      ensureMaintenanceEventOrderSchema(db!);
+      db!.exec("BEGIN IMMEDIATE");
+    }, mode);
+  } catch (error) {
+    db?.close();
+    releaseRebuildOpenToken(token);
+    if (mode === "try" && (error as { code?: string }).code === "SQLITE_BUSY") throw error;
+    if (fenced || (error instanceof Error && error.message === "maintenance_rebuild_paused")) {
+      return action({ highWater: marker.ledgerHighWater ?? null,
+        admissionSequence: marker.ledgerAdmissionSequence ?? null,
+        ledgerAbsentAtRefusal: false });
+    }
+    // A busy or unreadable ledger cannot prove a pre-refusal row boundary.
+    return action({ highWater: null, admissionSequence: null, ledgerAbsentAtRefusal: false });
+  }
+  try {
+    // A paused listener can start while another daemon is upgrading this
+    // ledger. It waits for that complete schema commit, then takes the
+    // boundary under its own writer lock before recording the refusal.
+    const result = action({ highWater: ledgerHighWater(db),
+      admissionSequence: ledgerAdmissionSequence(db), ledgerAbsentAtRefusal: false });
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* Preserve the first failure. */ }
+    throw error;
+  } finally {
+    db.close();
+    releaseRebuildOpenToken(token);
+  }
+}
+function hookEventId(body: string | Buffer) {
+  try {
+    const parsed: unknown = JSON.parse(String(body));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    for (const alias of HOOK_AUTHORITY_CONTRACT.eventId.aliases) {
+      const value = (parsed as Record<string, unknown>)[alias];
+      if (typeof value === "string" && isUuid(value.trim())) return value.trim();
+    }
+  } catch { /* An invalid body is still a refused request. */ }
+  return null;
+}
+function hookEventKind(body: string | Buffer) {
+  try {
+    const parsed: unknown = JSON.parse(String(body));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unknown";
+    const record = parsed as Record<string, unknown>;
+    for (const alias of [...HOOK_AUTHORITY_CONTRACT.eventType.aliases, "name", "span_name"]) {
+      const value = record[alias];
+      if (typeof value === "string") {
+        const kind = classifyEventType(value);
+        if (kind) return kind;
+      }
+    }
+  } catch { /* A terminal rejection can settle invalid JSON. */ }
+  return "unknown";
+}
+function readReceipt(file: string): RefusalReceipt {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) throw new Error("maintenance_refusal_unsafe");
+  const value = JSON.parse(fs.readFileSync(file, "utf8")) as RefusalReceipt;
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+    !Number.isSafeInteger(value.version) || value.version < 1 ||
+    value.version > 1_000_000 || !["hook", "otlp", "live"].includes(value.route) ||
+    !Number.isFinite(Date.parse(value.at)) ||
+    (value.source !== undefined && !/^[a-z_]{1,32}$/.test(value.source)) ||
+    (value.eventId !== undefined && !isUuid(value.eventId)) ||
+    (value.version === 3 && (value.route !== "hook" || !value.source || !value.eventId ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.ledgerHighWater === null ||
+        (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
+    (value.version === 4 && (value.route !== "hook" || !value.source || !value.eventId ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.eventDigest === null || (typeof value.eventDigest === "string" &&
+        /^[a-f0-9]{64}$/.test(value.eventDigest))) ||
+      typeof value.receiveClockFallback !== "boolean" ||
+      !(value.ledgerHighWater === null ||
+        (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
+    (value.version === 5 && (value.route !== "hook" || !value.source || !value.eventId ||
+      !value.receiptId || !isUuid(value.receiptId) ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.sessionId === null ||
+        (typeof value.sessionId === "string" && value.sessionId.length <= 256)) ||
+      !(value.originalTimestampDigest === null ||
+        (typeof value.originalTimestampDigest === "string" &&
+          /^[a-f0-9]{64}$/.test(value.originalTimestampDigest))) ||
+      !(value.eventDigest === null || (typeof value.eventDigest === "string" &&
+        /^[a-f0-9]{64}$/.test(value.eventDigest))) ||
+      typeof value.receiveClockFallback !== "boolean" ||
+      !(value.ledgerHighWater === null ||
+        (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
+    (value.version === 6 && (value.route !== "hook" || !value.source || !value.eventId ||
+      !value.receiptId || !isUuid(value.receiptId) ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.sessionId === null ||
+        (typeof value.sessionId === "string" && value.sessionId.length <= 256)) ||
+      !(value.bodyDigest === null || (typeof value.bodyDigest === "string" &&
+        /^[a-f0-9]{64}$/.test(value.bodyDigest))) ||
+      !(value.ledgerHighWater === null ||
+        (Number.isSafeInteger(value.ledgerHighWater) && (value.ledgerHighWater ?? -1) >= 0)))) ||
+    (value.version === 7 && (value.route !== "hook" || !value.source || !value.eventId ||
+      !value.receiptId || !isUuid(value.receiptId) ||
+      typeof value.kind !== "string" || !/^[a-z][a-z_]{0,32}$/.test(value.kind) ||
+      !(value.sessionId === null ||
+        (typeof value.sessionId === "string" && value.sessionId.length <= 256)) ||
+      typeof value.tenantId !== "string" || value.tenantId.length < 1 ||
+      value.tenantId.length > 256 ||
+      !(value.bodyDigest === null || (typeof value.bodyDigest === "string" &&
+        /^[a-f0-9]{64}$/.test(value.bodyDigest))) ||
+      !(value.ledgerAdmissionSequence === null ||
+        (Number.isSafeInteger(value.ledgerAdmissionSequence) &&
+          (value.ledgerAdmissionSequence ?? -1) >= 0)) ||
+      typeof value.ledgerAbsentAtRefusal !== "boolean")) ||
+    (value.unknownAt !== undefined && !Number.isFinite(Date.parse(value.unknownAt))) ||
+    (value.spoolName !== undefined && !SPOOL_NAME.test(value.spoolName))) {
+    throw new Error("maintenance_refusal_unsafe");
+  }
+  return value;
+}
+/** All receipt publishers and recoverers use the same permanent lock inode.
+ * Acquiring it proves that no cooperating publisher is still writing its temp.
+ * Readers of a complete final receipt need no lock: rename publishes all bytes. */
+function withReceiptIdentity<T>(file: string, action: () => T,
+  deadline = performance.now() + REFUSAL_WAIT_MS,
+  mode: RefusalWaitMode = "synchronous") {
+  const home = path.dirname(path.dirname(file));
+  const locks = path.join(home, "maintenance-rebuild-refusal-locks");
+  fs.mkdirSync(locks, { mode: 0o700, recursive: true });
+  const stat = fs.lstatSync(locks);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("maintenance_refusals_unsafe");
+  return beforeDeadline(deadline, () => withRebuildCoordination(
+    path.join(locks, path.basename(file)), action, 0), mode);
+}
+
+function assertNoLegacyReceiptWriter(file: string) {
+  // The previous unpublished format held the final receipt open while waiting
+  // for SQLite and did not take the identity lock. Do not reap such a live FD.
+  const result = spawnSync(process.platform === "darwin" ? "/usr/sbin/lsof" : "lsof",
+    ["-n", "-P", "-t", "--", file], { encoding: "utf8", timeout: 1_000 });
+  if (result.error || result.signal || result.status !== 1 || result.stdout.trim() || result.stderr.trim())
+    throw new Error("maintenance_refusal_writer_unconfirmed_dead");
+}
+
+/** Must hold the identity lock. A terminal fsync precedes every unlink, so
+ * recovery itself can restart after a crash without losing the visible loss. */
+function recoverReceiptArtifacts(home: string, file: string, observedTemporaries?: string[]) {
+  const directory = path.dirname(file);
+  const temporaryNames = observedTemporaries ?? fs.readdirSync(directory).filter((name) =>
+    name.startsWith(`${path.basename(file)}.`) && /^[a-f0-9]{64}\.receipt\.[0-9a-f-]{36}\.tmp$/.test(name));
+  const temporaries = temporaryNames.map((name) => path.join(directory, name));
+  let finalExists = false;
+  let finalValid = false;
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_refusal_unsafe");
+    finalExists = true;
+    try { readReceipt(file); finalValid = true; }
+    catch (error) {
+      if (!(error instanceof SyntaxError) && (error as Error).message !== "maintenance_refusal_unsafe") throw error;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  // A valid final receipt is the obligation. An interrupted metadata update
+  // has no independent loss, even if its temporary reached fsync.
+  if (finalExists && !finalValid) {
+    assertNoLegacyReceiptWriter(file);
+    appendTerminalOutcome(home, { version: 1, receipt: path.basename(file),
+      obligation: path.basename(file), at: new Date().toISOString(), outcome: "malformed_refusal" });
+    fs.unlinkSync(file);
+    fsyncDirectory(directory);
+  }
+  const candidates: string[] = [];
+  for (const candidate of temporaries) {
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(candidate); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_refusal_unsafe");
+    assertNoLegacyReceiptWriter(candidate);
+    candidates.push(candidate);
+  }
+  if (!finalExists && candidates.length > 0) {
+    // Even a valid temporary is an unpublished receipt: promoting it could
+    // hold capture claims forever if the writer died before rename. All
+    // temporaries for this receipt represent one obligation. Journal that one
+    // path-keyed loss before unlinking their private bytes.
+    appendTerminalOutcome(home, { version: 1, receipt: path.basename(file),
+      obligation: path.basename(file), at: new Date().toISOString(),
+      outcome: "abandoned_refusal_temporary" });
+  }
+  for (const candidate of candidates) {
+    fs.unlinkSync(candidate);
+    fsyncDirectory(directory);
+  }
+}
+
+function readRecoverableReceipt(file: string): RefusalReceipt {
+  try { return readReceipt(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
+    return withReceiptIdentity(file, () => {
+      recoverReceiptArtifacts(path.dirname(path.dirname(file)), file);
+      return readReceipt(file);
+    });
+  }
+}
+
+function writeReceipt(file: string, value: RefusalReceipt) {
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  const descriptor = fs.openSync(temporary, "wx", 0o600);
+  try { fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`); fs.fsyncSync(descriptor); }
+  finally { fs.closeSync(descriptor); }
+  fs.renameSync(temporary, file);
+  fsyncDirectory(path.dirname(file));
+}
+
+/** The 0.7.44 reader sees only the old spool grammar. When a direct caller
+ * supplied no ID, bind its compatible retry to the ID durably minted by the
+ * pause listener, so even an old drain records the same ledger key. */
+export function prepareMaintenanceHookSpoolBody(home: string, source: string, body: string) {
+  const original = existingRefusalPath(home, "hook", source, body);
+  let receipt: RefusalReceipt | null = null;
+  try { receipt = readRecoverableReceipt(original); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const eventId = hookEventId(body) ?? receipt?.eventId ?? randomUUID();
+  if (hookEventId(body)) return { body, receiptBody: body, eventId };
+  let parsed: unknown;
+  try { parsed = JSON.parse(body); } catch { return { body, receiptBody: body, eventId }; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { body, receiptBody: body, eventId };
+  const record = parsed as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, "id")) record.id = eventId;
+  else if (!Object.prototype.hasOwnProperty.call(record, "eventId")) record.eventId = eventId;
+  else record.event_id = eventId;
+  const stableBody = JSON.stringify(record);
+  return { body: stableBody, receiptBody: receipt ? body : stableBody, eventId };
+}
+
+/** An authenticated direct hook may retry the exact body without a client
+ * spool or its own ID. Bind only that ID-less body's pending receipt to the
+ * normalizer; ordinary posts retain their existing ID selection. */
+export function pendingMaintenanceHookEventId(home: string, source: string, body: string) {
+  if (hookEventId(body)) return null;
+  try {
+    const receipt = readRecoverableReceipt(existingRefusalPath(home, "hook", source, body));
+    return receipt.route === "hook" && receipt.source === source ? receipt.eventId ?? null : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/** A 503 has no server spool, so its route and body identity must survive the
+ * listener's exit. Repeated refusals of the same payload share one receipt. */
+export function recordMaintenanceRebuildRefusal(home: string, route: RefusalRoute,
+  source: string, body: string | Buffer,
+  options: { eventId?: string; spoolName?: string; config?: CollectorConfig;
+    deadline?: number; waitMode?: RefusalWaitMode } = {}) {
+  const marker = readMaintenanceRebuildPause(home);
+  if (!marker) throw new Error("maintenance_pause_marker_missing");
+  const directory = refusalDirectory(home);
+  try {
+    fs.mkdirSync(directory, { mode: 0o700 });
+    fsyncDirectory(home);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const dirStat = fs.lstatSync(directory);
+  if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) throw new Error("maintenance_refusals_unsafe");
+  const file = existingRefusalPath(home, route, source, body);
+  const deadline = options.deadline ?? performance.now() + REFUSAL_WAIT_MS;
+  const waitMode = options.waitMode ?? "synchronous";
+  return withReceiptIdentity(file, () => {
+    recoverReceiptArtifacts(home, file);
+    if (fs.existsSync(file)) {
+      const prior = readReceipt(file);
+      if (prior.route !== route) throw new Error("maintenance_refusal_unsafe");
+      if (route === "hook") {
+        const eventId = options.eventId ?? hookEventId(body) ?? prior.eventId ?? randomUUID();
+        if (prior.eventId && !sameEventId(prior.eventId, eventId)) {
+          throw new Error("maintenance_refusal_event_id_changed");
+        }
+        const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
+        if ((prior.version === 3 || prior.version === 4 || prior.version === 5 ||
+          prior.version === 6 || prior.version === 7) &&
+          (prior.source !== source || prior.kind !== identity.kind ||
+            ((prior.version === 5 || prior.version === 6 || prior.version === 7) &&
+              (!sameHookIdentityPart(prior.sessionId ?? null, identity.sessionId) ||
+                prior.originalTimestampDigest !== identity.originalTimestampDigest ||
+                ((prior.version === 6 || prior.version === 7) && prior.bodyDigest !== identity.bodyDigest) ||
+                (prior.version === 7 && prior.tenantId !== identity.tenantId))))) {
+          throw new Error("maintenance_refusal_identity_changed");
+        }
+        // Keep unknown and older evidence in its original format; guessing a
+        // v7 tenant or sequence at this later retry moves the refusal boundary.
+        if (prior.version !== 7) {
+          if (options.spoolName && prior.spoolName !== options.spoolName)
+            writeReceipt(file, { ...prior, spoolName: options.spoolName });
+          return;
+        }
+        if (options.spoolName && prior.spoolName !== options.spoolName) {
+          writeReceipt(file, { ...prior, ...(options.spoolName ? { spoolName: options.spoolName } : {}) });
+        }
+      }
+      return;
+    }
+    if (route === "hook") {
+      const eventId = options.eventId ?? hookEventId(body) ?? randomUUID();
+      const identity = hookReceiptIdentity(home, source, body, eventId, options.config);
+      withHookHighWater(home, marker, (boundary) => {
+        writeReceipt(file, { version: 7, route, source, receiptId: randomUUID(),
+          at: new Date().toISOString(), eventId, ...identity,
+          ledgerHighWater: boundary.highWater,
+          ledgerAdmissionSequence: boundary.admissionSequence,
+          ledgerAbsentAtRefusal: boundary.ledgerAbsentAtRefusal,
+          ...(options.spoolName ? { spoolName: options.spoolName } : {}) });
+      }, deadline, waitMode);
+    } else {
+      writeReceipt(file, { version: 1, route, at: new Date().toISOString() });
+    }
+  }, deadline, waitMode);
+}
+
+/** The listener's budget begins when HTTP admits the request, including body
+ * read and identity-lock queue time. Busy ledger attempts yield to every other
+ * request; at the two-second boundary a durable unknown receipt is published. */
+export async function recordMaintenanceRebuildRefusalAsync(home: string, route: RefusalRoute,
+  source: string, body: string | Buffer,
+  options: { eventId?: string; spoolName?: string; config?: CollectorConfig;
+    arrivedAt: number }) {
+  const deadline = options.arrivedAt + REFUSAL_WAIT_MS;
+  const responseDeadline = options.arrivedAt + 2_850;
+  for (;;) {
+    const waitMode: RefusalWaitMode = performance.now() < deadline ? "try" : "unknown";
+    try {
+      recordMaintenanceRebuildRefusal(home, route, source, body,
+        { ...options, deadline, waitMode });
+      return;
+    } catch (error) {
+      if ((error as { code?: string }).code !== "SQLITE_BUSY" ||
+        performance.now() >= responseDeadline) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve,
+        Math.min(10, Math.max(1, deadline - performance.now()))));
+    }
+  }
+}
+
+type AdmissionMatch = "accepted" | "unverified" | "unsequenced" | "unknown" | "none";
+function ledgerAdmissionMatches(db: Database.Database, receipt: RefusalReceipt): AdmissionMatch {
+  if (receipt.version !== 7 || !receipt.receiptId || !receipt.eventId ||
+    !receipt.source || !receipt.kind || !receipt.tenantId) return "none";
+  const hasAdmissionTable = db.prepare(`select 1 from sqlite_master
+    where type = 'table' and name = 'maintenance_rebuild_hook_admissions'`).get();
+  const admissions = hasAdmissionTable ? db.prepare(HOOK_ACK_LOOKUP_SQL).all(receipt.receiptId) as
+    Array<{ admitted_event_id: string; outcome: "accepted" | "mismatch" }> : [];
+  if (admissions.some((admission) => admission.outcome === "accepted")) return "accepted";
+  const rejectedIds = new Set(admissions.filter((admission) => admission.outcome === "mismatch")
+    .map((admission) => admission.admitted_event_id));
+  // SQLite's ID primary-key index supports every spelling below. A matching
+  // immutable digest proves capture regardless of insertion order. Only the
+  // digestless 0.7.44 fallback uses the never-reused admission sequence.
+  const variants = [receipt.eventId, receipt.eventId.toLowerCase(), receipt.eventId.toUpperCase()];
+  const hasDigest = db.prepare(`select 1 from pragma_table_info('buffered_events')
+    where name = 'maintenance_hook_body_digest'`).get();
+  const hasOrder = db.prepare(`select 1 from sqlite_master where type = 'table'
+    and name = 'maintenance_rebuild_event_order'`).get();
+  const rows = db.prepare(hasDigest && hasOrder ? HOOK_ROW_LOOKUP_SQL : HOOK_ROW_LEGACY_LOOKUP_SQL).all(...variants) as
+    Array<{ rowid: number; id: string; source: string; event_type: string;
+      session_id: string | null; tenant_id: string | null;
+      body_digest: string | null; admission_seq: number | null }>;
+  let ambiguous = false;
+  let digestlessAfter = false;
+  let digestedAfter = false;
+  let unsequenced = false;
+  for (const row of rows) {
+    if (rejectedIds.has(row.id) || !sameEventId(row.id, receipt.eventId) ||
+      row.source !== receipt.source || row.event_type !== receipt.kind ||
+      row.tenant_id !== receipt.tenantId ||
+      !sameHookIdentityPart(row.session_id, receipt.sessionId ?? null)) continue;
+    ambiguous = true;
+    if (receipt.bodyDigest && row.body_digest === receipt.bodyDigest) return "accepted";
+    if (row.body_digest !== null) { digestedAfter = true; continue; }
+    if (receipt.ledgerAdmissionSequence !== null &&
+      receipt.ledgerAdmissionSequence !== undefined &&
+      row.admission_seq !== null &&
+      row.admission_seq > receipt.ledgerAdmissionSequence) digestlessAfter = true;
+    // A brand-new ledger had no pre-refusal rows. A downgrade may create it
+    // without the trigger, so its first digestless row is still later evidence.
+    if (receipt.ledgerAbsentAtRefusal && row.admission_seq === null)
+      digestlessAfter = true;
+    else if (row.admission_seq === null) unsequenced = true;
+  }
+  if (digestlessAfter && !digestedAfter) return "unverified";
+  if (unsequenced) return "unsequenced";
+  return ambiguous ? "unknown" : "none";
+}
+
+type TerminalRecord = { version?: number; receipt?: string; at?: string;
+  outcome?: string; obligation?: string; eventId?: string | null;
+  source?: string; kind?: string; spoolName?: string };
+function terminalRecords(home: string): TerminalRecord[] {
+  try {
+    return fs.readFileSync(path.join(home, TERMINAL), "utf8").split("\n").filter(Boolean)
+      .flatMap((line) => {
+        try { return [JSON.parse(line) as TerminalRecord]; }
+        catch { return []; /* An unfinished last line is not a durable outcome. */ }
+      });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+function unverifiedCount(records: TerminalRecord[]) {
+  return new Set(records.filter((entry) => entry.version === 1 &&
+    entry.outcome === "retired_unverified" && typeof entry.receipt === "string" &&
+    /^[a-f0-9]{64}\.receipt$/.test(entry.receipt) && typeof entry.at === "string")
+    .map((entry) => `${entry.receipt}\0${entry.at}`)).size;
+}
+function unknownFormatRecords(records: TerminalRecord[]) {
+  return records.filter((entry) => entry.version === 1 &&
+    entry.outcome === "unknown_receipt_format" && typeof entry.receipt === "string" &&
+    /^[a-f0-9]{64}\.receipt$/.test(entry.receipt) && typeof entry.at === "string" &&
+    Number.isFinite(Date.parse(entry.at)));
+}
+function unknownFormatCount(records: TerminalRecord[]) {
+  return new Set(unknownFormatRecords(records)
+    .map((entry) => `${entry.receipt}\0${entry.at}`)).size;
+}
+function unknownFormatLosses(records: TerminalRecord[]) {
+  const unique = new Map<string, TerminalRecord>();
+  for (const entry of records) {
+    if (entry.version !== 1 || typeof entry.receipt !== "string" ||
+      !/^[a-f0-9]{64}\.receipt$/.test(entry.receipt)) continue;
+    if (entry.outcome === "accepted_retry") {
+      for (const key of unique.keys()) if (key.startsWith(`${entry.receipt}\0`)) unique.delete(key);
+      continue;
+    }
+    if (entry.outcome !== "unknown_receipt_format" &&
+      entry.outcome !== "unsequenced_legacy_admission" && entry.outcome !== "unknown_admission_order" &&
+      entry.outcome !== "abandoned_refusal_temporary" && entry.outcome !== "malformed_refusal") continue;
+    if (typeof entry.at !== "string" || !Number.isFinite(Date.parse(entry.at))) continue;
+    const obligation = entry.obligation ?? entry.at;
+    unique.set(`${entry.receipt}\0${obligation}`, entry);
+  }
+  return [...unique.values()].map((entry) => {
+    const at = Date.parse(entry.at!);
+    return { fromMs: at, toMs: at, count: 1 };
+  });
+}
+const RECEIPT_LOSS_OUTCOMES = new Set([
+  "unknown_receipt_format", "unsequenced_legacy_admission", "unknown_admission_order",
+  "abandoned_refusal_temporary", "malformed_refusal",
+]);
+function retireReceiptLossAfterAcceptance(home: string, file: string, eventId: string) {
+  const receipt = path.basename(file);
+  let pending = false;
+  for (const record of terminalRecords(home)) {
+    if (record.version !== 1 || record.receipt !== receipt) continue;
+    if (record.outcome === "accepted_retry") pending = false;
+    else if (record.outcome && RECEIPT_LOSS_OUTCOMES.has(record.outcome)) pending = true;
+  }
+  if (pending) appendTerminalOutcome(home, { version: 1, receipt, at: new Date().toISOString(),
+    eventId, outcome: "accepted_retry" });
+}
+export function readUnverifiedHookRetries(home: string): number | null {
+  try { return unverifiedCount(terminalRecords(home)); }
+  catch { return null; }
+}
+export function readUnknownHookReceiptFormats(home: string): number | null {
+  try { return unknownFormatCount(terminalRecords(home)); }
+  catch { return null; }
+}
+
+function terminalTailStart(descriptor: number, size: number) {
+  const block = Buffer.alloc(4096);
+  for (let cursor = size; cursor > 0;) {
+    const length = Math.min(block.length, cursor);
+    const start = cursor - length;
+    fs.readSync(descriptor, block, 0, length, start);
+    for (let index = length - 1; index >= 0; index -= 1) {
+      if (block[index] === 10) return start + index + 1;
+    }
+    cursor = start;
+  }
+  return 0;
+}
+/** Repair an unterminated final record before appending. The repair and its
+ * note are durable before the new terminal outcome can retire a receipt. */
+function appendTerminalOutcome(home: string, value: Record<string, unknown>) {
+  const file = path.join(home, TERMINAL);
+  // A permanent sibling SQLite lock file supplies an OS-released,
+  // process-shared exclusive lock, including after SIGKILL. Hold it from tail
+  // inspection through repair, append, fsync and directory publication.
+  withRebuildCoordination(file, () => {
+    const flags = fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_APPEND |
+      (fs.constants.O_NOFOLLOW ?? 0);
+    const descriptor = fs.openSync(file, flags, 0o600);
+    try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) throw new Error("maintenance_terminal_unsafe");
+    fs.fchmodSync(descriptor, 0o600);
+    if (stat.size > 0) {
+      const last = Buffer.alloc(1);
+      fs.readSync(descriptor, last, 0, 1, stat.size - 1);
+      if (last[0] !== 10) {
+        const start = terminalTailStart(descriptor, stat.size);
+        const length = stat.size - start;
+        let complete = false;
+        if (length <= 65_536) {
+          const tail = Buffer.alloc(length);
+          fs.readSync(descriptor, tail, 0, length, start);
+          try { JSON.parse(tail.toString("utf8")); complete = true; } catch { /* Torn last line. */ }
+        }
+        if (complete) {
+          fs.writeFileSync(descriptor, "\n");
+        } else {
+          fs.ftruncateSync(descriptor, start);
+          fs.fsyncSync(descriptor);
+          fs.writeFileSync(descriptor, `${JSON.stringify({ version: 1,
+            event: "recovered_torn_tail", truncatedBytes: length, at: new Date().toISOString() })}\n`);
+          fs.fsyncSync(descriptor);
+        }
+      }
+    }
+    fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
+    fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+    fsyncDirectory(home);
+  });
+}
+
+/** Only a matching retry whose normal route committed may retire this file. */
+export function resolveMaintenanceRebuildRefusal(home: string, route: RefusalRoute,
+  source: string, body: string | Buffer,
+  options: { outcome?: "accepted" | "terminal"; acceptedEventId?: string;
+    ledger?: Database.Database; spoolName?: string } = {}) {
+  let file = existingRefusalPath(home, route, source, body);
+  try {
+    let receipt: RefusalReceipt;
+    try { receipt = readRecoverableReceipt(file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || route !== "hook" || !options.spoolName) throw error;
+      const entries = fs.readdirSync(refusalDirectory(home)).filter((entry) => entry.endsWith(".receipt"));
+      const matched = entries.map((entry) => path.join(refusalDirectory(home), entry))
+        .filter((candidate) => {
+          const value = readRecoverableReceipt(candidate);
+          return value.route === "hook" && value.source === source &&
+            value.spoolName === options.spoolName && !!value.eventId && !!hookEventId(body) &&
+            sameEventId(value.eventId, hookEventId(body)!);
+        });
+      if (matched.length !== 1) throw error;
+      file = matched[0]!;
+      receipt = readRecoverableReceipt(file);
+    }
+    withReceiptIdentity(file, () => {
+      recoverReceiptArtifacts(home, file);
+      receipt = readReceipt(file);
+      if (route === "hook" && options.outcome !== "terminal") {
+        if (!receipt.eventId || !options.acceptedEventId ||
+          !sameEventId(options.acceptedEventId, receipt.eventId) || !options.ledger ||
+          ledgerAdmissionMatches(options.ledger, receipt) !== "accepted") return;
+        retireReceiptLossAfterAcceptance(home, file, options.acceptedEventId);
+      }
+      if (options.outcome === "terminal") {
+        // Record the exact receipt instance before removing its hold. A crash
+        // after this fsync is repaired by reconciliation on the next startup.
+        appendTerminalOutcome(home, { version: 1, receipt: path.basename(file),
+          at: receipt.at, route, eventId: receipt.eventId ?? null, outcome: "terminal" });
+      }
+      fs.unlinkSync(file);
+      fsyncDirectory(refusalDirectory(home));
+      if (receipt.receiptId && options.ledger) removeMaintenanceHookAdmission(options.ledger, receipt.receiptId);
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (route !== "hook" || options.outcome === "terminal" ||
+      !options.acceptedEventId || !options.ledger) return;
+    if (!fs.existsSync(refusalDirectory(home))) return;
+    // A retry may commit before the first reconciliation journals an
+    // interrupted initial publication. Recover it under its identity lock.
+    withReceiptIdentity(file, () => recoverReceiptArtifacts(home, file));
+    if (fs.existsSync(file)) {
+      resolveMaintenanceRebuildRefusal(home, route, source, body, options);
+      return;
+    }
+    const identity = hookReceiptIdentity(home, source, body, options.acceptedEventId);
+    const candidate: RefusalReceipt = { version: 7, route: "hook", at: new Date().toISOString(),
+      source, eventId: options.acceptedEventId, receiptId: randomUUID(),
+      ledgerHighWater: null, ledgerAdmissionSequence: null,
+      ledgerAbsentAtRefusal: false, ...identity };
+    if (ledgerAdmissionMatches(options.ledger, candidate) === "accepted")
+      retireReceiptLossAfterAcceptance(home, file, options.acceptedEventId);
+  }
+}
+
+/** null means the receipt inventory is unsafe or unreadable: hold attestation. */
+export function countMaintenanceRebuildRefusals(home: string): number | null {
+  return reconcileMaintenanceRebuildRefusals(home).count;
+}
+
+/** Only a row admitted after this refusal, with its canonical ID, source and
+ * kind, may settle an old-version drain. Missing files alone never do. */
+export function reconcileMaintenanceRebuildRefusals(home: string,
+  ledgerPath?: string, nowMs = Date.now()): { count: number | null;
+    unverifiedHookRetries: number | null;
+    unknownHookReceiptFormats: number | null;
+    lost: Array<{ fromMs: number; toMs: number; count: number }> } {
+  const directory = refusalDirectory(home);
+  try {
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return {
+      count: null, unverifiedHookRetries: null, unknownHookReceiptFormats: null, lost: [] };
+    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    if (entries.some((entry) =>
+      !(/^[a-f0-9]{64}\.receipt$/.test(entry.name) ||
+        /^[a-f0-9]{64}\.receipt\.[0-9a-f-]{36}\.tmp$/.test(entry.name)) ||
+      !entry.isFile() || entry.isSymbolicLink())) return {
+        count: null, unverifiedHookRetries: null, unknownHookReceiptFormats: null, lost: [] };
+    const identities = new Map<string, string[]>();
+    for (const entry of entries) {
+      const identity = entry.name.slice(0, 72);
+      if (!identities.has(identity)) identities.set(identity, []);
+      if (entry.name.endsWith(".tmp")) identities.get(identity)!.push(entry.name);
+    }
+    const receiptFiles: string[] = [];
+    let inFlight = 0;
+    for (const [identity, temporaries] of identities) {
+      const file = path.join(directory, identity);
+      try {
+        withReceiptIdentity(file, () => {
+          recoverReceiptArtifacts(home, file, temporaries);
+          if (fs.existsSync(file)) receiptFiles.push(file);
+        }, performance.now());
+      } catch (error) {
+        if ((error as { code?: string }).code !== "SQLITE_BUSY" &&
+          (error as Error).message !== "maintenance_refusal_writer_unconfirmed_dead") throw error;
+        // A live writer's private bytes are not ours to repair. Hold its one
+        // obligation and retry on the next reconciliation without waiting.
+        inFlight += 1;
+      }
+    }
+    const terminal = new Set<string>();
+    let unverifiedHookRetries: number;
+    let unknownHookReceiptFormats: number;
+    let lost: Array<{ fromMs: number; toMs: number; count: number }>;
+    try {
+      const records = terminalRecords(home);
+      unverifiedHookRetries = unverifiedCount(records);
+      unknownHookReceiptFormats = unknownFormatCount(records);
+      lost = unknownFormatLosses(records);
+      for (const value of records) {
+        if (value.version === 1 && (value.outcome === "terminal" ||
+          value.outcome === "retired_unverified" || value.outcome === "unknown_receipt_format" ||
+          value.outcome === "unsequenced_legacy_admission" || value.outcome === "unknown_admission_order") &&
+          typeof value.receipt === "string" && /^[a-f0-9]{64}\.receipt$/.test(value.receipt) &&
+          typeof value.at === "string") terminal.add(`${value.receipt}\0${value.at}`);
+      }
+    } catch (error) {
+      return { count: null, unverifiedHookRetries: null, unknownHookReceiptFormats: null, lost: [] };
+    }
+    const retiredIds: string[] = [];
+    let db: Database.Database | null = null;
+    const marker = readMaintenanceRebuildPause(home);
+    const selected = ledgerPath ?? selectedLedger(home, marker ?? undefined);
+    if (receiptFiles.length > 0) {
+      if (fs.existsSync(selected) && !fs.existsSync(`${selected}.maintenance-rebuild.lock`)) {
+        try { db = new Database(selected, { readonly: true, fileMustExist: true, timeout: 0 }); }
+        catch { /* An unavailable ledger holds receipts until a later pass. */ }
+      }
+    }
+    let count = inFlight;
+    try {
+      for (const file of receiptFiles) {
+        try {
+          withReceiptIdentity(file, () => {
+            const receipt = readReceipt(file);
+            if (terminal.has(`${path.basename(file)}\0${receipt.at}`)) {
+              fs.unlinkSync(file);
+              fsyncDirectory(directory);
+              if (receipt.receiptId) retiredIds.push(receipt.receiptId);
+              return;
+            }
+            if (receipt.route !== "hook") { count += 1; return; }
+            let match: AdmissionMatch = "none";
+            let checked = false;
+            if (db && receipt.eventId) {
+              try {
+                match = ledgerAdmissionMatches(db, receipt);
+                checked = true;
+              }
+              catch { /* An unreadable inventory never proves acceptance. */ }
+            }
+            if (match === "accepted") {
+              if (receipt.eventId) retireReceiptLossAfterAcceptance(home, file, receipt.eventId);
+              fs.unlinkSync(file);
+              fsyncDirectory(directory);
+              if (receipt.receiptId) retiredIds.push(receipt.receiptId);
+              return;
+            }
+            const pendingFile = receipt.spoolName &&
+              fs.existsSync(path.join(home, "hook-spool", receipt.spoolName));
+            const atMs = Date.parse(receipt.at);
+            if (receipt.version !== 7 && !pendingFile && nowMs - atMs >= MISSING_HOOK_RETRY_MS) {
+              // Previous unreleased receipt formats lack tenant and/or immutable
+              // caller-body evidence. Never guess acceptance, and never hold a
+              // capture claim forever after the retry window.
+              appendTerminalOutcome(home, { version: 1, receipt: path.basename(file), at: receipt.at,
+                route: "hook", eventId: receipt.eventId ?? null, source: receipt.source,
+                kind: receipt.kind, spoolName: receipt.spoolName, outcome: "unknown_receipt_format" });
+              unknownHookReceiptFormats += 1;
+              lost.push({ fromMs: atMs, toMs: atMs, count: 1 });
+              fs.unlinkSync(file);
+              fsyncDirectory(directory);
+              if (receipt.receiptId) retiredIds.push(receipt.receiptId);
+              return;
+            }
+            if (match === "unverified" && receipt.ledgerAdmissionSequence != null && receipt.spoolName && !pendingFile) {
+              appendTerminalOutcome(home, { version: 1, receipt: path.basename(file), at: receipt.at,
+                route: "hook", eventId: receipt.eventId ?? null, source: receipt.source,
+                kind: receipt.kind, spoolName: receipt.spoolName, outcome: "retired_unverified" });
+              unverifiedHookRetries += 1;
+              console.warn(JSON.stringify({ status: "maintenance_hook_retired_unverified",
+                eventId: receipt.eventId, source: receipt.source, kind: receipt.kind,
+                spoolName: receipt.spoolName }));
+              fs.unlinkSync(file);
+              fsyncDirectory(directory);
+              if (receipt.receiptId) retiredIds.push(receipt.receiptId);
+              return;
+            }
+            if ((match === "unsequenced" || receipt.ledgerAdmissionSequence == null) &&
+              !pendingFile && nowMs - atMs >= MISSING_HOOK_RETRY_MS) {
+              // The old writer supplied the right identity but no durable order.
+              // It could predate the refusal, so it cannot prove capture. Record
+              // the unknown as a lasting claim loss instead of holding forever.
+              appendTerminalOutcome(home, { version: 1, receipt: path.basename(file), at: receipt.at,
+                route: "hook", eventId: receipt.eventId ?? null, source: receipt.source,
+                kind: receipt.kind, spoolName: receipt.spoolName,
+                outcome: receipt.ledgerAdmissionSequence == null ? "unknown_admission_order" : "unsequenced_legacy_admission" });
+              lost.push({ fromMs: atMs, toMs: atMs, count: 1 });
+              fs.unlinkSync(file);
+              fsyncDirectory(directory);
+              if (receipt.receiptId) retiredIds.push(receipt.receiptId);
+              return;
+            }
+            if (!pendingFile && (checked || !receipt.eventId) && nowMs - atMs >= MISSING_HOOK_RETRY_MS) {
+              if (!receipt.unknownAt) writeReceipt(file, { ...receipt, unknownAt: new Date(nowMs).toISOString() });
+              if (match === "none") lost.push({ fromMs: atMs, toMs: atMs, count: 1 });
+              else count += 1;
+            } else count += 1;
+          }, performance.now());
+        }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          if ((error as { code?: string }).code !== "SQLITE_BUSY") throw error;
+          count += 1;
+        }
+      }
+    } finally { db?.close(); }
+    if (retiredIds.length > 0 && fs.existsSync(selected)) {
+      let token: string | null = null;
+      let writer: Database.Database | null = null;
+      try {
+        token = acquireRebuildOpenToken(selected);
+        writer = new Database(selected, { fileMustExist: true, timeout: 0 });
+        const remove = writer.transaction(() => {
+          for (const id of retiredIds) removeMaintenanceHookAdmission(writer!, id);
+        });
+        remove.immediate();
+      } catch { /* Retention also removes orphan acknowledgements after the event expires. */ }
+      finally { writer?.close(); releaseRebuildOpenToken(token); }
+    }
+    return { count, unverifiedHookRetries, unknownHookReceiptFormats, lost };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { count: 0, unverifiedHookRetries: readUnverifiedHookRetries(home),
+        unknownHookReceiptFormats: readUnknownHookReceiptFormats(home), lost: [] }
+      : { count: null, unverifiedHookRetries: null, unknownHookReceiptFormats: null, lost: [] };
+  }
+}
+
+function writeMarker(home: string, marker: PauseMarker) {
+  const file = path.join(home, MARKER);
+  const temporary = `${file}.${process.pid}.tmp`;
+  const descriptor = fs.openSync(temporary, "wx", 0o600);
+  try { fs.writeFileSync(descriptor, `${JSON.stringify(marker)}\n`); fs.fsyncSync(descriptor); }
+  finally { fs.closeSync(descriptor); }
+  fs.renameSync(temporary, file);
+  const directory = fs.openSync(home, "r");
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+}
+
+export function markMaintenanceRebuildPause(home: string) {
+  const name = ledgerName(home);
+  const file = path.join(home, name);
+  const selectedExisted = fs.existsSync(file);
+  const alternate = path.join(home, name === "ledger.sqlite" ? "work-ledger.sqlite" : "ledger.sqlite");
+  const existedAtPause = selectedExisted || fs.existsSync(alternate);
+  const marker: PauseMarker = { version: 1, at: new Date().toISOString(), pid: process.pid,
+    ledgerName: name, ledgerHighWater: existedAtPause ? null : 0,
+    ledgerAdmissionSequence: existedAtPause ? null : 0,
+    ledgerExistedAtPause: existedAtPause };
+  // Keep schema publication, the boundary observation and durable marker in
+  // one writer lock. A listener never publishes a partial-install sequence.
+  withHookHighWater(home, marker, (boundary) => {
+    writeMarker(home, { ...marker, ledgerHighWater: boundary.highWater,
+      ledgerAdmissionSequence: boundary.admissionSequence });
+  });
+}
+
+/** Called immediately after every daemon writer has quiesced, before the
+ * rebuild publishes its fence. Later 503 receipts can use this exact boundary
+ * while the exclusive source lock prevents a live SQLite query. */
+export function refreshMaintenanceRebuildPauseHighWater(ledgerPath: string) {
+  const home = path.dirname(ledgerPath);
+  const marker = readMaintenanceRebuildPause(home);
+  if (!marker || marker.endedAt) return;
+  const name = path.basename(ledgerPath);
+  if (name !== "work-ledger.sqlite" && name !== "ledger.sqlite") return;
+  const highWater = observedLedgerHighWater(ledgerPath);
+  if (highWater === null) throw new Error("maintenance_ledger_high_water_unavailable");
+  const admissionSequence = observedLedgerAdmissionSequence(ledgerPath);
+  if (admissionSequence === null) throw new Error("maintenance_admission_sequence_unavailable");
+  writeMarker(home, { ...marker, ledgerName: name, ledgerHighWater: highWater,
+    ledgerAdmissionSequence: admissionSequence });
+}
+
+export function readMaintenanceRebuildPause(home: string): PauseMarker | null {
+  try {
+    const file = path.join(home, MARKER);
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("maintenance_pause_marker_invalid");
+    const value = JSON.parse(fs.readFileSync(file, "utf8")) as PauseMarker;
+    if (value.version !== 1 || !Number.isFinite(Date.parse(value.at)) ||
+      (value.ledgerName !== undefined && value.ledgerName !== "work-ledger.sqlite" &&
+        value.ledgerName !== "ledger.sqlite") ||
+      (value.ledgerHighWater !== undefined && value.ledgerHighWater !== null &&
+        (!Number.isSafeInteger(value.ledgerHighWater) || value.ledgerHighWater < 0)) ||
+      (value.ledgerAdmissionSequence !== undefined && value.ledgerAdmissionSequence !== null &&
+        (!Number.isSafeInteger(value.ledgerAdmissionSequence) || value.ledgerAdmissionSequence < 0)) ||
+      (value.ledgerExistedAtPause !== undefined && typeof value.ledgerExistedAtPause !== "boolean") ||
+      (value.endedAt !== undefined && !Number.isFinite(Date.parse(value.endedAt)))) {
+      throw new Error("maintenance_pause_marker_invalid");
+    }
+    return value;
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export function finishMaintenanceRebuildPause(home: string) {
+  const marker = readMaintenanceRebuildPause(home);
+  if (marker && !marker.endedAt) writeMarker(home, { ...marker, endedAt: new Date().toISOString() });
+}
+
+/** A SIGKILL cannot stamp endedAt. A later daemon may settle its dead
+ * listener's marker before deciding whether any of its arrivals remain. */
+export function settleInterruptedMaintenanceRebuildPause(home: string) {
+  const marker = readMaintenanceRebuildPause(home);
+  if (!marker || marker.endedAt) return marker;
+  // Markers written by the first B13 version have no PID. Only that version
+  // wrote this shape, so a current daemon reading it is after its pause.
+  if (!marker.pid) {
+    finishMaintenanceRebuildPause(home);
+    return readMaintenanceRebuildPause(home);
+  }
+  try { process.kill(marker.pid, 0); return marker; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") return marker;
+    finishMaintenanceRebuildPause(home);
+    return readMaintenanceRebuildPause(home);
+  }
+}
+
+export function clearMaintenanceRebuildPause(home: string) {
+  try { fs.unlinkSync(path.join(home, MARKER)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+
+export function maintenanceRebuildPauseSeen(home: string) {
+  return readMaintenanceRebuildPause(home) !== null;
+}

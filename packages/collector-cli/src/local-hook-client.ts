@@ -168,7 +168,7 @@ export async function forwardHookOverLoopback(
   const wireBody = ensureHookEventId(body);
   // The spool carries the body and nothing else. The token stays in this
   // process, exactly as it does on the live request.
-  const spool = (requireStableId = false) => {
+  const spool = (requireStableId = false, maintenanceRebuild = false) => {
     if (!hookSpoolEnabled(env)) return null;
     if (requireStableId && !bodyHasStableEventId(wireBody)) return null;
     // Suppressed BEFORE the write: the spool is a local write, and
@@ -189,16 +189,21 @@ export async function forwardHookOverLoopback(
     } catch {
       return null;
     }
-    return writeHookSpoolFile({
+    const written = writeHookSpoolFile({
       home,
       source: options.source,
       body: blanked.text,
       blanked: blanked.blanked,
       limits: options.spoolLimits,
+      ...(maintenanceRebuild ? { cause: "maintenance_rebuild" as const, nowMs: requestAtMs } : {}),
     });
+    // The receipt remains until the daemon durably admits or rejects the file.
+    // This keeps an attested claim held even if the client clock is skewed.
+    return written;
   };
 
   let response: Response;
+  const requestAtMs = Date.now();
   try {
     response = await fetchCollectorUrl(
       `http://127.0.0.1:${options.port}${HOOK_PATHS[options.source]}`,
@@ -223,7 +228,8 @@ export async function forwardHookOverLoopback(
   }
 
   if (SPOOLABLE_STATUSES.has(response.status)) {
-    const spooled = spool();
+    const spooled = spool(false, response.status === 503 &&
+      response.headers.get("x-plimsoll-maintenance-rebuild") === "paused");
     if (spooled) return { spooled: true, path: spooled.path };
   }
   if (response.status !== 202) {

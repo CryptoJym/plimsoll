@@ -992,6 +992,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:stop-window-release
 
+      - name: Prove concurrent release and push durability (eco-6hoxj.164.7 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:stop-window-release-race
+
       - name: Prove session sync ledger reads on the worker match the direct path (eco-6hoxj.163.11)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-sync-worker-parity
@@ -1051,6 +1055,75 @@ jobs:
       - name: Prove local HTTP trust boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:http-boundary
+
+      - name: Prove maintenance rebuild, refusal boundaries and paused push replay (eco-6hoxj.164.7)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:maintenance-rebuild
+          pnpm proof:maintenance-rebuild-pause
+          pnpm proof:maintenance-rebuild-r2
+          pnpm proof:maintenance-rebuild-r3
+          pnpm proof:maintenance-rebuild-r4-live
+          pnpm proof:maintenance-rebuild-r4-spool
+          pnpm proof:maintenance-rebuild-r4-lease
+          pnpm proof:maintenance-rebuild-r6-lock
+          pnpm proof:maintenance-rebuild-r6-refusals
+          pnpm proof:maintenance-rebuild-r7-recovery
+          pnpm proof:maintenance-rebuild-r7-terminal
+          pnpm proof:maintenance-rebuild-r8-downgrade
+          pnpm proof:maintenance-rebuild-r8-crash-state
+          pnpm proof:maintenance-rebuild-r8-lock-race
+          pnpm proof:maintenance-rebuild-r8-late-hook
+          pnpm proof:maintenance-rebuild-r8-terminal-otlp
+          pnpm proof:maintenance-rebuild-r8-same-day
+          pnpm proof:maintenance-rebuild-r8-clock-skew
+          pnpm proof:maintenance-rebuild-r9-downgrade-receipt
+          pnpm proof:maintenance-rebuild-r9-direct-idless
+          pnpm proof:maintenance-rebuild-r9-hook-unknown
+          pnpm proof:maintenance-rebuild-r9-stale-lock
+          pnpm proof:maintenance-rebuild-r10-uppercase
+          pnpm proof:maintenance-rebuild-r10-id-collision
+          pnpm proof:maintenance-rebuild-r10-terminal-journal
+          pnpm proof:maintenance-rebuild-r11-rowid-reuse
+          pnpm proof:maintenance-rebuild-r11-busy-writer
+          pnpm proof:maintenance-rebuild-r11-terminal-processes
+          pnpm proof:maintenance-rebuild-r11-mixed-case
+          pnpm proof:maintenance-rebuild-r11-digest
+          pnpm proof:maintenance-rebuild-r13-plan
+          pnpm proof:maintenance-rebuild-r13-clock
+          pnpm proof:maintenance-rebuild-r13-enrichment
+          pnpm proof:maintenance-rebuild-r13-identity
+          pnpm proof:maintenance-rebuild-r13-atomic
+          pnpm proof:maintenance-rebuild-r13-nested-time
+          pnpm proof:maintenance-rebuild-r13-old-binary
+          pnpm proof:maintenance-rebuild-r14-fanout
+          pnpm proof:maintenance-rebuild-r14-prior-row
+          pnpm proof:maintenance-rebuild-r14-body-mismatch
+          pnpm proof:maintenance-rebuild-r14-ack-retention
+          pnpm proof:maintenance-rebuild-r14-fallback
+          pnpm proof:maintenance-rebuild-r15-rowid-reuse
+          pnpm proof:maintenance-rebuild-r15-prior-duplicate
+          pnpm proof:maintenance-rebuild-r15-nested-uuid
+          pnpm proof:maintenance-rebuild-r15-cross-tenant
+          pnpm proof:maintenance-rebuild-r15-old-format
+          pnpm proof:maintenance-rebuild-r15-fingerprint-controls
+          pnpm proof:maintenance-rebuild-r15-unverified-gates
+          pnpm proof:maintenance-rebuild-r15-query-plans
+          pnpm proof:maintenance-rebuild-r15-five-paired-timing
+          pnpm proof:maintenance-rebuild-r15-digest-anywhere
+          pnpm proof:maintenance-rebuild-r16-migration-gap
+          pnpm proof:maintenance-rebuild-r16-listener-wait
+          pnpm proof:maintenance-rebuild-r16-unsequenced
+          pnpm proof:maintenance-rebuild-r16-tailer-cost
+          pnpm proof:maintenance-rebuild-r18-null-boundary
+          pnpm proof:maintenance-rebuild-r18-busy-refusal
+          pnpm proof:maintenance-rebuild-r18-busy-http
+          pnpm proof:maintenance-rebuild-r18-receipt-crash
+          pnpm proof:maintenance-rebuild-r18-migration-gap
+          pnpm proof:maintenance-rebuild-r18-schema-crash
+          pnpm proof:maintenance-rebuild-r18-schema-commit
+          pnpm proof:maintenance-rebuild-writers
+          pnpm proof:maintenance-rebuild-contract
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:otlp-admission

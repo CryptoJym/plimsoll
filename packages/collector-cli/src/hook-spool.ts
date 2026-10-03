@@ -1,17 +1,18 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { maintenanceRebuildPauseSeen, MISSING_HOOK_RETRY_MS, prepareMaintenanceHookSpoolBody,
+  recordMaintenanceRebuildRefusal } from "./maintenance-rebuild-pause-state";
 
 import { recordSpoolLoss } from "./spool-losses";
 
 import {
-  isProtectedMetadataFieldName,
-  isSafeSuppressionSourceKey,
-  isSensitiveMetadataSemanticKey,
   protectedMetadataFieldNames,
 } from "../../shared/src/index";
 import { resolveCollectorHome } from "./collector-home";
 import { isUuid } from "./normalizer";
+import { SPOOL_DERIVATION_INPUT_KEYS, spoolKeepsProtectedIdentityRaw,
+  blankForbiddenRawContent } from "./hook-spool-privacy";
 
 /**
  * Bead eco-6hoxj.61: hook events the local collector cannot accept right now
@@ -110,20 +111,22 @@ export const HOOK_SPOOL_LIMITS = Object.freeze({
    */
   temporaryOrphanMs: 60_000,
   /** Doctor says so plainly once pending files are this old. */
-  stalePendingSeconds: 600,
+  stalePendingSeconds: MISSING_HOOK_RETRY_MS / 1000,
 });
 
 export type HookSpoolBounds = { maxFiles: number; maxBytes: number };
 
 /**
- * A spooled file name is `<utcMillis>-<pid>-<random6>.json`. The pattern is
- * strict on purpose: it is the only thing that makes a pending file, and it
+ * A spooled file name is `<utcMillis>-<pid>-<random6>.json`, including a
+ * client-owned retry of a pause 503. That grammar is also understood by the
+ * 0.7.44 reader. Older tagged files remain readable after an upgrade; new
+ * pause causes live in separate refusal receipts. The pattern is strict: it
  * keeps `.counters.json`, a half-written `.tmp`, and the `rejected/`
  * subdirectory out of every listing by construction.
  */
-const SPOOL_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})\.json$/;
+const SPOOL_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})(?:\.(maintenance_rebuild))?\.json$/;
 /** A rejected file keeps its identity and gains `.<reason>` before `.json`. */
-const REJECTED_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})\.([a-z0-9_]+)\.json$/;
+const REJECTED_FILE_PATTERN = /^(\d{13,})-(\d+)-([0-9a-f]{6})(?:\.maintenance_rebuild)?\.([a-z0-9_]+)\.json$/;
 /**
  * Every temporary this module writes (a spool file and the counters file both
  * land through `<name>.tmp`). They are invisible to `SPOOL_FILE_PATTERN` by
@@ -202,31 +205,7 @@ export type HookSpoolEnvelope = {
  * proof (`scripts/hook-spool-proof.ts`, case `q`) is the guard in the other
  * direction — a key whose blanking moves a persisted value belongs here.
  */
-export const SPOOL_DERIVATION_INPUT_KEYS = [
-  // The four keys `extractRepoContextCwd` (`repo-context.ts:22`, `CWD_KEYS`)
-  // reads from the raw payload. `appendForwardedHook` (`forwarder.ts:42`) uses
-  // the result to attach the repo-context sidecar, which the ledger turns into
-  // the event's repository linkage rows (repo/branch/head). Blanked, the event
-  // loses its repository attribution for good.
-  "cwd",
-  "current_working_directory",
-  "workdir",
-  "working_directory",
-  // The one `eventType` authority alias that is itself sensitive — as a
-  // camelCase variant of the approved `hook_event_name`, `isSensitiveMetadata
-  // SemanticKey` strips it. `normalizeHookPayload` selects the event's type
-  // from this value in the RAW body (`hook-authority.ts:81`,
-  // `normalizer.ts:364`), so blanking it would move `event_type`. The other
-  // value-bearing authority aliases (`id`/`eventId`/`event_id`,
-  // `eventType`/`event_type`/`type`, `actionClass`/`action_class`,
-  // `observedAt`/`observed_at`/`timestamp`/`time`) are not sensitive, so they
-  // are never blanked and need no exemption; the authority aliases that ARE
-  // sensitive but only ever produce a receipt from the key's presence
-  // (`transportPath`, `repo_hash`, `branch_hash`, `head_sha`, `tenant.id`, …)
-  // are blanked, and their receipts are unchanged because a receipt is built
-  // from the key path, never the value.
-  "hookEventName",
-] as const;
+export { SPOOL_DERIVATION_INPUT_KEYS };
 
 /**
  * The collector's own pre-write rule on its own, with no exemption applied:
@@ -235,9 +214,7 @@ export const SPOOL_DERIVATION_INPUT_KEYS = [
  * raw-content names, the private-concept rule and the raw/path word rule;
  * `!isSafeSuppressionSourceKey` is a name it cannot even put in a receipt.
  */
-function collectorStripsKeyOutright(key: string) {
-  return !isSafeSuppressionSourceKey(key) || isSensitiveMetadataSemanticKey(key);
-}
+// The shared privacy rule is implemented in hook-spool-privacy.ts.
 
 /**
  * The SECOND group of derivation inputs (review r3, N3; review r4, F1): the
@@ -289,9 +266,7 @@ function collectorStripsKeyOutright(key: string) {
  * conjunction would turn fourteen canonical path/email names raw in the spool
  * — the opposite of this fix.
  */
-export function spoolKeepsProtectedIdentityRaw(key: string) {
-  return !collectorStripsKeyOutright(key) && isProtectedMetadataFieldName(key);
-}
+export { spoolKeepsProtectedIdentityRaw };
 
 /**
  * The canonical spelling of every name the rule above covers: the shared list
@@ -369,8 +344,6 @@ export const SPOOL_DERIVATION_INPUT_DISCLOSURE: readonly SpoolDerivationInputDis
   })),
 ];
 
-const derivationInputKeys = new Set<string>(SPOOL_DERIVATION_INPUT_KEYS);
-
 /**
  * True when the collector would strip this key's value before the local
  * database write, so the spool must not hold it either.
@@ -389,11 +362,7 @@ const derivationInputKeys = new Set<string>(SPOOL_DERIVATION_INPUT_KEYS);
  *     become an override of the DROP rule by accident.
  * Both are disclosed in `SPOOL_DERIVATION_INPUT_DISCLOSURE`.
  */
-function spoolSuppressedKey(key: string) {
-  if (derivationInputKeys.has(key)) return false;
-  if (spoolKeepsProtectedIdentityRaw(key)) return false;
-  return collectorStripsKeyOutright(key);
-}
+// The shared suppression predicate is implemented in hook-spool-privacy.ts.
 
 /**
  * Blank everything the ledger would not keep, before it can reach the disk.
@@ -414,47 +383,7 @@ function spoolSuppressedKey(key: string) {
  * (`null`): it is a body the collector would refuse anyway, and putting
  * unexaminable bytes on disk is the thing this function exists to prevent.
  */
-export function blankForbiddenRawContent(
-  body: string,
-): { text: string; blanked: number } | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return null;
-  }
-  let blanked = 0;
-  const blank = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map((item) => blank(item));
-    if (!value || typeof value !== "object") return value;
-    const record = value as Record<string, unknown>;
-    // OTLP-shaped attribute: the name is in `key` and the content is in
-    // `value`. `sanitizeRoutineMetadata` judges the attribute by that name and
-    // stops descending; so do we.
-    const semanticKey = typeof record.key === "string" ? record.key : undefined;
-    if (semanticKey && "value" in record && spoolSuppressedKey(semanticKey)) {
-      blanked += 1;
-      return { ...record, value: "" };
-    }
-    const next: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(record)) {
-      if (spoolSuppressedKey(key)) {
-        blanked += 1;
-        next[key] = "";
-        continue;
-      }
-      next[key] = blank(nested);
-    }
-    return next;
-  };
-  let text: string | undefined;
-  try {
-    text = JSON.stringify(blank(parsed));
-  } catch {
-    return null;
-  }
-  return text === undefined ? null : { text, blanked };
-}
+export { blankForbiddenRawContent };
 
 /**
  * Private-path rule, identical to the one the collector home itself is held
@@ -501,7 +430,9 @@ export type HookSpoolFile = {
  * (eco-6hoxj.163.18: the upload capture claim is bounded by what the spool
  * still holds). Null when the directory exists but cannot be listed.
  */
-export function listHookSpoolArrivals(home: string): number[] | null {
+export function listHookSpoolArrivalDetails(home: string): Array<{
+  atMs: number; maintenanceRebuild: boolean;
+}> | null {
   let names: string[];
   try {
     names = fs.readdirSync(hookSpoolDirectory(home));
@@ -511,7 +442,11 @@ export function listHookSpoolArrivals(home: string): number[] | null {
   return names
     .map((name) => SPOOL_FILE_PATTERN.exec(name))
     .filter((match): match is RegExpExecArray => match !== null)
-    .map((match) => Number(match[1]));
+    .map((match) => ({ atMs: Number(match[1]), maintenanceRebuild: match[4] === "maintenance_rebuild" }));
+}
+
+export function listHookSpoolArrivals(home: string): number[] | null {
+  return listHookSpoolArrivalDetails(home)?.map((arrival) => arrival.atMs) ?? null;
 }
 
 export function listHookSpoolFiles(home: string, limit = Number.POSITIVE_INFINITY) {
@@ -794,11 +729,17 @@ export function writeHookSpoolEnvelope(options: {
   /** Forbidden raw-content values the caller emptied before handing it over. */
   blanked?: number;
   nowMs?: number;
+  /** Client-owned retry of a maintenance 503; receipt is separate from this file. */
+  cause?: "maintenance_rebuild";
   limits?: Partial<HookSpoolBounds>;
 }): HookSpoolWriteResult {
   const maxFiles = options.limits?.maxFiles ?? HOOK_SPOOL_LIMITS.maxFiles;
   const maxBytes = options.limits?.maxBytes ?? HOOK_SPOOL_LIMITS.maxBytes;
   const nowMs = options.nowMs ?? Date.now();
+  const maintenance = options.cause === "maintenance_rebuild" && maintenanceRebuildPauseSeen(options.home);
+  const prepared = maintenance
+    ? prepareMaintenanceHookSpoolBody(options.home, options.source, options.body)
+    : { body: options.body, receiptBody: options.body, eventId: undefined };
   const envelope: HookSpoolEnvelope = {
     v: 1,
     source: options.source,
@@ -806,7 +747,7 @@ export function writeHookSpoolEnvelope(options: {
     ...(options.producerEventId ? { producerEventId: options.producerEventId } : {}),
     receivedAt: new Date(nowMs).toISOString(),
     blanked: options.blanked ?? 0,
-    body: options.body,
+    body: prepared.body,
   };
   const content = JSON.stringify(envelope);
   const contentBytes = Buffer.byteLength(content);
@@ -849,6 +790,12 @@ export function writeHookSpoolEnvelope(options: {
     fs.renameSync(temporary, target);
     published = true;
     syncHookSpoolDirectory(directory);
+    // The filename stays readable by 0.7.44. A private metadata receipt
+    // carries the maintenance cause until this file reaches a final outcome.
+    if (maintenance) {
+      recordMaintenanceRebuildRefusal(options.home, "hook", options.source, prepared.receiptBody,
+        { eventId: prepared.eventId, spoolName: path.basename(target) });
+    }
     return { ok: true, path: target };
   } catch {
     // A failed directory flush is NOT durable acceptance. Hide this writer's
