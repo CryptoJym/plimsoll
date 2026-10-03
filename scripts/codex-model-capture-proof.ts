@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("codex-model-capture", 17);
+const completion = createProofCompletion("codex-model-capture", 24);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -8,6 +8,10 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { captureFrontier } from "../packages/collector-cli/src/capture-frontier";
+import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
+import { runWorkspaceHistoryUpload } from "../packages/collector-cli/src/upload-history";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { buildIngestBatch } from "../packages/collector-cli/src/upload";
 import type { CollectorConfig } from "../packages/collector-cli/src/config";
 import type { AiInteractionEvent } from "../packages/shared/src/index";
@@ -136,7 +140,16 @@ async function run(
     );
     if (expected) {
       assert.equal(result.model, expected);
-      assert.equal(result.inputTokens, 5555);
+      if (reason === "paired_sse_event") {
+        assert.equal(result.inputTokens, undefined);
+        assert.equal(result.metadata.usageDuplicateReason, reason);
+        assert.equal(result.metadata.modelCaptureInputTokens, 5555);
+        assert.equal(
+          events.filter((e) => e.inputTokens === 5555).length,
+          1,
+          "pair counts once",
+        );
+      } else assert.equal(result.inputTokens, 5555);
       assert.ok(result.metadata.modelCaptureSource);
       assert.ok(result.metadata["user.account_id"]);
     } else {
@@ -510,6 +523,149 @@ async function main() {
         );
         checks++;
         completion.check("legacy-sealed-gap-replacement");
+      } finally {
+        b.close();
+      }
+    }
+    await run(
+      "paired-model-first",
+      (b) => {
+        // Missing typed pairing shape on an older ledger: the exact SSE is still
+        // the first source, and the span must not become a second token row.
+        const nativeLog = log("gpt-6.1-sol", false, true);
+        b.append(nativeLog);
+        b.database
+          .prepare(
+            "update buffered_events set event_type='otel_log' where id=?",
+          )
+          .run(nativeLog.id);
+        b.append(log("gpt-6-astra", true));
+        return span();
+      },
+      "gpt-6.1-sol",
+      "paired_sse_event",
+    );
+    await run(
+      "two-model-pair",
+      (b) => {
+        b.append(log("gpt-6.1-sol", false, true));
+        b.append(log("gpt-6-astra", false, true));
+        return span();
+      },
+      null,
+      "ambiguous_pair_model",
+    );
+    await run(
+      "foreign-account",
+      (b) => {
+        b.append(log("gpt-6-astra", true));
+        return span([attr("user.account_id", "sha256:fedcba9876543210")]);
+      },
+      null,
+      "model_evidence_missing",
+    );
+    await run(
+      "resource-only-model",
+      () => {
+        resource.attributes.push(attr("gen_ai.request.model", "gpt-6-astra"));
+        try {
+          return span();
+        } finally {
+          resource.attributes.pop();
+        }
+      },
+      null,
+      "model_evidence_missing",
+    );
+    await run(
+      "no-model-hook",
+      () =>
+        normalizeHookPayload(
+          {
+            inputTokens: 5555,
+            outputTokens: 55,
+            cacheReadTokens: 5000,
+            observedAt: new Date(at).toISOString(),
+            eventType: "assistant_response",
+          },
+          { source: "codex", now: () => at + 1000 },
+        ).event,
+      null,
+      "model_evidence_missing",
+    );
+    await run(
+      "named-class2-model",
+      () => ({
+        ...span(),
+        model: "gpt-6-astra",
+        source: "claude_code",
+        metadata: { serviceName: "Codex_Desktop" },
+      }),
+      null,
+      "codex_service_under_claude_source",
+    );
+    {
+      const ledgerPath = path.join(root, "readonly-history.sqlite");
+      const b = new LocalEventBuffer(ledgerPath, {
+        workspaceId: session,
+        deviceId: "fixture-device",
+        enrollmentNow: () => new Date(at - 1000),
+      });
+      try {
+        b.append(span());
+        const snapshot = () =>
+          JSON.stringify({
+            rows: b.database.prepare("select * from buffered_events").all(),
+            schema: b.database
+              .prepare("select sql from sqlite_master order by name")
+              .all(),
+          });
+        const before = snapshot();
+        const sent: AiInteractionEvent[] = [];
+        const cfg = collectorConfigSchema.parse({
+          tenantId: session,
+          deviceId: "fixture-device",
+          installKey: "fixture-install",
+          uploadUrl: "http://127.0.0.1:49997/api/ai-work/ingest",
+        });
+        const result = await runWorkspaceHistoryUpload(cfg, {
+          ledgerPath,
+          statePath: path.join(root, "history-state.json"),
+          full: true,
+          delayMs: 0,
+          developmentLoopbackUrl: true,
+          now: () => new Date(Date.now() + 61000),
+          sleep: async () => {},
+          log: () => {},
+          fetchImpl: async (_url, init) => {
+            const body = String(init?.body);
+            const batch = JSON.parse(body);
+            sent.push(
+              ...batch.events.map(
+                (e: { event: AiInteractionEvent }) => e.event,
+              ),
+            );
+            return new Response(
+              JSON.stringify(acceptedFixtureDelivery(body, cfg.installKey)),
+              {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              },
+            );
+          },
+        });
+        assert.equal(result.ok, true);
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.metadata.captureGap, true);
+        assert.equal(sent[0]!.inputTokens, undefined);
+        assert.ok(sent[0]!.metadata.installationEpochId);
+        assert.equal(
+          snapshot(),
+          before,
+          "history model gate performs zero ledger writes",
+        );
+        checks++;
+        completion.check("readonly-history-gap");
       } finally {
         b.close();
       }

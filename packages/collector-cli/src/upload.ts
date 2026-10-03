@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { captureCodexModel, codexHasUsage, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
 import {
@@ -62,7 +62,7 @@ export function buildIngestBatch(
     candidateRows.map((row) => ({ event: row.payload, repoHash: row.repoHash })),
   );
   for (const row of candidateRows) {
-    if (codexHasUsage(row.payload) && !row.payload.model &&
+    if (unresolvedCapture(row.payload) &&
         (options.now?.() ?? new Date()).getTime() < Date.parse(row.createdAt) + CODEX_MODEL_WAIT_MS) continue;
     const captured = captureCodexModel(buffer.database,row.payload,row.id);
     const attributed = attribution.attribute(captured, {

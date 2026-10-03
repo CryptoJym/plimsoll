@@ -1,5 +1,5 @@
 import type { AiInteractionEvent } from "../../shared/src/index";
-import { captureCodexModel, codexModelGap, codexHasUsage, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexModelGap, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -1459,7 +1459,7 @@ export class DeliveryOutbox {
       if ((event.source === "codex" || event.source === "claude_code") && (
           event.source === "codex" && event.eventType === "assistant_response" && (event.metadata?.otelEventName === "codex.sse_event" ||
             event.metadata?.otelEventName === "handle_responses") ||
-          !event.model && codexHasUsage(event as AiInteractionEvent))) {
+          unresolvedCapture(event as AiInteractionEvent))) {
         nextAttemptAt = new Date(nowDate.getTime() + CODEX_MODEL_WAIT_MS).toISOString();
       }
     } catch {
@@ -2238,7 +2238,7 @@ export class DeliveryOutbox {
           locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
           continue;
         }
-        if (row.sealedEnvelopeJson && codexHasUsage(outboundEnvelope.event) && !outboundEnvelope.event.model) {
+        if (row.sealedEnvelopeJson && unresolvedCapture(outboundEnvelope.event)) {
           // An old, once-attempted request may already have committed remotely.
           // Never rewrite its frozen bytes or retry unknown billable usage.
           // Retire it and send a distinct tokenless gap with the same raw lineage.
@@ -2252,7 +2252,9 @@ export class DeliveryOutbox {
             const id=incarnationDeliveryId(row.rawId,row.rawCreatedAt,row.rawGeneration,attempt);
             if (!this.db.prepare(`select 1 from buffered_events where id=? union all
               select 1 from upload_outbox where delivery_id=? union all
-              select 1 from upload_receipts where delivery_id=? limit 1`).get(id,id,id)) {gapId=id;break;}
+              select 1 from upload_receipts where delivery_id=? union all
+              select 1 from upload_replays where delivery_id=? union all
+              select 1 from upload_validation_candidates where delivery_id=? limit 1`).get(id,id,id,id,id)) {gapId=id;break;}
           }
           if (!gapId) {
             locallyDead += this.deadActive(row.deliveryId,"local_model_capture_gap",nowIso,disposedRawRowids);

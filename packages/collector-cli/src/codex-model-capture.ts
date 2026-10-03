@@ -25,6 +25,76 @@ export function codexHasUsage(event: AiInteractionEvent): boolean {
   );
 }
 
+function nativeModels(event: AiInteractionEvent): Set<string> {
+  return new Set(
+    [
+      event.model,
+      ...usageFieldKeys.model.map((key) => event.metadata[key]),
+    ].filter(
+      (value): value is string => typeof value === "string" && !!value.trim(),
+    ),
+  );
+}
+export function codexMisfiledUnderClaude(event: AiInteractionEvent): boolean {
+  return (
+    event.source === "claude_code" &&
+    /^(codex[-_.]|codex$)/i.test(String(event.metadata.serviceName ?? ""))
+  );
+}
+export function unresolvedCapture(event: AiInteractionEvent): boolean {
+  return (
+    codexHasUsage(event) &&
+    (!text(event.model) ||
+      codexMisfiledUnderClaude(event) ||
+      event.metadata.modelEvidenceConflict === true ||
+      nativeModels(event).size > 1)
+  );
+}
+function pairedObservation(event: AiInteractionEvent): AiInteractionEvent {
+  const {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
+    costUsd: _cost,
+    costKind: _kind,
+    ...rest
+  } = event;
+  const metadata = { ...event.metadata };
+  for (const key of [
+    ...usageFieldKeys.inputTokens,
+    ...usageFieldKeys.outputTokens,
+    ...usageFieldKeys.cacheReadTokens,
+    ...usageFieldKeys.cacheCreationTokens,
+    ...usageFieldKeys.costUsd,
+    ...usageFieldKeys.estimatedCostUsd,
+  ])
+    delete metadata[key];
+  delete metadata.costEstimated;
+  // This exact native log already owns these counts. The span records the
+  // captured model, but contributes no second observation to cloud usage.
+  return {
+    ...rest,
+    eventType: "otel_span",
+    metadata: {
+      ...metadata,
+      usageDuplicateReason: "paired_sse_event",
+      ...(inputTokens !== undefined
+        ? { modelCaptureInputTokens: inputTokens }
+        : {}),
+      ...(outputTokens !== undefined
+        ? { modelCaptureOutputTokens: outputTokens }
+        : {}),
+      ...(cacheReadTokens !== undefined
+        ? { modelCaptureCacheReadTokens: cacheReadTokens }
+        : {}),
+      ...(cacheCreationTokens !== undefined
+        ? { modelCaptureCacheCreationTokens: cacheCreationTokens }
+        : {}),
+    },
+  };
+}
+
 type Peer = { event: AiInteractionEvent; pairedId: string | null };
 function sameCounts(a: AiInteractionEvent, b: AiInteractionEvent) {
   return (
@@ -114,7 +184,7 @@ export function codexModelGap(
 ): AiInteractionEvent {
   const epoch = text(event.metadata.installationEpochId),
     at = Date.parse(event.observedAt);
-  if (epoch && Number.isFinite(at)) {
+  if (!db.readonly && epoch && Number.isFinite(at)) {
     db.exec(`create table if not exists codex_model_capture_gaps (
       installation_epoch_id text not null, observed_day integer not null,
       from_ms integer not null, to_ms integer not null,
@@ -192,13 +262,7 @@ export function captureCodexModel(
   rawId = event.id,
 ): AiInteractionEvent {
   if (!codexHasUsage(event)) return event;
-  const row = db
-    .prepare(
-      `select workspace_id as workspace, device_id as device,
-    installation_epoch_id as epoch, usage_paired_event_id as pairedId
-    from buffered_events where id=?`,
-    )
-    .get(rawId) as
+  let row:
     | {
         workspace: string | null;
         device: string | null;
@@ -206,16 +270,35 @@ export function captureCodexModel(
         pairedId: string | null;
       }
     | undefined;
+  try {
+    row = db
+      .prepare(
+        `select workspace_id as workspace, device_id as device,
+      installation_epoch_id as epoch, usage_paired_event_id as pairedId
+      from buffered_events where id=?`,
+      )
+      .get(rawId) as typeof row;
+  } catch (error) {
+    // Explicit history uploads also support pre-install-identity ledgers.
+    // They remain read-only and cannot invent a native join boundary.
+    if (!(error instanceof Error) || !/no such column/.test(error.message))
+      throw error;
+  }
   if (row?.epoch)
     event = {
       ...event,
       metadata: { ...event.metadata, installationEpochId: row.epoch },
     };
   const gap = (reason: string) => codexModelGap(db, event, reason);
-  if (event.metadata.modelEvidenceConflict === true)
+  if (
+    nativeModels(event).size > 1 ||
+    event.metadata.modelEvidenceConflict === true
+  )
     return gap("conflicting_model_attributes");
   const accountKey =
     event.source === "claude_code" ? "user.account_uuid" : "user.account_id";
+  if (codexMisfiledUnderClaude(event))
+    return gap("codex_service_under_claude_source");
   if (text(event.model))
     return {
       ...event,
@@ -257,7 +340,7 @@ export function captureCodexModel(
     .all(
       new Date(at - WINDOW_MS).toISOString(),
       new Date(end + WINDOW_MS).toISOString(),
-      event.id,
+      rawId,
       row.workspace,
       row.device,
       row.epoch,
@@ -287,7 +370,7 @@ export function captureCodexModel(
     (p) =>
       compatible(event, p.event) &&
       sameCounts(event, p.event) &&
-      (!p.pairedId || p.pairedId === event.id) &&
+      (!p.pairedId || p.pairedId === rawId) &&
       Math.min(
         Math.abs(Date.parse(p.event.observedAt) - at),
         Math.abs(Date.parse(p.event.observedAt) - end),
@@ -306,7 +389,7 @@ export function captureCodexModel(
     pairModels.length === 1 &&
     competingSpans.length === 0
   )
-    return capture(event, pair, "paired_sse_event");
+    return pairedObservation(capture(event, pair, "paired_sse_event"));
   const traceId = text(event.metadata.traceId);
   const traced = traceId
     ? logs.filter((p) => p.event.metadata.traceId === traceId)
