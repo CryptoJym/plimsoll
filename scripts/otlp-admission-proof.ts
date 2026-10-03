@@ -237,7 +237,7 @@ const appServerMatrix = {
 // Every flood name, plus the model-only span and the case/whitespace variant.
 const APP_SERVER_DROPPED = APP_SERVER_FLOOD_SPANS.length + 2;
 
-/** The rule is Codex-scoped: the same envelope from Claude Code fails open. */
+/** A Codex exporter retains its source even with a valid Claude credential. */
 const appServerForeignSourceMatrix = {
   resourceSpans: [
     {
@@ -606,9 +606,13 @@ async function main() {
       "claude_code",
     );
     check(
-      "codex_service_with_claude_credential_is_refused",
-      appServerForeign.status === 401 &&
-        appServerForeign.body.reason === "source_mismatch",
+      "codex_service_with_claude_credential_keeps_codex_admission",
+      appServerForeign.status === 202 && appServerForeign.body.events === 0 &&
+        appServerForeign.body.droppedEvents === 1 &&
+        Array.isArray(appServerForeign.body.droppedByReason) &&
+        (appServerForeign.body.droppedByReason as Array<Record<string, unknown>>).some(
+          row => row.source === "codex" && row.reason === "app_server_internal_span" && row.count === 1,
+        ),
       appServerForeign,
     );
 
@@ -945,9 +949,10 @@ async function main() {
       const named = buffer.list(500).map((row) => row.payload).filter((event) =>
         (event.metadata as Record<string, unknown>).serviceName === serviceName &&
         event.inputTokens === 1000 + index);
-      check(`codex_service_${serviceName}_source_guard`,
-        wrong.status === 401 && wrong.body.reason === "source_mismatch" &&
-        right.status === 202 && named.length === 1 && named[0]?.source === "codex",
+      check(`codex_service_${serviceName}_source_classification`,
+        wrong.status === 202 && right.status === 202 && named.length === 2 &&
+        named.every(event => event.source === "codex" && event.outputTokens === 17) &&
+        named[0]?.id !== named[1]?.id,
         { wrong, right, sources: named.map((event) => event.source) });
     }
 
@@ -1044,7 +1049,7 @@ async function main() {
         droppedCountFor(status.otlpAdmission.dropped, "generic_zero_value_span") ===
           GENERIC_CONTROL_SPANS.length &&
         droppedCountFor(status.otlpAdmission.dropped, "app_server_internal_span") ===
-          APP_SERVER_DROPPED,
+          APP_SERVER_DROPPED + 1,
       status.otlpAdmission,
     );
 
@@ -1089,7 +1094,7 @@ async function main() {
         restarted.find((row) => row.reason === "generic_zero_value_span")?.droppedCount ===
           GENERIC_CONTROL_SPANS.length &&
         restarted.find((row) => row.reason === "app_server_internal_span")?.droppedCount ===
-          APP_SERVER_DROPPED,
+          APP_SERVER_DROPPED + 1,
       restarted,
     );
   } finally {

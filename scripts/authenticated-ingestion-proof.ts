@@ -1,5 +1,6 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("authenticated-ingestion", 12);
+const completion = createProofCompletion("authenticated-ingestion", 13);
+import { verifyOtlpServiceSourceCases } from "./lib/otlp-service-source-cases";
 /**
  * Focused proof for the authenticated portion of issue #108 / 0059.
  *
@@ -338,6 +339,10 @@ async function main() {
     buffer.close();
     fs.rmSync(home, { recursive: true, force: true });
   }
+
+  const serviceSourceCases = await verifyOtlpServiceSourceCases();
+  check("codex_exporters_keep_their_source_under_claude_credentials_and_warn_once",
+    true, serviceSourceCases);
 
   for (const result of checks) {
     console.log(`${result.passed ? "PASS" : "FAIL"} ${result.name} ${JSON.stringify(result.detail)}`);

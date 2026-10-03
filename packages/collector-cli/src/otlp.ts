@@ -98,7 +98,7 @@ function resourceSummary(resource: unknown, dataMode: PolicyConfig["dataMode"]) 
   const admitted = metadataSafeOtlpAttributes(attrs, dataMode, "resource");
   return {
     serviceName: admitted.attrs["service.name"] as string | undefined,
-    serviceSource: sourceForOtlpService(attrs["service.name"]),
+    serviceSource: sourceForOtlpService(resourceServiceName(attrs)),
     serviceVersion: admitted.attrs["service.version"] as string | undefined,
     suppressedFields: admitted.suppressedFields,
   };
@@ -143,26 +143,42 @@ function sourceForOtlpService(value: unknown): ToolSource | undefined {
   return "unknown";
 }
 
-/** Called only after the producer token has been checked. A service cannot
- * change its authenticated source by choosing a different resource name. */
-export function conflictingOtlpServiceSource(payload: unknown, claimed: ToolSource): boolean {
+function resourceServiceName(attrs: Record<string, unknown>): unknown {
+  return attrs["service.name"] ?? attrs.service_name ?? attrs.serviceName;
+}
+
+function* namedOtlpServiceSources(payload: unknown): Generator<ToolSource> {
   const root = asRecord(payload);
   for (const section of ["resourceLogs", "resourceSpans", "resourceMetrics"] as const) {
     const resources = root[section];
     if (!Array.isArray(resources)) continue;
     for (const entry of resources) {
       const attrs = flattenOtelAttributes(asRecord(asRecord(entry).resource).attributes);
-      const named = sourceForOtlpService(attrs["service.name"]);
-      if (named !== undefined && named !== "unknown" && named !== claimed) return true;
+      const named = sourceForOtlpService(resourceServiceName(attrs));
+      if (named !== undefined && named !== "unknown") yield named;
     }
+  }
+}
+
+/** Producer credentials authorize intake. Codex exporters can inherit another
+ * producer's credential; their resource still identifies the actual tool. */
+export function conflictingOtlpServiceSource(payload: unknown, claimed: ToolSource): boolean {
+  for (const named of namedOtlpServiceSources(payload)) {
+    if (named !== "codex" && named !== claimed) return true;
+  }
+  return false;
+}
+
+export function hasCodexOtlpServiceSource(payload: unknown): boolean {
+  for (const named of namedOtlpServiceSources(payload)) {
+    if (named === "codex") return true;
   }
   return false;
 }
 
 function eventSourceFor(fallback: ToolSource, serviceSource: ToolSource | undefined): ToolSource {
-  // The HTTP receiver rejects a known name that conflicts with its authenticated
-  // source before calling this parser. Direct/offline callers still get the
-  // named source; an unrecognized name is explicitly UNKNOWN.
+  // Credentials authorize intake separately from the named producer. An
+  // unrecognized resource name remains explicitly UNKNOWN.
   return serviceSource ?? fallback;
 }
 
@@ -361,6 +377,7 @@ function buildLogEvent(
 
   const observedAt = recordTimestamp(safeRecord, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
+  const eventSource = eventSourceFor(context.source, context.serviceSource);
   // OTLP log records can carry the trace context of the response span. Keep
   // this bounded identifier so the two usage shapes can be paired without
   // guessing from token counts across concurrent Codex sessions.
@@ -369,10 +386,10 @@ function buildLogEvent(
     ? validatedTraceId.value
     : undefined;
   const dispatchBinding = sessionId && context.dispatchSnapshot
-    ? context.source === "claude_code"
+    ? eventSource === "claude_code"
       ? claudeBindingForUnrootedEvent(sessionId,observedAt,context.dispatchSnapshot,
           context.durableSightings?.(sessionId))
-      : context.source === "codex"
+      : eventSource === "codex"
         ? dispatchBindingForSession("codex",sessionId,observedAt,context.dispatchSnapshot.roots) : null
     : null;
 
@@ -390,7 +407,7 @@ function buildLogEvent(
     ]),
     sessionId,
     tenantId: context.policy.tenantId,
-    source: eventSourceFor(context.source, context.serviceSource),
+    source: eventSource,
     dataMode: context.policy.dataMode,
     eventType,
     observedAt,
@@ -465,7 +482,8 @@ function buildSpanEvent(
     : undefined;
   const observedAt = recordTimestamp(safeSpan, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
-  const dispatchBinding = context.source === "claude_code" && sessionId && context.dispatchSnapshot
+  const eventSource = eventSourceFor(context.source, context.serviceSource);
+  const dispatchBinding = eventSource === "claude_code" && sessionId && context.dispatchSnapshot
     ? claudeBindingForUnrootedEvent(sessionId,observedAt,context.dispatchSnapshot,
         context.durableSightings?.(sessionId))
     : null;
@@ -561,7 +579,7 @@ function buildSpanEvent(
     ]),
     sessionId,
     tenantId: context.policy.tenantId,
-    source: eventSourceFor(context.source, context.serviceSource),
+    source: eventSource,
     dataMode: context.policy.dataMode,
     eventType,
     observedAt,

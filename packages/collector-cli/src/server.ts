@@ -32,7 +32,7 @@ import {
   classifyProducerOutcome,
   readProducerEventIdHeader,
 } from "./producer-parity";
-import { conflictingOtlpServiceSource, explodeOtlpPayload } from "./otlp";
+import { conflictingOtlpServiceSource, explodeOtlpPayload, hasCodexOtlpServiceSource } from "./otlp";
 import {
   otlpBatchRemainder,
   otlpChunk,
@@ -682,6 +682,8 @@ export type IntakeSpoolRefusal =
 export type IntakeSpoolOutcome =
   | { ok: true; path: string; source: HookSpoolSource }
   | { ok: false; attempted: boolean; refused: IntakeSpoolRefusal };
+
+let warnedCodexServiceCredentialMismatch = false;
 
 export function createCollectorServer(
   config: CollectorConfig,
@@ -1949,6 +1951,15 @@ export function createCollectorServer(
         if (hasLiveUsageClaim(parsedEnvelope)) throw new HttpBoundaryRejection("source_not_allowed", 403);
         if (conflictingOtlpServiceSource(parsedEnvelope, source)) {
           throw new HttpBoundaryRejection("source_mismatch", 401);
+        }
+        if (source !== "codex" && !warnedCodexServiceCredentialMismatch &&
+            hasCodexOtlpServiceSource(parsedEnvelope)) {
+          warnedCodexServiceCredentialMismatch = true;
+          console.warn(JSON.stringify({
+            status: "otlp_service_source_mismatch",
+            credentialSource: source,
+            serviceSource: "codex",
+          }));
         }
 
         const transportPath = canonicalOtlpTransportPath(request.url);
