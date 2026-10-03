@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("codex-model-capture", 29);
+const completion = createProofCompletion("codex-model-capture", 31);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -780,6 +780,30 @@ async function main() {
         ]);
       },
       "gpt-6.1-sol",
+    );
+    await run(
+      "local-turn-account-conflict",
+      (b) => {
+        recordCodexTurnModel(b.database, session, "turn-conflict", "gpt-6-astra", account);
+        return span([
+          attr("conversation.id", session),
+          attr("turn.id", "turn-conflict"),
+          attr("user.account_id", "sha256:fedcba9876543210"),
+        ]);
+      },
+      null,
+      "local_turn_identity_conflict",
+    );
+    await run(
+      "conflicting-model-peer",
+      (b) => {
+        const peer = log("gpt-6.1-sol", true);
+        peer.metadata["gen_ai.request.model"] = "gpt-6-astra";
+        b.append(peer);
+        return span();
+      },
+      null,
+      "model_evidence_missing",
     );
     completion.complete();
     console.log(

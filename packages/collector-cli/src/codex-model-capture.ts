@@ -365,7 +365,8 @@ export function captureCodexModel(
   const native = peers.filter(
     (p) =>
       !p.event.metadata.modelCaptureSource &&
-      p.event.metadata.modelEvidenceConflict !== true,
+      p.event.metadata.modelEvidenceConflict !== true &&
+      nativeModels(p.event).size <= 1,
   );
   const logs = native.filter(
     (p) => p.event.metadata.otelEventName === "codex.sse_event",
@@ -456,6 +457,8 @@ export function captureCodexModel(
   }
   const localModels = unique(local, (e) => text(e.model));
   if (localModels.length > 1) return gap("ambiguous_local_turn_model");
+  if (localModels.length === 1 && !local.every((p) => compatible(event, p.event)))
+    return gap("local_turn_identity_conflict");
   if (localModels.length === 1)
     return capture(event, local, "local_session_turn");
   return gap("model_evidence_missing");
