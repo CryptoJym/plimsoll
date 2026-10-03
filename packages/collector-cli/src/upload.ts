@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { captureCodexModel, codexHasUsage, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
 import {
@@ -46,7 +47,7 @@ export function attachRepoLinkage(
 export function buildIngestBatch(
   config: CollectorConfig,
   buffer: LocalEventBuffer,
-  options: { limit?: number; maxBytes?: number; appVersion?: string } = {},
+  options: { limit?: number; maxBytes?: number; appVersion?: string; now?: () => Date } = {},
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
   buffer.useWorkspace(config.tenantId, config.deviceId);
   const candidateRows = buffer.listUnuploaded({
@@ -61,7 +62,10 @@ export function buildIngestBatch(
     candidateRows.map((row) => ({ event: row.payload, repoHash: row.repoHash })),
   );
   for (const row of candidateRows) {
-    const attributed = attribution.attribute(row.payload, {
+    if (codexHasUsage(row.payload) && !row.payload.model &&
+        (options.now?.() ?? new Date()).getTime() < Date.parse(row.createdAt) + CODEX_MODEL_WAIT_MS) continue;
+    const captured = captureCodexModel(buffer.database,row.payload,row.id);
+    const attributed = attribution.attribute(captured, {
       repoHash: row.repoHash,
       branchHash: row.branchHash,
     });

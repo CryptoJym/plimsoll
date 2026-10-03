@@ -325,7 +325,10 @@ async function main() {
         local);
       h.at(30_000); check(`lone_${kind}_held`, h.upload().items.length === 0);
       h.at(61_500); h.upload();
-      check(`lone_${kind}_uploads_once`, h.observe().cloud.rows === 1);
+      const observed = h.observe();
+      if (kind === "span") check("lone_span_uploads_capture_gap_once", observed.cloud.rows === 0 &&
+        h.cloud.size === 1, observed);
+      else check("lone_log_uploads_once", observed.cloud.rows === 1);
     } finally { h.close(); }
   }
 
@@ -598,8 +601,9 @@ async function main() {
         receipt?.state === "acknowledged" && receipt.reason === "remote_acknowledged", receipt);
       h.at(123_000); h.upload();
       const o = h.observe();
-      check("late_pair_local_once_but_cloud_has_two_without_retraction",
-        once(o) && o.cloud.rows === 2, o);
+      check("late_pair_uploads_gap_then_one_log_without_retraction",
+        once(o) && o.cloud.rows === 1 && o.cloud.input === R().input && h.cloud.size === 2 &&
+          lease.items[0]!.envelope.event.metadata.captureGap === true, o);
     } finally { h.close(); }
   }
 

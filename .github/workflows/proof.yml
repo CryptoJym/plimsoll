@@ -766,6 +766,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability
 
+      - name: Prove model evidence or a capture gap on every Codex upload
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-model-capture
+
       - name: Prove bound Codex dispatch survives response pairing (eco-6hoxj.163.99)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-pairing-integration

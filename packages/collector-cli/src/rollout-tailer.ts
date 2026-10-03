@@ -1,3 +1,4 @@
+import { recordCodexTurnModel } from "./codex-model-capture";
 import { ensureJsonlContinuationStore, readJsonlContinuation, ContinuationAdmission, retireJsonlContinuations } from "./jsonl-continuation";
 import fs from "node:fs";
 import os from "node:os";
@@ -202,6 +203,7 @@ type RolloutParserState = {
   originator?: string;
   cliVersion?: string;
   model?: string;
+  turnId?: string;
   planType?: string;
   previous: TokenTotals;
   tokenCountIndex: number;
@@ -265,6 +267,7 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
       "originator",
       "cliVersion",
       "model",
+      "turnId",
       "planType",
       "previous",
       "tokenCountIndex",
@@ -306,7 +309,8 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
   const cliVersion = optionalString(value.cliVersion);
   const model = optionalString(value.model);
   const planType = optionalString(value.planType);
-  if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType].includes(null)) {
+  const turnId = optionalString(value.turnId);
+  if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType, turnId].includes(null)) {
     return undefined;
   }
   if (conversationId && !isCodexUuid(conversationId)) return undefined;
@@ -327,6 +331,7 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
     ...(originator ? { originator } : {}),
     ...(cliVersion ? { cliVersion } : {}),
     ...(model ? { model } : {}),
+    ...(turnId ? { turnId } : {}),
     ...(planType ? { planType } : {}),
     ...(typeof value.activeRepoContextId === "string"
       ? { activeRepoContextId: value.activeRepoContextId }
@@ -1668,6 +1673,7 @@ export class RolloutTailer {
       observedAt: string | undefined;
       delta: TokenTotals;
       model: string | undefined;
+      turnId: string | undefined;
       repoContext: ActiveContext;
       lineageFirstUnknown?: TokenTotals;
     }> = [];
@@ -1719,10 +1725,16 @@ export class RolloutTailer {
         if (typeof payload.originator === "string") state.originator = payload.originator;
         if (typeof payload.cli_version === "string") state.cliVersion = payload.cli_version;
       } else if (type === "turn_context") {
+        // A native turn ID is required to reuse this model for another signal.
+        // A session may switch models; an absent turn never means the prior turn.
+        state.turnId = typeof payload.turn_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(payload.turn_id)
+          ? payload.turn_id : undefined;
+        state.model = undefined;
         if (typeof payload.model === "string" && payload.model) {
           state.model = payload.model;
+          if (state.conversationId && state.turnId) recordCodexTurnModel(this.buffer.database,state.conversationId,state.turnId,state.model);
           // Codex can report its first token count before turn_context.
-          for (const entry of pending) entry.model ??= state.model;
+          for (const entry of pending) if (entry.turnId && entry.turnId === state.turnId) entry.model ??= state.model;
         }
         activeRepoContext = observeContext("turn_context", payload.cwd);
       } else if (type === "event_msg" && payload.type === "token_count") {
@@ -1757,6 +1769,7 @@ export class RolloutTailer {
           observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
           delta,
           model: state.model,
+          turnId: state.turnId,
           repoContext: activeRepoContext,
           ...(lineageFirstUnknown ? { lineageFirstUnknown } : {}),
         });
@@ -1853,6 +1866,7 @@ export class RolloutTailer {
           this.accountAttributionEnabled()),
         usageSource: "rollout",
         turnIndex: entry.index,
+        ...(entry.turnId ? { codexTurnId: entry.turnId } : {}),
         ...(accountKey ? { "user.account_id": accountKey } : {}),
       };
       if (state.originator) metadata.originator = state.originator;
