@@ -399,20 +399,44 @@ async function main() {
       null,
       "conflicting_model_attributes",
     );
-    await run(
-      "claude-incomplete-model",
-      () => ({
-        ...span(),
-        source: "claude_code",
-        cacheCreationTokens: undefined,
-        metadata: {
-          serviceName: "claude-code",
-          otelEventName: "claude_code.api_request",
+    {
+      // This gate owns Codex, including Codex under a Claude credential.
+      // Genuine Claude missing-model observations retain their existing
+      // delivery semantics and remain part of the cloud's plain unknown line.
+      const b = new LocalEventBuffer(
+        path.join(root, "claude-incomplete.sqlite"),
+        {
+          workspaceId: session,
+          deviceId: "fixture-device",
+          enrollmentNow: () => new Date(at - 1000),
+          delivery: { enabled: true },
         },
-      }),
-      null,
-      "claude_model_evidence_missing",
-    );
+      );
+      try {
+        const target: AiInteractionEvent = {
+          ...span(),
+          source: "claude_code",
+          cacheCreationTokens: undefined,
+          metadata: {
+            serviceName: "claude-code",
+            otelEventName: "claude_code.api_request",
+          },
+        };
+        b.append(target);
+        assert.deepEqual(captureCodexModel(b.database, target), target);
+        const result = b.delivery
+          .lease()
+          .items.find((i) => i.envelope.event.id === target.id)!.envelope.event;
+        assert.equal(result.inputTokens, target.inputTokens);
+        assert.equal(result.outputTokens, target.outputTokens);
+        assert.equal(result.cacheCreationTokens, undefined);
+        assert.equal(result.metadata.captureGap, undefined);
+        checks++;
+        completion.check("genuine-claude-delivery-unchanged");
+      } finally {
+        b.close();
+      }
+    }
     await run(
       "legacy-class2-model",
       () => ({

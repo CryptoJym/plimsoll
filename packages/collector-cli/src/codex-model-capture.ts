@@ -17,7 +17,7 @@ export function codexHasUsage(event: AiInteractionEvent): boolean {
   // unqualified observers; cloud excludes them from financial usage.
   return (
     event.eventType !== "usage_live" &&
-    (event.source === "codex" || event.source === "claude_code") &&
+    (event.source === "codex" || codexMisfiledUnderClaude(event)) &&
     ([
       event.inputTokens,
       event.outputTokens,
@@ -312,14 +312,6 @@ export function captureCodexModel(
           : "unavailable",
       },
     };
-  // New credential admission rejects this shape; old hook/outbox rows still
-  // require an explicit gap. Source repair belongs to the guarded cloud script.
-  if (event.source === "claude_code")
-    return gap(
-      /^(codex[-_.]|codex$)/i.test(String(event.metadata.serviceName ?? ""))
-        ? "codex_service_under_claude_source"
-        : "claude_model_evidence_missing",
-    );
   if (!row) return gap("capture_row_missing");
   if (!row.workspace || !row.epoch) return gap("capture_identity_missing");
   const at = Date.parse(event.observedAt),
