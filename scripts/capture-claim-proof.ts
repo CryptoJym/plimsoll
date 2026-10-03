@@ -61,6 +61,7 @@ function event(observedMs: number) {
     id: `00000000-0000-4000-8000-${String(900_000 + eventIndex).padStart(12, "0")}`,
     sessionId: `00000000-0000-4000-8000-${String(800_000 + eventIndex).padStart(12, "0")}`,
     source: "codex",
+    model: "gpt-6-sol",
     dataMode: "metadata",
     eventType: "assistant_response",
     observedAt: iso(observedMs),

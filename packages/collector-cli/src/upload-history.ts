@@ -1,3 +1,4 @@
+import { captureCodexModel, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -957,6 +958,14 @@ export async function runWorkspaceHistoryUpload(
               : "local_privacy_terminal",
         });
         continue;
+      }
+      if (preparedRow.ok && preparedRow.event) {
+        if (unresolvedCapture(preparedRow.event)) {
+          const age = now().getTime() - Date.parse(row.createdAt);
+          const waitMs = Math.max(0, Math.min(CODEX_MODEL_WAIT_MS, CODEX_MODEL_WAIT_MS - age));
+          if (Number.isFinite(waitMs) && waitMs > 0) await sleep(waitMs);
+        }
+        preparedRow.event = captureCodexModel(ledger, preparedRow.event, row.id);
       }
       const normalized = preparedRow.ok
         ? sealHistoryEvent(preparedRow, { ...row, attribution })

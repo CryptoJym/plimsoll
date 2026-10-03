@@ -18,7 +18,7 @@ async function main(){
    const file=path.join(leaf,`rollout-${id}.jsonl`),key=jsonlScanStateKey(file),cwd=path.join(root,'no-git');fs.mkdirSync(cwd);
    const make=(n:number,padding=0)=>provider==='codex'?{timestamp:now,type:'event_msg',payload:{padding:'X'.repeat(padding),type:'token_count',info:{total_token_usage:{input_tokens:n,cached_input_tokens:n/5,output_tokens:n/10,reasoning_output_tokens:0}}}}:
      {timestamp:now,type:'assistant',sessionId:id,cwd,message:{content:'X'.repeat(padding),id:'m',model:'claude-sonnet-4-20250514',usage:{input_tokens:n,output_tokens:n/10,cache_read_input_tokens:n/5,cache_creation_input_tokens:n/10}}};
-   const prefix=(provider==='codex'?[{type:'session_meta',timestamp:now,payload:{id,cwd}},make(0),make(10)]:[make(10)]).map(x=>JSON.stringify(x)+'\n').join('');
+   const prefix=(provider==='codex'?[{type:'session_meta',timestamp:now,payload:{id,cwd}},{type:'turn_context',timestamp:now,payload:{turn_id:'turn-a',model:'gpt-6-sol'}},make(0),make(10)]:[make(10)]).map(x=>JSON.stringify(x)+'\n').join('');
    fs.writeFileSync(file,prefix);
    const makeTailer=(b:LocalEventBuffer)=>provider==='codex'?new RolloutTailer(b,root,()=>[]):new TranscriptTailer(b,root);
    let tailer=makeTailer(buffer);let first=await tailer.scan({scope:'full'});assert.equal(first.readErrors,0);assert(first.eventsAppended>0);

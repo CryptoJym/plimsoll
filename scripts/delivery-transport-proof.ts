@@ -103,7 +103,7 @@ async function main() {
     const cfg=collectorConfigSchema.parse({tenantId,installKey,uploadUrl:options.url,delivery:{requestTimeoutSeconds:1}});
     const buffer=new LocalEventBuffer(path.join(root,`${name}.sqlite`),{workspaceId:tenantId,delivery:{enabled:true,limits:cfg.delivery}});
     try {
-      buffer.append(aiInteractionEventSchema.parse({id:uuid(20),source:'codex',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
+      buffer.append(aiInteractionEventSchema.parse({id:uuid(20),source:'codex',model:'gpt-6-sol',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
       await assert.rejects(uploadBufferedEvents(cfg,buffer,{fetchImpl:(async(_url,init)=>{
         if (typeof body !== "object" || body === null || !("ack" in body)) return new Response(typeof body === 'string'?body:JSON.stringify(body));
         const exp=deliveryExpectation(String(init?.body),installKey);
@@ -137,7 +137,7 @@ async function main() {
     const cfg=collectorConfigSchema.parse({tenantId,installKey,uploadUrl:options.url});
     const buffer=new LocalEventBuffer(path.join(root,'sessions.sqlite'),{workspaceId:tenantId});
     try {
-      buffer.append(aiInteractionEventSchema.parse({id:uuid(80),sessionId:uuid(81),source:'codex',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
+      buffer.append(aiInteractionEventSchema.parse({id:uuid(80),sessionId:uuid(81),source:'codex',model:'gpt-6-sol',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
       const result=await runSessionSync(cfg,{ledgerDb:buffer.database,fetchImpl:fake({}),sleep:async()=>{},delayMs:0,maxAttemptsPerBatch:1,log:()=>{}});
       assert.equal(result.ok,false);assert.equal(result.acceptedSessions,0);assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as {n:number}).n,1);
     }finally{buffer.close();}
@@ -149,7 +149,7 @@ async function main() {
     const buffer=new LocalEventBuffer(path.join(root,`outcomes-${mode}.sqlite`),{workspaceId:tenantId});
     const now=new Date().toISOString(), sha='a'.repeat(40);const logs:string[]=[];
     try {
-      buffer.append(aiInteractionEventSchema.parse({id:uuid(90),sessionId:uuid(91),source:'codex',eventType:'assistant_response',observedAt:now,inputTokens:7}));
+      buffer.append(aiInteractionEventSchema.parse({id:uuid(90),sessionId:uuid(91),source:'codex',model:'gpt-6-sol',eventType:'assistant_response',observedAt:now,inputTokens:7}));
       buffer.database.prepare('update buffered_events set repo_hash = ?, head_sha = ?').run(remoteLinkageHash('https://github.com/fixture/outcomes.git'),sha);
       const fetchImpl:typeof fetch=async(input,init)=>{
         const url=new URL(String(input));
@@ -169,7 +169,7 @@ async function main() {
   });
   await check('history_watermark_retained_on_missing_ack',async()=>{
     const ledger=path.join(root,'history.sqlite');const buffer=new LocalEventBuffer(ledger,{workspaceId:tenantId});
-    buffer.append(aiInteractionEventSchema.parse({id:uuid(70),source:'codex',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));buffer.close();
+    buffer.append(aiInteractionEventSchema.parse({id:uuid(70),source:'codex',model:'gpt-6-sol',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));buffer.close();
     const statePath=path.join(root,'history-state.json');const cfg=collectorConfigSchema.parse({tenantId,installKey,uploadUrl:options.url});
     const result=await runWorkspaceHistoryUpload(cfg,{ledgerPath:ledger,statePath,fetchImpl:fake({}),sleep:async()=>{},delayMs:0,maxAttemptsPerBatch:1,log:()=>{}});
     assert.equal(result.ok,false);const state=JSON.parse(fs.readFileSync(statePath,'utf8'));assert.equal(state.watermark,null);
@@ -191,7 +191,7 @@ async function main() {
   const pinLedger=()=>{
     const file=path.join(root,`pin-${++pinLedgers}.sqlite`);
     const buffer=new LocalEventBuffer(file,{workspaceId:tenantId,delivery:{enabled:true,limits:pinCfg.delivery}});
-    buffer.append(aiInteractionEventSchema.parse({id:uuid(100),sessionId:uuid(101),source:'codex',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
+    buffer.append(aiInteractionEventSchema.parse({id:uuid(100),sessionId:uuid(101),source:'codex',model:'gpt-6-sol',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
     buffer.database.prepare('update buffered_events set repo_hash = ?, head_sha = ?').run(repoHash,sha);
     return {buffer,file};
   };

@@ -593,7 +593,8 @@ export function runCodexReconciliationMaintenance(
          where id = @id`,
       );
       const sessionContext = nearestStatements(database, "session_id");
-      const modelContext = nearestStatements(database, "model");
+      // Capture resolves models from exact pairs, traces or native turns at sealing.
+      // A nearby model from another conversation is never evidence.
       const selectFreshCandidates = database.prepare(
         `select e.rowid, e.id, e.source, e.event_type as eventType,
            e.observed_at as observedAt, e.session_id as sessionId, e.model,
@@ -636,7 +637,7 @@ export function runCodexReconciliationMaintenance(
             continue;
           }
           const sessionId = row.sessionId ?? nearestValue(row, sessionContext);
-          const model = row.model ?? nearestValue(row, modelContext);
+          const model = row.model;
           let costUsd = row.costUsd;
           if (costUsd === null && model) {
             costUsd =

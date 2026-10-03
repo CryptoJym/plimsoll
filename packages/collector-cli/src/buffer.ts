@@ -2665,6 +2665,11 @@ export class LocalEventBuffer {
     const projectKey = canonicalProjectKey(event.projectKey);
     const costKind = admittedCostKind(event);
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
+    // OTLP resource spans do not carry an install; stamp the actual ledger
+    // binding rather than leaving the already-known machine in a local column.
+    if (event.source === "codex" && installationEpochId && !event.metadata.installationEpochId) {
+      event = { ...event, metadata: { ...event.metadata, installationEpochId } };
+    }
     const payloadJson = JSON.stringify(event);
     const insert = this.insertEventStatement ??= this.db.prepare(
         `insert or ignore into buffered_events

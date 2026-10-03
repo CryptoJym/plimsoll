@@ -1,3 +1,5 @@
+import type { AiInteractionEvent } from "../../shared/src/index";
+import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -66,6 +68,7 @@ export type DeliveryReceiptReason =
   | "local_privacy_violation"
   | "local_item_oversize"
   | "local_usage_duplicate"
+  | "local_model_capture_gap"
   | "remote_rejected_exhausted"
   | "remote_validation_rejected";
 
@@ -1452,11 +1455,16 @@ export class DeliveryOutbox {
     let nextAttemptAt = now;
     try {
       const event = (JSON.parse(row.payloadJson) as { source?: string; eventType?: string;
-        metadata?: { otelEventName?: string } });
-      if (event.source === "codex" && event.eventType === "assistant_response" &&
-          (event.metadata?.otelEventName === "codex.sse_event" ||
-           event.metadata?.otelEventName === "handle_responses")) {
-        nextAttemptAt = new Date(nowDate.getTime() + 60_000).toISOString();
+        model?: string; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number; metadata?: { otelEventName?: string } });
+      if ((event.source === "codex" || event.source === "claude_code") && (
+          event.source === "codex" && event.eventType === "assistant_response" && (event.metadata?.otelEventName === "codex.sse_event" ||
+            event.metadata?.otelEventName === "handle_responses") ||
+          unresolvedCapture(event as AiInteractionEvent))) {
+        // Repaired/re-enqueued history already waited at capture. Preserve
+        // that elapsed wait, while an injected clock bounds a future stamp.
+        const capturedAt = Math.min(Date.parse(row.createdAt), nowDate.getTime());
+        nextAttemptAt = new Date(Math.max(nowDate.getTime(),
+          (Number.isFinite(capturedAt) ? capturedAt : nowDate.getTime()) + CODEX_MODEL_WAIT_MS)).toISOString();
       }
     } catch {
       // prepareDelivery already validates the payload; this is only a grace
@@ -2178,6 +2186,7 @@ export class DeliveryOutbox {
             );
             continue;
           }
+          parsed.event = captureCodexModel(this.db, parsed.event, row.rawId ?? parsed.event.id);
           const sealed = sealOutboundEnvelope(
             attachFillOnlyLinkage(
               parsed,
@@ -2231,6 +2240,48 @@ export class DeliveryOutbox {
         const revalidated = sealOutboundEnvelope(outboundEnvelope);
         if (!revalidated.ok || JSON.stringify(revalidated.envelope) !== envelopeJson) {
           locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
+          continue;
+        }
+        if (row.sealedEnvelopeJson && unresolvedCapture(outboundEnvelope.event)) {
+          // An old, once-attempted request may already have committed remotely.
+          // Never rewrite its frozen bytes or retry unknown billable usage.
+          // Retire it and send a distinct tokenless gap with the same raw lineage.
+          const owner = this.db.prepare(`select installation_epoch_id as epoch from buffered_events where
+            rowid=? and id is ? and created_at is ? and privacy_generation is ?`).get(
+              row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration) as {epoch:string|null}|undefined;
+          const prior = {...outboundEnvelope.event,metadata:{...outboundEnvelope.event.metadata,
+            ...(owner?.epoch ? {installationEpochId:owner.epoch} : {})}};
+          let gapId: string | undefined;
+          if (row.rawId && row.rawCreatedAt && row.rawGeneration) for (let attempt=0;attempt<32;attempt++) {
+            const id=incarnationDeliveryId(row.rawId,row.rawCreatedAt,row.rawGeneration,attempt);
+            if (!this.db.prepare(`select 1 from buffered_events where id=? union all
+              select 1 from upload_outbox where delivery_id=? union all
+              select 1 from upload_receipts where delivery_id=? union all
+              select 1 from upload_replays where delivery_id=? union all
+              select 1 from upload_validation_candidates where delivery_id=? limit 1`).get(id,id,id,id,id)) {gapId=id;break;}
+          }
+          if (!gapId) {
+            locallyDead += this.deadActive(row.deliveryId,"local_model_capture_gap",nowIso,disposedRawRowids);
+            codexModelGap(this.db,prior,"legacy_gap_identity_unavailable");
+            continue;
+          }
+          const gap = sealOutboundEnvelope({...outboundEnvelope,event:{
+            ...codexModelGap(this.db,prior,codexMisfiledUnderClaude(prior) ? "legacy_sealed_source_mismatch" :
+              prior.model ? "legacy_sealed_model_evidence_conflict" : "legacy_sealed_model_missing"),id:gapId}});
+          if (!gap.ok) {
+            locallyDead += this.deadActive(row.deliveryId,"local_schema_invalid",nowIso,disposedRawRowids);
+            continue;
+          }
+          const gapJson=JSON.stringify(gap.envelope),gapBytes=Buffer.byteLength(gapJson);
+          locallyDead += this.deadActive(row.deliveryId,"local_model_capture_gap",nowIso,disposedRawRowids);
+          if (gapBytes <= this.limits.maxItemBytes) this.db.prepare(`insert or ignore into upload_outbox
+            (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,workspace_id,device_id,
+             base_envelope_json,base_bytes,repo_hash,branch_hash,state,attempt_count,next_attempt_at,
+             last_failure_class,created_at,updated_at)
+            select ?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,'none',?,?
+            where not exists(select 1 from upload_receipts where delivery_id=?)`).run(
+              gapId,row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration,this.workspaceId,row.deviceId,
+              gapJson,gapBytes,row.repoHash,row.branchHash,nowIso,row.rawCreatedAt??nowIso,nowIso,gapId);
           continue;
         }
         const envelopeBytes = Buffer.byteLength(envelopeJson);

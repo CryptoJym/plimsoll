@@ -964,11 +964,18 @@ export function mergeCaptureGaps(gaps: readonly CaptureGap[], max = CAPTURE_CLAI
   return merged;
 }
 
+function modelCaptureGaps(database: Database.Database, epochId: string, epochStartMs: number): CaptureGap[] {
+  if (!tableExists(database,"codex_model_capture_gaps")) return [];
+  return (database.prepare(`select from_ms as fromMs,to_ms as toMs from codex_model_capture_gaps
+    where installation_epoch_id=? and to_ms>=?`).all(epochId,epochStartMs) as CaptureGap[])
+    .map(g => ({fromMs:Math.max(epochStartMs,g.fromMs),toMs:g.toMs}));
+}
 export function captureFrontier(database: Database.Database): CaptureFrontier | null {
   const epoch = currentEpoch(database);
   if (!epoch) return null;
   if (!tableExists(database, "capture_coverage_state")) return { ...epoch, capturedThrough: null,
-    gaps: mergeCaptureGaps(captureRecordLossGaps(database, Date.parse(epoch.epochStartedAt), epoch.installationEpochId)) };
+    gaps: mergeCaptureGaps([...captureRecordLossGaps(database, Date.parse(epoch.epochStartedAt), epoch.installationEpochId),
+      ...modelCaptureGaps(database,epoch.installationEpochId,Date.parse(epoch.epochStartedAt))]) };
   const scope = [epoch.workspaceId, epoch.installationEpochId] as const;
   const rows = database
     .prepare(
@@ -1004,6 +1011,7 @@ export function captureFrontier(database: Database.Database): CaptureFrontier | 
   }
   // EOF closes the unread-file row; only skipped records that may hold usage
   // remain as permanent claim gaps. Classified non-usage skips need no gap.
-  gaps.push(...captureRecordLossGaps(database, epochStartMs, epoch.installationEpochId));
+  gaps.push(...captureRecordLossGaps(database, epochStartMs, epoch.installationEpochId),
+    ...modelCaptureGaps(database,epoch.installationEpochId,epochStartMs));
   return { ...epoch, capturedThrough, gaps: mergeCaptureGaps(gaps) };
 }

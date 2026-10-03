@@ -63,6 +63,7 @@ function event(index: number, sessionId = "repo-context-session"): AiInteraction
     eventType: "assistant_response",
     observedAt: new Date(Date.UTC(2026, 6, 20, 10, 0, index % 60)).toISOString(),
     sessionId,
+    model: "gpt-6-sol",
     inputTokens: index + 1,
     outputTokens: 1,
     actionClass: "other",

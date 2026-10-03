@@ -28,7 +28,7 @@ async function privacySiblingRollback(OldBuffer: typeof LocalEventBuffer) {
   try {
     const before = new LocalEventBuffer(ledger, options);
     try {
-      const event = aiInteractionEventSchema.parse({ id, sessionId: id, source: "codex",
+      const event = aiInteractionEventSchema.parse({ id, sessionId: id, source: "codex", model: "gpt-6-sol",
         eventType: "assistant_response", dataMode: "metadata", observedAt: oldAt,
         actionClass: "other", inputTokens: 1, outputTokens: 1 });
       before.database.prepare(`insert into buffered_events
@@ -143,7 +143,7 @@ async function main() {
     try {
       for (const rawId of seededIds) {
         const event = aiInteractionEventSchema.parse({ id: rawId, sessionId: rawId,
-          source: "codex", eventType: "assistant_response", dataMode: "metadata",
+          source: "codex", model: "gpt-6-sol", eventType: "assistant_response", dataMode: "metadata",
           observedAt: oldAt, actionClass: "other", inputTokens: 1, outputTokens: 1 });
         assert.equal(old.append(event), true);
         old.database.prepare("update buffered_events set created_at=? where id=?")
@@ -277,7 +277,7 @@ async function main() {
     const reused = new LocalEventBuffer(ledger, { ...options, delivery: { enabled: false } });
     try {
       const event = aiInteractionEventSchema.parse({ id: reusedId, sessionId: reusedId,
-        source: "codex", eventType: "assistant_response", dataMode: "metadata",
+        source: "codex", model: "gpt-6-sol", eventType: "assistant_response", dataMode: "metadata",
         observedAt: oldAt, actionClass: "other", inputTokens: 2, outputTokens: 1 });
       assert.equal(reused.append(event), true);
       reused.database.prepare("update buffered_events set created_at=? where id=?")

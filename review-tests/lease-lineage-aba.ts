@@ -9,7 +9,7 @@ import { aiInteractionEventSchema } from "../packages/shared/src/index";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "pr417-lease-lineage-aba-"));
 const at = new Date("2026-09-29T12:00:00.000Z");
 const event = (id: string) => aiInteractionEventSchema.parse({
-  id, sessionId: id, source: "codex", eventType: "assistant_response",
+  id, sessionId: id, source: "codex", model: "gpt-6-sol", eventType: "assistant_response",
   dataMode: "metadata", observedAt: at.toISOString(), actionClass: "other",
   inputTokens: 1, outputTokens: 1, metadata: { proof: "lineage-aba" },
 });
