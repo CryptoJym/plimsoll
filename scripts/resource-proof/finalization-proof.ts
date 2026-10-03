@@ -32,6 +32,31 @@ const parentChangeFixturePath = path.join(
 );
 let finalizationStage = "startup";
 
+// The bounded-capture fixture intentionally causes both of these commit errors.
+// Require their exact content-free diagnostic protocol; other stderr still fails.
+function expectedCommitDiagnostics(stderr: string) {
+  const messages = new Set(["rollout_slice_parse_failed", "maintenance_progress_budget_exhausted"]);
+  const seen = new Set<string>();
+  const lines = stderr.trim().split("\n");
+  if (!stderr.trim()) return false;
+  for (const line of lines) {
+    let record: Record<string, unknown>;
+    try { record = JSON.parse(line) as Record<string, unknown>; } catch { return false; }
+    if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+    const keys = Object.keys(record).sort().join(",");
+    if (keys !== "errorClass,fileHandleHash,message,messageHash,offset,status" ||
+        record.status !== "rollout_commit_error" || record.errorClass !== "Error" ||
+        typeof record.message !== "string" || !messages.has(record.message) ||
+        typeof record.fileHandleHash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fileHandleHash) ||
+        !Number.isSafeInteger(record.offset) || (record.offset as number) < 0) return false;
+    const messageHash = "sha256:" + createHash("sha256")
+      .update("plimsoll-maintenance-candidate-v1\0").update(record.message).digest("hex");
+    if (record.messageHash !== messageHash) return false;
+    seen.add(record.message);
+  }
+  return seen.size === messages.size;
+}
+
 function within(parent: string, candidate: string) {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -775,7 +800,7 @@ async function main() {
       privateTermsNotEmitted: leakCount === 0,
       receiptOverwriteExact: stdout === persisted,
       receiptModeOwnerOnly: mode === 0o600,
-      childStderrEmpty: stderr.length === 0,
+      childStderrContainsOnlyExpectedCommitDiagnostics: expectedCommitDiagnostics(stderr),
       resourceProofChildHomeUnchanged:
         fs.readdirSync(resourceChildHome).length === 0,
     };

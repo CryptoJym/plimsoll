@@ -16,7 +16,7 @@ import {
 } from "../../shared/src/index";
 import { sealOutboundEnvelope } from "./outbound-envelope";
 import { TransportError, pinnedUploadUrl, validatedTransportUrl } from "./http-transport";
-import { postDelivery } from "./delivery-post";
+import { CAPTURE_CLAIM_HEADER, postDeliveryWithCaptureCensusFallback } from "./capture-census-fallback";
 import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
 import { PLIMSOLL_VERSION } from "./version";
@@ -175,7 +175,7 @@ function bodyForItems(
 }
 
 /** Capture watermark v1 (eco-6hoxj.163.18): a header, so a cloud that predates it ignores it. */
-export const CAPTURE_CLAIM_HEADER = "x-plimsoll-capture";
+export { CAPTURE_CLAIM_HEADER };
 
 async function postItems(input: {
   config: CollectorConfig;
@@ -202,14 +202,14 @@ async function postItems(input: {
       rejectedItems: [],
     };
   }
-  let response: Awaited<ReturnType<typeof postDelivery>>;
+  let response: Awaited<ReturnType<typeof postDeliveryWithCaptureCensusFallback>>;
   try {
-    response = await postDelivery({
+    response = await postDeliveryWithCaptureCensusFallback({
       url: input.url, body, installKey: input.config.installKey,
       ingestKey: input.ingestKey, signingSecret: input.signingSecret,
       fetchImpl: input.fetchImpl, now: input.now,
       timeoutMs: input.timeoutSeconds * 1_000, maxRequestBytes: input.maxBytes,
-      ...(input.captureClaim ? { headers: { [CAPTURE_CLAIM_HEADER]: JSON.stringify(input.captureClaim) } } : {}),
+      captureClaim: input.captureClaim,
     });
   } catch (error) {
     const transient = error instanceof TransportError &&

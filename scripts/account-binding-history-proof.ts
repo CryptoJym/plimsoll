@@ -94,7 +94,8 @@ try {
   const old = all.filter(row => row.sessionId === first);
   assert.ok(old.some(row => row.eventType === "usage_rollout"));
   assert.ok(old.some(row => row.eventType === "usage_transcript"));
-  assert.ok(old.some(row => row.eventType === "plan_limit_observation"));
+  assert.equal(old.filter(row => row.eventType === "plan_limit_observation").length, 0,
+    "an unproven historical account must not emit a plan-limit reading");
   assert.ok(old.every(row => row.metadata["user.account_id"] === undefined &&
     row.metadata["user.account_uuid"] === undefined));
   assert.deepEqual(all.filter(row => row.sessionId === stamped), confirmed);
@@ -118,7 +119,10 @@ try {
   await scanAt("10:40", buffer);
   all = rows(buffer);
   const gapRows = all.filter(row => row.sessionId === gap);
-  assert.ok(gapRows.some(row => row.eventType === "plan_limit_observation"));
+  assert.ok(gapRows.some(row => row.eventType === "usage_rollout"));
+  assert.ok(gapRows.some(row => row.eventType === "usage_transcript"));
+  assert.equal(gapRows.filter(row => row.eventType === "plan_limit_observation").length, 0,
+    "an account-switch gap must not emit a keyless plan-limit reading");
   assert.ok(gapRows.every(row => row.metadata["user.account_id"] === undefined &&
     row.metadata["user.account_uuid"] === undefined));
 

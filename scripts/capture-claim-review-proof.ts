@@ -288,7 +288,9 @@ function s2DeadLettersAreBoundedGaps() {
   buffer.close();
   check("S2_dead_letters_are_bounded_gaps_and_privacy_refusals_are_withheld",
     claim.through === iso(attestedAt) && claim.dead === 1 && claim.withheld === 1 &&
-      JSON.stringify(claim.gaps) === JSON.stringify([{ from: iso(lostAt), to: iso(lostAt) }]) &&
+      JSON.stringify(claim.gaps?.map(({ from, to }) => ({ from, to }))) ===
+        JSON.stringify([{ from: iso(lostAt), to: iso(lostAt) }]) &&
+      Array.isArray((claim.gaps?.[0] as { deadLetters?: unknown })?.deadLetters) &&
       !inGap(claim, iso(refusedAt)),
     { claim, lostAt: iso(lostAt), refusedAt: iso(refusedAt), attestedAt: iso(attestedAt) });
 }

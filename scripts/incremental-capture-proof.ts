@@ -43,6 +43,7 @@ import { resolveRepoContextRequests } from "../packages/collector-cli/src/repo-c
 import { aiInteractionEventSchema, remoteLinkageHash } from "../packages/shared/src/index";
 import { installVirtualClock, restoreRealClock, spend } from "./lib/virtual-clock";
 import { proveChargedDiscoveryWiring } from "./charged-discovery-wiring-case";
+import { proveRolloutTokenCountCases } from "./lib/rollout-token-count-cases";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-incremental-proof-"));
 const buffer = new LocalEventBuffer(path.join(tempDir, "proof.sqlite"));
@@ -1591,6 +1592,8 @@ async function main() {
       return;
     }
     const rollout = await proveRolloutTailing();
+    const tokenCountCommits = await proveRolloutTokenCountCases();
+    console.log(JSON.stringify({ proof: "rollout-token-count-commit", ...tokenCountCommits }));
     const transcript = await proveTranscriptTailing();
     const parseFailureDurability = await proveParseFailuresRemainUnresolved();
     const transcriptChunkParity = await proveTranscriptChunkParity();

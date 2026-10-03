@@ -418,7 +418,12 @@ async function main() {
       journal);
     if (takeover.kind === "acquired") takeover.lease.release();
 
-    const resumed = await new LifecycleManager(fx.compose(sharedAuthority), {})
+    // The supersession check above intentionally uses a short lease. Recovery
+    // gets a normal lease so its success does not depend on completing real
+    // filesystem work within the expiry fixture's 150 ms deadline.
+    const recoveryAuthority = new LifecycleMutationAuthority(
+      path.join(fx.paths.lifecycleRoot, "authority"), { defaultLeaseMs: 60_000 });
+    const resumed = await new LifecycleManager(fx.compose(recoveryAuthority), {})
       .update({ operationId: "superseded-op", artifact: fx.artifact });
     check("resumed_operation_completes_under_the_current_owner",
       resumed.status === "completed", resumed.status);
