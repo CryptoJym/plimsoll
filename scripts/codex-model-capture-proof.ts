@@ -164,6 +164,10 @@ async function run(
       assert.equal(result.metadata.captureGap, true);
       assert.equal(result.metadata.modelGapReason, reason);
       assert.equal(result.metadata.modelGapInputTokens, 5555);
+      if (target.metadata["user.account_id"]) {
+        assert.equal(result.metadata["user.account_id"], target.metadata["user.account_id"]);
+        assert.equal(result.metadata.accountIdentityState, "reported");
+      }
       b.delivery.acknowledge(
         leased.leaseId,
         leased.items.map((item) => item.deliveryId),
@@ -344,7 +348,7 @@ async function main() {
       () => ({
         ...span(),
         source: "claude_code",
-        metadata: { serviceName: "Codex_Desktop" },
+        metadata: { serviceName: "Codex_Desktop", "user.account_id": account },
       }),
       null,
       "codex_service_under_claude_source",

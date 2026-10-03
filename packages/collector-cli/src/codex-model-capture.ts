@@ -243,7 +243,7 @@ export function codexModelGap(
         : {}),
       accountIdentityState: text(
         metadata[
-          event.source === "claude_code"
+          event.source === "claude_code" && !codexMisfiledUnderClaude(event)
             ? "user.account_uuid"
             : "user.account_id"
         ],
