@@ -6,7 +6,12 @@
   exceptions now produce content-free diagnostics, preserving the existing
   usage arithmetic, deterministic IDs and session authority.
 - Classify Codex OTLP resource service names as Codex even with another valid
-  producer credential, and warn once per process about that mismatch.
+  producer credential, and warn once per process about that mismatch. A
+  Codex Desktop service with a valid local Claude credential is accepted and
+  stored as Codex, preserving Studio0 Desktop usage. Invalid, unknown,
+  malformed or header-mismatched credentials remain refused. The dispatch
+  integration proof checks both admission and token rejection, including
+  deduplication and one warning containing source names only.
 - Attach complete, bounded dead-letter censuses to capture gaps. Unknown
   amounts stay null; untyped or oversized intervals remain known gaps. An
   census-schema or generic claim refusal permits one signed resend without

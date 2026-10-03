@@ -120,8 +120,8 @@ async function main() {
         server.listen(0, "127.0.0.1", resolve);
       });
       const port = (server.address() as AddressInfo).port;
-      const post = async (route: string, payload: unknown, source: string, token: string) => {
-        const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+      const post = async (route: string, payload: unknown, source: string, token: string, targetPort = port) => {
+        const response = await fetch(`http://127.0.0.1:${targetPort}${route}`, {
           method: "POST",
           headers: { "content-type": "application/json", connection: "close",
             "x-plimsoll-source": source, "x-plimsoll-token": token },
@@ -129,18 +129,60 @@ async function main() {
         });
         return { status: response.status, body: await response.json() as Record<string, unknown> };
       };
-      const rejected = await post("/v1/logs", logPayload, "claude_code", auth.claudeCodeProducer);
+      const rejected = await post("/v1/logs", logPayload, "claude_code", auth.codexProducer);
       assert.equal(rejected.status, 401);
-      assert.equal(rejected.body.reason, "source_mismatch");
+      assert.equal(rejected.body.reason, "producer_token_invalid");
       const before = buffer.database.prepare("select count(*) as count from buffered_events").get() as { count: number };
       assert.equal(before.count, 0);
-      proof.check("claude_credentialed_codex_desktop_is_rejected_before_storage");
+      proof.check("mismatched_producer_credential_header_is_rejected_before_storage");
 
       const admittedLog = await post("/v1/logs", logPayload, "codex", auth.codexProducer);
       const admittedSpan = await post("/v1/traces", spanPayload, "codex", auth.codexProducer);
       assert.equal(admittedLog.status, 202);
       assert.equal(admittedSpan.status, 202);
       proof.check("codex_credential_admits_codex_desktop_log_and_span");
+
+      // Service names classify usage; the credential still authenticates its header.
+      // Keep this admission case separate from the canonical dispatch pair below.
+      const classifiedBuffer = new LocalEventBuffer(path.join(plimsoll, "classified-codex.sqlite"), {
+        workspaceId: config.tenantId, deviceId: config.deviceId,
+        delivery: { enabled: false },
+      });
+      const classifiedServer = createCollectorServer(configured, classifiedBuffer, { localAuth: auth });
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...values: unknown[]) => warnings.push(values.map(String).join(" "));
+      try {
+        await new Promise<void>((resolve, reject) => {
+          classifiedServer.once("error", reject);
+          classifiedServer.listen(0, "127.0.0.1", resolve);
+        });
+        const classifiedPort = (classifiedServer.address() as AddressInfo).port;
+        for (let repeat = 0; repeat < 2; repeat += 1) {
+          const classified = await post("/v1/logs", logPayload, "claude_code", auth.claudeCodeProducer, classifiedPort);
+          assert.equal(classified.status, 202);
+        }
+        const classifiedRows = classifiedBuffer.database.prepare(
+          "select payload_json as payloadJson from buffered_events",
+        ).all() as Array<{ payloadJson: string }>;
+        assert.equal(classifiedRows.length, 1);
+        assert.equal(JSON.parse(classifiedRows[0]!.payloadJson).source, "codex");
+        proof.check("valid_claude_credential_admits_codex_desktop_as_codex_once");
+        assert.equal(warnings.length, 1);
+        assert.deepEqual(JSON.parse(warnings[0]!), {
+          status: "otlp_service_source_mismatch",
+          credentialSource: "claude_code",
+          serviceSource: "codex",
+        });
+        proof.check("codex_service_credential_mismatch_warns_once_with_source_names_only");
+      } finally {
+        console.warn = originalWarn;
+        try {
+          await new Promise<void>((resolve, reject) => classifiedServer.close(error => error ? reject(error) : resolve()));
+        } finally {
+          classifiedBuffer.close();
+        }
+      }
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
