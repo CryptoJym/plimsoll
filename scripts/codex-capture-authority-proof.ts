@@ -67,9 +67,10 @@ function assertGap(event: AiInteractionEvent) {
   assert.equal(event.metadata.usageSource, "capture_gap");
   assert.equal(event.model, undefined); assert.equal(event.inputTokens, undefined); assert.equal(event.outputTokens, undefined);
 }
-function drain(f: Fixture) {for (let i=0; i<40; i++) {f.buffer.projection.runMaintenance(f.now);
+function drain(f: Fixture) {const now = new Date(Math.max(Date.now(),f.now.getTime()));
+  for (let i=0; i<40; i++) {f.buffer.projection.runMaintenance(now);
   const s = f.buffer.projection.status(); if (s.parityReady && !s.dirty) return;}
-  assert.fail("bounded projection drain did not converge");}
+  assert.fail("bounded projection drain did not converge: " + JSON.stringify(f.buffer.projection.status()));}
 async function authorityCase(name: string, peer: AiInteractionEvent, authoritative: boolean, diagnosticInput?: number) {
   const f = new Fixture(); let tailer: RolloutTailer | undefined;
   try {
