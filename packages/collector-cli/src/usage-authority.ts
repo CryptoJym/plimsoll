@@ -40,16 +40,25 @@ export function hasSessionUsageAuthority(
   const candidates = probeRows === undefined ? "buffered_events" : `(select rowid,* from buffered_events
     where source=@source and session_id=@session order by observed_at desc limit @probe)`;
   const eligible = source === "codex" ? terminalPrivacyEligibilitySql(db, "e") : "1";
-  const rows = db.prepare(`select e.id from ${candidates} e
+  const query = db.prepare(`select e.id,e.observed_at as at from ${candidates} e
     where e.source=@source and e.session_id=@session and ${CODEX_SESSION_AUTHORITY_SQL}
       and ${eligible} ${source === "codex" ? "and e.usage_duplicate_reason is null" : ""}
       and e.event_type ${kind === "live" ? "not" : ""} in ('usage_rollout','usage_transcript')
       and (e.input_tokens is not null or e.output_tokens is not null
         or e.cache_read_tokens is not null or e.cache_creation_tokens is not null or e.cost_usd is not null)
       and e.rowid not in (select value from json_each(@excluded))
-    order by e.observed_at desc`).iterate({ source, session: sessionId,
-      excluded: JSON.stringify(excludeRowids), ...(probeRows === undefined ? {} : { probe: probeRows }) }) as IterableIterator<{ id: string }>;
-  for (const row of rows) if (source !== "codex" || rowCanOwnSessionUsage(db, row.id)) return true;
+      and (@cursorAt is null or e.observed_at<@cursorAt or (e.observed_at=@cursorAt and e.id<@cursorId))
+    order by e.observed_at desc,e.id desc limit 128`);
+  let cursorAt: string | null = null, cursorId: string | null = null;
+  // Finish each bounded SQL page before capture reads schema/lineage. An
+  // active SQLite iterator would prevent capture's schema-cookie pragma.
+  while (true) {
+    const rows = query.all({ source,session:sessionId,excluded:JSON.stringify(excludeRowids),cursorAt,cursorId,
+      ...(probeRows === undefined ? {} : {probe:probeRows}) }) as Array<{id:string;at:string}>;
+    for (const row of rows) if (source !== "codex" || rowCanOwnSessionUsage(db,row.id)) return true;
+    if (rows.length<128) break;
+    cursorAt = rows[rows.length-1]!.at; cursorId = rows[rows.length-1]!.id;
+  }
   if (probeRows !== undefined) {
     const { n } = db.prepare(`select count(*) as n from (select 1 from buffered_events
       where source=? and session_id=? order by observed_at desc limit ?)`)
