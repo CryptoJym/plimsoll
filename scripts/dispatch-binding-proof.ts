@@ -278,29 +278,45 @@ for (const captureRoot of forPrune.captureRoots ?? []) captureRoot.dispatch?.pus
   validFrom: "2026-09-01T00:00:00.000Z",validUntil: "2026-09-02T00:00:00.000Z",role: "author",
 });
 fs.writeFileSync(configPath, `${JSON.stringify(forPrune, null, 2)}\n`);
+const beforeUnauthenticatedClose = fs.readFileSync(configPath);
 const closed = cli(["dispatch", "close", "--attempt-id", "lane-1"]);
-assert.equal(closed.code, 0, closed.stderr);
-assert.equal(JSON.parse(closed.stdout).closed, 2);
-assert.equal(JSON.parse(closed.stdout).pruned, 2);
+assert.notEqual(closed.code, 0);
+assert.match(closed.stderr, /dispatch_terminal_proof_required/);
+assert.deepEqual(fs.readFileSync(configPath), beforeUnauthenticatedClose);
 const afterClose = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
-assert.ok(afterClose.captureRoots?.every(captureRoot => captureRoot.dispatch?.every(binding => binding.attemptId !== "old-lane")));
-assert.ok(afterClose.captureRoots?.every(captureRoot => captureRoot.dispatch?.find(binding => binding.attemptId === "lane-1")?.validUntil));
-// An event after the close: stamped from the clock, since close ends the binding at the current time.
-assert.equal(rootEventMetadata(roots[0], "after-close", new Date(Date.now() + 60_000).toISOString(), "codex-session").workItemId, undefined);
-proof.check("close_ends_attempt_and_prunes_closed_bindings_older_than_seven_days");
+assert.ok(afterClose.captureRoots?.every(captureRoot => captureRoot.dispatch?.some(binding => binding.attemptId === "old-lane")));
+assert.ok(afterClose.captureRoots?.every(captureRoot => captureRoot.dispatch?.find(binding => binding.attemptId === "lane-1")?.validUntil === null));
+assert.equal(rootEventMetadata(roots[0], "after-refused-close", new Date(Date.now() + 60_000).toISOString(), "codex-session").workItemId, "beads:eco-6hoxj.165.3");
+proof.check("unauthenticated_cli_close_preserves_open_and_historical_bindings");
 
 // A window that is still open when the proof runs, so close has something to shorten.
 const scheduledUntil = new Date(Date.now() + 7 * 86_400_000).toISOString();
+const beforeFutureBind = fs.readFileSync(configPath);
 const scheduled = cli(["dispatch", "bind", "--session-id", "scheduled-session", "--work-item-id", "beads:scheduled",
   "--project-key", key, "--attempt-id", "scheduled-lane", "--valid-from", "2026-09-25T00:00:00.000Z",
   "--valid-until", scheduledUntil]);
-assert.equal(scheduled.code, 0, scheduled.stderr);
+assert.notEqual(scheduled.code, 0);
+assert.match(scheduled.stderr, /dispatch_binding_future_window/);
+assert.deepEqual(fs.readFileSync(configPath), beforeFutureBind);
+// An already stored future window from an older writer remains readable and
+// cannot be shortened merely because a caller knows its attempt ID.
+const legacyScheduled = collectorConfigSchema.parse(JSON.parse(beforeFutureBind.toString("utf8")));
+for (const captureRoot of legacyScheduled.captureRoots ?? []) captureRoot.dispatch?.push({
+  sessionId: "scheduled-session", workItemId: "beads:scheduled", projectKey: key,
+  attemptId: "scheduled-lane", parentAttemptId: null, companyRef: null,
+  acceptedOutcomeId: null, evidenceRef: "scheduled-evidence",
+  validFrom: "2026-09-25T00:00:00.000Z", validUntil: scheduledUntil, role: "author",
+});
+fs.writeFileSync(configPath, `${JSON.stringify(legacyScheduled, null, 2)}\n`);
+const beforeScheduledClose = fs.readFileSync(configPath);
 const scheduledClose = cli(["dispatch", "close", "--attempt-id", "scheduled-lane"]);
-assert.equal(scheduledClose.code, 0, scheduledClose.stderr);
+assert.notEqual(scheduledClose.code, 0);
+assert.match(scheduledClose.stderr, /dispatch_terminal_proof_required/);
+assert.deepEqual(fs.readFileSync(configPath), beforeScheduledClose);
 const end = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8"))).captureRoots![0].dispatch!
   .find(binding => binding.attemptId === "scheduled-lane")!.validUntil!;
-assert.ok(Date.parse(end) < Date.parse(scheduledUntil), end);
-proof.check("close_shortens_a_scheduled_validity_window");
+assert.equal(end, scheduledUntil);
+proof.check("future_bind_refuses_and_legacy_scheduled_window_requires_terminal_authority");
 
 const atCap = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
 const rootAtCap = atCap.captureRoots![0];
@@ -326,10 +342,13 @@ proof.check("capacity_refuses_late_bind_without_dropping_live_bindings");
 const staleBound = cli(["dispatch", "bind", "--session-id", "cap-stale-session", "--work-item-id", "beads:cap-stale",
   "--project-key", key, "--attempt-id", "cap-stale-lane", "--valid-from", "2026-09-01T00:00:00.000Z",
   "--valid-until", "2026-09-02T00:00:00.000Z"]);
-assert.notEqual(staleBound.code, 0, staleBound.stdout);
-assert.match(staleBound.stderr, /dispatch_binding_outside_retention/);
-assert.deepEqual(fs.readFileSync(configPath), beforeCapBind);
-proof.check("bind_refuses_a_window_already_outside_retention");
+assert.equal(staleBound.code, 0, staleBound.stderr);
+const historicalAtCap = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+assert.deepEqual(new Map(historicalAtCap.captureRoots![0].dispatch!.map(binding => [binding.attemptId, binding])),
+  new Map(kept.map(binding => [binding.attemptId, binding])));
+assert.equal(historicalAtCap.captureRoots![0].dispatchHistory?.rootRows, 1);
+assert.equal(rootEventMetadata(roots[0], "late-historical-event", "2026-09-01T00:00:01.000Z", "cap-stale-session").workItemId, "beads:cap-stale");
+proof.check("elapsed_window_is_preserved_in_history_without_displacing_open_cap_bindings");
 proof.complete();
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

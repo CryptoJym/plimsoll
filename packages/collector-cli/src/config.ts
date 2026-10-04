@@ -7,8 +7,11 @@ import Database from "better-sqlite3";
 import { z } from "zod";
 
 import { DEFAULT_POLICY, LOCAL_TENANT_ID, policyConfigSchema } from "../../shared/src/index";
-import { captureRootSchema, validateCaptureRoots } from "./capture-root-inventory";
+import { captureRootSchema, dispatchBindingSchema, validateCaptureRoots } from "./capture-root-inventory";
 import { resolveCollectorHome } from "./collector-home";
+import { assertPrivateStateDirectory, assertPrivateStateFile, fsyncStateDirectory,
+  MAX_COLLECTOR_PROFILE_BYTES, readPrivateStateFile } from "./collector-state-io";
+import { materializeDispatchHistoryForRollback, validateDispatchHistoryTransition } from "./dispatch-binding-index";
 
 export const DEFAULT_COLLECTOR_PORT = 48271;
 
@@ -295,15 +298,25 @@ export function saveCollectorConfig(config: CollectorConfig, homeDir = os.homedi
 export function withCollectorConfigMutationLock<T>(configPath: string, action: () => T) {
   const directory = path.dirname(configPath);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  assertPrivateStateDirectory(directory);
   const lockPath = path.join(directory, `.${path.basename(configPath)}.mutation.lock.sqlite`);
   try {
     fs.closeSync(fs.openSync(lockPath, "wx", 0o600));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
-  const lockDatabase = new Database(lockPath, { timeout: CONFIG_MUTATION_LOCK_WAIT_MS });
+  const descriptor = fs.openSync(lockPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+  let lockDatabase: Database.Database;
   try {
-    fs.chmodSync(lockPath, 0o600);
+    const pinned = fs.fstatSync(descriptor);
+    assertPrivateStateFile(pinned, 1024 * 1024);
+    lockDatabase = new Database(lockPath, { timeout: CONFIG_MUTATION_LOCK_WAIT_MS });
+    const named = fs.lstatSync(lockPath);
+    if (named.isSymbolicLink() || named.dev !== pinned.dev || named.ino !== pinned.ino) {
+      lockDatabase.close(); throw new Error("collector_config_lock_changed");
+    }
+  } finally { fs.closeSync(descriptor); }
+  try {
     lockDatabase.pragma(`busy_timeout = ${CONFIG_MUTATION_LOCK_WAIT_MS}`);
     try {
       lockDatabase.exec("BEGIN IMMEDIATE");
@@ -313,15 +326,15 @@ export function withCollectorConfigMutationLock<T>(configPath: string, action: (
       }
       throw error;
     }
-    let commit = false;
     try {
+      assertPrivateStateDirectory(directory);
       const result = action();
-      commit = true;
+      try { lockDatabase.exec("COMMIT"); }
+      catch { throw new Error("collector_config_lock_commit_uncertain_reread_required"); }
       return result;
-    } finally {
-      if (lockDatabase.inTransaction) {
-        lockDatabase.exec(commit ? "COMMIT" : "ROLLBACK");
-      }
+    } catch (error) {
+      if (lockDatabase.inTransaction) lockDatabase.exec("ROLLBACK");
+      throw error;
     }
   } finally {
     lockDatabase.close();
@@ -333,20 +346,30 @@ function writeCollectorConfigTransactionallyUnlocked(
   configPath: string,
 ) {
   const directory = path.dirname(configPath);
+  assertPrivateStateDirectory(directory);
+  const bytes = Buffer.from(`${JSON.stringify(validated, null, 2)}\n`);
+  if (bytes.length > MAX_COLLECTOR_PROFILE_BYTES) throw new Error("collector_state_byte_bound_exceeded");
   const temporaryPath = path.join(
     directory,
     `.collector.config-${process.pid}-${crypto.randomUUID()}.tmp`,
   );
   let descriptor: number | undefined;
+  let published = false;
   try {
-    descriptor = fs.openSync(temporaryPath, "wx", 0o600);
-    fs.writeFileSync(descriptor, `${JSON.stringify(validated, null, 2)}\n`);
+    descriptor = fs.openSync(temporaryPath, fs.constants.O_WRONLY | fs.constants.O_CREAT |
+      fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    fs.writeFileSync(descriptor, bytes);
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
+    assertPrivateStateDirectory(directory);
+    if (fs.existsSync(configPath)) readPrivateStateFile(configPath);
     fs.renameSync(temporaryPath, configPath);
-    const directoryDescriptor = fs.openSync(directory, "r");
-    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+    published = true;
+    fsyncStateDirectory(directory);
+  } catch (error) {
+    if (published) throw new Error("collector_config_publication_uncertain_reread_required");
+    throw error;
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.rmSync(temporaryPath, { force: true });
@@ -373,25 +396,45 @@ export function writeCollectorConfigTransactionally(
   const published = options.preserveUnknownFields
     ? { ...options.preserveUnknownFields, ...validated } as CollectorConfig
     : validated;
-  return withCollectorConfigMutationLock(configPath, () =>
-    writeCollectorConfigTransactionallyUnlocked(published, configPath),
-  );
+  return withCollectorConfigMutationLock(configPath, () => {
+    if (fs.existsSync(configPath)) {
+      const current = collectorConfigSchema.parse(JSON.parse(readPrivateStateFile(configPath).toString("utf8")));
+      validateDispatchHistoryTransition(current.captureRoots ?? [], validated.captureRoots ?? [], dispatchBindingSchema.parse);
+    }
+    return writeCollectorConfigTransactionallyUnlocked(published, configPath);
+  });
 }
 
 /** Read the latest config while holding the same lock as other config writers. */
 export function mutateCollectorConfigTransactionally(
-  mutate: (current: CollectorConfig) => CollectorConfig,
+  mutate: (current: CollectorConfig, context: { sourceSha256: string }) => CollectorConfig,
   configPath = collectorConfigPath(),
+  options: { losslessDispatchHistoryRollback?: true } = {},
 ) {
   return withCollectorConfigMutationLock(configPath, () => {
-    const stored = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    const bytes = readPrivateStateFile(configPath);
+    const stored = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
     const current = collectorConfigSchema.parse(stored);
-    const next = collectorConfigSchema.parse(mutate(current));
+    const next = collectorConfigSchema.parse(mutate(current, {
+      sourceSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    }));
     assertCollectorPrivacyMode(next, "config write");
+    if (options.losslessDispatchHistoryRollback) {
+      const legacy = materializeDispatchHistoryForRollback(current.captureRoots ?? [], dispatchBindingSchema.parse);
+      if (JSON.stringify(legacy) !== JSON.stringify(next.captureRoots ?? []))
+        throw new Error("dispatch_history_rollback_not_lossless");
+    } else validateDispatchHistoryTransition(current.captureRoots ?? [], next.captureRoots ?? [], dispatchBindingSchema.parse);
     const published = { ...stored, ...next } as CollectorConfig;
     writeCollectorConfigTransactionallyUnlocked(published, configPath);
     return next;
   });
+}
+
+/** Owner-only adoption helper: atomically publish an exactly representable legacy inventory. */
+export function rollbackCollectorDispatchHistory(configPath = collectorConfigPath()) {
+  return mutateCollectorConfigTransactionally(current => ({ ...current,
+    captureRoots: materializeDispatchHistoryForRollback(current.captureRoots ?? [], dispatchBindingSchema.parse),
+  }), configPath, { losslessDispatchHistoryRollback: true });
 }
 
 /**
@@ -447,7 +490,7 @@ export function readCollectorConfig(homeDir = os.homedir()): CollectorConfigRead
     return {
       status: "valid",
       path: configPath,
-      config: collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8"))),
+      config: collectorConfigSchema.parse(JSON.parse(readPrivateStateFile(configPath).toString("utf8"))),
     };
   } catch {
     return { status: "invalid", path: configPath, config: null };
@@ -468,6 +511,6 @@ export function loadCollectorConfig(homeDir = os.homedir()): CollectorConfig {
     return created;
   }
 
-  const parsed = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+  const parsed = collectorConfigSchema.parse(JSON.parse(readPrivateStateFile(configPath).toString("utf8")));
   return assertCollectorPrivacyMode(parsed, "config load", { checkEnvironment: false });
 }

@@ -624,6 +624,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-binding
 
+      - name: Prove bounded dispatch history, terminal authority and lossless rollback
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:dispatch-history
+
       - name: Prove Claude dispatch stamping across hook, OTLP and usage (eco-6hoxj.165.97)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-dispatch-stamping
