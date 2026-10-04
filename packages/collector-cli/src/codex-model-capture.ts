@@ -403,12 +403,6 @@ export function captureCodexModel(
   persistDecision = false,
 ): AiInteractionEvent {
   if (!codexHasUsage(event)) return event;
-  const responsePair = codexSpanRolloutDecision(db, rawId);
-  if (responsePair && (responsePair.ownerId !== rawId || isCodexResponseSpan(event))) {
-    const captured = { ...event, model: responsePair.model,
-      metadata: { ...event.metadata, modelCaptureSource: "paired_rollout_event" } };
-    return responsePair.ownerId === rawId ? captured : pairedObservation(captured, "paired_rollout_event");
-  }
   let row:
     | {
         workspace: string | null;
@@ -462,6 +456,15 @@ export function captureCodexModel(
     return gap("conflicting_model_attributes");
   if (codexMisfiledUnderClaude(event))
     return gap("codex_service_under_claude_source");
+  // A saved pair cannot override an accounting gap or contradictory native
+  // attributes. In particular the raw diagnostics behind a frozen gap still
+  // carry their original counters.
+  const responsePair = codexSpanRolloutDecision(db, rawId);
+  if (responsePair && (responsePair.ownerId !== rawId || isCodexResponseSpan(event))) {
+    const captured = { ...event, model: responsePair.model,
+      metadata: { ...event.metadata, modelCaptureSource: "paired_rollout_event" } };
+    return responsePair.ownerId === rawId ? captured : pairedObservation(captured, "paired_rollout_event");
+  }
   // Some native exporters put the request model directly on the response
   // span. Treat that as trace evidence only when the event carries a bounded
   // trace id and the native model attribute agrees with the normalized model

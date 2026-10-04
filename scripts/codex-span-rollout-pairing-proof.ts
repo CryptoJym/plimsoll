@@ -5,9 +5,9 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
-import { recordCodexTurnModel } from "../packages/collector-cli/src/codex-model-capture";
+import { captureCodexModel, recordCodexTurnModel, rememberCaptureGap } from "../packages/collector-cli/src/codex-model-capture";
 import { createProofCompletion } from "./lib/proof-completion";
-import type { AiInteractionEvent } from "../packages/shared/src/index";
+import { aiInteractionEventSchema, type AiInteractionEvent } from "../packages/shared/src/index";
 
 const regression = process.argv.includes("--regression");
 const production = process.argv.includes("--production");
@@ -39,16 +39,18 @@ class Fixture {
     return new LocalEventBuffer(this.file, { workspaceId: WORKSPACE, deviceId: "fixture-device",
       enrollmentNow: () => new Date(AT - 1000), delivery: { enabled: true, now: () => this.now } });
   }
-  span(options: { session?: boolean; sessionId?: string; model?: boolean; delta?: number; id?: string } = {}) {
+  span(options: { session?: boolean; sessionId?: string; turnId?: string; model?: boolean;
+    modelName?: string; actorId?: string; delta?: number; id?: string } = {}) {
     const entry = explodeOtlpPayload({ resourceSpans: [{ resource, scopeSpans: [{ spans: [{
       name: "handle_responses", traceId: "a".repeat(32), spanId: options.id ?? "b".repeat(16),
       startTimeUnixNano: nano(AT), endTimeUnixNano: nano(AT + 1000),
       attributes: [attr("gen_ai.usage.input_tokens", INPUT + (options.delta ?? 0)),
         attr("gen_ai.usage.output_tokens", OUTPUT), attr("gen_ai.usage.cache_read.input_tokens", CACHE),
-        ...(options.session ? [attr("conversation.id", options.sessionId ?? SESSION), attr("turn.id", "turn-1")] : []),
-        ...(options.model ? [attr("model", MODEL)] : [])],
+        ...(options.session ? [attr("conversation.id", options.sessionId ?? SESSION), attr("turn.id", options.turnId ?? "turn-1")] : []),
+        ...(options.model ? [attr("model", options.modelName ?? MODEL)] : [])],
     }] }] }] }, { source: "codex", transportPath: "/v1/traces" }).events[0]!;
     assert.equal(entry.event.metadata.transport_path, "/v1/traces");
+    if (options.actorId) entry.event.actorId = options.actorId;
     assert.equal(this.buffer.append(entry.event, entry.suppressedFields), true);
     return entry.event;
   }
@@ -77,6 +79,18 @@ class Fixture {
     try { return await tailer.scan({ scope: "full", now: this.now }); }
     finally { tailer.close(); }
   }
+  nativeRollout(actorId?: string) {
+    recordCodexTurnModel(this.buffer.database, SESSION, "turn-1", MODEL, actorId);
+    const event = aiInteractionEventSchema.parse({
+      id: "44444444-4444-4444-8444-444444444444", source: "codex", dataMode: "metadata",
+      eventType: "usage_rollout", observedAt: new Date(AT + 1000).toISOString(),
+      sessionId: SESSION, model: MODEL, inputTokens: INPUT, outputTokens: OUTPUT,
+      cacheReadTokens: CACHE, ...(actorId ? { actorId } : {}),
+      metadata: { usageSource: "rollout", codexTurnId: "turn-1" },
+    });
+    assert.equal(this.buffer.append(event), true);
+    return event;
+  }
   upload(at = AT + 65_000) {
     this.now = new Date(at);
     const lease = this.buffer.delivery.lease({ now: this.now });
@@ -99,6 +113,89 @@ class Fixture {
     assert.equal(usage[0]!.cacheReadTokens, CACHE);
   }
   close() { this.buffer.close(); }
+}
+
+function assertUnpaired(f: Fixture, spanId: string) {
+  const exists = f.buffer.database.prepare("select 1 from sqlite_master where type='table' and name='codex_span_rollout_pairs'").get();
+  assert.equal(exists ? f.buffer.database.prepare("select 1 from codex_span_rollout_pairs where span_id=?").get(spanId) : undefined,
+    undefined, "ineligible span has no saved pairing decision");
+  const raw = f.buffer.database.prepare("select usage_duplicate_reason as reason from buffered_events where id=?")
+    .get(spanId) as { reason: string | null };
+  assert.equal(raw.reason, null, "ineligible span is not erased as a duplicate");
+}
+
+async function durableGapComposition() {
+  for (const state of ["sealed gap", "terminal gap replay", "saved pair then gap"] as const) {
+    const f = new Fixture(state);
+    try {
+      const span = f.span({ model: state === "saved pair then gap" });
+      f.now = new Date(AT + 65_000);
+      const first = f.buffer.delivery.lease({ now: f.now });
+      const item = first.items.find(value => value.rawId === span.id)!;
+      assert.ok(item);
+      if (state === "saved pair then gap") {
+        await f.rollout();
+        rememberCaptureGap(f.buffer.database, span.id, "late_native_conflict");
+        const result = captureCodexModel(f.buffer.database, span, span.id);
+        assert.equal(result.metadata.usageSource, "capture_gap", "durable gap precedes an existing pair");
+        assert.equal(result.model, undefined);
+        assert.equal(result.inputTokens, undefined);
+      } else {
+        assert.equal(item.envelope.event.metadata.usageSource, "capture_gap");
+        if (state === "terminal gap replay") {
+          assert.equal(f.buffer.delivery.deadLetterRemote(first.leaseId, [item.deliveryId], f.now), 1);
+        }
+        // An older gap reader has frozen bytes but no decision-table receipt.
+        f.buffer.database.prepare("delete from codex_capture_decisions where raw_id=?").run(span.id);
+        await f.rollout();
+        assertUnpaired(f, span.id);
+        if (state === "terminal gap replay") {
+          const replay = f.buffer.delivery.replayDeadLetters({ reason: "remote_validation_rejected", now: f.now });
+          assert.equal(replay.requeued, 1);
+          assert.equal(f.buffer.delivery.restampUnsentRaw(span.id, JSON.stringify(span)), false);
+        }
+        const frozen = f.buffer.database.prepare("select sealed_envelope_json as bytes from upload_outbox where delivery_id=?")
+          .get(item.deliveryId) as { bytes: string };
+        assert.equal(frozen.bytes, item.envelopeJson, "late twin keeps frozen gap bytes and identity");
+        f.upload(AT + 400_000);
+        f.once();
+        const deliveredGap = f.cloud.get(item.deliveryId)!;
+        assert.equal(deliveredGap.model, undefined);
+        assert.equal(deliveredGap.inputTokens, undefined);
+      }
+      console.log(JSON.stringify({ composition: state, status: "PASS" }));
+    } finally { f.close(); }
+  }
+}
+
+async function otherBoundaryRefusals() {
+  for (const boundary of ["workspace", "device", "turn", "model", "account", "nested model", "gap peer"] as const) {
+    const f = new Fixture("refuse-" + boundary);
+    try {
+      const span = f.span({ model: true, session: boundary === "turn",
+        ...(boundary === "turn" ? { turnId: "turn-2" } : {}),
+        ...(boundary === "model" ? { modelName: "gpt-6-astra" } : {}),
+        ...(boundary === "account" ? { actorId: "sha256:1111111111111111" } : {}) });
+      // Imported historical rows can belong to a prior boundary. Seed that
+      // stored identity directly; live binding APIs correctly refuse to relabel
+      // queued rows, and are not the pairing operation being exercised here.
+      if (boundary === "workspace") f.buffer.database.prepare("update buffered_events set workspace_id=? where id=?")
+        .run("55555555-5555-4555-8555-555555555555", span.id);
+      if (boundary === "device") f.buffer.database.prepare("update buffered_events set device_id=? where id=?")
+        .run("other-device", span.id);
+      if (boundary === "nested model" || boundary === "gap peer") {
+        const peer: AiInteractionEvent = { ...span, id: "66666666-6666-4666-8666-666666666666",
+          eventType: "otel_span", model: undefined, inputTokens: undefined, outputTokens: undefined,
+          cacheReadTokens: undefined, metadata: { traceId: span.metadata.traceId,
+            otelEventName: "codex.sse_event", otelAttributes: { "gen_ai.request.model": "gpt-6-astra" } } };
+        if (boundary === "gap peer") peer.metadata.usageSource = "capture_gap";
+        assert.equal(f.buffer.append(peer), true);
+      }
+      f.nativeRollout(boundary === "account" ? "sha256:2222222222222222" : undefined);
+      assertUnpaired(f, span.id);
+      console.log(JSON.stringify({ boundary, status: "PASS", paired: false }));
+    } finally { f.close(); }
+  }
 }
 
 async function check(name: string, body: (f: Fixture) => Promise<void> | void) {
@@ -133,9 +230,17 @@ async function main() { try {
       await f.rollout(); f.upload(); f.once();
       assert.ok([...f.cloud.values()].every(e => e.inputTokens === undefined || e.model));
     });
-    await check("production-unknown-span-only-is-gap", f => {
-      f.span(); f.upload(); assert.equal(f.usage().length, 0);
-      assert.equal([...f.cloud.values()][0]!.metadata.usageSource, "capture_gap");
+    await check("production-gap-rejects-late-rollout-twin", async f => {
+      const span = f.span();
+      const gap = captureCodexModel(f.buffer.database, span, span.id, true);
+      assert.equal(gap.metadata.usageSource, "capture_gap");
+      await f.rollout();
+      assertUnpaired(f, span.id);
+      f.upload();
+      const delivered = [...f.cloud.values()];
+      assert.equal(delivered.filter(event => event.metadata.usageSource === "capture_gap").length, 1);
+      assert.equal(f.usage().length, 1, "late rollout remains the one native usage observation");
+      await durableGapComposition();
     });
     await check("session-bearing-span-first", async f => {
       f.span({ session: true }); await f.rollout(); f.upload(); f.once();
@@ -173,6 +278,7 @@ async function main() { try {
     await check("native-session-mismatch", async f => {
       f.span({ model: true, session: true, sessionId: "33333333-3333-4333-8333-333333333333" });
       await f.rollout(); f.upload(); assert.equal(f.usage().length, 2);
+      await otherBoundaryRefusals();
     });
     await check("installation-epoch-mismatch", async f => {
       f.span({ model: true });

@@ -43,18 +43,32 @@ function kind(row: Row): "span" | "rollout" | null {
   return null;
 }
 const session = (event: AiInteractionEvent) => event.metadata.stitched === "time_window" ? undefined : event.sessionId;
+function nativeValues(event: AiInteractionEvent, keys: readonly string[]) {
+  const nested = event.metadata.otelAttributes;
+  const attributes = nested && typeof nested === "object" && !Array.isArray(nested)
+    ? nested as Record<string, unknown> : {};
+  return keys.flatMap(key => [event.metadata[key], attributes[key]])
+    .filter((value): value is string => typeof value === "string" && !!value.trim());
+}
 function account(event: AiInteractionEvent) {
-  const reported = event.metadata["user.account_id"];
-  return typeof reported === "string" ? new Set([reported, providerAccountKey(reported), event.actorId].filter(Boolean))
-    : new Set([event.actorId].filter(Boolean));
+  const reported = nativeValues(event, usageFieldKeys.actorId);
+  return new Set([...reported, ...reported.map(providerAccountKey), event.actorId].filter(Boolean));
+}
+function nativeConflict(event: AiInteractionEvent) {
+  const models = new Set(nativeValues(event, usageFieldKeys.model));
+  const accounts = new Set(nativeValues(event, usageFieldKeys.actorId));
+  const reportedAccount = [...accounts][0];
+  return event.metadata.modelEvidenceConflict === true || models.size > 1 || accounts.size > 1 ||
+    Boolean(event.model && models.size === 1 && !models.has(event.model)) ||
+    Boolean(event.actorId && reportedAccount && event.actorId !== reportedAccount &&
+      event.actorId !== providerAccountKey(reportedAccount));
 }
 function compatible(span: Row, rollout: Row) {
   const end = Date.parse(String(span.event.metadata.otelSpanEndAt ?? span.at));
   const start = Date.parse(span.at), at = Date.parse(rollout.at);
   const a = account(span.event), b = account(rollout.event);
   const spanTurn = turn(span.event), rolloutTurn = turn(rollout.event);
-  const nativeModels = new Set([span.event.metadata.model, span.event.metadata["gen_ai.request.model"],
-    span.event.metadata["gen_ai.response.model"]].filter(value => typeof value === "string"));
+  const nativeModels = new Set(nativeValues(span.event, usageFieldKeys.model));
   return span.workspace !== null && span.epoch !== null && span.device !== null &&
     span.workspace === rollout.workspace && span.epoch === rollout.epoch && span.device === rollout.device &&
     span.input === rollout.input && span.output === rollout.output &&
@@ -66,7 +80,7 @@ function compatible(span: Row, rollout: Row) {
     (!span.event.metadata.traceId || !rollout.event.metadata.traceId ||
       span.event.metadata.traceId === rollout.event.metadata.traceId) &&
     (a.size === 0 || b.size === 0 || [...a].some(value => b.has(value))) &&
-    span.event.metadata.modelEvidenceConflict !== true &&
+    !nativeConflict(span.event) && !nativeConflict(rollout.event) &&
     nativeModels.size <= 1 && (nativeModels.size === 0 || nativeModels.has(rollout.event.model ?? ""));
 }
 
@@ -123,6 +137,45 @@ function emittedSpanModel(db: Database.Database, row: Row): string | undefined {
   return undefined;
 }
 
+function isCaptureGapEnvelope(payload: string | null | undefined) {
+  if (!payload) return false;
+  try {
+    const event = JSON.parse(payload).event as { metadata?: { usageSource?: unknown; captureGap?: unknown } } | undefined;
+    return event?.metadata?.usageSource === "capture_gap" || event?.metadata?.captureGap === true;
+  } catch {
+    return false;
+  }
+}
+
+/** A response span that already has a durable gap decision is accounting
+ * history, not a new pairing candidate. The raw row deliberately retains its
+ * counters for diagnostics, while gap envelopes and replay lineage retain the
+ * frozen tokenless result. */
+function hasDurableCaptureGap(db: Database.Database, row: Row) {
+  if (table(db, "codex_capture_decisions") && db.prepare(`select 1
+      from codex_capture_decisions where raw_rowid=? and raw_id=? and raw_created_at=?
+        and raw_generation is ? limit 1`).get(row.rowid, row.id, row.created, row.generation)) return true;
+  try {
+    if (table(db, "upload_outbox")) {
+      const envelopes = db.prepare(`select base_envelope_json as base, sealed_envelope_json as sealed
+        from upload_outbox where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ?`)
+        .all(row.rowid, row.id, row.created, row.generation) as Array<{ base: string; sealed: string | null }>;
+      if (envelopes.some(value => isCaptureGapEnvelope(value.sealed) || isCaptureGapEnvelope(value.base))) return true;
+    }
+    if (table(db, "upload_replays")) {
+      const replays = db.prepare(`select frozen_envelope_json as frozen
+        from upload_replays where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ?`)
+        .all(row.rowid, row.id, row.created, row.generation) as Array<{ frozen: string | null }>;
+      if (replays.some(value => isCaptureGapEnvelope(value.frozen))) return true;
+    }
+  } catch {
+    // A pre-migration reader has no complete replay shape. Keep the raw
+    // pairing decision conservative and let the normal capture path decide.
+    return true;
+  }
+  return false;
+}
+
 function nearby(db: Database.Database, row: Row) {
   const end = Date.parse(String(row.event.metadata.otelSpanEndAt ?? row.at));
   if (!Number.isFinite(end)) return [];
@@ -162,15 +215,14 @@ function nativeTraceCompatible(db: Database.Database, span: Row, rollout: Row) {
   const models = new Set<string>();
   for (const row of rows) {
     const peer = JSON.parse(row.payload) as AiInteractionEvent;
-    if (peer.metadata.modelCaptureSource || peer.metadata.usageSource === "capture_gap") continue;
-    if (peer.metadata.modelEvidenceConflict === true ||
+    if (peer.metadata.modelCaptureSource) continue;
+    // Financially ineligible gap peers can still report contradictory native
+    // attributes. They must not hide ambiguity from a later pair.
+    if (nativeConflict(peer) ||
         (session(peer) && session(peer) !== session(rollout.event))) return false;
     const a = account(peer), b = account(rollout.event);
     if (a.size && b.size && ![...a].some(value => b.has(value))) return false;
-    for (const key of usageFieldKeys.model) {
-      const value = peer.metadata[key];
-      if (typeof value === "string" && value.trim()) models.add(value);
-    }
+    for (const value of nativeValues(peer, usageFieldKeys.model)) models.add(value);
   }
   return models.size === 0 || models.size === 1 && models.has(rollout.event.model ?? "");
 }
@@ -192,6 +244,7 @@ export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string
   if (reciprocal.length !== 1 || reciprocal[0]!.id !== row.id) return null;
   const span = kind(row) === "span" ? row : other;
   const rollout = kind(row) === "rollout" ? row : other;
+  if (hasDurableCaptureGap(db, span) || hasDurableCaptureGap(db, rollout)) return null;
   if (!table(db, "codex_turn_model_evidence")) return null;
   const nativeTurn = db.prepare(`select model,count(distinct nullif(account_key,'')) as accounts
     from codex_turn_model_evidence where workspace_id=? and device_id is ? and installation_epoch_id=?
