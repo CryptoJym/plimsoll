@@ -244,6 +244,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:doctor-stale-producers
 
+      - name: Prove tsx IPC pipe collisions cannot block proof children
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:tsx-ipc-pipe
+
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:packaged-runtime
@@ -849,6 +853,13 @@ jobs:
       - name: Prove capture budget reservation under repair backlog
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-budget
+
+      - name: Prove current-day Codex capture during a multi-GB scan backlog
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:codex-scan-backlog
+          pnpm proof:codex-scan-discovery
+          pnpm proof:collector-named-usage-rollback
 
       - name: Prove Grok usage capture from Grok's own usage files (eco-6hoxj.163.20)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

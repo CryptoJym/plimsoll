@@ -1,7 +1,7 @@
 /** Run the catch-up fixture against three isolated source regressions. The
  * checkout is never modified; every mutant is copied under the CI proof home. */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";

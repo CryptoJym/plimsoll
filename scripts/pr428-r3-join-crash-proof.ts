@@ -1,5 +1,5 @@
 /** Run each directed PR #428 crash witness under the join fixture cloud. */
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import path from "node:path";
 
 const cases: Record<string, string[]> = {

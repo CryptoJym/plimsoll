@@ -1,5 +1,5 @@
 /** Named round-six review regressions, each in its own fixture process. */
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import path from "node:path";
 
 const selected = process.argv[2];
