@@ -131,7 +131,9 @@ const cases = [
   }) },
   { name: "a deferred generation gets a slice alongside a busy current-day queue", run: () => fixture(async f => {
     const old = f.file(yesterday(), 3000);
-    for (let n = 0; n < 10; n++) f.file(today(), 3000);
+    // Fresh tails fit one slice; oversized current-day files now rotate with
+    // the deferred generation instead of belonging to this foreground queue.
+    for (let n = 0; n < 10; n++) f.file(today(), 60);
     await f.tailer.scan({ scope: "recent", automatic: { phase: "capture", budget: new CaptureWorkBudget() } });
     assert.ok(offset(f.buffer, old.file) > 0, "fresh generations cannot consume every backlog turn");
     assert.equal(f.reads[1], old.file, "one background slice follows the freshest slice");

@@ -13,7 +13,7 @@ import { TranscriptTailer } from "../packages/collector-cli/src/transcript-taile
 import { createProofCompletion } from "./lib/proof-completion";
 import { installVirtualClock, restoreRealClock } from "./lib/virtual-clock";
 
-const completion = createProofCompletion("codex-scan-discovery", 4);
+const completion = createProofCompletion("codex-scan-discovery", 5);
 const record = (type: string, payload: object) =>
   JSON.stringify({ type, payload, timestamp: new Date().toISOString() }) + "\n";
 const usage = (input: number) => record("event_msg", {
@@ -102,6 +102,77 @@ const cases = [
       "select 1 from buffered_events where session_id=? and event_type='usage_rollout' and input_tokens=100",
     ).get(session), "the oversized candidate must not spend the small ready tail's allowance");
     assert.ok(result.bytesRead <= 64 * 1024);
+  }) },
+  { name: "a new oversized current-day generation advances beside replenished small tails", run: () => fixture(async f => {
+    const ignored = record("fixture_ignored", { padding: "x".repeat(10) });
+    const offset = (file: string) => (f.buffer.database.prepare(
+      "select committed_offset as n from rollout_scan_state where file=?",
+    ).get(jsonlScanStateKey(file)) as { n: number } | undefined)?.n ?? 0;
+    const small = Array.from({ length: 16 }, (_, index) => {
+      const session = randomUUID();
+      const file = path.join(f.partition, `rollout-small-${index}-${session}.jsonl`);
+      fs.writeFileSync(file, prefix(session) + usage(10) + ignored.repeat(60));
+      return { session, file, total: 10 };
+    });
+    for (let turn = 0; turn < 16 && !small.every(tail => offset(tail.file) === fs.statSync(tail.file).size); turn++) {
+      await f.scan();
+    }
+    assert.ok(small.every(tail => offset(tail.file) === fs.statSync(tail.file).size),
+      "all small files start caught up");
+    const session = randomUUID();
+    const large = path.join(f.partition, `rollout-new-large-${session}.jsonl`);
+    const largePrefix = prefix(session) + usage(700);
+    fs.writeFileSync(large, largePrefix + record("fixture_ignored", { padding: "x".repeat(600 * 1024) }));
+    // Keep the uncursored large generation newest in the same UTC day, so
+    // the fixture isolates size priority rather than discovery or mtime order.
+    const newest = new Date(Date.now() + 60_000);
+    assert.equal(newest.toISOString().slice(0, 10), new Date().toISOString().slice(0, 10));
+    fs.utimesSync(large, newest, newest);
+    const smallPriorityTime = Date.now() + 1000;
+    const largeUsage = () => (f.buffer.database.prepare(
+      "select coalesce(sum(input_tokens),0) as n from buffered_events where session_id=? and event_type='usage_rollout'",
+    ).get(session) as { n: number }).n;
+    const smallUsage = () => small.map(tail => (f.buffer.database.prepare(
+      "select coalesce(sum(input_tokens),0) as n from buffered_events where session_id=? and event_type='usage_rollout'",
+    ).get(tail.session) as { n: number }).n);
+    const observations = [];
+    for (let turn = 1; turn <= 16; turn++) {
+      // Refill only caught-up tails: every ready small tail fits one slice.
+      for (const tail of small) if (offset(tail.file) === fs.statSync(tail.file).size) {
+        tail.total += 10;
+        fs.appendFileSync(tail.file, usage(tail.total) + ignored.repeat(63));
+        assert.ok(fs.statSync(tail.file).size - offset(tail.file) <= AUTOMATIC_CAPTURE_LIMITS.sliceBytes);
+      }
+      // Keep a fixed mtime epoch: replenished tails move behind those with
+      // fewer refills, including unserviced candidates with cached metadata.
+      // Every tail stays ready and the large generation remains newest.
+      for (const tail of small) {
+        const mtime = new Date(smallPriorityTime - tail.total);
+        fs.utimesSync(tail.file, mtime, mtime);
+      }
+      const walk = f.tailer.coverageWalk();
+      try {
+        for (let step = 0; step < 32 && !walk.done; step++) walk.step(performance.now() + 1000, () => {});
+        assert.ok(walk.done, "production coverage walk finishes in the bounded fixture");
+      } finally { walk.close(); }
+      const before = smallUsage();
+      const result = await f.scan();
+      const after = smallUsage();
+      const smallInputDelta = after.reduce((sum, total, index) => sum + total - before[index]!, 0);
+      assert.ok(smallInputDelta > 0, `small tails keep receiving usage service on turn ${turn}`);
+      assert.ok(result.bytesRead <= AUTOMATIC_CAPTURE_LIMITS.maxBytes);
+      assert.ok(result.recordsParsed <= AUTOMATIC_CAPTURE_LIMITS.maxRecords);
+      observations.push({ turn, largeCommitted: offset(large), largeInputTokens: largeUsage(),
+        records: result.recordsParsed, bytes: result.bytesRead, events: result.eventsAppended,
+        smallInputDelta, smallCaughtUp: small.filter(tail => offset(tail.file) === fs.statSync(tail.file).size).length });
+    }
+    console.log(JSON.stringify({ scenario: "replenished small tails beside a new oversized current-day rollout",
+      largeUsage: largeUsage(), largeCommitted: offset(large), observations }));
+    assert.ok(observations[0]!.largeCommitted >= Buffer.byteLength(largePrefix),
+      "the first background slice commits the large generation's complete prefix");
+    assert.equal(observations[0]!.largeInputTokens, 700, "the first slice captures exactly 700 input tokens");
+    assert.equal(largeUsage(), 700, "large generation usage is committed exactly once");
+    assert.ok(smallUsage().every(total => total > 10), "all sixteen small tails continue receiving service");
   }) },
   { name: "byte slices preserve UTF-8 record boundaries and wait for a final newline", run: () => fixture(async f => {
     const session = randomUUID();

@@ -1137,20 +1137,16 @@ export class RolloutTailer {
     // drain each candidate fully in one pass.
     const rotationKeyOf = (candidate: { file: string }) =>
       maintenanceCandidateHash(candidate.file);
-    // Fresh, short current-day tails bypass the historical rotation. A large
-    // committed-cursor backlog joins the background rotation even with a
-    // current mtime; it cannot consume every fresh-file turn.
-    const fresh = automatic ? candidates.filter(candidate =>
-      candidate.stat.mtime.toISOString().slice(0, 10) === today &&
-      (!candidate.cursor?.workRemaining || candidate.cursor.deferredBytes <= 64 * 1024)) : [];
-    // A newly discovered oversized record has no cursor yet. Its newer mtime
-    // must not put it ahead of a ready small tail, especially when the shared
-    // allowance can only park the oversized continuation without reading it.
-    // The stable sort keeps newest-first order within each size class.
     const fitsSlice = (candidate: typeof candidates[number]) =>
       candidate.stat.size - (candidate.cursor?.committedOffset ?? candidate.initialOffset ?? 0) <=
         AUTOMATIC_CAPTURE_LIMITS.sliceBytes;
-    fresh.sort((left, right) => Number(fitsSlice(right)) - Number(fitsSlice(left)));
+    // Fresh, short current-day tails bypass the historical rotation. Every
+    // oversized tail joins the background rotation, including new generations
+    // without a cursor, so replenished small tails cannot starve its first slice.
+    const fresh = automatic ? candidates.filter(candidate =>
+      candidate.stat.mtime.toISOString().slice(0, 10) === today &&
+      fitsSlice(candidate) &&
+      (!candidate.cursor?.workRemaining || candidate.cursor.deferredBytes <= 64 * 1024)) : [];
     const freshFiles = new Set(fresh.map(candidate => candidate.file));
     const background = automatic ? candidates.filter(candidate => !freshFiles.has(candidate.file)) : candidates;
     const rotated = automatic
