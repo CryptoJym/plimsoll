@@ -1,5 +1,6 @@
 import type { AiInteractionEvent } from "../../shared/src/index";
-import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, rememberCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, legacyFrozenNativeCapture, rememberCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { frozenCodexCapture, frozenCodexDelivery, installCodexFrozenCompatibility, rememberFrozenCodexCapture } from "./codex-named-capture";
 import { rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
 import crypto from "node:crypto";
 
@@ -457,7 +458,7 @@ export function refreshUnsentRawDelivery(
        base_bytes = @baseBytes, sealed_envelope_json = null, sealed_bytes = null,
        updated_at = @now
      where delivery_id = @deliveryId and state in ('pending','retry')
-       and attempt_count = 0`,
+       and sealed_envelope_json is null and attempt_count = 0`,
   ).run({ ...prepared, now: new Date().toISOString() }).changes > 0;
   };
   return db.inTransaction ? refresh() : db.transaction(refresh).immediate();
@@ -466,7 +467,7 @@ export function refreshUnsentRawDelivery(
 /** A paired span stays in the raw ledger but must not enter a new upload. */
 export function retirePairedSpanDelivery(db: Database.Database, spanId: string) {
   return db.prepare(
-    `delete from upload_outbox where delivery_id = ? and state in ('pending','retry')`,
+    `delete from upload_outbox where delivery_id = ? and sealed_envelope_json is null and state in ('pending','retry')`,
   ).run(ensureUuidEventId(spanId).id).changes;
 }
 
@@ -1194,6 +1195,7 @@ export class DeliveryOutbox {
          privacy_migration_version = 1, updated_at = @now
        where singleton = 1 and privacy_migration_version < 1`,
      ).run({ now: this.clock().toISOString() });
+    installCodexFrozenCompatibility(this.db);
    }
 
   /** Only dead NULL-lineage receipts ahead of the durable cursor block attestation. */
@@ -2247,6 +2249,46 @@ export class DeliveryOutbox {
     return { visited, bytes, enqueued, dead, skippedUploaded, quarantinedEvidence, complete, paused };
   }
 
+  /** Pin the admitted live result before a native reader consumes its
+   * cumulative counters as covered. This neither leases nor uploads, and
+   * leaves next_attempt_at (the 60-second transport hold) unchanged. */
+  freezeSessionCoverage(rawId: string): boolean {
+    const freeze = () => {
+      if (frozenCodexCapture(this.db,rawId)) return true;
+      const raw=this.db.prepare(`select payload_json as payload,uploaded_at as uploadedAt from buffered_events where id=?`)
+        .get(rawId) as {payload:string;uploadedAt:string|null}|undefined;
+      if(!raw)return false;
+      const captured=captureCodexModel(this.db,aiInteractionEventSchema.parse(JSON.parse(raw.payload)),rawId,false,false);
+      if(!codexHasUsage(captured)||isCaptureGap(captured))return false;
+      if(raw.uploadedAt)return true;
+      const row=this.db.prepare(`select delivery_id as deliveryId,base_envelope_json as base,
+        sealed_envelope_json as sealed,repo_hash as repo,branch_hash as branch from upload_outbox
+        where raw_id=? and raw_rowid=(select rowid from buffered_events where id=?)
+          and raw_created_at=(select created_at from buffered_events where id=?)
+          and raw_generation=(select privacy_generation from buffered_events where id=?) limit 1`)
+        .get(rawId,rawId,rawId,rawId) as {deliveryId:string;base:string;sealed:string|null;repo:string|null;branch:string|null}|undefined;
+      if(!row)throw new Error("codex_usage_coverage_delivery_pending");
+      if(row.sealed) {
+        const prior=aiWorkIngestEventSchema.parse(JSON.parse(row.sealed));
+        if(isCaptureGap(prior.event))return false;
+        rememberFrozenCodexCapture(this.db,rawId,row.deliveryId,row.sealed,captured);
+        return true;
+      }
+      const base=aiWorkIngestEventSchema.parse(JSON.parse(row.base));
+      const attribution=new SessionAttributionBatch(this.db,[{event:captured,repoHash:canonicalLinkage(row.repo)}]);
+      const sealed=sealOutboundEnvelope(attachFillOnlyLinkage({...base,event:{...captured,id:base.event.id}},
+        canonicalLinkage(row.repo),canonicalLinkage(row.branch),attribution,new Set()));
+      if(!sealed.ok)throw new Error("codex_usage_coverage_seal_refused");
+      const bytes=JSON.stringify(sealed.envelope);
+      if(Buffer.byteLength(bytes)>this.limits.maxItemBytes)throw new Error("codex_usage_coverage_item_oversize");
+      this.db.prepare(`update upload_outbox set sealed_envelope_json=?,sealed_bytes=?
+        where delivery_id=? and sealed_envelope_json is null`).run(bytes,Buffer.byteLength(bytes),row.deliveryId);
+      rememberFrozenCodexCapture(this.db,rawId,row.deliveryId,bytes,captured);
+      return true;
+    };
+    return this.db.inTransaction?freeze():this.db.transaction(freeze).immediate();
+  }
+
   lease(options: { maxRows?: number; maxBytes?: number; now?: Date; leaseId?: string } = {}): DeliveryLease {
     if (!this.enabled) return { leaseId: "", items: [], locallyDead: 0, blockedBy: "none" };
     const now = options.now ?? new Date();
@@ -2343,7 +2385,12 @@ export class DeliveryOutbox {
           locallyDead += this.deadActive(row.deliveryId, authoritativeReason, nowIso, disposedRawRowids);
           continue;
         }
-        let envelopeJson = row.sealedEnvelopeJson;
+        const namedWitness = frozenCodexDelivery(this.db,row);
+        let envelopeJson = row.sealedEnvelopeJson ??
+          namedWitness?.envelopeJson;
+        if (!row.sealedEnvelopeJson && envelopeJson) this.db.prepare(`update upload_outbox set
+          sealed_envelope_json=?,sealed_bytes=?,updated_at=? where delivery_id=? and sealed_envelope_json is null`)
+          .run(envelopeJson,Buffer.byteLength(envelopeJson),nowIso,row.deliveryId);
         if (!envelopeJson) {
           const parsed = unsealed.get(row.deliveryId);
           if (!parsed) {
@@ -2413,6 +2460,7 @@ export class DeliveryOutbox {
                where delivery_id = @deliveryId and sealed_envelope_json is null`,
             )
             .run({ deliveryId: row.deliveryId, envelopeJson, envelopeBytes, now: nowIso });
+          rememberFrozenCodexCapture(this.db,row.rawId ?? parsed.event.id,row.deliveryId,envelopeJson,captured);
         }
         // Older builds may already have sealed an evidence-marked item. The
         // sealed copy is not trusted merely because it predates this gate.
@@ -2446,12 +2494,25 @@ export class DeliveryOutbox {
         }
         let sealedOriginGap = false;
         if (row.sealedEnvelopeJson && codexHasUsage(outboundEnvelope.event)) {
-          if (!row.rawId || !row.rawPayloadJson) {
+          if (namedWitness?.envelopeJson === envelopeJson) {
+            // Complete lineage and frozen bytes identify the admitted result,
+            // even if raw retention has since removed its diagnostic row.
+          } else if (!row.rawId || !row.rawPayloadJson) {
             sealedOriginGap = true;
           } else {
             try {
               const rawLineage = aiInteractionEventSchema.parse(JSON.parse(row.rawPayloadJson));
-              if (isCaptureGap(rawLineage)) {
+              const frozen = frozenCodexCapture(this.db,row.rawId);
+              if (frozen?.deliveryId === row.deliveryId && frozen.envelopeJson === envelopeJson) {
+                // This exact native result was validated when these bytes
+                // froze. Later evidence governs new captures, not this ID.
+              } else if (!hasCaptureGapDecision(this.db, {
+                rawRowid: row.rawRowid!,rawId: row.rawId,
+                rawCreatedAt: row.rawCreatedAt!,rawGeneration: row.rawGeneration,
+              }) && legacyFrozenNativeCapture(rawLineage,outboundEnvelope.event)) {
+                rememberFrozenCodexCapture(this.db,row.rawId,row.deliveryId,envelopeJson,
+                  {...outboundEnvelope.event,metadata:{...outboundEnvelope.event.metadata,modelCaptureSource:"legacy_native_frozen"}});
+              } else if (isCaptureGap(rawLineage)) {
                 rememberCaptureGap(this.db, row.rawId,
                   String(rawLineage.metadata.modelGapReason ?? "legacy_capture_gap"));
                 sealedOriginGap = true;
@@ -2460,6 +2521,7 @@ export class DeliveryOutbox {
                 sealedOriginGap = isCaptureGap(validated) ||
                   typeof validated.model !== "string" || !validated.model.trim() ||
                   validated.model !== outboundEnvelope.event.model;
+                if (!sealedOriginGap) rememberFrozenCodexCapture(this.db,row.rawId,row.deliveryId,envelopeJson,validated);
               } else {
                 sealedOriginGap = true;
               }

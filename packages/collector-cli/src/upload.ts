@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
-import { captureCodexModel, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { frozenCodexCapture, rememberFrozenCodexCapture } from "./codex-named-capture";
 
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
 import {
@@ -74,8 +75,11 @@ export function buildIngestBatch(
       suppressedFields: row.suppressedFields,
     });
     if (!sealed.ok) continue;
+    const frozen = frozenCodexCapture(buffer.database,row.id);
+    const envelope = frozen ? JSON.parse(frozen.envelopeJson) : sealed.envelope;
+    rememberFrozenCodexCapture(buffer.database,row.id,envelope.event.id,JSON.stringify(envelope),captured);
     rows.push(row);
-    events.push(sealed.envelope);
+    events.push(envelope);
   }
   if (rows.length === 0) return { batch: null, rows };
   const batch = aiWorkIngestBatchSchema.parse({

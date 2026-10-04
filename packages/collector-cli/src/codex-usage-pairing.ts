@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { frozenCodexCapture } from "./codex-named-capture";
 
 import { estimateCostUsd } from "../../shared/src/index";
 import { refreshUnsentRawDelivery, retirePairedSpanDelivery } from "./outbox";
@@ -91,6 +92,7 @@ type UsageRow = {
   accountHash: string | null;
   workspaceId: string | null;
   deviceId: string | null;
+  installationEpochId: string | null;
   payloadJson: string;
   usagePairedEventId: string | null;
 };
@@ -132,6 +134,9 @@ function isUsageRow(row: UsageRow) {
 
 function compatible(log: UsageRow, span: UsageRow, logShape: Shape, spanShape: Shape) {
   if (logShape.kind !== "log" || spanShape.kind !== "span") return false;
+  if (!log.workspaceId || !log.deviceId || !log.installationEpochId ||
+      log.workspaceId !== span.workspaceId || log.deviceId !== span.deviceId ||
+      log.installationEpochId !== span.installationEpochId) return false;
   if (log.workspaceId && span.workspaceId && log.workspaceId !== span.workspaceId) return false;
   if (log.deviceId && span.deviceId && log.deviceId !== span.deviceId) return false;
   if (log.cacheReadTokens !== null && span.cacheReadTokens !== null &&
@@ -158,7 +163,7 @@ const ROW_COLUMNS = `rowid, id, source, event_type as eventType,
   cache_read_tokens as cacheReadTokens,
   cache_creation_tokens as cacheCreationTokens, cost_usd as costUsd,
   cost_kind as costKind, account_hash as accountHash,
-  workspace_id as workspaceId, device_id as deviceId, payload_json as payloadJson,
+  workspace_id as workspaceId, device_id as deviceId, installation_epoch_id as installationEpochId, payload_json as payloadJson,
   usage_paired_event_id as usagePairedEventId`;
 
 function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
@@ -217,6 +222,20 @@ function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
 export type CodexUsagePair = { logId: string; spanId: string };
 
 function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): CodexUsagePair {
+  const frozenSpan = frozenCodexCapture(db,span.id);
+  if (frozenSpan && frozenSpan.event.inputTokens === span.inputTokens &&
+      frozenSpan.event.outputTokens === span.outputTokens) {
+    // Ownership is accounting history. A later exact SSE supplies native
+    // evidence but cannot retire the already frozen named response span.
+    db.prepare(`update buffered_events set usage_paired_event_id=? where id=?
+      and usage_paired_event_id is null`).run(log.id,span.id);
+    db.prepare(`update buffered_events set usage_paired_event_id=?,usage_duplicate_reason=?,
+      event_type='otel_span',input_tokens=null,output_tokens=null,cache_read_tokens=null,
+      cache_creation_tokens=null,cost_usd=null where id=? and usage_paired_event_id is null`)
+      .run(span.id,CODEX_USAGE_DUPLICATE_REASON,log.id);
+    retirePairedSpanDelivery(db,log.id);
+    return {logId:log.id,spanId:span.id};
+  }
   const cacheReadTokens = log.cacheReadTokens ?? span.cacheReadTokens;
   const cacheCreationTokens = log.cacheCreationTokens ?? span.cacheCreationTokens;
   let costUsd = log.costUsd;

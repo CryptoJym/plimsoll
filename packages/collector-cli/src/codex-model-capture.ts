@@ -8,6 +8,7 @@ import {
 } from "../../shared/src/index";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { codexSpanRolloutDecision, hasDurableCaptureGap, isCodexResponseSpan } from "./codex-span-rollout-pairing";
+import { frozenCodexCapture, legacyNativeAcknowledgementsEligible } from "./codex-named-capture";
 
 export const CODEX_MODEL_WAIT_MS = 60_000;
 const WINDOW_MS = 10 * 60_000;
@@ -99,6 +100,23 @@ function accountConflict(event: AiInteractionEvent): boolean {
     event.actorId && account &&
       event.actorId !== account && event.actorId !== providerAccountKey(account),
   );
+}
+
+/** A pre-witness binary can freeze a producer's explicit model, or a guess.
+ * Only self-contained native provenance can establish the former without
+ * re-evaluating later peers. A derived/bare model never qualifies here. */
+export function legacyFrozenNativeCapture(raw: AiInteractionEvent, frozen: AiInteractionEvent): boolean {
+  if (raw.source !== "codex" || isCaptureGap(raw) || raw.metadata.modelCaptureSource ||
+      raw.metadata.modelEvidenceConflict === true || accountConflict(raw) ||
+      nativeModels(raw).size > 1 || modelAttributeConflict(raw) || !sameCounts(raw,frozen) ||
+      (raw.costUsd !== undefined && raw.costUsd !== frozen.costUsd)) return false;
+  const reported = nativeModel(raw);
+  const nativeRequest = raw.metadata.otelEventName === "codex.sse_event" ||
+    (isCodexResponseSpan(raw) && text(raw.metadata.traceId));
+  const nativeTurn = raw.metadata.usageSource === "rollout" && trustedSession(raw) &&
+    text(raw.metadata.codexTurnId) && text(raw.model);
+  return Boolean(frozen.model && ((nativeRequest && reported === frozen.model) ||
+    (nativeTurn && raw.model === frozen.model)));
 }
 export function codexMisfiledUnderClaude(event: AiInteractionEvent): boolean {
   return (
@@ -441,6 +459,7 @@ export function captureCodexModel(
         rawId: string;
         rawCreatedAt: string;
         rawGeneration: string | null;
+        uploadedAt: string | null;
       }
     | undefined;
   try {
@@ -448,7 +467,7 @@ export function captureCodexModel(
       .prepare(
         `select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
       privacy_generation as rawGeneration, workspace_id as workspace, device_id as device,
-      installation_epoch_id as epoch, usage_paired_event_id as pairedId
+      installation_epoch_id as epoch, usage_paired_event_id as pairedId,uploaded_at as uploadedAt
       from buffered_events where id=?`,
       )
       .get(rawId) as typeof row;
@@ -463,6 +482,10 @@ export function captureCodexModel(
       ...event,
       metadata: { ...event.metadata, installationEpochId: row.epoch },
       };
+  // An earlier validated native capture is an immutable accounting result.
+  // Its raw attributes remain available to contradict OTHER new captures.
+  const frozen = row && frozenCodexCapture(db,rawId);
+  if (frozen) return frozen.event;
   const gap = (reason: string) => {
     const result = codexModelGap(db, event, reason, recordDiagnostics);
     if (persistDecision && row && !db.readonly) {
@@ -480,6 +503,27 @@ export function captureCodexModel(
   };
   if (row && hasCaptureGapDecision(db, row))
     return gap("persisted_capture_gap");
+  // A native retry frozen by an older binary is final even before this
+  // binary's first lease. Readers must not consume a rollout against a
+  // mutable re-evaluation of that same, already-frozen request.
+  if (row && db.prepare("select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) {
+    const prior = db.prepare(`select delivery_id as id,sealed_envelope_json as bytes from upload_outbox
+      where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ?
+        and sealed_envelope_json is not null limit 1`).get(row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration) as
+      {id:string;bytes:string}|undefined;
+    if(prior)try {
+      const previous=JSON.parse(prior.bytes).event as AiInteractionEvent;
+      if(legacyFrozenNativeCapture(event,previous))return {...previous,
+        metadata:{...previous.metadata,modelCaptureSource:"legacy_native_frozen"}};
+    }catch { /* Malformed frozen bytes cannot attest a native capture. */ }
+  }
+  // Released .47/.48 readers billed explicit native SSE models and did not
+  // write capture gaps. A ledger that already had a capture-contract schema
+  // is deliberately ineligible for this inference: an ACK may be for a gap.
+  // Bare/proximity models and conflicting native attributes never qualify.
+  if (row?.uploadedAt && event.metadata.otelEventName === "codex.sse_event" &&
+      legacyNativeAcknowledgementsEligible(db) && legacyFrozenNativeCapture(event,event))
+    return capture(event,[{event,pairedId:null}],"legacy_native_acknowledged");
   if (nativeModels(event).size > 1 || modelAttributeConflict(event) || accountConflict(event) ||
     event.metadata.modelEvidenceConflict === true)
     return gap("conflicting_model_attributes");
@@ -516,6 +560,13 @@ export function captureCodexModel(
     event.metadata.otelEventName === "codex.sse_event" &&
     nativeModels(event).size === 1 &&
     !modelAttributeConflict(event);
+  const turn = text(event.metadata.codexTurnId) ?? text(event.metadata["turn.id"]) ?? text(event.metadata.turn_id);
+  // A rollout without a native turn cannot use a trace-free neighbouring
+  // response as provenance. Reject it before any bounded peer scan. This is
+  // common in old/model-less history and keeps writer work independent of
+  // the number of already-imported diagnostic rows.
+  if (event.metadata.usageSource === "rollout" && !turn && !directTraceId)
+    return gap("model_evidence_missing");
   // A populated model is not provenance. In particular, 0.7.48 could have
   // written a nearest model into this payload. Only the native pair, trace or
   // local-turn branches below may promote it to a billable event; an event
@@ -675,10 +726,6 @@ export function captureCodexModel(
   // no trace boundary to join, so only this row's own model can qualify it.
   if (nativeSseEvent && !traceId)
     return capture(event, [{ event, pairedId: null }], "native_sse_event");
-  const turn =
-    text(event.metadata.codexTurnId) ??
-    text(event.metadata["turn.id"]) ??
-    text(event.metadata.turn_id);
   const session = trustedSession(event);
   const local =
     session && turn

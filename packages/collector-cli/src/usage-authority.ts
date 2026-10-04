@@ -35,7 +35,7 @@ export function rowCanOwnSessionUsage(db: Database.Database, rawId: string) {
 
 export function hasSessionUsageAuthority(
   db: Database.Database, source: string, sessionId: string, kind: "live" | "tailer",
-  excludeRowids: number[] = [], probeRows?: number,
+  excludeRowids: number[] = [], probeRows?: number, commitCoverage?: (rawId: string) => boolean,
 ): boolean | "undecided" {
   const candidates = probeRows === undefined ? "buffered_events" : `(select rowid,* from buffered_events
     where source=@source and session_id=@session order by observed_at desc limit @probe)`;
@@ -50,7 +50,7 @@ export function hasSessionUsageAuthority(
       and (@cursorAt is null or e.observed_at<@cursorAt or (e.observed_at=@cursorAt and e.id<@cursorId))
     order by e.observed_at desc,e.id desc limit 128`);
   if (hasAdmittedWitness(db,query,source,{source,session:sessionId,excluded:JSON.stringify(excludeRowids),
-    ...(probeRows === undefined ? {} : {probe:probeRows})})) return true;
+    ...(probeRows === undefined ? {} : {probe:probeRows})},commitCoverage)) return true;
   if (probeRows !== undefined) {
     const { n } = db.prepare(`select count(*) as n from (select 1 from buffered_events
       where source=? and session_id=? order by observed_at desc limit ?)`)
@@ -60,13 +60,15 @@ export function hasSessionUsageAuthority(
   return false;
 }
 
-function hasAdmittedWitness(db: Database.Database,query: Database.Statement,source: string,parameters: Record<string,unknown>) {
+function hasAdmittedWitness(db: Database.Database,query: Database.Statement,source: string,parameters: Record<string,unknown>,
+  commitCoverage?: (rawId: string) => boolean) {
   let cursorAt: string | null = null, cursorId: string | null = null;
   // Finish each bounded SQL page before capture reads schema/lineage. An
   // active SQLite iterator would prevent capture's schema-cookie pragma.
   while (true) {
     const rows = query.all({...parameters,cursorAt,cursorId}) as Array<{id:string;at:string}>;
-    for (const row of rows) if (source !== "codex" || rowCanOwnSessionUsage(db,row.id)) return true;
+    for (const row of rows) if ((source !== "codex" || rowCanOwnSessionUsage(db,row.id)) &&
+      (!commitCoverage || commitCoverage(row.id))) return true;
     if (rows.length<128) break;
     cursorAt = rows[rows.length-1]!.at; cursorId = rows[rows.length-1]!.id;
   }

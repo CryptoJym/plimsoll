@@ -1,4 +1,5 @@
 import { captureCodexModel, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { frozenCodexCapture, rememberFrozenCodexCapture } from "./codex-named-capture";
 import { isCodexResponseSpan, rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
 import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
@@ -984,10 +985,11 @@ export async function runWorkspaceHistoryUpload(
           if (Number.isFinite(waitMs) && waitMs > 0) await sleep(waitMs);
         }
         preparedRow.event = captureCodexModel(
-          codexHasUsage(preparedRow.event) ? captureDatabase() : ledger,
+          codexHasUsage(preparedRow.event) && !options.dryRun ? captureDatabase() : ledger,
           preparedRow.event,
           row.id,
-          true,
+          !options.dryRun,
+          !options.dryRun,
         );
       }
       const normalized = preparedRow.ok
@@ -997,8 +999,19 @@ export async function runWorkspaceHistoryUpload(
         skipQueue.push({ rowid: row.rowid, reason: normalized.reason });
         continue;
       }
+      if (preparedRow.ok && preparedRow.event && codexHasUsage(preparedRow.event)) {
+        const capturedDb = captureDatabase();
+        const frozen = frozenCodexCapture(capturedDb,row.id);
+        if (frozen) {
+          normalized.envelope = JSON.parse(frozen.envelopeJson);
+          normalized.bytes = Buffer.byteLength(frozen.envelopeJson);
+          normalized.idDerived = normalized.envelope.event.id !== row.id;
+        }
+        if (!options.dryRun) rememberFrozenCodexCapture(capturedDb,row.id,normalized.envelope.event.id,
+          JSON.stringify(normalized.envelope),preparedRow.event);
+      }
       eligibleEvents += 1;
-      if (isCodexResponseSpan(normalized.envelope.event)) {
+      if (!options.dryRun && isCodexResponseSpan(normalized.envelope.event)) {
         rememberCodexSpanEmission(captureDatabase(), row.id, normalized.envelope.event);
       }
       carry.push({

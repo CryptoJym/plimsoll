@@ -67,7 +67,7 @@ import {
   maintenanceCandidateHash,
   type MaintenanceProgressStage,
 } from "./maintenance-progress";
-import { AccountBindingHistory, CodexAccountKeyCache, readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
+import { AccountBindingHistory, CodexAccountKeyCache, readLocalIdentities, type LocalIdentity } from "./local-identity";
 import { codexPlanLimitWindows, PlanLimitEmitter, type PlanLimitWindow } from "./plan-limit-observation";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import {
@@ -1655,7 +1655,7 @@ export class RolloutTailer {
   }
 
   private sessionHasNonRolloutTokens(sessionId: string) {
-    return this.buffer.sessionUsageAuthority("codex", sessionId) === "live";
+    return this.buffer.commitCodexSessionCoverage(sessionId);
   }
 
   private initialParserState(file: string): RolloutParserState {

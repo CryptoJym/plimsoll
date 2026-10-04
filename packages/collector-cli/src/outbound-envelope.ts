@@ -45,6 +45,8 @@ const LOCAL_ONLY_CAPTURE_METADATA_KEYS = new Set([
   "modelGapReason",
   "accountIdentityState",
   "codexTurnId",
+  "sessionLinkBasis",
+  "usageDuplicateReason",
 ]);
 
 type MetadataOutcome =

@@ -23,7 +23,6 @@ import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import {
-  CODEX_USAGE_DUPLICATE_REASON,
   buildCodexUsagePairingIndexes,
   ensureCodexUsagePairingSchema,
   pairCodexUsageEvent,
@@ -2731,10 +2730,10 @@ export class LocalEventBuffer {
       this.budgetAttemptedRows += 1;
       const usagePair = pairCodexUsageEvent(this.db, event.id);
       const rolloutPair = event.source === "codex" ? pairCodexSpanRolloutEvent(this.db, event.id) : null;
-      const pairedLogPayload = usagePair?.logId === event.id
-        ? (this.db.prepare(`select payload_json as payloadJson from buffered_events where id = ?`)
-            .get(event.id) as { payloadJson: string }).payloadJson
-        : payloadJson;
+      const pairedRaw = usagePair || rolloutPair
+        ? this.db.prepare(`select payload_json as payloadJson,usage_duplicate_reason as duplicate
+            from buffered_events where id=?`).get(event.id) as {payloadJson:string;duplicate:string|null}
+        : {payloadJson,duplicate:null};
       if (repoContextId) {
         this.db.prepare(
           `insert into repo_context_event_links
@@ -2758,15 +2757,14 @@ export class LocalEventBuffer {
         dataMode: event.dataMode,
         createdAt,
         uploadedAt: null,
-        payloadJson: pairedLogPayload,
+        payloadJson: pairedRaw.payloadJson,
         suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         repoHash,
         branchHash,
         workspaceId: this.workspaceId,
         privacyGeneration,
         privacyDisposition: null,
-        usageDuplicateReason: rolloutPair?.duplicateId === event.id
-          ? "codex_span_rollout_duplicate" : usagePair?.spanId === event.id ? CODEX_USAGE_DUPLICATE_REASON : null,
+        usageDuplicateReason: pairedRaw.duplicate,
         deviceId: this.deviceId,
       });
       if (repoContextConflict && repoContextId && existingRepoHash && resolvedRepoContext.repoHash) {
@@ -2878,6 +2876,14 @@ export class LocalEventBuffer {
     const live = hasSessionUsageAuthority(this.db, source, sessionId, "live", excludeRowids) === true;
     const tailer = !live && hasSessionUsageAuthority(this.db, source, sessionId, "tailer", excludeRowids) === true;
     return live ? "live" : tailer ? "tailer" : null;
+  }
+
+  /** Before consuming native cumulative bytes as covered, retain the native
+   * accounting result on which that destructive deduplication depends. The
+   * transport's grace hold remains; only its model/bytes become immutable. */
+  commitCodexSessionCoverage(sessionId: string) {
+    return hasSessionUsageAuthority(this.db,"codex",sessionId,"live",[],undefined,
+      rawId => this.delivery.freezeSessionCoverage(rawId)) === true;
   }
 
   append(
