@@ -1,0 +1,5 @@
+{
+  "finding": "R9-P1-07",
+  "operations": ["sse-valid", "expire-retry", "ack", "rollout-turn"],
+  "intent": "a paid SSE with absent cache must not hide the native twin's explicitly reported cache zero"
+}

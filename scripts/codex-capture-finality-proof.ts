@@ -1,3 +1,4 @@
+import { rowHasAdmittedUsage } from "../packages/collector-cli/src/usage-authority";
 import assert from 'node:assert/strict';
 import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
 import { LocalEventBuffer } from '../packages/collector-cli/src/buffer';
@@ -53,7 +54,8 @@ async function main(){try{
    const ordered=f.b.database.prepare("select id from buffered_events where source='codex' and session_id=? order by observed_at desc,id desc").all(SESSION);
    assert.equal(ordered[129].id,good.id);assert.equal(ordered.slice(0,128).some((r:any)=>r.id===good.id),false);
    const rawBefore=f.b.database.prepare('select payload_json from buffered_events order by rowid').all();
-   const authority=f.b.sessionUsageAuthority('codex',SESSION);assert.equal(authority,'live');
+   const authority=f.b.sessionUsageAuthority('codex',SESSION);assert.equal(authority,null,'one native response cannot cover a session');
+   const witness=rowHasAdmittedUsage(f.b.database,good.id);assert.equal(witness,true);
    assert.deepEqual(f.b.database.prepare('select payload_json from buffered_events order by rowid').all(),rawBefore);
    const hasDecisions=Boolean(f.b.database.prepare("select 1 from sqlite_master where name='codex_capture_decisions'").get());
    const premature=hasDecisions?f.b.database.prepare('select count(*) as n from codex_capture_decisions').get().n>0:false;assert.equal(premature,false);

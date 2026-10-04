@@ -1,0 +1,10 @@
+{
+  "finding": "R9-P0-04",
+  "seed": 1,
+  "operations": [
+    "sse-zero",
+    "neighbour-turn",
+    "upgrade-047"
+  ],
+  "intent": "a released producer after native capture cannot rebuild its twin as named usage"
+}

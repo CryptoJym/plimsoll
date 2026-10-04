@@ -1,0 +1,8 @@
+{
+  "finding": "R9-P0-05",
+  "operations": [
+    "cache-only-turn"
+  ],
+  "intent": "a cumulative cache-only marginal still has known native provenance and cannot be lost",
+  "shrink": "manually removed third-turn; cache-only-turn alone constructs the cumulative prefix"
+}

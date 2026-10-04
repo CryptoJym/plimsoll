@@ -1,0 +1,10 @@
+{
+  "finding": "R9-P0-06",
+  "operations": [
+    "sse-partial-twin",
+    "rollout-turn",
+    "sse-valid",
+    "expire-retry"
+  ],
+  "intent": "late complete evidence cannot pay again after complementary pieces of one response have captured"
+}

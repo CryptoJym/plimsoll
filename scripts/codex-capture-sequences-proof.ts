@@ -5,6 +5,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { buildIngestBatch } from "../packages/collector-cli/src/upload";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline, sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
 import { deriveCaptureRootIdentity } from "../packages/collector-cli/src/capture-root-inventory";
@@ -12,7 +13,7 @@ import { planCaptureHistory, applyCaptureHistory } from "../packages/collector-c
 import { createProofCompletion } from "./lib/proof-completion";
 import { proofTempRoot, withReader } from "./lib/legacy-reader";
 
-/** One session, one economic response, two independent diagnostic signals.
+/** Multiple economic responses, cumulative turns and independent diagnostics.
  * The oracle knows the PRODUCER facts and first frozen wire observations. It
  * never calls capture, pairing or authority helpers to calculate expectations.
  * A lease is a potentially accepted request; retransmission of the same ID is
@@ -22,9 +23,13 @@ import { proofTempRoot, withReader } from "./lib/legacy-reader";
 const OPS = ["sse-valid", "sse-invalid", "sse-conflicting", "trace-sol", "trace-astra", "span",
   "rollout-turn", "rollout-no-turn", "neighbour-turn", "history-turn", "history-no-turn",
   "lease", "ack", "expire-retry", "retry", "remote-terminal", "replay", "restamp", "gap-seal",
-  "stateless-build", "reopen", "rollback-047", "rollback-048", "upgrade-047", "upgrade-048"] as const;
+  "stateless-build", "reopen", "rollback-047", "rollback-048", "upgrade-047", "upgrade-048", "sse-zero", "sse-partial", "sse-cache-cost",
+  "second-turn", "third-turn", "history-multiple", "cache-only-turn", "sse-partial-twin", "sse-zero-complement-twin"] as const;
 type Op = typeof OPS[number];
 type Version = "head" | "0.7.47" | "0.7.48";
+const FIELDS = ["inputTokens","outputTokens","cacheReadTokens","cacheCreationTokens","costUsd"] as const;
+type Field = typeof FIELDS[number];
+type Producer = {event:any;response:string;kind:"trace"|"turn"|"invalid"};
 type Frozen = { id: string; rawId: string; bytes: string; event: any; named: boolean; gap: boolean };
 const MODEL = "gpt-6.1-sol", OTHER = "gpt-6-astra";
 const SESSION = "22222222-2222-4222-8222-222222222222";
@@ -54,12 +59,13 @@ function sequence(seed: number): Op[] {
   return result;
 }
 const attribute = (key: string,value: string|number) => ({key,value:typeof value==="number"?{intValue:String(value)}:{stringValue:value}});
-function log(model: string,trace: string,at: number,input?: number,output?: number,contradict=false) {
+function log(model: string,trace: string,at: number,input?: number,output?: number,contradict=false,cache?: number) {
   return explodeOtlpPayload({resourceLogs:[{resource:{attributes:[attribute("service.name","codex-app-server")]},
     scopeLogs:[{logRecords:[{timeUnixNano:String(BigInt(at)*1000000n),traceId:trace,
       attributes:[attribute("event.name","codex.sse_event"),attribute("conversation.id",SESSION),attribute("model",model),
         ...(input===undefined?[]:[attribute("input_token_count",input)]),
         ...(output===undefined?[]:[attribute("output_token_count",output)]),
+        ...(cache===undefined?[]:[attribute("cached_input_token_count",cache)]),
         ...(contradict?[attribute("gen_ai.request.model",OTHER)]:[])]}]}]}]},
     {source:"codex",transportPath:"/v1/logs"}).events[0]!.event;
 }
@@ -72,7 +78,6 @@ function responseSpan(trace: string) {
 }
 function financial(e: any) { return [e.inputTokens,e.outputTokens,e.cacheReadTokens,e.cacheCreationTokens,e.costUsd].some(v=>v!==undefined); }
 function gap(e: any) { return e.metadata?.usageSource==="capture_gap" || e.metadata?.captureGap===true; }
-function unit(e: any) { return e.inputTokens===19 && e.outputTokens===2; }
 function hasTable(db: any,name: string) { return Boolean(db.prepare("select 1 from sqlite_master where type='table' and name=?").get(name)); }
 function invariant(ok: unknown,tag: string,detail: unknown) { assert.ok(ok,tag+": "+JSON.stringify(detail)); }
 
@@ -82,7 +87,11 @@ class World {
   trace = "a".repeat(32); gapTrace="c".repeat(32);
   now = new Date(AT+2000); b: any; version: Version="head";
   frozen = new Map<string,Frozen>(); gapRaw = new Set<string>();
-  nativeKinds = new Map<string,"trace"|"turn"|"invalid">();
+  producers = new Map<string,Producer>();
+  traceModels = new Map<string,Set<string>>();
+  expected = new Map<string,Partial<Record<Field,number>>>();
+  knownNative = new Map<string,Partial<Record<Field,number>>>();
+  nativeTurns = 1; historyTurns = 0;
   nativeModels = new Set<string>();
   // The first complete file response establishes its counter/turn knowledge.
   // Later context-only sightings have no new marginal counters to deliver.
@@ -98,6 +107,35 @@ class World {
   }
   head() { if(this.version!=="head") this.open("head"); }
   advance(ms=123_000) { this.now=new Date(this.now.getTime()+ms); }
+  register(e:any,response:string,kind:Producer["kind"]) {
+    this.producers.set(e.id,{event:e,response,kind});
+    const amounts=this.expected.get(response)??{};
+    for(const k of FIELDS)if(e[k]!==undefined)amounts[k]=Math.max(amounts[k]??0,e[k]);
+    this.expected.set(response,amounts);
+  }
+  fact(trace:string,model:string) {
+    const models=this.traceModels.get(trace)??new Set<string>();models.add(model);this.traceModels.set(trace,models);
+  }
+  eligible(p:Producer,e:any) {
+    if(p.kind==="invalid")return false;
+    if(p.kind==="turn")return e.model===p.event.model;
+    const models=this.traceModels.get(p.event.metadata.traceId);
+    return models?.size===1&&models.has(e.model);
+  }
+  nativeProvenance(e:any,rawId:string) {
+    const p=this.producers.get(rawId);
+    invariant(p&&this.eligible(p,e),"I1_NATIVE_FACTS",{rawId,event:e,producer:p});
+    for(const k of FIELDS)if(e[k]!==undefined) {
+      invariant(p!.event[k]!==undefined&&e[k]>=0&&e[k]<=p!.event[k],"I1_NATIVE_FINANCIAL_FIELD",{field:k,event:e,producer:p});
+    }
+  }
+  sums(response:string) {
+    const result:Partial<Record<Field,number>>={};
+    for(const f of this.frozen.values())if(f.named&&this.producers.get(f.rawId)?.response===response)
+      for(const k of FIELDS)if(f.event[k]!==undefined)result[k]=(result[k]??0)+f.event[k];
+    return result;
+  }
+
   observe(lease: any,transportLease=true) {
     for(const item of lease.items) {
       const e=item.envelope.event, previous=this.frozen.get(item.deliveryId);
@@ -107,14 +145,11 @@ class World {
         this.gapRaw.add(item.rawId);
       } else if(financial(e)) {
         invariant(typeof e.model==="string"&&!!e.model,"I1_MODEL_MISSING",e);
-        if(!previous && unit(e)) {
-          const nativeTurn=e.metadata.usageSource==="rollout" && this.fileHasTurn;
-          invariant(nativeTurn || (this.nativeModels.size===1 && this.nativeModels.has(e.model)),"I1_NATIVE_FACTS",e);
-        }
+        if(!previous)this.nativeProvenance(e,item.rawId);
       }
       if(this.gapRaw.has(item.rawId)) invariant(gap(e)||!financial(e),"I3_GAP_REGAINS_USAGE",e);
       if(!previous) this.frozen.set(item.deliveryId,{id:item.deliveryId,rawId:item.rawId,bytes:item.envelopeJson,event:e,
-        named:!gap(e)&&unit(e),gap:gap(e)});
+        named:!gap(e)&&financial(e),gap:gap(e)});
     }
     if(transportLease)this.currentLease=lease;
   }
@@ -130,6 +165,8 @@ class World {
         row(5000,"event_msg",{type:"token_count",info:{total_token_usage:{input_tokens:0,output_tokens:0,cached_input_tokens:0}}}),
         row(6000,"event_msg",{type:"token_count",info:{total_token_usage:{input_tokens:19,output_tokens:2,cached_input_tokens:0}}})].join("\n")+"\n");
       this.fileWritten=true;this.fileHasTurn=withTurn;
+      this.register({id:deterministicEventId(["codex-rollout",SESSION,"1"]),model:MODEL,
+        inputTokens:19,outputTokens:2,cacheReadTokens:0,metadata:{usageSource:"rollout"}},"response-1",withTurn?"turn":"invalid");
     }
   }
   async tail(withTurn: boolean) {
@@ -137,7 +174,10 @@ class World {
     const t=new RolloutTailer(this.b,this.sessions,()=>[]);
     try { const result=await t.scan({scope:"full",now:this.now});
       invariant(result.parseErrors===0,"PRODUCER_PARSE",result);
-      if(this.fileHasTurn) this.nativeObserved=true;
+      this.nativeObserved=true;
+      for(const p of this.producers.values())if(p.kind==="turn")
+        this.knownNative.set(p.response,Object.fromEntries(FIELDS.filter(k=>p.event[k]!==undefined).map(k=>[k,p.event[k]])));
+
       pairingChecks++;
     } finally {t.close();}
   }
@@ -145,7 +185,7 @@ class World {
     await this.nativeFile(withTurn);
     if(this.now.getTime()<AT+64_000)this.now=new Date(AT+64_000);
     if(!this.rootIdentity) {
-      const db=this.b.database;
+      const db=this.b.database;this.historyTurns=this.nativeTurns;
       this.rootIdentity={...deriveCaptureRootIdentity("sequence","codex",this.sessions),directory:this.sessions,source:"codex",
         installationEpochId:this.b.workspaceBinding().currentInstallationEpochId};
       const start=beginAutomaticCaptureBaseline(db,"codex",{startedAt:new Date(AT-2000).toISOString(),filesDiscovered:0});
@@ -161,9 +201,9 @@ class World {
     const before=financialState();
     try {
       const plan=await planCaptureHistory(this.b.database,this.rootIdentity);
-      invariant(plan.missingRows<=1,"HISTORY_PREVIEW",plan);
+      invariant(plan.missingRows<=this.nativeTurns,"HISTORY_PREVIEW",plan);
       const receipt=await applyCaptureHistory(this.b,this.rootIdentity);
-      invariant(receipt.importedRows<=1,"HISTORY_IMPORT",receipt);historyImports+=receipt.importedRows;
+      invariant(receipt.importedRows<=this.nativeTurns,"HISTORY_IMPORT",receipt);historyImports+=receipt.importedRows;
     } catch(error) {
       // A paired native row can retain its original payload while its ledger
       // counters are suppressed. The public importer refuses that mismatch.
@@ -171,38 +211,81 @@ class World {
       if(String(error)!=="Error: capture_history_refused:existing_event_conflict")throw error;
       invariant(financialState()===before,"HISTORY_REFUSAL_CHANGED_USAGE",String(error));historyRefusals++;
     }
-    if(this.fileHasTurn)this.nativeObserved=true;
+    // A fenced history snapshot may exclude counters appended later. Its
+    // oracle marks only responses inside the native prefix sealed at creation.
+    for(const p of this.producers.values())if(p.kind==="turn"&&Number(p.response.slice(9))<=this.historyTurns)
+      this.knownNative.set(p.response,Object.fromEntries(FIELDS.filter(k=>p.event[k]!==undefined).map(k=>[k,p.event[k]])));
+
   }
   async operate(op: Op) {
     if(["sse-valid","sse-invalid","sse-conflicting","trace-sol","trace-astra","span","rollout-turn","rollout-no-turn",
       "neighbour-turn","history-turn","history-no-turn","gap-seal","stateless-build","upgrade-047","upgrade-048"].includes(op)) this.head();
+    if(["sse-zero","sse-partial","sse-cache-cost","second-turn","third-turn","history-multiple","cache-only-turn","sse-partial-twin","sse-zero-complement-twin"].includes(op))this.head();
     switch(op) {
+      case "sse-zero-complement-twin": {
+        const e=log(MODEL,this.trace,AT+6000,19,2,false,0);this.register(e,"response-1","trace");
+        if(this.b.append(e)){this.nativeModels.add(MODEL);this.fact(this.trace,MODEL);}break;
+      }
+      case "sse-partial-twin": {
+        const e=log(MODEL,this.trace,AT+6000,19);this.register(e,"response-1","trace");
+        if(this.b.append(e)){this.nativeModels.add(MODEL);this.fact(this.trace,MODEL);}break;
+      }
       case "sse-valid": {
-        const e=log(MODEL,this.trace,AT+6000,19,2);this.nativeKinds.set(e.id,"trace");
-        const accepted=this.b.append(e);if(accepted)this.nativeModels.add(MODEL);break;
+        const e=log(MODEL,this.trace,AT+6000,19,2);this.register(e,"response-1","trace");
+        const accepted=this.b.append(e);if(accepted){this.nativeModels.add(MODEL);this.fact(this.trace,MODEL);}break;
       }
       case "sse-invalid": case "sse-conflicting": {
         // Two explicit model aliases are permanently contradictory native
         // facts, even after a gap ACK. Counters describe a diagnostic signal.
         const e=log(MODEL,op==="sse-invalid"?this.gapTrace:this.trace,AT+7000,7,1,true);
-        this.nativeKinds.set(e.id,"invalid");const accepted=this.b.append(e);
-        if(accepted&&op==="sse-conflicting"){this.nativeModels.add(MODEL);this.nativeModels.add(OTHER);}break;
+        this.register(e,op==="sse-invalid"?"diagnostic-7-1":"diagnostic-conflict","invalid");const accepted=this.b.append(e);
+        if(accepted&&op==="sse-conflicting"){this.nativeModels.add(MODEL);this.nativeModels.add(OTHER);this.fact(this.trace,MODEL);this.fact(this.trace,OTHER);}break;
       }
       case "trace-sol": case "trace-astra": {
         // The world has one Sol response. The Astra operation contradicts
         // that SAME trace; an Astra-only trace and a Sol rollout would be
         // different eligible responses, not a proven duplicate by counts.
         if(op==="trace-astra") {
-          if(this.b.append(log(MODEL,this.trace,AT+8000)))this.nativeModels.add(MODEL);
+          if(this.b.append(log(MODEL,this.trace,AT+8000))){this.nativeModels.add(MODEL);this.fact(this.trace,MODEL);}
         }
         const model=op==="trace-sol"?MODEL:OTHER;const e=log(model,this.trace,AT+(op==="trace-sol"?8000:9000));
-        if(this.b.append(e))this.nativeModels.add(model);break;
+        if(this.b.append(e)){this.nativeModels.add(model);this.fact(this.trace,model);}break;
       }
-      case "span": { const e=responseSpan(this.trace);this.nativeKinds.set(e.id,"trace");this.b.append(e);break; }
+      case "span": { const e=responseSpan(this.trace);this.register(e,"response-1","trace");this.b.append(e);break; }
       case "rollout-turn": await this.tail(true);break;
       case "rollout-no-turn": await this.tail(false);break;
       case "history-turn": await this.history(true);break;
       case "history-no-turn": await this.history(false);break;
+      case "sse-zero": case "sse-partial": case "sse-cache-cost": {
+        const shape=op==="sse-zero"?{input:0,output:0,trace:"d",at:21000}:op==="sse-partial"?
+          {input:11,output:undefined,trace:"e",at:31000}:{input:23,output:4,trace:"f",at:41000};
+        const e=log(MODEL,shape.trace.repeat(32),AT+shape.at,shape.input,shape.output);
+        if(op==="sse-zero") {
+          e.cacheReadTokens=0;e.cacheCreationTokens=0;e.costUsd=0;e.costKind="reported";
+          Object.assign(e.metadata,{cached_token_count:0,"gen_ai.usage.cache_creation_input_tokens":0,cost_usd:0});
+        }
+        if(op==="sse-partial"){e.costUsd=.031;e.costKind="reported";e.metadata.cost_usd=.031;}
+        if(op==="sse-cache-cost") {
+          e.cacheReadTokens=9;e.cacheCreationTokens=5;e.costUsd=0.123;e.costKind="reported";
+          Object.assign(e.metadata,{"gen_ai.usage.cache_read_tokens":9,"gen_ai.usage.cache_creation_input_tokens":5,cost_usd:0.123});
+        }
+        this.register(e,op,"trace");this.fact(e.metadata.traceId as string,MODEL);this.b.append(e);break;
+      }
+      case "second-turn": case "third-turn": case "history-multiple": case "cache-only-turn": {
+        await this.nativeFile(true);
+        const target=op==="second-turn"?2:op==="cache-only-turn"?4:3;
+        for(let i=this.nativeTurns+1;i<=target;i++) {
+          const at=i===2?11000:i===3?16000:18000,cache=i===2?5:i===3?7:10;
+          const row=(type:string,payload:any)=>JSON.stringify({timestamp:new Date(AT+at).toISOString(),type,payload});
+          fs.appendFileSync(this.rolloutFile,[row("turn_context",{turn_id:`unit-turn-${i}`,model:MODEL}),
+            row("event_msg",{type:"token_count",info:{total_token_usage:{input_tokens:19+13*(Math.min(i,3)-1),
+              output_tokens:2+3*(Math.min(i,3)-1),cached_input_tokens:cache}}})].join("\n")+"\n");
+          this.register({id:deterministicEventId(["codex-rollout",SESSION,String(i)]),model:MODEL,
+            inputTokens:i===4?0:13,outputTokens:i===4?0:3,cacheReadTokens:i===2?5:i===3?2:3,metadata:{usageSource:"rollout"}},
+            `response-${i}`,"turn");this.nativeTurns=i;
+        }
+        if(op==="history-multiple")await this.history(this.fileHasTurn);else await this.tail(this.fileHasTurn);break;
+      }
       case "neighbour-turn": {
         await this.nativeFile(true);
         fs.appendFileSync(this.rolloutFile,JSON.stringify({timestamp:new Date(AT+10000).toISOString(),type:"turn_context",
@@ -241,7 +324,7 @@ class World {
         break;
       }
       case "gap-seal": {
-        const bad=log(MODEL,this.gapTrace,AT+7000,7,1,true);this.nativeKinds.set(bad.id,"invalid");this.b.append(bad);
+        const bad=log(MODEL,this.gapTrace,AT+7000,7,1,true);this.register(bad,"diagnostic-7-1","invalid");this.b.append(bad);
         this.lease();break;
       }
       case "stateless-build": {
@@ -263,8 +346,8 @@ class World {
         this.open(op==="upgrade-047"?"0.7.47":"0.7.48");
         // Actual old public producer, then upgrade before its unsealed usage
         // is sent. This qualifies by explicit native attributes, never a guess.
-        const e=log(MODEL,this.trace,AT+6000,19,2);this.nativeKinds.set(e.id,"trace");
-        if(this.b.append(e))this.nativeModels.add(MODEL);this.open("head");break;
+        const e=log(MODEL,this.trace,AT+6000,19,2);this.register(e,"response-1","trace");
+        if(this.b.append(e)){this.nativeModels.add(MODEL);this.fact(this.trace,MODEL);}this.open("head");break;
       }
     }
     coverage.set(op,coverage.get(op)!+1);steps++;
@@ -282,9 +365,8 @@ class World {
     // after later contradictory facts arrive.
     for(const row of active)if(row.bytes&&!this.frozen.has(row.id)) {
       const e=JSON.parse(row.bytes).event;
-      if(financial(e)&&unit(e))invariant(this.fileHasTurn&&e.metadata.usageSource==="rollout" ||
-        this.nativeModels.size===1&&this.nativeModels.has(e.model),"I1_NATIVE_FACTS_AT_FREEZE",e);
-      this.frozen.set(row.id,{id:row.id,rawId:row.rawId,bytes:row.bytes,event:e,named:!gap(e)&&unit(e),gap:gap(e)});
+      if(financial(e)&&!gap(e))this.nativeProvenance(e,row.rawId);
+      this.frozen.set(row.id,{id:row.id,rawId:row.rawId,bytes:row.bytes,event:e,named:!gap(e)&&financial(e),gap:gap(e)});
       if(gap(e))this.gapRaw.add(row.rawId);
     }
     for(const row of [...active,...replay]) if(row.bytes) {
@@ -296,21 +378,27 @@ class World {
       if(frozen)invariant(row.bytes===frozen.bytes,"I2_STORED_BYTES",{id:row.id,version:this.version});
     }
     const named=[...this.frozen.values()].filter(f=>f.named);
-    invariant(named.length<=1,"NO_DUPLICATE_USAGE",named.map(f=>({id:f.id,event:f.event})));
+    for(const [response,expected] of this.expected) {
+      const sum=this.sums(response);
+      for(const k of FIELDS)invariant((sum[k]??0)<=(expected[k]??0)+1e-12,"NO_DUPLICATE_USAGE",
+        {response,field:k,expected:expected[k]??0,observed:sum[k]??0,named:named.filter(f=>this.producers.get(f.rawId)?.response===response)});
+    }
     for(const frozen of named) {
       const a=active.find((r:any)=>r.id===frozen.id),r=replay.find((r:any)=>r.id===frozen.id),receipt=receipts.find((r:any)=>r.id===frozen.id);
       const parked=receipt?.state==="dead"&&receipt.reason.startsWith("remote_")&&
         captures.some((c:any)=>c.id===frozen.id&&c.bytes===frozen.bytes);
       invariant(a || r?.bytes===frozen.bytes || receipt?.state==="acknowledged" || parked,"I2_NAMED_LOST",{id:frozen.id,version:this.version,receipts});
     }
-    if(this.nativeObserved && this.fileHasTurn && !named.length) {
-      // A known native file may be waiting behind the grace hold or a
-      // provisional live stream, but it must have a retained eligible owner.
-      const raw=db.prepare("select id,event_type as type,usage_duplicate_reason as duplicate from buffered_events where source='codex' and (input_tokens=19 and output_tokens=2)").all();
-      const candidates=raw.filter((r:any)=>!r.duplicate&&!this.gapRaw.has(r.id)&&
-        (r.type==="usage_rollout" || (this.nativeModels.size===1&&this.nativeModels.has(MODEL))));
-      invariant(candidates.some((c:any)=>active.some((a:any)=>a.rawId===c.id)||replay.some((r:any)=>r.rawId===c.id)),
-        "KNOWN_NATIVE_LOST",{version:this.version,raw,active,replay,models:[...this.nativeModels]});
+    for(const [response,expected] of this.knownNative) {
+      const retained=this.sums(response);
+      for(const p of this.producers.values())if(p.response===response&&p.kind==="turn"&&
+        ![...this.frozen.values()].some(f=>f.rawId===p.event.id)&&!this.gapRaw.has(p.event.id)) {
+        const raw=db.prepare("select input_tokens as inputTokens,output_tokens as outputTokens,cache_read_tokens as cacheReadTokens,cache_creation_tokens as cacheCreationTokens,cost_usd as costUsd,usage_duplicate_reason as duplicate from buffered_events where id=?").get(p.event.id);
+        if(raw&&!raw.duplicate&&(active.some((a:any)=>a.rawId===p.event.id)||replay.some((r:any)=>r.rawId===p.event.id)))
+          for(const k of FIELDS)retained[k]=(retained[k]??0)+(raw[k]??0);
+      }
+      for(const k of FIELDS)invariant((retained[k]??0)>=(expected[k]??0),"KNOWN_NATIVE_LOST",
+        {response,field:k,retained,expected,version:this.version});
     }
     // Outbox/receipt state must never describe one ID as active and terminal.
     invariant(active.every((a:any)=>!receipts.some((r:any)=>r.id===a.id)),"STATE_ACTIVE_TERMINAL",active);
@@ -321,8 +409,17 @@ class World {
     // One pass retires unsafe legacy envelopes; its distinct gap is a second
     // real queued delivery. Drain it as well, without changing any source.
     this.lease();this.assertStep();this.lease();this.assertStep();
-    if(this.nativeObserved&&this.fileHasTurn)
-      invariant([...this.frozen.values()].filter(f=>f.named).length===1,"KNOWN_NATIVE_FINAL",{models:[...this.nativeModels]});
+    // Every eligible native producer, including zero/partial/cache/cost SSE,
+    // must retain all its fields. Persisted gaps remain diagnostic forever.
+    for(const p of this.producers.values())if(!this.gapRaw.has(p.event.id)&&this.eligible(p,p.event))
+      for(const k of FIELDS)if(p.event[k]!==undefined) {
+        invariant([...this.frozen.values()].some(f=>f.named&&this.producers.get(f.rawId)?.response===p.response&&
+          f.event[k]!==undefined),"KNOWN_NATIVE_FIELD_MISSING",{response:p.response,field:k,expected:p.event[k]});
+        invariant((this.sums(p.response)[k]??0)>=p.event[k],"KNOWN_NATIVE_FINAL",
+          {response:p.response,field:k,expected:p.event[k],sum:this.sums(p.response)});
+      }
+    for(const [response,expected] of this.knownNative)for(const k of FIELDS)
+      invariant((this.sums(response)[k]??0)===(expected[k]??0),"KNOWN_NATIVE_FINAL",{response,field:k,expected,sum:this.sums(response)});
   }
   close() { this.b?.close();fs.rmSync(this.dir,{recursive:true,force:true}); }
 }
@@ -393,7 +490,7 @@ async function main() {
   console.log(JSON.stringify({proof:"codex-capture-sequences",seeds,directed:directed.length,steps,
     operations:Object.fromEntries(coverage),rollbackLeases,terminalReplays,historyImports,historyRefusals,pairingChecks,
     invariants:["I1 native model or tokenless gap","I2 named ID/bytes final","I3 gap never regains counters",
-      "one potentially accepted named owner","known native response retained and eventually named"]},null,2));
+      "financial totals bounded per response and field","every known native response retained and eventually named"]},null,2));
   completion.complete();
 }
 main().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>fs.rmSync(root,{recursive:true,force:true}));

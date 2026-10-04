@@ -1,0 +1,7 @@
+{
+  "finding": "R9-P0-06",
+  "seed": 32,
+  "shrinkAttempts": 17,
+  "operations": ["sse-partial-twin", "history-turn", "span"],
+  "intent": "late response span cannot pay fields already retained across a partial SSE and native remainder"
+}

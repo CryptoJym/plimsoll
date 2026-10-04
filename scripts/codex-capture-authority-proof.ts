@@ -5,6 +5,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { captureCodexModel, recordCodexTurnModel, rememberCaptureGap } from "../packages/collector-cli/src/codex-model-capture";
+import { rowCanOwnSessionUsage } from "../packages/collector-cli/src/usage-authority";
 import { beginAutomaticCaptureBaseline,completeAutomaticCaptureBaseline,sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
 import { deriveCaptureRootIdentity } from "../packages/collector-cli/src/capture-root-inventory";
 import { planCaptureHistory,applyCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
@@ -78,7 +79,7 @@ async function authorityCase(name: string, peer: AiInteractionEvent, authoritati
   const f = new Fixture(); let tailer: RolloutTailer | undefined;
   try {
     assert.equal(f.buffer.append(peer), true);
-    assert.equal(f.buffer.sessionUsageAuthority("codex", SESSION), authoritative ? "live" : null);
+    assert.equal(f.buffer.sessionUsageAuthority("codex", SESSION), null);
     // A lookup must not record a financial gap before the hold/decision.
     const diagnostic = f.buffer.database.prepare("select 1 from sqlite_master where name='codex_model_capture_gaps'").get();
     assert.equal(Boolean(diagnostic), false);
@@ -96,15 +97,15 @@ async function authorityCase(name: string, peer: AiInteractionEvent, authoritati
         "capture diagnostics stay local, never in a frozen delivery");
     }
     f.buffer.delivery.acknowledge(first.leaseId, first.items.map(i => i.deliveryId), f.now);
-    f.reopen(); assert.equal(f.buffer.sessionUsageAuthority("codex", SESSION), authoritative ? "live" : null);
+    f.reopen(); assert.equal(f.buffer.sessionUsageAuthority("codex", SESSION), null);
     tailer = new RolloutTailer(f.buffer, nativeFile(f.dir), () => []);
     f.now = new Date(AT + 65000); const scan = await tailer.scan({scope: "full", now: f.now});
     tailer.close(); tailer = undefined;
-    assert.equal(scan.sessionsSkippedOtlpCovered, authoritative ? 1 : 0);
+    assert.equal(scan.sessionsSkippedOtlpCovered, 0);
     const later = f.lease(126000); const counted = usage(later.items);
-    assert.equal(counted.length, authoritative ? 0 : 1);
-    if (!authoritative) {assert.equal(counted[0].envelope.event.model, MODEL);
-      assert.equal(counted[0].envelope.event.inputTokens, 19); assert.equal(counted[0].envelope.event.outputTokens, 2);}
+    assert.equal(counted.length, 1,"a different completion is an uncovered response");
+    assert.equal(counted[0].envelope.event.model, MODEL);
+    assert.equal(counted[0].envelope.event.inputTokens, 19); assert.equal(counted[0].envelope.event.outputTokens, 2);
     drain(f);
     const facts = f.buffer.database.prepare(`select e.id,f.model,f.input_tokens as input,f.output_tokens as output
       from buffered_events e join dashboard_event_facts f on f.raw_rowid=e.rowid`).all() as any[];
@@ -171,10 +172,12 @@ async function foreignBoundaryAuthority() {
   const f = new Fixture();
   try {
     const peer = log("8".repeat(32), MODEL, 17, 3); f.buffer.append(peer);
-    assert.equal(f.buffer.sessionUsageAuthority("codex",SESSION),"live");
+    assert.equal(f.buffer.sessionUsageAuthority("codex",SESSION),null);
+    assert.equal(rowCanOwnSessionUsage(f.buffer.database,peer.id),true);
     f.buffer.database.prepare("update buffered_events set device_id='other-device' where id=?").run(peer.id);
     assert.equal(f.buffer.sessionUsageAuthority("codex",SESSION),null);
-    completion.check("a different device cannot own the current session authority");
+    assert.equal(rowCanOwnSessionUsage(f.buffer.database,peer.id),false);
+    completion.check("a different device cannot own response coverage");
   } finally {f.close();}
 }
 async function distantTraceConflict() {
@@ -263,8 +266,8 @@ async function historyPlanAuthority(valid: boolean,unkeyed: boolean) {
     if (valid && unkeyed) await assert.rejects(planCaptureHistory(f.buffer.database,captureRoot),/unkeyed_live_usage_overlap/);
     else {
       const plan=await planCaptureHistory(f.buffer.database,captureRoot);
-      assert.equal(plan.skippedLiveSessions,valid ? 1 : 0); assert.equal(plan.missingRows,valid ? 0 : 1);
-      if (!valid) {
+      assert.equal(plan.skippedLiveSessions,0); assert.equal(plan.missingRows,1);
+      {
         assert.equal(plan.tokens.input,19);assert.equal(plan.tokens.output,2);
         // Old ledgers can retain a live claim even though its raw witness was
         // financially rejected. Both planning and the writer must revalidate.
@@ -283,7 +286,7 @@ async function main() {
   try {
     await authorityCase("invalid SSE gap ACK cannot suppress known native turn", log("a".repeat(32), MODEL, 17, 3,
       [attr("gen_ai.request.model", "gpt-6-astra")]), false, 17);
-    await authorityCase("valid SSE keeps session deduplication", log("b".repeat(32), MODEL, 17, 3), true);
+    await authorityCase("valid SSE covers only its response", log("b".repeat(32), MODEL, 17, 3), true);
     await authorityCase("explicit zero SSE is known zero", log("c".repeat(32), MODEL, 0, 0), true);
     await authorityCase("resource model without request model grants no authority", log("d".repeat(32), undefined, 17, 3, [], true), false, 17);
     await authorityCase("partial counters with unknown model stay diagnostic", log("e".repeat(32), undefined, 17), false, 17);
