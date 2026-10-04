@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { buildIngestBatch } from "../packages/collector-cli/src/upload";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
@@ -15,9 +17,9 @@ const codexId = "fixture-codex-account-one";
 const claudeId = "fixture-claude-account-one";
 const attr = (key: string, value: string | number) => ({ key, value: typeof value === "number" ? { intValue: String(value) } : { stringValue: value } });
 const line = (timestamp: string, type: string, payload: object) => JSON.stringify({ timestamp, type, payload }) + "\n";
-const counts = (timestamp: string, input: number, used: number, reset: number, secondary = true) => line(timestamp, "event_msg", {
+const counts = (timestamp: string, input: number, used: number, reset: number, secondary = true, primaryMinutes = 300) => line(timestamp, "event_msg", {
   type: "token_count", info: { total_token_usage: { input_tokens: input, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } },
-  rate_limits: { plan_type: "pro", limit_id: "codex-limit-fixture", primary: { used_percent: used, window_minutes: 300, resets_at: reset },
+  rate_limits: { plan_type: "pro", limit_id: "codex-limit-fixture", primary: { used_percent: used, window_minutes: primaryMinutes, resets_at: reset },
     ...(secondary ? { secondary: { used_percent: 103.2, window_minutes: 10080, resets_at: reset + 1000 } } : {}) },
 });
 const scanAt = (clock: string) => ({ scope: "full" as const, now: new Date(`2026-09-29T${clock}Z`) });
@@ -73,7 +75,9 @@ async function main() {
     const usage = all.filter(row => row.eventType === "usage_rollout");
     const readings = all.filter(row => row.eventType === "plan_limit_observation");
     assert.ok(usage.length >= 2);
-    assert.ok(usage.every(row => row.metadata["user.account_id"] === key && row.model === "gpt-6-sol"));
+    const pricedUsage = usage.filter(row => (row.inputTokens ?? 0) > 0 || (row.outputTokens ?? 0) > 0 ||
+      (row.cacheReadTokens ?? 0) > 0 || (row.cacheCreationTokens ?? 0) > 0);
+    assert.ok(pricedUsage.every(row => row.metadata["user.account_id"] === key && row.model === "gpt-6-sol"));
     assert.equal(otlp("codex", "user.account_id", codexId).metadata["user.account_id"], usage[0].metadata["user.account_id"]);
     assert.equal(readings.length, 3);
     assert.deepEqual(readings.map(row => row.metadata.planLimitWindow).sort(), ["five_hour", "five_hour", "weekly"]);
@@ -122,6 +126,25 @@ async function main() {
     assert.ok(all.some(row => row.eventType === "plan_limit_observation" &&
       row.metadata["user.account_id"] === providerAccountKey(secondId) &&
       row.metadata.planLimitUsedPercent === 33 && row.inputTokens === undefined));
+
+    const usageBeforeInvalidWindow = all.filter(row => row.eventType === "usage_rollout").length;
+    fs.appendFileSync(rollout, counts("2026-09-29T09:25:00.000Z", 50, 34, reset, false, 525_601));
+    await tailer.scan(scanAt("09:25:05"));
+    all = rows(buffer);
+    assert.equal(all.filter(row => row.eventType === "usage_rollout").length,
+      usageBeforeInvalidWindow + 1,
+      "usage in the same capture survives an invalid plan-window reading");
+    assert.equal(all.some(row => row.eventType === "plan_limit_observation" &&
+      row.metadata.planLimitWindow === "window_525601m"), false,
+      "an over-bound plan-window reading is never emitted");
+    const invalidWindowBatch = buildIngestBatch(
+      collectorConfigSchema.parse({}),
+      buffer,
+      { now: () => new Date() },
+    );
+    assert.ok(invalidWindowBatch.batch?.events.some(event =>
+      event.event.eventType === "usage_rollout" && event.event.inputTokens === 10),
+      "usage from the same capture remains uploadable");
     tailer.close();
 
     const claudeDir = path.join(root, "claude-profile");
@@ -153,7 +176,7 @@ async function main() {
     try {
       assert.ok((oldBuffer.database.prepare("select count(*) as n from buffered_events where event_type='plan_limit_observation'").get() as { n: number }).n >= 6);
     } finally { oldBuffer.close(); }
-    console.log(JSON.stringify({ proof: "account-plan-limit", checks: 23, passed: 23, failed: 0 }));
+    console.log(JSON.stringify({ proof: "account-plan-limit", checks: 26, passed: 26, failed: 0 }));
   } finally {
     buffer?.close();
     if (oldWorktree) {

@@ -4,6 +4,7 @@ import {
   canonicalSuppressionReceipt,
   canonicalizeSuppressionReceipts,
   hasUnsafeMetadataString,
+  isPlanLimitWindowWithinBound,
   isForbiddenRawContentFieldName,
   isSensitiveMetadataSemanticKey,
   metadataKeyDisposition,
@@ -20,6 +21,30 @@ const OMIT_LOCAL_ONLY_KEYS = new Set([
   "cwd",
   "rolloutFile",
   "transcriptFile",
+]);
+
+// These fields were introduced after 0.7.48. They remain useful in the local
+// ledger and diagnostics, but cannot enter a sealed envelope: 0.7.47 and
+// 0.7.48 readers must re-seal a 0.7.49 envelope byte-for-byte during rollback.
+// These diagnostics are local evidence only; they do not become wire
+// suppression receipts, so older readers re-seal the frozen envelope exactly.
+const LOCAL_ONLY_CAPTURE_METADATA_KEYS = new Set([
+  "captureGap",
+  "modelEvidenceConflict",
+  "modelCaptureInputTokens",
+  "modelCaptureOutputTokens",
+  "modelCaptureCacheReadTokens",
+  "modelCaptureCacheCreationTokens",
+  "modelGapInputTokens",
+  "modelGapOutputTokens",
+  "modelGapCacheReadTokens",
+  "modelGapCacheCreationTokens",
+  "turn.id",
+  "turn_id",
+  "modelCaptureSource",
+  "modelGapReason",
+  "accountIdentityState",
+  "codexTurnId",
 ]);
 
 type MetadataOutcome =
@@ -76,6 +101,9 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
   for (const [key, value] of Object.entries(input)) {
     if (OMIT_LOCAL_ONLY_KEYS.has(key) || isForbiddenRawContentFieldName(key)) {
       recordOmission(key);
+      continue;
+    }
+    if (LOCAL_ONLY_CAPTURE_METADATA_KEYS.has(key)) {
       continue;
     }
     if (!/^[\x20-\x7e]+$/.test(key)) {
@@ -258,6 +286,12 @@ export function sealOutboundEvent(event: AiInteractionEvent) {
 export function sealOutboundEnvelope(input: unknown): OutboundEnvelopeOutcome {
   const parsed = aiWorkIngestEventSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: "schema" };
+  if (
+    parsed.data.event.eventType === "plan_limit_observation" &&
+    !isPlanLimitWindowWithinBound(parsed.data.event.metadata)
+  ) {
+    return { ok: false, reason: "schema" };
+  }
   // Evidence-marked rows belong in a separately reviewed encrypted vault.
   // That vault is not implemented, so no ordinary upload surface may seal
   // them even when their current typed fields happen to look harmless.

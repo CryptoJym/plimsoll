@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.49 — 2026-10-03 (unpublished)
+
+- Codex token-bearing captures now name their model from an exact paired SSE
+  log, one unambiguous native trace, or the same local conversation turn. Any
+  ambiguity becomes a tokenless capture gap while the original counters stay
+  in local diagnostics. Paired spans no longer overwrite an existing account
+  identity, and nested OTel model aliases participate in conflict checks.
+- Capture diagnostics stay out of the sealed envelope so 0.7.48 and 0.7.47
+  readers can replay 0.7.49 usage byte-for-byte during rollback. Plan-limit
+  windows are bounded to 525,600 minutes before emission or sealing, while
+  keyless legacy readings remain compatible.
+
 ## 0.7.48 — 2026-10-03 (unpublished)
 
 - Skip plan-limit observations without an account binding. Rollout commit

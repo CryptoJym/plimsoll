@@ -7,6 +7,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
+import { captureCodexModel } from "../packages/collector-cli/src/codex-model-capture";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
@@ -3424,6 +3425,8 @@ async function hostilePrivacyAndLinkageProof() {
 
   const invalidLinkageId = uuid(4_100);
   buffer.append(event(4_100, {
+    cacheReadTokens: 3,
+    cacheCreationTokens: 4,
     metadata: {
       transport_path: "/v1/traces",
       cacheReadTokens: 3,
@@ -3439,6 +3442,12 @@ async function hostilePrivacyAndLinkageProof() {
     .get(invalidLinkageId) as { rowid: number }).rowid;
   const malformedLinkage = "sha256:LINKAGE_SECRET_SENTINEL_8b4e";
   buffer.delivery.fillLinkageForRawRow(invalidRowid, malformedLinkage, null);
+  const invalidRaw = JSON.parse((buffer.database
+    .prepare("select payload_json as payload from buffered_events where id = ?")
+    .get(invalidLinkageId) as { payload: string }).payload) as AiInteractionEvent;
+  // The raw counters remain local diagnostics on the capture gap. The sealed
+  // envelope is deliberately tokenless so an older reader cannot bill them.
+  const invalidLocalGap = captureCodexModel(buffer.database, invalidRaw);
 
   const canonicalLinkageId = uuid(4_101);
   buffer.append(event(4_101, { metadata: { transport_path: "/v1/metrics" } }));
@@ -3581,17 +3590,26 @@ async function hostilePrivacyAndLinkageProof() {
       invalidSent?.projectKey === undefined &&
       canonicalSent?.projectKey === lowerCanonical &&
       invalidSent?.metadata.transport_path === "/v1/traces" &&
-      invalidSent?.inputTokens === 4_101 &&
-      invalidSent?.outputTokens === 1 &&
-      invalidSent?.metadata.cacheReadTokens === 3 &&
-      invalidSent?.metadata.cache_creation_tokens === 4 &&
+      invalidSent?.inputTokens === undefined &&
+      invalidSent?.outputTokens === undefined &&
+      invalidLocalGap.metadata.captureGap === true &&
+      invalidLocalGap.metadata.modelGapInputTokens === 4_101 &&
+      invalidLocalGap.metadata.modelGapOutputTokens === 1 &&
+      invalidLocalGap.metadata.modelGapCacheReadTokens === 3 &&
+      invalidLocalGap.metadata.modelGapCacheCreationTokens === 4 &&
+      invalidSent?.metadata.usageSource === "capture_gap" &&
+      invalidSent?.metadata.captureGap === undefined &&
+      invalidSent?.metadata.modelGapInputTokens === undefined &&
+      invalidSent?.metadata.modelGapOutputTokens === undefined &&
+      invalidSent?.metadata.modelGapCacheReadTokens === undefined &&
+      invalidSent?.metadata.modelGapCacheCreationTokens === undefined &&
       invalidSent !== undefined && !("cacheWhateverTokens" in invalidSent.metadata) &&
-      invalidSent?.metadata["gen_ai.usage.output_tokens"] === 6 &&
+      invalidSent?.metadata["gen_ai.usage.output_tokens"] === undefined &&
       invalidSent?.metadata.reasoningOutputTokens === 7 &&
       sent.events
         .find((entry) => entry.event.id === invalidLinkageId)
         ?.suppressedFields.includes(GENERIC_SUPPRESSION_RECEIPT) === true &&
-      invalidSent?.metadata["gen_ai.usage.input_tokens"] === "8" &&
+      invalidSent?.metadata["gen_ai.usage.input_tokens"] === undefined &&
       metadataLinkageSent?.projectKey === lowerCanonical &&
       metadataGit?.remoteUrlHash === lowerCanonical &&
       metadataGit?.branchHash === branchCanonical &&
@@ -3723,7 +3741,7 @@ async function requestBudgetAndResumableValidationProof() {
     });
     const oversizedId = uuid(2_300);
     const laterId = uuid(2_301);
-    buffer.append(event(2_300, { metadata: bulkyAllowedMetadata(64) }));
+    buffer.append(event(2_300, { model: "gpt-6.1-sol", metadata: bulkyAllowedMetadata(64) }));
     buffer.append(aiInteractionEventSchema.parse({
       id: laterId,
       source: "codex",

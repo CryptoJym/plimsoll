@@ -19,6 +19,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { captureCodexModel } from "../packages/collector-cli/src/codex-model-capture";
 import { runCodexReconciliationMaintenance } from "../packages/collector-cli/src/codex-reconciliation";
 import {
   buildCodexUsagePairingIndexes,
@@ -439,7 +440,7 @@ async function main() {
     const h = new Harness("trace-beats-guessed-session");
     try {
       h.at(100); h.append(contextEvent(SESSION_B, T0 - 1_490));
-      h.at(200); h.append(spanEvent(R()));
+      h.at(200); const spanId = h.append(spanEvent(R()));
       h.at(20_000); check("span_stitches_to_other_session_before_log", h.maintain() > 0);
       h.at(21_000); h.append(logEvent(R(), true));
       const o = h.observe();
@@ -588,8 +589,13 @@ async function main() {
   {
     const h = new Harness("late-span-first");
     try {
-      h.at(200); h.append(spanEvent(R()));
-      h.at(61_500); const lease = h.upload({ ack: false });
+      h.at(200); const spanId = h.append(spanEvent(R()));
+      h.at(61_500);
+      const rawSpan = JSON.parse((h.buffer.database.prepare(
+        `select payload_json as payload from buffered_events where id = ?`,
+      ).get(spanId) as { payload: string }).payload);
+      const localGap = captureCodexModel(h.buffer.database, rawSpan);
+      const lease = h.upload({ ack: false });
       check("late_pair_span_first_leases_before_counterpart", lease.items.length === 1);
       h.at(62_000); h.append(logEvent(R()));
       h.buffer.delivery.acknowledge(lease.leaseId,
@@ -601,9 +607,14 @@ async function main() {
         receipt?.state === "acknowledged" && receipt.reason === "remote_acknowledged", receipt);
       h.at(123_000); h.upload();
       const o = h.observe();
+      const wireGapEvent = lease.items[0]!.envelope.event;
       check("late_pair_uploads_gap_then_one_log_without_retraction",
         once(o) && o.cloud.rows === 1 && o.cloud.input === R().input && h.cloud.size === 2 &&
-          lease.items[0]!.envelope.event.metadata.captureGap === true, o);
+          localGap.metadata.captureGap === true &&
+          localGap.metadata.modelGapInputTokens === R().input &&
+          wireGapEvent.metadata.usageSource === "capture_gap" &&
+          wireGapEvent.metadata.captureGap === undefined &&
+          wireGapEvent.inputTokens === undefined, o);
     } finally { h.close(); }
   }
 

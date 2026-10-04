@@ -775,6 +775,9 @@ jobs:
       - name: Prove model evidence or a capture gap on every Codex upload
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-model-capture
+      - name: Prove named usage survives 0.7.48 and 0.7.47 rollback readers
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:collector-named-usage-rollback
 
       - name: Prove bound Codex dispatch survives response pairing (eco-6hoxj.163.99)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

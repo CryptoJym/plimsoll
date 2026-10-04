@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("codex-model-capture", 36);
+const completion = createProofCompletion("codex-model-capture", 38);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -137,6 +137,7 @@ async function run(
       "bounded wait before pair timeout",
     );
     now = new Date(at + 63_000);
+    const captured = captureCodexModel(b.database, target);
     const leased = b.delivery.lease({ now });
     const events = leased.items.map((item) => item.envelope.event);
     const result = events.find((e) => e.id === target.id)!;
@@ -147,32 +148,38 @@ async function run(
     );
     if (expected) {
       assert.equal(result.model, expected);
+      assert.equal(captured.model, expected);
       if (reason === "paired_sse_event") {
         assert.equal(result.inputTokens, undefined);
-        assert.equal(result.metadata.usageDuplicateReason, reason);
-        assert.equal(result.metadata.modelCaptureInputTokens, 5555);
+        assert.equal(captured.metadata.usageDuplicateReason, reason);
+        assert.equal(captured.metadata.modelCaptureInputTokens, 5555);
         assert.equal(
           events.filter((e) => e.inputTokens === 5555).length,
           1,
           "pair counts once",
         );
       } else assert.equal(result.inputTokens, 5555);
-      assert.ok(result.metadata.modelCaptureSource);
+      assert.ok(captured.metadata.modelCaptureSource);
       assert.ok(result.metadata["user.account_id"]);
     } else {
+      assert.equal(captured.model, undefined);
+      assert.equal(captured.metadata.captureGap, true);
+      assert.equal(captured.metadata.modelGapReason, reason);
+      assert.equal(captured.metadata.modelGapInputTokens, 5555);
       assert.equal(result.model, undefined);
       assert.equal(result.inputTokens, undefined);
       assert.equal(result.outputTokens, undefined);
       assert.equal(result.costUsd, undefined);
-      assert.equal(result.metadata.captureGap, true);
-      assert.equal(result.metadata.modelGapReason, reason);
-      assert.equal(result.metadata.modelGapInputTokens, 5555);
+      assert.equal(result.metadata.usageSource, "capture_gap");
+      assert.equal(result.metadata.captureGap, undefined);
+      assert.equal(result.metadata.modelGapReason, undefined);
+      assert.equal(result.metadata.modelGapInputTokens, undefined);
       if (target.metadata["user.account_id"]) {
         assert.equal(
           result.metadata["user.account_id"],
           target.metadata["user.account_id"],
         );
-        assert.equal(result.metadata.accountIdentityState, "reported");
+        assert.equal(captured.metadata.accountIdentityState, "reported");
       }
       b.delivery.acknowledge(
         leased.leaseId,
@@ -399,6 +406,40 @@ async function main() {
       null,
       "conflicting_model_attributes",
     );
+    await run(
+      "hook-nested-model-conflict",
+      () =>
+        normalizeHookPayload(
+          {
+            source: "codex",
+            observedAt: new Date(at).toISOString(),
+            model: "gpt-6.1-sol",
+            inputTokens: 5555,
+            outputTokens: 55,
+            attributes: [attr("gen_ai.request.model", "gpt-6-astra")],
+          },
+          {
+            source: "codex",
+            now: () => at,
+            fallbackEventId: deterministicEventId(["hook-nested-model-conflict"]),
+          },
+        ).event,
+      null,
+      "conflicting_model_attributes",
+    );
+    await run(
+      "paired-actor-account-conflict",
+      (b) => {
+        const peer = log("gpt-6.1-sol", false, true);
+        peer.metadata["user.account_id"] = "sha256:fedcba9876543210";
+        b.append(peer);
+        const target = span();
+        target.actorId = "sha256:aaaaaaaaaaaaaaaa";
+        return target;
+      },
+      null,
+      "model_evidence_missing",
+    );
     {
       // This gate owns Codex, including Codex under a Claude credential.
       // Genuine Claude missing-model observations retain their existing
@@ -537,7 +578,8 @@ async function main() {
         const result = buildIngestBatch(config, b, {
           now: () => new Date(Date.now() + 61000),
         });
-        assert.equal(result.batch?.events[0]?.event.metadata.captureGap, true);
+        assert.equal(result.batch?.events[0]?.event.metadata.usageSource, "capture_gap");
+        assert.equal(result.batch?.events[0]?.event.metadata.captureGap, undefined);
         assert.equal(result.batch?.events[0]?.event.inputTokens, undefined);
         checks++;
         completion.check("stateless-upload-gaps");
@@ -609,12 +651,11 @@ async function main() {
           }),
         );
         assert.notEqual(gap.deliveryId, queued.id);
-        assert.equal(gap.envelope.event.metadata.captureGap, true);
+        assert.equal(gap.envelope.event.metadata.usageSource, "capture_gap");
+        assert.equal(gap.envelope.event.metadata.captureGap, undefined);
         assert.equal(
           gap.envelope.event.metadata.modelGapReason,
-          namedClass2
-            ? "legacy_sealed_source_mismatch"
-            : "legacy_sealed_model_missing",
+          undefined,
         );
         assert.equal(gap.envelope.event.inputTokens, undefined);
         assert.ok(gap.envelope.event.metadata.installationEpochId);
@@ -775,7 +816,8 @@ async function main() {
         });
         assert.equal(result.ok, true);
         assert.equal(sent.length, 1);
-        assert.equal(sent[0]!.metadata.captureGap, true);
+        assert.equal(sent[0]!.metadata.usageSource, "capture_gap");
+        assert.equal(sent[0]!.metadata.captureGap, undefined);
         assert.equal(sent[0]!.inputTokens, undefined);
         assert.ok(sent[0]!.metadata.installationEpochId);
         assert.equal(
@@ -812,12 +854,12 @@ async function main() {
           b,
           { now: () => new Date(Date.now() + 61000) },
         );
-        assert.equal(result.batch?.events[0]?.event.metadata.captureGap, true);
+        const captured = captureCodexModel(b.database, event);
+        assert.equal(captured.metadata.captureGap, true);
+        assert.equal(captured.metadata.modelGapInputTokens, 0);
+        assert.equal(result.batch?.events[0]?.event.metadata.usageSource, "capture_gap");
+        assert.equal(result.batch?.events[0]?.event.metadata.captureGap, undefined);
         assert.equal(result.batch?.events[0]?.event.inputTokens, undefined);
-        assert.equal(
-          result.batch?.events[0]?.event.metadata.modelGapInputTokens,
-          0,
-        );
         checks++;
         completion.check("zero-token-model-gap");
       } finally {
@@ -916,6 +958,7 @@ async function main() {
         const peer = log("gpt-6.1-sol", true);
         peer.id = deterministicEventId([peer.id, "second-account"]);
         peer.metadata["user.account_id"] = "sha256:fedcba9876543210";
+        peer.actorId = undefined;
         b.append(peer);
         return span();
       },

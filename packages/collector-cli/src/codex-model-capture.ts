@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   estimateCostUsd,
+  providerAccountKey,
   usageFieldKeys,
   validatedMetadataAttribute,
   type AiInteractionEvent,
@@ -28,14 +29,58 @@ export function codexHasUsage(event: AiInteractionEvent): boolean {
   );
 }
 
+function nestedOtelAttributes(event: AiInteractionEvent): Record<string, unknown> {
+  const value = event.metadata.otelAttributes;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function valuesForAliases(
+  event: AiInteractionEvent,
+  aliases: readonly string[],
+): string[] {
+  return [
+    ...aliases.map((key) => event.metadata[key]),
+    ...aliases.map((key) => nestedOtelAttributes(event)[key]),
+  ].filter(
+    (value): value is string => typeof value === "string" && !!value.trim(),
+  );
+}
+
 function nativeModels(event: AiInteractionEvent): Set<string> {
   return new Set(
-    [
-      event.model,
-      ...usageFieldKeys.model.map((key) => event.metadata[key]),
-    ].filter(
+    [event.model, ...valuesForAliases(event, usageFieldKeys.model)].filter(
       (value): value is string => typeof value === "string" && !!value.trim(),
     ),
+  );
+}
+
+function metadataAccounts(event: AiInteractionEvent): Set<string> {
+  return new Set(valuesForAliases(event, usageFieldKeys.actorId));
+}
+
+/**
+ * Producer account metadata is already a protected hash, while actorId may be
+ * the protected hash of that metadata value. Keep both representations as
+ * evidence for joins, but only call an event internally conflicting when its
+ * explicit metadata disagrees or actorId is unrelated to its one account.
+ */
+function nativeAccounts(event: AiInteractionEvent): Set<string> {
+  const metadata = metadataAccounts(event);
+  const evidence = new Set(metadata);
+  for (const value of metadata) evidence.add(providerAccountKey(value));
+  if (text(event.actorId)) evidence.add(event.actorId!);
+  return evidence;
+}
+
+function accountConflict(event: AiInteractionEvent): boolean {
+  const metadata = metadataAccounts(event);
+  if (metadata.size > 1) return true;
+  const account = [...metadata][0];
+  return Boolean(
+    event.actorId && account &&
+      event.actorId !== account && event.actorId !== providerAccountKey(account),
   );
 }
 export function codexMisfiledUnderClaude(event: AiInteractionEvent): boolean {
@@ -115,14 +160,15 @@ function trustedSession(event: AiInteractionEvent) {
 function compatible(a: AiInteractionEvent, b: AiInteractionEvent) {
   const as = trustedSession(a),
     bs = trustedSession(b);
+  const aa = nativeAccounts(a),
+    ba = nativeAccounts(b);
   return (
     (!as || !bs || as === bs) &&
     (!a.metadata.traceId ||
       !b.metadata.traceId ||
       a.metadata.traceId === b.metadata.traceId) &&
-    (!a.metadata["user.account_id"] ||
-      !b.metadata["user.account_id"] ||
-      a.metadata["user.account_id"] === b.metadata["user.account_id"])
+    (aa.size === 0 || ba.size === 0 ||
+      [...aa].some((value) => ba.has(value)))
   );
 }
 function unique(
@@ -143,10 +189,11 @@ function capture(
   source: string,
 ): AiInteractionEvent {
   const model = unique(peers, (e) => text(e.model))[0]!;
-  const accounts = unique(peers, (e) => text(e.metadata["user.account_id"]));
+  const eventAccounts = [...metadataAccounts(event)];
+  const accounts = [...new Set(peers.flatMap((peer) => [...metadataAccounts(peer.event)]))];
   const sessions = unique(peers, (e) => trustedSession(e));
   const account =
-    text(event.metadata["user.account_id"]) ??
+    eventAccounts[0] ??
     (accounts.length === 1 ? accounts[0] : undefined);
   const sessionId =
     trustedSession(event) ?? (sessions.length === 1 ? sessions[0] : undefined);
@@ -161,7 +208,7 @@ function capture(
     ...event,
     model,
     ...(sessionId ? { sessionId } : {}),
-    ...(account ? { actorId: account } : {}),
+    ...(text(event.actorId) || !account ? {} : { actorId: account }),
     ...(estimate && event.costUsd === undefined
       ? { costUsd: estimate.costUsd, costKind: "estimated" as const }
       : {}),
@@ -293,10 +340,8 @@ export function captureCodexModel(
       metadata: { ...event.metadata, installationEpochId: row.epoch },
     };
   const gap = (reason: string) => codexModelGap(db, event, reason);
-  if (
-    nativeModels(event).size > 1 ||
-    event.metadata.modelEvidenceConflict === true
-  )
+  if (nativeModels(event).size > 1 || accountConflict(event) ||
+    event.metadata.modelEvidenceConflict === true)
     return gap("conflicting_model_attributes");
   const accountKey =
     event.source === "claude_code" ? "user.account_uuid" : "user.account_id";
@@ -357,7 +402,8 @@ export function captureCodexModel(
   const native = peers.filter((p) => !p.event.metadata.modelCaptureSource);
   const conflicts = (p: Peer) =>
     p.event.metadata.modelEvidenceConflict === true ||
-    nativeModels(p.event).size > 1;
+    nativeModels(p.event).size > 1 ||
+    accountConflict(p.event);
   // An internally conflicting peer remains evidence of ambiguity. Dropping
   // it before counting models could leave one clean log and select its model.
   const logs = native.filter(
@@ -396,7 +442,8 @@ export function captureCodexModel(
   const traceModels = unique(traced, (e) => text(e.model));
   if (traceModels.length > 1) return gap("ambiguous_trace_model");
   if (
-    unique(traced, (e) => text(e.metadata["user.account_id"])).length > 1 ||
+    traced.some((p) => accountConflict(p.event)) ||
+    traced.some((p) => traced.some((other) => !compatible(p.event, other.event))) ||
     unique(traced, (e) => trustedSession(e)).length > 1
   )
     return gap("ambiguous_trace_identity");
@@ -449,6 +496,7 @@ export function captureCodexModel(
       local.push({
         event: {
           ...event,
+          ...(name.account ? { actorId: name.account } : { actorId: undefined }),
           model: name.model,
           metadata: {
             ...event.metadata,
@@ -460,7 +508,10 @@ export function captureCodexModel(
   }
   const localModels = unique(local, (e) => text(e.model));
   if (localModels.length > 1) return gap("ambiguous_local_turn_model");
-  if (unique(local, (e) => text(e.metadata["user.account_id"])).length > 1)
+  if (
+    local.some((p) => accountConflict(p.event)) ||
+    local.some((p) => local.some((other) => !compatible(p.event, other.event)))
+  )
     return gap("ambiguous_local_turn_identity");
   if (
     localModels.length === 1 &&

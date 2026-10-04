@@ -75,6 +75,40 @@ const idSchema = z.string().trim().min(1);
 const keySchema = z.string().trim().min(1);
 const metadataSchema = z.record(z.string(), z.unknown()).default({});
 
+/** Cloud and collector share this maximum for provider-reported plan windows. */
+export const MAX_PLAN_LIMIT_WINDOW_MINUTES = 525_600;
+
+/**
+ * Validate the optional plan-window fields carried by a plan-limit event.
+ *
+ * Older ledgers may not have either field, so absence remains valid. When a
+ * producer supplies a numeric window, or encodes one as `window_<n>m`, the
+ * value must stay within the cloud contract before it can be sealed.
+ */
+export function isPlanLimitWindowWithinBound(metadata: Record<string, unknown>): boolean {
+  const rawMinutes = metadata.planLimitWindowMinutes;
+  if (rawMinutes !== undefined) {
+    const minutes = typeof rawMinutes === "number"
+      ? rawMinutes
+      : typeof rawMinutes === "string" && /^\d+$/.test(rawMinutes.trim())
+        ? Number(rawMinutes)
+        : NaN;
+    if (!Number.isSafeInteger(minutes) || minutes <= 0 || minutes > MAX_PLAN_LIMIT_WINDOW_MINUTES) {
+      return false;
+    }
+  }
+
+  const rawWindow = metadata.planLimitWindow;
+  if (rawWindow !== undefined) {
+    if (typeof rawWindow !== "string" || !rawWindow.trim()) return false;
+    const match = rawWindow.trim().match(/^window_(\d+)m$/);
+    if (match && (!Number.isSafeInteger(Number(match[1])) || Number(match[1]) <= 0 ||
+      Number(match[1]) > MAX_PLAN_LIMIT_WINDOW_MINUTES)) return false;
+  }
+
+  return true;
+}
+
 /** Canonical privacy-preserving linkage used on every outbound boundary.
  * Uppercase hexadecimal input is accepted for legacy compatibility and
  * normalized to the exact lowercase wire representation. */
@@ -322,6 +356,11 @@ export const aiInteractionEventSchema = z
       event.costUsd === undefined && event.costKind === undefined
     ),
     { message: "Plan-limit observations cannot carry usage or cost." },
+  )
+  .refine(
+    (event) => event.eventType !== "plan_limit_observation" ||
+      isPlanLimitWindowWithinBound(event.metadata),
+    { message: "Plan-limit observations cannot exceed the provider window bound." },
   )
   .refine(
     (event) => event.eventType !== "usage_live" || (

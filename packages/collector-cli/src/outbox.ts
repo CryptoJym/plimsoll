@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import type Database from "better-sqlite3";
 
 import {
+  aiInteractionEventSchema,
   aiWorkIngestEventSchema,
   type AiWorkIngestEvent,
 } from "../../shared/src/index";
@@ -291,6 +292,7 @@ type ActiveDeliveryRow = {
   rawCreatedAt: string | null;
   rawGeneration: string | null;
   baseEnvelopeJson: string;
+  rawPayloadJson: string | null;
   sealedEnvelopeJson: string | null;
   repoHash: string | null;
   branchHash: string | null;
@@ -2138,6 +2140,8 @@ export class DeliveryOutbox {
              raw_id as rawId, raw_created_at as rawCreatedAt,
              raw_generation as rawGeneration,
              base_envelope_json as baseEnvelopeJson,
+             (select payload_json from buffered_events raw
+               where raw.rowid = upload_outbox.raw_rowid) as rawPayloadJson,
              sealed_envelope_json as sealedEnvelopeJson,
              repo_hash as repoHash, branch_hash as branchHash,
              device_id as deviceId,
@@ -2211,7 +2215,24 @@ export class DeliveryOutbox {
             );
             continue;
           }
-          parsed.event = captureCodexModel(this.db, parsed.event, row.rawId ?? parsed.event.id);
+          // Sealed base envelopes intentionally omit local capture diagnostics
+          // for rollback readers. Re-read the immutable raw payload here so
+          // turn IDs and nested evidence still participate in capture; only
+          // the resulting outbound event is sealed below.
+          let captureInput = parsed.event;
+          if (row.rawPayloadJson) {
+            try {
+              captureInput = aiInteractionEventSchema.parse(JSON.parse(row.rawPayloadJson));
+            } catch {
+              captureInput = parsed.event;
+            }
+          }
+          const captured = captureCodexModel(
+            this.db,
+            captureInput,
+            row.rawId ?? parsed.event.id,
+          );
+          parsed.event = { ...captured, id: parsed.event.id };
           const sealed = sealOutboundEnvelope(
             attachFillOnlyLinkage(
               parsed,
