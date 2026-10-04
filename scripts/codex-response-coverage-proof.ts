@@ -99,6 +99,10 @@ async function main(){try{
    assert.equal(summary.snapshot!.outputTokens,expectedOutput);assert.equal(summary.snapshot!.cacheReadTokens,secondCache);
 
    if(shape==='partial')assert.ok(good.some((i:any)=>i.envelope.event.inputTokens===0&&i.envelope.event.outputTokens===2));
+   for(const item of good){const ev=item.envelope.event;
+    if(ev.metadata.otelEventName==='codex.sse_event'&&ev.inputTokens===0&&ev.metadata.input_token_count!==undefined)
+     assert.equal(ev.metadata.input_token_count,0,'wire aliases retain only the unpaid input portion');}
+
    return {passed:true,totals,retainedDeliveries:good.map((i:any)=>i.envelope.event),shape};
   }finally{f.close();}
  });

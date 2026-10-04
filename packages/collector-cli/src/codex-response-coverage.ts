@@ -7,6 +7,17 @@ import { sealOutboundEnvelope } from "./outbound-envelope";
 
 export const CODEX_RESPONSE_DUPLICATE = "codex_response_covered";
 const FIELDS = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens", "costUsd"] as const;
+// A history slice probes the same fixed SQL for each native counter. Keep
+// compilation and its allocation off the writer loop; the bounded cache is
+// connection-local and SQLite reparses statements after schema changes.
+const statementCaches = new WeakMap<Database.Database,Map<string,Database.Statement>>();
+function statement(db: Database.Database, sql: string) {
+  let cache=statementCaches.get(db);
+  if (!cache) {cache=new Map();statementCaches.set(db,cache);}
+  const cached=cache.get(sql);if(cached)return cached;
+  if(cache.size>=32)cache.clear();
+  const prepared=db.prepare(sql);cache.set(sql,prepared);return prepared;
+}
 type Row = { rowid: number; id: string; created: string; generation: string; workspace: string;
   device: string; epoch: string; payload: string; duplicate: string | null };
 const columns = `e.rowid,e.id,e.created_at as created,e.privacy_generation as generation,
@@ -18,7 +29,7 @@ const sse = (e: AiInteractionEvent) => e.metadata.otelEventName === "codex.sse_e
 const span = (e: AiInteractionEvent) => e.metadata.otelEventName === "handle_responses";
 const otlp = (e: AiInteractionEvent) => sse(e) || span(e);
 const completion = (e: AiInteractionEvent) => span(e) ? e.metadata.otelSpanEndAt : e.observedAt;
-const table = (db: Database.Database) => Boolean(db.prepare(
+const table = (db: Database.Database) => Boolean(statement(db,
   "select 1 from sqlite_master where type='table' and name='codex_response_coverage'").get());
 
 function accounts(e: AiInteractionEvent) {
@@ -70,7 +81,7 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
       (!event.sessionId && !exactPeerId) || event.metadata.counterLineage) return undefined;
   let binding: Pick<Row, "workspace" | "device" | "epoch"> | undefined;
   try {
-    binding = raw ?? db.prepare(`select current_workspace_id as workspace,current_device_id as device,
+    binding = raw ?? statement(db,`select current_workspace_id as workspace,current_device_id as device,
       current_installation_epoch_id as epoch from collector_workspace_binding where singleton=1`).get() as typeof binding;
   } catch (error) {
     if (error instanceof Error && /no such (table|column)/.test(error.message)) return undefined;
@@ -82,7 +93,7 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
   if (typeof at !== "string" || !Number.isFinite(Date.parse(at))) return undefined;
   const peerCompletion = "case when json_extract(e.payload_json,'$.metadata.otelEventName')='handle_responses' then json_extract(e.payload_json,'$.metadata.otelSpanEndAt') else e.observed_at end";
   const otlpPredicate = "json_extract(e.payload_json,'$.metadata.otelEventName') in ('codex.sse_event','handle_responses')";
-  const rows = db.prepare(`select ${columns} from buffered_events e
+  const rows = statement(db,`select ${columns} from buffered_events e
     where e.source='codex' and ${exactPeerId ? '1' : 'e.session_id=?'} and e.id<>? and e.workspace_id=?
       and e.device_id=? and e.installation_epoch_id=? and e.usage_duplicate_reason is null
       and ${native(event) ? otlpPredicate
@@ -111,11 +122,11 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     // The full raw incarnation, boundary and privacy checks hold at each hop.
     while (table(db)) {
       const last = contributors[contributors.length-1]!.row;
-      if (native(event) && db.prepare(`select 1 from codex_response_coverage
+      if (native(event) && statement(db,`select 1 from codex_response_coverage
         where owner_rowid=? and owner_id=? and owner_created=? and owner_generation=?
           and native_id<>? and native_id not like 'otel:%'`)
         .get(last.rowid,last.id,last.created,last.generation,nativeId)) return [];
-      const parent = db.prepare(`select ${columns} from codex_response_coverage c join buffered_events e
+      const parent = statement(db,`select ${columns} from codex_response_coverage c join buffered_events e
         on e.rowid=c.owner_rowid and e.id=c.owner_id and e.created_at=c.owner_created
           and e.privacy_generation=c.owner_generation
         where c.raw_rowid=? and c.raw_id=? and c.raw_created=? and c.raw_generation=? and ${eligible}
@@ -168,17 +179,21 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
       : estimateCostUsd({model:event.model,inputTokens:remaining.inputTokens,outputTokens:remaining.outputTokens,
         cacheReadTokens:remaining.cacheReadTokens,cacheCreationTokens:remaining.cacheCreationTokens})?.costUsd;
   }
-  if (remaining.costUsd !== undefined && remaining.costUsd !== event.costUsd) {
-    for (const key of [...usageFieldKeys.reportedCostUsd,...usageFieldKeys.estimatedCostUsd])
-      if (remaining.metadata[key] !== undefined) remaining.metadata[key]=remaining.costUsd;
-    const attrs=remaining.metadata.otelAttributes;
-    if (attrs && typeof attrs === "object" && !Array.isArray(attrs)) {
-      const adjusted: Record<string,unknown>={...attrs};
-      for (const key of [...usageFieldKeys.reportedCostUsd,...usageFieldKeys.estimatedCostUsd])
-        if(key in adjusted)adjusted[key]=remaining.costUsd;
-      remaining.metadata.otelAttributes=adjusted;
+  const aliases = {inputTokens:usageFieldKeys.inputTokens,outputTokens:usageFieldKeys.outputTokens,
+    cacheReadTokens:usageFieldKeys.cacheReadTokens,cacheCreationTokens:usageFieldKeys.cacheCreationTokens,
+    costUsd:[...usageFieldKeys.costUsd,...usageFieldKeys.estimatedCostUsd]};
+  const attrs=remaining.metadata.otelAttributes;
+  const adjusted: Record<string,unknown>|undefined=attrs&&typeof attrs==='object'&&!Array.isArray(attrs)
+    ? {...attrs}:undefined;
+  for(const field of FIELDS)if(remaining[field]!==event[field])for(const key of aliases[field]) {
+    if(key in remaining.metadata) {
+      if(remaining[field]===undefined)delete remaining.metadata[key];else remaining.metadata[key]=remaining[field];
+    }
+    if(adjusted&&key in adjusted) {
+      if(remaining[field]===undefined)delete adjusted[key];else adjusted[key]=remaining[field];
     }
   }
+  if(adjusted)remaining.metadata.otelAttributes=adjusted;
   const amountsCovered = tokensCovered && (remaining.costUsd ?? 0) === 0;
   // An absent field has never attested a reported zero. Keep a named zero
   // remainder for any newly known field instead of hiding its completeness.
@@ -194,7 +209,7 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
       primary key(raw_rowid,raw_id,raw_created,raw_generation)
     ); create index if not exists idx_codex_response_owner on codex_response_coverage
       (owner_rowid,owner_id,owner_created,owner_generation,native_id);`);
-    db.prepare(`insert or ignore into codex_response_coverage values (?,?,?,?,?,?,?,?,?,?)`)
+    statement(db,`insert or ignore into codex_response_coverage values (?,?,?,?,?,?,?,?,?,?)`)
       .run(raw.rowid,raw.id,raw.created,raw.generation,row.rowid,row.id,row.created,row.generation,
         nativeId,JSON.stringify(event));
   }
@@ -208,7 +223,7 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
  * keep their ID/bytes; only the newly admitted twin's unsealed counters move. */
 export function applyCodexResponseCoverage(db: Database.Database, rawId: string, freeze: (id: string) => boolean,
   exactPeerId?: string) {
-  const raw = db.prepare(`select ${columns} from buffered_events e where e.id=?`).get(rawId) as Row | undefined;
+  const raw = statement(db,`select ${columns} from buffered_events e where e.id=?`).get(rawId) as Row | undefined;
   if (!raw || raw.duplicate || frozenCodexCapture(db,rawId)) return false;
   if (originalCoveredResponse(db,rawId)) return false;
   const event = JSON.parse(raw.payload) as AiInteractionEvent;
@@ -216,24 +231,24 @@ export function applyCodexResponseCoverage(db: Database.Database, rawId: string,
   if (!coverage) return false;
   if (coverage.reservationOnly) return false;
   const e = coverage.remaining;
-  db.prepare(`update buffered_events set payload_json=?,event_type=?,usage_duplicate_reason=?,
+  statement(db,`update buffered_events set payload_json=?,event_type=?,usage_duplicate_reason=?,
     input_tokens=?,output_tokens=?,cache_read_tokens=?,cache_creation_tokens=?,cost_usd=? where id=?`)
     .run(coverage.covered ? raw.payload : JSON.stringify(e),coverage.covered ? "otel_span" : event.eventType,
       coverage.covered ? CODEX_RESPONSE_DUPLICATE : null,
       coverage.covered ? null : e.inputTokens ?? null,coverage.covered ? null : e.outputTokens ?? null,
       coverage.covered ? null : e.cacheReadTokens ?? null,coverage.covered ? null : e.cacheCreationTokens ?? null,
       coverage.covered ? null : e.costUsd ?? null,rawId);
-  const queues = db.prepare(`select delivery_id as id,base_envelope_json as payload from upload_outbox
+  const queues = statement(db,`select delivery_id as id,base_envelope_json as payload from upload_outbox
     where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation=? and sealed_envelope_json is null`)
     .all(raw.rowid,raw.id,raw.created,raw.generation) as Array<{id:string;payload:string}>;
   for (const queue of queues) {
-    if (coverage.covered) db.prepare("delete from upload_outbox where delivery_id=? and sealed_envelope_json is null").run(queue.id);
+    if (coverage.covered) statement(db,"delete from upload_outbox where delivery_id=? and sealed_envelope_json is null").run(queue.id);
     else {
       const base = JSON.parse(queue.payload);
       const sealed = sealOutboundEnvelope({...base,event:{...e,id:base.event.id}});
       if (!sealed.ok) throw new Error("codex_response_remainder_seal_refused");
       const bytes = JSON.stringify(sealed.envelope);
-      db.prepare(`update upload_outbox set base_envelope_json=?,base_bytes=?
+      statement(db,`update upload_outbox set base_envelope_json=?,base_bytes=?
         where delivery_id=? and sealed_envelope_json is null`).run(bytes,Buffer.byteLength(bytes),queue.id);
     }
   }
@@ -242,7 +257,7 @@ export function applyCodexResponseCoverage(db: Database.Database, rawId: string,
 
 export function originalCoveredResponse(db: Database.Database, rawId: string) {
   if (!table(db)) return undefined;
-  const row = db.prepare(`select c.original_event_json as payload from codex_response_coverage c
+  const row = statement(db,`select c.original_event_json as payload from codex_response_coverage c
     join buffered_events e on e.rowid=c.raw_rowid and e.id=c.raw_id and e.created_at=c.raw_created
       and e.privacy_generation=c.raw_generation where e.id=?`).get(rawId) as {payload:string} | undefined;
   return row ? JSON.parse(row.payload) as AiInteractionEvent : undefined;
