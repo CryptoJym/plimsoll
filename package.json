@@ -114,6 +114,7 @@
     "proof:ordinary-repo-lease": "tsx scripts/ordinary-repo-lease-proof.ts",
     "proof:session-context-index": "tsx scripts/session-context-index-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
+    "proof:codex-capture-authority": "tsx scripts/run-proof.ts scripts/codex-capture-authority-proof.ts",
     "proof:codex-model-capture": "tsx scripts/run-proof.ts scripts/codex-model-capture-proof.ts",
     "proof:codex-span-rollout-pairing": "tsx scripts/run-proof.ts scripts/codex-span-rollout-pairing-proof.ts",
     "proof:codex-capture-invariants-matrix": "tsx scripts/run-proof.ts scripts/codex-capture-invariants-matrix-proof.ts",

@@ -7,6 +7,11 @@
   ambiguity becomes a tokenless capture gap while the original counters stay
   in local diagnostics. Paired spans no longer overwrite an existing account
   identity, and nested OTel model aliases participate in conflict checks.
+- Invalid or durably gap-decided Codex rows cannot own live session authority
+  or suppress known native rollout usage in projections. Native trace models
+  and identities remain contradiction evidence after a gap is ACKed; only
+  eligible native evidence may promote a model. Genuine Claude authority is
+  unchanged.
 - Capture diagnostics stay out of the sealed envelope so 0.7.48 and 0.7.47
   readers can replay 0.7.49 usage byte-for-byte during rollback. Plan-limit
   windows are bounded to 525,600 minutes before emission or sealing, while
@@ -29,10 +34,13 @@
 - The capture contract proof executes and asserts all 147 combinations of seven
   evidence tiers, three outbox states and seven delivery paths, including the
   span-plus-rollout one-owner shape, live lease refusals, aggregate billing
-  counts, a real 0.7.48 upgrade reader, replay-then-restamp, and late
+  counts, 0.7.48 reader compatibility, replay-then-restamp, and late
   contradictory native evidence. Native retries and terminal replays keep their
   frozen ID and bytes; sealed gaps remain tokenless and cannot be restamped or
-  regain counters.
+  regain counters. The three twin upgrade cells compose the pairing helper
+  with synthetic stable-turn evidence; opening or leasing a historical ledger
+  does not automatically pair its existing twins. A real 0.7.47 tailer fixture
+  separately proves one named span plus one tokenless rollout gap on upgrade.
 
 ## 0.7.48 — 2026-10-03 (unpublished)
 

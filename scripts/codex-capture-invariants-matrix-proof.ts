@@ -54,6 +54,7 @@ type Cell = {
   inputTokens?: number; outputTokens?: number; frozenBytesSame?: boolean;
   frozenHold?: boolean;
   replacement?: boolean;
+  coverage?: string;
 };
 
 function id() { return crypto.randomUUID(); }
@@ -438,9 +439,9 @@ async function runUpgradeCell(evidence: Evidence, state: State): Promise<Cell> {
     if (evidence === "span plus rollout twin") {
       const paired = pairCodexSpanRolloutEvent(f.buffer.database, f.focusId);
       assert.ok(paired && paired.ownerId === f.focusId,
-        "current reader pairs the historical span/rollout twin");
-      operations.push({ name: "current reader pairs historical span/rollout", leaseItems: 0,
-        detail: "upgrade keeps one rollout owner and leaves any frozen span bytes unchanged" });
+        "explicit helper composition pairs synthetic stable-turn twins");
+      operations.push({ name: "explicit helper composition after historical reader", leaseItems: 0,
+        detail: "synthetic current turn evidence; production open/lease does not automatically pair existing historical twins" });
     }
     let result: Lease;
     let replacement = false;
@@ -465,6 +466,7 @@ async function runUpgradeCell(evidence: Evidence, state: State): Promise<Cell> {
     return { evidence, state, path: "upgrade", result: "PASS", operations,
       refusals: state === "sealed and unacknowledged" ? ["historical live-lease refusal"] : [],
       aggregate: checked.aggregate, i1: true, i2: true, i3: true, frozenHold, replacement,
+      ...(evidence === "span plus rollout twin" ? { coverage: "helper composition with synthetic stable-turn evidence; not automatic historical upgrade pairing" } : {}),
       deliveryId: checked.output.id, model: checked.output.event.model,
       inputTokens: checked.output.event.inputTokens, outputTokens: checked.output.event.outputTokens,
       frozenBytesSame: checked.sameBytes };

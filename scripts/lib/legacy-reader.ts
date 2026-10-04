@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 export async function withReader<T>(commit: string, run: (modules: {
   Buffer: any;
   reconciliation: any;
+  Tailer: any;
 }) => Promise<T> | T): Promise<T> {
   const root = path.join(
     process.cwd(),
@@ -20,11 +21,12 @@ export async function withReader<T>(commit: string, run: (modules: {
   const modules = path.join(process.cwd(), "node_modules");
   if (fs.existsSync(modules)) fs.symlinkSync(modules, path.join(root, "node_modules"), "dir");
   try {
-    const [buffer, reconciliation] = await Promise.all([
+    const [buffer, reconciliation, rollout] = await Promise.all([
       import(pathToFileURL(path.join(root, "packages/collector-cli/src/buffer.ts")).href),
       import(pathToFileURL(path.join(root, "packages/collector-cli/src/codex-reconciliation.ts")).href),
+      import(pathToFileURL(path.join(root, "packages/collector-cli/src/rollout-tailer.ts")).href),
     ]);
-    return await run({ Buffer: buffer.LocalEventBuffer, reconciliation });
+    return await run({ Buffer: buffer.LocalEventBuffer, reconciliation, Tailer: rollout.RolloutTailer });
   } finally {
     try { execFileSync("git", ["worktree", "remove", "--force", root], { cwd: process.cwd(), stdio: "ignore" }); } catch { /* best effort cleanup */ }
     fs.rmSync(root, { recursive: true, force: true });
