@@ -14,8 +14,9 @@ import { createProofCompletion } from "./lib/proof-completion";
 import { installVirtualClock, restoreRealClock } from "./lib/virtual-clock";
 
 const completion = createProofCompletion("codex-scan-discovery", 5);
+const fixtureNow = new Date("2026-10-04T12:00:00.000Z");
 const record = (type: string, payload: object) =>
-  JSON.stringify({ type, payload, timestamp: new Date().toISOString() }) + "\n";
+  JSON.stringify({ type, payload, timestamp: fixtureNow.toISOString() }) + "\n";
 const usage = (input: number) => record("event_msg", {
   type: "token_count", info: { total_token_usage: { input_tokens: input, output_tokens: input / 10 } },
 });
@@ -28,7 +29,7 @@ async function fixture(body: (f: {
 }) => Promise<void>) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-discovery-"));
   const sessions = path.join(root, "sessions");
-  const partition = path.join(sessions, ...new Date().toISOString().slice(0, 10).split("-"));
+  const partition = path.join(sessions, ...fixtureNow.toISOString().slice(0, 10).split("-"));
   const claude = path.join(root, "claude");
   fs.mkdirSync(partition, { recursive: true });
   fs.mkdirSync(claude);
@@ -43,7 +44,7 @@ async function fixture(body: (f: {
     assert.equal(captureBaselineStatus(buffer.database).status, "complete");
     await new Promise(resolve => setTimeout(resolve, 5));
     await body({ buffer, tailer, partition, scan: (budget = new CaptureWorkBudget()) =>
-      tailer.scan({ scope: "recent", automatic: { phase: "capture", budget } }) });
+      tailer.scan({ scope: "recent", now: fixtureNow, automatic: { phase: "capture", budget } }) });
   } finally {
     restoreRealClock();
     maintenance.close();
@@ -57,7 +58,7 @@ const cases = [
     for (let n = 0; n < 24; n++) fs.writeFileSync(path.join(f.partition, `rollout-${n}.jsonl`), "{}\n");
     let metadata = 0;
     const signal = new AbortController();
-    const first = await f.tailer.scan({ scope: "recent", signal: signal.signal,
+    const first = await f.tailer.scan({ scope: "recent", now: fixtureNow, signal: signal.signal,
       automatic: { phase: "capture", budget: new CaptureWorkBudget() },
       onProgress: progress => {
         if (progress.stage === "candidate_metadata" && ++metadata === 4) {
@@ -112,6 +113,7 @@ const cases = [
       const session = randomUUID();
       const file = path.join(f.partition, `rollout-small-${index}-${session}.jsonl`);
       fs.writeFileSync(file, prefix(session) + usage(10) + ignored.repeat(60));
+      fs.utimesSync(file, fixtureNow, fixtureNow);
       return { session, file, total: 10 };
     });
     for (let turn = 0; turn < 16 && !small.every(tail => offset(tail.file) === fs.statSync(tail.file).size); turn++) {
@@ -125,10 +127,10 @@ const cases = [
     fs.writeFileSync(large, largePrefix + record("fixture_ignored", { padding: "x".repeat(600 * 1024) }));
     // Keep the uncursored large generation newest in the same UTC day, so
     // the fixture isolates size priority rather than discovery or mtime order.
-    const newest = new Date(Date.now() + 60_000);
-    assert.equal(newest.toISOString().slice(0, 10), new Date().toISOString().slice(0, 10));
+    const newest = new Date(fixtureNow.getTime() + 60_000);
+    assert.equal(newest.toISOString().slice(0, 10), fixtureNow.toISOString().slice(0, 10));
     fs.utimesSync(large, newest, newest);
-    const smallPriorityTime = Date.now() + 1000;
+    const smallPriorityTime = fixtureNow.getTime() + 1000;
     const largeUsage = () => (f.buffer.database.prepare(
       "select coalesce(sum(input_tokens),0) as n from buffered_events where session_id=? and event_type='usage_rollout'",
     ).get(session) as { n: number }).n;
