@@ -2,7 +2,7 @@
 // filesystem baseline, 20 roots, 248 excluded files, SQLite and maintenance.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";

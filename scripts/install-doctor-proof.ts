@@ -7,7 +7,7 @@
  * unloads, or starts a real LaunchAgent and never reads the operator's tool
  * config, ledger, or credentials.
  */
-import { spawn } from "node:child_process";
+import { spawn } from "./lib/proof-child-process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
