@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 
 // CI fetches complete ancestry. Run the actual 0.7.44 buffer implementation
 // against a fixture ledger without publishing or installing an old package.

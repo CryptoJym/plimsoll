@@ -244,6 +244,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:doctor-stale-producers
 
+      - name: Prove tsx IPC pipe collisions cannot block proof children
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:tsx-ipc-pipe
+
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:packaged-runtime

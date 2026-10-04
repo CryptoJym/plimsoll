@@ -1,5 +1,5 @@
 /** Directed join fixtures from the independent PR #428 round-four review. */
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import path from "node:path";
 
 const selected = process.argv[2];

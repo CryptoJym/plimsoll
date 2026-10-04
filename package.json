@@ -26,6 +26,7 @@
     "proof:grok-worker-replacement": "tsx scripts/grok-worker-replacement-proof.ts",
     "runtime:build": "tsx scripts/build-packaged-runtime.ts",
     "runtime:verify": "tsx scripts/build-packaged-runtime.ts --verify",
+    "proof:tsx-ipc-pipe": "node --import tsx scripts/proof-tsx-ipc-pipe-proof.ts",
     "proof:packaged-runtime": "tsx scripts/run-proof.ts scripts/packaged-runtime-proof.ts",
     "proof:allocation": "tsx scripts/event-allocation-proof.ts",
     "proof:work-linkage": "tsx scripts/work-linkage-proof.ts",

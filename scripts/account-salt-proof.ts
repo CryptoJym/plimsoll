@@ -2,7 +2,7 @@
 
 /** Contract proof for hosted tenant account-actor salt acquisition. */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn } from "./lib/proof-child-process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";

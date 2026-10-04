@@ -1,7 +1,7 @@
 /** Two old classifier failures must be rejected by the real claim proof.
  * Mutants live only under the CI proof home; the checkout is never edited. */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./proof-child-process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
