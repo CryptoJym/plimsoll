@@ -444,7 +444,7 @@ async function main() {
     const h = new Harness("trace-beats-guessed-session");
     try {
       h.at(100); h.append(contextEvent(SESSION_B, T0 - 1_490));
-      h.at(200); const spanId = h.append(spanEvent(R()));
+      h.at(200); h.append(spanEvent(R()));
       h.at(20_000); check("span_stitches_to_other_session_before_log", h.maintain() > 0);
       h.at(21_000); h.append(logEvent(R(), true));
       const o = h.observe();

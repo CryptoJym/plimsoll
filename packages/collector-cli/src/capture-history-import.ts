@@ -437,6 +437,7 @@ function rememberSessionBytes(db: DB, source: CaptureRoot["source"], sessionId: 
     .run(source, sessionId, length, digest);
 }
 function isLiveSession(db: DB, source: CaptureRoot["source"], sessionId: string) {
+  if (source === "codex") return hasSessionUsageAuthority(db,source,sessionId,"live") === true;
   return (db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
     .get(source, sessionId) as { authority: string } | undefined)?.authority === "live";
 }
@@ -1235,9 +1236,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
           const e = item.candidate.event;
           // A concurrent live writer may have won the session while files
           // were read; session authority is checked again under the writer.
-          const authority = db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
-            .get(root.source, e.sessionId) as { authority: string } | undefined;
-          if (authority?.authority !== "live" && appendRootObservation(buffer, e, root, false, true)) {
+          if (!isLiveSession(db,root.source,e.sessionId!) && appendRootObservation(buffer, e, root, false, true)) {
             rows += 1;
             counts.input += e.inputTokens ?? 0;
             counts.output += e.outputTokens ?? 0;

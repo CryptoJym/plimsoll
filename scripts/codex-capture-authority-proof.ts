@@ -7,7 +7,7 @@ import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { captureCodexModel, recordCodexTurnModel, rememberCaptureGap } from "../packages/collector-cli/src/codex-model-capture";
 import { beginAutomaticCaptureBaseline,completeAutomaticCaptureBaseline,sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
 import { deriveCaptureRootIdentity } from "../packages/collector-cli/src/capture-root-inventory";
-import { planCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
+import { planCaptureHistory,applyCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
 import { aiInteractionEventSchema, type AiInteractionEvent } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
 import { proofTempRoot, withReader } from "./lib/legacy-reader";
@@ -264,7 +264,17 @@ async function historyPlanAuthority(valid: boolean,unkeyed: boolean) {
     else {
       const plan=await planCaptureHistory(f.buffer.database,captureRoot);
       assert.equal(plan.skippedLiveSessions,valid ? 1 : 0); assert.equal(plan.missingRows,valid ? 0 : 1);
-      if (!valid) {assert.equal(plan.tokens.input,19);assert.equal(plan.tokens.output,2);}
+      if (!valid) {
+        assert.equal(plan.tokens.input,19);assert.equal(plan.tokens.output,2);
+        // Old ledgers can retain a live claim even though its raw witness was
+        // financially rejected. Both planning and the writer must revalidate.
+        if (!unkeyed) f.buffer.database.prepare(`insert or replace into session_usage_authority
+          (source,session_id,authority,claimed_at) values ('codex',?,'live',?)`).run(SESSION,new Date().toISOString());
+        const imported=await applyCaptureHistory(f.buffer,captureRoot);
+        assert.equal(imported.importedRows,1);
+        assert.equal((f.buffer.database.prepare("select count(*) as n from buffered_events where event_type='usage_rollout'")
+          .get() as {n:number}).n,1);
+      }
     }
     completion.check(`history planner ${unkeyed ? "unkeyed overlap" : "keyed authority"} ${valid ? "valid native SSE" : "ACKed gap"}`);
   } finally {f.close();}
