@@ -187,12 +187,17 @@ function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
       ? [[time - PAIR_WINDOW_MS, time + PAIR_WINDOW_MS],
          [spanEnd - PAIR_WINDOW_MS, spanEnd + PAIR_WINDOW_MS]]
       : [[time - PAIR_WINDOW_MS, time + PAIR_WINDOW_MS]];
+  const capturedOwner = wanted === "span" && db.prepare(
+    "select 1 from sqlite_master where type='table' and name='codex_named_captures'").get()
+    ? `or exists(select 1 from codex_named_captures w where w.raw_id=buffered_events.id
+        and w.raw_rowid=buffered_events.rowid and w.raw_created_at=buffered_events.created_at
+        and w.raw_generation is buffered_events.privacy_generation)` : "";
   const query = db.prepare(
     `select ${ROW_COLUMNS} from buffered_events indexed by ${index}
      where observed_at >= @start and observed_at <= @end
        and ${predicate}
        and input_tokens = @inputTokens and output_tokens = @outputTokens
-       and usage_duplicate_reason is null and usage_paired_event_id is null
+       and usage_duplicate_reason is null and (usage_paired_event_id is null ${capturedOwner})
        and id != @id
      order by observed_at, id limit ${MAX_NEARBY_ROWS + 1}`,
   );

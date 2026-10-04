@@ -47,7 +47,10 @@
   after new contradictory evidence; those facts still gate new captures.
   Native readers freeze qualified live coverage before consuming cumulative
   counters, while transport retains its 60-second hold across an abrupt crash.
-  A late SSE twin preserves an already-frozen named span as the counted owner.
+  Late SSE and rollout twins preserve an already-frozen named span as the
+  counted owner, including an actual 0.7.48 writer running during rollback.
+  Stateless and history snapshots also freeze their matching queue copy so
+  those captures cannot become restampable before their first outbox lease.
 - History import carries explicit native turn IDs and same-turn model conflicts
   through parsing, byte checkpoints and tailer handoff. Known native turns stay
   billable; missing turns and conflicting models still produce tokenless gaps.

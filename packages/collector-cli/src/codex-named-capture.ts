@@ -60,6 +60,43 @@ export function installCodexFrozenCompatibility(db: Database.Database) {
         where delivery_id=new.delivery_id and raw_rowid is new.raw_rowid and raw_id is new.raw_id
           and raw_created_at is new.raw_created_at and raw_generation is new.raw_generation;
     end;
+    -- Released writers always choose the SSE as owner. If a named span was
+    -- already captured, retain its financial row and classify the new exact
+    -- log twin as diagnostic instead. All original payload facts remain.
+    create trigger if not exists trg_codex_named_span_pair after update of usage_duplicate_reason on buffered_events
+    when new.usage_duplicate_reason='codex_sse_event_span' and exists(
+      select 1 from codex_named_captures w join buffered_events l on l.id=new.usage_paired_event_id
+      where w.raw_rowid=new.rowid and w.raw_id=new.id and w.raw_created_at=new.created_at
+        and w.raw_generation is new.privacy_generation and l.workspace_id is new.workspace_id
+        and l.device_id is new.device_id and l.installation_epoch_id is new.installation_epoch_id
+        and l.input_tokens=old.input_tokens and l.output_tokens=old.output_tokens
+        and not exists(select 1 from codex_named_captures other where other.raw_id=l.id)
+        and not exists(select 1 from upload_outbox q where q.raw_id=l.id and q.sealed_envelope_json is not null))
+    begin
+      update buffered_events set usage_duplicate_reason=old.usage_duplicate_reason,event_type=old.event_type,
+        input_tokens=old.input_tokens,output_tokens=old.output_tokens,cache_read_tokens=old.cache_read_tokens,
+        cache_creation_tokens=old.cache_creation_tokens,cost_usd=old.cost_usd where rowid=new.rowid;
+      update buffered_events set usage_duplicate_reason='codex_sse_event_span',event_type='otel_span',
+        input_tokens=null,output_tokens=null,cache_read_tokens=null,cache_creation_tokens=null,cost_usd=null
+        where id=new.usage_paired_event_id;
+    end;
+    create trigger if not exists trg_codex_named_span_pair_keep before delete on upload_outbox
+    when not exists(select 1 from upload_receipts where delivery_id=old.delivery_id) and exists(
+      select 1 from codex_named_captures w join buffered_events s on s.rowid=w.raw_rowid and s.id=w.raw_id
+        and s.created_at=w.raw_created_at and s.privacy_generation is w.raw_generation
+        join buffered_events l on l.id=s.usage_paired_event_id and l.usage_duplicate_reason='codex_sse_event_span'
+      where w.delivery_id=old.delivery_id and w.raw_rowid is old.raw_rowid and w.raw_id is old.raw_id
+        and w.raw_created_at is old.raw_created_at and w.raw_generation is old.raw_generation
+        and s.privacy_disposition is null)
+    begin select raise(ignore); end;
+    create trigger if not exists trg_codex_named_span_pair_skip after insert on upload_outbox
+    when new.sealed_envelope_json is null and exists(
+      select 1 from buffered_events l join codex_named_captures w on w.raw_id=l.usage_paired_event_id
+        join buffered_events s on s.rowid=w.raw_rowid and s.id=w.raw_id and s.created_at=w.raw_created_at
+          and s.privacy_generation is w.raw_generation
+      where l.rowid=new.raw_rowid and l.id=new.raw_id and l.created_at=new.raw_created_at
+        and l.privacy_generation is new.raw_generation and l.usage_duplicate_reason='codex_sse_event_span')
+    begin delete from upload_outbox where delivery_id=new.delivery_id; end;
     create trigger if not exists trg_codex_terminal_frozen after insert on upload_receipts
     when new.terminal_state='dead' and new.reason like 'remote_%'
     begin
