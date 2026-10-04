@@ -47,19 +47,29 @@
   after new contradictory evidence; those facts still gate new captures.
   Native readers freeze qualified live coverage before consuming cumulative
   counters, while transport retains its 60-second hold across an abrupt crash.
+  Codex coverage is per native response and financial field: an exact twin
+  consumes only retained accounting, preserves the first delivery's bytes,
+  and leaves later cumulative turn deltas billable on tailing and history.
+  Partial SSE/span updates retain only unpaid fields; newly reported zeros
+  remain known even beside an already-frozen owner with that field absent.
   Late SSE and rollout twins preserve an already-frozen named span as the
   counted owner, including an actual 0.7.48 writer running during rollback.
   Stateless and history snapshots also freeze their matching queue copy so
   those captures cannot become restampable before their first outbox lease.
 - History import carries explicit native turn IDs and same-turn model conflicts
   through parsing, byte checkpoints and tailer handoff. Known native turns stay
-  billable; missing turns and conflicting models still produce tokenless gaps.
+  billable when uncovered by that response's retained accounting; missing
+  turns and conflicting models still produce tokenless gaps.
   Turnless history fails capture admission before peer scans, and writer slices
-  reuse session admission within their transaction.
-- A seeded operation proof drives 200 small-session worlds through production
+  reuse Claude session admission within their transaction. Codex projection
+  and summary readers no longer suppress whole sessions after one SSE.
+- A seeded operation proof drives 200 worlds with multiple responses and
+  cumulative counters through production
   ingest, pairing, native tailing, history, retries, ACK, replay, restamp and the
   actual 0.7.47/0.7.48 readers. It checks accounting after every operation and
-  retains directed counterexamples. This finite coverage complements the matrix;
+  retains directed counterexamples. Its independent producer oracle checks
+  every financial field, including diagnostic, zero, partial and cache/cost
+  signals. This finite coverage complements the matrix;
   it does not claim every possible producer shape or operation sequence.
 
 ## 0.7.48 — 2026-10-03 (unpublished)

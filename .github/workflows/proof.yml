@@ -787,6 +787,9 @@ jobs:
       - name: Prove seeded Codex accounting operation sequences
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-sequences --seeds=200
+      - name: Prove per-response native coverage and partial cumulative accounting
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-response-coverage
       - name: Prove Codex response spans and rollout marginals count once
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-span-rollout-pairing
