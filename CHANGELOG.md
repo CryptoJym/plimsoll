@@ -23,7 +23,7 @@
 - The same native-provenance and durable-gap checks now cover SSE rows, sealed
   retries, history upload, migration, pairing refresh and remote dead-letter
   replay. A recorded gap cannot regain counters after a receipt is replaced;
-  uncertain frozen deliveries retire to a distinct tokenless replacement.
+  unsafe legacy guesses retire to a distinct tokenless replacement.
 - A model-less `handle_responses` span with usage counts pairs with one mutually
   unique, model-bearing rollout marginal only when its workspace, install,
   device, session, turn, account, model and exact counters agree. The rollout
@@ -41,6 +41,23 @@
   with synthetic stable-turn evidence; opening or leasing a historical ledger
   does not automatically pair its existing twins. A real 0.7.47 tailer fixture
   separately proves one named span plus one tokenless rollout gap on upgrade.
+
+- Valid native named captures now retain a lineage-bound accounting witness.
+  Retry, ACK, remote replay and rollback preserve their frozen IDs and bytes
+  after new contradictory evidence; those facts still gate new captures.
+  Native readers freeze qualified live coverage before consuming cumulative
+  counters, while transport retains its 60-second hold across an abrupt crash.
+  A late SSE twin preserves an already-frozen named span as the counted owner.
+- History import carries explicit native turn IDs and same-turn model conflicts
+  through parsing, byte checkpoints and tailer handoff. Known native turns stay
+  billable; missing turns and conflicting models still produce tokenless gaps.
+  Turnless history fails capture admission before peer scans, and writer slices
+  reuse session admission within their transaction.
+- A seeded operation proof drives 200 small-session worlds through production
+  ingest, pairing, native tailing, history, retries, ACK, replay, restamp and the
+  actual 0.7.47/0.7.48 readers. It checks accounting after every operation and
+  retains directed counterexamples. This finite coverage complements the matrix;
+  it does not claim every possible producer shape or operation sequence.
 
 ## 0.7.48 — 2026-10-03 (unpublished)
 

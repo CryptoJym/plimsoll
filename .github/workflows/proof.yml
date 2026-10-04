@@ -778,6 +778,15 @@ jobs:
       - name: Prove gap-decided Codex rows cannot claim authority or erase native conflicts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-authority
+      - name: Prove native capture finality and explicit history turns
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-finality
+      - name: Prove held native coverage survives an abrupt fixture crash
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-hold-crash
+      - name: Prove seeded Codex accounting operation sequences
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-sequences --seeds=200
       - name: Prove Codex response spans and rollout marginals count once
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-span-rollout-pairing

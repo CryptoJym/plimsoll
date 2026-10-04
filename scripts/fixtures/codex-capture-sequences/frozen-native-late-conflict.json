@@ -1,0 +1,9 @@
+{
+  "finding": "R7-P0-02",
+  "operations": [
+    "sse-valid",
+    "expire-retry",
+    "trace-astra",
+    "expire-retry"
+  ]
+}
