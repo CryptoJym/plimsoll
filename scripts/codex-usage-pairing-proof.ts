@@ -322,8 +322,12 @@ async function main() {
     try {
       h.at(200); h.append(kind === "log" ? logEvent(R()) : spanEvent(R()));
       const local = h.observe();
-      check(`lone_${kind}_counts_once`, once(local) && (kind !== "log" || local.local.cache === R().cache),
-        local);
+      if (kind === "span") check("lone_span_retains_diagnostics_without_projected_usage",
+        local.local.usageRows === 1 && local.local.input === R().input && local.local.output === R().output &&
+        local.local.cache === R().cache && local.dashboard.tokenEvents === 0 &&
+        local.dashboard.input === 0 && local.dashboard.output === 0 && local.dashboard.cache === 0 &&
+        local.dashboard.usageFacts === 0, local);
+      else check("lone_log_counts_once", once(local) && local.local.cache === R().cache, local);
       h.at(30_000); check(`lone_${kind}_held`, h.upload().items.length === 0);
       h.at(61_500); h.upload();
       const observed = h.observe();
