@@ -51,14 +51,22 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
   commit?: (rawId: string) => boolean, raw?: Row) {
   if (event.source !== "codex" || !codexHasUsage(event) || !(native(event) || sse(event)) ||
       !event.sessionId || event.metadata.counterLineage) return undefined;
-  const binding = raw ?? db.prepare(`select current_workspace_id as workspace,current_device_id as device,
-    current_installation_epoch_id as epoch from collector_workspace_binding where singleton=1`).get() as
-      Pick<Row, "workspace" | "device" | "epoch"> | undefined;
+  if (native(event) && (!turn(event) || !event.model || event.metadata.modelEvidenceConflict === true)) return undefined;
+  let binding: Pick<Row, "workspace" | "device" | "epoch"> | undefined;
+  try {
+    binding = raw ?? db.prepare(`select current_workspace_id as workspace,current_device_id as device,
+      current_installation_epoch_id as epoch from collector_workspace_binding where singleton=1`).get() as typeof binding;
+  } catch (error) {
+    if (error instanceof Error && /no such (table|column)/.test(error.message)) return undefined;
+    throw error;
+  }
   if (!binding?.epoch || !binding.device) return undefined;
   const eligible = terminalPrivacyEligibilitySql(db, "e");
   const rows = db.prepare(`select ${columns} from buffered_events e
     where e.source='codex' and e.session_id=? and e.id<>? and e.workspace_id=?
       and e.device_id=? and e.installation_epoch_id=? and e.usage_duplicate_reason is null
+      and ${native(event) ? "json_extract(e.payload_json,'$.metadata.otelEventName')='codex.sse_event'"
+        : "e.event_type='usage_rollout' and json_extract(e.payload_json,'$.metadata.usageSource')='rollout'"}
       and ${eligible} and (e.observed_at=? or (? is not null and
         coalesce(json_extract(e.payload_json,'$.metadata.codexTurnId'),
           json_extract(e.payload_json,'$.metadata."turn.id"'),json_extract(e.payload_json,'$.metadata.turn_id'))=?))
