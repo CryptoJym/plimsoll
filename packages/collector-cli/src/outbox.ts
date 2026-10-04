@@ -1,5 +1,5 @@
 import type { AiInteractionEvent } from "../../shared/src/index";
-import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, isCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, rememberCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -381,6 +381,24 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number, resolvedId?:
   };
 }
 
+function persistedGapPayload(db: Database.Database, row: RawDeliveryRow) {
+  let event: AiInteractionEvent;
+  try { event = aiInteractionEventSchema.parse(JSON.parse(row.payloadJson)); }
+  catch { return row.payloadJson; }
+  const lineage = {
+    rawRowid: row.rawRowid, rawId: row.rawId, rawCreatedAt: row.createdAt,
+    rawGeneration: row.privacyGeneration,
+  };
+  if (isCaptureGap(event)) {
+    const reason = typeof event.metadata.modelGapReason === "string"
+      ? event.metadata.modelGapReason : "legacy_capture_gap";
+    rememberCaptureGap(db, row.rawId, reason);
+    return row.payloadJson;
+  }
+  if (!codexHasUsage(event) || !hasCaptureGapDecision(db, lineage)) return row.payloadJson;
+  return JSON.stringify(codexModelGap(db, event, "persisted_capture_gap"));
+}
+
 /** Refresh only a never-attempted envelope after pairing adds cached tokens. */
 export function refreshUnsentRawDelivery(
   db: Database.Database,
@@ -405,6 +423,10 @@ export function refreshUnsentRawDelivery(
       and raw_generation is ? limit 1`).get(raw.rawRowid, raw.rawId,
     raw.createdAt, raw.privacyGeneration) as { id: string; baseEnvelopeJson: string } | undefined;
   if (!linked) return false;
+  if (hasCaptureGapDecision(db, {
+    rawRowid: raw.rawRowid, rawId: raw.rawId, rawCreatedAt: raw.createdAt,
+    rawGeneration: raw.privacyGeneration,
+  })) return false;
   try {
     const base = aiWorkIngestEventSchema.parse(JSON.parse(linked.baseEnvelopeJson));
     if (isCaptureGap(base.event)) return false;
@@ -1441,7 +1463,7 @@ export class DeliveryOutbox {
         dead: this.retireLinkedPrivacyDeliveries(row.rawRowid, row.rawId,
           row.createdAt, row.privacyGeneration, existingReceipt.reason, terminalAt) };
     }
-    const prepared = prepareDelivery(row, this.limits.maxItemBytes,
+    const prepared = prepareDelivery({ ...row, payloadJson: persistedGapPayload(this.db, row) }, this.limits.maxItemBytes,
       deliveryId === ensureUuidEventId(row.rawId).id ? undefined : deliveryId);
     if (prepared.ok === false) {
       const terminalAt = this.clock().toISOString();
@@ -1562,6 +1584,10 @@ export class DeliveryOutbox {
         workspace_id as workspaceId,device_id as deviceId,privacy_generation as privacyGeneration,
         privacy_disposition as privacyDisposition from buffered_events where id=?`).get(rawId) as RawDeliveryRow|undefined;
       if (!row || row.uploadedAt || row.privacyDisposition) return false;
+      if (hasCaptureGapDecision(this.db, {
+        rawRowid: row.rawRowid, rawId: row.rawId, rawCreatedAt: row.createdAt,
+        rawGeneration: row.privacyGeneration,
+      })) return false;
       const outbox = this.db.prepare(`select delivery_id as deliveryId,state,attempt_count as attemptCount,
         sealed_envelope_json as sealedEnvelopeJson from upload_outbox
         where raw_rowid=? and raw_id=? and raw_created_at=?
@@ -2241,7 +2267,11 @@ export class DeliveryOutbox {
           }
           const captured = isCaptureGap(parsed.event)
             ? parsed.event
-            : captureCodexModel(this.db, captureInput, row.rawId ?? parsed.event.id);
+            : captureCodexModel(this.db, captureInput, row.rawId ?? parsed.event.id, true);
+          if (isCaptureGap(parsed.event) && row.rawId) {
+            rememberCaptureGap(this.db, row.rawId,
+              String(parsed.event.metadata.modelGapReason ?? "legacy_capture_gap"));
+          }
           parsed.event = { ...captured, id: parsed.event.id };
           const sealed = sealOutboundEnvelope(
             attachFillOnlyLinkage(
@@ -2298,7 +2328,29 @@ export class DeliveryOutbox {
           locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
           continue;
         }
-        if (row.sealedEnvelopeJson && unresolvedCapture(outboundEnvelope.event)) {
+        let sealedOriginGap = false;
+        if (row.sealedEnvelopeJson && codexHasUsage(outboundEnvelope.event)) {
+          if (!row.rawId || !row.rawPayloadJson) {
+            sealedOriginGap = true;
+          } else {
+            try {
+              const rawLineage = aiInteractionEventSchema.parse(JSON.parse(row.rawPayloadJson));
+              if (isCaptureGap(rawLineage)) {
+                rememberCaptureGap(this.db, row.rawId,
+                  String(rawLineage.metadata.modelGapReason ?? "legacy_capture_gap"));
+                sealedOriginGap = true;
+              } else if (codexHasUsage(rawLineage)) {
+                const validated = captureCodexModel(this.db, rawLineage, row.rawId, true);
+                sealedOriginGap = isCaptureGap(validated) || typeof validated.model !== "string" || !validated.model.trim();
+              } else {
+                sealedOriginGap = true;
+              }
+            } catch {
+              sealedOriginGap = true;
+            }
+          }
+        }
+        if (row.sealedEnvelopeJson && (sealedOriginGap || unresolvedCapture(outboundEnvelope.event))) {
           // An old, once-attempted request may already have committed remotely.
           // Never rewrite its frozen bytes or retry unknown billable usage.
           // Retire it and send a distinct tokenless gap with the same raw lineage.

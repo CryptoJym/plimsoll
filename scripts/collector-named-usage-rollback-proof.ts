@@ -109,7 +109,10 @@ async function main() {
         actorId: accountId,
         source: "codex", dataMode: "metadata", eventType: "otel_span",
         observedAt: new Date(baseMs).toISOString(), model: "gpt-6.1-sol",
-        metadata: { otelEventName: "codex.sse_event", traceId, "user.account_id": accountId },
+        metadata: {
+          otelEventName: "codex.sse_event", traceId, "user.account_id": accountId,
+          "gen_ai.request.model": "gpt-6.1-sol",
+        },
       });
       assert.equal(buffer.append(evidence), true);
       const evidenceLease = buffer.delivery.lease({ now });

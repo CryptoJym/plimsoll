@@ -15,6 +15,10 @@
   so a lost acknowledgement cannot make the same usage billable under a new
   delivery ID. Legacy 0.7.48 proximity-assigned models without a native pair,
   trace or turn now become tokenless gaps instead of billable usage.
+- The same native-provenance and durable-gap checks now cover SSE rows, sealed
+  retries, history upload, migration, pairing refresh and remote dead-letter
+  replay. A recorded gap cannot regain counters after a receipt is replaced;
+  uncertain frozen deliveries retire to a distinct tokenless replacement.
 
 ## 0.7.48 — 2026-10-03 (unpublished)
 

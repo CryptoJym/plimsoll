@@ -781,6 +781,12 @@ jobs:
       - name: Prove legacy proximity models become tokenless gaps
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-legacy-model-evidence
+      - name: Prove every round-three capture and replay path keeps a durable gap
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-review-r4
+      - name: Prove the bound A03 plan window keeps valid usage billable
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-a03-directed
       - name: Prove named usage survives 0.7.48 and 0.7.47 rollback readers
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:collector-named-usage-rollback

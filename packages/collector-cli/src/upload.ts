@@ -64,7 +64,7 @@ export function buildIngestBatch(
   for (const row of candidateRows) {
     if (unresolvedCapture(row.payload) &&
         (options.now?.() ?? new Date()).getTime() < Date.parse(row.createdAt) + CODEX_MODEL_WAIT_MS) continue;
-    const captured = captureCodexModel(buffer.database,row.payload,row.id);
+    const captured = captureCodexModel(buffer.database,row.payload,row.id,true);
     const attributed = attribution.attribute(captured, {
       repoHash: row.repoHash,
       branchHash: row.branchHash,

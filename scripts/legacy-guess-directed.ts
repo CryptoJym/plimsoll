@@ -37,24 +37,25 @@ async function main() {
   if (fs.existsSync(installed)) fs.symlinkSync(installed,path.join(oldRoot,'node_modules'),'dir');
   const oldModules=await import(pathToFileURL(path.join(oldRoot,'packages/collector-cli/src/buffer.ts')).href);
   const oldReconciliation=await import(pathToFileURL(path.join(oldRoot,'packages/collector-cli/src/codex-reconciliation.ts')).href);
-  old=new oldModules.LocalEventBuffer(file,opts);
+  const oldReader = new oldModules.LocalEventBuffer(file,opts);
+  old = oldReader;
   const target=aiInteractionEventSchema.parse({id:targetId,sessionId:targetSession,
     source:'codex',dataMode:'metadata',eventType:'assistant_response',
     observedAt:new Date(at).toISOString(),inputTokens:19,outputTokens:2,
     metadata:{otelEventName:'handle_responses',traceId:'a'.repeat(32)},
   });
-  assert.equal(old.append(aiInteractionEventSchema.parse({id:peerId,sessionId:foreignSession,
+  assert.equal(oldReader.append(aiInteractionEventSchema.parse({id:peerId,sessionId:foreignSession,
     source:'codex',dataMode:'metadata',eventType:'otel_span',
     observedAt:new Date(at+1000).toISOString(),model:'gpt-6-astra',
     metadata:{otelEventName:'thread/read',traceId:'b'.repeat(32)},
   })),true);
-  assert.equal(old.append(target),true);
-  const maintenance=oldReconciliation.runCodexReconciliationMaintenance(old.database,{legacyRowLimit:100,legacyChunkLimit:100,
+  assert.equal(oldReader.append(target),true);
+  const maintenance=oldReconciliation.runCodexReconciliationMaintenance(oldReader.database,{legacyRowLimit:100,legacyChunkLimit:100,
     contextWindowLimit:100,contextRowLimit:100,candidateLimit:100,freshCandidateLimit:100,timeLimitMs:1000});
-  const oldRaw=JSON.parse((old.database.prepare('select payload_json as payload from buffered_events where id=?').get(targetId) as {payload:string}).payload);
+  const oldRaw=JSON.parse((oldReader.database.prepare('select payload_json as payload from buffered_events where id=?').get(targetId) as {payload:string}).payload);
   assert.equal(oldRaw.model,'gpt-6-astra','base main really guesses a model from the other session and trace');
   assert.equal(oldRaw.sessionId,targetSession);
-  old.close();old=undefined;
+  oldReader.close();old=undefined;
   now=new Date(at+123000);
   newer=new NewBuffer(file,opts);
   const leased=newer.delivery.lease({now});

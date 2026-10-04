@@ -1,4 +1,4 @@
-import { captureCodexModel, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -37,9 +37,11 @@ import {
  * the local archive backfill.
  *
  * Invariants:
- * - The ledger is opened strictly READ-ONLY. The live daemon keeps writing it
- *   (WAL) and keeps draining its own 5-minute sync; nothing here marks rows
- *   uploaded or touches collector.config.json.
+ * - Raw history rows are opened strictly READ-ONLY. The live daemon keeps
+ *   writing them (WAL) and keeps draining its own 5-minute sync; this path
+ *   never marks rows uploaded or touches collector.config.json. Codex capture
+ *   gaps may add only their durable decision/census metadata in a separate
+ *   bounded writer connection.
  * - Idempotency comes from event ids, not from local state: the cloud dedupes
  *   by id (bulk createMany(skipDuplicates) since cloud PR #19; per-event
  *   upserts before that), so re-sending the same history can never create new
@@ -716,6 +718,19 @@ export async function runWorkspaceHistoryUpload(
       `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — nothing to backfill.`,
     );
   }
+  // History walks keep their source connection read-only. Capture gaps still
+  // need a durable lineage decision, so open one bounded writable connection
+  // only for the small capture-decision/census tables used by Codex capture.
+  // The raw ledger rows and history watermark remain untouched.
+  let captureLedger: Database.Database | null = null;
+  const captureDatabase = () => {
+    if (!captureLedger) captureLedger = openLedgerDatabase(ledgerPath, { fileMustExist: true });
+    return captureLedger;
+  };
+  const closeCaptureDatabase = () => {
+    captureLedger?.close();
+    captureLedger = null;
+  };
 
   const startedAt = now();
   const batchSize = Math.max(1, Math.min(options.batchSize ?? HISTORY_MAX_BATCH_EVENTS, HISTORY_MAX_BATCH_EVENTS));
@@ -736,6 +751,7 @@ export async function runWorkspaceHistoryUpload(
       .prepare(`select id from buffered_events where rowid = ?`)
       .get(state.watermark.rowid) as { id: string } | undefined;
     if (atRowid && atRowid.id !== state.watermark.id) {
+      closeCaptureDatabase();
       ledger.close();
       throw new Error(
         `Resume watermark mismatch (rowid ${state.watermark.rowid} no longer holds event ${state.watermark.id}). ` +
@@ -746,6 +762,7 @@ export async function runWorkspaceHistoryUpload(
   }
 
   if (options.until && Number.isNaN(Date.parse(options.until))) {
+    closeCaptureDatabase();
     ledger.close();
     throw new Error(`--until must be an ISO timestamp, got: ${options.until}`);
   }
@@ -965,7 +982,12 @@ export async function runWorkspaceHistoryUpload(
           const waitMs = Math.max(0, Math.min(CODEX_MODEL_WAIT_MS, CODEX_MODEL_WAIT_MS - age));
           if (Number.isFinite(waitMs) && waitMs > 0) await sleep(waitMs);
         }
-        preparedRow.event = captureCodexModel(ledger, preparedRow.event, row.id);
+        preparedRow.event = captureCodexModel(
+          codexHasUsage(preparedRow.event) ? captureDatabase() : ledger,
+          preparedRow.event,
+          row.id,
+          true,
+        );
       }
       const normalized = preparedRow.ok
         ? sealHistoryEvent(preparedRow, { ...row, attribution })
@@ -1051,6 +1073,7 @@ export async function runWorkspaceHistoryUpload(
   }
 
   await Promise.allSettled([...inFlight]);
+  closeCaptureDatabase();
   ledger.close();
 
   const drainedEverything = abortReason === null && !limitReached;

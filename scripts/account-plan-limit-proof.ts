@@ -17,8 +17,8 @@ const codexId = "fixture-codex-account-one";
 const claudeId = "fixture-claude-account-one";
 const attr = (key: string, value: string | number) => ({ key, value: typeof value === "number" ? { intValue: String(value) } : { stringValue: value } });
 const line = (timestamp: string, type: string, payload: object) => JSON.stringify({ timestamp, type, payload }) + "\n";
-const counts = (timestamp: string, input: number, used: number, reset: number, secondary = true, primaryMinutes = 300) => line(timestamp, "event_msg", {
-  type: "token_count", info: { total_token_usage: { input_tokens: input, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } },
+const counts = (timestamp: string, input: number, used: number, reset: number, secondary = true, primaryMinutes = 300, output = 1) => line(timestamp, "event_msg", {
+  type: "token_count", info: { total_token_usage: { input_tokens: input, cached_input_tokens: 0, output_tokens: output, reasoning_output_tokens: 0 } },
   rate_limits: { plan_type: "pro", limit_id: "codex-limit-fixture", primary: { used_percent: used, window_minutes: primaryMinutes, resets_at: reset },
     ...(secondary ? { secondary: { used_percent: 103.2, window_minutes: 10080, resets_at: reset + 1000 } } : {}) },
 });
@@ -57,17 +57,22 @@ async function main() {
     assert.equal(readLocalIdentities({ codexAuthPath: authPath, claudeConfigPath: null })[0]?.actorHash, key);
     writeAuth(codexId, 1_000_000);
 
-    buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
+    const session = "019e9999-1111-7222-8333-444444444444";
+    const workspace = "11111111-1111-4111-8111-111111111111";
+    buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"), {
+      workspaceId: workspace,
+      deviceId: "fixture-device",
+      enrollmentNow: () => new Date("2026-09-29T00:00:00.000Z"),
+    });
     const tailer = new RolloutTailer(buffer, sessions, () => []);
     await tailer.scan(scanAt("08:00:00")); // account observed before these later events
     assert.equal((buffer.database.prepare("select count(*) as n from sqlite_master where name='plan_limit_emission_state'")
       .get() as { n: number }).n, 0, "an idle tailer does not create plan-limit state");
-    const session = "019e9999-1111-7222-8333-444444444444";
     const rollout = path.join(day, `rollout-2026-09-29T09-00-00-${session}.jsonl`);
     const reset = 1790676000;
     fs.writeFileSync(rollout, line("2026-09-29T09:00:00.000Z", "session_meta", { id: session }) +
-      counts("2026-09-29T09:00:01.000Z", 1, 30.5, reset) +
-      line("2026-09-29T09:00:02.000Z", "turn_context", { model: "gpt-6-sol" }) +
+      counts("2026-09-29T09:00:01.000Z", 0, 30.5, reset, true, 300, 0) +
+      line("2026-09-29T09:00:02.000Z", "turn_context", { turn_id: "fixture-turn", model: "gpt-6-sol" }) +
       counts("2026-09-29T09:00:03.000Z", 10, 30.8, reset) +
       counts("2026-09-29T09:00:04.000Z", 20, 31.6, reset, false));
     await tailer.scan(scanAt("09:00:05"));
@@ -138,9 +143,13 @@ async function main() {
       row.metadata.planLimitWindow === "window_525601m"), false,
       "an over-bound plan-window reading is never emitted");
     const invalidWindowBatch = buildIngestBatch(
-      collectorConfigSchema.parse({}),
+      collectorConfigSchema.parse({
+        tenantId: workspace,
+        deviceId: "fixture-device",
+        installKey: "fixture-install",
+      }),
       buffer,
-      { now: () => new Date() },
+      { now: () => new Date(Date.now() + 61_000) },
     );
     assert.ok(invalidWindowBatch.batch?.events.some(event =>
       event.event.eventType === "usage_rollout" && event.event.inputTokens === 10),

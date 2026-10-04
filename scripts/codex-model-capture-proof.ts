@@ -773,13 +773,7 @@ async function main() {
       });
       try {
         b.append(span());
-        const snapshot = () =>
-          JSON.stringify({
-            rows: b.database.prepare("select * from buffered_events").all(),
-            schema: b.database
-              .prepare("select sql from sqlite_master order by name")
-              .all(),
-          });
+        const snapshot = () => JSON.stringify(b.database.prepare("select * from buffered_events").all());
         const before = snapshot();
         const sent: AiInteractionEvent[] = [];
         const cfg = collectorConfigSchema.parse({
@@ -820,10 +814,11 @@ async function main() {
         assert.equal(sent[0]!.metadata.captureGap, undefined);
         assert.equal(sent[0]!.inputTokens, undefined);
         assert.ok(sent[0]!.metadata.installationEpochId);
+        assert.equal(snapshot(), before, "history model gate leaves raw rows unchanged");
         assert.equal(
-          snapshot(),
-          before,
-          "history model gate performs zero ledger writes",
+          (b.database.prepare("select count(*) as n from codex_capture_decisions where decision='gap'").get() as { n: number }).n,
+          1,
+          "history model gap is durable by raw lineage",
         );
         checks++;
         completion.check("readonly-history-gap");

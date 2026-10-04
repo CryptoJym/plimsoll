@@ -54,12 +54,22 @@ function valuesForAliases(
   );
 }
 
+/** Model names reported by the native producer attributes.  `event.model` is
+ * deliberately excluded: 0.7.48 maintenance could write a nearest model
+ * into that field after capture, and that value has no provenance. */
 function nativeModels(event: AiInteractionEvent): Set<string> {
-  return new Set(
-    [event.model, ...valuesForAliases(event, usageFieldKeys.model)].filter(
-      (value): value is string => typeof value === "string" && !!value.trim(),
-    ),
-  );
+  return new Set(valuesForAliases(event, usageFieldKeys.model));
+}
+
+function nativeModel(event: AiInteractionEvent): string | undefined {
+  const models = nativeModels(event);
+  return models.size === 1 ? [...models][0] : undefined;
+}
+
+function modelAttributeConflict(event: AiInteractionEvent): boolean {
+  const model = text(event.model);
+  const native = nativeModel(event);
+  return Boolean(model && native && model !== native);
 }
 
 function metadataAccounts(event: AiInteractionEvent): Set<string> {
@@ -99,9 +109,11 @@ export function unresolvedCapture(event: AiInteractionEvent): boolean {
   return (
     codexHasUsage(event) &&
     (!text(event.model) ||
+      nativeModels(event).size === 0 ||
       codexMisfiledUnderClaude(event) ||
       event.metadata.modelEvidenceConflict === true ||
-      nativeModels(event).size > 1)
+      nativeModels(event).size > 1 ||
+      modelAttributeConflict(event))
   );
 }
 function pairedObservation(event: AiInteractionEvent): AiInteractionEvent {
@@ -194,7 +206,7 @@ function capture(
   peers: Peer[],
   source: string,
 ): AiInteractionEvent {
-  const model = unique(peers, (e) => text(e.model))[0]!;
+  const model = unique(peers, (e) => nativeModel(e) ?? text(e.model))[0]!;
   const eventAccounts = [...metadataAccounts(event)];
   const accounts = [...new Set(peers.flatMap((peer) => [...metadataAccounts(peer.event)]))];
   const sessions = unique(peers, (e) => trustedSession(e));
@@ -307,6 +319,65 @@ export function codexModelGap(
   };
 }
 
+type CaptureLineage = {
+  rawRowid: number;
+  rawId: string;
+  rawCreatedAt: string;
+  rawGeneration: string | null;
+};
+
+function ensureCaptureDecisionTable(db: Database.Database) {
+  if (!db.readonly) {
+    db.exec(`create table if not exists codex_capture_decisions (
+      decision_id integer primary key,
+      raw_rowid integer not null, raw_id text not null,
+      raw_created_at text not null, raw_generation text,
+      decision text not null check(decision='gap'),
+      reason text not null, decided_at text not null
+    );
+    create unique index if not exists idx_codex_capture_decisions_lineage
+      on codex_capture_decisions(raw_rowid,raw_id,raw_created_at,coalesce(raw_generation,''));`);
+  }
+}
+
+function captureDecision(db: Database.Database, lineage: CaptureLineage) {
+  if (!db.prepare("select 1 from sqlite_master where type='table' and name='codex_capture_decisions'").get()) return undefined;
+  return db.prepare("select reason from codex_capture_decisions where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ? limit 1").get(
+    lineage.rawRowid, lineage.rawId, lineage.rawCreatedAt, lineage.rawGeneration,
+  ) as { reason: string } | undefined;
+}
+
+function captureLineage(db: Database.Database, rawId: string): CaptureLineage | undefined {
+  try {
+    return db.prepare(`select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
+      privacy_generation as rawGeneration from buffered_events where id=?`).get(rawId) as
+      CaptureLineage | undefined;
+  } catch { return undefined; }
+}
+
+export function hasCaptureGapDecision(db: Database.Database, lineage: CaptureLineage): boolean {
+  return Boolean(captureDecision(db, lineage));
+}
+
+export function rememberCaptureGap(
+  db: Database.Database,
+  rawId: string,
+  reason: string,
+  at = new Date(),
+) {
+  const lineage = captureLineage(db, rawId);
+  if (!lineage || db.readonly) return false;
+  ensureCaptureDecisionTable(db);
+  db.prepare(`insert or replace into codex_capture_decisions
+    (raw_rowid,raw_id,raw_created_at,raw_generation,decision,reason,decided_at)
+    values (?,?,?,?,?,?,?)`).run(
+    lineage.rawRowid, lineage.rawId, lineage.rawCreatedAt, lineage.rawGeneration,
+    "gap",
+    reason, at.toISOString(),
+  );
+  return true;
+}
+
 /** Called after the durable 60-second pair wait, immediately before sealing.
  * Time alone never supplies a model or account. Evidence never crosses the
  * ledger's workspace/device/install or a conflicting native session/trace.
@@ -316,6 +387,7 @@ export function captureCodexModel(
   db: Database.Database,
   event: AiInteractionEvent,
   rawId = event.id,
+  persistDecision = false,
 ): AiInteractionEvent {
   if (!codexHasUsage(event)) return event;
   let row:
@@ -324,12 +396,17 @@ export function captureCodexModel(
         device: string | null;
         epoch: string | null;
         pairedId: string | null;
+        rawRowid: number;
+        rawId: string;
+        rawCreatedAt: string;
+        rawGeneration: string | null;
       }
     | undefined;
   try {
     row = db
       .prepare(
-        `select workspace_id as workspace, device_id as device,
+        `select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
+      privacy_generation as rawGeneration, workspace_id as workspace, device_id as device,
       installation_epoch_id as epoch, usage_paired_event_id as pairedId
       from buffered_events where id=?`,
       )
@@ -344,9 +421,24 @@ export function captureCodexModel(
     event = {
       ...event,
       metadata: { ...event.metadata, installationEpochId: row.epoch },
-    };
-  const gap = (reason: string) => codexModelGap(db, event, reason);
-  if (nativeModels(event).size > 1 || accountConflict(event) ||
+      };
+  const gap = (reason: string) => {
+    const result = codexModelGap(db, event, reason);
+    if (persistDecision && row && !db.readonly) {
+      ensureCaptureDecisionTable(db);
+      db.prepare(`insert or replace into codex_capture_decisions
+        (raw_rowid,raw_id,raw_created_at,raw_generation,decision,reason,decided_at)
+        values (?,?,?,?,?,?,?)`).run(
+        row.rawRowid, row.rawId, row.rawCreatedAt, row.rawGeneration,
+        "gap",
+        reason, new Date().toISOString(),
+      );
+    }
+    return result;
+  };
+  if (row && hasCaptureGapDecision(db, row))
+    return gap("persisted_capture_gap");
+  if (nativeModels(event).size > 1 || modelAttributeConflict(event) || accountConflict(event) ||
     event.metadata.modelEvidenceConflict === true)
     return gap("conflicting_model_attributes");
   if (codexMisfiledUnderClaude(event))
@@ -371,7 +463,8 @@ export function captureCodexModel(
   );
   const nativeSseEvent =
     event.metadata.otelEventName === "codex.sse_event" &&
-    nativeModels(event).size === 1;
+    nativeModels(event).size === 1 &&
+    !modelAttributeConflict(event);
   // A populated model is not provenance. In particular, 0.7.48 could have
   // written a nearest model into this payload. Only the native pair, trace or
   // local-turn branches below may promote it to a billable event; an event
@@ -422,6 +515,7 @@ export function captureCodexModel(
   const conflicts = (p: Peer) =>
     p.event.metadata.modelEvidenceConflict === true ||
     nativeModels(p.event).size > 1 ||
+    modelAttributeConflict(p.event) ||
     accountConflict(p.event);
   // An internally conflicting peer remains evidence of ambiguity. Dropping
   // it before counting models could leave one clean log and select its model.
@@ -438,8 +532,9 @@ export function captureCodexModel(
         Math.abs(Date.parse(p.event.observedAt) - end),
       ) <= 30_000,
   );
-  if (pair.some(conflicts)) return gap("conflicting_pair_model_evidence");
-  const pairModels = unique(pair, (e) => text(e.model));
+  if (pair.some((p) => nativeModel(p.event) === undefined || conflicts(p)))
+    return gap("conflicting_pair_model_evidence");
+  const pairModels = unique(pair, (e) => nativeModel(e));
   if (pairModels.length > 1) return gap("ambiguous_pair_model");
   const competingSpans = peers.filter(
     (p) =>
@@ -465,7 +560,7 @@ export function captureCodexModel(
       ? [{ event, pairedId: null }, ...traced]
       : traced;
   if (tracedPeers.some(conflicts)) return gap("conflicting_trace_model_evidence");
-  const nativeTraceModels = unique(tracedPeers, (e) => text(e.model));
+  const nativeTraceModels = unique(tracedPeers, (e) => nativeModel(e));
   if (nativeTraceModels.length > 1)
     return gap("ambiguous_trace_model");
   if (
@@ -474,7 +569,7 @@ export function captureCodexModel(
     nativeTraceModels[0] !== event.model
   )
     return gap("ambiguous_trace_model");
-  const traceModels = unique(traceEvidence, (e) => text(e.model));
+  const traceModels = unique(traceEvidence, (e) => nativeModel(e) ?? text(e.model));
   if (traceModels.length > 1) return gap("ambiguous_trace_model");
   if (
     tracedPeers.some((p) => accountConflict(p.event)) ||

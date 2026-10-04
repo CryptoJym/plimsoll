@@ -3758,7 +3758,10 @@ async function requestBudgetAndResumableValidationProof() {
     });
     const oversizedId = uuid(2_300);
     const laterId = uuid(2_301);
-    buffer.append(event(2_300, { model: "gpt-6.1-sol", metadata: bulkyAllowedMetadata(64) }));
+    buffer.append(event(2_300, {
+      model: "gpt-6.1-sol",
+      metadata: { ...bulkyAllowedMetadata(64), "gen_ai.request.model": "gpt-6.1-sol" },
+    }));
     buffer.append(aiInteractionEventSchema.parse({
       id: laterId,
       source: "codex",
