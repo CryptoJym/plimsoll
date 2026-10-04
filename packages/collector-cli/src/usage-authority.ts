@@ -37,6 +37,9 @@ export function hasSessionUsageAuthority(
   db: Database.Database, source: string, sessionId: string, kind: "live" | "tailer",
   excludeRowids: number[] = [], probeRows?: number, commitCoverage?: (rawId: string) => boolean,
 ): boolean | "undecided" {
+  // Codex witnesses cover responses, never an entire conversation. Keep the
+  // old API conservative for sibling/older local readers.
+  if (source === "codex") return false;
   const candidates = probeRows === undefined ? "buffered_events" : `(select rowid,* from buffered_events
     where source=@source and session_id=@session order by observed_at desc limit @probe)`;
   const eligible = source === "codex" ? terminalPrivacyEligibilitySql(db, "e") : "1";

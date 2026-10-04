@@ -63,6 +63,12 @@ export function buildIngestBatch(
     candidateRows.map((row) => ({ event: row.payload, repoHash: row.repoHash })),
   );
   for (const row of candidateRows) {
+    if (row.payload.source === "codex" && buffer.delivery.reconcileCodexResponse(row.id)) {
+      const current = buffer.database.prepare(`select payload_json as payload,usage_duplicate_reason as duplicate
+        from buffered_events where id=?`).get(row.id) as {payload:string;duplicate:string}|undefined;
+      if (!current || current.duplicate) continue;
+      row.payload=JSON.parse(current.payload);
+    }
     if (unresolvedCapture(row.payload) &&
         (options.now?.() ?? new Date()).getTime() < Date.parse(row.createdAt) + CODEX_MODEL_WAIT_MS) continue;
     const captured = captureCodexModel(buffer.database,row.payload,row.id,true);

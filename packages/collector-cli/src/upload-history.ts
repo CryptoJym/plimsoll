@@ -1,6 +1,8 @@
 import { captureCodexModel, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import { frozenCodexCapture, rememberFrozenCodexCapture } from "./codex-named-capture";
 import { isCodexResponseSpan, rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
+import { DeliveryOutbox } from "./outbox";
+import { codexResponseCoverage } from "./codex-response-coverage";
 import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -104,6 +106,7 @@ export type HistorySkipReason =
   | "schema_invalid"
   | "forbidden_content"
   | "local_privacy_terminal"
+  | "usage_duplicate"
   | "local_evidence_quarantine_migration_required";
 
 export type HistoryEnvelope = {
@@ -722,9 +725,10 @@ export async function runWorkspaceHistoryUpload(
   }
   // History walks keep their source connection read-only. Capture gaps still
   // need a durable lineage decision, so open one bounded writable connection
-  // only for the small capture-decision/census tables used by Codex capture.
-  // The raw ledger rows and history watermark remain untouched.
+  // for capture decisions and response reconciliation before an actual send.
+  // Dry runs never consume response coverage or change the raw ledger.
   let captureLedger: Database.Database | null = null;
+  let captureOutbox: DeliveryOutbox | undefined;
   const captureDatabase = () => {
     if (!captureLedger) captureLedger = openLedgerDatabase(ledgerPath, { fileMustExist: true });
     return captureLedger;
@@ -732,6 +736,7 @@ export async function runWorkspaceHistoryUpload(
   const closeCaptureDatabase = () => {
     captureLedger?.close();
     captureLedger = null;
+    captureOutbox = undefined;
   };
 
   const startedAt = now();
@@ -979,6 +984,22 @@ export async function runWorkspaceHistoryUpload(
         continue;
       }
       if (preparedRow.ok && preparedRow.event) {
+        if (preparedRow.event.source === "codex") {
+          if (options.dryRun) {
+            const coverage=codexResponseCoverage(ledger,preparedRow.event);
+            if(coverage?.covered){skipQueue.push({rowid:row.rowid,reason:"usage_duplicate"});continue;}
+            if(coverage)preparedRow.event=coverage.remaining;
+          } else if ((ledger.pragma("table_info(buffered_events)") as Array<{name:string}>)
+              .some(c=>c.name==="installation_epoch_id")) {
+            captureOutbox ??= new DeliveryOutbox(captureDatabase());
+            captureOutbox.reconcileCodexResponse(row.id);
+            const current=captureDatabase().prepare(`select payload_json as payload,usage_duplicate_reason as duplicate
+              from buffered_events where rowid=? and id=? and created_at=?`)
+              .get(row.rowid,row.id,row.createdAt) as {payload:string;duplicate:string|null}|undefined;
+            if(current?.duplicate){skipQueue.push({rowid:row.rowid,reason:"usage_duplicate"});continue;}
+            if(current)preparedRow.event=aiInteractionEventSchema.parse(JSON.parse(current.payload));
+          }
+        }
         if (unresolvedCapture(preparedRow.event)) {
           const age = now().getTime() - Date.parse(row.createdAt);
           const waitMs = Math.max(0, Math.min(CODEX_MODEL_WAIT_MS, CODEX_MODEL_WAIT_MS - age));

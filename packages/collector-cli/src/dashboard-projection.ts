@@ -4,7 +4,7 @@ import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
 import { CODEX_SESSION_AUTHORITY_SQL } from "./codex-span-rollout-pairing";
-import { hasSessionUsageAuthority, rowCanOwnSessionUsage, rowHasAdmittedUsage } from "./usage-authority";
+import { hasSessionUsageAuthority, rowHasAdmittedUsage } from "./usage-authority";
 import { ensureUuidEventId } from "./upload-history";
 import { readLiveUsageEventObservation } from "../../shared/src/live-usage-metadata";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
@@ -268,7 +268,9 @@ const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","
  * once while both raw evidence rows stay untouched. The class definition is
  * keyed to buffer.ts claimSessionUsageAuthority — `('usage_rollout',
  * 'usage_transcript')` as tailer, anything else usage-bearing as live — and
- * repairs ledgers whose mixed rows predate that gate (issue #193).
+ * repairs ledgers whose mixed rows predate that gate (issue #193). Codex
+ * uses response coverage in append and bounded repair; this session rule
+ * applies only to the other sources.
  */
 const USAGE_AUTHORITY_RULE = "live_capture_usage_wins";
 const USAGE_TAILER_EVENT_TYPES = ["usage_rollout", "usage_transcript"] as const;
@@ -551,7 +553,7 @@ function carriesUsage(row: Pick<RawProjectionRow,
  * converge to the same totals (issue #193).
  */
 function backfillUsageSuppressed(db: Database.Database, row: RawProjectionRow) {
-  return isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
+  return row.source !== "codex" && isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
     hasSessionUsageAuthority(db, row.source, row.sessionId, "live") === true;
 }
 
@@ -697,6 +699,7 @@ export class DashboardProjectionStore {
   private failNextCompactGcAfterRewrite = false;
 
   private readonly captureStatements = new Map<string, Database.Statement>();
+  private readonly reconcileCodexResponse?: (rawId: string) => boolean;
 
   // Reuse the fixed capture SQL; each 128-record request used to compile the
   // same aggregate/trigger statements hundreds of times on the listener.
@@ -714,8 +717,10 @@ export class DashboardProjectionStore {
 
   constructor(
     private readonly db: Database.Database,
-    options: { newLedger?: boolean; now?: Date; onOpenStep?: LedgerOpenTimingSink } = {},
+    options: { newLedger?: boolean; now?: Date; onOpenStep?: LedgerOpenTimingSink;
+      reconcileCodexResponse?: (rawId: string) => boolean } = {},
   ) {
+    this.reconcileCodexResponse=options.reconcileCodexResponse;
     const openStarted = performance.now();
     let stepStarted = openStarted;
     const markOpenStep = (step: string) => {
@@ -1242,7 +1247,7 @@ export class DashboardProjectionStore {
       this.db.prepare(`insert or ignore into codex_duplicate_fact_scan
         (singleton, complete) values (1, ?)`).run(newLedger ? 1 : 0);
       this.db.prepare(`update codex_duplicate_fact_scan set cursor_raw_rowid=0,
-        complete=?,authority_version=1 where singleton=1 and authority_version=0`).run(newLedger ? 1 : 0);
+        complete=?,authority_version=2 where singleton=1 and authority_version<2`).run(newLedger ? 1 : 0);
       // Import the still-queued prefix of a round-6 scan once on upgrade.
       if (!hadScanRepairReceipts) this.db.prepare(`insert or ignore into
         codex_duplicate_fact_scan_repairs (raw_rowid)
@@ -1916,8 +1921,7 @@ export class DashboardProjectionStore {
     // Decided before any write, so a deferral leaves nothing to undo.
     const liveUsageBatchRowids = new Map<string, number[]>();
     for (const row of rows) {
-      if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
-          (row.source !== "codex" || rowCanOwnSessionUsage(this.db, row.id))) {
+      if (row.source !== "codex" && !isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
         const key = `${row.source}\u0000${row.sessionId}`;
         const rowids = liveUsageBatchRowids.get(key);
         if (rowids) rowids.push(row.rawRowid);
@@ -1937,7 +1941,12 @@ export class DashboardProjectionStore {
       if (!earlier) firstLiveUsage.push([source, sessionId]);
     }
     const compactRows: RawProjectionRow[] = [];
-    for (const row of rows) {
+    for (const initial of rows) {
+      // Historical mixed rows use the same response coverage as append and
+      // send. A bounded repair can restore an uncovered old turn without
+      // making its already-accounted twin contribute a second time.
+      const row=initial.source === "codex" && carriesUsage(initial) &&
+        this.reconcileCodexResponse?.(initial.id) ? this.rawRow(initial.rawRowid) ?? initial : initial;
       // Raw rowids can be reused before a queued prune repair runs. The retained
       // live fact already has independent event identity; release its old slot.
       const formerLive = this.captureStatement(`select projection_id as id from dashboard_event_facts

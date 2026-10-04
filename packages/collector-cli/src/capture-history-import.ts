@@ -16,7 +16,8 @@ import { deterministicEventId } from "./normalizer";
 import { ensureJsonlScanState, jsonlScanStateKey, rememberJsonlScanCursor,
   type JsonlTailRead } from "./jsonl-byte-tailer";
 import { rootCursorKey } from "./capture-root-inventory";
-import { hasSessionUsageAuthority, hasUnkeyedLiveUsageOverlap } from "./usage-authority";
+import { hasUnkeyedLiveUsageOverlap } from "./usage-authority";
+import { codexResponseCoverage, originalCoveredResponse } from "./codex-response-coverage";
 import { recordCodexTurnModel } from "./codex-model-capture";
 
 const UUID_AT_END = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -441,7 +442,7 @@ function rememberSessionBytes(db: DB, source: CaptureRoot["source"], sessionId: 
     .run(source, sessionId, length, digest);
 }
 function isLiveSession(db: DB, source: CaptureRoot["source"], sessionId: string) {
-  if (source === "codex") return hasSessionUsageAuthority(db,source,sessionId,"live") === true;
+  if (source === "codex") return false;
   return (db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
     .get(source, sessionId) as { authority: string } | undefined)?.authority === "live";
 }
@@ -664,8 +665,7 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   onMissing?: (candidate: Candidate, index: number, digest: string, file: File) => Promise<void>,
   expectedFiles?: File[], resume?: ResumePoint,
   onFileReady?: (file: File) => Promise<void>,
-  onFilePublished?: (file: File) => Promise<void>,
-  commitLiveCoverage?: (sessionId: string) => boolean): Promise<ScanResult> {
+  onFilePublished?: (file: File) => Promise<void>): Promise<ScanResult> {
   if (options.since && !validIso(options.since)) refusal("since_invalid_iso");
   const files = candidateFiles(db, root);
   if (expectedFiles && (files.length !== expectedFiles.length || files.some((file, index) =>
@@ -694,7 +694,8 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
         : `select count(*) as n from raw_retention_receipts`).get() as { n: number }).n : 0;
   const prior = db.prepare(`select source,session_id as sessionId,event_type as eventType,
     observed_at as observedAt,model,input_tokens as inputTokens,output_tokens as outputTokens,
-    cache_read_tokens as cacheReadTokens,cache_creation_tokens as cacheCreationTokens
+    cache_read_tokens as cacheReadTokens,cache_creation_tokens as cacheCreationTokens,
+    payload_json as payload,usage_duplicate_reason as duplicate
     from buffered_events where id=? limit 1`);
   const retained = table(db, "raw_retention_receipts")
     ? db.prepare(`select 1 from raw_retention_receipts where event_id=? limit 1`) : null;
@@ -758,11 +759,10 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       sessions.add(session);
       if (!plan.firstObservedAt || e.observedAt < plan.firstObservedAt) plan.firstObservedAt = e.observedAt;
       if (!plan.lastObservedAt || e.observedAt > plan.lastObservedAt) plan.lastObservedAt = e.observedAt;
-      let live = root.source === "codex"
-        ? hasSessionUsageAuthority(db,root.source,session,"live") === true
+      const live = root.source === "codex"
+        ? false
         : (authority.get(root.source, session) as { authority: string } | undefined)?.authority === "live" ||
           Boolean(liveRaw.get(root.source, session));
-      if(live && root.source === "codex" && commitLiveCoverage)live=commitLiveCoverage(session);
       if (live) { skippedLive.add(session); continue; }
       const digest = crypto.createHash("sha256").update(JSON.stringify([
         e.observedAt, e.model, e.inputTokens, e.outputTokens, e.cacheReadTokens, e.cacheCreationTokens,
@@ -777,11 +777,20 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
         refusal("prior_root_observation_conflict");
       if (retained?.get(candidate.sourceId) && sightings.length === 0)
         matchedReceipts.add(candidate.sourceId);
-      const existing = prior.get(candidate.sourceId) as {
+      let existing = prior.get(candidate.sourceId) as {
         source: string; sessionId: string | null; eventType: string; observedAt: string;
         model: string | null; inputTokens: number | null; outputTokens: number | null;
         cacheReadTokens: number | null; cacheCreationTokens: number | null;
+        payload: string; duplicate: string | null;
       } | undefined;
+      if (existing && root.source === "codex") {
+        const original = originalCoveredResponse(db,candidate.sourceId) ??
+          (existing.duplicate ? JSON.parse(existing.payload) as AiInteractionEvent : undefined);
+        if (original) existing = {...existing,source:original.source,sessionId:original.sessionId ?? null,
+          eventType:original.eventType,observedAt:original.observedAt,model:original.model ?? null,
+          inputTokens:original.inputTokens ?? null,outputTokens:original.outputTokens ?? null,
+          cacheReadTokens:original.cacheReadTokens ?? null,cacheCreationTokens:original.cacheCreationTokens ?? null};
+      }
       if (existing && (existing.source !== e.source || existing.sessionId !== session ||
           existing.eventType !== e.eventType || existing.observedAt !== e.observedAt ||
           existing.model !== (e.model ?? null) || (existing.inputTokens ?? 0) !== (e.inputTokens ?? 0) ||
@@ -800,10 +809,12 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       if (file.importedByteLength !== undefined &&
           candidate.prefixCheckpoint!.byteOffset <= file.importedByteLength) continue;
       plan.missingRows += 1;
-      plan.tokens.input += e.inputTokens ?? 0;
-      plan.tokens.output += e.outputTokens ?? 0;
-      plan.tokens.cacheRead += e.cacheReadTokens ?? 0;
-      plan.tokens.cacheCreation += e.cacheCreationTokens ?? 0;
+      const coverage = root.source === "codex" ? codexResponseCoverage(db,e) : undefined;
+      const uncovered = coverage?.covered ? undefined : coverage?.remaining ?? e;
+      plan.tokens.input += uncovered?.inputTokens ?? 0;
+      plan.tokens.output += uncovered?.outputTokens ?? 0;
+      plan.tokens.cacheRead += uncovered?.cacheReadTokens ?? 0;
+      plan.tokens.cacheCreation += uncovered?.cacheCreationTokens ?? 0;
       if (onMissing) {
         if (resume && candidateIndex <= resume.index) refusal("resume_cursor_evidence_lost");
         verifiedCandidates.push({ candidate, index: candidateIndex,
@@ -1252,7 +1263,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         for (const item of batch) {
           const rowStarted = performance.now();
           const e = item.candidate.event;
-          // A concurrent live writer may have won the session while files
+          // A concurrent Claude writer may have won the session while files
           // were read; session authority is checked again under the writer.
           // No live writer can enter this IMMEDIATE transaction. Tailer
           // appends cannot create live authority, so one check per session
@@ -1265,10 +1276,15 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
               typeof e.metadata.captureAccountHash === "string" ? e.metadata.captureAccountHash : undefined);
           if (!liveSessions.get(e.sessionId!) && appendRootObservation(buffer, e, root, false, true)) {
             rows += 1;
-            counts.input += e.inputTokens ?? 0;
-            counts.output += e.outputTokens ?? 0;
-            counts.cacheRead += e.cacheReadTokens ?? 0;
-            counts.cacheCreation += e.cacheCreationTokens ?? 0;
+            // Append rechecks response coverage under this writer. Receipt
+            // counters use the admitted remainder, including partial twins.
+            const admitted = db.prepare(`select input_tokens as input,output_tokens as output,
+              cache_read_tokens as cacheRead,cache_creation_tokens as cacheCreation
+              from buffered_events where id=?`).get(e.id) as Amounts;
+            counts.input += admitted.input ?? 0;
+            counts.output += admitted.output ?? 0;
+            counts.cacheRead += admitted.cacheRead ?? 0;
+            counts.cacheCreation += admitted.cacheCreation ?? 0;
             if (item.candidate.claudeRevision) rememberClaudeRevision(db, item.candidate.claudeRevision);
             if (item.candidate.prefixCheckpoint)
               rememberPrefixCheckpoint(db, root.source, e.sessionId!, item.candidate.prefixCheckpoint);
@@ -1414,7 +1430,7 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         db.prepare(`update capture_history_file_state set handoff_ready=1 where file_key=?`)
           .run(file.fileKey);
       }).immediate();
-    },sessionId=>buffer.commitCodexSessionCoverage(sessionId));
+    });
     while (pending.length) await flush();
     db.transaction(() => {
       const lock = db.prepare(`select root_id as rootId,owner_pid as pid,owner_start as started,

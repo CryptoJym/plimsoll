@@ -2,6 +2,7 @@ import type { AiInteractionEvent } from "../../shared/src/index";
 import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, legacyFrozenNativeCapture, rememberCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import { frozenCodexCapture, frozenCodexDelivery, installCodexFrozenCompatibility, rememberFrozenCodexCapture } from "./codex-named-capture";
 import { rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
+import { applyCodexResponseCoverage } from "./codex-response-coverage";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -2289,6 +2290,11 @@ export class DeliveryOutbox {
     return this.db.inTransaction?freeze():this.db.transaction(freeze).immediate();
   }
 
+  reconcileCodexResponse(rawId: string) {
+    const reconcile = () => applyCodexResponseCoverage(this.db,rawId,id => this.freezeSessionCoverage(id));
+    return this.db.inTransaction ? reconcile() : this.db.transaction(reconcile).immediate();
+  }
+
   lease(options: { maxRows?: number; maxBytes?: number; now?: Date; leaseId?: string } = {}): DeliveryLease {
     if (!this.enabled) return { leaseId: "", items: [], locallyDead: 0, blockedBy: "none" };
     const now = options.now ?? new Date();
@@ -2359,6 +2365,13 @@ export class DeliveryOutbox {
       const unsealed = new Map<string, AiWorkIngestEvent | null>();
       for (const row of candidates) {
         if (row.sealedEnvelopeJson) continue;
+        if (row.rawId && this.reconcileCodexResponse(row.rawId)) {
+          const current = this.db.prepare(`select base_envelope_json as base,sealed_envelope_json as sealed,
+            (select payload_json from buffered_events where id=?) as raw from upload_outbox where delivery_id=?`)
+            .get(row.rawId,row.deliveryId) as {base:string;sealed:string|null;raw:string}|undefined;
+          if (!current) continue;
+          row.baseEnvelopeJson=current.base;row.rawPayloadJson=current.raw;row.sealedEnvelopeJson=current.sealed;
+        }
         try {
           unsealed.set(row.deliveryId, aiWorkIngestEventSchema.parse(JSON.parse(row.baseEnvelopeJson)));
         } catch {
@@ -2379,6 +2392,7 @@ export class DeliveryOutbox {
       const disposedRawRowids = new Set<number>();
 
       for (const row of candidates) {
+        if (!this.db.prepare("select 1 from upload_outbox where delivery_id=?").get(row.deliveryId)) continue;
         const authoritativeReason = this.authoritativePrivacyReason(row);
         if (authoritativeReason === "lineage_unresolved") continue;
         if (authoritativeReason) {

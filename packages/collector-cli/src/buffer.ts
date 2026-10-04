@@ -28,7 +28,7 @@ import {
   pairCodexUsageEvent,
 } from "./codex-usage-pairing";
 import { isCodexResponseSpan, pairCodexSpanRolloutEvent } from "./codex-span-rollout-pairing";
-import { hasSessionUsageAuthority, rowCanOwnSessionUsage } from "./usage-authority";
+import { applyCodexResponseCoverage } from "./codex-response-coverage";
 import { queueCodexAuthorityProjectionRepairs } from "./codex-model-capture";
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
@@ -1022,6 +1022,7 @@ export class LocalEventBuffer {
     markOpenStep("ledger.learning_schema");
     this.projection = new DashboardProjectionStore(this.db, {
       newLedger,
+      reconcileCodexResponse: id => this.delivery.reconcileCodexResponse(id),
       onOpenStep: options.onOpenStep
         ? (step) => options.onOpenStep!({
             ...step,
@@ -2730,7 +2731,9 @@ export class LocalEventBuffer {
       this.budgetAttemptedRows += 1;
       const usagePair = pairCodexUsageEvent(this.db, event.id);
       const rolloutPair = event.source === "codex" ? pairCodexSpanRolloutEvent(this.db, event.id) : null;
-      const pairedRaw = usagePair || rolloutPair
+      const responseCoverage = event.source === "codex" ? applyCodexResponseCoverage(this.db,event.id,
+        id => this.delivery.freezeSessionCoverage(id)) : false;
+      const pairedRaw = usagePair || rolloutPair || responseCoverage
         ? this.db.prepare(`select payload_json as payloadJson,usage_duplicate_reason as duplicate
             from buffered_events where id=?`).get(event.id) as {payloadJson:string;duplicate:string|null}
         : {payloadJson,duplicate:null};
@@ -2833,25 +2836,18 @@ export class LocalEventBuffer {
   }
 
   /**
-   * Token accounting is first-writer-authoritative for an entire session, not
-   * merely for one maintenance slice. Without this durable claim, a chunked
-   * rollout could commit early deltas, then allow a later OTLP event to make
-   * the tailer skip the remainder of that same cumulative stream.
+   * Claude retains its original first-writer session authority. Codex
+   * deduplicates individual responses after admission, under this writer.
    */
   private claimSessionUsageAuthority(event: AiInteractionEvent, claimedAt: string, committed = false) {
-    if (!event.sessionId || isCodexResponseSpan(event) ||
+    if (event.source === "codex" || !event.sessionId || isCodexResponseSpan(event) ||
         (event.inputTokens === undefined && event.outputTokens === undefined) ||
-        (event.source !== "codex" && event.source !== "claude_code")) return true;
-    if (event.source === "codex" && (!committed || !rowCanOwnSessionUsage(this.db, event.id))) return true;
+        event.source !== "claude_code") return true;
     const desired = event.eventType === "usage_rollout" || event.eventType === "usage_transcript" ? "tailer" : "live";
     const inserted = committed ? this.db.prepare("select rowid from buffered_events where id=?")
       .get(event.id) as { rowid: number } | undefined : undefined;
     const existing = this.sessionUsageAuthority(event.source, event.sessionId, inserted ? [inserted.rowid] : []);
     if (existing) return existing === desired;
-    // A historical live claim with no admissible usage witness is stale. It
-    // cannot make diagnostic counters suppress a new known native turn.
-    if (event.source === "codex") this.db.prepare(`delete from session_usage_authority
-      where source=? and session_id=?`).run(event.source, event.sessionId);
     this.db.prepare(`insert into session_usage_authority (source,session_id,authority,claimed_at)
       values (?,?,?,?) on conflict(source,session_id) do nothing`)
       .run(event.source, event.sessionId, desired, claimedAt);
@@ -2861,6 +2857,7 @@ export class LocalEventBuffer {
   }
 
   sessionUsageAuthority(source: "codex" | "claude_code" | "grok", sessionId: string, excludeRowids: number[] = []) {
+    void excludeRowids;
     const row = this.db.prepare(`select authority from session_usage_authority
       where source=? and session_id=?`).get(source, sessionId) as { authority: "tailer" | "live" } | undefined;
     if (source !== "codex") {
@@ -2873,17 +2870,14 @@ export class LocalEventBuffer {
         .get(source,sessionId) as {tailer:number|null;live:number|null};
       return legacy.live ? "live" : legacy.tailer ? "tailer" : null;
     }
-    const live = hasSessionUsageAuthority(this.db, source, sessionId, "live", excludeRowids) === true;
-    const tailer = !live && hasSessionUsageAuthority(this.db, source, sessionId, "tailer", excludeRowids) === true;
-    return live ? "live" : tailer ? "tailer" : null;
+    return null;
   }
 
-  /** Before consuming native cumulative bytes as covered, retain the native
-   * accounting result on which that destructive deduplication depends. The
-   * transport's grace hold remains; only its model/bytes become immutable. */
+  /** Kept for old local callers; no finite response attests a whole session.
+   * Response coverage is committed by append, without advancing the hold. */
   commitCodexSessionCoverage(sessionId: string) {
-    return hasSessionUsageAuthority(this.db,"codex",sessionId,"live",[],undefined,
-      rawId => this.delivery.freezeSessionCoverage(rawId)) === true;
+    void sessionId;
+    return false;
   }
 
   append(
