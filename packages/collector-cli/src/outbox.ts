@@ -1,5 +1,5 @@
 import type { AiInteractionEvent } from "../../shared/src/index";
-import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, isCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -400,11 +400,20 @@ export function refreshUnsentRawDelivery(
      from buffered_events where id = ?`,
   ).get(rawId) as RawDeliveryRow | undefined;
   if (!raw || raw.uploadedAt || raw.usageDuplicateReason) return false;
-  const linked = db.prepare(`select delivery_id as id from upload_outbox
+  const linked = db.prepare(`select delivery_id as id,base_envelope_json as baseEnvelopeJson from upload_outbox
     where raw_rowid=? and raw_id=? and raw_created_at=?
       and raw_generation is ? limit 1`).get(raw.rawRowid, raw.rawId,
-    raw.createdAt, raw.privacyGeneration) as { id: string } | undefined;
+    raw.createdAt, raw.privacyGeneration) as { id: string; baseEnvelopeJson: string } | undefined;
   if (!linked) return false;
+  try {
+    const base = aiWorkIngestEventSchema.parse(JSON.parse(linked.baseEnvelopeJson));
+    if (isCaptureGap(base.event)) return false;
+  } catch {
+    // A malformed base cannot prove that this delivery is safe to refresh.
+    // Leave it for the ordinary lease/schema path instead of deriving a new
+    // billable envelope from the raw row.
+    return false;
+  }
   const prepared = prepareDelivery(raw, maxItemBytes, linked.id);
   if (!prepared.ok) return false;
   return db.prepare(
@@ -2220,18 +2229,19 @@ export class DeliveryOutbox {
           // turn IDs and nested evidence still participate in capture; only
           // the resulting outbound event is sealed below.
           let captureInput = parsed.event;
-          if (row.rawPayloadJson) {
+          // A retired uncertain delivery is replaced by an explicit gap. Its
+          // raw lineage is retained for diagnostics, but rereading it here
+          // would resurrect the counters under the replacement ID.
+          if (!isCaptureGap(parsed.event) && row.rawPayloadJson) {
             try {
               captureInput = aiInteractionEventSchema.parse(JSON.parse(row.rawPayloadJson));
             } catch {
               captureInput = parsed.event;
             }
           }
-          const captured = captureCodexModel(
-            this.db,
-            captureInput,
-            row.rawId ?? parsed.event.id,
-          );
+          const captured = isCaptureGap(parsed.event)
+            ? parsed.event
+            : captureCodexModel(this.db, captureInput, row.rawId ?? parsed.event.id);
           parsed.event = { ...captured, id: parsed.event.id };
           const sealed = sealOutboundEnvelope(
             attachFillOnlyLinkage(

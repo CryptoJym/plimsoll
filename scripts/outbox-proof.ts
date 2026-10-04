@@ -2115,6 +2115,7 @@ async function semanticScalarSpanParityProof() {
           costUsd?: number;
           sessionId?: string;
           model?: string;
+          eventType?: string;
           projectKey?: string;
           customerKey?: string;
           workflowKey?: string;
@@ -2122,24 +2123,38 @@ async function semanticScalarSpanParityProof() {
           metadata?: Record<string, unknown>;
         }
       | undefined;
+    // The Codex span deliberately has no valid trace id or native peer: its
+    // model aliases remain in the local normalization readback, while the
+    // outbound capture gate strips all billable aliases into a tokenless gap.
+    const gapStrippedPositiveKeys = new Set([
+      "gen_ai.usage.input_tokens",
+      "llm.usage.prompt_tokens",
+      "gen_ai.usage.output_tokens",
+      "llm.usage.completion_tokens",
+      "gen_ai.usage.cost_usd",
+      "gen_ai.request.model",
+    ]);
     const positiveMetadataExact = positiveEntries.every(([key, value]) => {
       const expectedValue = typeof value === "number" && Number.isInteger(value)
         ? String(value)
         : value;
-      return localMetadata?.[key] === expectedValue && wireEvent?.metadata?.[key] === expectedValue;
+      return localMetadata?.[key] === expectedValue &&
+        wireEvent?.metadata?.[key] === (gapStrippedPositiveKeys.has(key) ? undefined : expectedValue);
     });
     record(
-      "production_span_positive_string_and_scalar_controls_promote_and_round_trip_exactly",
+      "unqualified_codex_span_preserves_local_scalars_and_delivers_tokenless_gap",
       localEvent?.inputTokens === 501 &&
         localEvent.outputTokens === 51 &&
         localEvent.costUsd === 0.33 &&
         localEvent.sessionId === "11111111-2222-4333-8444-555555555555" &&
         localEvent.model === "gpt-5.5" &&
-        wireEvent?.inputTokens === 501 &&
-        wireEvent.outputTokens === 51 &&
-        wireEvent.costUsd === 0.33 &&
+        wireEvent?.eventType === "unknown" &&
+        wireEvent.inputTokens === undefined &&
+        wireEvent.outputTokens === undefined &&
+        wireEvent.costUsd === undefined &&
         wireEvent.sessionId === "11111111-2222-4333-8444-555555555555" &&
-        wireEvent.model === "gpt-5.5" &&
+        wireEvent.model === undefined &&
+        wireEvent.metadata?.usageSource === "capture_gap" &&
         localEvent.projectKey === `sha256:${"81".repeat(32)}` &&
         localEvent.customerKey === "safe_customer_81" &&
         localEvent.workflowKey === "safe_workflow_81" &&
@@ -2274,6 +2289,7 @@ async function topLevelPromotionAdmissionProof() {
         scope: { name: "promotion-admission-proof" },
         logRecords: [{
           timeUnixNano: "1781401014000000000",
+          traceId: "a".repeat(32),
           attributes: [
             ...safeLogEntries.map(([key, value]) => otelAttr(key, value)),
             ...unsafeLogEntries.map(([key, value]) => otelAttr(key, value)),
@@ -2825,20 +2841,21 @@ async function hookPromotionAdmissionProof() {
       localEvent.actorId.startsWith("sha256:") &&
       wireEvent?.id === localEvent.id &&
       wireEvent.source === localEvent.source &&
-      wireEvent?.model === localEvent.model &&
       wireEvent.tenantId === cfg.tenantId &&
       wireEvent.dataMode === localEvent.dataMode &&
-      wireEvent.eventType === localEvent.eventType &&
+      wireEvent.eventType === "unknown" &&
       wireEvent.observedAt === localEvent.observedAt &&
       wireEvent.sessionId === localEvent.sessionId &&
       wireEvent.projectKey === localEvent.projectKey &&
       wireEvent.customerKey === localEvent.customerKey &&
       wireEvent.workflowKey === localEvent.workflowKey &&
       wireEvent.actionClass === localEvent.actionClass &&
-      wireEvent.inputTokens === localEvent.inputTokens &&
-      wireEvent.outputTokens === localEvent.outputTokens &&
-      wireEvent.costUsd === localEvent.costUsd &&
+      wireEvent.model === undefined &&
+      wireEvent.inputTokens === undefined &&
+      wireEvent.outputTokens === undefined &&
+      wireEvent.costUsd === undefined &&
       wireEvent.actorId === localEvent.actorId &&
+      wireMetadata.usageSource === "capture_gap" &&
       repositoryAttributionUnknown &&
       callerAuthorityMetadataKeys.every(
         (key) => !(key in localMetadata) && !(key in wireMetadata),

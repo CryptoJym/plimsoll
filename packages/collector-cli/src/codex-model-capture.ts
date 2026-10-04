@@ -13,10 +13,16 @@ const WINDOW_MS = 10 * 60_000;
 const MAX_EVIDENCE_ROWS = 128;
 const text = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value : undefined;
+/** A capture gap is a durable accounting decision. Its raw counters remain
+ * local diagnostics and must never become usage again on a later read. */
+export function isCaptureGap(event: AiInteractionEvent): boolean {
+  return event.metadata.usageSource === "capture_gap" || event.metadata.captureGap === true;
+}
 export function codexHasUsage(event: AiInteractionEvent): boolean {
   // Native runtime intervals deliberately carry no per-request model and are
   // unqualified observers; cloud excludes them from financial usage.
   return (
+    !isCaptureGap(event) &&
     event.eventType !== "usage_live" &&
     (event.source === "codex" || codexMisfiledUnderClaude(event)) &&
     ([
@@ -343,20 +349,33 @@ export function captureCodexModel(
   if (nativeModels(event).size > 1 || accountConflict(event) ||
     event.metadata.modelEvidenceConflict === true)
     return gap("conflicting_model_attributes");
-  const accountKey =
-    event.source === "claude_code" ? "user.account_uuid" : "user.account_id";
   if (codexMisfiledUnderClaude(event))
     return gap("codex_service_under_claude_source");
-  if (text(event.model))
-    return {
-      ...event,
-      metadata: {
-        ...event.metadata,
-        accountIdentityState: text(event.metadata[accountKey])
-          ? "reported"
-          : "unavailable",
-      },
-    };
+  // Some native exporters put the request model directly on the response
+  // span. Treat that as trace evidence only when the event carries a bounded
+  // trace id and the native model attribute agrees with the normalized model
+  // field. A bare model field is still untrusted, which keeps 0.7.48's
+  // reconciliation output tokenless. The evidence is joined below with every
+  // native row on that trace so a conflicting session, account, or model can
+  // never be hidden by this self-attested value.
+  const directTraceId = text(event.metadata.traceId);
+  const directTraceModels = [
+    ...new Set(valuesForAliases(event, usageFieldKeys.model)),
+  ];
+  const directTraceModelEvidence = Boolean(
+    directTraceId &&
+    text(event.model) &&
+    directTraceModels.length === 1 &&
+    directTraceModels[0] === event.model &&
+    nativeModels(event).size === 1,
+  );
+  const nativeSseEvent =
+    event.metadata.otelEventName === "codex.sse_event" &&
+    nativeModels(event).size === 1;
+  // A populated model is not provenance. In particular, 0.7.48 could have
+  // written a nearest model into this payload. Only the native pair, trace or
+  // local-turn branches below may promote it to a billable event; an event
+  // whose model has no such evidence falls through to a tokenless gap.
   if (!row) return gap("capture_row_missing");
   if (!row.workspace || !row.epoch) return gap("capture_identity_missing");
   const at = Date.parse(event.observedAt),
@@ -435,23 +454,44 @@ export function captureCodexModel(
   )
     return pairedObservation(capture(event, pair, "paired_sse_event"));
   const traceId = text(event.metadata.traceId);
+  const tracedPeers = traceId
+    ? native.filter((p) => p.event.metadata.traceId === traceId)
+    : [];
   const traced = traceId
     ? logs.filter((p) => p.event.metadata.traceId === traceId)
     : [];
-  if (traced.some(conflicts)) return gap("conflicting_trace_model_evidence");
-  const traceModels = unique(traced, (e) => text(e.model));
+  const traceEvidence =
+    traceId && (directTraceModelEvidence || nativeSseEvent)
+      ? [{ event, pairedId: null }, ...traced]
+      : traced;
+  if (tracedPeers.some(conflicts)) return gap("conflicting_trace_model_evidence");
+  const nativeTraceModels = unique(tracedPeers, (e) => text(e.model));
+  if (nativeTraceModels.length > 1)
+    return gap("ambiguous_trace_model");
+  if (
+    (directTraceModelEvidence || nativeSseEvent) &&
+    nativeTraceModels.length === 1 &&
+    nativeTraceModels[0] !== event.model
+  )
+    return gap("ambiguous_trace_model");
+  const traceModels = unique(traceEvidence, (e) => text(e.model));
   if (traceModels.length > 1) return gap("ambiguous_trace_model");
   if (
-    traced.some((p) => accountConflict(p.event)) ||
-    traced.some((p) => traced.some((other) => !compatible(p.event, other.event))) ||
-    unique(traced, (e) => trustedSession(e)).length > 1
+    tracedPeers.some((p) => accountConflict(p.event)) ||
+    tracedPeers.some((p) => !compatible(event, p.event)) ||
+    tracedPeers.some((p) => tracedPeers.some((other) => !compatible(p.event, other.event))) ||
+    unique(tracedPeers, (e) => trustedSession(e)).length > 1
   )
     return gap("ambiguous_trace_identity");
   if (
     traceModels.length === 1 &&
-    traced.every((p) => compatible(event, p.event))
+    traceEvidence.every((p) => compatible(event, p.event))
   )
-    return capture(event, traced, "unique_trace_sse_event");
+    return capture(event, traceEvidence, "unique_trace_sse_event");
+  // A native SSE log without a trace is still an exact named source. There is
+  // no trace boundary to join, so only this row's own model can qualify it.
+  if (nativeSseEvent && !traceId)
+    return capture(event, [{ event, pairedId: null }], "native_sse_event");
   const turn =
     text(event.metadata.codexTurnId) ??
     text(event.metadata["turn.id"]) ??

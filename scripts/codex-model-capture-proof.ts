@@ -722,7 +722,7 @@ async function main() {
         return span([attr("user.account_id", "sha256:fedcba9876543210")]);
       },
       null,
-      "model_evidence_missing",
+      "ambiguous_trace_identity",
     );
     await run(
       "resource-only-model",

@@ -115,6 +115,8 @@
     "proof:session-context-index": "tsx scripts/session-context-index-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
     "proof:codex-model-capture": "tsx scripts/run-proof.ts scripts/codex-model-capture-proof.ts",
+    "proof:codex-capture-retry": "tsx scripts/run-proof.ts scripts/retry-directed.ts",
+    "proof:codex-legacy-model-evidence": "tsx scripts/run-proof.ts scripts/legacy-guess-directed.ts",
     "proof:collector-named-usage-rollback": "tsx scripts/run-proof.ts scripts/collector-named-usage-rollback-proof.ts",
     "proof:codex-usage-pairing": "tsx scripts/codex-usage-pairing-proof.ts",
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",

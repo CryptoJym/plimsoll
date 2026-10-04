@@ -775,6 +775,12 @@ jobs:
       - name: Prove model evidence or a capture gap on every Codex upload
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-model-capture
+      - name: Prove late evidence cannot resurrect a tokenless capture gap
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-retry
+      - name: Prove legacy proximity models become tokenless gaps
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-legacy-model-evidence
       - name: Prove named usage survives 0.7.48 and 0.7.47 rollback readers
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:collector-named-usage-rollback

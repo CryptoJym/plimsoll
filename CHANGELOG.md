@@ -11,6 +11,10 @@
   readers can replay 0.7.49 usage byte-for-byte during rollback. Plan-limit
   windows are bounded to 525,600 minutes before emission or sealing, while
   keyless legacy readings remain compatible.
+- A queued tokenless capture-gap replacement never rereads late raw counters,
+  so a lost acknowledgement cannot make the same usage billable under a new
+  delivery ID. Legacy 0.7.48 proximity-assigned models without a native pair,
+  trace or turn now become tokenless gaps instead of billable usage.
 
 ## 0.7.48 — 2026-10-03 (unpublished)
 

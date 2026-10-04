@@ -597,6 +597,9 @@ async function main() {
       const localGap = captureCodexModel(h.buffer.database, rawSpan);
       const lease = h.upload({ ack: false });
       check("late_pair_span_first_leases_before_counterpart", lease.items.length === 1);
+      // The held lease survives a collector crash/restart. Reopen the same
+      // ledger before the late counterpart arrives and before the receipt flush.
+      h.restart();
       h.at(62_000); h.append(logEvent(R()));
       h.buffer.delivery.acknowledge(lease.leaseId,
         lease.items.map((item) => item.deliveryId), new Date(h.vnow));
