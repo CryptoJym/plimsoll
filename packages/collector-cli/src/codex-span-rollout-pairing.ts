@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { frozenCodexCapture } from "./codex-named-capture";
 import { estimateCostUsd, providerAccountKey, usageFieldKeys, validatedMetadataAttribute,
   type AiInteractionEvent } from "../../shared/src/index";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -242,7 +243,8 @@ export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string
   if (reciprocal.length !== 1 || reciprocal[0]!.id !== row.id) return null;
   const span = kind(row) === "span" ? row : other;
   const rollout = kind(row) === "rollout" ? row : other;
-  if (hasDurableCaptureGap(db, span) || hasDurableCaptureGap(db, rollout)) return null;
+  const captured = frozenCodexCapture(db,span.id);
+  if ((!captured && hasDurableCaptureGap(db, span)) || hasDurableCaptureGap(db, rollout)) return null;
   if (!table(db, "codex_turn_model_evidence")) return null;
   const nativeTurn = db.prepare(`select model,count(distinct nullif(account_key,'')) as accounts
     from codex_turn_model_evidence where workspace_id=? and device_id is ? and installation_epoch_id=?
@@ -251,8 +253,11 @@ export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string
       Array<{ model: string; accounts: number }>;
   if (nativeTurn.length !== 1 || nativeTurn[0]!.model !== rollout.event.model || nativeTurn[0]!.accounts > 1 ||
       rollout.event.metadata.modelEvidenceConflict === true) return null;
-  if (!nativeTraceCompatible(db, span, rollout)) return null;
-  const emitted = emittedSpanModel(db, span);
+  // Fresh captures still require all native trace facts. An exact twin of
+  // a captured named span is deduplication against accounting history; later
+  // facts cannot give that already-counted response another financial owner.
+  if (!captured && !nativeTraceCompatible(db, span, rollout)) return null;
+  const emitted = captured?.event.model ?? emittedSpanModel(db, span);
   // A historical acknowledged span without an emission witness needs the
   // reviewed cloud correction, rather than an invented local ownership claim.
   if (!emitted && span.uploaded) return null;

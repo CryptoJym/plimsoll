@@ -127,4 +127,14 @@ export function rememberFrozenCodexCapture(
     (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,envelope_json,captured_event_json)
     select ?,rowid,id,created_at,privacy_generation,?,? from buffered_events
       where id=? and privacy_generation is not null`).run(deliveryId,envelopeJson,JSON.stringify(captured),rawId);
+  // Stateless/history upload can freeze a request before the outbox leases it.
+  // Freeze the matching queue copy too, including for an older reader. Use the
+  // stored first witness, never a later caller's restamped candidate bytes.
+  if (!db.prepare("select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) return;
+  db.prepare(`update upload_outbox as o set sealed_envelope_json=(select w.envelope_json
+      from codex_named_captures w where w.delivery_id=o.delivery_id),
+    sealed_bytes=(select length(cast(w.envelope_json as blob)) from codex_named_captures w where w.delivery_id=o.delivery_id)
+    where o.delivery_id=? and o.sealed_envelope_json is null and exists(select 1 from codex_named_captures w
+      where w.delivery_id=o.delivery_id and w.raw_rowid is o.raw_rowid and w.raw_id is o.raw_id
+        and w.raw_created_at is o.raw_created_at and w.raw_generation is o.raw_generation)`).run(deliveryId);
 }
