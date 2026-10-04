@@ -87,6 +87,7 @@ class Fixture:
         db.commit()
         db.close()
         (self.collector / "collector.config.json").write_text("{}\n")
+        (self.collector / "collector.config.json").chmod(0o600)
 
     def call(self, cli, args, fault=None):
         env = dict(os.environ)
