@@ -16,6 +16,7 @@ import { deterministicEventId } from "./normalizer";
 import { ensureJsonlScanState, jsonlScanStateKey, rememberJsonlScanCursor,
   type JsonlTailRead } from "./jsonl-byte-tailer";
 import { rootCursorKey } from "./capture-root-inventory";
+import { hasSessionUsageAuthority, hasUnkeyedLiveUsageOverlap } from "./usage-authority";
 
 const UUID_AT_END = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
@@ -741,8 +742,10 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       sessions.add(session);
       if (!plan.firstObservedAt || e.observedAt < plan.firstObservedAt) plan.firstObservedAt = e.observedAt;
       if (!plan.lastObservedAt || e.observedAt > plan.lastObservedAt) plan.lastObservedAt = e.observedAt;
-      const live = (authority.get(root.source, session) as { authority: string } | undefined)?.authority === "live" ||
-        Boolean(liveRaw.get(root.source, session));
+      const live = root.source === "codex"
+        ? hasSessionUsageAuthority(db,root.source,session,"live") === true
+        : (authority.get(root.source, session) as { authority: string } | undefined)?.authority === "live" ||
+          Boolean(liveRaw.get(root.source, session));
       if (live) { skippedLive.add(session); continue; }
       const digest = crypto.createHash("sha256").update(JSON.stringify([
         e.observedAt, e.model, e.inputTokens, e.outputTokens, e.cacheReadTokens, e.cacheCreationTokens,
@@ -810,11 +813,13 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   // earlier OTLP/hook capture of any still-missing session, so refuse.
   if (plan.missingRows > 0 && receiptCount !== matchedReceipts.size) refusal("unattributed_pruned_rows");
   if (plan.missingRows > 0 && plan.firstObservedAt && plan.lastObservedAt) {
-    const unkeyed = db.prepare(`select 1 from buffered_events where source=? and session_id is null
-      and observed_at between ? and ? and event_type not in ('usage_rollout','usage_transcript')
-      and (input_tokens is not null or output_tokens is not null or cache_read_tokens is not null
-        or cache_creation_tokens is not null or cost_usd is not null) limit 1`)
-      .get(root.source, plan.firstObservedAt, plan.lastObservedAt);
+    const unkeyed = root.source === "codex"
+      ? hasUnkeyedLiveUsageOverlap(db,root.source,plan.firstObservedAt,plan.lastObservedAt)
+      : db.prepare(`select 1 from buffered_events where source=? and session_id is null
+          and observed_at between ? and ? and event_type not in ('usage_rollout','usage_transcript')
+          and (input_tokens is not null or output_tokens is not null or cache_read_tokens is not null
+            or cache_creation_tokens is not null or cost_usd is not null) limit 1`)
+          .get(root.source,plan.firstObservedAt,plan.lastObservedAt);
     if (unkeyed) refusal("unkeyed_live_usage_overlap");
   }
   return { plan, files };

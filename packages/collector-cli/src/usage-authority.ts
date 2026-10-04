@@ -49,16 +49,8 @@ export function hasSessionUsageAuthority(
       and e.rowid not in (select value from json_each(@excluded))
       and (@cursorAt is null or e.observed_at<@cursorAt or (e.observed_at=@cursorAt and e.id<@cursorId))
     order by e.observed_at desc,e.id desc limit 128`);
-  let cursorAt: string | null = null, cursorId: string | null = null;
-  // Finish each bounded SQL page before capture reads schema/lineage. An
-  // active SQLite iterator would prevent capture's schema-cookie pragma.
-  while (true) {
-    const rows = query.all({ source,session:sessionId,excluded:JSON.stringify(excludeRowids),cursorAt,cursorId,
-      ...(probeRows === undefined ? {} : {probe:probeRows}) }) as Array<{id:string;at:string}>;
-    for (const row of rows) if (source !== "codex" || rowCanOwnSessionUsage(db,row.id)) return true;
-    if (rows.length<128) break;
-    cursorAt = rows[rows.length-1]!.at; cursorId = rows[rows.length-1]!.id;
-  }
+  if (hasAdmittedWitness(db,query,source,{source,session:sessionId,excluded:JSON.stringify(excludeRowids),
+    ...(probeRows === undefined ? {} : {probe:probeRows})})) return true;
   if (probeRows !== undefined) {
     const { n } = db.prepare(`select count(*) as n from (select 1 from buffered_events
       where source=? and session_id=? order by observed_at desc limit ?)`)
@@ -66,4 +58,30 @@ export function hasSessionUsageAuthority(
     if (n > probeRows) return "undecided";
   }
   return false;
+}
+
+function hasAdmittedWitness(db: Database.Database,query: Database.Statement,source: string,parameters: Record<string,unknown>) {
+  let cursorAt: string | null = null, cursorId: string | null = null;
+  // Finish each bounded SQL page before capture reads schema/lineage. An
+  // active SQLite iterator would prevent capture's schema-cookie pragma.
+  while (true) {
+    const rows = query.all({...parameters,cursorAt,cursorId}) as Array<{id:string;at:string}>;
+    for (const row of rows) if (source !== "codex" || rowCanOwnSessionUsage(db,row.id)) return true;
+    if (rows.length<128) break;
+    cursorAt = rows[rows.length-1]!.at; cursorId = rows[rows.length-1]!.id;
+  }
+  return false;
+}
+
+export function hasUnkeyedLiveUsageOverlap(db: Database.Database,source: string,from: string,to: string) {
+  const eligible = terminalPrivacyEligibilitySql(db,"e");
+  const query = db.prepare(`select e.id,e.observed_at as at from buffered_events e
+    where e.source=@source and e.session_id is null and e.observed_at between @from and @to
+      and ${CODEX_SESSION_AUTHORITY_SQL} and ${eligible}
+      and e.event_type not in ('usage_rollout','usage_transcript')
+      and (e.input_tokens is not null or e.output_tokens is not null or e.cache_read_tokens is not null
+        or e.cache_creation_tokens is not null or e.cost_usd is not null)
+      and (@cursorAt is null or e.observed_at<@cursorAt or (e.observed_at=@cursorAt and e.id<@cursorId))
+    order by e.observed_at desc,e.id desc limit 128`);
+  return hasAdmittedWitness(db,query,source,{source,from,to});
 }

@@ -5,11 +5,14 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { captureCodexModel, recordCodexTurnModel, rememberCaptureGap } from "../packages/collector-cli/src/codex-model-capture";
+import { beginAutomaticCaptureBaseline,completeAutomaticCaptureBaseline,sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
+import { deriveCaptureRootIdentity } from "../packages/collector-cli/src/capture-root-inventory";
+import { planCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
 import { aiInteractionEventSchema, type AiInteractionEvent } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
 import { proofTempRoot, withReader } from "./lib/legacy-reader";
 
-const completion = createProofCompletion("codex-capture-authority", 14);
+const completion = createProofCompletion("codex-capture-authority", 18);
 const root = proofTempRoot("capture-authority");
 const AT = Date.now() - 300_000;
 const SESSION = "22222222-2222-4222-8222-222222222222";
@@ -238,6 +241,34 @@ async function historicalProjectionRepair() {
   });
 }
 
+async function historyPlanAuthority(valid: boolean,unkeyed: boolean) {
+  const f = new Fixture();
+  try {
+    const peer = log("6".repeat(32),MODEL,17,3,valid ? [] : [attr("gen_ai.request.model","gpt-6-astra")]);
+    peer.observedAt = new Date(AT+11000).toISOString();
+    if (unkeyed) {delete peer.sessionId; delete peer.metadata["conversation.id"];}
+    assert.equal(f.buffer.append(peer),true); const first=f.lease(63000);
+    const delivery=first.items.find(i=>i.rawId===peer.id)!; assert.ok(delivery);
+    if (!valid) assertGap(delivery.envelope.event);
+    f.buffer.delivery.acknowledge(first.leaseId,first.items.map(i=>i.deliveryId),f.now);
+    const directory=nativeFile(f.dir);
+    const file=path.join(directory,...new Date(AT).toISOString().slice(0,10).split("-"),`rollout-fixture-${SESSION}.jsonl`);
+    const captureRoot={...deriveCaptureRootIdentity("fixture","codex",directory),directory,source:"codex" as const,
+      installationEpochId:f.buffer.workspaceBinding()!.currentInstallationEpochId!};
+    const baseline=beginAutomaticCaptureBaseline(f.buffer.database,"codex",{startedAt:new Date(AT-2000).toISOString(),filesDiscovered:0});
+    completeAutomaticCaptureBaseline(f.buffer.database,"codex",{runId:baseline.latestRun!.runId,completedAt:new Date(AT-1000).toISOString()});
+    const stat=fs.statSync(file,{bigint:true});
+    sealCaptureBaselineGenerations(f.buffer.database,"codex",[{path:file,device:stat.dev,inode:stat.ino,
+      size:stat.size,birthtimeNs:stat.birthtimeNs}],new Date(AT+64000).toISOString());
+    if (valid && unkeyed) await assert.rejects(planCaptureHistory(f.buffer.database,captureRoot),/unkeyed_live_usage_overlap/);
+    else {
+      const plan=await planCaptureHistory(f.buffer.database,captureRoot);
+      assert.equal(plan.skippedLiveSessions,valid ? 1 : 0); assert.equal(plan.missingRows,valid ? 0 : 1);
+      if (!valid) {assert.equal(plan.tokens.input,19);assert.equal(plan.tokens.output,2);}
+    }
+    completion.check(`history planner ${unkeyed ? "unkeyed overlap" : "keyed authority"} ${valid ? "valid native SSE" : "ACKed gap"}`);
+  } finally {f.close();}
+}
 async function main() {
   try {
     await authorityCase("invalid SSE gap ACK cannot suppress known native turn", log("a".repeat(32), MODEL, 17, 3,
@@ -248,6 +279,7 @@ async function main() {
     await authorityCase("partial counters with unknown model stay diagnostic", log("e".repeat(32), undefined, 17), false, 17);
     for (const kind of ["model", "account", "session"] as const) await traceFactCase(kind);
     await localFactCase(); await duplicateNativeFact(); await foreignBoundaryAuthority(); await distantTraceConflict(); await historicalUpgrade(); await historicalProjectionRepair();
+    for (const valid of [false,true]) for (const unkeyed of [false,true]) await historyPlanAuthority(valid,unkeyed);
     completion.complete();
   } finally {fs.rmSync(root, {recursive: true,force: true});}
 }
