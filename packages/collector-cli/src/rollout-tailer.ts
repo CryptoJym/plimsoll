@@ -536,6 +536,7 @@ export class RolloutTailer {
     discovery: IncrementalJsonlDiscovery;
     pendingFiles: AutomaticCapturePendingFile[];
     discoveryDone: boolean;
+    foregroundEntries: number;
   } | null = null;
   private currentDayAttempt: {
     day: string;
@@ -606,8 +607,11 @@ export class RolloutTailer {
     // either gone or a fresh replacement that has enumerated nothing. Publish
     // the sweep this cadence actually ran, not those zeros.
     const retired = this.retiredProgress;
+    const progress = retired ?? attempt?.discovery.progress() ?? null;
     const scan = captureScanProgress({
-      discovery: retired ?? attempt?.discovery.progress() ?? null,
+      discovery: progress && !retired && this.captureAttempt
+        ? { ...progress, entriesVisited: progress.entriesVisited + this.captureAttempt.foregroundEntries }
+        : progress,
       cursorRetired: retired !== null,
       successorInstalled: this.successorInstalled,
       configuredRoots: this.configuredRootCount,
@@ -1529,14 +1533,28 @@ export class RolloutTailer {
         discovery: this.recentDiscovery(options.now ?? new Date(), options.discoveryLimit, options),
         pendingFiles: [],
         discoveryDone: false,
+        foregroundEntries: 0,
       };
     }
     const attempt = this.captureAttempt;
     const discoveryStartedAt = performance.now();
     const now = options.now ?? new Date();
     const day = now.toISOString().slice(0, 10);
-    if (this.currentDayAttempt?.day !== day) {
+    const currentDirectories = new Set(this.directories.map(directory =>
+      path.join(directory, ...day.split("-"))));
+    // A normal sweep already visits today. Use the independent walk only
+    // when older or partially serviced candidates pin that sweep's batch.
+    // Unserviced current-day metadata must resume before more discovery can
+    // consume its progress frames (#181).
+    const needsForeground = attempt.pendingFiles.some(file =>
+      (file.servicedCadences ?? 0) > 0 || !currentDirectories.has(path.dirname(file.file)));
+    if (this.currentDayAttempt && (this.currentDayAttempt.day !== day ||
+        !needsForeground && this.currentDayAttempt.pendingFiles.length === 0)) {
+      for (const file of this.currentDayAttempt.pendingFiles) this.revisit.offer(file.file);
       this.currentDayAttempt?.discovery.close();
+      this.currentDayAttempt = null;
+    }
+    if (!this.currentDayAttempt && needsForeground) {
       this.currentDayAttempt = {
         day, discovery: this.recentDiscovery(now, options.discoveryLimit, options, 1, this.currentDayRootIndex),
         pendingFiles: [],
@@ -1545,12 +1563,12 @@ export class RolloutTailer {
     const current = this.currentDayAttempt;
     // A retained large file has had its quantum. Return it to the stat-only
     // revisit rotation instead of letting it occupy a freshness slot.
-    current.pendingFiles = current.pendingFiles.filter(file => {
+    if (current) current.pendingFiles = current.pendingFiles.filter(file => {
       if (!file.servicedCadences) return true;
       this.revisit.offer(file.file);
       return false;
     });
-    const currentChunk = current.pendingFiles.length < CURRENT_DAY_PENDING_CAP
+    const currentChunk = current && current.pendingFiles.length === 0 && needsForeground
       ? await current.discovery.collect(budget, {
           signal: options.signal,
           maxFiles: CURRENT_DAY_PENDING_CAP - current.pendingFiles.length,
@@ -1559,9 +1577,10 @@ export class RolloutTailer {
           minimumSteps: CURRENT_DAY_PENDING_CAP,
         })
       : { files: [], entriesVisited: 0, errors: 0, done: false, limitReached: false };
-    current.pendingFiles.push(...currentChunk.files.filter(file =>
+    if (current) current.pendingFiles.push(...currentChunk.files.filter(file =>
       !current.pendingFiles.some(pending => pending.file === file.file)));
-    if (currentChunk.done || currentChunk.limitReached || currentChunk.errors > 0) {
+    attempt.foregroundEntries += currentChunk.entriesVisited;
+    if (current && (currentChunk.done || currentChunk.limitReached || currentChunk.errors > 0)) {
       const progress = current.discovery.progress();
       this.currentDayRootIndex = (progress.origin + 1) % Math.max(1, this.directories.length);
       current.discovery.close();
@@ -1595,10 +1614,10 @@ export class RolloutTailer {
       truncated = !chunk.done || chunk.limitReached;
       if (chunk.errors > 0 || chunk.limitReached) attempt.discoveryDone = true;
     }
-    const currentFiles = new Set(current.pendingFiles.map(file => file.file));
-    const files = [...current.pendingFiles, ...attempt.pendingFiles.filter(file => !currentFiles.has(file.file))];
+    const currentFiles = new Set(current?.pendingFiles.map(file => file.file));
+    const files = [...(current?.pendingFiles ?? []), ...attempt.pendingFiles.filter(file => !currentFiles.has(file.file))];
     const done = attempt.discoveryDone;
-    return { files, errors, truncated: truncated || !done, discoveryEntries: entries,
+    return { files, errors, truncated: truncated || !done, discoveryEntries: entries + currentChunk.entriesVisited,
       currentDayDiscoveryEntries: currentChunk.entriesVisited };
   }
 
@@ -1610,8 +1629,13 @@ export class RolloutTailer {
     if (!attempt) return;
     attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
+      const progress = attempt.discovery.progress();
       this.persistSweepResume(attempt.discovery);
       this.retire(attempt.discovery);
+      this.retiredProgress = {
+        ...progress,
+        entriesVisited: progress.entriesVisited + attempt.foregroundEntries,
+      };
       this.captureAttempt = null;
     }
   }
