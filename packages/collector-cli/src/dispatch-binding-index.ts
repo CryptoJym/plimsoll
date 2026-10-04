@@ -7,7 +7,7 @@ import { z } from "zod";
 import { resolveCollectorHome } from "./collector-home";
 import { assertPrivateStateDirectory, fsyncStateDirectory, readPrivateStateFile } from "./collector-state-io";
 import { dispatchTerminalProofSchema, type DispatchTerminalProof } from "./dispatch-binding-lifecycle";
-import { assertDispatchHistoryWriterDeadline, dispatchHistoryAdoptionRequired,
+import { assertDispatchHistoryBuildPairQualified, assertDispatchHistoryWriterDeadline, dispatchHistoryAdoptionRequired,
   dispatchHistoryPublicationQualified, hasDispatchHistoryAdoption, qualifyDispatchHistoryPublication,
   type DispatchRollbackRootInventory } from "./dispatch-history-adoption";
 
@@ -380,6 +380,7 @@ export function updateDispatchHistory<B extends Binding, R extends DispatchHisto
       return { roots: legacyRoots, archived: 0, pruned: 0 as const };
     dispatchHistoryAdoptionRequired(roots);
   }
+  assertDispatchHistoryBuildPairQualified(roots);
   if (nextRecords.size > DISPATCH_HISTORY_LIMITS.historyRows) throw new Error("dispatch_history_row_bound_exceeded");
   const records = [...nextRecords.values()];
   let rawBytes=0;
@@ -409,6 +410,7 @@ export function updateDispatchHistory<B extends Binding, R extends DispatchHisto
     if (hash(image) !== generation.sha256) throw new Error("dispatch_history_digest_mismatch");
     qualifyDispatchHistoryPublication(result, image, { generation: generation.generation,
       ...rollbackInventory(result, records, terminals) }, now);
+    if (!dispatchHistoryPublicationQualified(result)) throw new Error("dispatch_history_adoption_reader_inventory_mismatch");
     if (staged) publishArchive(staged);
   }
   return { roots: result, archived, pruned: 0 as const };

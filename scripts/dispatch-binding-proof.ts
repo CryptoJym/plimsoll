@@ -1,3 +1,5 @@
+import { DISPATCH_HISTORY_BUILD_PAIR } from "../packages/collector-cli/src/dispatch-history-build-pair";
+import { runFutureDispatchHistorySourcePair } from "./lib/dispatch-history-future-pair-fixture";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -17,8 +19,9 @@ import { remoteLinkageHash } from "../packages/shared/src/linkage";
 import { validatedMetadataAttribute } from "../packages/shared/src/analytical-metadata";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const proof = createProofCompletion("dispatch-binding");
+let proof: ReturnType<typeof createProofCompletion>;
 async function main() {
+proof = createProofCompletion("dispatch-binding");
 const root = process.env.PLIMSOLL_PROOF_ROOT!;
 const home = process.env.HOME!;
 const plimsoll = process.env.PLIMSOLL_HOME!;
@@ -360,4 +363,4 @@ assert.equal(rootEventMetadata(roots[0], "late-historical-event", "2026-09-01T00
 proof.check("unqualified_history_refuses_then_real_qualified_reader_preserves_elapsed_window_at_open_cap");
 proof.complete();
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+Promise.resolve().then(()=>DISPATCH_HISTORY_BUILD_PAIR.mode==="rollback-bridge" ? runFutureDispatchHistorySourcePair("scripts/dispatch-binding-proof.ts") : main()).catch(error => { console.error(error); process.exitCode = 1; });

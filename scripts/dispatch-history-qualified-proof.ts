@@ -1,3 +1,5 @@
+import { DISPATCH_HISTORY_BUILD_PAIR } from "../packages/collector-cli/src/dispatch-history-build-pair";
+import { runFutureDispatchHistorySourcePair } from "./lib/dispatch-history-future-pair-fixture";
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -6,6 +8,9 @@ import { withDispatchHistoryAdoption } from '../packages/collector-cli/src/dispa
 import { dispatchHistoryAdoptionFixture, installDispatchHistoryWriterTimingFixture } from './lib/dispatch-history-adoption-fixture';
 import { createProofCompletion, requireIsolatedProofEnvironment } from './lib/proof-completion';
 requireIsolatedProofEnvironment();
+if (DISPATCH_HISTORY_BUILD_PAIR.mode === "rollback-bridge") {
+  runFutureDispatchHistorySourcePair("scripts/dispatch-history-qualified-proof.ts");
+} else {
 installDispatchHistoryWriterTimingFixture();
 const original=path.resolve('scripts/dispatch-history-proof.ts');
 const hash=()=>crypto.createHash('sha256').update(fs.readFileSync(original)).digest('hex');
@@ -32,3 +37,5 @@ process.on('exit',()=>{
 withDispatchHistoryAdoption(dispatchHistoryAdoptionFixture,()=>import('./dispatch-history-proof')).catch(error=>{
   console.error(error);process.exitCode=1;
 });
+
+}
