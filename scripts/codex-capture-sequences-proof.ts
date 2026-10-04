@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
+import { buildIngestBatch } from "../packages/collector-cli/src/upload";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline, sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
 import { deriveCaptureRootIdentity } from "../packages/collector-cli/src/capture-root-inventory";
@@ -20,7 +22,7 @@ import { proofTempRoot, withReader } from "./lib/legacy-reader";
 const OPS = ["sse-valid", "sse-invalid", "sse-conflicting", "trace-sol", "trace-astra", "span",
   "rollout-turn", "rollout-no-turn", "neighbour-turn", "history-turn", "history-no-turn",
   "lease", "ack", "expire-retry", "retry", "remote-terminal", "replay", "restamp", "gap-seal",
-  "reopen", "rollback-047", "rollback-048", "upgrade-047", "upgrade-048"] as const;
+  "stateless-build", "reopen", "rollback-047", "rollback-048", "upgrade-047", "upgrade-048"] as const;
 type Op = typeof OPS[number];
 type Version = "head" | "0.7.47" | "0.7.48";
 type Frozen = { id: string; rawId: string; bytes: string; event: any; named: boolean; gap: boolean };
@@ -96,7 +98,7 @@ class World {
   }
   head() { if(this.version!=="head") this.open("head"); }
   advance(ms=123_000) { this.now=new Date(this.now.getTime()+ms); }
-  observe(lease: any) {
+  observe(lease: any,transportLease=true) {
     for(const item of lease.items) {
       const e=item.envelope.event, previous=this.frozen.get(item.deliveryId);
       if(previous) invariant(item.envelopeJson===previous.bytes,"I2_BYTES",{id:item.deliveryId,version:this.version});
@@ -114,7 +116,7 @@ class World {
       if(!previous) this.frozen.set(item.deliveryId,{id:item.deliveryId,rawId:item.rawId,bytes:item.envelopeJson,event:e,
         named:!gap(e)&&unit(e),gap:gap(e)});
     }
-    this.currentLease=lease;
+    if(transportLease)this.currentLease=lease;
   }
   lease(expire=true) { if(expire)this.advance();const result=this.b.delivery.lease({now:this.now});this.observe(result);return result; }
   async nativeFile(withTurn: boolean) {
@@ -173,7 +175,7 @@ class World {
   }
   async operate(op: Op) {
     if(["sse-valid","sse-invalid","sse-conflicting","trace-sol","trace-astra","span","rollout-turn","rollout-no-turn",
-      "neighbour-turn","history-turn","history-no-turn","gap-seal","upgrade-047","upgrade-048"].includes(op)) this.head();
+      "neighbour-turn","history-turn","history-no-turn","gap-seal","stateless-build","upgrade-047","upgrade-048"].includes(op)) this.head();
     switch(op) {
       case "sse-valid": {
         const e=log(MODEL,this.trace,AT+6000,19,2);this.nativeKinds.set(e.id,"trace");
@@ -241,6 +243,15 @@ class World {
       case "gap-seal": {
         const bad=log(MODEL,this.gapTrace,AT+7000,7,1,true);this.nativeKinds.set(bad.id,"invalid");this.b.append(bad);
         this.lease();break;
+      }
+      case "stateless-build": {
+        const config=collectorConfigSchema.parse({tenantId:WORKSPACE,deviceId:"sequence-device",installKey:"sequence-fixture-key"});
+        const result=buildIngestBatch(config,this.b,{now:()=>this.now});
+        invariant(!result.batch || result.batch.events.length===result.rows.length,"SNAPSHOT_ROWS",result.rows.length);
+        if(result.batch)this.observe({items:result.batch.events.map((envelope,index)=>({
+          deliveryId:envelope.event.id,rawId:result.rows[index]!.id,envelope,envelopeJson:JSON.stringify(envelope),
+        }))},false);
+        break;
       }
       case "reopen": this.open(this.version);break;
       case "rollback-047": case "rollback-048": {

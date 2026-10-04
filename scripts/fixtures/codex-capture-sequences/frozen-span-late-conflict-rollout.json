@@ -1,0 +1,12 @@
+{
+  "finding": "R8-P0-08",
+  "operations": [
+    "trace-sol",
+    "span",
+    "expire-retry",
+    "trace-astra",
+    "rollout-turn",
+    "expire-retry"
+  ],
+  "contract": "Late trace contradictions gate new captures but cannot make an already frozen named span lose ownership of its exact rollout twin."
+}
