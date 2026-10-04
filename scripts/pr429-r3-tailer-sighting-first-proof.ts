@@ -25,7 +25,7 @@ fs.mkdirSync(project, { recursive: true, mode: 0o700 });
 fs.mkdirSync(plimsoll, { recursive: true, mode: 0o700 });
 const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-tailer-sighting",
   uploadUrl: "http://127.0.0.1:1/unused", captureRoots: [root] });
-fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`);
+fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
 const line = (index: number) => JSON.stringify({ type: "assistant", sessionId,
   timestamp: observedAt, message: { id: `message-${index}`, model: "claude-sonnet-4-20250514",
     content: [], usage: { input_tokens: index, output_tokens: index,

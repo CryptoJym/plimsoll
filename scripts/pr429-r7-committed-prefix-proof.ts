@@ -52,10 +52,10 @@ const config = collectorConfigSchema.parse({deviceId:`dev-r7-${scenario}`,
   uploadUrl:"http://127.0.0.1:1/unused",captureRoots:[{...A,dispatch:[binding]},B]});
 fs.mkdirSync(A.directory,{recursive:true});
 fs.mkdirSync(path.dirname(file),{recursive:true});
-fs.mkdirSync(process.env.PLIMSOLL_HOME!,{recursive:true});
+fs.mkdirSync(process.env.PLIMSOLL_HOME!,{recursive:true,mode:0o700});
 fs.writeFileSync(file,original);
 fs.writeFileSync(path.join(process.env.PLIMSOLL_HOME!,"collector.config.json"),
-  JSON.stringify(config)+"\n");
+  JSON.stringify(config)+"\n",{mode:0o600});
 const dbPath = path.join(process.env.PLIMSOLL_HOME!,"committed-prefix.sqlite");
 const options = {workspaceId:config.tenantId,deviceId:config.deviceId,
   enrollmentNow:()=>new Date(now-3_600_000),delivery:{enabled:true},databaseBusyTimeoutMs:0};

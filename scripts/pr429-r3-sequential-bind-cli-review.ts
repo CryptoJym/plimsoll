@@ -4,9 +4,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { appendRootObservation, claudeDispatchSkipStatus, currentDispatchBindingSnapshot,
+import { appendRootObservation, claudeDispatchSkipStatus, currentDispatchBindingSnapshot, dispatchBindingSchema,
   rootEventMetadata } from "../packages/collector-cli/src/capture-root-inventory";
-import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { collectorConfigSchema, rollbackCollectorDispatchHistory } from "../packages/collector-cli/src/config";
+import { historicalDispatchBindings } from "../packages/collector-cli/src/dispatch-binding-index";
 import { bindDispatch, restampDispatch } from "../packages/collector-cli/src/dispatch-command";
 import { normalizeForwardedHook } from "../packages/collector-cli/src/forwarder";
 import { aiInteractionEventSchema } from "../packages/shared/src/schemas";
@@ -23,17 +24,18 @@ const roots = Array.from({ length: 3 }, (_, i) => ({ rootId: `claude-${i}`,
   profileId: `profile-${i}`, installationEpochId: fixtureEpochId(`epoch-${i}`), source: "claude_code" as const,
   directory: path.join(home, `.claude-${i}`, "projects") }));
 for (const root of roots) fs.mkdirSync(root.directory, { recursive: true });
-fs.mkdirSync(plimsoll, { recursive: true });
+fs.mkdirSync(plimsoll, { recursive: true, mode: 0o700 });
 const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-sequential-cli",
   uploadUrl: "http://127.0.0.1:1/unused", captureRoots: roots });
-fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`);
-function bind(workItemId: string, attemptId: string, from: string, until: string) {
+fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
+function bind(workItemId: string, attemptId: string, from: string, until: string | null) {
   return bindDispatch(["--session-id", sessionId, "--work-item-id", workItemId,
     "--project-key", `sha256:${"a".repeat(64)}`, "--attempt-id", attemptId,
-    "--valid-from", from, "--valid-until", until], new Date(now));
+    "--valid-from", from, ...(until ? ["--valid-until", until] : [])], new Date(now));
 }
 const old = bind(oldWork, "11111111-1111-4111-8111-111111111111", iso(-120_000), iso(-60_000));
-const next = bind(newWork, "22222222-2222-4222-8222-222222222222", iso(-60_000), iso(60_000));
+// An active binding remains open; a future window end is no longer accepted.
+const next = bind(newWork, "22222222-2222-4222-8222-222222222222", iso(-60_000), null);
 const snapshot = currentDispatchBindingSnapshot();
 const at = iso(-30_000);
 const before = claudeDispatchSkipStatus().conflictingBindings;
@@ -60,7 +62,10 @@ try {
   restamp = restampDispatch(["--attempt-id", "22222222-2222-4222-8222-222222222222"],
     buffer, snapshot.roots);
 } finally { buffer.close(); }
-const copies = snapshot.roots.map(root => (root.dispatch ?? []).map(binding => ({
+const archived = historicalDispatchBindings(snapshot.roots, { source: "claude_code", sessionId }, dispatchBindingSchema.parse);
+const copies = snapshot.roots.map(root => [...(root.dispatch ?? []),
+  ...archived.filter(row => row.root.rootId === root.rootId).map(row => row.binding)]
+  .sort((a, b) => a.validFrom.localeCompare(b.validFrom)).map(binding => ({
   workItemId: binding.workItemId, attemptId: binding.attemptId,
   validFrom: binding.validFrom, validUntil: binding.validUntil })));
 const actual = { oldBindRoots: old.roots, newBindRoots: next.roots, transcript, hook,
@@ -73,10 +78,13 @@ assert.equal(copies.every(copy => JSON.stringify(copy) === JSON.stringify(copies
 assert.equal(transcript, newWork, "known-root transcript lost the only active binding");
 assert.equal(hook, newWork, "rootless hook lost the only active binding");
 assert.equal(restamp.restamped, 1, "known-root row lost the only active binding during restamp");
-const overlapRoots = snapshot.roots.map(root => ({ ...root, dispatch: root.dispatch?.map(binding =>
+// Seed the older overlap fixture through the production lossless rollback.
+// Immutable history is never dropped or rewritten to create a conflict.
+rollbackCollectorDispatchHistory();
+const overlapRoots = currentDispatchBindingSnapshot().roots.map(root => ({ ...root, dispatch: root.dispatch?.map(binding =>
   binding.workItemId === oldWork ? { ...binding, validUntil: iso(-59_000) } : binding) }));
 const overlapConfig = collectorConfigSchema.parse({ ...config, captureRoots: overlapRoots });
-fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(overlapConfig)}\n`);
+fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(overlapConfig)}\n`, { mode: 0o600 });
 const overlapSnapshot = currentDispatchBindingSnapshot();
 const beforeOverlap = claudeDispatchSkipStatus().conflictingBindings;
 const overlapHook = normalizeForwardedHook({ id: "seq-overlap", hook_event_name: "AssistantResponse",

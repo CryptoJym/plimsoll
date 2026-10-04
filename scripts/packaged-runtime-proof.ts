@@ -553,6 +553,7 @@ async function measurePackagedDaemon(artifact: string): Promise<void> {
   fs.writeFileSync(
     path.join(collectorHome, "collector.config.json"),
     `${JSON.stringify({ port }, null, 2)}\n`,
+    { mode: 0o600 },
   );
   const daemon = spawn(process.execPath, [artifact, "start"], {
     env: {

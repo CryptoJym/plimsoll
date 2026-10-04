@@ -36,7 +36,7 @@ for (const root of roots) fs.mkdirSync(root.directory, { recursive: true, mode: 
 fs.mkdirSync(plimsoll, { recursive: true, mode: 0o700 });
 const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-window-divergence",
   uploadUrl: "http://127.0.0.1:1/unused", captureRoots: roots });
-fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`);
+fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
 const snapshot = currentDispatchBindingSnapshot();
 const before = claudeDispatchSkipStatus();
 const timestamp = at(0);

@@ -110,7 +110,7 @@ async function realDaemonTrial(trial: number, loader: string) {
     fs.mkdirSync(path.join(home, folder), { recursive: true, mode: 0o700 });
   const config = { port: 49100 + trial, tenantId: workspaceId,
     deviceId: "dev_startup_schema_fixture", managedConfig: { reconcile: { enabled: false } } };
-  fs.writeFileSync(path.join(home, ".plimsoll/collector.config.json"), JSON.stringify(config));
+  fs.writeFileSync(path.join(home, ".plimsoll/collector.config.json"), JSON.stringify(config), { mode: 0o600 });
   const env = { ...process.env, HOME: home, USERPROFILE: home,
     PLIMSOLL_HOME: path.join(home, ".plimsoll"), CODEX_HOME: path.join(home, ".codex"),
     CLAUDE_CONFIG_DIR: path.join(home, ".claude"), GROK_HOME: path.join(home, ".grok"),
