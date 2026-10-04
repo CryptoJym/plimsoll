@@ -7,6 +7,9 @@ import { z } from "zod";
 import { resolveCollectorHome } from "./collector-home";
 import { assertPrivateStateDirectory, fsyncStateDirectory, readPrivateStateFile } from "./collector-state-io";
 import { dispatchTerminalProofSchema, type DispatchTerminalProof } from "./dispatch-binding-lifecycle";
+import { assertDispatchHistoryWriterDeadline, dispatchHistoryAdoptionRequired,
+  dispatchHistoryPublicationQualified, hasDispatchHistoryAdoption, qualifyDispatchHistoryPublication,
+  type DispatchRollbackRootInventory } from "./dispatch-history-adoption";
 
 export const DISPATCH_HISTORY_LIMITS = Object.freeze({
   hotRowsPerRoot: 1_000, historyRowsPerRoot: 4_096, historyRows: 65_536,
@@ -172,6 +175,9 @@ function inventoryArchive(roots: readonly DispatchHistoryRoot[], validate: (inpu
       throw new Error("dispatch_history_snapshot_mismatch");
   }
   const archive = loadArchive(first, validate);
+  const presentDigests = new Set(roots.map(dispatchHistoryRootDigest));
+  for (const digest of archive.rootCounts.keys()) if (!presentDigests.has(digest))
+    throw new Error("dispatch_history_partial_snapshot");
   for (const { ref } of refs) if (archive.rootCounts.get(ref.rootDigest) !== ref.rootRows)
     throw new Error("dispatch_history_generation_mismatch");
   // A participating root cannot silently omit its historical membership.
@@ -213,23 +219,8 @@ export function historicalDispatchBindings<B extends Binding>(roots: readonly Di
   }
 }
 
-function publishArchive(records: RecordRow[], now: Date, terminals: DispatchTerminalProof[]) {
-  const started = performance.now(), directory = directoryPath();
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  assertPrivateStateDirectory(directory);
-  const names: string[]=[];
-  const handle=fs.opendirSync(directory);
-  try { while(names.length<=DISPATCH_HISTORY_LIMITS.files) {
-    const entry=handle.readSync();if(!entry)break;names.push(entry.name);
-  } } finally {handle.closeSync();}
-  if (names.length >= DISPATCH_HISTORY_LIMITS.files) throw new Error("dispatch_history_storage_pressure");
-  let bytes = 0;
-  for (const name of names) {
-    if (!/^(?:[a-f0-9]{64}\.sqlite|\.generation-[a-f0-9-]+\.tmp)$/.test(name))
-      throw new Error("dispatch_history_directory_unsafe");
-    const file = path.join(directory, name);
-    archiveStamp(file); bytes += fs.lstatSync(file).size;
-  }
+function buildArchive(records: RecordRow[], now: Date, terminals: DispatchTerminalProof[]) {
+  const started = performance.now();
   const generation = crypto.randomUUID(), database = new Database(":memory:");
   let image: Buffer;
   try {
@@ -251,9 +242,33 @@ function publishArchive(records: RecordRow[], now: Date, terminals: DispatchTerm
     })();
     image = database.serialize();
   } finally { database.close(); }
-  if (image.length > DISPATCH_HISTORY_LIMITS.fileBytes || bytes + image.length > DISPATCH_HISTORY_LIMITS.directoryBytes)
+  if (image.length > DISPATCH_HISTORY_LIMITS.fileBytes)
     throw new Error("dispatch_history_storage_pressure");
-  const digest = hash(image), target = path.join(directory, `${digest}.sqlite`);
+  assertDispatchHistoryWriterDeadline();
+  return { generation, sha256: hash(image), totalRows: records.length, image };
+}
+
+function publishArchive(generation: { generation: string; sha256: string; totalRows: number; image: Buffer }) {
+  const started = performance.now(), directory = directoryPath(), { image } = generation;
+  assertDispatchHistoryWriterDeadline();
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  assertPrivateStateDirectory(directory);
+  const names: string[]=[];
+  const handle=fs.opendirSync(directory);
+  try { while(names.length<=DISPATCH_HISTORY_LIMITS.files) {
+    const entry=handle.readSync();if(!entry)break;names.push(entry.name);
+  } } finally {handle.closeSync();}
+  if (names.length >= DISPATCH_HISTORY_LIMITS.files) throw new Error("dispatch_history_storage_pressure");
+  let bytes = 0;
+  for (const name of names) {
+    if (!/^(?:[a-f0-9]{64}\.sqlite|\.generation-[a-f0-9-]+\.tmp)$/.test(name))
+      throw new Error("dispatch_history_directory_unsafe");
+    const file = path.join(directory, name);
+    archiveStamp(file); bytes += fs.lstatSync(file).size;
+  }
+  if (bytes + image.length > DISPATCH_HISTORY_LIMITS.directoryBytes)
+    throw new Error("dispatch_history_storage_pressure");
+  const target = path.join(directory, `${generation.sha256}.sqlite`);
   let descriptor: number | undefined;
   try {
     deadline(started, DISPATCH_HISTORY_LIMITS.writerDeadlineMs, "writer");
@@ -265,10 +280,26 @@ function publishArchive(records: RecordRow[], now: Date, terminals: DispatchTerm
     fs.writeFileSync(descriptor, image); fs.fsyncSync(descriptor); fs.closeSync(descriptor); descriptor = undefined;
     fsyncStateDirectory(directory);
     deadline(started, DISPATCH_HISTORY_LIMITS.writerDeadlineMs, "writer");
+    assertDispatchHistoryWriterDeadline();
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
-  return { generation, sha256: digest, totalRows: records.length };
+}
+
+function rollbackInventory<B extends Binding>(roots: readonly DispatchHistoryRoot<B>[],
+  records: readonly RecordRow[], terminals: readonly DispatchTerminalProof[]) {
+  const byRoot = new Map<string, string[]>();
+  for (const row of records) {
+    const values = byRoot.get(row.rootDigest) ?? []; values.push(row.binding); byRoot.set(row.rootDigest, values);
+  }
+  const inventory: DispatchRollbackRootInventory[] = roots.map(root => {
+    const { dispatch, dispatchHistory: ignored, ...metadata } = root;
+    const rootDigest = dispatchHistoryRootDigest(root), historical = byRoot.get(rootDigest) ?? [];
+    const bindings = [...(dispatch ?? []).map(binding => JSON.stringify(binding)), ...historical].sort();
+    return { rootDigest, rootMetadataSha256: hash(JSON.stringify(metadata)), inventorySha256: hash(JSON.stringify(bindings)),
+      hot: dispatch?.length ?? 0, historical: historical.length, total: bindings.length };
+  }).sort((a,b) => a.rootDigest.localeCompare(b.rootDigest));
+  return { roots: inventory, terminalSha256: hash(JSON.stringify(terminals.map(proof => JSON.stringify(proof)).sort())) };
 }
 
 /**
@@ -282,6 +313,7 @@ export function updateDispatchHistory<B extends Binding, R extends DispatchHisto
   const started = performance.now();
   if (!Number.isFinite(now.getTime())) throw new Error("dispatch_clock_invalid");
   const previous = inventoryArchive(roots, validate);
+  const buildingHistory = hasDispatchHistoryAdoption() || Boolean(previous) || Boolean(terminalProof);
   const terminals=[...(previous?.terminals??[])];
   if(terminalProof) {
     const prior=terminals.find(proof=>proof.proofId===terminalProof.proofId);
@@ -294,6 +326,7 @@ export function updateDispatchHistory<B extends Binding, R extends DispatchHisto
     const rows = byRoot.get(row.rootDigest) ?? []; rows.push(row); byRoot.set(row.rootDigest, rows);
   }
   const nextRecords = new Map((previous?.records ?? []).map(row => [recordKey(row), row]));
+  const legacyRoots: R[] = [];
   let archived = 0;
   const nextRoots = roots.map(root => {
     deadline(started, DISPATCH_HISTORY_LIMITS.writerDeadlineMs, "writer");
@@ -307,31 +340,46 @@ export function updateDispatchHistory<B extends Binding, R extends DispatchHisto
       seen.add(key);
     }
     const updated = transform(root, combined).map(binding => validate(binding));
-    const hot: B[] = [], historical: B[] = [];
+    const hot: B[] = [], historical: Array<{ binding: B; serialized: string }> = [];
     for (const binding of updated) {
       const from = Date.parse(binding.validFrom), until = binding.validUntil === null ? Infinity : Date.parse(binding.validUntil);
       if (!Number.isFinite(from) || Number.isNaN(until) || from >= until) throw new Error("capture_dispatch_window_invalid");
-      (Number.isFinite(until) && until <= now.getTime() ? historical : hot).push(binding);
+      if (Number.isFinite(until) && until <= now.getTime()) historical.push({ binding, serialized: JSON.stringify(binding) });
+      else hot.push(binding);
     }
     if (hot.length > DISPATCH_HISTORY_LIMITS.hotRowsPerRoot) throw new Error("dispatch_binding_capacity_exceeded");
     if (historical.length > DISPATCH_HISTORY_LIMITS.historyRowsPerRoot) throw new Error("dispatch_history_row_bound_exceeded");
     // Previously archived evidence is immutable, including a closed interval
     // of an attempt whose native thread later continues under another interval.
-    for (const row of oldRows) if (!historical.some(binding => JSON.stringify(binding) === row.binding))
-      throw new Error("dispatch_historical_binding_immutable");
-    for (const binding of historical) {
-      const row: RecordRow = { rootDigest, custody: custody(root), source: root.source,
-        sessionId: binding.sessionId, attemptId: binding.attemptId, fromMs: Date.parse(binding.validFrom),
-        untilMs: Date.parse(binding.validUntil!), binding: JSON.stringify(binding) };
-      if (Buffer.byteLength(row.binding) > DISPATCH_HISTORY_LIMITS.bindingBytes || Buffer.byteLength(row.custody) > 8_192)
-        throw new Error("dispatch_history_byte_bound_exceeded");
-      const key = recordKey(row), existing = nextRecords.get(key);
-      if (existing && JSON.stringify(existing) !== JSON.stringify(row)) throw new Error("dispatch_history_collision");
-      if (!existing) { nextRecords.set(key, row); archived++; }
+    if (buildingHistory) {
+      const historicalBytes = new Set(historical.map(entry => entry.serialized));
+      for (const row of oldRows) if (!historicalBytes.has(row.binding))
+        throw new Error("dispatch_historical_binding_immutable");
+      const rootCustody = custody(root);
+      for (const { binding, serialized } of historical) {
+        const row: RecordRow = { rootDigest, custody: rootCustody, source: root.source,
+          sessionId: binding.sessionId, attemptId: binding.attemptId, fromMs: Date.parse(binding.validFrom),
+          untilMs: Date.parse(binding.validUntil!), binding: serialized };
+        if (Buffer.byteLength(row.binding) > DISPATCH_HISTORY_LIMITS.bindingBytes || Buffer.byteLength(row.custody) > 8_192)
+          throw new Error("dispatch_history_byte_bound_exceeded");
+        const key = recordKey(row), existing = nextRecords.get(key);
+        if (existing && JSON.stringify(existing) !== JSON.stringify(row)) throw new Error("dispatch_history_collision");
+        if (!existing) { nextRecords.set(key, row); archived++; }
+      }
     }
+    const { dispatchHistory: ignored, ...legacy } = root;
+    legacyRoots.push({ ...legacy, dispatch: updated } as R);
     hot.sort((a, b) => Date.parse(b.validFrom) - Date.parse(a.validFrom) || b.attemptId.localeCompare(a.attemptId) || b.sessionId.localeCompare(a.sessionId));
     return { ...root, dispatch: hot, dispatchHistory: undefined };
   });
+  // Ordinary binds that fit the legacy representation keep that representation.
+  // Over-cap admission and every history/terminal publication require explicit
+  // qualification before even creating an archive directory or generation file.
+  if (!hasDispatchHistoryAdoption()) {
+    if (!previous && !terminalProof && legacyRoots.every(root => (root.dispatch?.length ?? 0) <= DISPATCH_HISTORY_LIMITS.hotRowsPerRoot))
+      return { roots: legacyRoots, archived: 0, pruned: 0 as const };
+    dispatchHistoryAdoptionRequired(roots);
+  }
   if (nextRecords.size > DISPATCH_HISTORY_LIMITS.historyRows) throw new Error("dispatch_history_row_bound_exceeded");
   const records = [...nextRecords.values()];
   let rawBytes=0;
@@ -346,7 +394,8 @@ export function updateDispatchHistory<B extends Binding, R extends DispatchHisto
   const counts = new Map<string, number>();
   for (const row of records) counts.set(row.rootDigest, (counts.get(row.rootDigest) ?? 0) + 1);
   deadline(started, DISPATCH_HISTORY_LIMITS.writerDeadlineMs, "writer");
-  const generation = archived || terminals.length!==(previous?.terminals.length??0) ? publishArchive(records, now, terminals) : previous?.ref;
+  const staged = archived || terminals.length!==(previous?.terminals.length??0) ? buildArchive(records, now, terminals) : null;
+  const generation = staged ?? previous?.ref;
   const result = nextRoots.map(root => {
     const rootDigest = dispatchHistoryRootDigest(root), rootRows = counts.get(rootDigest) ?? 0;
     const { dispatchHistory: ignored, ...withoutHistory } = root;
@@ -355,7 +404,28 @@ export function updateDispatchHistory<B extends Binding, R extends DispatchHisto
       totalRows: records.length, rootDigest, rootRows,terminalRows:terminals.length,
     } } : {}) } as R;
   });
+  if (generation) {
+    const image = staged?.image ?? readPrivateStateFile(previous!.file, DISPATCH_HISTORY_LIMITS.fileBytes);
+    if (hash(image) !== generation.sha256) throw new Error("dispatch_history_digest_mismatch");
+    qualifyDispatchHistoryPublication(result, image, { generation: generation.generation,
+      ...rollbackInventory(result, records, terminals) }, now);
+    if (staged) publishArchive(staged);
+  }
   return { roots: result, archived, pruned: 0 as const };
+}
+
+/** All config writers, not only bind/close, must enforce the same adoption gate. */
+export function qualifyStoredDispatchHistoryForPublication<B extends Binding>(roots: readonly DispatchHistoryRoot<B>[],
+  validate: (input: unknown) => B, now = new Date(), actualProfile?: Buffer) {
+  if (!roots.some(root => root.dispatchHistory)) return;
+  if (dispatchHistoryPublicationQualified(roots, actualProfile)) { assertDispatchHistoryWriterDeadline(); return; }
+  if (!hasDispatchHistoryAdoption()) dispatchHistoryAdoptionRequired(roots);
+  const archive = inventoryArchive(roots, validate);
+  if (!archive) throw new Error("dispatch_history_adoption_history_missing");
+  const image = readPrivateStateFile(archive.file, DISPATCH_HISTORY_LIMITS.fileBytes);
+  if (hash(image) !== archive.ref.sha256) throw new Error("dispatch_history_digest_mismatch");
+  qualifyDispatchHistoryPublication(roots, image, { generation: archive.ref.generation,
+    ...rollbackInventory(roots, archive.records, archive.terminals) }, now, actualProfile);
 }
 
 /** Lossless downgrade only when the legacy finite profile can represent every current binding. */

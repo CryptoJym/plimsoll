@@ -5,6 +5,9 @@ import path from "node:path";
 import Database from "better-sqlite3";
 
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { bindDispatch } from "../packages/collector-cli/src/dispatch-command";
+import { withDispatchHistoryAdoption } from "../packages/collector-cli/src/dispatch-history-adoption";
+import { dispatchHistoryAdoptionFixture } from "./lib/dispatch-history-adoption-fixture";
 import { dispatchBindingMetadata, dispatchBindingSchema, namespacedWorkItemIdSchema, rootEventMetadata } from "../packages/collector-cli/src/capture-root-inventory";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
@@ -342,13 +345,19 @@ proof.check("capacity_refuses_late_bind_without_dropping_live_bindings");
 const staleBound = cli(["dispatch", "bind", "--session-id", "cap-stale-session", "--work-item-id", "beads:cap-stale",
   "--project-key", key, "--attempt-id", "cap-stale-lane", "--valid-from", "2026-09-01T00:00:00.000Z",
   "--valid-until", "2026-09-02T00:00:00.000Z"]);
-assert.equal(staleBound.code, 0, staleBound.stderr);
+assert.notEqual(staleBound.code, 0, staleBound.stdout);
+assert.match(staleBound.stderr, /dispatch_history_adoption_required/);
+assert.deepEqual(fs.readFileSync(configPath), beforeCapBind);
+assert.equal(fs.existsSync(path.join(plimsoll, "dispatch-binding-history")), false);
+withDispatchHistoryAdoption(dispatchHistoryAdoptionFixture, () => bindDispatch(["--session-id", "cap-stale-session",
+  "--work-item-id", "beads:cap-stale", "--project-key", key, "--attempt-id", "cap-stale-lane",
+  "--valid-from", "2026-09-01T00:00:00.000Z", "--valid-until", "2026-09-02T00:00:00.000Z"]));
 const historicalAtCap = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
 assert.deepEqual(new Map(historicalAtCap.captureRoots![0].dispatch!.map(binding => [binding.attemptId, binding])),
   new Map(kept.map(binding => [binding.attemptId, binding])));
 assert.equal(historicalAtCap.captureRoots![0].dispatchHistory?.rootRows, 1);
 assert.equal(rootEventMetadata(roots[0], "late-historical-event", "2026-09-01T00:00:01.000Z", "cap-stale-session").workItemId, "beads:cap-stale");
-proof.check("elapsed_window_is_preserved_in_history_without_displacing_open_cap_bindings");
+proof.check("unqualified_history_refuses_then_real_qualified_reader_preserves_elapsed_window_at_open_cap");
 proof.complete();
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

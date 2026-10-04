@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
@@ -11,7 +12,10 @@ import { captureRootSchema, dispatchBindingSchema, validateCaptureRoots } from "
 import { resolveCollectorHome } from "./collector-home";
 import { assertPrivateStateDirectory, assertPrivateStateFile, fsyncStateDirectory,
   MAX_COLLECTOR_PROFILE_BYTES, readPrivateStateFile } from "./collector-state-io";
-import { materializeDispatchHistoryForRollback, validateDispatchHistoryTransition } from "./dispatch-binding-index";
+import { materializeDispatchHistoryForRollback, qualifyStoredDispatchHistoryForPublication,
+  validateDispatchHistoryTransition } from "./dispatch-binding-index";
+import { assertDispatchHistoryPublicationSource, assertDispatchHistoryWriterDeadline,
+  hasDispatchHistoryPublication, withDispatchHistoryPublication } from "./dispatch-history-adoption";
 
 export const DEFAULT_COLLECTOR_PORT = 48271;
 
@@ -344,11 +348,28 @@ export function withCollectorConfigMutationLock<T>(configPath: string, action: (
 function writeCollectorConfigTransactionallyUnlocked(
   validated: CollectorConfig,
   configPath: string,
-) {
+): CollectorConfig {
+  // Internal writers (including device-id reconciliation) share the same gate;
+  // a config helper cannot silently bypass qualification by using this primitive.
+  if (!hasDispatchHistoryPublication()) {
+    const started = performance.now(), currentBytes = fs.existsSync(configPath) ? readPrivateStateFile(configPath) : null;
+    return withDispatchHistoryPublication({ started, sourcePath: configPath,
+      sourceProfileSha256: currentBytes ? crypto.createHash("sha256").update(currentBytes).digest("hex") : null,
+      normalizeRoots: roots => validateCaptureRoots(roots),
+      profileForRoots: roots => Buffer.from(`${JSON.stringify({ ...validated, captureRoots: roots }, null, 2)}\n`),
+    }, () => {
+      if (currentBytes) {
+        const current = collectorConfigSchema.parse(JSON.parse(currentBytes.toString("utf8")));
+        validateDispatchHistoryTransition(current.captureRoots ?? [], validated.captureRoots ?? [], dispatchBindingSchema.parse);
+      }
+      return writeCollectorConfigTransactionallyUnlocked(validated, configPath);
+    });
+  }
   const directory = path.dirname(configPath);
   assertPrivateStateDirectory(directory);
   const bytes = Buffer.from(`${JSON.stringify(validated, null, 2)}\n`);
   if (bytes.length > MAX_COLLECTOR_PROFILE_BYTES) throw new Error("collector_state_byte_bound_exceeded");
+  qualifyStoredDispatchHistoryForPublication(validated.captureRoots ?? [], dispatchBindingSchema.parse, new Date(), bytes);
   const temporaryPath = path.join(
     directory,
     `.collector.config-${process.pid}-${crypto.randomUUID()}.tmp`,
@@ -356,6 +377,7 @@ function writeCollectorConfigTransactionallyUnlocked(
   let descriptor: number | undefined;
   let published = false;
   try {
+    assertDispatchHistoryWriterDeadline();
     descriptor = fs.openSync(temporaryPath, fs.constants.O_WRONLY | fs.constants.O_CREAT |
       fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
     fs.writeFileSync(descriptor, bytes);
@@ -363,10 +385,13 @@ function writeCollectorConfigTransactionallyUnlocked(
     fs.closeSync(descriptor);
     descriptor = undefined;
     assertPrivateStateDirectory(directory);
-    if (fs.existsSync(configPath)) readPrivateStateFile(configPath);
+    const currentBytes = fs.existsSync(configPath) ? readPrivateStateFile(configPath) : null;
+    assertDispatchHistoryPublicationSource(currentBytes ? crypto.createHash("sha256").update(currentBytes).digest("hex") : null);
+    assertDispatchHistoryWriterDeadline();
     fs.renameSync(temporaryPath, configPath);
     published = true;
     fsyncStateDirectory(directory);
+    assertDispatchHistoryWriterDeadline();
   } catch (error) {
     if (published) throw new Error("collector_config_publication_uncertain_reread_required");
     throw error;
@@ -397,11 +422,19 @@ export function writeCollectorConfigTransactionally(
     ? { ...options.preserveUnknownFields, ...validated } as CollectorConfig
     : validated;
   return withCollectorConfigMutationLock(configPath, () => {
-    if (fs.existsSync(configPath)) {
-      const current = collectorConfigSchema.parse(JSON.parse(readPrivateStateFile(configPath).toString("utf8")));
-      validateDispatchHistoryTransition(current.captureRoots ?? [], validated.captureRoots ?? [], dispatchBindingSchema.parse);
-    }
-    return writeCollectorConfigTransactionallyUnlocked(published, configPath);
+    const started = performance.now(), bytes = fs.existsSync(configPath) ? readPrivateStateFile(configPath) : null;
+    return withDispatchHistoryPublication({ started, sourcePath: configPath,
+      sourceProfileSha256: bytes ? crypto.createHash("sha256").update(bytes).digest("hex") : null,
+      normalizeRoots: roots => validateCaptureRoots(roots),
+      profileForRoots: roots => Buffer.from(`${JSON.stringify({ ...published, captureRoots: roots }, null, 2)}\n`),
+    }, () => {
+      if (bytes) {
+        const current = collectorConfigSchema.parse(JSON.parse(bytes.toString("utf8")));
+        validateDispatchHistoryTransition(current.captureRoots ?? [], validated.captureRoots ?? [], dispatchBindingSchema.parse);
+      }
+      qualifyStoredDispatchHistoryForPublication(validated.captureRoots ?? [], dispatchBindingSchema.parse);
+      return writeCollectorConfigTransactionallyUnlocked(published, configPath);
+    });
   });
 }
 
@@ -412,21 +445,29 @@ export function mutateCollectorConfigTransactionally(
   options: { losslessDispatchHistoryRollback?: true } = {},
 ) {
   return withCollectorConfigMutationLock(configPath, () => {
+    const started = performance.now();
     const bytes = readPrivateStateFile(configPath);
     const stored = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
     const current = collectorConfigSchema.parse(stored);
-    const next = collectorConfigSchema.parse(mutate(current, {
-      sourceSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-    }));
-    assertCollectorPrivacyMode(next, "config write");
-    if (options.losslessDispatchHistoryRollback) {
-      const legacy = materializeDispatchHistoryForRollback(current.captureRoots ?? [], dispatchBindingSchema.parse);
-      if (JSON.stringify(legacy) !== JSON.stringify(next.captureRoots ?? []))
-        throw new Error("dispatch_history_rollback_not_lossless");
-    } else validateDispatchHistoryTransition(current.captureRoots ?? [], next.captureRoots ?? [], dispatchBindingSchema.parse);
-    const published = { ...stored, ...next } as CollectorConfig;
-    writeCollectorConfigTransactionallyUnlocked(published, configPath);
-    return next;
+    let intended = current;
+    const sourceSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+    return withDispatchHistoryPublication({ started, sourcePath: configPath, sourceProfileSha256: sourceSha256,
+      normalizeRoots: roots => validateCaptureRoots(roots),
+      profileForRoots: roots => Buffer.from(`${JSON.stringify({ ...stored, ...intended, captureRoots: roots }, null, 2)}\n`),
+    }, () => {
+      const next = collectorConfigSchema.parse(mutate(current, { sourceSha256 }));
+      intended = next;
+      assertCollectorPrivacyMode(next, "config write");
+      if (options.losslessDispatchHistoryRollback) {
+        const legacy = materializeDispatchHistoryForRollback(current.captureRoots ?? [], dispatchBindingSchema.parse);
+        if (JSON.stringify(legacy) !== JSON.stringify(next.captureRoots ?? []))
+          throw new Error("dispatch_history_rollback_not_lossless");
+      } else validateDispatchHistoryTransition(current.captureRoots ?? [], next.captureRoots ?? [], dispatchBindingSchema.parse);
+      qualifyStoredDispatchHistoryForPublication(next.captureRoots ?? [], dispatchBindingSchema.parse);
+      const published = { ...stored, ...next } as CollectorConfig;
+      writeCollectorConfigTransactionallyUnlocked(published, configPath);
+      return next;
+    });
   });
 }
 

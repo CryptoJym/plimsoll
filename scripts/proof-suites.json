@@ -1,4 +1,7 @@
 {
+  "scripts/dispatch-history-qualified-proof.ts": [
+    "scripts/dispatch-history-proof.ts"
+  ],
   "scripts/oversized-continuation-suite-proof.ts": [
     "scripts/oversized-continuation-state-proof.ts",
     "scripts/oversized-continuation-transaction-proof.ts",
