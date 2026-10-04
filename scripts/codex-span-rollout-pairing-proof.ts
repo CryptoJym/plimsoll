@@ -125,21 +125,46 @@ function assertUnpaired(f: Fixture, spanId: string) {
 }
 
 async function durableGapComposition() {
-  for (const state of ["sealed gap", "terminal gap replay", "saved pair then gap"] as const) {
+  for (const state of ["sealed gap", "terminal gap replay", "saved pair then gap", "frozen pair then correction"] as const) {
     const f = new Fixture(state);
     try {
-      const span = f.span({ model: state === "saved pair then gap" });
-      f.now = new Date(AT + 65_000);
-      const first = f.buffer.delivery.lease({ now: f.now });
-      const item = first.items.find(value => value.rawId === span.id)!;
-      assert.ok(item);
+      const span = f.span({ model: state === "saved pair then gap" || state === "frozen pair then correction" });
       if (state === "saved pair then gap") {
+        // Gap priority applies before capture. Establish the pair without a
+        // named lease, then record its gap and keep the original assertions.
+        // The old setup first froze named usage, contradicting finality (I2).
         await f.rollout();
+        assert.ok(f.buffer.database.prepare("select 1 from codex_span_rollout_pairs where span_id=?").get(span.id));
         rememberCaptureGap(f.buffer.database, span.id, "late_native_conflict");
         const result = captureCodexModel(f.buffer.database, span, span.id);
         assert.equal(result.metadata.usageSource, "capture_gap", "durable gap precedes an existing pair");
         assert.equal(result.model, undefined);
         assert.equal(result.inputTokens, undefined);
+        f.upload(AT + 400_000); f.once();
+        assert.equal(f.cloud.has(span.id), false, "paired gap does not create another billable ID");
+        console.log(JSON.stringify({ composition: state, status: "PASS" }));
+        continue;
+      }
+      f.now = new Date(AT + 65_000);
+      const first = f.buffer.delivery.lease({ now: f.now });
+      const item = first.items.find(value => value.rawId === span.id)!;
+      assert.ok(item);
+      if (state === "frozen pair then correction") {
+        assert.equal(item.envelope.event.model, MODEL);
+        await f.rollout();
+        rememberCaptureGap(f.buffer.database, span.id, "late_native_conflict");
+        const result = captureCodexModel(f.buffer.database, span, span.id);
+        assert.equal(result.model, MODEL, "a later correction cannot withdraw a captured native result");
+        assert.equal(result.inputTokens, INPUT);
+        assert.equal(result.outputTokens, OUTPUT);
+        f.now = new Date(AT + 400_000);
+        const retry = f.buffer.delivery.lease({ now: f.now });
+        assert.equal(retry.locallyDead, 0);
+        const original = retry.items.find(value => value.rawId === span.id)!;
+        assert.ok(original);
+        assert.equal(original.deliveryId, item.deliveryId);
+        assert.equal(original.envelopeJson, item.envelopeJson);
+        assert.equal(retry.items.filter(value => value.envelope.event.inputTokens !== undefined).length, 1);
       } else {
         assert.equal(item.envelope.event.metadata.usageSource, "capture_gap");
         if (state === "terminal gap replay") {
