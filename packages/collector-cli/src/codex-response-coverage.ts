@@ -15,6 +15,9 @@ const columns = `e.rowid,e.id,e.created_at as created,e.privacy_generation as ge
 const turn = (e: AiInteractionEvent) => e.metadata.codexTurnId ?? e.metadata["turn.id"] ?? e.metadata.turn_id;
 const native = (e: AiInteractionEvent) => e.eventType === "usage_rollout" && e.metadata.usageSource === "rollout";
 const sse = (e: AiInteractionEvent) => e.metadata.otelEventName === "codex.sse_event";
+const span = (e: AiInteractionEvent) => e.metadata.otelEventName === "handle_responses";
+const otlp = (e: AiInteractionEvent) => sse(e) || span(e);
+const completion = (e: AiInteractionEvent) => span(e) ? e.metadata.otelSpanEndAt : e.observedAt;
 const table = (db: Database.Database) => Boolean(db.prepare(
   "select 1 from sqlite_master where type='table' and name='codex_response_coverage'").get());
 
@@ -25,22 +28,36 @@ function accounts(e: AiInteractionEvent) {
     .map(v => v.startsWith("sha256:") ? v : providerAccountKey(v)));
 }
 
-function compatible(a: AiInteractionEvent, b: AiInteractionEvent) {
-  if (a.source !== "codex" || b.source !== "codex" || !a.sessionId || a.sessionId !== b.sessionId ||
+function compatible(a: AiInteractionEvent, b: AiInteractionEvent, exactPair = false) {
+  if (a.source !== "codex" || b.source !== "codex" ||
+      (a.sessionId && b.sessionId && a.sessionId !== b.sessionId) ||
+      (!exactPair && (!a.sessionId || !b.sessionId)) ||
       a.metadata.stitched === "time_window" || b.metadata.stitched === "time_window" ||
-      a.metadata.counterLineage || b.metadata.counterLineage || native(a) === native(b) ||
-      !(native(a) && sse(b) || sse(a) && native(b))) return false;
+      a.metadata.counterLineage || b.metadata.counterLineage ||
+      !(native(a) && otlp(b) || otlp(a) && native(b) || sse(a) && otlp(b) || otlp(a) && sse(b))) return false;
+  if (!exactPair && otlp(a) && otlp(b) && (!a.metadata.traceId || a.metadata.traceId !== b.metadata.traceId)) return false;
+  const requestA=a.metadata.request_id ?? a.metadata.call_id,requestB=b.metadata.request_id ?? b.metadata.call_id;
+  if (requestA && requestB && requestA !== requestB) return false;
   const at = turn(a), bt = turn(b);
-  // A turn can contain several responses. Require the exact native
-  // completion timestamp as well; turn IDs, when both reported, must agree.
-  // Neither a turn alone nor nearest time/counts can spend a witness.
-  if (a.observedAt !== b.observedAt || at && bt && at !== bt) return false;
+  if (at && bt && at !== bt) return false;
+  // Native cumulative counters can retain a complete earlier SSE portion.
+  // This is a directional exact-counter match, never a nearest-time choice:
+  // a future SSE cannot consume an older native counter. Partial reports
+  // without the complete counter signature require the same completion.
+  if (!exactPair && completion(a) !== completion(b)) {
+    if (otlp(a) && otlp(b)) return false;
+    const log=otlp(a)?a:b,rollout=native(a)?a:b;
+    if (!sse(log) || Date.parse(log.observedAt)>Date.parse(rollout.observedAt) ||
+        log.inputTokens===undefined || log.outputTokens===undefined ||
+        log.inputTokens!==rollout.inputTokens || log.outputTokens!==rollout.outputTokens ||
+        log.inputTokens+log.outputTokens===0) return false;
+  }
   const aa = accounts(a), ba = accounts(b);
   if (aa.size > 1 || ba.size > 1 || aa.size && ba.size && ![...aa].some(v => ba.has(v))) return false;
   if (a.metadata.captureAccountHash && b.metadata.captureAccountHash &&
       a.metadata.captureAccountHash !== b.metadata.captureAccountHash) return false;
   const common = FIELDS.filter(k => k !== "costUsd" && a[k] !== undefined && b[k] !== undefined);
-  if (!common.length) return a.costUsd !== undefined && a.costUsd === b.costUsd;
+  if (!common.length) return otlp(a) && otlp(b) || a.costUsd !== undefined && a.costUsd === b.costUsd;
   return common.every(k => a[k] === b[k]);
 }
 
@@ -48,10 +65,9 @@ function compatible(a: AiInteractionEvent, b: AiInteractionEvent) {
  * The mapping consumes a witness at most once per native counter record;
  * a later turn (even with identical amounts) cannot spend it again. */
 export function codexResponseCoverage(db: Database.Database, event: AiInteractionEvent,
-  commit?: (rawId: string) => boolean, raw?: Row) {
-  if (event.source !== "codex" || !codexHasUsage(event) || !(native(event) || sse(event)) ||
-      !event.sessionId || event.metadata.counterLineage) return undefined;
-  if (native(event) && (!turn(event) || !event.model || event.metadata.modelEvidenceConflict === true)) return undefined;
+  commit?: (rawId: string) => boolean, raw?: Row, exactPeerId?: string) {
+  if (event.source !== "codex" || !codexHasUsage(event) || !(native(event) || otlp(event)) ||
+      (!event.sessionId && !exactPeerId) || event.metadata.counterLineage) return undefined;
   let binding: Pick<Row, "workspace" | "device" | "epoch"> | undefined;
   try {
     binding = raw ?? db.prepare(`select current_workspace_id as workspace,current_device_id as device,
@@ -62,49 +78,114 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
   }
   if (!binding?.epoch || !binding.device) return undefined;
   const eligible = terminalPrivacyEligibilitySql(db, "e");
+  const at = completion(event);
+  if (typeof at !== "string" || !Number.isFinite(Date.parse(at))) return undefined;
+  const peerCompletion = "case when json_extract(e.payload_json,'$.metadata.otelEventName')='handle_responses' then json_extract(e.payload_json,'$.metadata.otelSpanEndAt') else e.observed_at end";
+  const otlpPredicate = "json_extract(e.payload_json,'$.metadata.otelEventName') in ('codex.sse_event','handle_responses')";
   const rows = db.prepare(`select ${columns} from buffered_events e
-    where e.source='codex' and e.session_id=? and e.id<>? and e.workspace_id=?
+    where e.source='codex' and ${exactPeerId ? '1' : 'e.session_id=?'} and e.id<>? and e.workspace_id=?
       and e.device_id=? and e.installation_epoch_id=? and e.usage_duplicate_reason is null
-      and ${native(event) ? "json_extract(e.payload_json,'$.metadata.otelEventName')='codex.sse_event'"
-        : "e.event_type='usage_rollout' and json_extract(e.payload_json,'$.metadata.usageSource')='rollout'"}
-      and ${eligible} and (e.observed_at=? or (? is not null and
-        coalesce(json_extract(e.payload_json,'$.metadata.codexTurnId'),
-          json_extract(e.payload_json,'$.metadata."turn.id"'),json_extract(e.payload_json,'$.metadata.turn_id'))=?))
+      and ${native(event) ? otlpPredicate
+        : "((e.event_type='usage_rollout' and json_extract(e.payload_json,'$.metadata.usageSource')='rollout') or " + otlpPredicate + ")"}
+      and ${eligible} and ${exactPeerId ? "e.id=?" : native(event)
+        ? `${peerCompletion}<=? and (${peerCompletion}=? or (e.input_tokens=? and e.output_tokens=?))`
+        : `((e.event_type='usage_rollout' and e.observed_at>=? and (e.observed_at=? or (e.input_tokens=? and e.output_tokens=?))) or (${otlpPredicate} and ${peerCompletion}=?))`}
       and (e.input_tokens is not null or e.output_tokens is not null or e.cache_read_tokens is not null
         or e.cache_creation_tokens is not null or e.cost_usd is not null) limit 129`)
-    .all(event.sessionId,event.id,binding.workspace,binding.device,binding.epoch,event.observedAt,
-      turn(event) ?? null,turn(event) ?? null) as Row[];
+    .all(...(exactPeerId ? [] : [event.sessionId]),event.id,binding.workspace,binding.device,binding.epoch,
+      ...(exactPeerId ? [exactPeerId] : [at,at,event.inputTokens ?? null,event.outputTokens ?? null,
+        ...(native(event)?[]:[at])])) as Row[];
   if (rows.length > 128) return undefined;
   const candidates = rows.flatMap(row => {
     const peer = JSON.parse(row.payload) as AiInteractionEvent;
-    if (!compatible(event, peer)) return [];
-    const nativeId = native(event) ? event.id : peer.id;
-    if (table(db) && db.prepare(`select 1 from codex_response_coverage
-      where owner_rowid=? and owner_id=? and owner_created=? and owner_generation=? and native_id<>?`)
-      .get(row.rowid,row.id,row.created,row.generation,nativeId)) return [];
+    const identity = originalCoveredResponse(db,row.id) ?? peer;
+    if (!compatible(event, identity, row.id === exactPeerId)) return [];
+    const nativeId = native(event) ? event.id : native(peer) ? peer.id :
+      `otel:${event.sessionId}:${event.metadata.traceId}:${at}`;
     const captured = frozenCodexCapture(db,row.id)?.event ?? captureCodexModel(db,peer,row.id,false,false);
-    return !isCaptureGap(captured) && codexHasUsage(captured) && captured.model &&
-      (!event.model || event.model === captured.model) ? [{row,captured,nativeId}] : [];
+    if (isCaptureGap(captured) || !codexHasUsage(captured) || !captured.model ||
+        event.model && event.model !== captured.model) return [];
+    const contributors = [{row,captured}];
+    // A partial twin can own only the remainder. Follow its accounting
+    // ancestry so a later complete report consumes all retained fields once.
+    // The full raw incarnation, boundary and privacy checks hold at each hop.
+    while (table(db)) {
+      const last = contributors[contributors.length-1]!.row;
+      if (native(event) && db.prepare(`select 1 from codex_response_coverage
+        where owner_rowid=? and owner_id=? and owner_created=? and owner_generation=?
+          and native_id<>? and native_id not like 'otel:%'`)
+        .get(last.rowid,last.id,last.created,last.generation,nativeId)) return [];
+      const parent = db.prepare(`select ${columns} from codex_response_coverage c join buffered_events e
+        on e.rowid=c.owner_rowid and e.id=c.owner_id and e.created_at=c.owner_created
+          and e.privacy_generation=c.owner_generation
+        where c.raw_rowid=? and c.raw_id=? and c.raw_created=? and c.raw_generation=? and ${eligible}
+          and e.workspace_id=? and e.device_id=? and e.installation_epoch_id=?`)
+        .get(last.rowid,last.id,last.created,last.generation,row.workspace,row.device,row.epoch) as Row|undefined;
+      if (!parent) break;
+      if (contributors.length>=16 || contributors.some(c=>c.row.rowid===parent.rowid&&c.row.id===parent.id)) return [];
+      const value = frozenCodexCapture(db,parent.id)?.event ??
+        captureCodexModel(db,JSON.parse(parent.payload),parent.id,false,false);
+      if (isCaptureGap(value) || !codexHasUsage(value) || value.model !== captured.model) return [];
+      contributors.push({row:parent,captured:value});
+    }
+    return [{row,captured,nativeId,contributors,root:contributors[contributors.length-1]!.row.id}];
   });
-  if (candidates.length !== 1) return undefined;
-  const {row,captured,nativeId} = candidates[0]!;
+  if (!candidates.length) return undefined;
+  let owners=candidates;
+  if (new Set(candidates.map(c=>c.root)).size !== 1) {
+    // A released writer may leave several still-unsealed producers for one
+    // response. They are not separate paid roots. Require mutual native
+    // identity, then retain the one already frozen root, or the first raw
+    // producer. Each other producer is reconciled before its own lease.
+    if (!candidates.every(a => candidates.every(b => a===b ||
+      compatible(originalCoveredResponse(db,a.row.id) ?? JSON.parse(a.row.payload),
+        originalCoveredResponse(db,b.row.id) ?? JSON.parse(b.row.payload))))) return undefined;
+    const paid = candidates.filter(c => c.contributors.some(value => frozenCodexCapture(db,value.row.id)));
+    if (new Set(paid.map(c=>c.root)).size > 1) return undefined;
+    owners = paid.length ? paid : [...candidates].sort((a,b)=>a.row.rowid-b.row.rowid).slice(0,1);
+  }
+  const {row,captured,nativeId,contributors} = owners.sort((a,b)=>b.contributors.length-a.contributors.length)[0]!;
+  let reservationOnly=false;
   if (raw) {
     const admitted = captureCodexModel(db,event,event.id,false,false);
-    if (isCaptureGap(admitted) || admitted.model !== captured.model) return undefined;
+    // A diagnostic native row can reserve an already-paid exact counter
+    // portion without acquiring the owner's model or a financial envelope.
+    // Its gap decision and raw native facts stay untouched.
+    if (isCaptureGap(admitted)) reservationOnly=native(event);
+    else if(admitted.model!==captured.model)return undefined;
+    if(isCaptureGap(admitted)&&!reservationOnly)return undefined;
   }
-  if (commit && !commit(row.id)) return undefined;
+  if (commit && contributors.some(c=>!commit(c.row.id))) return undefined;
   const remaining = {...event, metadata: {...event.metadata}};
-  for (const k of FIELDS) if (event[k] !== undefined && captured[k] !== undefined)
-    remaining[k] = Math.max(0,event[k]! - captured[k]!);
+  for (const k of FIELDS) if (event[k] !== undefined && contributors.some(c=>c.captured[k] !== undefined))
+    remaining[k] = Math.max(0,event[k]! - contributors.reduce((n,c)=>n+(c.captured[k]??0),0));
   const tokensCovered = FIELDS.slice(0,4).every(k => (remaining[k] ?? 0) === 0);
-  // A native estimate prices the remaining counters, never the full twin
-  // again. A reported cost keeps its own field-wise accounting.
+  // An estimated cost keeps only its unpaid portion. Reported cost is
+  // likewise field-wise; no complete twin is priced a second time.
   if (event.costKind === "estimated" || event.metadata.costEstimated === true) {
-    remaining.costUsd = tokensCovered ? undefined : estimateCostUsd({model:event.model,
-      inputTokens:remaining.inputTokens,outputTokens:remaining.outputTokens,
-      cacheReadTokens:remaining.cacheReadTokens,cacheCreationTokens:remaining.cacheCreationTokens})?.costUsd;
+    remaining.costUsd = event.costUsd !== undefined
+      ? Math.max(0,event.costUsd-contributors.reduce((n,c)=>n+(c.captured.costUsd??0),0))
+      : estimateCostUsd({model:event.model,inputTokens:remaining.inputTokens,outputTokens:remaining.outputTokens,
+        cacheReadTokens:remaining.cacheReadTokens,cacheCreationTokens:remaining.cacheCreationTokens})?.costUsd;
   }
-  const covered = tokensCovered && (remaining.costUsd ?? 0) === 0;
+  if (remaining.costUsd !== undefined && remaining.costUsd !== event.costUsd) {
+    for (const key of [...usageFieldKeys.reportedCostUsd,...usageFieldKeys.estimatedCostUsd])
+      if (remaining.metadata[key] !== undefined) remaining.metadata[key]=remaining.costUsd;
+    const attrs=remaining.metadata.otelAttributes;
+    if (attrs && typeof attrs === "object" && !Array.isArray(attrs)) {
+      const adjusted: Record<string,unknown>={...attrs};
+      for (const key of [...usageFieldKeys.reportedCostUsd,...usageFieldKeys.estimatedCostUsd])
+        if(key in adjusted)adjusted[key]=remaining.costUsd;
+      remaining.metadata.otelAttributes=adjusted;
+    }
+  }
+  const amountsCovered = tokensCovered && (remaining.costUsd ?? 0) === 0;
+  // An absent field has never attested a reported zero. Keep a named zero
+  // remainder for any newly known field instead of hiding its completeness.
+  const fieldsKnown = FIELDS.every(k => event[k] === undefined ||
+    contributors.some(c => c.captured[k] !== undefined));
+  const covered = amountsCovered && fieldsKnown;
+  if(reservationOnly&&!amountsCovered)return undefined;
   if (commit && raw) {
     db.exec(`create table if not exists codex_response_coverage (
       raw_rowid integer not null,raw_id text not null,raw_created text not null,raw_generation text not null,
@@ -117,18 +198,23 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
       .run(raw.rowid,raw.id,raw.created,raw.generation,row.rowid,row.id,row.created,row.generation,
         nativeId,JSON.stringify(event));
   }
-  return {covered,remaining,ownerId:row.id};
+  return {covered,remaining,ownerId:row.id,reservationOnly};
 }
 
-/** Called under append's writer, after exact span pairing. Frozen owners
+/** exactPeerId is supplied only by the two mutually unique exact-counter
+ * pairing routines after their native boundary/completion checks. It carries
+ * their established response identity; it never bypasses capture admission.
+ * Called under append's writer, after exact span pairing. Frozen owners
  * keep their ID/bytes; only the newly admitted twin's unsealed counters move. */
-export function applyCodexResponseCoverage(db: Database.Database, rawId: string, freeze: (id: string) => boolean) {
+export function applyCodexResponseCoverage(db: Database.Database, rawId: string, freeze: (id: string) => boolean,
+  exactPeerId?: string) {
   const raw = db.prepare(`select ${columns} from buffered_events e where e.id=?`).get(rawId) as Row | undefined;
   if (!raw || raw.duplicate || frozenCodexCapture(db,rawId)) return false;
   if (originalCoveredResponse(db,rawId)) return false;
   const event = JSON.parse(raw.payload) as AiInteractionEvent;
-  const coverage = codexResponseCoverage(db,event,freeze,raw);
+  const coverage = codexResponseCoverage(db,event,freeze,raw,exactPeerId);
   if (!coverage) return false;
+  if (coverage.reservationOnly) return false;
   const e = coverage.remaining;
   db.prepare(`update buffered_events set payload_json=?,event_type=?,usage_duplicate_reason=?,
     input_tokens=?,output_tokens=?,cache_read_tokens=?,cache_creation_tokens=?,cost_usd=? where id=?`)

@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
 import { frozenCodexCapture } from "./codex-named-capture";
+import { applyCodexResponseCoverage } from "./codex-response-coverage";
 
-import { estimateCostUsd } from "../../shared/src/index";
+import { estimateCostUsd, type AiInteractionEvent } from "../../shared/src/index";
 import { refreshUnsentRawDelivery, retirePairedSpanDelivery } from "./outbox";
 import { isSqliteContentionError } from "./sqlite-contention";
 
@@ -228,10 +229,17 @@ function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
 
 export type CodexUsagePair = { logId: string; spanId: string };
 
-function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): CodexUsagePair {
+function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): CodexUsagePair | null {
   const frozenSpan = frozenCodexCapture(db,span.id);
   if (frozenSpan && frozenSpan.event.inputTokens === span.inputTokens &&
       frozenSpan.event.outputTokens === span.outputTokens) {
+    const nativeLog = JSON.parse(log.payloadJson) as AiInteractionEvent;
+    if (["cacheReadTokens","cacheCreationTokens","costUsd"]
+      .some(k => nativeLog[k as keyof AiInteractionEvent] !== undefined &&
+        frozenSpan.event[k as keyof AiInteractionEvent] === undefined)) {
+      if (!applyCodexResponseCoverage(db,log.id,id => Boolean(frozenCodexCapture(db,id)),span.id)) return null;
+      return {logId:log.id,spanId:span.id};
+    }
     // Ownership is accounting history. A later exact SSE supplies native
     // evidence but cannot retire the already frozen named response span.
     db.prepare(`update buffered_events set usage_paired_event_id=? where id=?
@@ -308,7 +316,7 @@ export function pairCodexUsageEvent(
   let pairs: CodexUsagePair[];
   if (candidates.length === 1 && reciprocal.length === 1 && reciprocal[0]!.id === row.id) {
     pairs = [commitPair(db, rowShape.kind === "log" ? row : candidates[0]!,
-      rowShape.kind === "span" ? row : candidates[0]!)];
+      rowShape.kind === "span" ? row : candidates[0]!)].filter((pair): pair is CodexUsagePair => pair !== null);
   } else {
     // Every member must see the same complete bipartite candidate set. A
     // missing report makes the sizes differ, so no uncertain row is dropped.
@@ -327,7 +335,7 @@ export function pairCodexUsageEvent(
       const other = others[index]!;
       return commitPair(db, rowShape.kind === "log" ? member : other,
         rowShape.kind === "span" ? member : other);
-    });
+    }).filter((pair): pair is CodexUsagePair => pair !== null);
   }
   const own = pairs.find((pair) => pair.logId === eventId || pair.spanId === eventId);
   return own ? { ...own, pairCount: pairs.length } : null;

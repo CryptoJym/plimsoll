@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { frozenCodexCapture } from "./codex-named-capture";
+import { applyCodexResponseCoverage } from "./codex-response-coverage";
 import { estimateCostUsd, providerAccountKey, usageFieldKeys, validatedMetadataAttribute,
   type AiInteractionEvent } from "../../shared/src/index";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -15,8 +16,8 @@ export function isCodexResponseSpan(event: AiInteractionEvent) {
 
 // A response span is one request, not evidence that live capture covers every
 // request in the conversation. This is only the indexable candidate filter;
-// usage-authority.ts verifies the financial capture decision before granting
-// session coverage to a Codex row. Other sources keep their existing rule.
+// response coverage verifies retained financial fields for each Codex row.
+// Other sources keep their existing session rule.
 export const CODEX_SESSION_AUTHORITY_SQL = `not (source='codex' and
   coalesce(case when json_valid(payload_json) then
     json_extract(payload_json,'$.metadata.otelEventName') end,'')='handle_responses')`;
@@ -262,6 +263,14 @@ export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string
   // reviewed cloud correction, rather than an invented local ownership claim.
   if (!emitted && span.uploaded) return null;
   if (emitted && emitted !== rollout.event.model) return null;
+  if (captured && ["cacheReadTokens","cacheCreationTokens","costUsd"]
+    .some(k => rollout.event[k as keyof AiInteractionEvent] !== undefined &&
+      captured.event[k as keyof AiInteractionEvent] === undefined)) {
+    // Exact response identity does not mean every field was known. Keep
+    // the native zero/cost complement while retaining the captured owner.
+    return applyCodexResponseCoverage(db,rollout.id,id => Boolean(frozenCodexCapture(db,id)),span.id)
+      ? {ownerId:span.id,duplicateId:rollout.id} : null;
+  }
   const owner = emitted ? span : rollout;
   const duplicate = emitted ? rollout : span;
   ensureSchema(db);
