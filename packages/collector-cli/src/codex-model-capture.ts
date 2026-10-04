@@ -7,6 +7,7 @@ import {
   type AiInteractionEvent,
 } from "../../shared/src/index";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import { codexSpanRolloutDecision, isCodexResponseSpan } from "./codex-span-rollout-pairing";
 
 export const CODEX_MODEL_WAIT_MS = 60_000;
 const WINDOW_MS = 10 * 60_000;
@@ -116,7 +117,7 @@ export function unresolvedCapture(event: AiInteractionEvent): boolean {
       modelAttributeConflict(event))
   );
 }
-function pairedObservation(event: AiInteractionEvent): AiInteractionEvent {
+function pairedObservation(event: AiInteractionEvent, reason = "paired_sse_event"): AiInteractionEvent {
   const {
     inputTokens,
     outputTokens,
@@ -144,7 +145,7 @@ function pairedObservation(event: AiInteractionEvent): AiInteractionEvent {
     eventType: "otel_span",
     metadata: {
       ...metadata,
-      usageDuplicateReason: "paired_sse_event",
+      usageDuplicateReason: reason,
       ...(inputTokens !== undefined
         ? { modelCaptureInputTokens: inputTokens }
         : {}),
@@ -402,6 +403,12 @@ export function captureCodexModel(
   persistDecision = false,
 ): AiInteractionEvent {
   if (!codexHasUsage(event)) return event;
+  const responsePair = codexSpanRolloutDecision(db, rawId);
+  if (responsePair && (responsePair.ownerId !== rawId || isCodexResponseSpan(event))) {
+    const captured = { ...event, model: responsePair.model,
+      metadata: { ...event.metadata, modelCaptureSource: "paired_rollout_event" } };
+    return responsePair.ownerId === rawId ? captured : pairedObservation(captured, "paired_rollout_event");
+  }
   let row:
     | {
         workspace: string | null;

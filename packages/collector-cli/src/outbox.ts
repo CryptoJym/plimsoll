@@ -1,5 +1,6 @@
 import type { AiInteractionEvent } from "../../shared/src/index";
 import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, rememberCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -2514,6 +2515,7 @@ export class DeliveryOutbox {
         if (items.length > 0 && selectedBytes + addedBytes > maxBytes) break;
         selectedBytes += addedBytes;
         const attemptCount = row.attemptCount + 1;
+        if (row.rawId) rememberCodexSpanEmission(this.db, row.rawId, outboundEnvelope.event);
         this.db
           .prepare(
             `update upload_outbox set state = 'in_flight', attempt_count = @attemptCount,

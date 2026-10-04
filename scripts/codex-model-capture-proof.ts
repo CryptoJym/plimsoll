@@ -542,7 +542,7 @@ async function main() {
           });
           assert.equal(
             scan.sessionsSkippedOtlpCovered,
-            1,
+            0,
             JSON.stringify(scan),
           );
           assert.equal(
@@ -553,6 +553,8 @@ async function main() {
             ).n,
             1,
           );
+          assert.equal(scan.unvalidatedFirstRows, 1,
+            "the span does not discard rollout evidence; unknown initial counter stays excluded");
         } finally {
           tailer.close();
         }

@@ -28,10 +28,11 @@ import {
   ensureCodexUsagePairingSchema,
   pairCodexUsageEvent,
 } from "./codex-usage-pairing";
+import { CODEX_SESSION_AUTHORITY_SQL, isCodexResponseSpan, pairCodexSpanRolloutEvent } from "./codex-span-rollout-pairing";
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
-import { ensureUuidEventId, registerRetentionDeliveryId } from "./delivery-id";
+import { registerRetentionDeliveryId } from "./delivery-id";
 import { countRetentionHoldsOffThread } from "./retention-hold-count";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -2717,6 +2718,7 @@ export class LocalEventBuffer {
     if (result.changes > 0) {
       this.budgetAttemptedRows += 1;
       const usagePair = pairCodexUsageEvent(this.db, event.id);
+      const rolloutPair = event.source === "codex" ? pairCodexSpanRolloutEvent(this.db, event.id) : null;
       const pairedLogPayload = usagePair?.logId === event.id
         ? (this.db.prepare(`select payload_json as payloadJson from buffered_events where id = ?`)
             .get(event.id) as { payloadJson: string }).payloadJson
@@ -2751,8 +2753,8 @@ export class LocalEventBuffer {
         workspaceId: this.workspaceId,
         privacyGeneration,
         privacyDisposition: null,
-        usageDuplicateReason: usagePair?.spanId === event.id
-          ? CODEX_USAGE_DUPLICATE_REASON : null,
+        usageDuplicateReason: rolloutPair?.duplicateId === event.id
+          ? "codex_span_rollout_duplicate" : usagePair?.spanId === event.id ? CODEX_USAGE_DUPLICATE_REASON : null,
         deviceId: this.deviceId,
       });
       if (repoContextConflict && repoContextId && existingRepoHash && resolvedRepoContext.repoHash) {
@@ -2827,6 +2829,7 @@ export class LocalEventBuffer {
   private claimSessionUsageAuthority(event: AiInteractionEvent, claimedAt: string) {
     if (
       !event.sessionId ||
+      isCodexResponseSpan(event) ||
       (event.inputTokens === undefined && event.outputTokens === undefined) ||
       (event.source !== "codex" && event.source !== "claude_code")
     ) {
@@ -2841,7 +2844,18 @@ export class LocalEventBuffer {
          where source = ? and session_id = ?`,
       )
       .get(event.source, event.sessionId) as { authority: "tailer" | "live" } | undefined;
-    if (existing) return existing.authority === desired;
+    if (existing) {
+      if (existing.authority !== "live" || event.source !== "codex" ||
+          this.db.prepare(`select 1 from buffered_events where source=? and session_id=?
+            and ${CODEX_SESSION_AUTHORITY_SQL} and event_type not in ('usage_rollout','usage_transcript')
+            and (input_tokens is not null or output_tokens is not null) limit 1`).get(event.source, event.sessionId)) {
+        return existing.authority === desired;
+      }
+      // Upgrade a claim made solely by response spans. SSE-owned sessions
+      // retain their existing authority; response pairs are decided below.
+      this.db.prepare(`delete from session_usage_authority where source=? and session_id=? and authority='live'`)
+        .run(event.source, event.sessionId);
+    }
 
     // Upgrade old ledgers deterministically before admitting new work. Live
     // capture wins an already-mixed legacy session; otherwise the existing
@@ -2853,6 +2867,7 @@ export class LocalEventBuffer {
            max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
          from buffered_events
          where source = ? and session_id = ?
+           and ${CODEX_SESSION_AUTHORITY_SQL}
            and (input_tokens is not null or output_tokens is not null)`,
       )
       .get(event.source, event.sessionId) as { tailer: number | null; live: number | null };
@@ -2883,7 +2898,10 @@ export class LocalEventBuffer {
          where source = ? and session_id = ?`,
       )
       .get(source, sessionId) as { authority: "tailer" | "live" } | undefined;
-    if (row) return row.authority;
+    if (row && (row.authority !== "live" || source !== "codex" ||
+        this.db.prepare(`select 1 from buffered_events where source=? and session_id=?
+          and ${CODEX_SESSION_AUTHORITY_SQL} and event_type not in ('usage_rollout','usage_transcript')
+          and (input_tokens is not null or output_tokens is not null) limit 1`).get(source, sessionId))) return row.authority;
     const legacy = this.db
       .prepare(
         `select
@@ -2891,6 +2909,7 @@ export class LocalEventBuffer {
            max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
          from buffered_events
          where source = ? and session_id = ?
+           and ${CODEX_SESSION_AUTHORITY_SQL}
            and (input_tokens is not null or output_tokens is not null)`,
       )
       .get(source, sessionId) as { tailer: number | null; live: number | null };

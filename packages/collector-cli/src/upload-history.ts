@@ -1,4 +1,5 @@
 import { captureCodexModel, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { isCodexResponseSpan, rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
 import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -997,6 +998,9 @@ export async function runWorkspaceHistoryUpload(
         continue;
       }
       eligibleEvents += 1;
+      if (isCodexResponseSpan(normalized.envelope.event)) {
+        rememberCodexSpanEmission(captureDatabase(), row.id, normalized.envelope.event);
+      }
       carry.push({
         envelope: normalized.envelope,
         bytes: normalized.bytes,

@@ -115,6 +115,7 @@
     "proof:session-context-index": "tsx scripts/session-context-index-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
     "proof:codex-model-capture": "tsx scripts/run-proof.ts scripts/codex-model-capture-proof.ts",
+    "proof:codex-span-rollout-pairing": "tsx scripts/run-proof.ts scripts/codex-span-rollout-pairing-proof.ts",
     "proof:codex-capture-invariants-matrix": "tsx scripts/run-proof.ts scripts/codex-capture-invariants-matrix-proof.ts",
     "proof:codex-good-retry": "tsx scripts/good-retry-directed.ts",
     "proof:codex-legacy-sse-peer": "tsx scripts/legacy-sse-peer-directed.ts",

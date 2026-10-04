@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
+import { CODEX_SESSION_AUTHORITY_SQL } from "./codex-span-rollout-pairing";
 import { ensureUuidEventId } from "./upload-history";
 import { readLiveUsageEventObservation } from "../../shared/src/live-usage-metadata";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
@@ -18,7 +19,6 @@ import {
   recordFinanceCaptureActivity,
   financeScanTimeIsCurrent,
   type FinanceCoverageSource,
-  type FinanceSourceCoverageRow,
 } from "./history-coverage";
 import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -106,7 +106,6 @@ const SESSION_REPAIR_ROWS = 1_000;
 const SESSION_REPAIR_BUDGET_MS = 50;
 /** Historical snapshots remain readable after expiry, with parity withdrawn. */
 export const SNAPSHOT_MAX_STALENESS_MS = STATUS_MAX_AGE_MS;
-const FINANCE_CAPTURE_FRESHNESS_MS = 86_400_000;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
@@ -281,6 +280,7 @@ function isUsageTailerEventType(eventType: string) {
 const LIVE_USAGE_SIBLING_SQL = `
   select 1 from buffered_events
    where source = ? and session_id = ?
+     and ${CODEX_SESSION_AUTHORITY_SQL}
      and event_type not in ('usage_rollout','usage_transcript')
      and (input_tokens is not null or output_tokens is not null
        or cache_read_tokens is not null or cache_creation_tokens is not null
@@ -289,6 +289,7 @@ const LIVE_USAGE_SIBLING_SQL = `
 
 /** A raw row that is live-class and carries usage (the predicate above, unqualified). */
 const LIVE_USAGE_ROW_SQL = `event_type not in ('usage_rollout','usage_transcript')
+  and ${CODEX_SESSION_AUTHORITY_SQL}
   and (input_tokens is not null or output_tokens is not null
     or cache_read_tokens is not null or cache_creation_tokens is not null
     or cost_usd is not null)`;
@@ -3190,7 +3191,6 @@ export class DashboardProjectionStore {
       BACKFILL_ROWS : TIMED_BACKFILL_BATCH_ROWS;
     const expiryBatchRows = options.maxActiveMs === undefined ?
       REPAIR_ROWS : TIMED_BACKFILL_BATCH_ROWS;
-    const phaseRows = options.maxActiveMs === undefined ? BACKFILL_ROWS : TIMED_REPAIR_BATCH_ROWS;
     let phaseStarted = options.onPhaseForProof ? performance.now() : 0;
     const markPhase = (phase: "scan" | "pre_repair" | "repair" | "finish" | "commit") => {
       if (!options.onPhaseForProof) return;
@@ -4212,6 +4212,7 @@ export class DashboardProjectionStore {
          intersect
          select source, session_id from buffered_events indexed by idx_events_usage_authority_live
           where session_id is not null
+            and ${CODEX_SESSION_AUTHORITY_SQL}
             and event_type not in ('usage_rollout','usage_transcript')
             and (input_tokens is not null or output_tokens is not null
               or cache_read_tokens is not null or cache_creation_tokens is not null

@@ -1,0 +1,229 @@
+import type Database from "better-sqlite3";
+import { estimateCostUsd, providerAccountKey, usageFieldKeys, validatedMetadataAttribute,
+  type AiInteractionEvent } from "../../shared/src/index";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+
+const WINDOW_MS = 30_000;
+const MAX_SPAN_MS = 10 * 60_000;
+const MAX_ROWS = 128;
+export const CODEX_SPAN_ROLLOUT_DUPLICATE = "codex_span_rollout_duplicate";
+
+export function isCodexResponseSpan(event: AiInteractionEvent) {
+  return event.source === "codex" && event.metadata.otelEventName === "handle_responses";
+}
+
+// A response span is one request, not evidence that live capture covers every
+// request in the conversation. Keep the existing authority rule for SSE logs
+// and every other source. This predicate also covers old span-only claims.
+export const CODEX_SESSION_AUTHORITY_SQL = `not (source='codex' and
+  coalesce(case when json_valid(payload_json) then
+    json_extract(payload_json,'$.metadata.otelEventName') end,'')='handle_responses')`;
+
+type Row = {
+  rowid: number; id: string; created: string; generation: string | null;
+  workspace: string | null; device: string | null; epoch: string | null;
+  at: string; uploaded: string | null; input: number; output: number;
+  cache: number | null; write: number | null; paired: string | null;
+  payload: string; event: AiInteractionEvent;
+};
+const COLUMNS = `e.rowid,e.id,e.created_at as created,e.privacy_generation as generation,
+  e.workspace_id as workspace,e.device_id as device,e.installation_epoch_id as epoch,
+  e.observed_at as at,e.uploaded_at as uploaded,e.input_tokens as input,e.output_tokens as output,
+  e.cache_read_tokens as cache,e.cache_creation_tokens as write,
+  e.usage_paired_event_id as paired,e.payload_json as payload`;
+const decode = (row: Omit<Row, "event">): Row => ({ ...row, event: JSON.parse(row.payload) });
+const table = (db: Database.Database, name: string) =>
+  Boolean(db.prepare("select 1 from sqlite_master where type='table' and name=?").get(name));
+const turn = (event: AiInteractionEvent) => event.metadata.codexTurnId ?? event.metadata["turn.id"] ?? event.metadata.turn_id;
+function kind(row: Row): "span" | "rollout" | null {
+  if (isCodexResponseSpan(row.event) && row.event.eventType === "assistant_response") return "span";
+  if (row.event.eventType === "usage_rollout" && row.event.metadata.usageSource === "rollout" &&
+      row.event.metadata.counterLineage === undefined && row.event.sessionId && turn(row.event) &&
+      row.event.model && validatedMetadataAttribute("model", row.event.model).accepted) return "rollout";
+  return null;
+}
+const session = (event: AiInteractionEvent) => event.metadata.stitched === "time_window" ? undefined : event.sessionId;
+function account(event: AiInteractionEvent) {
+  const reported = event.metadata["user.account_id"];
+  return typeof reported === "string" ? new Set([reported, providerAccountKey(reported), event.actorId].filter(Boolean))
+    : new Set([event.actorId].filter(Boolean));
+}
+function compatible(span: Row, rollout: Row) {
+  const end = Date.parse(String(span.event.metadata.otelSpanEndAt ?? span.at));
+  const start = Date.parse(span.at), at = Date.parse(rollout.at);
+  const a = account(span.event), b = account(rollout.event);
+  const spanTurn = turn(span.event), rolloutTurn = turn(rollout.event);
+  const nativeModels = new Set([span.event.metadata.model, span.event.metadata["gen_ai.request.model"],
+    span.event.metadata["gen_ai.response.model"]].filter(value => typeof value === "string"));
+  return span.workspace !== null && span.epoch !== null && span.device !== null &&
+    span.workspace === rollout.workspace && span.epoch === rollout.epoch && span.device === rollout.device &&
+    span.input === rollout.input && span.output === rollout.output &&
+    (span.cache ?? 0) === (rollout.cache ?? 0) && (span.write ?? 0) === (rollout.write ?? 0) &&
+    span.input + span.output > 0 &&
+    Number.isFinite(end) && end >= start && end - start <= MAX_SPAN_MS && Math.abs(end - at) <= WINDOW_MS &&
+    (!session(span.event) || session(span.event) === session(rollout.event)) &&
+    (!spanTurn || !rolloutTurn || spanTurn === rolloutTurn) &&
+    (!span.event.metadata.traceId || !rollout.event.metadata.traceId ||
+      span.event.metadata.traceId === rollout.event.metadata.traceId) &&
+    (a.size === 0 || b.size === 0 || [...a].some(value => b.has(value))) &&
+    span.event.metadata.modelEvidenceConflict !== true &&
+    nativeModels.size <= 1 && (nativeModels.size === 0 || nativeModels.has(rollout.event.model ?? ""));
+}
+
+function ensureSchema(db: Database.Database) {
+  db.exec(`create table if not exists codex_span_usage_emissions (
+    raw_id text primary key,raw_rowid integer not null,raw_created_at text not null,
+    raw_generation text,model text not null
+  );
+  create table if not exists codex_span_rollout_pairs (
+    span_id text primary key,span_rowid integer not null,span_created_at text not null,span_generation text,
+    rollout_id text not null unique,rollout_rowid integer not null,rollout_created_at text not null,rollout_generation text,
+    owner_id text not null,model text not null,method text not null
+  );`);
+}
+
+/** The frozen named span remains the owner even after its upload is ACKed.
+ * Called in the lease transaction only after schema/privacy validation, or
+ * before an explicit history send. It never changes a frozen envelope. */
+export function rememberCodexSpanEmission(db: Database.Database, rawId: string, event: AiInteractionEvent) {
+  if (db.readonly || !isCodexResponseSpan(event) || !event.model ||
+      (event.inputTokens ?? 0) + (event.outputTokens ?? 0) === 0) return;
+  ensureSchema(db);
+  db.prepare(`insert into codex_span_usage_emissions
+    select id,rowid,created_at,privacy_generation,? from buffered_events where id=?
+    on conflict(raw_id) do update set raw_rowid=excluded.raw_rowid,raw_created_at=excluded.raw_created_at,
+      raw_generation=excluded.raw_generation,model=excluded.model`).run(event.model, rawId);
+}
+
+export function codexSpanRolloutDecision(db: Database.Database, rawId: string) {
+  if (!table(db, "codex_span_rollout_pairs")) return undefined;
+  return db.prepare(`select p.owner_id as ownerId,p.model,e.id as eventId
+    from codex_span_rollout_pairs p join buffered_events e on
+      (e.id=p.span_id and e.rowid=p.span_rowid and e.created_at=p.span_created_at and e.privacy_generation is p.span_generation)
+      or (e.id=p.rollout_id and e.rowid=p.rollout_rowid and e.created_at=p.rollout_created_at and e.privacy_generation is p.rollout_generation)
+    where e.id=? and (p.span_id=? or p.rollout_id=?) limit 1`).get(rawId, rawId, rawId) as
+      { ownerId: string; model: string; eventId: string } | undefined;
+}
+
+function emittedSpanModel(db: Database.Database, row: Row): string | undefined {
+  if (table(db, "codex_span_usage_emissions")) {
+    const emission = db.prepare(`select model from codex_span_usage_emissions where raw_id=?
+      and raw_rowid=? and raw_created_at=? and raw_generation is ?`).get(row.id, row.rowid, row.created, row.generation) as
+      { model: string } | undefined;
+    if (emission) return emission.model;
+  }
+  // Also respect a sealed pre-upgrade retry whose attempt may have committed.
+  const frozen = db.prepare(`select sealed_envelope_json as payload from upload_outbox where raw_id=?
+    and raw_rowid=? and raw_created_at=? and raw_generation is ? and sealed_envelope_json is not null limit 1`)
+    .get(row.id, row.rowid, row.created, row.generation) as { payload: string } | undefined;
+  if (frozen) try {
+    const event = JSON.parse(frozen.payload).event as AiInteractionEvent;
+    if (event.inputTokens === row.input && event.outputTokens === row.output && event.model) return event.model;
+  } catch { /* Unknown frozen bytes cannot attest usage. */ }
+  return undefined;
+}
+
+function nearby(db: Database.Database, row: Row) {
+  const end = Date.parse(String(row.event.metadata.otelSpanEndAt ?? row.at));
+  if (!Number.isFinite(end)) return [];
+  const eligible = terminalPrivacyEligibilitySql(db, "e");
+  const found = db.prepare(`select ${COLUMNS} from buffered_events e indexed by idx_events_observed
+    where e.source='codex' and e.observed_at>=? and e.observed_at<=?
+      and e.input_tokens=? and e.output_tokens=? and e.workspace_id is ?
+      and e.device_id is ? and e.installation_epoch_id is ? and ${eligible}
+      and e.usage_duplicate_reason is null and e.usage_paired_event_id is null
+      and e.id<>? order by e.observed_at,e.id limit ${MAX_ROWS + 1}`)
+    .all(new Date(end - MAX_SPAN_MS - WINDOW_MS).toISOString(), new Date(end + WINDOW_MS).toISOString(),
+      row.input, row.output, row.workspace, row.device, row.epoch, row.id) as Array<Omit<Row, "event">>;
+  if (found.length > MAX_ROWS) return [];
+  return found.flatMap(candidate => {
+    try {
+      const other = decode(candidate);
+      const span = kind(row) === "span" ? row : other;
+      const rollout = kind(row) === "rollout" ? row : other;
+      return kind(span) === "span" && kind(rollout) === "rollout" && compatible(span, rollout) ? [other] : [];
+    } catch { return []; }
+  });
+}
+
+function nativeTraceCompatible(db: Database.Database, span: Row, rollout: Row) {
+  const traceId = span.event.metadata.traceId;
+  if (typeof traceId !== "string") return true;
+  const eligible = terminalPrivacyEligibilitySql(db, "e");
+  const end = Date.parse(String(span.event.metadata.otelSpanEndAt ?? span.at));
+  const rows = db.prepare(`select e.payload_json as payload from buffered_events e indexed by idx_events_observed
+    where e.source='codex' and e.observed_at>=? and e.observed_at<=? and ${eligible}
+      and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
+      and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?
+      and e.usage_duplicate_reason is null limit ${MAX_ROWS + 1}`)
+    .all(new Date(Date.parse(span.at) - MAX_SPAN_MS).toISOString(), new Date(end + MAX_SPAN_MS).toISOString(),
+      span.workspace, span.device, span.epoch, traceId) as Array<{ payload: string }>;
+  if (rows.length > MAX_ROWS) return false;
+  const models = new Set<string>();
+  for (const row of rows) {
+    const peer = JSON.parse(row.payload) as AiInteractionEvent;
+    if (peer.metadata.modelCaptureSource || peer.metadata.usageSource === "capture_gap") continue;
+    if (peer.metadata.modelEvidenceConflict === true ||
+        (session(peer) && session(peer) !== session(rollout.event))) return false;
+    const a = account(peer), b = account(rollout.event);
+    if (a.size && b.size && ![...a].some(value => b.has(value))) return false;
+    for (const key of usageFieldKeys.model) {
+      const value = peer.metadata[key];
+      if (typeof value === "string" && value.trim()) models.add(value);
+    }
+  }
+  return models.size === 0 || models.size === 1 && models.has(rollout.event.model ?? "");
+}
+
+/** The append caller owns the SQLite writer transaction. Exact marginal
+ * counts and completion time must have a mutually unique match. Repeated
+ * counts, lineage-first totals, different devices/epochs and near-twins stay
+ * unpaired; time proximity by itself never proves response identity. */
+export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string) {
+  const raw = db.prepare(`select ${COLUMNS} from buffered_events e where e.id=?`).get(eventId) as
+    Omit<Row, "event"> | undefined;
+  if (!raw || raw.paired || raw.input === null || raw.output === null) return null;
+  const row = decode(raw);
+  if (!kind(row)) return null;
+  const candidates = nearby(db, row);
+  if (candidates.length !== 1) return null;
+  const other = candidates[0]!;
+  const reciprocal = nearby(db, other);
+  if (reciprocal.length !== 1 || reciprocal[0]!.id !== row.id) return null;
+  const span = kind(row) === "span" ? row : other;
+  const rollout = kind(row) === "rollout" ? row : other;
+  if (!table(db, "codex_turn_model_evidence")) return null;
+  const nativeTurn = db.prepare(`select model,count(distinct nullif(account_key,'')) as accounts
+    from codex_turn_model_evidence where workspace_id=? and device_id is ? and installation_epoch_id=?
+      and session_id=? and turn_id=? group by model limit 2`).all(
+        rollout.workspace, rollout.device, rollout.epoch, rollout.event.sessionId, turn(rollout.event)) as
+      Array<{ model: string; accounts: number }>;
+  if (nativeTurn.length !== 1 || nativeTurn[0]!.model !== rollout.event.model || nativeTurn[0]!.accounts > 1 ||
+      rollout.event.metadata.modelEvidenceConflict === true) return null;
+  if (!nativeTraceCompatible(db, span, rollout)) return null;
+  const emitted = emittedSpanModel(db, span);
+  // A historical acknowledged span without an emission witness needs the
+  // reviewed cloud correction, rather than an invented local ownership claim.
+  if (!emitted && span.uploaded) return null;
+  if (emitted && emitted !== rollout.event.model) return null;
+  const owner = emitted ? span : rollout;
+  const duplicate = emitted ? rollout : span;
+  ensureSchema(db);
+  db.prepare(`insert into codex_span_rollout_pairs values (?,?,?,?,?,?,?,?,?,?,?)`).run(
+    span.id, span.rowid, span.created, span.generation, rollout.id, rollout.rowid, rollout.created, rollout.generation,
+    owner.id, rollout.event.model!, "unique_exact_marginal_completion/v1");
+  db.prepare(`update buffered_events set usage_paired_event_id=?,usage_duplicate_reason=?,
+    event_type='otel_span',input_tokens=null,output_tokens=null,cache_read_tokens=null,
+    cache_creation_tokens=null,cost_usd=null where id=?`).run(owner.id, CODEX_SPAN_ROLLOUT_DUPLICATE, duplicate.id);
+  const price = estimateCostUsd({ model: rollout.event.model, inputTokens: owner.input, outputTokens: owner.output,
+    cacheReadTokens: owner.cache ?? 0, cacheCreationTokens: owner.write ?? 0 });
+  db.prepare(`update buffered_events set usage_paired_event_id=?,model=?,cost_usd=coalesce(cost_usd,?),
+    cost_kind=case when cost_usd is null and ? is not null then 'estimated' else cost_kind end where id=?`)
+    .run(duplicate.id, rollout.event.model!, price?.costUsd ?? null, price?.costUsd ?? null, owner.id);
+  // An attempted named span was selected as owner above. No frozen usage is
+  // rewritten or deleted; a loser that has not been sealed can leave the queue.
+  db.prepare(`delete from upload_outbox where raw_id=? and raw_rowid=? and raw_created_at=?
+    and raw_generation is ? and sealed_envelope_json is null and state in ('pending','retry')`)
+    .run(duplicate.id, duplicate.rowid, duplicate.created, duplicate.generation);
+  return { ownerId: owner.id, duplicateId: duplicate.id };
+}
