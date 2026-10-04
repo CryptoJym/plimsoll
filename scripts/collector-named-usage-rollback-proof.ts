@@ -6,12 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { captureCodexModel } from "../packages/collector-cli/src/codex-model-capture";
 import { createProofCompletion } from "./lib/proof-completion";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
-const completion = createProofCompletion("collector-named-usage-rollback", 5);
+const completion = createProofCompletion("collector-named-usage-rollback", 6);
+// Preserve PR #450's exact writer and all five rollback assertions while
+// testing this 0.7.48 branch as an additional reader. No #450 runtime changes
+// or release bump are required in the scanner branch.
+const writerCommit = "9f75bdcdf6d19fd477caed838482bb0fe16c8d31";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-named-rollback-"));
 const ledgerPath = path.join(root, "rollback.sqlite");
 const workspaceId = "00000000-0000-4000-8000-000000000001";
@@ -89,9 +91,24 @@ async function leaseWithReader(
 }
 
 async function main() {
+  let writerTree: string | undefined;
   let old048: string | undefined;
   let old047: string | undefined;
   try {
+    try { execFileSync("git", ["cat-file", "-e", `${writerCommit}^{commit}`], { stdio: "ignore" }); }
+    catch {
+      execFileSync("git", ["-c", "credential.helper=", "fetch", "--no-tags",
+        "https://github.com/CryptoJym/plimsoll.git", writerCommit], { stdio: "ignore", timeout: 60_000 });
+    }
+    writerTree = path.join(root, "collector-pr450-writer");
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", writerTree, writerCommit]);
+    fs.symlinkSync(path.resolve("node_modules"), path.join(writerTree, "node_modules"), "dir");
+    const { LocalEventBuffer } = await import(pathToFileURL(
+      path.join(writerTree, "packages/collector-cli/src/buffer.ts"),
+    ).href);
+    const { captureCodexModel } = await import(pathToFileURL(
+      path.join(writerTree, "packages/collector-cli/src/codex-model-capture.ts"),
+    ).href);
     let now = new Date(baseMs);
     const buffer = new LocalEventBuffer(ledgerPath, {
       workspaceId,
@@ -150,8 +167,8 @@ async function main() {
       const lease = buffer.delivery.lease({ now });
       assert.equal(lease.locallyDead, 0);
       assert.equal(lease.items.length, 2);
-      const namedWire = lease.items.find((item) => item.deliveryId === namedId)?.envelope.event;
-      const gapWire = lease.items.find((item) => item.deliveryId === gapId)?.envelope.event;
+      const namedWire = lease.items.find((item: any) => item.deliveryId === namedId)?.envelope.event;
+      const gapWire = lease.items.find((item: any) => item.deliveryId === gapId)?.envelope.event;
       assert.equal(namedWire?.model, "gpt-6.1-sol");
       assert.equal(namedWire?.inputTokens, 19);
       assert.equal(namedWire?.metadata.modelCaptureSource, undefined);
@@ -160,7 +177,7 @@ async function main() {
       completion.check("new-reader-seals-named-usage-and-tokenless-gap");
 
       claim = buffer.delivery.captureClaim(
-        lease.items.map((item) => item.deliveryId),
+        lease.items.map((item: any) => item.deliveryId),
         { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false },
         now,
       );
@@ -184,14 +201,20 @@ async function main() {
     for (const worktree of [old048, old047])
       fs.symlinkSync(path.resolve("node_modules"), path.join(worktree, "node_modules"), "dir");
 
-    const first = await leaseWithReader(old048, "0.7.48", baseMs + 182_000, false);
+    const current = await leaseWithReader(path.resolve("."), "0.7.48", baseMs + 182_000, false);
+    assert.deepEqual(current.itemIds.sort(), [gapId, namedId].sort());
+    const afterCurrent = new Database(ledgerPath, { readonly: true });
+    try { assert.deepEqual(readSealed(afterCurrent), sealedBefore); } finally { afterCurrent.close(); }
+    completion.check("scanner-head-reader-preserves-exact-sealed-usage-and-gap");
+
+    const first = await leaseWithReader(old048, "0.7.48", baseMs + 303_000, false);
     assert.deepEqual(first.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.48-preserves-usage");
 
     const after048 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after048), sealedBefore); } finally { after048.close(); }
 
-    const second = await leaseWithReader(old047, "0.7.47", baseMs + 303_000, true);
+    const second = await leaseWithReader(old047, "0.7.47", baseMs + 424_000, true);
     assert.deepEqual(second.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.47-preserves-usage");
 
@@ -213,12 +236,14 @@ async function main() {
     completion.check("rollback-outbox-receipt-state-is-consistent");
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
-      readers: ["0.7.48", "0.7.47"],
+      writerCommit,
+      readers: ["scanner-head-0.7.48", "main-0.7.48", "0.7.47"],
       claim,
       frozenEnvelopes: sealedBefore.length,
     }));
     completion.complete();
   } finally {
+    if (writerTree) closeQuietly(writerTree);
     if (old048) closeQuietly(old048);
     if (old047) closeQuietly(old047);
     fs.rmSync(root, { recursive: true, force: true });
