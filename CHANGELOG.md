@@ -19,10 +19,12 @@
   retries, history upload, migration, pairing refresh and remote dead-letter
   replay. A recorded gap cannot regain counters after a receipt is replaced;
   uncertain frozen deliveries retire to a distinct tokenless replacement.
-- The capture contract is exercised as three invariants across all six evidence
-  tiers, three outbox states and seven delivery paths, including a real 0.7.48
-  upgrade reader. Native retries keep their frozen ID and bytes; sealed gaps
-  remain tokenless through terminal replay and restamping.
+- The capture contract proof executes and asserts all 126 combinations of six
+  evidence tiers, three outbox states and seven delivery paths, including live
+  lease refusals, aggregate billing counts, a real 0.7.48 upgrade reader,
+  replay-then-restamp, and late contradictory native evidence. Native retries
+  and terminal replays keep their frozen ID and bytes; sealed gaps remain
+  tokenless and cannot be restamped or regain counters.
 
 ## 0.7.48 — 2026-10-03 (unpublished)
 

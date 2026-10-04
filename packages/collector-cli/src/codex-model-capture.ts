@@ -541,8 +541,12 @@ export function captureCodexModel(
   // A previously decided capture gap is accounting state, not a native
   // producer peer. Keeping it out of the trace set lets a later genuine SSE
   // evidence row be captured without ever rereading the gap's counters.
-  const native = peers.filter((p) =>
-    !p.event.metadata.modelCaptureSource &&
+  // A peer with a durable gap decision is not allowed to supply a model, but
+  // its native attributes remain evidence of ambiguity. Keep the two sets
+  // separate: financial eligibility is not permission to erase contradictory
+  // producer facts from a later trace capture.
+  const peerEvidence = peers.filter((p) => !p.event.metadata.modelCaptureSource);
+  const native = peerEvidence.filter((p) =>
     !isCaptureGap(p.event) &&
     !(p.lineage && hasCaptureGapDecision(db, p.lineage)));
   const conflicts = (p: Peer) =>
@@ -582,6 +586,10 @@ export function captureCodexModel(
   )
     return pairedObservation(capture(event, pair, "paired_sse_event"));
   const traceId = text(event.metadata.traceId);
+  const tracePeers = traceId
+    ? peerEvidence.filter((p) => p.event.metadata.traceId === traceId)
+    : [];
+  if (tracePeers.some(conflicts)) return gap("conflicting_trace_model_evidence");
   const tracedPeers = traceId
     ? native.filter((p) => p.event.metadata.traceId === traceId)
     : [];
@@ -592,7 +600,6 @@ export function captureCodexModel(
     traceId && (directTraceModelEvidence || nativeSseEvent)
       ? [{ event, pairedId: null }, ...traced]
       : traced;
-  if (tracedPeers.some(conflicts)) return gap("conflicting_trace_model_evidence");
   const nativeTraceModels = unique(tracedPeers, (e) => nativeModel(e));
   if (nativeTraceModels.length > 1)
     return gap("ambiguous_trace_model");

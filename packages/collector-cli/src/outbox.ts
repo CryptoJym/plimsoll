@@ -878,7 +878,14 @@ export class DeliveryOutbox {
         reason text not null,
         original_terminal_at text not null,
         replayed_at text not null,
-        replay_count integer not null default 1
+        replay_count integer not null default 1,
+        raw_rowid integer,
+        raw_id text,
+        raw_created_at text,
+        raw_generation text,
+        frozen_envelope_json text,
+        frozen_bytes integer,
+        frozen_attempt_count integer
       );
       create table if not exists upload_control (
         singleton integer primary key check (singleton = 1),
@@ -991,6 +998,22 @@ export class DeliveryOutbox {
         where singleton = 1;
       end;
     `);
+    const replayColumns = this.db
+      .prepare(`pragma table_info(upload_replays)`)
+      .all() as Array<{ name: string }>;
+    const replayAdditions: Array<[string, string]> = [
+      ["raw_rowid", "integer"],
+      ["raw_id", "text"],
+      ["raw_created_at", "text"],
+      ["raw_generation", "text"],
+      ["frozen_envelope_json", "text"],
+      ["frozen_bytes", "integer"],
+      ["frozen_attempt_count", "integer"],
+    ];
+    for (const [name, type] of replayAdditions) {
+      if (!replayColumns.some((column) => column.name === name))
+        this.db.exec(`alter table upload_replays add column ${name} ${type}`);
+    }
     const controlColumns = this.db
       .prepare(`pragma table_info(upload_control)`)
       .all() as Array<{ name: string }>;
@@ -1612,6 +1635,13 @@ export class DeliveryOutbox {
         const reason = captureGapReason(outbox.sealedEnvelopeJson);
         if (reason) rememberCaptureGap(this.db, rawId, reason);
       }
+      // A remote terminal replay must not erase the fact that this delivery
+      // was already frozen. Keep restamp conservative even if an old replay
+      // reader rebuilt a pending attempt-zero row.
+      if (this.db.prepare(`select 1 from upload_replays
+        where (delivery_id=? or (raw_id=? and raw_created_at=? and raw_generation is ?))
+        limit 1`).get(outbox?.deliveryId ?? ensureUuidEventId(rawId).id,
+          row.rawId, row.createdAt, row.privacyGeneration)) return false;
       if (outbox && (outbox.attemptCount !== 0 || outbox.sealedEnvelopeJson !== null || outbox.state !== "pending"))
         return false;
       if (this.db.prepare("select 1 from upload_receipts where delivery_id=?").get(ensureUuidEventId(rawId).id))
@@ -1840,6 +1870,22 @@ export class DeliveryOutbox {
           }
           this.supersedeDeadReceipt(candidate.deliveryId, reason, candidate.diedAt, nowIso);
           const outcome = this.enqueueRaw(raw);
+          if (outcome.enqueued > 0) {
+            const lineage = this.db.prepare(`select frozen_envelope_json as frozenEnvelopeJson,
+                frozen_bytes as frozenBytes, frozen_attempt_count as frozenAttemptCount
+              from upload_replays where delivery_id=?`).get(candidate.deliveryId) as {
+                frozenEnvelopeJson: string | null; frozenBytes: number | null;
+                frozenAttemptCount: number | null;
+              } | undefined;
+            const frozenEnvelopeJson = lineage?.frozenEnvelopeJson;
+            if (frozenEnvelopeJson) {
+              const restored = this.restoreReplayEnvelope(candidate.deliveryId, {
+                ...lineage,
+                frozenEnvelopeJson,
+              }, nowIso);
+              if (!restored) throw new Error("replay_frozen_lineage_missing");
+            }
+          }
           if (outcome.enqueued > 0) summary.requeued += 1;
           else if (outcome.dead > 0) summary.skipped.privacyDisposed += 1;
           else summary.skipped.missingRaw += 1;
@@ -1904,6 +1950,51 @@ export class DeliveryOutbox {
            replay_count = upload_replays.replay_count + 1`,
       )
       .run({ deliveryId, reason, diedAt, now: nowIso });
+  }
+
+  private rememberReplayLineage(input: {
+    deliveryId: string;
+    rawRowid: number | null;
+    rawId: string | null;
+    rawCreatedAt: string | null;
+    rawGeneration: string | null;
+    frozenEnvelopeJson: string;
+    frozenAttemptCount: number;
+    terminalAt: string;
+  }) {
+    const frozenBytes = Buffer.byteLength(input.frozenEnvelopeJson);
+    this.db.prepare(`insert into upload_replays
+      (delivery_id,reason,original_terminal_at,replayed_at,replay_count,
+       raw_rowid,raw_id,raw_created_at,raw_generation,frozen_envelope_json,
+       frozen_bytes,frozen_attempt_count)
+      values (?, 'remote_validation_rejected', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(delivery_id) do update set
+        raw_rowid=coalesce(upload_replays.raw_rowid,excluded.raw_rowid),
+        raw_id=coalesce(upload_replays.raw_id,excluded.raw_id),
+        raw_created_at=coalesce(upload_replays.raw_created_at,excluded.raw_created_at),
+        raw_generation=coalesce(upload_replays.raw_generation,excluded.raw_generation),
+        frozen_envelope_json=coalesce(upload_replays.frozen_envelope_json,excluded.frozen_envelope_json),
+        frozen_bytes=coalesce(upload_replays.frozen_bytes,excluded.frozen_bytes),
+        frozen_attempt_count=coalesce(upload_replays.frozen_attempt_count,excluded.frozen_attempt_count)`).run(
+      input.deliveryId, input.terminalAt, input.terminalAt, input.rawRowid, input.rawId,
+      input.rawCreatedAt, input.rawGeneration, input.frozenEnvelopeJson, frozenBytes,
+      input.frozenAttemptCount,
+    );
+  }
+
+  private restoreReplayEnvelope(
+    deliveryId: string,
+    lineage: { frozenEnvelopeJson: string; frozenBytes: number | null; frozenAttemptCount: number | null },
+    nowIso: string,
+  ) {
+    const bytes = lineage.frozenBytes ?? Buffer.byteLength(lineage.frozenEnvelopeJson);
+    return this.db.prepare(`update upload_outbox set
+      base_envelope_json=?, base_bytes=?, sealed_envelope_json=?, sealed_bytes=?,
+      attempt_count=max(attempt_count,?), state='pending', lease_id=null,
+      lease_expires_at=null, next_attempt_at=?, updated_at=? where delivery_id=?`).run(
+      lineage.frozenEnvelopeJson, bytes, lineage.frozenEnvelopeJson, bytes,
+      lineage.frozenAttemptCount ?? 1, nowIso, nowIso, deliveryId,
+    ).changes === 1;
   }
 
   fillLinkageForRawRow(rawRowid: number, repoHash: string | null, branchHash: string | null) {
@@ -2759,6 +2850,8 @@ export class DeliveryOutbox {
     const terminalAt = at.toISOString();
     const get = this.db.prepare(
       `select attempt_count as attemptCount, created_at as createdAt,
+              raw_rowid as rawRowid, raw_created_at as rawCreatedAt,
+              raw_generation as rawGeneration,
               raw_id as rawId, sealed_envelope_json as sealedEnvelopeJson,
               base_envelope_json as baseEnvelopeJson
        from upload_outbox where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
@@ -2768,13 +2861,24 @@ export class DeliveryOutbox {
       let dead = 0;
       for (const id of ids) {
         const row = get.get(id, leaseId) as {
-          attemptCount: number; createdAt: string; rawId: string | null;
+          attemptCount: number; createdAt: string; rawRowid: number | null;
+          rawCreatedAt: string | null; rawGeneration: string | null; rawId: string | null;
           sealedEnvelopeJson: string | null; baseEnvelopeJson: string;
         } | undefined;
         if (!row) continue;
         const reason = captureGapReason(row.sealedEnvelopeJson) ??
           captureGapReason(row.baseEnvelopeJson);
         if (row.rawId && reason) rememberCaptureGap(this.db, row.rawId, reason);
+        this.rememberReplayLineage({
+          deliveryId: id,
+          rawRowid: row.rawRowid,
+          rawId: row.rawId,
+          rawCreatedAt: row.rawCreatedAt,
+          rawGeneration: row.rawGeneration,
+          frozenEnvelopeJson: row.sealedEnvelopeJson ?? row.baseEnvelopeJson,
+          frozenAttemptCount: row.attemptCount,
+          terminalAt,
+        });
         dead += this.writeReceipt({
           deliveryId: id,
           state: "dead",
@@ -3144,6 +3248,18 @@ export class DeliveryOutbox {
             baseEnvelopeJson: string; sealedEnvelopeJson: string | null }
         | undefined;
     if (!row) return 0;
+    if (isReplayableReceiptReason(reason)) {
+      this.rememberReplayLineage({
+        deliveryId,
+        rawRowid: row.rawRowid,
+        rawId: row.rawId,
+        rawCreatedAt: row.rawCreatedAt,
+        rawGeneration: row.rawGeneration,
+        frozenEnvelopeJson: row.sealedEnvelopeJson ?? row.baseEnvelopeJson,
+        frozenAttemptCount: row.attemptCount,
+        terminalAt,
+      });
+    }
     const gapReason = captureGapReason(row.sealedEnvelopeJson) ??
       captureGapReason(row.baseEnvelopeJson);
     if (row.rawId && gapReason) rememberCaptureGap(this.db, row.rawId, gapReason);

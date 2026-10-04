@@ -796,6 +796,15 @@ jobs:
       - name: Prove every round-three capture and replay path keeps a durable gap
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-review-r4
+      - name: Prove round-five contradictory peers and replay restamping remain closed
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-review-r5-directed
+      - name: Prove terminal replay preserves frozen named delivery bytes
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-replay-restamp
+      - name: Retain the 0.7.48 replay-restamp defect control
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-replay-restamp-base-origin
       - name: Prove the bound A03 plan window keeps valid usage billable
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-a03-directed

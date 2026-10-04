@@ -53,7 +53,7 @@ async function main() {
     head.append(aiInteractionEventSchema.parse({
       id: "00000000-0000-4000-8000-000000000832", source: "codex", dataMode: "metadata",
       eventType: "otel_span", sessionId: session, observedAt: new Date(at + 1_000).toISOString(),
-      model: "gpt-6.1-sol", metadata: { otelEventName: "codex.sse_event", trace, "gen_ai.request.model": "gpt-6.1-sol" },
+      model: "gpt-6.1-sol", metadata: { otelEventName: "codex.sse_event", traceId: trace, "gen_ai.request.model": "gpt-6.1-sol" },
     }));
     const replay = head.delivery.replayDeadLetters({ reason: "remote_validation_rejected", now });
     assert.equal(replay.requeued, 1);
