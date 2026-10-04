@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.48 — 2026-10-03 (unpublished)
+
+- Skip plan-limit observations without an account binding. Rollout commit
+  exceptions now produce content-free diagnostics, preserving the existing
+  usage arithmetic, deterministic IDs and session authority.
+- Classify Codex OTLP resource service names as Codex even with another valid
+  producer credential, and warn once per process about that mismatch. A
+  Codex Desktop service with a valid local Claude credential is accepted and
+  stored as Codex, preserving Studio0 Desktop usage. Invalid, unknown,
+  malformed or header-mismatched credentials remain refused. The dispatch
+  integration proof checks both admission and token rejection, including
+  deduplication and one warning containing source names only.
+- Attach complete, bounded dead-letter censuses to capture gaps. Unknown
+  amounts stay null; untyped or oversized intervals remain known gaps. An
+  census-schema or generic claim refusal permits one signed resend without
+  the census. Named signature, clock or admission refusals retain their guard.
+- **Release prerequisite:** cloud PR #279 must be merged and live before the
+  lead authorizes the 0.7.48 GO file. The lead owns that production check.
+  The studio3 live-tail exception remains unconfirmed by scratch replay;
+  this release does not claim that outage resolved.
+
 ## 0.7.43 — 2026-09-26
 
 - `plimsoll dispatch bind` assigns a bounded work item, role, and optional

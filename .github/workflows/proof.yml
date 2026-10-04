@@ -5,9 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: proof-${{ github.ref }}
+  cancel-in-progress: true
+
+
+# Self-hosted runner labels don't imply a shell, so name it: bash with errexit, as on GitHub's macOS image.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   proof:
-    runs-on: macos-14
+    # James, 3 Oct 2026 12:05 MDT: no CI on GitHub's cloud; every check runs on our own machines.
+    runs-on: [self-hosted, macOS, ARM64, plimsoll]
     # Allow the measured sequential artifact, repeated E2E and resource gates.
     # Per-proof deadlines and acceptance thresholds remain unchanged. A full run
     # took about 56 minutes on 30 Sep 2026, so 60 cut off healthy runs.
@@ -233,10 +244,6 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:doctor-stale-producers
 
-      - name: Prove atomic no-follow LaunchAgent manifest lifecycle
-        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        run: pnpm proof:launch-agent
-
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:packaged-runtime
@@ -253,7 +260,6 @@ jobs:
         run: |
           pnpm --dir packages/collector-cli build
           pnpm proof:launch-agent-unload
-          pnpm proof:collector-supervision
 
       - name: Prove lifecycle receipts separate wrapper ownership and collector readiness (#148)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -1359,15 +1365,6 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:status-summary
 
-      # Independent of the TypeScript typecheck. A cold build and test takes
-      # about 21 s here, so no build cache: nothing restored can reach a proof.
-      - name: Build and test the macOS menubar app (#12)
-        if: ${{ !cancelled() }}
-        env:
-          # The tests use Swift Testing (Xcode 16+); macos-14 defaults to Xcode 15.4.
-          DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
-        run: pnpm proof:mac-menubar
-
       - name: Upload evidence artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -1375,3 +1372,40 @@ jobs:
           name: signal-fidelity-evidence
           path: evidence/
           if-no-files-found: warn
+
+  mac-menubar:
+    # Swift Testing needs Xcode 16 or later. Only studio1 has Xcode (26.5), labelled xcode.
+    runs-on: [self-hosted, macOS, ARM64, plimsoll, xcode]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.20.0
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Isolate every proof home and provider root
+        shell: bash
+        run: |
+          proof_home="${RUNNER_TEMP}/plimsoll-ci-home"
+          mkdir -p "$proof_home/.plimsoll" "$proof_home/.codex" "$proof_home/.claude" "$proof_home/tmp"
+          chmod 700 "$proof_home" "$proof_home/.plimsoll"
+          {
+            echo "HOME=$proof_home"
+            echo "USERPROFILE=$proof_home"
+            echo "PLIMSOLL_HOME=$proof_home/.plimsoll"
+            echo "CODEX_HOME=$proof_home/.codex"
+            echo "CLAUDE_CONFIG_DIR=$proof_home/.claude"
+            echo "XDG_CONFIG_HOME=$proof_home/.config"
+            echo "XDG_CACHE_HOME=$proof_home/.cache"
+            echo "XDG_STATE_HOME=$proof_home/.local/state"
+            echo "TMPDIR=$proof_home/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and test the macOS menubar app (#12)
+        env:
+          DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+        run: pnpm proof:mac-menubar

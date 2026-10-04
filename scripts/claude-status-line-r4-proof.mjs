@@ -62,11 +62,13 @@ function checkAccountSwitch() {
     rows = db.prepare("select payload_json from buffered_events where event_type='plan_limit_observation'")
       .all().map(row => JSON.parse(row.payload_json));
   } finally { db.close(); }
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].metadata['user.account_uuid'], undefined,
-    'a reading whose chain changed A to B must not acquire B');
-  assert.equal(rows[1].metadata['user.account_uuid'], key(accountB),
+  assert.equal(rows.length, 1,
+    'the ambiguous account-switch reading must be skipped');
+  assert.equal(rows[0].metadata['user.account_uuid'], key(accountB),
     'a later reading with B on both sides of the chain belongs to B');
+  assert.equal(rows[0].metadata.planLimitUsedPercent, 39);
+  assert.equal(rows.some(row => row.metadata.planLimitUsedPercent === 37), false,
+    'the first reading must not be emitted without an account');
   assert.notEqual(rows[0].metadata['user.account_uuid'], key(accountA));
   for (const candidate of [ledger, ledger + '-wal', ledger + '-shm']) {
     if (!fs.existsSync(candidate)) continue;
@@ -74,7 +76,7 @@ function checkAccountSwitch() {
     assert.equal(bytes.includes(Buffer.from(accountA)), false);
     assert.equal(bytes.includes(Buffer.from(accountB)), false);
   }
-  console.log(JSON.stringify({ proof: 'claude-status-line-r4-account-switch', checks: 8, passed: 8 }));
+  console.log(JSON.stringify({ proof: 'claude-status-line-r4-account-switch', checks: 9, passed: 9 }));
 }
 
 const raceHook = String.raw`

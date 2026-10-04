@@ -33,8 +33,10 @@ import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema, aiWorkIngestBatchSchema } from "../packages/shared/src/index";
 import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
+import { verifyCaptureDeadLetterCases } from "./lib/capture-dead-letter-cases";
+import { verifyCaptureCensusFallbackCases } from "./lib/capture-census-fallback-cases";
 
-const completion = createProofCompletion("capture-claim", 13);
+const completion = createProofCompletion("capture-claim", 15);
 const check = (name: string, passed: boolean, detail: Record<string, unknown> = {}) => {
   completion.check(name, passed);
   if (!passed) throw new Error(`${name} failed: ${JSON.stringify(detail)}`);
@@ -98,6 +100,11 @@ function coverAll(buffer: LocalEventBuffer, codexMs: number, claudeMs: number) {
 const claimFor = (buffer: LocalEventBuffer, ids: string[]) => buffer.delivery.captureClaim(ids, NO_SPOOL)!;
 
 async function main() {
+  const censusCases = verifyCaptureDeadLetterCases();
+  check("typed_dead_letter_census_preserves_known_unknown_and_withheld_loss", censusCases.scenarios === 3, censusCases);
+  const fallbackCases = await verifyCaptureCensusFallbackCases();
+  check("census_schema_fallback_preserves_signatures_gaps_and_delivery_authority",
+    fallbackCases.scenarios === 9, fallbackCases);
   // 1. No coverage check yet: the claim carries the epoch and a cursor, attests
   //    nothing, and says why. (The upload path finishes the legacy migration
   //    before it leases; so does this.)
@@ -144,7 +151,11 @@ async function main() {
   const deadClaim = claimFor(buffer, [first.id]);
   const deadAt = iso(EPOCH_START_MS + 10 * 60_000);
   check("dead_delivery_is_a_bounded_gap_that_holds_nothing_back",
-    deadClaim.dead === 1 && JSON.stringify(deadClaim.gaps) === JSON.stringify([{ from: deadAt, to: deadAt }]) &&
+    deadClaim.dead === 1 && JSON.stringify(deadClaim.gaps.map(({ from, to }) => ({ from, to }))) ===
+      JSON.stringify([{ from: deadAt, to: deadAt }]) &&
+      deadClaim.gaps[0]?.deadLetters?.[0]?.eventType === "assistant_response" &&
+      deadClaim.gaps[0]?.deadLetters?.[0]?.tokens === 4 &&
+      deadClaim.gaps[0]?.deadLetters?.[0]?.costUsd === null &&
       deadClaim.through === iso(EPOCH_START_MS + HOUR) && deadClaim.pending === 0 && deadClaim.withheld === 0,
     { deadClaim });
   const replay = buffer.delivery.replayDeadLetters({ reason: "remote_validation_rejected" });
