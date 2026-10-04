@@ -134,8 +134,10 @@ function isUsageRow(row: UsageRow) {
 
 function compatible(log: UsageRow, span: UsageRow, logShape: Shape, spanShape: Shape) {
   if (logShape.kind !== "log" || spanShape.kind !== "span") return false;
-  if (!log.workspaceId || !log.deviceId || !log.installationEpochId ||
-      log.workspaceId !== span.workspaceId || log.deviceId !== span.deviceId ||
+  // Historical pairing also classifies old diagnostics with no install
+  // columns. Missing identity cannot promote their model: capture admission
+  // separately checks its complete boundary. Known installs never cross.
+  if (log.installationEpochId && span.installationEpochId &&
       log.installationEpochId !== span.installationEpochId) return false;
   if (log.workspaceId && span.workspaceId && log.workspaceId !== span.workspaceId) return false;
   if (log.deviceId && span.deviceId && log.deviceId !== span.deviceId) return false;

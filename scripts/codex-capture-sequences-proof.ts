@@ -323,7 +323,19 @@ async function run(operations: Op[],settle=true) {
     for(index=0;index<operations.length;index++) { await world.operate(operations[index]!);world.assertStep(); }
     if(settle)await world.settle();
     return {passed:true as const,steps:operations.length,named:[...world.frozen.values()].filter(f=>f.named).length};
-  } catch(error) { return {passed:false as const,index,error:String(error)}; }
+  } catch(error) {
+    // Persist enough producer/state evidence to diagnose an accounting error
+    // after this disposable world is removed. This is observation, not an
+    // oracle shortcut: expected accounting still comes from producer facts.
+    const db=world.b.database;
+    const snapshot={version:world.version,now:world.now.toISOString(),nativeModels:[...world.nativeModels],
+      fileHasTurn:world.fileHasTurn,nativeObserved:world.nativeObserved,
+      raw:db.prepare("select * from buffered_events order by rowid").all(),
+      outbox:db.prepare("select * from upload_outbox order by delivery_id").all(),
+      receipts:db.prepare("select * from upload_receipts order by delivery_id").all(),
+      frozen:[...world.frozen.values()]};
+    return {passed:false as const,index,error:String(error),snapshot};
+  }
   finally { world.close(); }
 }
 function failureTag(error: string) { return error.match(/(?:I[123]_[A-Z_]+|NO_DUPLICATE_USAGE|KNOWN_NATIVE_[A-Z_]+|STATE_ACTIVE_TERMINAL)/)?.[0]; }
@@ -353,10 +365,13 @@ async function main() {
         const operations=sequence(seed),result=await run(operations);
         if(!result.passed) {
           const tag=failureTag(result.error);
-          const reduced=tag?await shrink(operations,tag):{operations,attempts:0};
-          const counterexample={seed,requestedSeeds:seeds,...result,...reduced};
           const evidence=path.join(process.cwd(),"evidence/codex-capture-sequences");fs.mkdirSync(evidence,{recursive:true});
           const file=path.join(evidence,`seed-${seed}-${tag??"harness"}.json`);
+          // Save the full counterexample BEFORE shrinking. A proof timeout
+          // during reduction must not erase the original failing sequence.
+          fs.writeFileSync(file,JSON.stringify({seed,requestedSeeds:seeds,...result,operations,attempts:0},null,2)+"\n");
+          const reduced=tag?await shrink(operations,tag):{operations,attempts:0};
+          const counterexample={seed,requestedSeeds:seeds,...result,...reduced};
           fs.writeFileSync(file,JSON.stringify(counterexample,null,2)+"\n");
           console.error(JSON.stringify({counterexample,file},null,2));throw new Error(result.error);
         }
