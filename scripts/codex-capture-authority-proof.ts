@@ -213,21 +213,31 @@ async function historicalUpgrade() {
   });
 }
 async function historicalProjectionRepair() {
-  const f = new Fixture();
-  try {
-    const bad = log("f".repeat(32), MODEL, 17, 3, [attr("gen_ai.request.model", "gpt-6-astra")]);
-    f.buffer.append(bad); f.lease(63000); drain(f);
-    // Simulate the old derived fact only; preserve raw and frozen bytes.
-    f.buffer.database.prepare(`update dashboard_event_facts set model=?,input_tokens=17,output_tokens=3
-      where raw_rowid=(select rowid from buffered_events where id=?)`).run(MODEL,bad.id);
-    f.buffer.database.prepare("update codex_duplicate_fact_scan set authority_version=0,complete=1").run();
-    f.reopen(); assert.equal(f.buffer.projection.status().parityReady, false); drain(f);
-    const fact = f.buffer.database.prepare(`select model,input_tokens as input,output_tokens as output from dashboard_event_facts
-      where raw_rowid=(select rowid from buffered_events where id=?)`).get(bad.id) as any;
-    assert.deepEqual(fact, {model: null,input: null,output: null});
-    completion.check("historical derived gap usage repaired through bounded public maintenance");
-  } finally {f.close();}
+  await withReader("34d58bcd90865679e09fcbd1ee1703de5effda97", async ({Buffer: Old}) => {
+    const f = new Fixture(); f.buffer.close();
+    for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(f.file + suffix, {force: true});
+    let old: any;
+    try {
+      old = new Old(f.file, f.options);
+      const bad = log("f".repeat(32),MODEL,17,3,[attr("gen_ai.request.model","gpt-6-astra")]);
+      assert.equal(old.append(bad),true);
+      for (let i=0;i<40;i++) {old.projection.runMaintenance(new Date());
+        if (old.projection.status().parityReady && !old.projection.status().dirty) break;}
+      const prior = old.database.prepare(`select input_tokens as input,output_tokens as output from dashboard_event_facts
+        where raw_rowid=(select rowid from buffered_events where id=?)`).get(bad.id);
+      assert.deepEqual(prior,{input:17,output:3});
+      // Both the old fact and its aggregate totals come from a real public
+      // writer. Editing only a fact would simulate an inconsistent ledger.
+      old.close(); old=undefined; f.buffer=f.open();
+      assert.equal(f.buffer.projection.status().parityReady,false); drain(f);
+      const fact = f.buffer.database.prepare(`select model,input_tokens as input,output_tokens as output from dashboard_event_facts
+        where raw_rowid=(select rowid from buffered_events where id=?)`).get(bad.id) as any;
+      assert.deepEqual(fact,{model:null,input:null,output:null});
+      completion.check("historical derived gap usage repaired through bounded public maintenance");
+    } finally {old?.close();f.close();}
+  });
 }
+
 async function main() {
   try {
     await authorityCase("invalid SSE gap ACK cannot suppress known native turn", log("a".repeat(32), MODEL, 17, 3,
