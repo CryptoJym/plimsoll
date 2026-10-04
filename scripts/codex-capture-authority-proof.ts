@@ -4,7 +4,7 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
-import { recordCodexTurnModel, rememberCaptureGap } from "../packages/collector-cli/src/codex-model-capture";
+import { captureCodexModel, recordCodexTurnModel, rememberCaptureGap } from "../packages/collector-cli/src/codex-model-capture";
 import { aiInteractionEventSchema, type AiInteractionEvent } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
 import { proofTempRoot, withReader } from "./lib/legacy-reader";
@@ -82,9 +82,14 @@ async function authorityCase(name: string, peer: AiInteractionEvent, authoritati
     if (!authoritative) assertGap(item.envelope.event);
     else assert.equal(item.envelope.event.model, MODEL);
     if (diagnosticInput !== undefined) {
-      const stored = f.buffer.database.prepare("select base_envelope_json as payload from upload_outbox where raw_id=?")
+      const stored = f.buffer.database.prepare("select payload_json as payload from buffered_events where id=?")
         .get(peer.id) as {payload: string};
-      assert.equal(JSON.parse(stored.payload).event.metadata.modelGapInputTokens, diagnosticInput);
+      assert.equal(JSON.parse(stored.payload).inputTokens, diagnosticInput);
+      const localGap = captureCodexModel(f.buffer.database, peer, peer.id, false, false);
+      assert.equal(localGap.metadata.modelGapInputTokens, diagnosticInput);
+      assert.equal(localGap.metadata.modelGapOutputTokens, peer.outputTokens);
+      assert.equal(item.envelope.event.metadata.modelGapInputTokens, undefined,
+        "capture diagnostics stay local, never in a frozen delivery");
     }
     f.buffer.delivery.acknowledge(first.leaseId, first.items.map(i => i.deliveryId), f.now);
     f.reopen(); assert.equal(f.buffer.sessionUsageAuthority("codex", SESSION), authoritative ? "live" : null);
