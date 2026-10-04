@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { LocalEventBuffer } from "./buffer";
-import type { LiveAuthenticatedBinding, LiveSourceContext } from "./codex-live-usage-auth";
+import type { LiveAuthenticatedBinding } from "./codex-live-usage-auth";
 import { isAuthenticatedLiveBinding } from "./codex-live-usage-auth";
 import { currentDispatchRoot,dispatchBindingMetadata,type CaptureRoot } from "./capture-root-inventory";
 import { AccountBindingHistory, CodexAccountKeyCache } from "./local-identity";
