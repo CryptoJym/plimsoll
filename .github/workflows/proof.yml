@@ -850,6 +850,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-budget
 
+      - name: Prove current-day Codex capture during a multi-GB scan backlog
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-scan-backlog
+
       - name: Prove Grok usage capture from Grok's own usage files (eco-6hoxj.163.20)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:grok-usage
