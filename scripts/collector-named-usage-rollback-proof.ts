@@ -11,8 +11,11 @@ import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const completion = createProofCompletion("collector-named-usage-rollback", 6);
 // Preserve PR #450's exact writer and all five rollback assertions while
-// testing this 0.7.48 branch as an additional reader. No #450 runtime changes
+// testing this scanner branch as an additional reader. No #450 runtime changes
 // or release bump are required in the scanner branch.
+const currentVersion: string = JSON.parse(fs.readFileSync(
+  path.resolve("packages/collector-cli/package.json"), "utf8",
+)).version;
 const writerCommit = "9f75bdcdf6d19fd477caed838482bb0fe16c8d31";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-named-rollback-"));
 const ledgerPath = path.join(root, "rollback.sqlite");
@@ -201,7 +204,7 @@ async function main() {
     for (const worktree of [old048, old047])
       fs.symlinkSync(path.resolve("node_modules"), path.join(worktree, "node_modules"), "dir");
 
-    const current = await leaseWithReader(path.resolve("."), "0.7.48", baseMs + 182_000, false);
+    const current = await leaseWithReader(path.resolve("."), currentVersion, baseMs + 182_000, false);
     assert.deepEqual(current.itemIds.sort(), [gapId, namedId].sort());
     const afterCurrent = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(afterCurrent), sealedBefore); } finally { afterCurrent.close(); }
@@ -237,7 +240,7 @@ async function main() {
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
-      readers: ["scanner-head-0.7.48", "main-0.7.48", "0.7.47"],
+      readers: [`scanner-head-${currentVersion}`, "main-0.7.48", "0.7.47"],
       claim,
       frozenEnvelopes: sealedBefore.length,
     }));
