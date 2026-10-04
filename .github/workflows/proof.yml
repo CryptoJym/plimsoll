@@ -31,6 +31,10 @@ jobs:
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
+        with:
+          # One pnpm folder per runner: runners sharing a Mac user raced in the default
+          # ~/setup-pnpm (ENOTEMPTY, 'pnpm: command not found'; eco-6hoxj.165.179.2).
+          dest: ~/setup-pnpm-runners/${{ runner.name }}
 
       - uses: actions/setup-node@v4
         with:
@@ -1387,6 +1391,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
+        with:
+          # One pnpm folder per runner: runners sharing a Mac user raced in the default
+          # ~/setup-pnpm (ENOTEMPTY, 'pnpm: command not found'; eco-6hoxj.165.179.2).
+          dest: ~/setup-pnpm-runners/${{ runner.name }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22.20.0
