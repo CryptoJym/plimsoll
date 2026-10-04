@@ -399,6 +399,19 @@ function persistedGapPayload(db: Database.Database, row: RawDeliveryRow) {
   return JSON.stringify(codexModelGap(db, event, "persisted_capture_gap"));
 }
 
+function captureGapReason(envelopeJson: string | null | undefined): string | undefined {
+  if (!envelopeJson) return undefined;
+  try {
+    const envelope = aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
+    if (!isCaptureGap(envelope.event)) return undefined;
+    return typeof envelope.event.metadata.modelGapReason === "string"
+      ? envelope.event.metadata.modelGapReason
+      : "sealed_capture_gap";
+  } catch {
+    return undefined;
+  }
+}
+
 /** Refresh only a never-attempted envelope after pairing adds cached tokens. */
 export function refreshUnsentRawDelivery(
   db: Database.Database,
@@ -1595,6 +1608,10 @@ export class DeliveryOutbox {
         row.rawRowid, row.rawId, row.createdAt, row.privacyGeneration,
       ) as
         { deliveryId: string;state: string;attemptCount: number;sealedEnvelopeJson: string|null }|undefined;
+      if (outbox?.sealedEnvelopeJson) {
+        const reason = captureGapReason(outbox.sealedEnvelopeJson);
+        if (reason) rememberCaptureGap(this.db, rawId, reason);
+      }
       if (outbox && (outbox.attemptCount !== 0 || outbox.sealedEnvelopeJson !== null || outbox.state !== "pending"))
         return false;
       if (this.db.prepare("select 1 from upload_receipts where delivery_id=?").get(ensureUuidEventId(rawId).id))
@@ -2314,6 +2331,13 @@ export class DeliveryOutbox {
           locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso, disposedRawRowids);
           continue;
         }
+        // A gap sealed by an older binary has no r4 decision-table row yet.
+        // Import the accounting decision from the frozen envelope before any
+        // terminal deletion or replay can remove that envelope.
+        if (row.rawId) {
+          const reason = captureGapReason(envelopeJson);
+          if (reason) rememberCaptureGap(this.db, row.rawId, reason);
+        }
         if (outboundEnvelope.event.dataMode === "evidence") {
           locallyDead += this.deadActive(
             row.deliveryId,
@@ -2341,7 +2365,9 @@ export class DeliveryOutbox {
                 sealedOriginGap = true;
               } else if (codexHasUsage(rawLineage)) {
                 const validated = captureCodexModel(this.db, rawLineage, row.rawId, true);
-                sealedOriginGap = isCaptureGap(validated) || typeof validated.model !== "string" || !validated.model.trim();
+                sealedOriginGap = isCaptureGap(validated) ||
+                  typeof validated.model !== "string" || !validated.model.trim() ||
+                  validated.model !== outboundEnvelope.event.model;
               } else {
                 sealedOriginGap = true;
               }
@@ -2350,7 +2376,7 @@ export class DeliveryOutbox {
             }
           }
         }
-        if (row.sealedEnvelopeJson && (sealedOriginGap || unresolvedCapture(outboundEnvelope.event))) {
+        if (row.sealedEnvelopeJson && sealedOriginGap) {
           // An old, once-attempted request may already have committed remotely.
           // Never rewrite its frozen bytes or retry unknown billable usage.
           // Retire it and send a distinct tokenless gap with the same raw lineage.
@@ -2732,15 +2758,23 @@ export class DeliveryOutbox {
   deadLetterRemote(leaseId: string, ids: string[], at = new Date()) {
     const terminalAt = at.toISOString();
     const get = this.db.prepare(
-      `select attempt_count as attemptCount, created_at as createdAt
+      `select attempt_count as attemptCount, created_at as createdAt,
+              raw_id as rawId, sealed_envelope_json as sealedEnvelopeJson,
+              base_envelope_json as baseEnvelopeJson
        from upload_outbox where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
     );
     const remove = this.db.prepare(`delete from upload_outbox where delivery_id = ? and lease_id = ?`);
     const run = this.db.transaction(() => {
       let dead = 0;
       for (const id of ids) {
-        const row = get.get(id, leaseId) as { attemptCount: number; createdAt: string } | undefined;
+        const row = get.get(id, leaseId) as {
+          attemptCount: number; createdAt: string; rawId: string | null;
+          sealedEnvelopeJson: string | null; baseEnvelopeJson: string;
+        } | undefined;
         if (!row) continue;
+        const reason = captureGapReason(row.sealedEnvelopeJson) ??
+          captureGapReason(row.baseEnvelopeJson);
+        if (row.rawId && reason) rememberCaptureGap(this.db, row.rawId, reason);
         dead += this.writeReceipt({
           deliveryId: id,
           state: "dead",
@@ -3098,15 +3132,21 @@ export class DeliveryOutbox {
       .prepare(
         `select raw_rowid as rawRowid,raw_id as rawId,
            raw_created_at as rawCreatedAt,raw_generation as rawGeneration,
-           attempt_count as attemptCount,created_at as createdAt
+           attempt_count as attemptCount,created_at as createdAt,
+           base_envelope_json as baseEnvelopeJson,
+           sealed_envelope_json as sealedEnvelopeJson
          from upload_outbox where delivery_id = ?`,
       )
       .get(deliveryId) as
         | { rawRowid: number | null; rawId: string | null;
             rawCreatedAt: string | null; rawGeneration: string | null;
-            attemptCount: number; createdAt: string }
+            attemptCount: number; createdAt: string;
+            baseEnvelopeJson: string; sealedEnvelopeJson: string | null }
         | undefined;
     if (!row) return 0;
+    const gapReason = captureGapReason(row.sealedEnvelopeJson) ??
+      captureGapReason(row.baseEnvelopeJson);
+    if (row.rawId && gapReason) rememberCaptureGap(this.db, row.rawId, gapReason);
     let siblingReceipts = 0;
     if (row.rawRowid !== null && isTerminalPrivacyReason(reason)) {
       const owner = this.db.prepare(`select id from buffered_events

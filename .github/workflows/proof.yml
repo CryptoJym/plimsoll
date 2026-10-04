@@ -775,6 +775,18 @@ jobs:
       - name: Prove model evidence or a capture gap on every Codex upload
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-model-capture
+      - name: Prove all Codex capture invariants across evidence, state and path
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-invariants-matrix
+      - name: Prove native trace and local-turn usage survives retry
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-good-retry
+      - name: Prove a guessed SSE peer cannot supply a model
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-legacy-sse-peer
+      - name: Prove an older sealed capture gap survives replay
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-upgrade-gap-replay
       - name: Prove late evidence cannot resurrect a tokenless capture gap
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-retry

@@ -4,8 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-/** Open a real 0.7.48 reader in a disposable checkout for upgrade proofs. */
-export async function withLegacyReader<T>(run: (modules: {
+/** Open a real historical reader in a disposable checkout for upgrade proofs. */
+export async function withReader<T>(commit: string, run: (modules: {
   Buffer: any;
   reconciliation: any;
 }) => Promise<T> | T): Promise<T> {
@@ -16,7 +16,7 @@ export async function withLegacyReader<T>(run: (modules: {
   );
   fs.mkdirSync(path.dirname(root), { recursive: true });
   execFileSync("git", ["worktree", "add", "--detach", "--quiet", root,
-    "34d58bcd90865679e09fcbd1ee1703de5effda97"], { cwd: process.cwd(), stdio: "ignore" });
+    commit], { cwd: process.cwd(), stdio: "ignore" });
   const modules = path.join(process.cwd(), "node_modules");
   if (fs.existsSync(modules)) fs.symlinkSync(modules, path.join(root, "node_modules"), "dir");
   try {
@@ -30,6 +30,14 @@ export async function withLegacyReader<T>(run: (modules: {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
+
+/** The real release immediately before this PR. */
+export const withLegacyReader = <T>(run: (modules: { Buffer: any; reconciliation: any }) => Promise<T> | T) =>
+  withReader("34d58bcd90865679e09fcbd1ee1703de5effda97", run);
+
+/** The round-three reader used to prove upgrade inheritance. */
+export const withRoundThreeReader = <T>(run: (modules: { Buffer: any; reconciliation: any }) => Promise<T> | T) =>
+  withReader("98385d8b918147d58339fc5ab838552482384a00", run);
 
 export function proofTempRoot(name: string) {
   return fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), `codex-${name}-`));

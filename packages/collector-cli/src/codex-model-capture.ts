@@ -161,7 +161,11 @@ function pairedObservation(event: AiInteractionEvent): AiInteractionEvent {
   };
 }
 
-type Peer = { event: AiInteractionEvent; pairedId: string | null };
+type Peer = {
+  event: AiInteractionEvent;
+  pairedId: string | null;
+  lineage?: CaptureLineage;
+};
 function sameCounts(a: AiInteractionEvent, b: AiInteractionEvent) {
   return (
     a.inputTokens === b.inputTokens &&
@@ -206,7 +210,15 @@ function capture(
   peers: Peer[],
   source: string,
 ): AiInteractionEvent {
-  const model = unique(peers, (e) => nativeModel(e) ?? text(e.model))[0]!;
+  // Trace/SSE and exact-pair evidence must be named by a native producer
+  // attribute. Local-turn evidence is the one deliberate exception: the
+  // native turn table supplies a model on its synthetic context row.
+  const model = unique(
+    peers,
+    (e) => source === "local_session_turn"
+      ? nativeModel(e) ?? text(e.model)
+      : nativeModel(e),
+  )[0]!;
   const eventAccounts = [...metadataAccounts(event)];
   const accounts = [...new Set(peers.flatMap((peer) => [...metadataAccounts(peer.event)]))];
   const sessions = unique(peers, (e) => trustedSession(e));
@@ -483,7 +495,9 @@ export function captureCodexModel(
   const eligible = terminalPrivacyEligibilitySql(db, "e");
   const raw = db
     .prepare(
-      `select e.payload_json as payload, e.usage_paired_event_id as pairedId
+      `select e.rowid as evidenceRowid, e.id as evidenceId,
+       e.created_at as evidenceCreatedAt, e.privacy_generation as evidenceGeneration,
+       e.payload_json as payload, e.usage_paired_event_id as pairedId
     from buffered_events e indexed by idx_events_observed
     where e.source='codex' and e.observed_at>=? and e.observed_at<=? and e.id<>?
       and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
@@ -497,7 +511,14 @@ export function captureCodexModel(
       row.workspace,
       row.device,
       row.epoch,
-    ) as Array<{ payload: string; pairedId: string | null }>;
+    ) as Array<{
+      evidenceRowid: number;
+      evidenceId: string;
+      evidenceCreatedAt: string;
+      evidenceGeneration: string | null;
+      payload: string;
+      pairedId: string | null;
+    }>;
   if (raw.length > MAX_EVIDENCE_ROWS) return gap("evidence_window_overflow");
   const peers: Peer[] = raw.flatMap((r) => {
     try {
@@ -505,13 +526,25 @@ export function captureCodexModel(
         {
           event: JSON.parse(r.payload) as AiInteractionEvent,
           pairedId: r.pairedId,
+          lineage: {
+            rawRowid: r.evidenceRowid,
+            rawId: r.evidenceId,
+            rawCreatedAt: r.evidenceCreatedAt,
+            rawGeneration: r.evidenceGeneration,
+          },
         },
       ];
     } catch {
       return [];
     }
   });
-  const native = peers.filter((p) => !p.event.metadata.modelCaptureSource);
+  // A previously decided capture gap is accounting state, not a native
+  // producer peer. Keeping it out of the trace set lets a later genuine SSE
+  // evidence row be captured without ever rereading the gap's counters.
+  const native = peers.filter((p) =>
+    !p.event.metadata.modelCaptureSource &&
+    !isCaptureGap(p.event) &&
+    !(p.lineage && hasCaptureGapDecision(db, p.lineage)));
   const conflicts = (p: Peer) =>
     p.event.metadata.modelEvidenceConflict === true ||
     nativeModels(p.event).size > 1 ||
@@ -569,7 +602,12 @@ export function captureCodexModel(
     nativeTraceModels[0] !== event.model
   )
     return gap("ambiguous_trace_model");
-  const traceModels = unique(traceEvidence, (e) => nativeModel(e) ?? text(e.model));
+  // Every peer participating in the trace tier must carry one native
+  // producer model. A model written on an old row is never promoted by this
+  // branch, even when its counters differ from the response.
+  if (tracedPeers.some((p) => nativeModel(p.event) === undefined))
+    return gap("missing_trace_model_evidence");
+  const traceModels = unique(traceEvidence, (e) => nativeModel(e));
   if (traceModels.length > 1) return gap("ambiguous_trace_model");
   if (
     tracedPeers.some((p) => accountConflict(p.event)) ||
@@ -594,13 +632,21 @@ export function captureCodexModel(
   const session = trustedSession(event);
   const local =
     session && turn
-      ? native.filter(
+      ? [
+          // Rollout tailer rows are themselves native turn observations. This
+          // preserves a row written by an older reader during an upgrade while
+          // still refusing a bare model on a response or SSE row.
+          ...(event.metadata.usageSource === "rollout" && text(event.model)
+            ? [{ event, pairedId: null }]
+            : []),
+          ...native.filter(
           (p) =>
             (p.event.metadata.usageSource === "codex_local_turn" ||
               p.event.metadata.usageSource === "rollout") &&
             p.event.sessionId === session &&
             p.event.metadata.codexTurnId === turn,
-        )
+          ),
+        ]
       : [];
   if (local.some(conflicts)) return gap("conflicting_local_model_evidence");
   // Keep context-only records already read by the native tailer. Token rows
@@ -635,13 +681,16 @@ export function captureCodexModel(
           model: name.model,
           metadata: {
             ...event.metadata,
+            // This attribute is synthesized only from recordCodexTurnModel's
+            // native turn_context record, inside the exact install boundary.
+            model: name.model,
             ...(name.account ? { "user.account_id": name.account } : {}),
           },
         },
         pairedId: null,
       });
   }
-  const localModels = unique(local, (e) => text(e.model));
+  const localModels = unique(local, (e) => nativeModel(e) ?? text(e.model));
   if (localModels.length > 1) return gap("ambiguous_local_turn_model");
   if (
     local.some((p) => accountConflict(p.event)) ||
