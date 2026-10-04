@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { recordCodexTurnModel } from "../packages/collector-cli/src/codex-model-capture";
+import { pairCodexSpanRolloutEvent } from "../packages/collector-cli/src/codex-span-rollout-pairing";
 import { aiInteractionEventSchema, type AiInteractionEvent } from "../packages/shared/src/index";
 import { createProofCompletion } from "./lib/proof-completion";
 import { proofTempRoot, withLegacyReader } from "./lib/legacy-reader";
@@ -15,6 +16,7 @@ const EVIDENCE = [
   "legacy guess on target",
   "legacy guess on a peer with counters different from the response",
   "no evidence",
+  "span plus rollout twin",
 ] as const;
 const STATES = ["unsealed", "sealed and unacknowledged", "sealed with lease expired"] as const;
 const PATHS = ["first lease", "retry", "reopen", "upgrade", "dead-letter replay", "remote-terminal replay", "restamp"] as const;
@@ -26,7 +28,7 @@ const WORKSPACE = "11111111-1111-4111-8111-111111111111";
 const DEVICE = "matrix-device";
 const SESSION = "22222222-2222-4222-8222-222222222222";
 const AT = Date.now() - 900_000;
-const completion = createProofCompletion("codex-capture-invariants-matrix", 126);
+const completion = createProofCompletion("codex-capture-invariants-matrix", 147);
 const root = proofTempRoot("capture-invariants-matrix");
 
 type Lease = { leaseId: string; items: any[]; locallyDead: number; blockedBy?: string };
@@ -37,13 +39,14 @@ type Fixture = {
   now: { value: Date };
   lastAt: number;
   focusId: string;
+  focusIds?: string[];
   targetId: string;
   witness?: { id: string; leaseId: string; item: any; contract: string };
   initialId?: string;
   initialBytes?: string;
   lease?: Lease;
 };
-type Aggregate = { activeRows: number; billableRows: number; gapRows: number; deliveryIds: string[] };
+type Aggregate = { activeRows: number; billableRows: number; gapRows: number; countedRows: number; deliveryIds: string[] };
 type Cell = {
   evidence: Evidence; state: State; path: Path; result: "PASS";
   operations: Operation[]; refusals: string[]; aggregate: Aggregate;
@@ -72,6 +75,26 @@ function nativeLog(logId: string, traceId?: string, usage = false) {
     metadata: { otelEventName: "codex.sse_event", ...(traceId ? { traceId } : {}),
       "gen_ai.request.model": MODEL } });
 }
+function appendSpanRolloutTwin(buffer: any, spanId: string, traceId: string, turn: string, assertPair = true) {
+  recordCodexTurnModel(buffer.database, SESSION, turn, MODEL);
+  const span = event({ id: spanId, sessionId: undefined, eventType: "assistant_response",
+    inputTokens: 19, outputTokens: 2,
+    metadata: { otelEventName: "handle_responses", traceId,
+      otelSpanEndAt: new Date(AT + 1000).toISOString(), transport_path: "/v1/traces",
+      "gen_ai.usage.input_tokens": 19, "gen_ai.usage.output_tokens": 2 } });
+  const rolloutId = id();
+  const rollout = event({ id: rolloutId, eventType: "usage_rollout", model: MODEL,
+    metadata: { usageSource: "rollout", codexTurnId: turn } });
+  assert.equal(buffer.append(span), true, "span twin appended");
+  assert.equal(buffer.append(rollout), true, "rollout twin appended");
+  if (assertPair) {
+    const pair = buffer.database.prepare(
+      "select owner_id as ownerId, rollout_id as rolloutId from codex_span_rollout_pairs where span_id=?",
+    ).get(spanId) as { ownerId: string; rolloutId: string } | undefined;
+    assert.deepEqual(pair, { ownerId: rolloutId, rolloutId }, "unique span/rollout twin has one rollout owner");
+  }
+  return { spanId, rolloutId };
+}
 function targetFor(evidence: Evidence, targetId: string, traceId: string, turn: string) {
   if (evidence === "native local turn")
     return event({ id: targetId, eventType: "usage_rollout", model: MODEL,
@@ -98,17 +121,24 @@ function readFocus(f: Fixture) {
   return { id: row.id, bytes: row.sealed || row.base, event: decodeEnvelope(row).event };
 }
 function aggregateFocus(f: Fixture): Aggregate {
+  const focusIds = f.focusIds ?? [f.focusId];
+  const marks = focusIds.map(() => "?").join(",");
   const rows = f.buffer.database.prepare(
     "select delivery_id as id, base_envelope_json as base, sealed_envelope_json as sealed " +
-    "from upload_outbox where raw_id=? order by delivery_id",
-  ).all(f.focusId) as Array<{ id: string; base: string; sealed: string | null }>;
+    `from upload_outbox where raw_id in (${marks}) order by delivery_id`,
+  ).all(...focusIds) as Array<{ id: string; base: string; sealed: string | null }>;
   const events = rows.map(decodeEnvelope).map((value) => value.event);
   const billableRows = events.filter((e) => e.source === "codex" &&
     e.metadata.usageSource !== "capture_gap" && e.model === MODEL &&
     e.inputTokens === 19 && e.outputTokens === 2).length;
   const gapRows = events.filter((e) => e.metadata.usageSource === "capture_gap" &&
     e.model === undefined && e.inputTokens === undefined && e.outputTokens === undefined).length;
-  return { activeRows: rows.length, billableRows, gapRows, deliveryIds: rows.map((row) => row.id) };
+  const countedRows = events.filter((e) => e.source === "codex" &&
+    e.metadata.usageSource !== "capture_gap" && e.eventType !== "usage_live" &&
+    [e.inputTokens, e.outputTokens, e.cacheReadTokens, e.cacheCreationTokens, e.costUsd]
+      .some(value => value !== undefined)).length;
+  return { activeRows: rows.length, billableRows, gapRows, countedRows,
+    deliveryIds: rows.map((row) => row.id) };
 }
 function closeFixture(f: Fixture) { f.buffer.close(); }
 function advance(f: Fixture, at: number) {
@@ -138,6 +168,7 @@ async function buildFixture(evidence: Evidence, pathName: Path): Promise<Fixture
   const traceId = crypto.randomBytes(16).toString("hex");
   const turn = "matrix-" + targetId;
   let focusId: string = targetId;
+  let focusIds: string[] | undefined;
   let witness: Fixture["witness"];
   let witnessLease: Lease | undefined;
   let witnessEvent: AiInteractionEvent | undefined;
@@ -148,7 +179,11 @@ async function buildFixture(evidence: Evidence, pathName: Path): Promise<Fixture
     witnessEvent.sessionId = "33333333-3333-4333-8333-333333333333";
     buffer.append(witnessEvent);
   }
-  if (evidence === "exact pair") {
+  if (evidence === "span plus rollout twin") {
+    const twin = appendSpanRolloutTwin(buffer, targetId, traceId, turn);
+    focusId = twin.rolloutId;
+    focusIds = [twin.spanId, twin.rolloutId];
+  } else if (evidence === "exact pair") {
     const pair = nativeLog(id(), undefined, true);
     buffer.append(pair);
     buffer.database.prepare("update buffered_events set event_type='otel_log' where id=?").run(pair.id);
@@ -174,7 +209,7 @@ async function buildFixture(evidence: Evidence, pathName: Path): Promise<Fixture
       contract: "sha256:" + "a".repeat(64) };
   }
   return { file, buffer, now, lastAt: pathName === "remote-terminal replay" ? 60000 : 2000,
-    focusId, targetId, witness, lease: witnessLease };
+    focusId, focusIds, targetId, witness, lease: witnessLease };
 }
 function seedState(f: Fixture, state: State) {
   if (state === "unsealed") return;
@@ -200,7 +235,8 @@ function alteredPayload(f: Fixture) {
 function aggregateAssertions(f: Fixture, evidence: Evidence, frozenHold = false) {
   const output = readFocus(f);
   assert.ok(output, "focus delivery remains inspectable");
-  const valid = evidence === "exact pair" || evidence === "native trace" || evidence === "native local turn";
+  const valid = evidence === "exact pair" || evidence === "native trace" ||
+    evidence === "native local turn" || evidence === "span plus rollout twin";
   const billable = output.event.source === "codex" && output.event.metadata.usageSource !== "capture_gap" &&
     output.event.model === MODEL && output.event.inputTokens === 19 && output.event.outputTokens === 2;
   const gap = output.event.metadata.usageSource === "capture_gap" &&
@@ -213,8 +249,16 @@ function aggregateAssertions(f: Fixture, evidence: Evidence, frozenHold = false)
       evidence + ": frozen legacy row is refused while its old lease is live");
   }
   const aggregate = aggregateFocus(f);
-  assert.equal(aggregate.activeRows, 1, evidence + ": one active delivery");
-  if (!frozenHold) {
+  if (evidence === "span plus rollout twin") {
+    assert.ok(aggregate.activeRows >= 1 && aggregate.activeRows <= 2,
+      evidence + ": at most one frozen twin plus one owner");
+    assert.equal(aggregate.billableRows, 1, evidence + ": one billable owner");
+    assert.equal(aggregate.countedRows, 1, evidence + ": one counted observation");
+    assert.ok(aggregate.gapRows <= 1, evidence + ": duplicate span remains tokenless");
+  } else {
+    assert.equal(aggregate.activeRows, 1, evidence + ": one active delivery");
+  }
+  if (!frozenHold && evidence !== "span plus rollout twin") {
     assert.equal(aggregate.billableRows, valid ? 1 : 0, evidence + ": aggregate billable count");
     assert.equal(aggregate.gapRows, valid ? 0 : 1, evidence + ": aggregate gap count");
   }
@@ -235,6 +279,8 @@ async function runNormalCell(evidence: Evidence, state: State, pathName: Path): 
   const operations: Operation[] = [];
   const refusals: string[] = [];
   try {
+    if (evidence === "span plus rollout twin") operations.push({ name: "unique span/rollout pairing",
+      leaseItems: 0, detail: "exact marginal, native turn and bounded trace identity leave one rollout owner" });
     seedState(f, state);
     if (pathName === "first lease") {
       const at = state === "unsealed" ? 63000 : state === "sealed and unacknowledged" ? 64000 : 185000;
@@ -330,13 +376,18 @@ async function runUpgradeCell(evidence: Evidence, state: State): Promise<Cell> {
   const now = { value: new Date(AT + 2000) };
   const targetId = id(); const traceId = crypto.randomBytes(16).toString("hex");
   const turn = "matrix-" + targetId; let focusId: string = targetId;
+  let focusIds: string[] | undefined;
   let oldInitialId: string | undefined; let oldInitialBytes: string | undefined;
   const operations: Operation[] = [];
   const oldAt = (at: number) => { now.value = new Date(AT + at); };
   await withLegacyReader(async ({ Buffer: OldBuffer, reconciliation }) => {
     const old = new OldBuffer(file, opts(() => now.value));
     try {
-      if (evidence === "exact pair") {
+      if (evidence === "span plus rollout twin") {
+        const twin = appendSpanRolloutTwin(old, targetId, traceId, turn, false);
+        focusId = twin.rolloutId;
+        focusIds = [twin.spanId, twin.rolloutId];
+      } else if (evidence === "exact pair") {
         const pair = nativeLog(id(), undefined, true); old.append(pair);
         old.database.prepare("update buffered_events set event_type='otel_log' where id=?").run(pair.id);
         focusId = pair.id; old.append(targetFor(evidence, targetId, traceId, turn));
@@ -368,8 +419,15 @@ async function runUpgradeCell(evidence: Evidence, state: State): Promise<Cell> {
     } finally { old.close(); }
   });
   const f: Fixture = { file, buffer: new LocalEventBuffer(file, opts(() => now.value)),
-    now, lastAt: 2000, focusId, targetId };
+    now, lastAt: 2000, focusId, focusIds, targetId };
   try {
+    if (evidence === "span plus rollout twin") {
+      const paired = pairCodexSpanRolloutEvent(f.buffer.database, f.focusId);
+      assert.ok(paired && paired.ownerId === f.focusId,
+        "current reader pairs the historical span/rollout twin");
+      operations.push({ name: "current reader pairs historical span/rollout", leaseItems: 0,
+        detail: "upgrade keeps one rollout owner and leaves any frozen span bytes unchanged" });
+    }
     let result: Lease;
     let replacement = false;
     if (state === "unsealed") result = leaseAt(f, 63000, "present");
@@ -438,11 +496,14 @@ async function main() {
     }
     cells.push(cell); completion.check(evidence + " × " + state + " × " + pathName);
   }
-  assert.equal(cells.length, 126);
+  assert.equal(cells.length, 147);
   assert.ok(cells.every((cell) => cell.result === "PASS" && cell.i1 && cell.i2 && cell.i3 &&
-    cell.operations.length > 0 && cell.aggregate.activeRows === 1 &&
-    (cell.frozenHold || ((cell.aggregate.billableRows === 1) ===
-      (cell.evidence === "exact pair" || cell.evidence === "native trace" || cell.evidence === "native local turn")))));
+    cell.operations.length > 0 && cell.aggregate.activeRows >= 1 &&
+    (cell.evidence === "span plus rollout twin"
+      ? cell.aggregate.countedRows === 1 && cell.aggregate.billableRows === 1
+      : cell.aggregate.activeRows === 1 &&
+        (cell.frozenHold || ((cell.aggregate.billableRows === 1) ===
+          (cell.evidence === "exact pair" || cell.evidence === "native trace" || cell.evidence === "native local turn"))))));
   await lateContradictoryNativeEvidence();
   console.log(JSON.stringify({
     proof: "codex-capture-invariants-matrix",
@@ -451,8 +512,8 @@ async function main() {
       "I2 a frozen named delivery keeps its ID and bytes across retry, restart, upgrade and terminal replay",
       "I3 a capture gap is tokenless and never regains counters or a model on any replay path",
     ],
-    matrix: { evidence: EVIDENCE, states: STATES, paths: PATHS, cellsExecuted: cells.length, expected: 126 },
-    composedCases: ["replay then restamp", "late contradictory native evidence"], cells,
+    matrix: { evidence: EVIDENCE, states: STATES, paths: PATHS, cellsExecuted: cells.length, expected: 147 },
+    composedCases: ["replay then restamp", "late contradictory native evidence", "span plus rollout twin one-owner"], cells,
   }, null, 2));
   completion.complete();
 }
