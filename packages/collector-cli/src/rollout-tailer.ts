@@ -1654,9 +1654,6 @@ export class RolloutTailer {
     return { files: files.sort(), truncated, errors, discoveryEntries: entriesVisited };
   }
 
-  private sessionHasNonRolloutTokens(sessionId: string) {
-    return this.buffer.commitCodexSessionCoverage(sessionId);
-  }
 
   private initialParserState(file: string): RolloutParserState {
     return {
@@ -1795,7 +1792,7 @@ export class RolloutTailer {
         const delta = diff(totals, state.previous);
         state.previous = totals;
         state.counterUncertain = false;
-        if (delta.input === 0 && delta.output === 0) continue; // periodic no-op emission
+        if (delta.input === 0 && delta.output === 0 && delta.cachedInput === 0) continue; // periodic no-op emission
         pending.push({
           index: state.tokenCountIndex,
           observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
@@ -1820,15 +1817,6 @@ export class RolloutTailer {
       if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
         window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
         planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;
-    }
-
-    const sessionCovered = state.conversationId
-      ? this.sessionHasNonRolloutTokens(state.conversationId)
-      : false;
-    if (sessionCovered) {
-      if (pending.length > 0) result.sessionsSkippedOtlpCovered += 1;
-      if (activeRepoContext?.kind === "request") state.activeRepoContextId = undefined;
-      return state;
     }
 
     // Only contexts that can affect a token or the next slice consume bounded
