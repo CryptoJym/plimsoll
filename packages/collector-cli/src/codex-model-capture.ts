@@ -7,7 +7,7 @@ import {
   type AiInteractionEvent,
 } from "../../shared/src/index";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
-import { codexSpanRolloutDecision, isCodexResponseSpan } from "./codex-span-rollout-pairing";
+import { codexSpanRolloutDecision, hasDurableCaptureGap, isCodexResponseSpan } from "./codex-span-rollout-pairing";
 
 export const CODEX_MODEL_WAIT_MS = 60_000;
 const WINDOW_MS = 10 * 60_000;
@@ -166,6 +166,7 @@ type Peer = {
   event: AiInteractionEvent;
   pairedId: string | null;
   lineage?: CaptureLineage;
+  duplicate?: boolean;
 };
 function sameCounts(a: AiInteractionEvent, b: AiInteractionEvent) {
   return (
@@ -262,10 +263,11 @@ export function codexModelGap(
   db: Database.Database,
   event: AiInteractionEvent,
   reason: string,
+  recordDiagnostics = true,
 ): AiInteractionEvent {
   const epoch = text(event.metadata.installationEpochId),
     at = Date.parse(event.observedAt);
-  if (!db.readonly && epoch && Number.isFinite(at)) {
+  if (recordDiagnostics && !db.readonly && epoch && Number.isFinite(at)) {
     db.exec(`create table if not exists codex_model_capture_gaps (
       installation_epoch_id text not null, observed_day integer not null,
       from_ms integer not null, to_ms integer not null,
@@ -353,13 +355,6 @@ function ensureCaptureDecisionTable(db: Database.Database) {
   }
 }
 
-function captureDecision(db: Database.Database, lineage: CaptureLineage) {
-  if (!db.prepare("select 1 from sqlite_master where type='table' and name='codex_capture_decisions'").get()) return undefined;
-  return db.prepare("select reason from codex_capture_decisions where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ? limit 1").get(
-    lineage.rawRowid, lineage.rawId, lineage.rawCreatedAt, lineage.rawGeneration,
-  ) as { reason: string } | undefined;
-}
-
 function captureLineage(db: Database.Database, rawId: string): CaptureLineage | undefined {
   try {
     return db.prepare(`select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
@@ -369,7 +364,38 @@ function captureLineage(db: Database.Database, rawId: string): CaptureLineage | 
 }
 
 export function hasCaptureGapDecision(db: Database.Database, lineage: CaptureLineage): boolean {
-  return Boolean(captureDecision(db, lineage));
+  return hasDurableCaptureGap(db, { rowid: lineage.rawRowid, id: lineage.rawId,
+    created: lineage.rawCreatedAt, generation: lineage.rawGeneration });
+}
+
+/** Re-derive existing local facts when native trace facts or a gap change
+ * authority. Raw diagnostics and all frozen delivery bytes stay untouched. */
+export function queueCodexAuthorityProjectionRepairs(db: Database.Database, rawId: string) {
+  if (db.readonly || !db.prepare(`select 1 from sqlite_master
+    where type='table' and name='dashboard_projection_repairs'`).get()) return;
+  const row = db.prepare(`select rowid as rawRowid,source,session_id as session,observed_at as at,
+    workspace_id as workspace,device_id as device,installation_epoch_id as epoch,
+    case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end as trace
+    from buffered_events where id=?`).get(rawId) as
+    { rawRowid: number; source: string; session: string | null; at: string; workspace: string; device: string; epoch: string; trace: string | null } | undefined;
+  if (!row || row.source !== "codex") return;
+  const peers = row.trace ? db.prepare(`select rowid,id,session_id as session from buffered_events
+    where source='codex' and workspace_id is ? and device_id is ? and installation_epoch_id is ?
+      and case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end=?
+    limit ${MAX_EVIDENCE_ROWS + 1}`).all(row.workspace,row.device,row.epoch,row.trace) as
+      Array<{ rowid: number; id: string; session: string | null }> : [];
+  const queue = db.prepare(`insert or ignore into dashboard_projection_repairs (raw_rowid,reason,queued_at)
+    values (?,'codex_usage_authority_changed',?)`);
+  const at = new Date().toISOString();
+  queue.run(row.rawRowid,at);
+  for (const peer of peers) queue.run(peer.rowid,at);
+  const sessions = new Set([row.session,...peers.map(peer=>peer.session)].filter(Boolean));
+  for (const session of sessions) db.prepare(`insert or ignore into dashboard_projection_repairs
+    (raw_rowid,reason,queued_at) select e.rowid,'codex_usage_authority_changed',? from buffered_events e
+      join dashboard_event_facts f on f.raw_rowid=e.rowid
+      where e.source='codex' and e.session_id=? and e.event_type in ('usage_rollout','usage_transcript')`)
+      .run(at,session);
+  db.prepare(`update dashboard_projection_control set dirty=1,parity_ready=0 where singleton=1`).run();
 }
 
 export function rememberCaptureGap(
@@ -388,6 +414,7 @@ export function rememberCaptureGap(
     "gap",
     reason, at.toISOString(),
   );
+  queueCodexAuthorityProjectionRepairs(db, rawId);
   return true;
 }
 
@@ -401,6 +428,7 @@ export function captureCodexModel(
   event: AiInteractionEvent,
   rawId = event.id,
   persistDecision = false,
+  recordDiagnostics = true,
 ): AiInteractionEvent {
   if (!codexHasUsage(event)) return event;
   let row:
@@ -436,7 +464,7 @@ export function captureCodexModel(
       metadata: { ...event.metadata, installationEpochId: row.epoch },
       };
   const gap = (reason: string) => {
-    const result = codexModelGap(db, event, reason);
+    const result = codexModelGap(db, event, reason, recordDiagnostics);
     if (persistDecision && row && !db.readonly) {
       ensureCaptureDecisionTable(db);
       db.prepare(`insert or replace into codex_capture_decisions
@@ -446,6 +474,7 @@ export function captureCodexModel(
         "gap",
         reason, new Date().toISOString(),
       );
+      queueCodexAuthorityProjectionRepairs(db, rawId);
     }
     return result;
   };
@@ -502,16 +531,17 @@ export function captureCodexModel(
     end - at > WINDOW_MS
   )
     return gap("evidence_window_invalid");
-  const eligible = terminalPrivacyEligibilitySql(db, "e");
+  const eligible = terminalPrivacyEligibilitySql(db, "e", { includeUsageDuplicates: true });
   const raw = db
     .prepare(
       `select e.rowid as evidenceRowid, e.id as evidenceId,
        e.created_at as evidenceCreatedAt, e.privacy_generation as evidenceGeneration,
-       e.payload_json as payload, e.usage_paired_event_id as pairedId
+       e.payload_json as payload, e.usage_paired_event_id as pairedId,
+       e.usage_duplicate_reason as duplicateReason
     from buffered_events e indexed by idx_events_observed
     where e.source='codex' and e.observed_at>=? and e.observed_at<=? and e.id<>?
       and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
-      and ${eligible} and e.usage_duplicate_reason is null
+      and ${eligible}
     order by e.observed_at, e.id limit ${MAX_EVIDENCE_ROWS + 1}`,
     )
     .all(
@@ -528,14 +558,16 @@ export function captureCodexModel(
       evidenceGeneration: string | null;
       payload: string;
       pairedId: string | null;
+      duplicateReason: string | null;
     }>;
   if (raw.length > MAX_EVIDENCE_ROWS) return gap("evidence_window_overflow");
-  const peers: Peer[] = raw.flatMap((r) => {
+  const decodePeers = (rows: typeof raw): Peer[] => rows.flatMap((r) => {
     try {
       return [
         {
           event: JSON.parse(r.payload) as AiInteractionEvent,
           pairedId: r.pairedId,
+          duplicate: r.duplicateReason !== null,
           lineage: {
             rawRowid: r.evidenceRowid,
             rawId: r.evidenceId,
@@ -548,17 +580,14 @@ export function captureCodexModel(
       return [];
     }
   });
-  // A previously decided capture gap is accounting state, not a native
-  // producer peer. Keeping it out of the trace set lets a later genuine SSE
-  // evidence row be captured without ever rereading the gap's counters.
-  // A peer with a durable gap decision is not allowed to supply a model, but
-  // its native attributes remain evidence of ambiguity. Keep the two sets
-  // separate: financial eligibility is not permission to erase contradictory
-  // producer facts from a later trace capture.
-  const peerEvidence = peers.filter((p) => !p.event.metadata.modelCaptureSource);
-  const native = peerEvidence.filter((p) =>
-    !isCaptureGap(p.event) &&
-    !(p.lineage && hasCaptureGapDecision(db, p.lineage)));
+  // Native facts survive a financial gap, ACK and replay. Promotion is a
+  // separate decision: derived model guesses and durable gaps cannot supply
+  // a model, but their original attributes still establish contradictions.
+  const peers = decodePeers(raw);
+  const peerEvidence = peers;
+  const mayPromote = (p: Peer) => !p.duplicate && !p.event.metadata.modelCaptureSource && !isCaptureGap(p.event) &&
+    !(p.lineage && hasCaptureGapDecision(db, p.lineage));
+  const native = peerEvidence.filter(mayPromote);
   const conflicts = (p: Peer) =>
     p.event.metadata.modelEvidenceConflict === true ||
     nativeModels(p.event).size > 1 ||
@@ -596,21 +625,26 @@ export function captureCodexModel(
   )
     return pairedObservation(capture(event, pair, "paired_sse_event"));
   const traceId = text(event.metadata.traceId);
-  const tracePeers = traceId
-    ? peerEvidence.filter((p) => p.event.metadata.traceId === traceId)
-    : [];
+  // A native trace is an identity boundary, not a nearest-time window.
+  // Inspect its complete admitted fact set, bounded by overflow rather than
+  // silently dropping a more distant contradictory model or account.
+  const traceRows = traceId ? db.prepare(`select e.rowid as evidenceRowid,e.id as evidenceId,
+    e.created_at as evidenceCreatedAt,e.privacy_generation as evidenceGeneration,
+    e.payload_json as payload,e.usage_paired_event_id as pairedId,e.usage_duplicate_reason as duplicateReason
+    from buffered_events e where e.source='codex' and e.id<>?
+      and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
+      and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?
+      and ${eligible} limit ${MAX_EVIDENCE_ROWS + 1}`).all(rawId,row.workspace,row.device,row.epoch,traceId) as typeof raw : [];
+  if (traceRows.length > MAX_EVIDENCE_ROWS) return gap("trace_evidence_overflow");
+  const tracePeers = decodePeers(traceRows);
   if (tracePeers.some(conflicts)) return gap("conflicting_trace_model_evidence");
-  const tracedPeers = traceId
-    ? native.filter((p) => p.event.metadata.traceId === traceId)
-    : [];
-  const traced = traceId
-    ? logs.filter((p) => p.event.metadata.traceId === traceId)
-    : [];
+  const tracedPeers = tracePeers.filter(mayPromote);
+  const traced = tracedPeers.filter(p=>p.event.metadata.otelEventName === "codex.sse_event");
   const traceEvidence =
     traceId && (directTraceModelEvidence || nativeSseEvent)
       ? [{ event, pairedId: null }, ...traced]
       : traced;
-  const nativeTraceModels = unique(tracedPeers, (e) => nativeModel(e));
+  const nativeTraceModels = unique(tracePeers, (e) => nativeModel(e));
   if (nativeTraceModels.length > 1)
     return gap("ambiguous_trace_model");
   if (
@@ -627,10 +661,9 @@ export function captureCodexModel(
   const traceModels = unique(traceEvidence, (e) => nativeModel(e));
   if (traceModels.length > 1) return gap("ambiguous_trace_model");
   if (
-    tracedPeers.some((p) => accountConflict(p.event)) ||
-    tracedPeers.some((p) => !compatible(event, p.event)) ||
-    tracedPeers.some((p) => tracedPeers.some((other) => !compatible(p.event, other.event))) ||
-    unique(tracedPeers, (e) => trustedSession(e)).length > 1
+    tracePeers.some((p) => !compatible(event, p.event)) ||
+    tracePeers.some((p) => tracePeers.some((other) => !compatible(p.event, other.event))) ||
+    unique(tracePeers, (e) => trustedSession(e)).length > 1
   )
     return gap("ambiguous_trace_identity");
   if (
@@ -665,6 +698,17 @@ export function captureCodexModel(
           ),
         ]
       : [];
+  const localFacts = session && turn ? peerEvidence.filter((p) =>
+    (p.event.metadata.usageSource === "codex_local_turn" || p.event.metadata.usageSource === "rollout") &&
+    trustedSession(p.event) === session &&
+    (p.event.metadata.codexTurnId ?? p.event.metadata["turn.id"] ?? p.event.metadata.turn_id) === turn) : [];
+  const localFactModels = unique(localFacts, (e) => nativeModel(e) ??
+    (e.metadata.usageSource === "rollout" ? text(e.model) : undefined));
+  if (localFacts.some(conflicts) || localFactModels.length > 1)
+    return gap("conflicting_local_model_evidence");
+  if (localFacts.some((p) => !compatible(event, p.event)) ||
+      localFacts.some((p) => localFacts.some((other) => !compatible(p.event, other.event))))
+    return gap("ambiguous_local_turn_identity");
   if (local.some(conflicts)) return gap("conflicting_local_model_evidence");
   // Keep context-only records already read by the native tailer. Token rows
   // may be suppressed by the existing OTLP deduper without losing this evidence.
@@ -708,7 +752,7 @@ export function captureCodexModel(
       });
   }
   const localModels = unique(local, (e) => nativeModel(e) ?? text(e.model));
-  if (localModels.length > 1) return gap("ambiguous_local_turn_model");
+  if (new Set([...localModels,...localFactModels]).size > 1) return gap("ambiguous_local_turn_model");
   if (
     local.some((p) => accountConflict(p.event)) ||
     local.some((p) => local.some((other) => !compatible(p.event, other.event)))

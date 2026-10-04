@@ -4,6 +4,7 @@ import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
 import { CODEX_SESSION_AUTHORITY_SQL } from "./codex-span-rollout-pairing";
+import { hasSessionUsageAuthority, rowCanOwnSessionUsage, rowHasAdmittedUsage } from "./usage-authority";
 import { ensureUuidEventId } from "./upload-history";
 import { readLiveUsageEventObservation } from "../../shared/src/live-usage-metadata";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
@@ -275,17 +276,6 @@ const USAGE_TAILER_EVENT_TYPES = ["usage_rollout", "usage_transcript"] as const;
 function isUsageTailerEventType(eventType: string) {
   return (USAGE_TAILER_EVENT_TYPES as readonly string[]).includes(eventType);
 }
-
-/** Live-class sibling carrying any usage field for the same (source, session). */
-const LIVE_USAGE_SIBLING_SQL = `
-  select 1 from buffered_events
-   where source = ? and session_id = ?
-     and ${CODEX_SESSION_AUTHORITY_SQL}
-     and event_type not in ('usage_rollout','usage_transcript')
-     and (input_tokens is not null or output_tokens is not null
-       or cache_read_tokens is not null or cache_creation_tokens is not null
-       or cost_usd is not null)
-   limit 1`;
 
 /** A raw row that is live-class and carries usage (the predicate above, unqualified). */
 const LIVE_USAGE_ROW_SQL = `event_type not in ('usage_rollout','usage_transcript')
@@ -562,7 +552,7 @@ function carriesUsage(row: Pick<RawProjectionRow,
  */
 function backfillUsageSuppressed(db: Database.Database, row: RawProjectionRow) {
   return isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
-    Boolean(db.prepare(LIVE_USAGE_SIBLING_SQL).get(row.source, row.sessionId));
+    hasSessionUsageAuthority(db, row.source, row.sessionId, "live") === true;
 }
 
 function safeClassification(value:string|null|undefined,allowed:Set<string>,fallback:string){
@@ -586,7 +576,7 @@ function day(value: string) {
   return value.slice(0, 10);
 }
 
-function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFact {
+function factFromRaw(row: RawProjectionRow, suppressUsage = false, captureGap = false): ProjectionFact {
   let liveUsageJson: string | null = null;
   let liveUsageFactJson: string | null = null;
   let unresolvedInterval = row.eventType === "usage_live";
@@ -616,7 +606,7 @@ function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFa
     observedAt: row.observedAt,
     sessionHash: safeHash(row.sessionId),
     actionClass: safeClassification(row.actionClass,SAFE_ACTIONS,"other"),
-    model: row.eventType === "usage_live" ? null : safeModel(row.model),
+    model: captureGap || row.eventType === "usage_live" ? null : safeModel(row.model),
     inputTokens: suppressUsage ? null : row.inputTokens,
     outputTokens: suppressUsage ? null : row.outputTokens,
     cacheReadTokens: suppressUsage ? null : row.cacheReadTokens,
@@ -1243,9 +1233,16 @@ export class DashboardProjectionStore {
     // first scheduled maintenance slice can inspect the historical facts.
     // The scan record and parity refusal commit together, including on a
     // restart after an interrupted open.
+    // Extend the existing bounded fact scan to the authority rule once. This
+    // non-dashboard column leaves the public projection shape unchanged.
+    if (!(this.db.prepare("pragma table_info(codex_duplicate_fact_scan)").all() as Array<{name:string}>)
+        .some(column=>column.name==="authority_version"))
+      this.db.exec("alter table codex_duplicate_fact_scan add column authority_version integer not null default 0");
     this.db.transaction(() => {
       this.db.prepare(`insert or ignore into codex_duplicate_fact_scan
         (singleton, complete) values (1, ?)`).run(newLedger ? 1 : 0);
+      this.db.prepare(`update codex_duplicate_fact_scan set cursor_raw_rowid=0,
+        complete=?,authority_version=1 where singleton=1 and authority_version=0`).run(newLedger ? 1 : 0);
       // Import the still-queued prefix of a round-6 scan once on upgrade.
       if (!hadScanRepairReceipts) this.db.prepare(`insert or ignore into
         codex_duplicate_fact_scan_repairs (raw_rowid)
@@ -1919,7 +1916,8 @@ export class DashboardProjectionStore {
     // Decided before any write, so a deferral leaves nothing to undo.
     const liveUsageBatchRowids = new Map<string, number[]>();
     for (const row of rows) {
-      if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
+      if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
+          (row.source !== "codex" || rowCanOwnSessionUsage(this.db, row.id))) {
         const key = `${row.source}\u0000${row.sessionId}`;
         const rowids = liveUsageBatchRowids.get(key);
         if (rowids) rowids.push(row.rawRowid);
@@ -1963,7 +1961,8 @@ export class DashboardProjectionStore {
         // writer from winning after this tailer row is admitted.
         const usageSuppressed = historyImportNoLiveSibling && isUsageTailerEventType(row.eventType)
           ? false : backfillUsageSuppressed(this.db, row);
-        this.applyFact(factFromRaw(row, usageSuppressed), now);
+        const captureGap = row.source === "codex" && carriesUsage(row) && !rowHasAdmittedUsage(this.db, row.id);
+        this.applyFact(factFromRaw(row, usageSuppressed || captureGap, captureGap), now);
       }
     }
     if (compactRows.length) this.addCompactRows(compactRows);
@@ -1993,33 +1992,7 @@ export class DashboardProjectionStore {
     batchRowids: number[],
     probeRows?: number,
   ): boolean | "undecided" {
-    const batch = JSON.stringify(batchRowids);
-    if (probeRows === undefined) {
-      return Boolean(this.captureStatement(
-        `select 1 from buffered_events
-          where source = ? and session_id = ? and ${LIVE_USAGE_ROW_SQL}
-            and rowid not in (select value from json_each(?))
-          order by observed_at desc limit 1`,
-      ).get(source, sessionId, batch));
-    }
-    const found = this.captureStatement(
-      `select 1 from (
-         select rowid as raw_rowid, event_type, input_tokens, output_tokens,
-           cache_read_tokens, cache_creation_tokens, cost_usd
-         from buffered_events where source = ? and session_id = ?
-         order by observed_at desc limit ?)
-       where ${LIVE_USAGE_ROW_SQL}
-         and raw_rowid not in (select value from json_each(?))
-       limit 1`,
-    ).get(source, sessionId, probeRows, batch);
-    if (found) return true;
-    // The same newest rows the probe just read, plus one: is there anything older?
-    const { n } = this.captureStatement(
-      `select count(*) as n from (
-         select 1 from buffered_events where source = ? and session_id = ?
-         order by observed_at desc limit ?)`,
-    ).get(source, sessionId, probeRows + 1) as { n: number };
-    return n > probeRows ? "undecided" : false;
+    return hasSessionUsageAuthority(this.db, source, sessionId, "live", batchRowids, probeRows);
   }
 
   private compactWindowCutoffs() {
@@ -3240,12 +3213,12 @@ export class DashboardProjectionStore {
       // control-row setup spent the clock, visit one row and yield afterward.
       if (!duplicateScan.complete) {
         const candidates = this.db.prepare(`select f.raw_rowid as rawRowid,
-            b.usage_duplicate_reason as duplicateReason
+            b.usage_duplicate_reason as duplicateReason,b.source
           from dashboard_event_facts f
           left join buffered_events b on b.rowid=f.raw_rowid
           where f.raw_rowid > ? order by f.raw_rowid limit ?`
         ).all(duplicateScan.cursor, DUPLICATE_FACT_SCAN_ROWS) as
-          Array<{ rawRowid: number; duplicateReason: string | null }>;
+          Array<{ rawRowid: number; duplicateReason: string | null; source: string | null }>;
         const queue = this.db.prepare(`insert or ignore into dashboard_projection_repairs
           (raw_rowid, reason, queued_at) values (?, 'legacy_usage_duplicate', ?)`);
         const oweRepair = this.db.prepare(`insert or ignore into
@@ -3254,7 +3227,7 @@ export class DashboardProjectionStore {
           // The cursor advances over exactly the prefix admitted in this
           // transaction. A later tick resumes the rest of the fetched page.
           if (duplicateFactScanRowsVisited > 0 && !hasActiveTime()) break;
-          if (candidate.duplicateReason !== null) {
+          if (candidate.duplicateReason !== null || candidate.source === "codex") {
             queue.run(candidate.rawRowid, now.toISOString());
             oweRepair.run(candidate.rawRowid);
           }
@@ -3571,7 +3544,10 @@ export class DashboardProjectionStore {
         "dashboard_parity_window",
         windows,
         rows.filter((row) => Boolean(row.privacyEligible))
-          .map((row) => factFromRaw(row, backfillUsageSuppressed(this.db, row))),
+          .map((row) => {
+            const captureGap = row.source === "codex" && carriesUsage(row) && !rowHasAdmittedUsage(this.db, row.id);
+            return factFromRaw(row, captureGap || backfillUsageSuppressed(this.db, row), captureGap);
+          }),
       );
       for(const _row of rows)onWorkRowForProof?.("parity");
       rowsVisited+=rows.length;
@@ -4195,14 +4171,14 @@ export class DashboardProjectionStore {
    * (`usage_rollout`/`usage_transcript`) inside the reporting window whose
    * live class (any other event type) also recorded usage. The observed_at
    * window binds ONLY the tailer/backfill side (it is the reporting window);
-   * the live side is unbounded, exactly matching LIVE_USAGE_SIBLING_SQL and
+   * the live side is unbounded, exactly matching hasSessionUsageAuthority and
    * backfillUsageSuppressed, which carry no time bound. Derived from raw
    * evidence with the same class definition as the ingest gate, so the count
    * names what it says: backfill sessions actually suppressed (issue #193).
    */
   private usageAuthoritySummary(cutoff: string) {
     const dualSessions = this.db.prepare(
-      `select count(*) as n from (
+      `select source,session_id as sessionId from (
          select source, session_id from buffered_events indexed by idx_events_usage_authority_tailer
           where observed_at >= ? and session_id is not null
             and event_type in ('usage_rollout','usage_transcript')
@@ -4218,8 +4194,9 @@ export class DashboardProjectionStore {
               or cache_read_tokens is not null or cache_creation_tokens is not null
               or cost_usd is not null)
        )`,
-    ).get(cutoff) as { n: number };
-    return { rule: USAGE_AUTHORITY_RULE, backfillSessionsSuppressed: dualSessions.n };
+    ).all(cutoff) as Array<{ source: string; sessionId: string }>;
+    return { rule: USAGE_AUTHORITY_RULE, backfillSessionsSuppressed: dualSessions.filter(row =>
+      hasSessionUsageAuthority(this.db, row.source, row.sessionId, "live") === true).length };
   }
 
   private lifetimeStats() {

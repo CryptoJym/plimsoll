@@ -13,8 +13,9 @@ export function isCodexResponseSpan(event: AiInteractionEvent) {
 }
 
 // A response span is one request, not evidence that live capture covers every
-// request in the conversation. Keep the existing authority rule for SSE logs
-// and every other source. This predicate also covers old span-only claims.
+// request in the conversation. This is only the indexable candidate filter;
+// usage-authority.ts verifies the financial capture decision before granting
+// session coverage to a Codex row. Other sources keep their existing rule.
 export const CODEX_SESSION_AUTHORITY_SQL = `not (source='codex' and
   coalesce(case when json_valid(payload_json) then
     json_extract(payload_json,'$.metadata.otelEventName') end,'')='handle_responses')`;
@@ -151,7 +152,7 @@ function isCaptureGapEnvelope(payload: string | null | undefined) {
  * history, not a new pairing candidate. The raw row deliberately retains its
  * counters for diagnostics, while gap envelopes and replay lineage retain the
  * frozen tokenless result. */
-function hasDurableCaptureGap(db: Database.Database, row: Row) {
+export function hasDurableCaptureGap(db: Database.Database, row: Pick<Row, "rowid" | "id" | "created" | "generation">) {
   if (table(db, "codex_capture_decisions") && db.prepare(`select 1
       from codex_capture_decisions where raw_rowid=? and raw_id=? and raw_created_at=?
         and raw_generation is ? limit 1`).get(row.rowid, row.id, row.created, row.generation)) return true;
@@ -202,20 +203,17 @@ function nearby(db: Database.Database, row: Row) {
 function nativeTraceCompatible(db: Database.Database, span: Row, rollout: Row) {
   const traceId = span.event.metadata.traceId;
   if (typeof traceId !== "string") return true;
-  const eligible = terminalPrivacyEligibilitySql(db, "e");
-  const end = Date.parse(String(span.event.metadata.otelSpanEndAt ?? span.at));
-  const rows = db.prepare(`select e.payload_json as payload from buffered_events e indexed by idx_events_observed
-    where e.source='codex' and e.observed_at>=? and e.observed_at<=? and ${eligible}
+  const eligible = terminalPrivacyEligibilitySql(db, "e", { includeUsageDuplicates: true });
+  const rows = db.prepare(`select e.payload_json as payload from buffered_events e
+    where e.source='codex' and ${eligible}
       and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
       and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?
-      and e.usage_duplicate_reason is null limit ${MAX_ROWS + 1}`)
-    .all(new Date(Date.parse(span.at) - MAX_SPAN_MS).toISOString(), new Date(end + MAX_SPAN_MS).toISOString(),
-      span.workspace, span.device, span.epoch, traceId) as Array<{ payload: string }>;
+      limit ${MAX_ROWS + 1}`)
+    .all(span.workspace, span.device, span.epoch, traceId) as Array<{ payload: string }>;
   if (rows.length > MAX_ROWS) return false;
   const models = new Set<string>();
   for (const row of rows) {
     const peer = JSON.parse(row.payload) as AiInteractionEvent;
-    if (peer.metadata.modelCaptureSource) continue;
     // Financially ineligible gap peers can still report contradictory native
     // attributes. They must not hide ambiguity from a later pair.
     if (nativeConflict(peer) ||

@@ -28,7 +28,9 @@ import {
   ensureCodexUsagePairingSchema,
   pairCodexUsageEvent,
 } from "./codex-usage-pairing";
-import { CODEX_SESSION_AUTHORITY_SQL, isCodexResponseSpan, pairCodexSpanRolloutEvent } from "./codex-span-rollout-pairing";
+import { isCodexResponseSpan, pairCodexSpanRolloutEvent } from "./codex-span-rollout-pairing";
+import { hasSessionUsageAuthority, rowCanOwnSessionUsage } from "./usage-authority";
+import { queueCodexAuthorityProjectionRepairs } from "./codex-model-capture";
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
@@ -819,6 +821,10 @@ export class LocalEventBuffer {
         on buffered_events (workspace_id, uploaded_at, created_at);
       create index if not exists idx_events_session on buffered_events (session_id, observed_at);
       create index if not exists idx_events_observed on buffered_events (observed_at);
+      create index if not exists idx_codex_capture_trace_facts on buffered_events
+        (workspace_id,device_id,installation_epoch_id,
+         case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end)
+        where source='codex';
       create index if not exists idx_events_retention on buffered_events (created_at, id);
       create index if not exists idx_events_repo on buffered_events (repo_hash, branch_hash);
       create index if not exists idx_raw_retention_expired
@@ -2716,6 +2722,12 @@ export class LocalEventBuffer {
         privacyGeneration,
       });
     if (result.changes > 0) {
+      // Codex needs the admitted raw row to evaluate native provenance. An
+      // invalid live row remains diagnostic evidence without taking authority.
+      if (event.source === "codex" && !this.claimSessionUsageAuthority(event, createdAt, true)) {
+        this.db.prepare("delete from buffered_events where id=?").run(event.id);
+        return { appended: false, repoContextRequest: null };
+      }
       this.budgetAttemptedRows += 1;
       const usagePair = pairCodexUsageEvent(this.db, event.id);
       const rolloutPair = event.source === "codex" ? pairCodexSpanRolloutEvent(this.db, event.id) : null;
@@ -2772,6 +2784,8 @@ export class LocalEventBuffer {
       if (project) this.projection.tryApplyRawRow(Number(result.lastInsertRowid), new Date(),
         historyImportNoLiveSibling && this.historyImportEpoch !== null &&
         (event.eventType === "usage_rollout" || event.eventType === "usage_transcript"));
+      if (event.source === "codex" && event.metadata.traceId)
+        queueCodexAuthorityProjectionRepairs(this.db, event.id);
       // Otherwise the insert trigger's durable repair receipt remains queued.
       // Capture admission never depends on finishing all derived aggregates.
       // Runtime learning facts (#156) promote from the same durable moment.
@@ -2826,94 +2840,44 @@ export class LocalEventBuffer {
    * rollout could commit early deltas, then allow a later OTLP event to make
    * the tailer skip the remainder of that same cumulative stream.
    */
-  private claimSessionUsageAuthority(event: AiInteractionEvent, claimedAt: string) {
-    if (
-      !event.sessionId ||
-      isCodexResponseSpan(event) ||
-      (event.inputTokens === undefined && event.outputTokens === undefined) ||
-      (event.source !== "codex" && event.source !== "claude_code")
-    ) {
-      return true;
-    }
-    const tailerEvent =
-      event.eventType === "usage_rollout" || event.eventType === "usage_transcript";
-    const desired = tailerEvent ? "tailer" : "live";
-    const existing = this.db
-      .prepare(
-        `select authority from session_usage_authority
-         where source = ? and session_id = ?`,
-      )
-      .get(event.source, event.sessionId) as { authority: "tailer" | "live" } | undefined;
-    if (existing) {
-      if (existing.authority !== "live" || event.source !== "codex" ||
-          this.db.prepare(`select 1 from buffered_events where source=? and session_id=?
-            and ${CODEX_SESSION_AUTHORITY_SQL} and event_type not in ('usage_rollout','usage_transcript')
-            and (input_tokens is not null or output_tokens is not null) limit 1`).get(event.source, event.sessionId)) {
-        return existing.authority === desired;
-      }
-      // Upgrade a claim made solely by response spans. SSE-owned sessions
-      // retain their existing authority; response pairs are decided below.
-      this.db.prepare(`delete from session_usage_authority where source=? and session_id=? and authority='live'`)
-        .run(event.source, event.sessionId);
-    }
-
-    // Upgrade old ledgers deterministically before admitting new work. Live
-    // capture wins an already-mixed legacy session; otherwise the existing
-    // source that actually has token rows becomes authoritative.
-    const legacy = this.db
-      .prepare(
-        `select
-           max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
-           max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
-         from buffered_events
-         where source = ? and session_id = ?
-           and ${CODEX_SESSION_AUTHORITY_SQL}
-           and (input_tokens is not null or output_tokens is not null)`,
-      )
-      .get(event.source, event.sessionId) as { tailer: number | null; live: number | null };
-    const authority = legacy.live ? "live" : legacy.tailer ? "tailer" : desired;
-    this.db
-      .prepare(
-        `insert into session_usage_authority (source, session_id, authority, claimed_at)
-         values (?, ?, ?, ?)
-         on conflict(source, session_id) do nothing`,
-      )
-      .run(event.source, event.sessionId, authority, claimedAt);
-    // Another connection can win between the compatibility lookup and the
-    // insert. Always re-read the durable winner; returning our proposed value
-    // would allow both the live receiver and maintenance tailer to append.
-    const winner = this.db
-      .prepare(
-        `select authority from session_usage_authority
-         where source = ? and session_id = ?`,
-      )
-      .get(event.source, event.sessionId) as { authority: "tailer" | "live" } | undefined;
+  private claimSessionUsageAuthority(event: AiInteractionEvent, claimedAt: string, committed = false) {
+    if (!event.sessionId || isCodexResponseSpan(event) ||
+        (event.inputTokens === undefined && event.outputTokens === undefined) ||
+        (event.source !== "codex" && event.source !== "claude_code")) return true;
+    if (event.source === "codex" && (!committed || !rowCanOwnSessionUsage(this.db, event.id))) return true;
+    const desired = event.eventType === "usage_rollout" || event.eventType === "usage_transcript" ? "tailer" : "live";
+    const inserted = committed ? this.db.prepare("select rowid from buffered_events where id=?")
+      .get(event.id) as { rowid: number } | undefined : undefined;
+    const existing = this.sessionUsageAuthority(event.source, event.sessionId, inserted ? [inserted.rowid] : []);
+    if (existing) return existing === desired;
+    // A historical live claim with no admissible usage witness is stale. It
+    // cannot make diagnostic counters suppress a new known native turn.
+    if (event.source === "codex") this.db.prepare(`delete from session_usage_authority
+      where source=? and session_id=?`).run(event.source, event.sessionId);
+    this.db.prepare(`insert into session_usage_authority (source,session_id,authority,claimed_at)
+      values (?,?,?,?) on conflict(source,session_id) do nothing`)
+      .run(event.source, event.sessionId, desired, claimedAt);
+    const winner = this.db.prepare(`select authority from session_usage_authority
+      where source=? and session_id=?`).get(event.source, event.sessionId) as { authority: string } | undefined;
     return winner?.authority === desired;
   }
 
-  sessionUsageAuthority(source: "codex" | "claude_code" | "grok", sessionId: string) {
-    const row = this.db
-      .prepare(
-        `select authority from session_usage_authority
-         where source = ? and session_id = ?`,
-      )
-      .get(source, sessionId) as { authority: "tailer" | "live" } | undefined;
-    if (row && (row.authority !== "live" || source !== "codex" ||
-        this.db.prepare(`select 1 from buffered_events where source=? and session_id=?
-          and ${CODEX_SESSION_AUTHORITY_SQL} and event_type not in ('usage_rollout','usage_transcript')
-          and (input_tokens is not null or output_tokens is not null) limit 1`).get(source, sessionId))) return row.authority;
-    const legacy = this.db
-      .prepare(
-        `select
-           max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
-           max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
-         from buffered_events
-         where source = ? and session_id = ?
-           and ${CODEX_SESSION_AUTHORITY_SQL}
-           and (input_tokens is not null or output_tokens is not null)`,
-      )
-      .get(source, sessionId) as { tailer: number | null; live: number | null };
-    return legacy.live ? "live" : legacy.tailer ? "tailer" : null;
+  sessionUsageAuthority(source: "codex" | "claude_code" | "grok", sessionId: string, excludeRowids: number[] = []) {
+    const row = this.db.prepare(`select authority from session_usage_authority
+      where source=? and session_id=?`).get(source, sessionId) as { authority: "tailer" | "live" } | undefined;
+    if (source !== "codex") {
+      if (row) return row.authority;
+      const legacy = this.db.prepare(`select
+        max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
+        max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
+        from buffered_events where source=? and session_id=?
+          and (input_tokens is not null or output_tokens is not null)`)
+        .get(source,sessionId) as {tailer:number|null;live:number|null};
+      return legacy.live ? "live" : legacy.tailer ? "tailer" : null;
+    }
+    const live = hasSessionUsageAuthority(this.db, source, sessionId, "live", excludeRowids) === true;
+    const tailer = !live && hasSessionUsageAuthority(this.db, source, sessionId, "tailer", excludeRowids) === true;
+    return live ? "live" : tailer ? "tailer" : null;
   }
 
   append(
