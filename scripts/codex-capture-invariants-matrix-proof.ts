@@ -135,6 +135,7 @@ function aggregateFocus(f: Fixture): Aggregate {
     e.model === undefined && e.inputTokens === undefined && e.outputTokens === undefined).length;
   const countedRows = events.filter((e) => e.source === "codex" &&
     e.metadata.usageSource !== "capture_gap" && e.eventType !== "usage_live" &&
+    typeof e.model === "string" && !!e.model.trim() &&
     [e.inputTokens, e.outputTokens, e.cacheReadTokens, e.cacheCreationTokens, e.costUsd]
       .some(value => value !== undefined)).length;
   return { activeRows: rows.length, billableRows, gapRows, countedRows,
@@ -255,6 +256,19 @@ function aggregateAssertions(f: Fixture, evidence: Evidence, frozenHold = false)
     assert.equal(aggregate.billableRows, 1, evidence + ": one billable owner");
     assert.equal(aggregate.countedRows, 1, evidence + ": one counted observation");
     assert.ok(aggregate.gapRows <= 1, evidence + ": duplicate span remains tokenless");
+    if (aggregate.activeRows === 2 && aggregate.gapRows === 0) {
+      assert.equal(frozenHold, true, evidence + ": unsafe historical frozen twin is held");
+    }
+    for (const item of f.lease?.items ?? []) {
+      if (!f.focusIds?.includes(item.rawId)) continue;
+      const sent = item.envelope.event as AiInteractionEvent;
+      const hasCounters = [sent.inputTokens, sent.outputTokens, sent.cacheReadTokens, sent.cacheCreationTokens, sent.costUsd]
+        .some(value => value !== undefined);
+      if (hasCounters) {
+        assert.equal(item.rawId, f.focusId, evidence + ": only the named owner is leased with counters");
+        assert.equal(sent.model, MODEL, evidence + ": no model-less twin can be leased as usage");
+      }
+    }
   } else {
     assert.equal(aggregate.activeRows, 1, evidence + ": one active delivery");
   }
