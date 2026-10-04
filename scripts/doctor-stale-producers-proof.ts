@@ -44,7 +44,7 @@ function check(name: string, condition: unknown, detail: unknown = null) {
 const root = path.resolve(import.meta.dirname, "..");
 const cli = path.join(root, "packages", "collector-cli", "src", "cli.ts");
 const tsx = path.join(root, "node_modules", "tsx", "dist", "cli.mjs");
-const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-doctor-stale-producers-proof-"));
+const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-doctor-stale-producers-proof-")));
 const fixture = useFixtureRoot(sandbox);
 const home = fixture.home;
 const collectorHome = fixture.env.PLIMSOLL_HOME!;
@@ -701,7 +701,7 @@ async function main() {
   });
   await new Promise<void>((resolve) => fakeDaemon.listen(0, "127.0.0.1", resolve));
   fs.writeFileSync(path.join(collectorHome, "collector.config.json"),
-    JSON.stringify({ port: (fakeDaemon.address() as { port: number }).port }));
+    JSON.stringify({ port: (fakeDaemon.address() as { port: number }).port }), { mode: 0o600 });
   function oneShotStatus(admission: unknown, extraEnv: Record<string, string>) {
     statusBody = { ok: true, httpAdmission: admission };
     return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
@@ -723,6 +723,7 @@ async function main() {
   type StatusJson = { captureHealth: { staleProducers?: string; staleProducerAttribution?: unknown } };
   try {
     const valid = await oneShotStatus(openCounters, { [PRODUCER_PROCESS_FIXTURE_ENV]: mainFixture });
+    assert.equal(valid.code, 0, valid.stderr);
     const validJson = JSON.parse(valid.stdout) as StatusJson;
     check("one_shot_status_names_the_stale_producer_count", valid.code === 0 &&
       withoutDefaultHomeNote(validJson.captureHealth.staleProducers) === "3 producer process(es) older than their managed config" + doctorHint &&
