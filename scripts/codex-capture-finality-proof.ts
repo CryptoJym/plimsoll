@@ -108,7 +108,12 @@ async function main(){try{
    if(acknowledged){const {sessions}=nativeFile(f);tailer=new RolloutTailer(f.b,sessions,()=>[]);scan=await tailer.scan({scope:'full',now:new Date(AT+184000)});tailer.close();tailer=undefined;}
    const later=f.lease(185000),counted=usage(later.items);
    const sameId=counted.length===1&&counted[0].deliveryId===original.deliveryId,sameBytes=counted.length===1&&counted[0].envelopeJson===original.envelopeJson;
-   const passed=acknowledged?counted.length===0:counted.length===1&&sameId&&sameBytes&&later.locallyDead===0;
+   const stored=f.b.database.prepare('select envelope_json as bytes from codex_named_captures where delivery_id=?').get(original.deliveryId);
+   const fields=['inputTokens','outputTokens','cacheReadTokens','cacheCreationTokens','costUsd'];
+   const knownZeroComplement=counted.length===1&&counted[0].envelope.event.model===MODEL&&
+    counted[0].envelope.event.cacheReadTokens===0&&counted[0].deliveryId!==original.deliveryId&&
+    fields.every(key=>(counted[0].envelope.event[key]??0)===0)&&stored.bytes===original.envelopeJson;
+   const passed=acknowledged?knownZeroComplement:counted.length===1&&sameId&&sameBytes&&later.locallyDead===0;
    return {passed,firstNativeRow:good,firstFrozen:original.envelope,firstDeliveryId:original.deliveryId,acknowledged,contraryNativeRow:contrary,authority,scan,laterLocallyDead:later.locallyDead,laterDeliveries:later.items.map((i:any)=>i.envelope),sameId,sameBytes,financialInputIfAccepted:(acknowledged?19:0)+counted.reduce((s:number,i:any)=>s+(i.envelope.event.inputTokens??0),0),financialOutputIfAccepted:(acknowledged?2:0)+counted.reduce((s:number,i:any)=>s+(i.envelope.event.outputTokens??0),0),expected:acknowledged?'accepted native SSE counts remain covered; identical native rollout must not count the same response twice':'a once-captured native named row must retain its frozen ID and bytes on retry even if later trace facts become ambiguous'};
   }finally{tailer?.close();f.close();}
  });
