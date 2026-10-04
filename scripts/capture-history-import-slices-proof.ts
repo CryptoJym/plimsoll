@@ -89,10 +89,9 @@ async function main() {
       { rows: number; input: number | null; countedRows: number; firstModel: string | null; lastModel: string | null };
     // This fixture has counters but no native model/turn evidence. The raw
     // totals above still prove conservation; projected financial usage must
-    // stay unknown. A historical-reader control keeps its former expectation.
-    const legacyProjection = process.argv.includes("--legacy-projection");
-    assert.deepEqual(projected, { rows: 512, input: legacyProjection ? 512 : null,
-      countedRows: legacyProjection ? 512 : 0, firstModel: null, lastModel: null });
+    // stay unknown. The main-reader run retains its own former expectation.
+    assert.deepEqual(projected, { rows: 512, input: null,
+      countedRows: 0, firstModel: null, lastModel: null });
     assert.equal((buffer.database.prepare(`select count(*) as rows from dashboard_projection_repairs`)
       .get() as { rows: number }).rows, 0);
     const rerun = await applyCaptureHistory(buffer, captureRoot);
@@ -101,7 +100,7 @@ async function main() {
       maxWriterSliceMs: receipt.maxWriterSliceMs, timeBudgetStops: receipt.timeBudgetStops,
       writerSliceHistogram: receipt.writerSliceHistogram, rows: totals.rows,
       projectedRows: projected.rows, projectedInput: projected.input,
-      projectedCountedRows: projected.countedRows, legacyProjection }));
+      projectedCountedRows: projected.countedRows }));
   } finally {
     buffer.close();
     fixture.restore();
