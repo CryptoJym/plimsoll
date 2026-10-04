@@ -1556,6 +1556,12 @@ export class RolloutTailer {
     // consume its progress frames (#181).
     const needsForeground = attempt.pendingFiles.some(file =>
       (file.servicedCadences ?? 0) > 0 || !currentDirectories.has(path.dirname(file.file)));
+    const backgroundCap = AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP -
+      (needsForeground || this.currentDayAttempt?.pendingFiles.length ? CURRENT_DAY_PENDING_CAP : 0);
+    // Keep the normal 64-candidate discovery quantum and its progress-frame
+    // admission. Reserve foreground slots only during backlog service; paths
+    // displaced from that batch stay in the bounded stat-only revisit queue.
+    for (const file of attempt.pendingFiles.splice(backgroundCap)) this.revisit.offer(file.file);
     if (this.currentDayAttempt && (this.currentDayAttempt.day !== day ||
         !needsForeground && this.currentDayAttempt.pendingFiles.length === 0)) {
       for (const file of this.currentDayAttempt.pendingFiles) this.revisit.offer(file.file);
@@ -1605,7 +1611,6 @@ export class RolloutTailer {
     let truncated = false;
     // Unserviced candidates deferred by the progress gate must be admitted
     // before more discovery can spend their next cadence's frame allowance.
-    const backgroundCap = AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP - CURRENT_DAY_PENDING_CAP;
     if (attempt.pendingFiles.length < backgroundCap && !attempt.discoveryDone &&
         attempt.pendingFiles.every((file) => (file.servicedCadences ?? 0) > 0)) {
       const chunk = await attempt.discovery.collect(budget, {
