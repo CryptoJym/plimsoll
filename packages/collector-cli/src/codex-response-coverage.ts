@@ -286,8 +286,10 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
   }
   const {captured,nativeId,contributors: ancestry} = owners.sort((a,b)=>b.contributors.length-a.contributors.length)[0]!;
   let contributors=ancestry;
-  if(explicit) {
+  if(explicit || owners.length>1) {
     // Sum retained deltas across ALL accounting branches of the response.
+    // Exact anonymous twins here already share the one retained root. A
+    // zero native reservation cannot hide a complementary span branch.
     // Frozen/ACKed owners are final. Among unsealed released producers retain
     // one first owner; each other row is reconciled before its own lease.
     const unique=new Map<string,typeof ancestry[number]>();
