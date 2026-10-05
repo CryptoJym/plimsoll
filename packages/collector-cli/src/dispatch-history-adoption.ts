@@ -189,7 +189,9 @@ const name=typeof error?.name==='string'?error.name.slice(0,80):'UNKNOWN';
 const code=typeof error?.code==='string'?error.code.slice(0,80):null;
 const message=typeof error?.message==='string'&&/^[a-z][a-z0-9_:.-]{0,160}$/.test(error.message)?error.message:null;
 const issues=Array.isArray(error?.issues)?error.issues:null;
-process.stderr.write(JSON.stringify({readerError:{name,code,message,issuesTotal:issues?.length??null,
+process.stderr.write(JSON.stringify({readerError:{name,code,message,
+messageSha256:typeof error?.message==='string'?require('node:crypto').createHash('sha256').update(error.message).digest('hex'):null,
+issuesTotal:issues?.length??null,
 issues:issues?.slice(0,8).map(issue=>({code:String(issue.code).slice(0,64),
 path:Array.isArray(issue.path)?issue.path.slice(0,12).map(part=>typeof part==='number'?part:String(part).slice(0,64)):null,
 expected:typeof issue.expected==='string'?issue.expected.slice(0,64):null}))??null}})+'\\n');
