@@ -153,9 +153,15 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
         ...(native(event)?[]:[at])])) as Row[];
   if (exactRows.length > 128 && !rows.length) return undefined;
   for(const row of exactRows)if(!rows.some(r=>r.rowid===row.rowid))rows.push(row);
+  const originals=new Map(rows.map(row=>[row.id,
+    originalCoveredResponse(db,row.id)??JSON.parse(row.payload) as AiInteractionEvent]));
+  const nativeObservations=[...(native(event)?[event]:[]),...[...originals.values()].filter(native)];
+  const nativeAmount=(basis: AiInteractionEvent,field: typeof FIELDS[number]) =>
+    nativeObservations.reduce((sum,observation)=>sum+
+      (sameResponse(basis,observation)&&compatible(basis,observation)?observation[field]??0:0),0);
   const observations = rows.flatMap(row => {
     const peer=JSON.parse(row.payload) as AiInteractionEvent;
-    const identity=originalCoveredResponse(db,row.id)??peer;
+    const identity=originals.get(row.id)!;
     if(!compatible(event,identity,row.id===exactPeerId))return [];
     if(native(event)&&!sameResponse(event,identity)&&completion(event)!==completion(identity)) {
       // A diagnostic native counter can already identify this anonymous SSE
@@ -182,10 +188,7 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     // counter records in one explicit response add before competing with its
     // cumulative SSE/span observations. Distinct turns never enter this sum.
     for(const field of FIELDS)if(event[field]!==undefined)
-      budget[field]=event[field]!+rows.reduce((n,row)=>{
-        const original=originalCoveredResponse(db,row.id)??JSON.parse(row.payload) as AiInteractionEvent;
-        return n+(native(original)&&sameResponse(event,original)&&compatible(event,original)?original[field]??0:0);
-      },0);
+      budget[field]=nativeAmount(event,field);
   }
   const candidates = observations.flatMap(({row,identity,captured}) => {
     if(row.duplicate&&!frozenCodexCapture(db,row.id)||!codexHasUsage(captured))return [];
@@ -255,9 +258,11 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     const unsealed=all.filter(c=>!frozenCodexCapture(db,c.row.id)).sort((a,b)=>a.row.rowid-b.row.rowid);
     const retained=Object.fromEntries(FIELDS.map(k=>[k,frozen.reduce((n,c)=>n+(c.captured[k]??0),0)]));
     const first=unsealed.find(c=>{
-      const original=originalCoveredResponse(db,c.row.id)??JSON.parse(c.row.payload) as AiInteractionEvent;
+      const original=originals.get(c.row.id)??originalCoveredResponse(db,c.row.id)??JSON.parse(c.row.payload) as AiInteractionEvent;
+      // A native marginal belongs to its source response, independently of
+      // a smaller incoming SSE. Its own prefix decides whether it can freeze.
       return FIELDS.every(k=>c.captured[k]===undefined || original[k]!==undefined&&c.captured[k]!<=
-        Math.max(0,(native(original)&&sameResponse(event,original)?budget[k]??original[k]!:original[k]!)-retained[k]!));
+        Math.max(0,(native(original)&&sameResponse(event,original)?nativeAmount(original,k):original[k]!)-retained[k]!));
     });
     contributors=[...frozen,...(first?[first]:[])];
     if(!contributors.length)return undefined;
@@ -305,10 +310,6 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     contributors.some(c => c.captured[k] !== undefined));
   const covered = amountsCovered && fieldsKnown;
   if(reservationOnly&&!amountsCovered)return undefined;
-  // Native marginals already add correctly without borrowing custody when
-  // the result is exactly their own observation. In particular a disabled
-  // outbox must not turn a harmless second native delta into a failed append.
-  if(native(event)&&!covered&&FIELDS.every(k=>remaining[k]===event[k]))return undefined;
   if (commit && contributors.some(c=>!commit(c.row.id))) return undefined;
   // Keep the first retained root visible to the anonymous once-per-counter
   // guard. A newer zero/complement owner must not hide that its older paid

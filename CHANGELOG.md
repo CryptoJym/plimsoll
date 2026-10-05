@@ -66,7 +66,8 @@
   counted owner, including an actual 0.7.48 writer running during rollback.
   Stateless and history snapshots also freeze their matching queue copy so
   those captures cannot become restampable before their first outbox lease.
-  Native marginals that need no reduction do not borrow another row's custody.
+  Native source prefixes retain their accounting custody even when the next
+  marginal needs no reduction; a smaller SSE cannot hide an unsealed prefix.
   With the outbox disabled, stateless accounting freezes a validated local
   envelope instead of throwing away a native append for a missing queue entry.
 - History import carries explicit native turn IDs and same-turn model conflicts
