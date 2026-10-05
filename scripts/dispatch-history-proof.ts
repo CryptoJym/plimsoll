@@ -100,16 +100,24 @@ async function worker() {
     let reads=0,failures=0;const generations=new Set<string>();
     process.send?.({ready:true});
     await new Promise<void>(resolve=>process.once("message",()=>resolve()));
-    const end=Date.now()+700;
-    while(Date.now()<end) {
+    // The parent owns the existing 10s child deadline. Observe a baseline
+    // before writers start, then keep concurrent reads through an acknowledged
+    // post-writer read. A 700ms sampling horizon can end before a valid commit.
+    let writersComplete=false,baselineSent=false;
+    const completed=(message:unknown)=>{if(message==="writers-complete")writersComplete=true;};
+    process.on("message",completed);
+    while(true) {
       const current=roots();reads++;
       if(current.length!==2)failures++;
       const a=current[0]?.dispatchHistory,b=current[1]?.dispatchHistory;
       if(Boolean(a)!==Boolean(b)||a?.generation!==b?.generation)failures++;
       if(dispatchBindingForSession("codex","session-945","2026-10-01T00:00:00.000Z",current)?.attemptId!==attempt(945))failures++;
       generations.add(a?.generation??"legacy");
+      if(!baselineSent){baselineSent=true;process.send?.({baseline:true});}
+      if(writersComplete)break;
       await new Promise(resolve=>setTimeout(resolve,2));
     }
+    process.off("message",completed);
     process.send?.({reads,failures,generations:[...generations]});return;
   }
   process.send?.({ready:true});
@@ -122,12 +130,13 @@ function child(mode:string,id?:number) {
   let diagnostics="";const messages:any[]=[];
   processChild.stderr!.on("data",chunk=>{diagnostics+=chunk;});
   const ready=new Promise<void>(resolve=>processChild.on("message",message=>{messages.push(message);if((message as any).ready)resolve();}));
+  const baseline=new Promise<void>(resolve=>processChild.on("message",message=>{if((message as any).baseline)resolve();}));
   const done=new Promise<{code:number|null;messages:any[]}>( (resolve,reject)=>{
     const timer=setTimeout(()=>{processChild.kill("SIGKILL");reject(new Error("fixture child deadline"));},10000);
     processChild.on("error",reject);processChild.on("exit",code=>{clearTimeout(timer);
       if(code!==0&&!mode.startsWith("crash"))reject(new Error(diagnostics||`child exited ${code}`));else resolve({code,messages});});
   });
-  return {processChild,ready,done};
+  return {processChild,ready,baseline,done};
 }
 
 async function main() {
@@ -325,8 +334,9 @@ async function main() {
   await check("concurrent-real-sqlite-writers-and-reader-have-no-partial-generation-or-lost-binding",async()=>{
     fixture(mixed(),2);const observer=child("observe"),writers=[20001,20002,20003,20004].map(id=>child("bind",id));
     await Promise.all([observer.ready,...writers.map(w=>w.ready)]);observer.processChild.send("go");
-    await new Promise(resolve=>setTimeout(resolve,20));for(const writer of writers)writer.processChild.send("go");
-    await Promise.all(writers.map(w=>w.done));const result=await observer.done;const observation=result.messages.find(m=>m.reads);
+    await observer.baseline;for(const writer of writers)writer.processChild.send("go");
+    await Promise.all(writers.map(w=>w.done));observer.processChild.send("writers-complete");
+    const result=await observer.done;const observation=result.messages.find(m=>m.reads);
     assert.ok(observation.reads>1);assert.equal(observation.failures,0);assert.ok(observation.generations.length>=2);
     for(const root of roots())assert.equal(root.dispatch!.length,949);
     for(const id of [20001,20002,20003,20004])assert.equal(dispatchBindingForSession("codex",`session-${id}`,NOW.toISOString(),roots())?.attemptId,attempt(id));
