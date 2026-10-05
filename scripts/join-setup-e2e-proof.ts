@@ -634,7 +634,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       const running = fs.existsSync(f.state) && await waitForCollector(Number(f.env.PLIMSOLL_PROOF_JOIN_PORT));
       console.log(JSON.stringify({ scenario: name, firstExit: joined.code, obligationBytes: bytes,
         retryExit: retry.code, retryStatus: retryResult.status, retryCloudJoins: remote.joins.length,
-        collectorRunningAfterRetry: running }));
+        collectorRunningAfterRetry: running, diagnosticOnly:true,retryReason:retryResult.reason ?? null,retryMessage:retryResult.message ?? null,daemon:retryResult.daemon }));
       check("fresh_obligation_write_crash_retry_recovers_and_serves", joined.code === null && retry.code === 0 &&
         retryResult.status === "joined" && running);
       return;
@@ -920,6 +920,7 @@ async function joinedScenario(name: string, running: boolean, mode: "ack" | "no_
       return;
     }
     const expectedRoots = name === "mixed_roots" ? 3 : 2;
+    if (name === "path_drift") console.log(JSON.stringify({scenario:name,diagnosticOnly:true,code:joined.code,status:result.status,reason:result.reason ?? null,message:result.message ?? null,launchAgent:result.launchAgent,daemon:result.daemon}));
     if (name === "path_drift") check("path_drift_recorded_without_join_refusal",
       joined.code === 0 && result.launchAgent?.runtimeDriftKeys?.includes("EnvironmentVariables.PATH"));
     const rootsTogether = config.captureRoots?.length === expectedRoots &&
