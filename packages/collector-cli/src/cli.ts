@@ -50,7 +50,9 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
         disposition: null,
       };
 
-import { LocalEventBuffer } from "./buffer";
+import type { LocalEventBuffer as LocalEventBufferType } from "./buffer";
+type LocalEventBuffer = LocalEventBufferType;
+let LocalEventBuffer: typeof import("./buffer").LocalEventBuffer;
 import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
@@ -111,12 +113,7 @@ import {
   LifecycleMutationAuthority,
   type LifecycleMutationLease,
 } from "./lifecycle-authority";
-import {
-  cleanupStaleJoinHandshakeDirectories,
-  finalizeActivatedPendingJoin,
-  performJoin,
-  resumePendingJoin,
-} from "./join";
+import type { performJoin } from "./join";
 import {
   AutomaticMaintenanceCadence,
   automaticRepairServiceStatus,
@@ -2847,6 +2844,13 @@ async function main() {
     return;
   }
 
+  // These commands inspect config or delegate enrollment; none calls the
+  // capture-ledger factory. Keep its migrations and model graph out of their
+  // startup. Every ledger command loads the same implementation before use.
+  if (command !== "doctor" && command !== "setup" && command !== "join") {
+    ({ LocalEventBuffer } = await import("./buffer"));
+  }
+
   if (command === "__rehearse_ledger_open") {
     if (process.env.PLIMSOLL_REHEARSAL !== "copied-ledger-v1") {
       throw new Error("copied-ledger rehearsal must be launched through scripts/rehearse-ledger-open.ts");
@@ -3018,6 +3022,7 @@ async function main() {
           "No token was read, no request was sent, and no local state was changed.",
       );
     }
+    const { performJoin, resumePendingJoin } = await import("./join");
     const rawJoinArguments = process.argv.slice(3);
     const noDaemon = rawJoinArguments.includes("--no-daemon");
     if (rawJoinArguments.filter((argument) => argument === "--no-daemon").length > 1) {
@@ -3330,6 +3335,8 @@ async function main() {
   }
 
   if (command === "start") {
+    const { cleanupStaleJoinHandshakeDirectories,
+      finalizeActivatedPendingJoin } = await import("./join");
     cleanupStaleJoinHandshakeDirectories();
     finalizeActivatedPendingJoin();
   }
