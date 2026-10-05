@@ -177,6 +177,7 @@
     "proof:session-summary-cycle-resume": "tsx scripts/run-proof.ts scripts/session-summary-cycle-resume-proof.ts",
     "proof:session-summary-stall": "tsx scripts/run-proof.ts scripts/session-summary-stall-proof.ts",
     "proof:session-summary-pending-review": "tsx scripts/run-proof.ts scripts/session-summary-pending-review-proof.ts",
+    "proof:session-summary-queued-session": "tsx scripts/run-proof.ts scripts/session-summary-queued-session-proof.ts",
     "proof:status-pending-reasons": "tsx scripts/run-proof.ts scripts/status-pending-reasons-proof.ts",
     "proof:session-summary-live-churn": "tsx scripts/run-proof.ts scripts/session-summary-live-churn-proof.ts",
     "proof:session-summary-reconciliation": "tsx scripts/run-proof.ts scripts/session-summary-reconciliation-proof.ts",

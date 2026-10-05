@@ -912,6 +912,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-pending-review
 
+      - name: Prove blocked queued-session backlogs do not force full re-sends (eco-6hoxj.163.94.10)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-queued-session
+
       - name: Prove pending summary reasons and freshness in private status (eco-6hoxj.163.116)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:status-pending-reasons
