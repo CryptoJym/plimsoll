@@ -1417,7 +1417,11 @@ async function main() {
   assert.ok(totalCpuMs > 0, "observed parent plus child CPU must be nonzero");
   assert.ok(totalRowOperations > 0, "observed row work must be nonzero");
   assert.ok(Number.isFinite(wallMs) && wallMs > 0, "system E2E wall time must be observed");
-  assert.ok(totalCpuMs <= BUDGETS.cpuMs, "system E2E exceeded total parent plus child CPU budget");
+  assert.ok(totalCpuMs <= BUDGETS.cpuMs,
+    `system E2E exceeded total parent plus child CPU budget: ${JSON.stringify({
+      budgetMs:BUDGETS.cpuMs,totalMs:totalCpuMs,controllerMs:controllerCpuMs,
+      phases:phases.map(phase=>({name:phase.name,...phase.measurements})),
+    })}`);
   assert.ok(maxRssBytes <= BUDGETS.maxRssBytes, "system E2E exceeded RSS budget");
   assert.ok(blockOperations <= BUDGETS.blockOperations, "system E2E exceeded block-I/O budget");
   assert.ok(totalRowOperations <= BUDGETS.totalRowOperations, "system E2E exceeded row-work budget");
