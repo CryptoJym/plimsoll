@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "../scripts/lib/native-codex-fixture";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,13 +12,13 @@ const at = new Date("2026-09-29T12:00:00.000Z");
 const event = (id: string) => aiInteractionEventSchema.parse({
   id, sessionId: id, source: "codex", model: "gpt-6-sol", eventType: "assistant_response",
   dataMode: "metadata", observedAt: at.toISOString(), actionClass: "other",
-  inputTokens: 1, outputTokens: 1, metadata: { proof: "lineage-aba" },
+  inputTokens: 1, outputTokens: 1, metadata: { ...nativeCodexFixture(id).metadata, proof: "lineage-aba" },
 });
 
 try {
   for (const field of ["rawId", "rawCreatedAt", "rawGeneration"] as const) {
     const file = path.join(root, `${field}.sqlite`);
-    const buffer = new LocalEventBuffer(file, { delivery: { enabled: true } });
+    const buffer = new LocalEventBuffer(file, { workspaceId: "00000000-0000-4000-8000-000000000001", deviceId: "aba-fixture-device", delivery: { enabled: true } });
     try {
       const id = "11711711-1111-4111-8111-111111111140";
       assert.equal(buffer.append(event(id)), true);

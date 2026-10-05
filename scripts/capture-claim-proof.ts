@@ -35,6 +35,7 @@ import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 import { verifyCaptureDeadLetterCases } from "./lib/capture-dead-letter-cases";
 import { verifyCaptureCensusFallbackCases } from "./lib/capture-census-fallback-cases";
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 
 const completion = createProofCompletion("capture-claim", 15);
 const check = (name: string, passed: boolean, detail: Record<string, unknown> = {}) => {
@@ -63,14 +64,14 @@ function event(observedMs: number) {
     id: `00000000-0000-4000-8000-${String(900_000 + eventIndex).padStart(12, "0")}`,
     sessionId: `00000000-0000-4000-8000-${String(800_000 + eventIndex).padStart(12, "0")}`,
     source: "codex",
-    model: "gpt-6-sol",
+    ...nativeCodexFixture(String(eventIndex)),
     dataMode: "metadata",
     eventType: "assistant_response",
     observedAt: iso(observedMs),
     actionClass: "other",
     inputTokens: 3,
     outputTokens: 1,
-    metadata: { proof: "capture-claim" },
+    metadata: { ...nativeCodexFixture(String(eventIndex)).metadata, proof: "capture-claim" },
   });
 }
 

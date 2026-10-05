@@ -5,6 +5,7 @@ import { buildWorkspaceEconomics,reconcileUsage } from "../packages/shared/src/e
 import { allocateMinorUnits,reconcileFinance } from "../packages/shared/src/economics/finance";
 import { digest } from "../packages/shared/src/economics/validation";
 import type { AcceptanceFact,EconomicsInput,FinanceLine,FinanceSnapshot,UsageFact } from "../packages/shared/src/economics/contracts";
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
@@ -328,7 +329,7 @@ async function captureProof() {
     const session="019e1111-2222-7333-8444-555555555555";
     for(const [index,repo,tokens] of [[1,A,1],[2,A,1],[3,B,100]] as const) {
       const id=`00000000-0000-4000-8000-${String(index).padStart(12,"0")}`;
-      ledger.append(aiInteractionEventSchema.parse({ id,tenantId: tenant,source: "codex",dataMode: "metadata",eventType: "usage_rollout",observedAt: "2026-09-02T00:00:00.000Z",sessionId: session,inputTokens: tokens,outputTokens: 0,metadata: {} }),[]);
+      ledger.append(aiInteractionEventSchema.parse({ id,tenantId: tenant,source: "codex",...nativeCodexFixture(id),dataMode: "metadata",eventType: "usage_rollout",observedAt: "2026-09-02T00:00:00.000Z",sessionId: session,inputTokens: tokens,outputTokens: 0,metadata: nativeCodexFixture(id).metadata }),[]);
       ledger.database.prepare("update buffered_events set repo_hash=? where id=?").run(repo,id);
     }
     check("session_summary_does_not_assign_102_tokens_to_A",() => assert.equal(collectSessionSnapshots(ledger.database,{ until: "2099-01-01T00:00:00.000Z" })[0].repoHash,null));
@@ -343,7 +344,7 @@ async function captureProof() {
     });
     for(const [index,at,tokens] of [[81,"2026-08-31T18:00:00-06:00",3],[82,"2026-09-06T18:00:00-06:00",900]] as const) {
       const id=`00000000-0000-4000-8000-${String(index).padStart(12,"0")}`;
-      ledger.append(aiInteractionEventSchema.parse({ id,tenantId: tenant,source: "codex",dataMode: "metadata",eventType: "assistant_response",observedAt: at,inputTokens: tokens,outputTokens: 0,projectKey: A,metadata: {} }),[]);
+      ledger.append(aiInteractionEventSchema.parse({ id,tenantId: tenant,source: "codex",...nativeCodexFixture(id),dataMode: "metadata",eventType: "assistant_response",observedAt: at,inputTokens: tokens,outputTokens: 0,projectKey: A,metadata: nativeCodexFixture(id).metadata }),[]);
       ledger.database.prepare("update buffered_events set repo_hash=? where id=?").run(B,id);
     }
     ledger.projection.runMaintenance(new Date());

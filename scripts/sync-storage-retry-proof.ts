@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -76,7 +77,8 @@ function event() {
     actionClass: "other",
     inputTokens: 1,
     outputTokens: 1,
-    metadata: { proof: "sync_storage_retry" },
+    ...nativeCodexFixture(`sync-storage-${eventIndex}`),
+    metadata: { ...nativeCodexFixture(`sync-storage-${eventIndex}`).metadata, proof: "sync_storage_retry" },
   });
 }
 

@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import assert from "node:assert/strict";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
@@ -29,7 +30,7 @@ function event(id: string, observedAt: string, options: Partial<AiInteractionEve
     actionClass: "other",
     inputTokens: 10,
     outputTokens: 20,
-    metadata: {},
+    ...nativeCodexFixture(id),
     ...options,
   };
 }
@@ -63,11 +64,13 @@ function main() {
         scopeLogs: [{
           logRecords: [{
             observedTimeUnixNano: "1790164800000000000",
+            traceId: nativeCodexFixture("attribution-otlp").metadata.traceId,
             attributes: [
               otelAttr("event.name", "assistant_response"),
               otelAttr("session.id", "session-fixture"),
               otelAttr("gen_ai.usage.input_tokens", 10),
               otelAttr("gen_ai.usage.output_tokens", 20),
+              otelAttr("gen_ai.request.model", "gpt-6-sol"),
             ],
           }],
         }],

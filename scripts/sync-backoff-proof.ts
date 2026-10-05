@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -32,7 +33,7 @@ function open(file = path.join(fixture.root, `ledger-${++database}.sqlite`)) {
 }
 function append(buffer: LocalEventBuffer) {
   const event = aiInteractionEventSchema.parse({ id: `00000000-0000-4000-8000-${String(++sequence).padStart(12,"0")}`,
-    source: "codex", dataMode: "metadata", eventType: "assistant_response", observedAt: new Date(t0 - 60_000).toISOString(), inputTokens: 1, outputTokens: 1, metadata: {} });
+    source: "codex", dataMode: "metadata", eventType: "assistant_response", observedAt: new Date(t0 - 60_000).toISOString(), inputTokens: 1, outputTokens: 1, ...nativeCodexFixture(`sync-backoff-${sequence}`) });
   buffer.append(event); return event.id;
 }
 const json = (status: number, retry?: string) => new Response(JSON.stringify(status === 200 ? { accepted: 1 } : {}), { status,

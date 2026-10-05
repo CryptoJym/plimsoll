@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -56,6 +57,7 @@ function appendSession(
       observedAt,
       inputTokens: 3,
       outputTokens: 1,
+      ...nativeCodexFixture(`session-sync-${index}`),
     }),
   );
   if (!appended) {

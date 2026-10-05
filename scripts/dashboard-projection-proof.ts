@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -55,7 +56,7 @@ import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
-import { ANALYTICAL_METADATA_LIMITS, aiInteractionEventSchema } from "../packages/shared/src/index";
+import { ANALYTICAL_METADATA_LIMITS, LOCAL_TENANT_ID, aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = new Date("2026-07-15T12:00:00.000Z");
@@ -83,6 +84,14 @@ function uuid(n: number) {
   return `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 }
 
+// These projection fixtures represent locally captured producer usage. Give
+// them an explicit workspace, device and install boundary; normalized model
+// text alone cannot attest Codex usage after #450.
+function projectionFixtureBuffer(file: string, options: ConstructorParameters<typeof LocalEventBuffer>[1] = {}) {
+  return new LocalEventBuffer(file, { workspaceId: LOCAL_TENANT_ID,
+    deviceId: uuid(999_999), ...options });
+}
+
 let eventSequence = 1;
 function event(input: {
   observedAt?: string;
@@ -101,26 +110,35 @@ function event(input: {
   actorId?: string;
   metadata?: Record<string, unknown>;
 }) {
+  const id = uuid(eventSequence++);
+  // Generic financial fixtures test projection arithmetic and cutoffs. Give
+  // their native producer a request model; explicit model-less Codex cases
+  // still exercise the diagnostic-only capture contract.
+  const model = input.model ?? (!input.source && [input.inputTokens, input.outputTokens,
+    input.cacheReadTokens, input.cacheCreationTokens, input.costUsd].some(value => value !== undefined)
+    ? "gpt-proof" : undefined);
+  const native = (input.source ?? "codex") === "codex" && model
+    ? nativeCodexFixture(id, model) : undefined;
   const git = input.repoHash || input.branchHash
     ? { remoteUrlHash: input.repoHash, branchHash: input.branchHash }
     : undefined;
   return aiInteractionEventSchema.parse({
-    id: uuid(eventSequence++),
-    tenantId: "local",
+    id,
+    tenantId: LOCAL_TENANT_ID,
     source: input.source ?? "codex",
     dataMode: "metadata",
     eventType: input.eventType ?? "assistant_response",
     observedAt: input.observedAt ?? new Date(NOW.getTime() - DAY_MS).toISOString(),
     sessionId: input.sessionId,
     actionClass: input.actionClass ?? "other",
-    model: input.model,
+    model,
     inputTokens: input.inputTokens,
     outputTokens: input.outputTokens,
     cacheReadTokens: input.cacheReadTokens,
     cacheCreationTokens: input.cacheCreationTokens,
     costUsd: input.costUsd,
     actorId: input.actorId,
-    metadata: { ...(input.metadata ?? {}), ...(git ? { git } : {}) },
+    metadata: { ...native?.metadata, ...(input.metadata ?? {}), ...(git ? { git } : {}) },
   });
 }
 
@@ -170,7 +188,7 @@ async function release044ProjectionReader(root: string) {
 async function prove044RollbackScanFence(root: string) {
   const OldProjection = await release044ProjectionReader(root);
   const file = path.join(root, "duplicate-scan-044-rollback.sqlite");
-  const buffer = new LocalEventBuffer(file);
+  const buffer = projectionFixtureBuffer(file);
   const rows = Array.from({length:3}, () => event({source:"codex",model:"gpt-proof"}));
   for (const row of rows) assert.equal(buffer.append(row), true);
   settle(buffer);
@@ -180,6 +198,7 @@ async function prove044RollbackScanFence(root: string) {
   // trigger, so one raw row is excluded while its dashboard fact still exists.
   const legacy = new Database(file);
   legacy.exec(`drop trigger trg_dashboard_usage_duplicate_update;
+    drop trigger if exists trg_dashboard_pending_duplicate_scan_fence;
     drop table codex_duplicate_fact_scan;
     update dashboard_projection_control set schema_version=2 where singleton=1;
     update dashboard_snapshots set schema_version=2;`);
@@ -202,7 +221,7 @@ async function prove044RollbackScanFence(root: string) {
     {kind:staleBefore.kind,preUpgrade});
   oldDb.close();
 
-  let upgraded = new LocalEventBuffer(file);
+  let upgraded = projectionFixtureBuffer(file);
   const pending = upgraded.projection.status();
   const version = (upgraded.database.prepare(`select schema_version as version
     from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
@@ -230,7 +249,7 @@ async function prove044RollbackScanFence(root: string) {
     {readKind:refusedBefore.kind,oldTick,oldStatus,persisted,preUpgrade});
   oldDb.close();
 
-  upgraded = new LocalEventBuffer(file);
+  upgraded = projectionFixtureBuffer(file);
   settle(upgraded);
   const repaired = upgraded.projection.readSnapshot(30);
   const repairedFacts = (upgraded.database.prepare(`select count(*) as n from dashboard_event_facts`)
@@ -253,7 +272,7 @@ async function prove044RollbackScanFence(root: string) {
     {kind:refusedAfter.kind,completeTick});
   oldDb.close();
 
-  upgraded = new LocalEventBuffer(file);
+  upgraded = projectionFixtureBuffer(file);
   settle(upgraded);
   const forwardAgain = upgraded.projection.readSnapshot(30);
   check("reupgrade_after_complete_rollback_converges_without_rebuild",
@@ -265,7 +284,7 @@ async function prove044RollbackScanFence(root: string) {
 
 function proveDuplicateFactRepair(root: string) {
   const file = path.join(root, "duplicate-fact-repair.sqlite");
-  let buffer = new LocalEventBuffer(file);
+  let buffer = projectionFixtureBuffer(file);
   try {
     const tokenFree = event({ source: "codex", sessionId: "duplicate-fact-session",
       model: "gpt-proof" });
@@ -322,7 +341,7 @@ function proveDuplicateFactRepair(root: string) {
         where raw_rowid=(select rowid from buffered_events where id=?)`).get(tokenFree.id));
     db.exec(`update codex_duplicate_fact_scan set cursor_raw_rowid=0, complete=0`);
     buffer.close();
-    buffer = new LocalEventBuffer(file);
+    buffer = projectionFixtureBuffer(file);
     db = buffer.database;
     buffer.projection.runMaintenance(NOW);
     settle(buffer);
@@ -337,7 +356,7 @@ function proveDuplicateFactRepair(root: string) {
 async function proveDuplicateScanUpgradeAndDrain(root: string) {
   const file = path.join(root, "duplicate-scan-upgrade.sqlite");
   const factCount = 3_101;
-  let buffer = new LocalEventBuffer(file);
+  let buffer = projectionFixtureBuffer(file);
   let firstId = "";
   try {
     for (let index = 0; index < factCount; index += 1) {
@@ -356,7 +375,8 @@ async function proveDuplicateScanUpgradeAndDrain(root: string) {
     // Recreate the pre-fix upgrade boundary: a ready published snapshot and
     // stale fact, but no duplicate-scan state or trigger from this release.
     const legacy = new Database(file);
-    legacy.exec(`drop table codex_duplicate_fact_scan;
+    legacy.exec(`drop trigger if exists trg_dashboard_pending_duplicate_scan_fence;
+    drop table codex_duplicate_fact_scan;
       drop trigger trg_dashboard_usage_duplicate_update;`);
     legacy.prepare(`update buffered_events set usage_duplicate_reason='codex_sse_event_span'
       where id=?`).run(firstId);
@@ -365,7 +385,7 @@ async function proveDuplicateScanUpgradeAndDrain(root: string) {
     legacy.close();
     check("duplicate_scan_upgrade_fixture_has_no_old_repair_receipt",queued === 0,{queued});
 
-    buffer = new LocalEventBuffer(file);
+    buffer = projectionFixtureBuffer(file);
     const pending = buffer.projection.status();
     const stale = buffer.projection.readSnapshot(30);
     check("duplicate_scan_upgrade_withholds_ready_snapshot_parity_before_maintenance",
@@ -397,7 +417,7 @@ async function proveDuplicateScanUpgradeAndDrain(root: string) {
 
 async function proveScanSettlesUnderSteadyCapture(root: string) {
   const file = path.join(root, "scan-steady-capture.sqlite");
-  const buffer = new LocalEventBuffer(file);
+  const buffer = projectionFixtureBuffer(file);
   const rows = Array.from({length:3}, () => event({source:"codex",model:"gpt-proof"}));
   for (const row of rows) assert.equal(buffer.append(row), true);
   settle(buffer);
@@ -496,7 +516,7 @@ async function proveScanSettlesUnderSteadyCapture(root: string) {
 
 function proveWholeTransactionAdmission(root: string) {
   const file = path.join(root, "backlogged-upgrade-budget.sqlite");
-  const buffer = new LocalEventBuffer(file);
+  const buffer = projectionFixtureBuffer(file);
   try {
     const observedAt = new Date(NOW.getTime()-29*DAY_MS).toISOString();
     for (let i=0; i<64; i++) assert.equal(buffer.append(event({observedAt,
@@ -564,7 +584,7 @@ function proveWholeTransactionAdmission(root: string) {
 }
 
 function proveTimedBackfillsUseAvailableBudget(root: string) {
-  const buffer = new LocalEventBuffer(path.join(root, "timed-backfill-budget.sqlite"));
+  const buffer = projectionFixtureBuffer(path.join(root, "timed-backfill-budget.sqlite"));
   try {
     for (let i = 0; i < 128; i++) assert.equal(buffer.append(event({source:"codex"})), true);
     settle(buffer);
@@ -634,7 +654,7 @@ function proveTimedBackfillsUseAvailableBudget(root: string) {
 }
 
 async function proveMillionFactTimedUpgrade(root: string) {
-  const buffer = new LocalEventBuffer(path.join(root,"million-fact-timed-upgrade.sqlite"));
+  const buffer = projectionFixtureBuffer(path.join(root,"million-fact-timed-upgrade.sqlite"));
   const factCount = 1_000_000;
   try {
     const db = buffer.database;
@@ -786,7 +806,7 @@ async function proveMillionFactTimedUpgrade(root: string) {
 }
 
 async function proveMillionFactScanCadence(root: string) {
-  const buffer = new LocalEventBuffer(path.join(root, "million-fact-scan.sqlite"));
+  const buffer = projectionFixtureBuffer(path.join(root, "million-fact-scan.sqlite"));
   const factCount = 1_000_001;
   const codexRoot = path.join(root, "million-fact-codex");
   const claudeRoot = path.join(root, "million-fact-claude");
@@ -921,7 +941,7 @@ function proveMillionFactVersionFenceCost(root: string) {
   const before = beforeDb.prepare(stateSql).get() as Record<string,number>;
   beforeDb.close();
   const started = performance.now();
-  const upgraded = new LocalEventBuffer(file);
+  const upgraded = projectionFixtureBuffer(file);
   const openMs = performance.now() - started;
   try {
     const after = upgraded.database.prepare(stateSql).get() as Record<string,number>;
@@ -943,7 +963,7 @@ type MillionFactRowCosts = {scanMsPerRow:number;repairMsPerRow:number};
 async function proveMillionFactDuplicateRepairCadence(root: string, slow = false,
   reference?: MillionFactRowCosts): Promise<MillionFactRowCosts> {
   const prefix = slow ? "slow-" : "";
-  const buffer = new LocalEventBuffer(path.join(root, `${prefix}million-duplicate-fact-scan.sqlite`));
+  const buffer = projectionFixtureBuffer(path.join(root, `${prefix}million-duplicate-fact-scan.sqlite`));
   const factCount = 1_000_001;
   const duplicateCount = 300_000;
   const codexRoot = path.join(root, `${prefix}million-duplicate-fact-codex`);
@@ -1247,7 +1267,7 @@ function dropProjectionState(db:Database.Database){
 function proveMixedFactAndCompactExpiry(root:string,compactRows:number,timed:boolean){
   const name=`mixed-expiry-${compactRows}-${timed?"timed":"unbounded"}`;
   const file=path.join(root,`${name}.sqlite`);
-  new LocalEventBuffer(file).close();
+  projectionFixtureBuffer(file).close();
   const seed=new Database(file);
   dropProjectionState(seed);
   const observedAt=new Date(NOW.getTime()-29*DAY_MS).toISOString();
@@ -1259,7 +1279,7 @@ function proveMixedFactAndCompactExpiry(root:string,compactRows:number,timed:boo
       `${name}-${index}`,"codex","otel_span","metadata",observedAt,"{}","[]",NOW.toISOString());
   })();
   seed.close();
-  const buffer=new LocalEventBuffer(file);
+  const buffer=projectionFixtureBuffer(file);
   try{
     assert.equal(buffer.append(event({sessionId:name,model:"gpt-mixed-expiry",
       observedAt,inputTokens:2,outputTokens:3})),true);
@@ -1299,7 +1319,7 @@ function proveMixedFactAndCompactExpiry(root:string,compactRows:number,timed:boo
 function proveNegativeTotalPublicationGuard(root:string){
   for(const field of ["events","input_tokens","model_calls","model_input_tokens"] as const){
     const file=path.join(root,`negative-publication-${field}.sqlite`);
-    const buffer=new LocalEventBuffer(file);
+    const buffer=projectionFixtureBuffer(file);
     try{
       assert.equal(buffer.append(event({sessionId:`negative-${field}`,model:"gpt-guard",
         inputTokens:4,outputTokens:5})),true);
@@ -1337,7 +1357,7 @@ function proveNegativeTotalPublicationGuard(root:string){
     }finally{buffer.close();}
   }
   const file=path.join(root,"negative-stored-generation.sqlite");
-  const seeded=new LocalEventBuffer(file);
+  const seeded=projectionFixtureBuffer(file);
   assert.equal(seeded.append(event({sessionId:"negative-stored",model:"gpt-guard"})),true);
   settle(seeded,NOW);
   seeded.close();
@@ -1349,7 +1369,7 @@ function proveNegativeTotalPublicationGuard(root:string){
   db.prepare(`update dashboard_snapshots set payload_json=? where days=30`)
     .run(JSON.stringify(payload));
   db.close();
-  const reopened=new LocalEventBuffer(file);
+  const reopened=projectionFixtureBuffer(file);
   try{
     const status=reopened.projection.status();
     const read=reopened.projection.readSnapshot(30);
@@ -1420,7 +1440,7 @@ function downgradeCompactProjectionToC0(db:Database.Database){
 
 function compactMutationRepairDependencyFixture(root:string,label:string,reopenAfterFirst:boolean){
   const fixturePath=path.join(root,`compact-mutation-repair-${label}.sqlite`);
-  let fixture=new LocalEventBuffer(fixturePath);
+  let fixture=projectionFixtureBuffer(fixturePath);
   for(let index=0;index<4_000;index++)fixture.append(event({
     source:"codex",eventType:"assistant_response",actionClass:"other",
     observedAt:new Date(NOW.getTime()-DAY_MS+index).toISOString(),
@@ -1478,7 +1498,7 @@ function compactMutationRepairDependencyFixture(root:string,label:string,reopenA
   };
   if(reopenAfterFirst){
     fixture.close();
-    fixture=new LocalEventBuffer(fixturePath);
+    fixture=projectionFixtureBuffer(fixturePath);
   }
   const receipts=settle(fixture,NOW,30);
   const payload=compactItems(fixture.database);
@@ -1505,7 +1525,7 @@ async function main() {
   // with /var, whose physical path is /private/var; keep fixtures physical.
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-")));
   const dbPath = path.join(root, "ledger.sqlite");
-  const buffer = new LocalEventBuffer(dbPath);
+  const buffer = projectionFixtureBuffer(dbPath);
   const repoA = hash("a");
   const repoB = hash("b");
   const branchA = hash("c");
@@ -1892,7 +1912,7 @@ async function main() {
     // Separate expiry/clock fixture keeps the boundary proof independent from
     // the scale-shape repair backlog above.
     const expiryPath = path.join(root, "expiry.sqlite");
-    const expiry = new LocalEventBuffer(expiryPath);
+    const expiry = projectionFixtureBuffer(expiryPath);
     try {
       expiry.append(event({ sessionId: "expiry", observedAt: new Date(NOW.getTime() - 29 * DAY_MS).toISOString(),
         inputTokens: 10, outputTokens: 1, costUsd: 1 }));
@@ -1913,7 +1933,7 @@ async function main() {
     }
 
     const clockPath=path.join(root,"clock-only.sqlite");
-    const clockOnly=new LocalEventBuffer(clockPath);
+    const clockOnly=projectionFixtureBuffer(clockPath);
     const clockBefore=readySnapshot(clockOnly,30);
     const clockAdvanced=new Date(NOW.getTime()+60_000);
     const clockReceipt=clockOnly.projection.runMaintenance(clockAdvanced);
@@ -1926,7 +1946,7 @@ async function main() {
     clockOnly.close();
 
     const compactExpiryPath=path.join(root,"compact-expiry.sqlite");
-    const compactExpirySeed=new LocalEventBuffer(compactExpiryPath);
+    const compactExpirySeed=projectionFixtureBuffer(compactExpiryPath);
     compactExpirySeed.close();
     const compactExpiryDb=new Database(compactExpiryPath);
     dropProjectionState(compactExpiryDb);
@@ -1940,7 +1960,7 @@ async function main() {
         "metadata",new Date(NOW.getTime()-29*DAY_MS).toISOString(),"{}","[]",NOW.toISOString());
     })();
     compactExpiryDb.close();
-    const compactExpiry=new LocalEventBuffer(compactExpiryPath);
+    const compactExpiry=projectionFixtureBuffer(compactExpiryPath);
     settle(compactExpiry,NOW,20);
     const compactExpiryAdvanced=new Date(NOW.getTime()+2*DAY_MS);
     const compactExpiryReceipts=[compactExpiry.projection.runMaintenance(compactExpiryAdvanced)];
@@ -1962,7 +1982,7 @@ async function main() {
     // Generic sessionless zero-value spans dominate the live raw history. They
     // must backfill into compressed segments, not one six-index fact per span.
     const compactPath=path.join(root,"compact.sqlite");
-    const compactSeed=new LocalEventBuffer(compactPath);
+    const compactSeed=projectionFixtureBuffer(compactPath);
     compactSeed.close();
     const compactDb=new Database(compactPath);
     dropProjectionState(compactDb);
@@ -1979,7 +1999,7 @@ async function main() {
     compactDb.pragma("wal_checkpoint(TRUNCATE)");
     compactDb.close();
     const compactBaseBytes=fs.statSync(compactPath).size;
-    let compact=new LocalEventBuffer(compactPath);
+    let compact=projectionFixtureBuffer(compactPath);
     const compactReceipts=settle(compact,NOW,240);
     const compactFacts=(compact.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n;
     const compactSegments=(compact.database.prepare(`select count(*) as n from dashboard_compact_segments`).get() as {n:number}).n;
@@ -2000,7 +2020,7 @@ async function main() {
         fileDeltaBytesPerRaw:Number((compactFileDeltaBytes/100_000).toFixed(2)),slices:compactReceipts.length});
 
     const activePath=path.join(root,"active-compact.sqlite");
-    const active=new LocalEventBuffer(activePath);
+    const active=projectionFixtureBuffer(activePath);
     const activeAppendStarted=performance.now();
     for(let index=0;index<5_000;index++)active.append(event({
       source:"codex",eventType:"assistant_response",actionClass:"other",
@@ -2071,7 +2091,7 @@ async function main() {
       mutationDependencyReopen);
 
     const pendingPath=path.join(root,"pending-compact-lifecycle.sqlite");
-    let pending=new LocalEventBuffer(pendingPath);
+    let pending=projectionFixtureBuffer(pendingPath);
     const pendingEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other",
       observedAt:new Date(NOW.getTime()-DAY_MS).toISOString()});
     pending.append(pendingEvent);
@@ -2082,13 +2102,13 @@ async function main() {
       `select reason from dashboard_projection_repairs where raw_rowid=?`,
     ).get(pendingRawRowid) as {reason:string}).reason;
     pending.close();
-    pending=new LocalEventBuffer(pendingPath);
+    pending=projectionFixtureBuffer(pendingPath);
     pending.database.prepare(
       `update buffered_events set source='claude_code',event_type='tool_use',
         action_class='read',observed_at=? where rowid=?`,
     ).run(new Date(NOW.getTime()-2*DAY_MS).toISOString(),pendingRawRowid);
     pending.close();
-    pending=new LocalEventBuffer(pendingPath);
+    pending=projectionFixtureBuffer(pendingPath);
     const pendingFinalObservedAt=new Date(NOW.getTime()-3*DAY_MS).toISOString();
     pending.database.prepare(
       `update buffered_events set action_class='edit',observed_at=? where rowid=?`,
@@ -2098,7 +2118,7 @@ async function main() {
     ).get(pendingRawRowid) as {reason:string}).reason;
     const pendingBacklogBeforeDrain=pending.projection.status().backlog;
     pending.close();
-    pending=new LocalEventBuffer(pendingPath);
+    pending=projectionFixtureBuffer(pendingPath);
     const pendingReceipts=settle(pending,NOW,20);
     const pendingProjected=readySnapshot(pending,30).summary.totals as Record<string,number>;
     const pendingPayload=compactItems(pending.database);
@@ -2108,7 +2128,7 @@ async function main() {
       cancellations:(pending.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
     };
     pending.close();
-    pending=new LocalEventBuffer(pendingPath);
+    pending=projectionFixtureBuffer(pendingPath);
     const pendingReplay=settle(pending,NOW,5);
     check("pending_compact_insert_updates_preserve_never_projected_receipt_and_apply_latest_once",
       pendingInsertReason==="raw_insert"&&pendingReasonBeforeDrain==="raw_insert"&&
@@ -2125,14 +2145,14 @@ async function main() {
     pending.close();
 
     const promotePath=path.join(root,"pending-compact-promote.sqlite");
-    let promote=new LocalEventBuffer(promotePath);
+    let promote=projectionFixtureBuffer(promotePath);
     const promoteEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other"});
     promote.append(promoteEvent);
     const promoteRawRowid=(promote.database.prepare(
       `select rowid as rawRowid from buffered_events where id=?`,
     ).get(promoteEvent.id) as {rawRowid:number}).rawRowid;
     promote.close();
-    promote=new LocalEventBuffer(promotePath);
+    promote=projectionFixtureBuffer(promotePath);
     promote.database.prepare(
       `update buffered_events set session_id='pending-promote-session',model='promoted-model',
         input_tokens=7,output_tokens=2,cost_usd=0.000009 where rowid=?`,
@@ -2141,7 +2161,7 @@ async function main() {
       `select reason from dashboard_projection_repairs where raw_rowid=?`,
     ).get(promoteRawRowid) as {reason:string}).reason;
     promote.close();
-    promote=new LocalEventBuffer(promotePath);
+    promote=projectionFixtureBuffer(promotePath);
     settle(promote,NOW,20);
     const promoteTotals=readySnapshot(promote,30).summary.totals as Record<string,number>;
     const promoteState={
@@ -2151,7 +2171,7 @@ async function main() {
       mutations:(promote.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
     };
     promote.close();
-    promote=new LocalEventBuffer(promotePath);
+    promote=projectionFixtureBuffer(promotePath);
     const promoteReplay=settle(promote,NOW,5);
     check("pending_compact_insert_promote_applies_one_full_fact_after_reopen",
       promoteReason==="raw_insert"&&promoteState.facts===1&&promoteState.compactItems===0&&
@@ -2162,17 +2182,17 @@ async function main() {
     promote.close();
 
     const pendingDeletePath=path.join(root,"pending-compact-delete.sqlite");
-    let pendingDelete=new LocalEventBuffer(pendingDeletePath);
+    let pendingDelete=projectionFixtureBuffer(pendingDeletePath);
     const pendingDeleteEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other"});
     pendingDelete.append(pendingDeleteEvent);
     const pendingDeleteRawRowid=(pendingDelete.database.prepare(
       `select rowid as rawRowid from buffered_events where id=?`,
     ).get(pendingDeleteEvent.id) as {rawRowid:number}).rawRowid;
     pendingDelete.close();
-    pendingDelete=new LocalEventBuffer(pendingDeletePath);
+    pendingDelete=projectionFixtureBuffer(pendingDeletePath);
     pendingDelete.database.prepare(`delete from buffered_events where rowid=?`).run(pendingDeleteRawRowid);
     pendingDelete.close();
-    pendingDelete=new LocalEventBuffer(pendingDeletePath);
+    pendingDelete=projectionFixtureBuffer(pendingDeletePath);
     settle(pendingDelete,NOW,20);
     const pendingDeleteTotals=readySnapshot(pendingDelete,30).summary.totals as Record<string,number>;
     const pendingDeleteState={
@@ -2189,7 +2209,7 @@ async function main() {
     pendingDelete.close();
 
     const failedPendingPath=path.join(root,"failed-pending-compact.sqlite");
-    let failedPending=new LocalEventBuffer(failedPendingPath);
+    let failedPending=projectionFixtureBuffer(failedPendingPath);
     failedPending.projection.failNextApplyForProof();
     const failedPendingEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other"});
     failedPending.append(failedPendingEvent);
@@ -2200,7 +2220,7 @@ async function main() {
       `select reason from dashboard_projection_repairs where raw_rowid=?`,
     ).get(failedPendingRawRowid) as {reason:string}).reason;
     failedPending.close();
-    failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending=projectionFixtureBuffer(failedPendingPath);
     failedPending.database.prepare(
       `update buffered_events set source='claude_code',event_type='tool_use',action_class='read' where rowid=?`,
     ).run(failedPendingRawRowid);
@@ -2208,7 +2228,7 @@ async function main() {
       `select reason from dashboard_projection_repairs where raw_rowid=?`,
     ).get(failedPendingRawRowid) as {reason:string}).reason;
     failedPending.close();
-    failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending=projectionFixtureBuffer(failedPendingPath);
     settle(failedPending,NOW,20);
     const failedPendingPayload=compactItems(failedPending.database);
     check("failed_initial_compact_apply_update_preserves_never_projected_state_across_reopen",
@@ -2223,7 +2243,7 @@ async function main() {
     ).run(failedPendingRawRowid);
     const irrelevantBacklog=failedPending.projection.status().backlog;
     failedPending.close();
-    failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending=projectionFixtureBuffer(failedPendingPath);
     settle(failedPending,NOW,20);
     const irrelevantPayload=compactItems(failedPending.database);
     const irrelevantTotals=readySnapshot(failedPending,30).summary.totals as Record<string,number>;
@@ -2239,7 +2259,7 @@ async function main() {
     ).run(meaningfulObservedAt,failedPendingRawRowid);
     const meaningfulBacklog=failedPending.projection.status().backlog;
     failedPending.close();
-    failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending=projectionFixtureBuffer(failedPendingPath);
     settle(failedPending,NOW,20);
     const meaningfulPayload=compactItems(failedPending.database);
     const meaningfulRemaining={
@@ -2272,7 +2292,7 @@ async function main() {
     ).run(coalescedObservedAt,failedPendingRawRowid);
     const coalescedBacklog=failedPending.projection.status().backlog;
     failedPending.close();
-    failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending=projectionFixtureBuffer(failedPendingPath);
     settle(failedPending,NOW,20);
     const coalescedPayload=compactItems(failedPending.database);
     check("projected_irrelevant_then_meaningful_update_coalesces_one_old_state_mutation",
@@ -2288,7 +2308,7 @@ async function main() {
     failedPending.database.prepare(`delete from buffered_events where rowid=?`).run(failedPendingRawRowid);
     const projectedDeleteBacklog=failedPending.projection.status().backlog;
     failedPending.close();
-    failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending=projectionFixtureBuffer(failedPendingPath);
     settle(failedPending,NOW,20);
     const projectedDeleteState={
       raw:(failedPending.database.prepare(`select count(*) as n from buffered_events`).get() as {n:number}).n,
@@ -2305,7 +2325,7 @@ async function main() {
     failedPending.close();
 
     const c0UpgradePath=path.join(root,"c0-compact-summary-upgrade.sqlite");
-    let c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    let c0Upgrade=projectionFixtureBuffer(c0UpgradePath);
     for(let index=0;index<100;index++)c0Upgrade.append(event({
       source:index<50?"codex":"claude_code",
       eventType:"assistant_response",
@@ -2351,7 +2371,7 @@ async function main() {
     downgradeCompactProjectionToC0(c0Shape);
     c0Shape.close();
 
-    c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    c0Upgrade=projectionFixtureBuffer(c0UpgradePath);
     const migrationColumns=new Set((c0Upgrade.database.pragma(
       "table_info(dashboard_projection_control)",
     ) as Array<{name:string}>).map((row)=>row.name));
@@ -2379,7 +2399,7 @@ async function main() {
       {c0DrainReceipt,c0PhysicalState,migrationMarker,migrationJobsBeforeReopen,
         migrationNullBuckets,migrationStatus,migrationStale});
     c0Upgrade.close();
-    c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    c0Upgrade=projectionFixtureBuffer(c0UpgradePath);
     const migrationJobsAfterReopen=c0Upgrade.database.prepare(
       `select bucket_day as bucketDay,revision,processing_revision as processingRevision,
         high_water_segment as highWater,cursor_segment as cursorSegment,queued_at as queuedAt
@@ -2441,7 +2461,7 @@ async function main() {
         migrationRawBounds,migrationProjectedBounds,migrationRawSources,
         migrationProjectedSources,migrationFinalState});
     c0Upgrade.close();
-    c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    c0Upgrade=projectionFixtureBuffer(c0UpgradePath);
     const migrationIdleReceipts=settle(c0Upgrade,NOW,5);
     check("c0_compact_summary_upgrade_marker_prevents_second_reopen_reseed",
       migrationIdleReceipts.length===0&&
@@ -2453,7 +2473,7 @@ async function main() {
     c0Upgrade.close();
 
     const gcPath=path.join(root,"compact-gc.sqlite");
-    const gcSeed=new LocalEventBuffer(gcPath);
+    const gcSeed=projectionFixtureBuffer(gcPath);
     gcSeed.close();
     const gcDb=new Database(gcPath);
     dropProjectionState(gcDb);
@@ -2471,7 +2491,7 @@ async function main() {
       }
     })();
     gcDb.close();
-    let gc=new LocalEventBuffer(gcPath);
+    let gc=projectionFixtureBuffer(gcPath);
     settle(gc,NOW,80);
     gc.database.pragma("wal_checkpoint(TRUNCATE)");
     const physicalBefore={
@@ -2524,7 +2544,7 @@ async function main() {
         secondGc.compactGcItemsVisited<=1_000),
       {first:jobsAfterFirst,second:jobsAfterSecond});
     gc.close();
-    gc=new LocalEventBuffer(gcPath);
+    gc=projectionFixtureBuffer(gcPath);
     const reopenedJobs=(gc.database.prepare(
       `select count(*) as n from dashboard_compact_gc_days where cursor_segment>0`,
     ).get() as {n:number}).n;
@@ -2573,7 +2593,7 @@ async function main() {
     compact.database.prepare(`delete from buffered_events where rowid=2`).run();
     const mutationBeforeCrash=compact.projection.status();
     compact.close();
-    compact=new LocalEventBuffer(compactPath);
+    compact=projectionFixtureBuffer(compactPath);
     const compactMutationReceipts=settle(compact,NOW,260);
     const compactRaw=dashboardSummary(compact.database,30);
     const compactAfter=readySnapshot(compact,30);
@@ -2594,7 +2614,7 @@ async function main() {
     compact.database.prepare(`delete from buffered_events where rowid=1`).run();
     const factDeleteBeforeCrash=compact.projection.status();
     compact.close();
-    compact=new LocalEventBuffer(compactPath);
+    compact=projectionFixtureBuffer(compactPath);
     settle(compact,NOW,30);
     const factDeleteRaw=dashboardSummary(compact.database,30);
     const factDeleteProjected=readySnapshot(compact,30).summary.totals as Record<string,number>;
@@ -2611,7 +2631,7 @@ async function main() {
     // Live evidence found a 233,665-row session. The reducer therefore proves
     // a larger real fixture, not a scaled-down timing proxy.
     const giantPath=path.join(root,"giant-session.sqlite");
-    let giant=new LocalEventBuffer(giantPath);
+    let giant=projectionFixtureBuffer(giantPath);
     const giantSession=hash("9"),giantRepoA=hash("7"),giantRepoB=hash("8");
     const giantAccountA=hash("5"),giantAccountB=hash("6"),giantMachine=hash("4");
     const giantInsert=giant.database.prepare(
@@ -2646,7 +2666,7 @@ async function main() {
       ).get(giantSession)),
       {first:giantFirst,projection:staleDuringGiant.kind==="ready"?staleDuringGiant.snapshot.projection:staleDuringGiant});
     giant.close();
-    giant=new LocalEventBuffer(giantPath);
+    giant=projectionFixtureBuffer(giantPath);
     let giantSlices=1,eventLoopYields=0;
     while(giant.projection.status().backlog.dirtySessions){
       const receipt=giant.projection.runMaintenance(NOW);
@@ -2678,7 +2698,7 @@ async function main() {
     // reopen as an upgrade, crash/reopen after one slice, append concurrently,
     // and require bounded fact + independent parity passes before ready.
     const legacyPath = path.join(root, "legacy.sqlite");
-    const legacySeed = new LocalEventBuffer(legacyPath);
+    const legacySeed = projectionFixtureBuffer(legacyPath);
     legacySeed.close();
     const legacyDb = new Database(legacyPath);
     const legacyInsert = legacyDb.prepare(
@@ -2704,7 +2724,7 @@ async function main() {
     dropProjectionState(legacyDb);
     legacyDb.close();
 
-    let legacy = new LocalEventBuffer(legacyPath);
+    let legacy = projectionFixtureBuffer(legacyPath);
     legacy.database.prepare(`update buffered_events set created_at='2000-01-01T00:00:00.000Z',uploaded_at=? where rowid=1`).run(NOW.toISOString());
     const migrationPrune=legacy.prune(90);
     check("legacy_constructor_does_not_scan_or_materialize_history",
@@ -2718,7 +2738,7 @@ async function main() {
     check("legacy_backfill_slice_is_bounded", firstSlice.backfillRowsVisited === 1_000 && firstSlice.metricRowsVisited===1_000&&firstSlice.parityRowsVisited === 0,
       firstSlice as unknown as Record<string, unknown>);
     legacy.close();
-    legacy = new LocalEventBuffer(legacyPath);
+    legacy = projectionFixtureBuffer(legacyPath);
     legacy.database.prepare(
       `insert into metric_samples (id,source,metric_name,observed_at,value,created_at) values (?,?,?,?,?,?)`,
     ).run("legacy-metric-concurrent","codex","proof.metric",NOW.toISOString(),1,NOW.toISOString());
@@ -2770,7 +2790,7 @@ async function main() {
     };
 
     const captureHealthFixture = (label: string, eventAgeMs: number) => {
-      const fixture = new LocalEventBuffer(path.join(root, `capture-health-${label}.sqlite`));
+      const fixture = projectionFixtureBuffer(path.join(root, `capture-health-${label}.sqlite`));
       for (const [source, sessions] of [["claude_code", 2], ["codex", 2], ["grok", 1]] as const) {
         for (let index = 0; index < sessions; index += 1) {
           fixture.append(event({
@@ -2885,7 +2905,7 @@ async function main() {
 
     // Negative control for .63: a configured source with no events reports a
     // distinct no_events status instead of being absent or reading healthy.
-    const empty = new LocalEventBuffer(path.join(root, "capture-health-no-events.sqlite"));
+    const empty = projectionFixtureBuffer(path.join(root, "capture-health-no-events.sqlite"));
     empty.append(event({
       source: "codex", sessionId: uuid(910_001),
       observedAt: new Date(NOW.getTime() - 5 * 60_000).toISOString(),
@@ -2924,7 +2944,7 @@ async function main() {
     // Bead eco-6hoxj.73.2, REVIEW-73 r1 F5: when every configured source is
     // no_events, overall must not read as a healthy host. Mixed unused
     // sources still leave overall green (check above).
-    const neverCaptured = new LocalEventBuffer(path.join(root, "capture-health-all-no-events.sqlite"));
+    const neverCaptured = projectionFixtureBuffer(path.join(root, "capture-health-all-no-events.sqlite"));
     for (const source of ["claude_code", "codex"] as const) {
       neverCaptured.projection.recordCaptureActivity({
         source,
@@ -2957,7 +2977,7 @@ async function main() {
     // Bead eco-6hoxj.73.2, REVIEW-73 r1 F6: `receipt.error` still stamps
     // `last_error_code` for finance, but it is not a capture-health scan state.
     // Restoring the dead `describeCaptureScan` error branch fails both checks.
-    const errorScan = new LocalEventBuffer(path.join(root, "capture-health-scan-error.sqlite"));
+    const errorScan = projectionFixtureBuffer(path.join(root, "capture-health-scan-error.sqlite"));
     errorScan.append(event({
       source: "codex", sessionId: uuid(910_101),
       observedAt: new Date(NOW.getTime() - 5 * 60_000).toISOString(),
@@ -3011,7 +3031,7 @@ async function main() {
     // never buy a green label — least of all on a hook-only source, where the
     // ledger is the only truth and no later event can correct the stamp.
     const futureDated = (label: string, sources: Array<{ source: "claude_code" | "codex" | "grok"; ageMs: number }>) => {
-      const fixture = new LocalEventBuffer(path.join(root, `capture-health-${label}.sqlite`));
+      const fixture = projectionFixtureBuffer(path.join(root, `capture-health-${label}.sqlite`));
       sources.forEach(({ source, ageMs }, index) => {
         fixture.append(event({
           source,
@@ -3206,7 +3226,7 @@ async function main() {
     // the body to exactly this callable; nothing between the socket and here
     // touches a timestamp, so this IS the hook intake path for `observedAt`.
     const hookConfig = collectorConfigSchema.parse({});
-    const hookFixture = new LocalEventBuffer(path.join(root, "intake-clamp-hook.sqlite"));
+    const hookFixture = projectionFixtureBuffer(path.join(root, "intake-clamp-hook.sqlite"));
     const hookNow = () => NOW.getTime();
     const postHook = (observedAt: string, session: number, now = hookNow) => appendForwardedHook({
       hook_event_name: "Stop",
@@ -3283,7 +3303,7 @@ async function main() {
           usage: { input_tokens: tokens, output_tokens: 0 } },
       })}\n`);
     };
-    const tailerFixture = new LocalEventBuffer(path.join(root, "intake-clamp-tailer.sqlite"));
+    const tailerFixture = projectionFixtureBuffer(path.join(root, "intake-clamp-tailer.sqlite"));
     const scanIntakeTranscripts = async () => {
       const tailer = new TranscriptTailer(tailerFixture, intakeTranscriptRoot);
       try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
@@ -3390,7 +3410,7 @@ async function main() {
       })}\n`);
     };
     const enrolledTranscriptRoot = path.join(root, "intake-clamp-enrolled-transcript");
-    const enrolledTranscript = new LocalEventBuffer(
+    const enrolledTranscript = projectionFixtureBuffer(
       path.join(root, "intake-clamp-enrolled-transcript.sqlite"),
       { workspaceId: enrolledWorkspace, enrollmentNow: () => enrolledCutoff },
     );
@@ -3426,7 +3446,7 @@ async function main() {
       ].map((record) => JSON.stringify(record)).join("\n") + "\n");
     };
     const enrolledRolloutRoot = path.join(root, "intake-clamp-enrolled-rollout");
-    const enrolledRollout = new LocalEventBuffer(
+    const enrolledRollout = projectionFixtureBuffer(
       path.join(root, "intake-clamp-enrolled-rollout.sqlite"),
       { workspaceId: enrolledWorkspace, enrollmentNow: () => enrolledCutoff },
     );
@@ -3456,7 +3476,7 @@ async function main() {
         usage: { input_tokens: 50, output_tokens: 0 } },
     })}\n`);
     fs.utimesSync(mtimeTranscriptFile, futureMtime, futureMtime);
-    const mtimeTranscript = new LocalEventBuffer(path.join(root, "intake-clamp-mtime-transcript.sqlite"));
+    const mtimeTranscript = projectionFixtureBuffer(path.join(root, "intake-clamp-mtime-transcript.sqlite"));
     const mtimeTranscriptScan = await (async () => {
       const tailer = new TranscriptTailer(mtimeTranscript, mtimeTranscriptRoot);
       try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
@@ -3489,7 +3509,7 @@ async function main() {
           reasoning_output_tokens: 0 } } } },
     ].map((record) => JSON.stringify(record)).join("\n") + "\n");
     fs.utimesSync(mtimeRolloutFile, futureMtime, futureMtime);
-    const mtimeRollout = new LocalEventBuffer(path.join(root, "intake-clamp-mtime-rollout.sqlite"));
+    const mtimeRollout = projectionFixtureBuffer(path.join(root, "intake-clamp-mtime-rollout.sqlite"));
     const mtimeRolloutScan = await (async () => {
       const tailer = new RolloutTailer(mtimeRollout, mtimeRolloutRoot, () => []);
       try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
@@ -3580,7 +3600,7 @@ async function main() {
           row.reason.includes("has not reached the current UTC day (lag 2m)")),
         { rows: midnightRows });
     } finally { Date.now = savedNow; }
-    const noTokenCount=new LocalEventBuffer(path.join(root,"capture-health-no-token-count.sqlite"));
+    const noTokenCount=projectionFixtureBuffer(path.join(root,"capture-health-no-token-count.sqlite"));
     noTokenCount.append(event({source:"codex",sessionId:uuid(930_001),eventType:"tool_use",observedAt:eventAt}));
     settle(noTokenCount,NOW,30);
     const noTokenRow=(readySnapshot(noTokenCount,30).status.health as {sources:CountHealth[]})
@@ -3606,7 +3626,7 @@ async function main() {
       missingNonToken.ledgerSessionsToday===null&&missingNonToken.status==="amber"&&
         missingNonToken.sessionCountProjection?.ledgerState==="lagging",{row:missingNonToken});
     noTokenCount.close();
-    const unlinkedCount=new LocalEventBuffer(path.join(root,"capture-health-unlinked-token-count.sqlite"));
+    const unlinkedCount=projectionFixtureBuffer(path.join(root,"capture-health-unlinked-token-count.sqlite"));
     unlinkedCount.append(event({source:"grok",observedAt:eventAt,inputTokens:10,outputTokens:1}));
     settle(unlinkedCount,NOW,30);
     const unlinkedRow=(readySnapshot(unlinkedCount,30).status.health as {sources:CountHealth[]})
@@ -3708,7 +3728,7 @@ async function main() {
     // any-kind end as token evidence and keep withholding the counts.
     const upgradePath=path.join(root,"capture-health-token-clock-upgrade.sqlite");
     const tokenEventAt=new Date(NOW.getTime()-5*60_000).toISOString();
-    const upgraded=new LocalEventBuffer(upgradePath);
+    const upgraded=projectionFixtureBuffer(upgradePath);
     upgraded.append(event({source:"grok",sessionId:uuid(930_010),observedAt:tokenEventAt,
       inputTokens:1_200,outputTokens:340,costUsd:0.004}));
     upgraded.append(event({source:"grok",sessionId:uuid(930_010),eventType:"tool_use",
@@ -3720,7 +3740,7 @@ async function main() {
       legacyLedger.exec(`alter table ${table} drop column last_token_event_at`);
     }
     legacyLedger.close();
-    const reopened=new LocalEventBuffer(upgradePath);
+    const reopened=projectionFixtureBuffer(upgradePath);
     // Read before any maintenance: the open-time migration is what must fill it.
     const backfilled=(reopened.database.prepare(
       `select last_token_event_at as at from dashboard_session_source_window where days=7`,
@@ -3745,7 +3765,7 @@ async function main() {
     // written by a newer binary is refused rather than half-read.
     const downgradeTokenAt=new Date(NOW.getTime()-5*60_000).toISOString();
     const downgradePath=path.join(root,"projection-schema-downgrade.sqlite");
-    const newerBinary=new LocalEventBuffer(downgradePath);
+    const newerBinary=projectionFixtureBuffer(downgradePath);
     newerBinary.append(event({source:"grok",sessionId:uuid(940_010),observedAt:downgradeTokenAt,
       inputTokens:1_200,outputTokens:340,costUsd:0.004}));
     settle(newerBinary,NOW,30);
@@ -3766,7 +3786,7 @@ async function main() {
     publishedByNewer.exec(`alter table dashboard_repo_session_window add column future_column text`);
     publishedByNewer.close();
 
-    const rolledBack=new LocalEventBuffer(downgradePath);
+    const rolledBack=projectionFixtureBuffer(downgradePath);
     const refusedStatus=rolledBack.projection.status();
     const refusedRead=rolledBack.projection.readSnapshot(30);
     // The frozen payload is still on disk: the count is withheld by the guard,
@@ -3807,7 +3827,7 @@ async function main() {
     // DASHBOARD_SCHEMA_VERSION, finance publication among them, would otherwise
     // read a settled projection as unsettled for good.
     const stampPath=path.join(root,"projection-schema-stamp.sqlite");
-    const stamped=new LocalEventBuffer(stampPath);
+    const stamped=projectionFixtureBuffer(stampPath);
     stamped.append(event({source:"grok",sessionId:uuid(940_020),observedAt:downgradeTokenAt,
       inputTokens:900,outputTokens:120,costUsd:0.002}));
     settle(stamped,NOW,30);
@@ -3818,7 +3838,7 @@ async function main() {
       asPre360.exec(`alter table ${table} drop column last_token_event_at`);
     }
     asPre360.close();
-    const stampReopened=new LocalEventBuffer(stampPath);
+    const stampReopened=projectionFixtureBuffer(stampPath);
     const adoptedVersion=(stampReopened.database.prepare(
       `select schema_version as version from dashboard_projection_control where singleton=1`)
       .get() as {version:number}).version;
@@ -3841,7 +3861,7 @@ async function main() {
     // name it. This is that documented rollback, run against the exact
     // positional insert-select the pre-#360 collector compiled every tick.
     const manualPath=path.join(root,"projection-manual-rollback.sqlite");
-    const manual=new LocalEventBuffer(manualPath);
+    const manual=projectionFixtureBuffer(manualPath);
     manual.append(event({source:"grok",sessionId:uuid(940_030),observedAt:downgradeTokenAt,
       inputTokens:700,outputTokens:90,costUsd:0.001}));
     settle(manual,NOW,30);
@@ -3882,7 +3902,7 @@ async function main() {
       {});
 
     const compactBacklogPath=path.join(root,"projection-schema-newer-compact-backlog.sqlite");
-    const compactBacklog=new LocalEventBuffer(compactBacklogPath);
+    const compactBacklog=projectionFixtureBuffer(compactBacklogPath);
     compactBacklog.append(event({source:"grok",sessionId:uuid(940_040),observedAt:downgradeTokenAt,
       inputTokens:400,outputTokens:50,costUsd:0.001}));
     settle(compactBacklog,NOW,30);
@@ -3897,7 +3917,7 @@ async function main() {
        last_schedule,queued_at,updated_at)
       values ('2026-07-01',1,0,null,0,0,'2026-07-15T12:00:00.000Z','2026-07-15T12:00:00.000Z')`);
     compactBacklogDb.close();
-    const compactBacklogRefused=new LocalEventBuffer(compactBacklogPath);
+    const compactBacklogRefused=projectionFixtureBuffer(compactBacklogPath);
     const compactStored=(compactBacklogRefused.database.prepare(
       `select degraded_reason as reason, compact_summary_migration_complete as complete
        from dashboard_projection_control where singleton=1`)
@@ -3915,7 +3935,7 @@ async function main() {
     compactBacklogRefused.close();
 
     const missingRowPath=path.join(root,"projection-control-row-missing.sqlite");
-    const missingRow=new LocalEventBuffer(missingRowPath);
+    const missingRow=projectionFixtureBuffer(missingRowPath);
     missingRow.append(event({source:"grok",sessionId:uuid(940_050),observedAt:downgradeTokenAt,
       inputTokens:300,outputTokens:40,costUsd:0.001}));
     settle(missingRow,NOW,30);
@@ -3931,7 +3951,7 @@ async function main() {
       `select 1 from sqlite_master where type='table' and name='dashboard_projection_control'`,
     ).get());
     missingRowDb.close();
-    const missingRowReopened=new LocalEventBuffer(missingRowPath);
+    const missingRowReopened=projectionFixtureBuffer(missingRowPath);
     const missingStatus=missingRowReopened.projection.status();
     const missingStored=(missingRowReopened.database.prepare(
       `select degraded_reason as reason, ready from dashboard_projection_control where singleton=1`)
@@ -3948,7 +3968,7 @@ async function main() {
         tick:{ready:missingTick.ready,degraded:missingTick.degraded}});
     missingRowReopened.close();
 
-    const shapeLedger=new LocalEventBuffer(path.join(root,"projection-schema-shape-pin.sqlite"));
+    const shapeLedger=projectionFixtureBuffer(path.join(root,"projection-schema-shape-pin.sqlite"));
     const liveShapeDigest=dashboardProjectionSchemaShapeDigest(shapeLedger.database);
     check("dashboard_schema_shape_digest_matches_the_version_pin",
       liveShapeDigest===DASHBOARD_SCHEMA_SHAPE_DIGEST&&
@@ -3976,7 +3996,7 @@ async function main() {
       return { rootId: `root-${index}`, profileId: `profile-${index}`,
         installationEpochId: "epoch-baseline", source: "claude_code" as const, directory };
     });
-    const baselineBuffer = new LocalEventBuffer(path.join(root, "capture-health-baseline.sqlite"));
+    const baselineBuffer = projectionFixtureBuffer(path.join(root, "capture-health-baseline.sqlite"));
     baselineBuffer.append(event({
       source: "claude_code", sessionId: uuid(930_001),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
@@ -4077,7 +4097,7 @@ async function main() {
         return { rootId: `${label}-root-${index}`, profileId: `${label}-profile-${index}`,
           installationEpochId: "epoch-codex", source: "codex" as const, directory };
       });
-    const codexBuffer = new LocalEventBuffer(path.join(root, "capture-health-codex.sqlite"));
+    const codexBuffer = projectionFixtureBuffer(path.join(root, "capture-health-codex.sqlite"));
     codexBuffer.append(event({
       source: "codex", eventType: "usage_rollout", sessionId: uuid(930_002),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
@@ -4272,7 +4292,7 @@ async function main() {
     // `scanState: "limit_reached"`.
     const LIFETIME_LIMIT = 5;
     const limitCodexRoots = codexRoots(1, 1, "limit", 20);
-    const limitCodexBuffer = new LocalEventBuffer(
+    const limitCodexBuffer = projectionFixtureBuffer(
       path.join(root, "capture-health-codex-limit.sqlite"));
     limitCodexBuffer.append(event({
       source: "codex", eventType: "usage_rollout", sessionId: uuid(930_003),
@@ -4396,7 +4416,7 @@ async function main() {
       }).sources.find((row) => row.source === "codex")!;
     };
     const multiCodexRoots = codexRoots(1, 1, "limit-multi", MULTI_TICK_FILES / 2);
-    const multiCodexBuffer = new LocalEventBuffer(
+    const multiCodexBuffer = projectionFixtureBuffer(
       path.join(root, "capture-health-codex-limit-multi.sqlite"));
     multiCodexBuffer.append(event({
       source: "codex", eventType: "usage_rollout", sessionId: uuid(930_005),
@@ -4461,7 +4481,7 @@ async function main() {
           installationEpochId: "epoch-claude", source: "claude_code" as const, directory };
       });
     const claudeFixture = (label: string) => {
-      const fixture = new LocalEventBuffer(path.join(root, `capture-health-${label}.sqlite`));
+      const fixture = projectionFixtureBuffer(path.join(root, `capture-health-${label}.sqlite`));
       fixture.append(event({
         source: "claude_code", sessionId: uuid(930_004 + label.length),
         observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
@@ -4945,7 +4965,7 @@ async function main() {
     }
     const unitCodexRoots = [{ rootId: "unit-codex-root-0", profileId: "unit-codex-profile-0",
       installationEpochId: "epoch-codex", source: "codex" as const, directory: unitCodexDir }];
-    const unitCodexBuffer = new LocalEventBuffer(path.join(root, "capture-health-codex-unit.sqlite"));
+    const unitCodexBuffer = projectionFixtureBuffer(path.join(root, "capture-health-codex-unit.sqlite"));
     unitCodexBuffer.append(event({
       source: "codex", eventType: "usage_rollout", sessionId: uuid(930_006),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
@@ -5104,7 +5124,7 @@ async function main() {
     const explicitCodexRoots = [{ rootId: "explicit-codex-0", profileId: "explicit-codex-p",
       installationEpochId: "epoch-codex", source: "codex" as const,
       directory: explicitCodexDir }];
-    const explicitCodexBuffer = new LocalEventBuffer(
+    const explicitCodexBuffer = projectionFixtureBuffer(
       path.join(root, "capture-health-codex-explicit.sqlite"));
     explicitCodexBuffer.append(event({
       source: "codex", eventType: "usage_rollout", sessionId: uuid(930_007),
@@ -5261,7 +5281,7 @@ async function main() {
       message: { id: "idle-token-message", model: "claude-opus-5",
         usage: { input_tokens: 1200, output_tokens: 340 } } })}\n`);
     fs.utimesSync(idleFile, idleAt, idleAt);
-    const beforeRestart = new LocalEventBuffer(restartDbPath);
+    const beforeRestart = projectionFixtureBuffer(restartDbPath);
     beforeRestart.append(event({source: "claude_code", sessionId: uuid(950_001),
       observedAt: idleAt.toISOString(), inputTokens: 1200, outputTokens: 340}));
     beforeRestart.append(event({source: "claude_code", sessionId: uuid(950_001),
@@ -5299,7 +5319,7 @@ async function main() {
       where singleton=1`).run();
     staged.close();
 
-    const afterRestart = new LocalEventBuffer(restartDbPath);
+    const afterRestart = projectionFixtureBuffer(restartDbPath);
     let refreshRestartStatus: (() => boolean) | undefined;
     const restartServer = createCollectorServer(collectorConfigSchema.parse({ subscriptions }),
       afterRestart, {registerStatusRefresher: refresh => {refreshRestartStatus = refresh;}});
@@ -5357,7 +5377,7 @@ async function main() {
       message: {id: "missed-token-message", model: "claude-opus-5",
         usage: {input_tokens: 900, output_tokens: 90}}})}\n`);
     fs.utimesSync(missedFile, missedAt, missedAt);
-    const missed = new LocalEventBuffer(path.join(root, "capture-health-missed.sqlite"));
+    const missed = projectionFixtureBuffer(path.join(root, "capture-health-missed.sqlite"));
     settle(missed, NOW, 30);
     missed.projection.recordCaptureActivity({source: "claude_code",
       lastActivityAt: fs.statSync(missedFile).mtime.toISOString(), filesToday: 1,

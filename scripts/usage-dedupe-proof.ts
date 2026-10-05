@@ -279,7 +279,8 @@ function issue193EventClassAndOrderGaps() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-issue193-proof-"));
   const buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
   try {
-    // Gap 1a — legacy mixed CODEX session: tailer class is usage_rollout.
+    // Legacy Codex counters with no native payload/provenance are diagnostic
+    // gaps. They cannot suppress another response or become billable.
     const codexRollout = "i193-codex-rollout-mixed";
     rawUsageRow(buffer.database, { source: "codex", eventType: "usage_rollout",
       sessionId: codexRollout, model: "gpt-fable-5", inputTokens: 400, outputTokens: 40, costUsd: 4 });
@@ -308,17 +309,16 @@ function issue193EventClassAndOrderGaps() {
       model: "claude-fable-5" });
 
     settle(buffer);
-    // Expected: 2.0 (rollout session, live only) + 1.0 (otel session, live only)
-    //           + 9.9 (no-usage-live control keeps backfill) = 12.9
+    // Expected: 0 Codex admitted usage + 1.0 Claude live + 9.9 Claude control.
     let projected30 = windowCostUsd(buffer.database, 30);
-    check("i193_rollout_and_otel_live_siblings_suppress_backfill",
-      Math.abs(projected30 - 12.9) < 1e-6,
-      { projected30, expected: 12.9 });
+    check("i193_unqualified_codex_is_gap_and_claude_live_suppresses_backfill",
+      Math.abs(projected30 - 10.9) < 1e-6,
+      { projected30, expected: 10.9 });
 
     let authority = (readySnapshot(buffer, 30).summary as Record<string, unknown>).usageAuthority as
       { rule: string; backfillSessionsSuppressed: number };
     check("i193_summary_counts_dual_path_sessions_by_class",
-      authority.backfillSessionsSuppressed === 2 && authority.rule === "live_capture_usage_wins",
+      authority.backfillSessionsSuppressed === 1 && authority.rule === "live_capture_usage_wins",
       authority);
 
     // Gap 2 — transcript-first arrival order. Project the tailer fact with no
@@ -329,7 +329,7 @@ function issue193EventClassAndOrderGaps() {
     settle(buffer);
     const transcriptFirstAlone = windowCostUsd(buffer.database, 30);
     check("i193_transcript_first_counts_before_sibling",
-      Math.abs(transcriptFirstAlone - 18.9) < 1e-6, // 12.9 + 6.0
+      Math.abs(transcriptFirstAlone - 16.9) < 1e-6, // 10.9 + 6.0
       { transcriptFirstAlone });
     rawUsageRow(buffer.database, { eventType: "assistant_response", sessionId: lateLive,
       model: "claude-fable-5", inputTokens: 150, outputTokens: 15, costUsd: 2 });
@@ -345,20 +345,20 @@ function issue193EventClassAndOrderGaps() {
     settle(buffer);
 
     projected30 = windowCostUsd(buffer.database, 30);
-    // Converged total: 12.9 + 2.0 (late live wins) + 1.25 (otel wins) = 16.15
+    // Converged total: 10.9 + 2.0 (late live wins) + 1.25 (otel wins) = 14.15
     check("i193_late_live_sibling_rederives_projected_backfill_fact",
-      Math.abs(projected30 - 16.15) < 1e-6,
-      { projected30, expected: 16.15 });
+      Math.abs(projected30 - 14.15) < 1e-6,
+      { projected30, expected: 14.15 });
 
     const lifetime = readySnapshot(buffer, 30).status.stats as Record<string, number>;
     check("i193_converged_lifetime_single_counted",
-      Math.abs(Number(lifetime.totalCostUsd) - 16.15) < 1e-6,
+      Math.abs(Number(lifetime.totalCostUsd) - 14.15) < 1e-6,
       { totalCostUsd: lifetime.totalCostUsd });
 
     authority = (readySnapshot(buffer, 30).summary as Record<string, unknown>).usageAuthority as
       { rule: string; backfillSessionsSuppressed: number };
-    check("i193_summary_tracks_all_four_suppressed_sessions",
-      authority.backfillSessionsSuppressed === 4,
+    check("i193_summary_tracks_three_claude_suppressed_sessions",
+      authority.backfillSessionsSuppressed === 3,
       authority);
 
     const state = buffer.projection.status();

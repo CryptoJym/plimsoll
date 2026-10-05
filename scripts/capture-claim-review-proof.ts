@@ -37,6 +37,7 @@ import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 
 const completion = createProofCompletion("capture-claim-review", 6);
 const results: Array<{ name: string; passed: boolean; detail: Record<string, unknown> }> = [];
@@ -85,14 +86,14 @@ function event(observedMs: number) {
     id: `00000000-0000-4000-8000-${String(700_000 + eventIndex).padStart(12, "0")}`,
     sessionId: `00000000-0000-4000-8000-${String(600_000 + eventIndex).padStart(12, "0")}`,
     source: "codex",
-    model: "gpt-6-sol",
+    ...nativeCodexFixture(String(eventIndex)),
     dataMode: "metadata",
     eventType: "assistant_response",
     observedAt: iso(observedMs),
     actionClass: "other",
     inputTokens: 3,
     outputTokens: 1,
-    metadata: { proof: "capture-claim-review" },
+    metadata: { ...nativeCodexFixture(String(eventIndex)).metadata, proof: "capture-claim-review" },
   });
 }
 

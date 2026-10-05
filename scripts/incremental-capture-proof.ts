@@ -1067,16 +1067,18 @@ async function proveDeferredRepoContextOccurrences() {
       rolloutRoot,
       () => [],
     ).scan({ scope: "full" });
-    assert.equal(liveCovered.sessionsSkippedOtlpCovered, 1);
-    assert.equal(occurrenceBuffer.repoContextInflightCount(), 3);
+    // A legacy session-wide live marker is not per-response evidence.
+    assert.equal(liveCovered.sessionsSkippedOtlpCovered, 0);
+    assert.equal(liveCovered.eventsAppended, 1);
+    assert.equal(occurrenceBuffer.repoContextInflightCount(), 4);
 
     const childRequests = occurrenceBuffer.finishChildRepoContextRun();
     assert.equal(
       childRequests.length,
-      3,
+      4,
       "the cross-slice transcript conflict must cancel its child-owned request",
     );
-    assert.equal(occurrenceBuffer.repoContextInflightCount(), 3);
+    assert.equal(occurrenceBuffer.repoContextInflightCount(), 4);
     const usageRowsBeforeResolution = (occurrenceBuffer.database.prepare(
       `select count(*) as count from buffered_events
        where event_type in ('usage_rollout', 'usage_transcript')`,
@@ -1084,7 +1086,7 @@ async function proveDeferredRepoContextOccurrences() {
     const unknownApply = occurrenceBuffer.applyRepoContextResults(
       resolveRepoContextRequests(childRequests),
     );
-    assert.equal(unknownApply.unknownResults, 3);
+    assert.equal(unknownApply.unknownResults, 4);
     assert.equal(occurrenceBuffer.repoContextInflightCount(), 0);
     assert.equal(
       (occurrenceBuffer.database.prepare(
@@ -1111,7 +1113,7 @@ async function proveDeferredRepoContextOccurrences() {
       transcriptDifferentCwdConflictUnknown: true,
       transcriptZeroDeltaConflictDetected: true,
       transcriptConflictCancelsChildInflight: true,
-      liveCoveredSessionConsumesNoChildCapacity: true,
+      legacyLiveMarkerCannotConsumeUncoveredResponse: true,
       resolverFailurePreservesTokensAndCursors: true,
       rawCwdAbsentFromParserState: true,
     };

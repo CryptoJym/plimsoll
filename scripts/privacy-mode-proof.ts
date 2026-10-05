@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { useFixtureRoot } from "./lib/fixture-root";
 /**
@@ -585,7 +586,8 @@ async function main() {
     actionClass: "other",
     inputTokens: 1,
     outputTokens: 1,
-    metadata: { admission: "privacy-proof" },
+    ...nativeCodexFixture("privacy-proof"),
+    metadata: { ...nativeCodexFixture("privacy-proof").metadata, admission: "privacy-proof" },
   });
   legacyBuffer.append(safeEvent);
   legacyBuffer.close();
@@ -1304,7 +1306,7 @@ async function main() {
     ...safeEvent,
     id: "11711711-1111-4111-8111-111111111125",
     observedAt: "2026-07-17T12:00:07.000Z",
-    metadata: { admission: "before-remote-race" },
+    metadata: { ...nativeCodexFixture("before-remote-race").metadata, admission: "before-remote-race" },
   });
   raceBuffer.append(beforeRemoteRace);
   let beforeRemoteMutated = false;
@@ -1337,7 +1339,7 @@ async function main() {
     ...safeEvent,
     id: "11711711-1111-4111-8111-111111111126",
     observedAt: "2026-07-17T12:00:08.000Z",
-    metadata: { admission: "after-remote-race" },
+    metadata: { ...nativeCodexFixture("after-remote-race").metadata, admission: "after-remote-race" },
   });
   raceBuffer.append(afterRemoteRace);
   let afterRemoteMutated = false;

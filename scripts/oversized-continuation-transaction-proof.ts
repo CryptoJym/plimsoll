@@ -12,7 +12,7 @@ async function main(){
  const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'oversized-transaction-'))),receipts=[];
  for(const provider of ['codex','claude'] as const){
    const root=path.join(dir,provider);fs.mkdirSync(root);const ledger=path.join(root,'product.sqlite'),controlLedger=path.join(root,'control.sqlite');
-   const buffer=new LocalEventBuffer(ledger,{workspaceId,delivery:{enabled:true}});
+   const buffer=new LocalEventBuffer(ledger,{workspaceId,deviceId:"oversized-fixture-device",delivery:{enabled:true}});
    const now=new Date().toISOString(),id='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
    const leaf=path.join(root,...(provider==='codex'?now.slice(0,10).split('-'):['project']));fs.mkdirSync(leaf,{recursive:true});
    const file=path.join(leaf,`rollout-${id}.jsonl`),key=jsonlScanStateKey(file),cwd=path.join(root,'no-git');fs.mkdirSync(cwd);
@@ -22,7 +22,7 @@ async function main(){
    fs.writeFileSync(file,prefix);
    const makeTailer=(b:LocalEventBuffer)=>provider==='codex'?new RolloutTailer(b,root,()=>[]):new TranscriptTailer(b,root);
    let tailer=makeTailer(buffer);let first=await tailer.scan({scope:'full'});assert.equal(first.readErrors,0);assert(first.eventsAppended>0);
-   const lease=buffer.delivery.lease();assert(lease.items.length>0,'actual outbox has an attempted sealed payload');
+   const lease=buffer.delivery.lease({now:new Date(Date.now()+60_001)});assert(lease.items.length>0,'actual outbox has an attempted sealed payload');
    const attempted=()=>buffer.database.prepare('select delivery_id,sealed_envelope_json,sealed_bytes,attempt_count from upload_outbox where attempt_count>0 order by delivery_id').all();
    const attemptedBefore=JSON.stringify(attempted()),oldCursor=JSON.stringify(buffer.database.prepare('select * from rollout_scan_state where file=?').get(key));
    await buffer.database.backup(controlLedger);
@@ -51,7 +51,7 @@ async function main(){
    const productEvents=events(buffer);
    tailer.close();
    fs.writeFileSync(file,prefix+JSON.stringify(make(100))+'\n');
-   const control=new LocalEventBuffer(controlLedger,{workspaceId,delivery:{enabled:true}}),controlTailer=makeTailer(control);
+   const control=new LocalEventBuffer(controlLedger,{workspaceId,deviceId:"oversized-fixture-device",delivery:{enabled:true}}),controlTailer=makeTailer(control);
    const controlResult=await controlTailer.scan({scope:'full'});assert.equal(controlResult.readErrors,0);assert.equal(controlResult.eventsAppended,complete.eventsAppended);
    assert.deepEqual(events(control),productEvents,'actual provider exact event IDs/lineage/revision/metadata match existing unpadded semantics');
    const controlParser=JSON.parse((control.database.prepare('select parser_state_json from rollout_scan_state where file=?').get(key) as any).parser_state_json);assert.deepEqual(controlParser,productParser);

@@ -39,7 +39,7 @@ async function prove(source: CaptureRoot["source"]) {
     }
   }
   await new Promise(resolve => setTimeout(resolve, 5));
-  const bufferOptions = { workspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", delivery: { enabled: true } };
+  const bufferOptions = { workspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", deviceId: "revisit-fixture-device", delivery: { enabled: true } };
   let buffer = new LocalEventBuffer(path.join(base, "ledger.sqlite"), bufferOptions);
   const roots = directories.map((r, i): CaptureRoot => ({ ...r, rootId: `root-${i}`, profileId: `profile-${i}`,
     installationEpochId: buffer.workspaceBinding()!.currentInstallationEpochId! }));
@@ -142,7 +142,7 @@ async function prove(source: CaptureRoot["source"]) {
         usage: { input_tokens: 1, output_tokens: 0 } }, padding: "x".repeat(padding) };
     const prefix = (id: string) => source === "codex" ? [
       { type: "session_meta", timestamp: at, payload: { id } },
-      { type: "turn_context", timestamp: at, payload: { model: "gpt-5.5" } }, usage(0, id),
+      { type: "turn_context", timestamp: at, payload: { turn_id: "revisit-turn", model: "gpt-5.5" } }, usage(0, id),
     ] : [];
     const large = (bytes: number) => ({ type: "event_msg", timestamp: at, payload: {
       type: "user_message", message: "SYNTHETIC_BODY_" + "x".repeat(bytes) } });
@@ -172,7 +172,7 @@ async function prove(source: CaptureRoot["source"]) {
       if (c) { assert(c.committed_offset >= prior); prior = c.committed_offset; }
       if (sawUnresolved && !restartDone) { restart(); restartDone = true; }
       if (result.eventsAppended && sealedBefore.length === 0) {
-        buffer.delivery.lease({ leaseId: "revisit-immutable" }); sealedBefore = sealed();
+        buffer.delivery.lease({ leaseId: "revisit-immutable", now:new Date(Date.now()+60_001) }); sealedBefore = sealed();
       }
       const attempt = (tailers![source === "codex" ? 0 : 1] as any).captureAttempt;
       if (partialAppends < 3 && !pendingAppend && c?.committed_offset > 1000 && c.deferred_bytes > 0 &&

@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "../scripts/lib/native-codex-fixture";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -28,7 +29,7 @@ async function privacySiblingRollback(OldBuffer: typeof LocalEventBuffer) {
   try {
     const before = new LocalEventBuffer(ledger, options);
     try {
-      const event = aiInteractionEventSchema.parse({ id, sessionId: id, source: "codex", model: "gpt-6-sol",
+      const event = aiInteractionEventSchema.parse({ id, sessionId: id, source: "codex", ...nativeCodexFixture(id), model: "gpt-6-sol",
         eventType: "assistant_response", dataMode: "metadata", observedAt: oldAt,
         actionClass: "other", inputTokens: 1, outputTokens: 1 });
       before.database.prepare(`insert into buffered_events
@@ -143,7 +144,7 @@ async function main() {
     try {
       for (const rawId of seededIds) {
         const event = aiInteractionEventSchema.parse({ id: rawId, sessionId: rawId,
-          source: "codex", model: "gpt-6-sol", eventType: "assistant_response", dataMode: "metadata",
+          source: "claude_code", model: "claude-proof", eventType: "assistant_response", dataMode: "metadata",
           observedAt: oldAt, actionClass: "other", inputTokens: 1, outputTokens: 1 });
         assert.equal(old.append(event), true);
         old.database.prepare("update buffered_events set created_at=? where id=?")
@@ -177,7 +178,14 @@ async function main() {
       const db = upgraded.database;
       db.prepare(`update upload_outbox set sealed_envelope_json=base_envelope_json,
         sealed_bytes=base_bytes where raw_id in (?,?)`).run(ids.sealed, ids.reseal);
-      assert.equal(refreshUnsentRawDelivery(db, ids.reseal), true);
+      // Generic resealing/retention stays on genuine Claude. Codex's frozen
+      // capture contract is independently checked by the named rollback and
+      // reused-ID expiry-gap proofs, including missing raw provenance.
+      const frozenBefore = (db.prepare("select sealed_envelope_json as bytes from upload_outbox where raw_id=?")
+        .get(ids.reseal) as {bytes:string}).bytes;
+      assert.equal(refreshUnsentRawDelivery(db, ids.reseal), false);
+      assert.equal((db.prepare("select sealed_envelope_json as bytes from upload_outbox where raw_id=?")
+        .get(ids.reseal) as {bytes:string}).bytes,frozenBefore);
       const states = db.prepare(`select raw_id as id,
         sealed_envelope_json is not null as sealed,
         length(base_envelope_json) > 0 as basePresent,
@@ -186,7 +194,7 @@ async function main() {
           id: string; sealed: number; basePresent: number;
           workspaceId: string; deviceId: string;
         }>;
-      assert.deepEqual(states.map((row) => row.sealed), [0, 1, 0]);
+      assert.deepEqual(states.map((row) => row.sealed), [0, 1, 1]);
       assert.ok(states.every((row) => row.basePresent === 1 &&
         row.workspaceId === workspaceId && row.deviceId === deviceId));
       console.log(JSON.stringify({ phase: "upgrade", first, held: allIds.length, states }));
@@ -277,7 +285,7 @@ async function main() {
     const reused = new LocalEventBuffer(ledger, { ...options, delivery: { enabled: false } });
     try {
       const event = aiInteractionEventSchema.parse({ id: reusedId, sessionId: reusedId,
-        source: "codex", model: "gpt-6-sol", eventType: "assistant_response", dataMode: "metadata",
+        source: "claude_code", model: "claude-proof", eventType: "assistant_response", dataMode: "metadata",
         observedAt: oldAt, actionClass: "other", inputTokens: 2, outputTokens: 1 });
       assert.equal(reused.append(event), true);
       reused.database.prepare("update buffered_events set created_at=? where id=?")

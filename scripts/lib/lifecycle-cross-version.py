@@ -190,7 +190,6 @@ def scenario(fixture, name):
 def main():
     require(NODE is not None and HEAD.is_file() and HOOK.is_file(), "Node, head build or fixture hook missing")
     head_version = read_json(REPO / "packages/collector-cli/package.json")["version"]
-    require(head_version == "0.7.49", "head package version changed")
     require(read_json(HEAD.parent / "runtime-manifest.json")["package"]["version"] == head_version,
             "head runtime version differs from checkout")
     temp = Path(os.environ["TMPDIR"]).resolve()

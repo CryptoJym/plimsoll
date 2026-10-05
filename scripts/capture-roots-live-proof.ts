@@ -32,7 +32,7 @@ function check(name: string, condition: unknown, detail: unknown) {
 }
 
 async function freePort() {
-  for (let port = 49300; port <= 49399; port += 1) {
+  for (let port = 49750; port <= 49799; port += 1) {
     const server = net.createServer();
     try {
       await new Promise<void>((resolve, reject) => {
@@ -45,7 +45,7 @@ async function freePort() {
       if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
     }
   }
-  throw new Error("No fixture port available in 49300-49399");
+  throw new Error("No fixture port available in 49750-49799");
 }
 
 async function main() {
@@ -175,7 +175,7 @@ async function main() {
       JSON.stringify({ timestamp: at, type, payload });
     fs.writeFileSync(path.join(day, `rollout-${timestamp.replace(/[:.]/g, "-")}-${session}.jsonl`), [
       line("session_meta", { id: session, cwd: sandbox }),
-      line("turn_context", { model: "gpt-5.5", cwd: sandbox }),
+      line("turn_context", { turn_id: "native-live-turn-91", model: "gpt-5.5", cwd: sandbox }),
       line("event_msg", { type: "token_count", info: { total_token_usage: {
         input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
         reasoning_output_tokens: 0, total_tokens: 0 } } }),
@@ -188,8 +188,8 @@ async function main() {
       const liveEvent = aiInteractionEventSchema.parse({
         id: "fixture-live-response-91", tenantId: workspace, source: "codex",
         dataMode: "metadata", eventType: "assistant_response", observedAt: timestamp,
-        sessionId: session, inputTokens: 2400, outputTokens: 510,
-        metadata: { otelEventName: "codex.sse_event", serviceName: "codex-app-server" },
+        sessionId: session, model: "gpt-5.5", inputTokens: 2400, outputTokens: 510, cacheReadTokens:0,
+        metadata: { model: "gpt-5.5", "conversation.id": session, codexTurnId: "native-live-turn-91", otelEventName: "codex.sse_event", serviceName: "codex-app-server" },
       });
       const liveAppended = enrolledBuffer.append(liveEvent);
       const scan = await new RolloutTailer(enrolledBuffer, codexLive, () => [], undefined,
@@ -201,10 +201,13 @@ async function main() {
           and input_tokens is not null`).all(session) as Array<{
             eventType: string; inputTokens: number; outputTokens: number }>;
       check("enrolled_live_response_and_file_path_reconcile_to_one_row",
-        liveAppended && scan.sessionsSkippedOtlpCovered === 1 &&
+        liveAppended && scan.sessionsSkippedOtlpCovered === 0 &&
         rows.length === 1 && rows[0]?.eventType === "assistant_response" &&
         rows[0]?.inputTokens === 2400 && rows[0]?.outputTokens === 510,
-        { liveAppended, skipped: scan.sessionsSkippedOtlpCovered, rows });
+        { liveAppended, skipped: scan.sessionsSkippedOtlpCovered, rows,
+          rootEpoch:enrolledRoot!.installationEpochId,
+          bindingEpoch:enrolledBuffer.workspaceBinding()?.currentInstallationEpochId,
+          raw:enrolledBuffer.database.prepare('select installation_epoch_id as epoch,payload_json as payload from buffered_events where session_id=?').all(session) });
     } finally { enrolledBuffer.close(); }
     // These are the 0.7.42 response-pair and reconciliation fixtures, run
     // unchanged after enrollment. They assert one countable row per response.

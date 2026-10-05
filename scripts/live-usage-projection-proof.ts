@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ensureUuidEventId } from "../packages/collector-cli/src/upload-history";
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { aiInteractionEventSchema } from "../packages/shared/src/schemas";
 import { usageFactFromEvent } from "../packages/shared/src/economics/event-adapter";
@@ -71,7 +72,7 @@ try {
     assert.equal(receipt.events,1);
     assert.equal((buffer.database.prepare(`select count(*) as n from buffered_events`).get() as {n:number}).n,0);
     // Reuse the raw rowid before maintenance can drain the prune receipt.
-    assert.equal(buffer.append({...seed,id:"second-live-projection-event",sessionId:"second-session",inputTokens:3}),true);
+    assert.equal(buffer.append({...seed,id:"second-live-projection-event",sessionId:"second-session",...nativeCodexFixture("second-projection"),inputTokens:3}),true);
     buffer.close();buffer=new LocalEventBuffer(ledger,options);
     for(let i=0;i<4;i++)buffer.projection.runMaintenance(new Date());
     assert.equal(read()?.event_type,"assistant_response");

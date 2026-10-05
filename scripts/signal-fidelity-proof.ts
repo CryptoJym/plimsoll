@@ -62,6 +62,9 @@ import type { AddressInfo } from "node:net";
 
 import Database from "better-sqlite3";
 
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
+import { captureCodexModel } from "../packages/collector-cli/src/codex-model-capture";
+import { rowHasAdmittedUsage } from "../packages/collector-cli/src/usage-authority";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigPath, collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { performJoin } from "../packages/collector-cli/src/join";
@@ -132,6 +135,7 @@ import { MODEL_PRICING } from "../packages/shared/src/pricing";
 import { buildPatternsReport, validatedDeliveryYieldV2 } from "./efficiency-report";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
 import {
+  LOCAL_TENANT_ID,
   aiInteractionEventSchema,
   aiWorkIngestBatchSchema,
   aiWorkSessionSyncBatchSchema,
@@ -331,6 +335,7 @@ const codexLogsEnvelope = {
           logRecords: [
             {
               observedTimeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 4_000),
+              traceId: "abcdef0123456789abcdef0123456789",
               attributes: [
                 otelAttr("event.name", "codex.tool_result"),
                 otelAttr("tool_name", "exec_command"),
@@ -574,7 +579,7 @@ async function main() {
   // managed-config apply guard enforces for the section 13 applies below.
   useFixtureRoot(tempDir, { plimsollHome: tempDir });
   const bufferPath = path.join(tempDir, "work-ledger.sqlite");
-  const buffer = new LocalEventBuffer(bufferPath);
+  const buffer = new LocalEventBuffer(bufferPath,{workspaceId:LOCAL_TENANT_ID,deviceId:"signal-fixture-device"});
   const config = collectorConfigSchema.parse({});
   const server = createCollectorServer(config, buffer);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -861,17 +866,18 @@ async function main() {
     ),
     codexSpan ? JSON.stringify({ in: codexSpan.payload.inputTokens, out: codexSpan.payload.outputTokens }) : "codex usage span missing",
   );
-  // Reconciler adopts session + model from nearest codex rows, then prices:
+  const capturedCodexSpan = codexSpan ? captureCodexModel(buffer.database,codexSpan.payload,codexSpan.id) : undefined;
+  // Model comes from the single named native trace, then pricing applies:
   // (2400-1800)*$5 + 1800*$0.50 + 510*$30 per 1M = $0.0192 (gpt-5.5, 2026-06-10).
   check(
     "codex_usage_stitched_and_priced",
     Boolean(
       codexSpan &&
         codexSpan.payload.sessionId === CODEX_SESSION &&
-        codexSpan.payload.model === "gpt-5.5" &&
-        Math.abs((codexSpan.payload.costUsd ?? 0) - 0.0192) < 0.0001,
+        capturedCodexSpan?.model === "gpt-5.5" &&
+        Math.abs((capturedCodexSpan.costUsd ?? 0) - 0.0192) < 0.0001,
     ),
-    codexSpan ? JSON.stringify({ session: codexSpan.payload.sessionId, model: codexSpan.payload.model, cost: codexSpan.payload.costUsd }) : "missing",
+    codexSpan ? JSON.stringify({ session: codexSpan.payload.sessionId, model: capturedCodexSpan?.model, cost: capturedCodexSpan?.costUsd }) : "missing",
   );
 
   const codexTool = rows.find(
@@ -988,10 +994,21 @@ async function main() {
   // Buckets + leverage: configuring a priority repo must not retroactively
   // attribute UNKNOWN immediate events. All current spend remains unlinked.
   buffer.setPriorityRepo(expectedRemoteHash!, "github.com/proof-owner/proof-repo");
-  const accounts = dashboardAccounts(buffer.database, [
+  const subscriptions = [
     { account: storedAccount?.accountHash ?? "none", plan: "Max", usdPerMonth: 200, vendor: "anthropic" },
-  ]);
-  const proofAccount = accounts.accounts.find((a) => a.accountHash === storedAccount?.accountHash);
+  ] as const;
+  // The shipped dashboard reads admitted projection facts. Raw diagnostics
+  // deliberately retain a missing normalized model and price, while the
+  // exact native trace supplies the model and derived price at capture.
+  for(let slice=0;slice<20;slice++) {
+    const state=buffer.projection.status();
+    if(state.ready&&!state.dirty&&state.parityReady&&Object.values(state.backlog).every(n=>n===0))break;
+    buffer.projection.runMaintenance(new Date(Date.now()));
+  }
+  const admittedSnapshot=buffer.projection.readSnapshot(30,[...subscriptions]);
+  if(admittedSnapshot.kind!=="ready")throw new Error("admitted_dashboard_snapshot_missing");
+  const accounts = admittedSnapshot.snapshot.accounts as ReturnType<typeof dashboardAccounts>;
+  const proofAccount = accounts.accounts.find((a) => a.subscription?.plan === "Max");
   check(
     "priority_buckets_computed",
     accounts.buckets.priorityUsd === 0 &&
@@ -1448,8 +1465,8 @@ async function main() {
       }),
     ].join("\n") + "\n",
   );
-  // Second fixture: a session that already has OTLP-delivered usage (the
-  // stitched codex span from section 4) — first-writer-wins, tailer skips it.
+  // Second fixture: another response in the same native conversation. The
+  // earlier OTLP span cannot attest this unrelated cumulative counter.
   fs.writeFileSync(
     path.join(rolloutDay, `rollout-2026-06-10T11-00-00-${CODEX_SESSION}.jsonl`),
     [
@@ -1557,8 +1574,8 @@ async function main() {
       lineageRow!.sourceCumulativeOutput === 50 &&
       lineageRow!.sourceCumulativeReasoningOutput === 10 &&
       lineageRow!.costEstimated === undefined &&
-      firstScan.tokensUnvalidated?.input === 1000 &&
-      firstScan.unvalidatedFirstRows === 1,
+      firstScan.tokensUnvalidated?.input === 1_000_999 &&
+      firstScan.unvalidatedFirstRows === 2,
     JSON.stringify({ tokensUnvalidated: firstScan.tokensUnvalidated, lineage: lineageRow }),
   );
   check(
@@ -1632,9 +1649,12 @@ async function main() {
     }),
   );
   check(
-    "rollout_otlp_covered_session_skipped",
-    firstScan.sessionsSkippedOtlpCovered >= 1 &&
-      rolloutRows.every((row) => row.sessionId !== CODEX_SESSION),
+    "rollout_unrelated_response_not_suppressed_by_session",
+    firstScan.sessionsSkippedOtlpCovered === 0 &&
+      rolloutRows.filter((row) => row.sessionId === CODEX_SESSION).length === 1 &&
+      rolloutRows.filter((row) => row.sessionId === CODEX_SESSION).every((row) =>
+        row.inputTokens === 0 && row.outputTokens === 0 &&
+        JSON.parse(row.payloadJson as string).metadata.counterLineage === "unknown_nonzero_first"),
     JSON.stringify({ skipped: firstScan.sessionsSkippedOtlpCovered }),
   );
   const lateLiveAppend = buffer.append(
@@ -1649,14 +1669,15 @@ async function main() {
     }),
   );
   check(
-    "rollout_first_slice_claim_blocks_late_live_double_count",
-    lateLiveAppend === false &&
-      buffer.sessionUsageAuthority("codex", ROLLOUT_SESSION) === "tailer" &&
+    "rollout_late_model_less_live_is_diagnostic_without_session_claim",
+    lateLiveAppend === true &&
+      rowHasAdmittedUsage(buffer.database,deterministicEventId(["late-live-after-rollout-claim", ROLLOUT_SESSION])) === false &&
+      buffer.sessionUsageAuthority("codex", ROLLOUT_SESSION) === null &&
       (buffer.database
         .prepare(`select count(*) as n from buffered_events where id = ?`)
         .get(deterministicEventId(["late-live-after-rollout-claim", ROLLOUT_SESSION])) as {
           n: number;
-        }).n === 0,
+        }).n === 1,
     JSON.stringify({ lateLiveAppend }),
   );
   // Clearing the persistent scan state forces a true re-parse — which must
@@ -1673,7 +1694,7 @@ async function main() {
     "rollout_rescan_idempotent",
     // 3000 = validated marginals only; the lineage-first counter (1000)
     // stays excluded after a full stateless re-parse (issue #153).
-    afterRescan.n === 2 && afterRescan.input === 2000 && rescan.sessionsSkippedOtlpCovered >= 1,
+    afterRescan.n === 3 && afterRescan.input === 2000 && rescan.sessionsSkippedOtlpCovered === 0,
     JSON.stringify({ rows: afterRescan.n, input: afterRescan.input }),
   );
   // Rate-table updates must heal existing rows: a model unpriced at ingest
@@ -2003,10 +2024,10 @@ async function main() {
     "upload_watermark_drains",
     before > 0 &&
       first.markedUploaded === 4 &&
-      second.remainingUnuploaded === 1 &&
-      second.remainingDelivery === 1 &&
-      heldAtSecond.remainingDelivery === 1 &&
-      afterHold.markedUploaded === 1 &&
+      second.remainingUnuploaded === 6 &&
+      second.remainingDelivery === 6 &&
+      heldAtSecond.remainingDelivery === 6 &&
+      afterHold.markedUploaded === 6 &&
       afterHold.remainingUnuploaded === 0 &&
       afterHold.remainingDelivery === 0 &&
       deliveryAfterUpload.remainingDelivery === 0 &&
@@ -2428,7 +2449,7 @@ async function main() {
     ];
     const HISTORY_REPO_HASH = `sha256:${"a1".repeat(32)}`;
     const HISTORY_BRANCH_HASH = `sha256:${"b2".repeat(32)}`;
-    const seedBuffer = new LocalEventBuffer(historyLedgerPath);
+    const seedBuffer = new LocalEventBuffer(historyLedgerPath,{workspaceId:LOCAL_TENANT_ID,deviceId:"history-fixture-device"});
     const seededIds: string[] = [];
     const seedEvent = (index: number): AiInteractionEvent =>
       aiInteractionEventSchema.parse({
@@ -2442,11 +2463,12 @@ async function main() {
         inputTokens: 10,
         outputTokens: 5,
         ...(index < 100 ? { costUsd: 0.01 } : {}),
-        // Repo linkage (issue 0036): metadata.git drives the ledger's
-        // repo_hash/branch_hash columns at append, exactly like live capture.
-        ...(index < 100
-          ? { metadata: { git: { remoteUrlHash: HISTORY_REPO_HASH, branchHash: HISTORY_BRANCH_HASH } } }
-          : {}),
+        // Transport fixtures carry native Codex evidence, while projection
+        // and privacy assertions keep their original counters and linkage.
+        metadata: {
+          ...(index % 2 === 0 ? nativeCodexFixture("history-e2e-"+index,"proof-model").metadata : {}),
+          ...(index < 100 ? { git: { remoteUrlHash: HISTORY_REPO_HASH, branchHash: HISTORY_BRANCH_HASH } } : {}),
+        },
       });
     for (let index = 0; index < 250; index += 1) {
       const event = seedEvent(index);
@@ -2458,6 +2480,7 @@ async function main() {
     seedBuffer.append(
       aiInteractionEventSchema.parse({
         id: stitchId,
+        ...nativeCodexFixture("history-e2e-stitch","proof-model"),
         source: "codex",
         eventType: "assistant_response",
         observedAt: "2026-02-10T00:00:00.000Z",
@@ -2482,6 +2505,7 @@ async function main() {
       aiInteractionEventSchema.parse({
         ...seedEvent(10_002),
         id: deterministicEventId(["history-e2e-model-path", 1]),
+        source: "claude_code", // Exercise the shared model-value privacy gate on admitted usage.
         model: HISTORY_MODEL_PATH,
         metadata: {},
       }),
@@ -2505,7 +2529,7 @@ async function main() {
       aiInteractionEventSchema.parse({
         ...seedEvent(10_004),
         id: historySuppressedId,
-        metadata: {},
+        metadata: nativeCodexFixture("history-e2e-10004","proof-model").metadata,
       }),
       [HISTORY_SUPPRESSED_CREDENTIAL],
     );
@@ -2646,6 +2670,8 @@ async function main() {
         state1?.completedAt !== null &&
         state1?.watermark !== null,
       JSON.stringify({
+        auditTotals: historyAuditTotals(run1.audit), expectedInputTokens,
+        missingSeededIds: seededIds.filter(id=>!historyStore.has(id)).length,
         accepted: run1.acceptedEvents,
         inserted: run1.insertedEvents,
         storeSize: historyStore.size,
