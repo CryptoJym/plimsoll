@@ -581,7 +581,6 @@ async function runSharedFlow() {
     // consumed by runtime promotion. Capture owns attempt creation thereafter.
     const episodeA = buildWorkEpisodeFact({
       source: "codex",
-      ...nativeCodexFixture(CONTROL_EVENT_ID),
       sessionId: SESSION_A,
       sourceEpisodeKey: "session",
       workClass: "implementation",
@@ -649,6 +648,7 @@ async function runSharedFlow() {
     for (const captured of events) bufferA.append(captured);
     bufferB.append(aiInteractionEventSchema.parse({
       id: CONTROL_EVENT_ID,
+      model: nativeCodexFixture(CONTROL_EVENT_ID).model,
       sessionId: SESSION_B,
       actorId: MACHINE_B,
       source: "codex",
