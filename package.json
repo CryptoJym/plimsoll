@@ -177,6 +177,7 @@
     "proof:session-summary-cycle-resume": "tsx scripts/run-proof.ts scripts/session-summary-cycle-resume-proof.ts",
     "proof:session-summary-stall": "tsx scripts/run-proof.ts scripts/session-summary-stall-proof.ts",
     "proof:session-summary-pending-review": "tsx scripts/run-proof.ts scripts/session-summary-pending-review-proof.ts",
+    "proof:session-summary-queued-session": "tsx scripts/run-proof.ts scripts/session-summary-queued-session-proof.ts",
     "proof:status-pending-reasons": "tsx scripts/run-proof.ts scripts/status-pending-reasons-proof.ts",
     "proof:session-summary-live-churn": "tsx scripts/run-proof.ts scripts/session-summary-live-churn-proof.ts",
     "proof:session-summary-reconciliation": "tsx scripts/run-proof.ts scripts/session-summary-reconciliation-proof.ts",
@@ -452,7 +453,8 @@
     "proof:capture-history-import-seen_prefix_codex": "tsx scripts/capture-history-import-short-copy-proof.ts seen_prefix_codex",
     "proof:capture-history-import-seen_prefix_claude": "tsx scripts/capture-history-import-short-copy-proof.ts seen_prefix_claude",
     "proof:capture-history-import-main-handoff-codex": "tsx scripts/capture-history-import-main-handoff-proof.ts codex",
-    "proof:capture-history-import-main-handoff-claude": "tsx scripts/capture-history-import-main-handoff-proof.ts claude"
+    "proof:capture-history-import-main-handoff-claude": "tsx scripts/capture-history-import-main-handoff-proof.ts claude",
+    "test:codex-usage-fields": "node --import tsx scripts/codex-usage-fields.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

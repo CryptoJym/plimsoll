@@ -1533,16 +1533,22 @@ function fallbackReason(
 }
 
 /**
- * Sessions with trigger-queued rows. CROSS JOIN keeps the small queue as the
- * outer loop. Without it, a ledger with no sqlite_stat1 walks every event
- * through idx_events_retention, and the bounded-read check runs once per walked
- * row. On a 409k-event ledger that missed the 250 ms deadline every cycle, so
- * the daemon fell back to sending every session (eco-6hoxj.163.135).
+ * Seek queued sessions before probing their events. A blocked session can
+ * retain thousands of queued rows; joining every row still exceeds the
+ * planner's 250 ms deadline and forces unrelated sessions into full catch-up.
+ * DISTINCT streams the covering queue index, and EXISTS stops at the first
+ * eligible event per session. Keep the event's authoritative created_at and
+ * the queue-first CROSS JOIN (eco-6hoxj.163.135), including for future rows.
  */
 export const SESSION_SUMMARY_QUEUED_ROWS_PENDING_SQL =
-  `select r.session_id as sessionId from session_sync_summary_rows r
-       cross join buffered_events e on e.rowid = r.raw_rowid
-       where e.created_at <= @until and ${BOUNDED_SQL_READ_PREDICATE}`;
+  `select q.session_id as sessionId
+       from (select distinct session_id from session_sync_summary_rows) q
+       where ${BOUNDED_SQL_READ_PREDICATE} and exists (
+         select 1 from session_sync_summary_rows r
+           cross join buffered_events e on e.rowid = r.raw_rowid
+           where r.session_id = q.session_id and e.created_at <= @until
+             and ${BOUNDED_SQL_READ_PREDICATE}
+       )`;
 
 /** Session ids whose durable summaries need another bounded pass. */
 export function listSessionSummaryPendingIds(db: Database.Database, until: string, maxIds = 8_000): string[] {

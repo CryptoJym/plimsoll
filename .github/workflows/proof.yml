@@ -912,6 +912,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:session-summary-pending-review
 
+      - name: Prove blocked queued-session backlogs do not force full re-sends (eco-6hoxj.163.94.10)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-summary-queued-session
+
       - name: Prove pending summary reasons and freshness in private status (eco-6hoxj.163.116)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:status-pending-reasons
@@ -1209,6 +1213,10 @@ jobs:
       - name: Prove bounded daemon upload timer returns
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:upload-timer-bounds
+
+      - name: Test Codex cached-count and recorded-tier capture
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm test:codex-usage-fields
 
       - name: Prove rollout lineage and reasoning-token upload
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
