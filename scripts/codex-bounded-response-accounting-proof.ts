@@ -97,10 +97,14 @@ async function fixture(shape: "held-SSE" | "ACKed-SSE" | "native-first" | "resta
   }
   try {
     installVirtualClock();
-    const baseline = beginAutomaticCaptureBaseline(buffer.database, "codex", {
-      startedAt: new Date(at - 2000).toISOString(), filesDiscovered: 0 });
-    completeAutomaticCaptureBaseline(buffer.database, "codex", {
-      runId: baseline.latestRun!.runId, completedAt: new Date(at - 1000).toISOString() });
+    // Automatic intake is globally armed only after both source baselines.
+    for (const source of ["codex", "claude_code"] as const) {
+      const baseline = beginAutomaticCaptureBaseline(buffer.database, source, {
+        startedAt: new Date(at - 2000).toISOString(), filesDiscovered: 0 });
+      const completed = completeAutomaticCaptureBaseline(buffer.database, source, {
+        runId: baseline.latestRun!.runId, completedAt: new Date(at - 1000).toISOString() });
+      assert.equal(completed.status, "complete");
+    }
     // The later native update and a distinct response sit past four real slices.
     // Scheduling uses the existing virtual clock; filesystem, parsing and
     // event/cursor/outbox commits are real, with all production byte/record caps.
