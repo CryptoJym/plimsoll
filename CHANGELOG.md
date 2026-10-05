@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.49 — 2026-10-03 (unpublished)
+## 0.7.50 (unreleased)
 
 - Codex token-bearing captures now name their model from an exact paired SSE
   log, one unambiguous native trace, or the same local conversation turn. Any
@@ -90,6 +90,14 @@
   Public tailer/history, snapshot, projection and summary fixtures also cover
   skewed partial/complete and growing reports. This finite coverage complements the matrix;
   it does not claim every possible producer shape or operation sequence.
+
+## 0.7.49 — 2026-10-04
+
+- Bound automatic Codex capture to four slices per file per cadence. Fresh
+  current-day tails receive service beside the historical backlog, and deferred
+  discovery and JSONL work resumes in later cadences (#454).
+- Run proof children with Node's tsx loader so stale macOS tsx CLI IPC pipes
+  cannot block them (#455).
 
 ## 0.7.48 — 2026-10-03 (unpublished)
 

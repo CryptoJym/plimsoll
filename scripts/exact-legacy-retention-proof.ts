@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 
 // Exercise the committed release sources against one disposable ledger. CI
 // fetches complete ancestry; no released package or live collector is used.

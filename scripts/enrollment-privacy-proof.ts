@@ -10,7 +10,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn } from "./lib/proof-child-process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";

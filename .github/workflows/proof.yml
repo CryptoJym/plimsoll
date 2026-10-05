@@ -31,6 +31,10 @@ jobs:
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
+        with:
+          # One pnpm folder per runner: runners sharing a Mac user raced in the default
+          # ~/setup-pnpm (ENOTEMPTY, 'pnpm: command not found'; eco-6hoxj.165.179.2).
+          dest: ~/setup-pnpm-runners/${{ runner.name }}
 
       - uses: actions/setup-node@v4
         with:
@@ -243,6 +247,10 @@ jobs:
       - name: Prove doctor names producer processes older than their managed config
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:doctor-stale-producers
+
+      - name: Prove tsx IPC pipe collisions cannot block proof children
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:tsx-ipc-pipe
 
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -790,6 +798,9 @@ jobs:
       - name: Prove per-response native coverage and partial cumulative accounting
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-response-coverage
+      - name: Prove bounded automatic capture preserves response accounting
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-bounded-response-accounting
       - name: Prove Codex response spans and rollout marginals count once
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-span-rollout-pairing
@@ -826,7 +837,7 @@ jobs:
       - name: Prove the bound A03 plan window keeps valid usage billable
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-a03-directed
-      - name: Prove named usage survives 0.7.48 and 0.7.47 rollback readers
+      - name: Prove named usage survives released 0.7.49 and 0.7.48 readers and the legacy scanner rollback
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:collector-named-usage-rollback
 
@@ -907,6 +918,12 @@ jobs:
       - name: Prove capture budget reservation under repair backlog
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-budget
+
+      - name: Prove current-day Codex capture during a multi-GB scan backlog
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:codex-scan-backlog
+          pnpm proof:codex-scan-discovery
 
       - name: Prove Grok usage capture from Grok's own usage files (eco-6hoxj.163.20)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -1434,6 +1451,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
+        with:
+          # One pnpm folder per runner: runners sharing a Mac user raced in the default
+          # ~/setup-pnpm (ENOTEMPTY, 'pnpm: command not found'; eco-6hoxj.165.179.2).
+          dest: ~/setup-pnpm-runners/${{ runner.name }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22.20.0

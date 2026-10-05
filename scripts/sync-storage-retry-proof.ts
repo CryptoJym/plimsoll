@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "./lib/proof-child-process";
 import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";

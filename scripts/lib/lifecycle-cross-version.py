@@ -189,7 +189,10 @@ def scenario(fixture, name):
 
 def main():
     require(NODE is not None and HEAD.is_file() and HOOK.is_file(), "Node, head build or fixture hook missing")
-    require(read_json(REPO / "packages/collector-cli/package.json")["version"] == "0.7.49", "head package version changed")
+    head_version = read_json(REPO / "packages/collector-cli/package.json")["version"]
+    require(head_version == "0.7.49", "head package version changed")
+    require(read_json(HEAD.parent / "runtime-manifest.json")["package"]["version"] == head_version,
+            "head runtime version differs from checkout")
     temp = Path(os.environ["TMPDIR"]).resolve()
     require(temp.is_dir(), "CI TMPDIR is missing")
     # Packaged lifecycle paths require the install tree to be a strict child
@@ -220,7 +223,8 @@ def main():
                                    "reason": retention.get("skippedReason"), "protectedEntries": len(before),
                                    "byteCensusUnchanged": before == after})
                     print(f"{'PASS' if ok else 'FAIL'} {name} {version}: {checks[-1]}", flush=True)
-        summary = {"proof": "lifecycle-cross-version", "checks": checks, "passed": sum(c["passed"] for c in checks),
+        summary = {"proof": "lifecycle-cross-version", "headVersion": head_version,
+                   "checks": checks, "passed": sum(c["passed"] for c in checks),
                    "total": len(checks), "liveStateTouched": False}
         print(json.dumps(summary), flush=True)
         require(summary["passed"] == summary["total"] == 15, "released CLI matrix failed")

@@ -1,7 +1,7 @@
 /** The real claim proof must reject the old prefix-only non-usage decision.
  * This mutant is written only beneath the CI fixture home. */
 import assert from "node:assert/strict";
-import {spawnSync} from "node:child_process";
+import {spawnSync} from "./proof-child-process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";

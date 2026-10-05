@@ -1,6 +1,6 @@
 /** Adversarial proof for bounded, review-artifact-only learning packets (#101). */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";

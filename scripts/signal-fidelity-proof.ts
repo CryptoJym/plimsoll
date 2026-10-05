@@ -52,7 +52,7 @@ const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : create
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
