@@ -1,3 +1,4 @@
+import { codexCaptureStatement } from "./codex-capture-statements";
 import type Database from "better-sqlite3";
 import {
   estimateCostUsd,
@@ -292,7 +293,7 @@ export function codexModelGap(
       installation_epoch_id text not null, observed_day integer not null,
       from_ms integer not null, to_ms integer not null,
       primary key(installation_epoch_id,observed_day)) without rowid`);
-    db.prepare(
+    codexCaptureStatement(db,
       `insert into codex_model_capture_gaps values (?,?,?,?)
       on conflict(installation_epoch_id,observed_day) do update set
         from_ms=min(from_ms,excluded.from_ms),to_ms=max(to_ms,excluded.to_ms)`,
@@ -377,7 +378,7 @@ function ensureCaptureDecisionTable(db: Database.Database) {
 
 function captureLineage(db: Database.Database, rawId: string): CaptureLineage | undefined {
   try {
-    return db.prepare(`select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
+    return codexCaptureStatement(db,`select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
       privacy_generation as rawGeneration from buffered_events where id=?`).get(rawId) as
       CaptureLineage | undefined;
   } catch { return undefined; }
@@ -391,31 +392,31 @@ export function hasCaptureGapDecision(db: Database.Database, lineage: CaptureLin
 /** Re-derive existing local facts when native trace facts or a gap change
  * authority. Raw diagnostics and all frozen delivery bytes stay untouched. */
 export function queueCodexAuthorityProjectionRepairs(db: Database.Database, rawId: string) {
-  if (db.readonly || !db.prepare(`select 1 from sqlite_master
+  if (db.readonly || !codexCaptureStatement(db,`select 1 from sqlite_master
     where type='table' and name='dashboard_projection_repairs'`).get()) return;
-  const row = db.prepare(`select rowid as rawRowid,source,session_id as session,observed_at as at,
+  const row = codexCaptureStatement(db,`select rowid as rawRowid,source,session_id as session,observed_at as at,
     workspace_id as workspace,device_id as device,installation_epoch_id as epoch,
     case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end as trace
     from buffered_events where id=?`).get(rawId) as
     { rawRowid: number; source: string; session: string | null; at: string; workspace: string; device: string; epoch: string; trace: string | null } | undefined;
   if (!row || row.source !== "codex") return;
-  const peers = row.trace ? db.prepare(`select rowid,id,session_id as session from buffered_events
+  const peers = row.trace ? codexCaptureStatement(db,`select rowid,id,session_id as session from buffered_events
     where source='codex' and workspace_id is ? and device_id is ? and installation_epoch_id is ?
       and case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end=?
     limit ${MAX_EVIDENCE_ROWS + 1}`).all(row.workspace,row.device,row.epoch,row.trace) as
       Array<{ rowid: number; id: string; session: string | null }> : [];
-  const queue = db.prepare(`insert or ignore into dashboard_projection_repairs (raw_rowid,reason,queued_at)
+  const queue = codexCaptureStatement(db,`insert or ignore into dashboard_projection_repairs (raw_rowid,reason,queued_at)
     values (?,'codex_usage_authority_changed',?)`);
   const at = new Date().toISOString();
   queue.run(row.rawRowid,at);
   for (const peer of peers) queue.run(peer.rowid,at);
   const sessions = new Set([row.session,...peers.map(peer=>peer.session)].filter(Boolean));
-  for (const session of sessions) db.prepare(`insert or ignore into dashboard_projection_repairs
+  for (const session of sessions) codexCaptureStatement(db,`insert or ignore into dashboard_projection_repairs
     (raw_rowid,reason,queued_at) select e.rowid,'codex_usage_authority_changed',? from buffered_events e
       join dashboard_event_facts f on f.raw_rowid=e.rowid
       where e.source='codex' and e.session_id=? and e.event_type in ('usage_rollout','usage_transcript')`)
       .run(at,session);
-  db.prepare(`update dashboard_projection_control set dirty=1,parity_ready=0 where singleton=1`).run();
+  codexCaptureStatement(db,`update dashboard_projection_control set dirty=1,parity_ready=0 where singleton=1`).run();
 }
 
 export function rememberCaptureGap(
@@ -436,7 +437,7 @@ export function rememberCaptureGapForLineage(
 ) {
   if (db.readonly) return false;
   ensureCaptureDecisionTable(db);
-  db.prepare(`insert or replace into codex_capture_decisions
+  codexCaptureStatement(db,`insert or replace into codex_capture_decisions
     (raw_rowid,raw_id,raw_created_at,raw_generation,decision,reason,decided_at)
     values (?,?,?,?,?,?,?)`).run(
     lineage.rawRowid, lineage.rawId, lineage.rawCreatedAt, lineage.rawGeneration,
@@ -481,8 +482,7 @@ export function captureCodexModel(
       }
     | undefined;
   try {
-    row = db
-      .prepare(
+    row = codexCaptureStatement(db,
         `select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
       privacy_generation as rawGeneration, workspace_id as workspace, device_id as device,
       installation_epoch_id as epoch, usage_paired_event_id as pairedId,uploaded_at as uploadedAt
@@ -508,7 +508,7 @@ export function captureCodexModel(
     const result = codexModelGap(db, event, reason, recordDiagnostics);
     if (persistDecision && row && !db.readonly) {
       ensureCaptureDecisionTable(db);
-      db.prepare(`insert or replace into codex_capture_decisions
+      codexCaptureStatement(db,`insert or replace into codex_capture_decisions
         (raw_rowid,raw_id,raw_created_at,raw_generation,decision,reason,decided_at)
         values (?,?,?,?,?,?,?)`).run(
         row.rawRowid, row.rawId, row.rawCreatedAt, row.rawGeneration,
@@ -524,8 +524,8 @@ export function captureCodexModel(
   // A native retry frozen by an older binary is final even before this
   // binary's first lease. Readers must not consume a rollout against a
   // mutable re-evaluation of that same, already-frozen request.
-  if (row && db.prepare("select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) {
-    const prior = db.prepare(`select delivery_id as id,sealed_envelope_json as bytes from upload_outbox
+  if (row && codexCaptureStatement(db,"select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) {
+    const prior = codexCaptureStatement(db,`select delivery_id as id,sealed_envelope_json as bytes from upload_outbox
       where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ?
         and sealed_envelope_json is not null limit 1`).get(row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration) as
       {id:string;bytes:string}|undefined;
@@ -649,7 +649,7 @@ export function captureCodexModel(
   // from the first 128 rows and hiding a later relevant contradiction.
   let windowOverflow = false;
   const pairCandidates: Peer[] = [];
-  for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+  for (const candidate of codexCaptureStatement(db,`${selectEvidence} where ${scope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end
       in ('codex.sse_event','handle_responses')
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='codex.sse_event'
@@ -665,7 +665,7 @@ export function captureCodexModel(
   }
   if (windowOverflow) return gap("evidence_window_overflow");
   const sessionForWindow = trustedSession(event);
-  if (sessionForWindow && turn) for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+  if (sessionForWindow && turn) for (const candidate of codexCaptureStatement(db,`${selectEvidence} where ${scope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.usageSource') end
       in ('codex_local_turn','rollout')
     and e.session_id=? and coalesce(
@@ -679,7 +679,7 @@ export function captureCodexModel(
   }
   if (windowOverflow) return gap("evidence_window_overflow");
   const promotablePairs = pairCandidates.filter(mayPromote);
-  if (promotablePairs.length) for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+  if (promotablePairs.length) for (const candidate of codexCaptureStatement(db,`${selectEvidence} where ${scope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end
       in ('codex.sse_event','handle_responses')
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='handle_responses'
@@ -746,7 +746,7 @@ export function captureCodexModel(
   // A native trace is an identity boundary, not a nearest-time window.
   // Inspect its complete admitted fact set, bounded by overflow rather than
   // silently dropping a more distant contradictory model or account.
-  const traceRows = traceId ? db.prepare(`select e.rowid as evidenceRowid,e.id as evidenceId,
+  const traceRows = traceId ? codexCaptureStatement(db,`select e.rowid as evidenceRowid,e.id as evidenceId,
     e.created_at as evidenceCreatedAt,e.privacy_generation as evidenceGeneration,
     e.payload_json as payload,e.usage_paired_event_id as pairedId,e.usage_duplicate_reason as duplicateReason
     from buffered_events e where e.source='codex' and e.id<>?
@@ -831,14 +831,12 @@ export function captureCodexModel(
   if (
     session &&
     turn &&
-    db
-      .prepare(
+    codexCaptureStatement(db,
         "select 1 from sqlite_master where type='table' and name='codex_turn_model_evidence'",
       )
       .get()
   ) {
-    const names = db
-      .prepare(
+    const names = codexCaptureStatement(db,
         `select model, count(distinct nullif(account_key,'')) as accounts,
       min(nullif(account_key,'')) as account from codex_turn_model_evidence where
       workspace_id=? and device_id is ? and installation_epoch_id=? and session_id=? and turn_id=? group by model limit 2`,
@@ -898,8 +896,7 @@ export function recordCodexTurnModel(
     !validatedMetadataAttribute("model", model).accepted
   )
     return;
-  const binding = db
-    .prepare(
+  const binding = codexCaptureStatement(db,
       `select current_workspace_id as workspace, current_device_id as device,
     current_installation_epoch_id as epoch from collector_workspace_binding where singleton=1`,
     )
@@ -911,7 +908,7 @@ export function recordCodexTurnModel(
     workspace_id text not null,device_id text,installation_epoch_id text not null,
     session_id text not null,turn_id text not null,model text not null,account_key text not null,
     primary key(workspace_id,installation_epoch_id,session_id,turn_id,model,account_key)) without rowid`);
-  db.prepare(
+  codexCaptureStatement(db,
     `insert or ignore into codex_turn_model_evidence values (?,?,?,?,?,?,?)`,
   ).run(
     binding.workspace,

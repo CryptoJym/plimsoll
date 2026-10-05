@@ -1,3 +1,4 @@
+import { codexCaptureStatement } from "./codex-capture-statements";
 import type Database from "better-sqlite3";
 import type { AiInteractionEvent } from "../../shared/src/index";
 
@@ -23,8 +24,8 @@ export function ensureCodexNamedCaptures(db: Database.Database) {
 }
 
 export function legacyNativeAcknowledgementsEligible(db: Database.Database) {
-  if (!db.prepare("select 1 from sqlite_master where name='codex_named_capture_origin' and type='table'").get()) return false;
-  return (db.prepare("select legacy_native_ack_eligible as eligible from codex_named_capture_origin where singleton=1")
+  if (!codexCaptureStatement(db,"select 1 from sqlite_master where name='codex_named_capture_origin' and type='table'").get()) return false;
+  return (codexCaptureStatement(db,"select legacy_native_ack_eligible as eligible from codex_named_capture_origin where singleton=1")
     .get() as {eligible:number}|undefined)?.eligible === 1;
 }
 
@@ -124,9 +125,9 @@ export function installCodexFrozenCompatibility(db: Database.Database) {
 }
 
 export function frozenCodexCapture(db: Database.Database, rawId: string) {
-  if (!db.prepare("select 1 from sqlite_master where name='codex_named_captures' and type='table'").get())
+  if (!codexCaptureStatement(db,"select 1 from sqlite_master where name='codex_named_captures' and type='table'").get())
     return undefined;
-  const witness = db.prepare(`select w.delivery_id as deliveryId,w.envelope_json as envelopeJson,
+  const witness = codexCaptureStatement(db,`select w.delivery_id as deliveryId,w.envelope_json as envelopeJson,
       w.captured_event_json as capturedEventJson
     from codex_named_captures w join buffered_events e on e.rowid=w.raw_rowid and e.id=w.raw_id
       and e.created_at=w.raw_created_at and e.privacy_generation=w.raw_generation
@@ -140,11 +141,11 @@ export function frozenCodexDelivery(db: Database.Database, lineage: {
   deliveryId: string; rawRowid: number | null; rawId: string | null;
   rawCreatedAt: string | null; rawGeneration: string | null;
 }) {
-  if (!db.prepare("select 1 from sqlite_master where name='codex_named_captures' and type='table'").get())
+  if (!codexCaptureStatement(db,"select 1 from sqlite_master where name='codex_named_captures' and type='table'").get())
     return undefined;
   // Lease privacy/retention validation owns raw eligibility. This lookup can
   // still preserve a frozen request after ordinary raw retention removed it.
-  const witness = db.prepare(`select envelope_json as envelopeJson from codex_named_captures
+  const witness = codexCaptureStatement(db,`select envelope_json as envelopeJson from codex_named_captures
     where delivery_id=? and raw_rowid is ? and raw_id is ? and raw_created_at is ? and raw_generation is ?`)
     .get(lineage.deliveryId,lineage.rawRowid,lineage.rawId,lineage.rawCreatedAt,lineage.rawGeneration) as
       { envelopeJson: string } | undefined;
@@ -160,15 +161,15 @@ export function rememberFrozenCodexCapture(
       ![captured.inputTokens,captured.outputTokens,captured.cacheReadTokens,captured.cacheCreationTokens,captured.costUsd]
         .some(value => value !== undefined)) return;
   ensureCodexNamedCaptures(db);
-  db.prepare(`insert or ignore into codex_named_captures
+  codexCaptureStatement(db,`insert or ignore into codex_named_captures
     (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,envelope_json,captured_event_json)
     select ?,rowid,id,created_at,privacy_generation,?,? from buffered_events
       where id=? and privacy_generation is not null`).run(deliveryId,envelopeJson,JSON.stringify(captured),rawId);
   // Stateless/history upload can freeze a request before the outbox leases it.
   // Freeze the matching queue copy too, including for an older reader. Use the
   // stored first witness, never a later caller's restamped candidate bytes.
-  if (!db.prepare("select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) return;
-  db.prepare(`update upload_outbox as o set sealed_envelope_json=(select w.envelope_json
+  if (!codexCaptureStatement(db,"select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) return;
+  codexCaptureStatement(db,`update upload_outbox as o set sealed_envelope_json=(select w.envelope_json
       from codex_named_captures w where w.delivery_id=o.delivery_id),
     sealed_bytes=(select length(cast(w.envelope_json as blob)) from codex_named_captures w where w.delivery_id=o.delivery_id)
     where o.delivery_id=? and o.sealed_envelope_json is null and exists(select 1 from codex_named_captures w
