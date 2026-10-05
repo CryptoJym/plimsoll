@@ -96,6 +96,7 @@ type UsageRow = {
   installationEpochId: string | null;
   payloadJson: string;
   usagePairedEventId: string | null;
+  uploadedAt: string | null;
 };
 
 type Shape = {
@@ -174,7 +175,7 @@ const ROW_COLUMNS = `rowid, id, source, event_type as eventType,
   cache_creation_tokens as cacheCreationTokens, cost_usd as costUsd,
   cost_kind as costKind, account_hash as accountHash,
   workspace_id as workspaceId, device_id as deviceId, installation_epoch_id as installationEpochId, payload_json as payloadJson,
-  usage_paired_event_id as usagePairedEventId`;
+  usage_paired_event_id as usagePairedEventId,uploaded_at as uploadedAt`;
 
 function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
   const time = Date.parse(row.observedAt);
@@ -237,7 +238,18 @@ function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
 export type CodexUsagePair = { logId: string; spanId: string };
 
 function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): CodexUsagePair | null {
-  const frozenSpan = frozenCodexCapture(db,span.id);
+  const frozenSpan = frozenCodexCapture(db,span.id),frozenLog=frozenCodexCapture(db,log.id);
+  // Paid owners cannot absorb new cache/cost fields in raw diagnostics or be
+  // NULLed as twins. Shared coverage emits only the newly known remainder;
+  // it separately validates legacy native ACK eligibility and incarnation.
+  if((log.uploadedAt||frozenLog)&&(span.uploadedAt||frozenSpan))return null;
+  if(log.uploadedAt||frozenLog) {
+    return applyCodexResponseCoverage(db,span.id,id=>Boolean(frozenCodexCapture(db,id))||
+      Boolean(db.prepare("select 1 from buffered_events where id=? and uploaded_at is not null").get(id)),log.id)
+      ? {logId:log.id,spanId:span.id}:null;
+  }
+  // Missing historical span bytes cannot attest its former emitted model.
+  if(span.uploadedAt&&!frozenSpan)return null;
   if (frozenSpan && frozenSpan.event.inputTokens === span.inputTokens &&
       frozenSpan.event.outputTokens === span.outputTokens) {
     const nativeLog = JSON.parse(log.payloadJson) as AiInteractionEvent;

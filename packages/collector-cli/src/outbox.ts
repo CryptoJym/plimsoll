@@ -2262,7 +2262,10 @@ export class DeliveryOutbox {
       if(!raw)return false;
       const captured=captureCodexModel(this.db,aiInteractionEventSchema.parse(JSON.parse(raw.payload)),rawId,false,false);
       if(!codexHasUsage(captured)||isCaptureGap(captured))return false;
-      if(raw.uploadedAt)return true;
+      // Coverage retains qualified old ACK fields directly. Their released
+      // readers discarded the envelope: acknowledge custody, without making
+      // up bytes or a new named witness from the raw diagnostic payload.
+      if(raw.uploadedAt)return captured.metadata.modelCaptureSource==="legacy_native_acknowledged";
       const row=this.db.prepare(`select delivery_id as deliveryId,base_envelope_json as base,
         sealed_envelope_json as sealed,repo_hash as repo,branch_hash as branch from upload_outbox
         where raw_id=? and raw_rowid=(select rowid from buffered_events where id=?)

@@ -278,6 +278,14 @@ export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string
   }
   const owner = emitted ? span : rollout;
   const duplicate = emitted ? rollout : span;
+  // Accepted twins retain their real local finance even if their old release
+  // did not record a named witness. Never conceal two historical deliveries.
+  if(duplicate.uploaded||frozenCodexCapture(db,duplicate.id))return null;
+  const ownerCapture=frozenCodexCapture(db,owner.id);
+  if(ownerCapture&&["cacheReadTokens","cacheCreationTokens","costUsd"].some(k=>
+    duplicate.event[k as keyof AiInteractionEvent]!==undefined&&ownerCapture.event[k as keyof AiInteractionEvent]===undefined))
+    return applyCodexResponseCoverage(db,duplicate.id,id=>Boolean(frozenCodexCapture(db,id)),owner.id)
+      ?{ownerId:owner.id,duplicateId:duplicate.id}:null;
   ensureSchema(db);
   db.prepare(`insert into codex_span_rollout_pairs values (?,?,?,?,?,?,?,?,?,?,?)`).run(
     span.id, span.rowid, span.created, span.generation, rollout.id, rollout.rowid, rollout.created, rollout.generation,
@@ -287,7 +295,8 @@ export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string
     cache_creation_tokens=null,cost_usd=null where id=?`).run(owner.id, CODEX_SPAN_ROLLOUT_DUPLICATE, duplicate.id);
   const price = estimateCostUsd({ model: rollout.event.model, inputTokens: owner.input, outputTokens: owner.output,
     cacheReadTokens: owner.cache ?? 0, cacheCreationTokens: owner.write ?? 0 });
-  db.prepare(`update buffered_events set usage_paired_event_id=?,model=?,cost_usd=coalesce(cost_usd,?),
+  if(owner.uploaded||ownerCapture)db.prepare("update buffered_events set usage_paired_event_id=? where id=?").run(duplicate.id,owner.id);
+  else db.prepare(`update buffered_events set usage_paired_event_id=?,model=?,cost_usd=coalesce(cost_usd,?),
     cost_kind=case when cost_usd is null and ? is not null then 'estimated' else cost_kind end where id=?`)
     .run(duplicate.id, rollout.event.model!, price?.costUsd ?? null, price?.costUsd ?? null, owner.id);
   // An attempted named span was selected as owner above. No frozen usage is
