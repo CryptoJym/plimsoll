@@ -1,0 +1,9 @@
+{
+  "finding": "B-P0-04",
+  "operations": [
+    "skew-partial-request",
+    "skew-complete-request"
+  ],
+  "shrink": "the r9 source fails even without the native intermediary; bounded deletion shrinking removed it",
+  "intent": "different timestamps do not make two native SSE reports of one explicit request additive"
+}

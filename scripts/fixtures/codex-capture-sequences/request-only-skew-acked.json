@@ -1,0 +1,15 @@
+{
+  "finding": "B-P0-04",
+  "operations": [
+    "request-only-partial",
+    "expire-retry",
+    "ack",
+    "request-only-span",
+    "expire-retry",
+    "ack",
+    "request-only-complete",
+    "expire-retry",
+    "ack"
+  ],
+  "intent": "request-only drift retains full field maxima with immutable ACKed owners"
+}

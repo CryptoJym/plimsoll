@@ -10,18 +10,19 @@ import { explodeOtlpPayload } from '../packages/collector-cli/src/otlp';
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline, sealCaptureBaselineGenerations } from '../packages/collector-cli/src/capture-baseline';
 import { deriveCaptureRootIdentity } from '../packages/collector-cli/src/capture-root-inventory';
 import { planCaptureHistory, applyCaptureHistory } from '../packages/collector-cli/src/capture-history-import';
+import { buildIngestBatch } from '../packages/collector-cli/src/upload';
 
 const base=false;
 const Reader=LocalEventBuffer, Tailer=RolloutTailer;
-const completion=createProofCompletion('codex-response-coverage',22);
+const completion=createProofCompletion('codex-response-coverage',26);
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'r8-own-'));
 const AT=Date.now()-600000, SESSION='22222222-2222-4222-8222-222222222222';
 const SOL='gpt-6.1-sol', ASTRA='gpt-6-astra';
 let index=0;
 const outcomes:any[]=[];
 const attr=(key:string,value:string|number)=>({key,value:typeof value==='number'?{intValue:String(value)}:{stringValue:value}});
-function sse(){return explodeOtlpPayload({resourceLogs:[{resource:{attributes:[attr('service.name','codex-app-server')]},scopeLogs:[{logRecords:[{
- timeUnixNano:String(BigInt(AT+6000)*1000000n),traceId:'a'.repeat(32),attributes:[attr('event.name','codex.sse_event'),attr('conversation.id',SESSION),attr('model',SOL),attr('input_token_count',19),attr('output_token_count',2)]
+function sse(at=6000,input=19,output=2,partial=false){return explodeOtlpPayload({resourceLogs:[{resource:{attributes:[attr('service.name','codex-app-server')]},scopeLogs:[{logRecords:[{
+ timeUnixNano:String(BigInt(AT+at)*1000000n),traceId:'a'.repeat(32),attributes:[attr('event.name','codex.sse_event'),attr('conversation.id',SESSION),attr('model',SOL),attr('input_token_count',input),...(partial?[]:[attr('output_token_count',output)])]
 }]}]}]},{source:'codex',transportPath:'/v1/logs'}).events[0]!.event;}
 class Fixture {
  dir=path.join(root,String(++index)); file=path.join(this.dir,'ledger.sqlite'); sessions=path.join(this.dir,'sessions'); b:any; now=new Date(AT+2000); native='';
@@ -58,7 +59,7 @@ async function main(){try{
  });
  }
 
- for(const mode of ['tailer','history']) for(const shape of ['held','ACKed','partial','native-first','native-frozen','cached','neighbour'])
+ for(const mode of ['tailer','history']) for(const shape of ['held','ACKed','partial','native-first','native-frozen','cached','neighbour','skew','skew-growing'])
  await check('response-coverage-'+mode+'-'+shape,async()=>{
   const f=new Fixture();try{
    const firstCache=shape==='cached'?5:0,secondCache=shape==='cached'?7:0;
@@ -70,7 +71,9 @@ async function main(){try{
     if(prior)assert.equal(item.envelopeJson,prior.envelopeJson);else retained.set(item.deliveryId,item);}};
    const ingest=async()=>{if(mode==='history')return f.history();const t=new Tailer(f.b,f.sessions,()=>[]);
     try{return await t.scan({scope:'full',now:new Date(AT+65000)});}finally{t.close();}};
-   const e=sse();if(shape==='neighbour')e.observedAt=new Date(AT+21000).toISOString();if(shape==='partial'){delete e.outputTokens;delete e.metadata.output_token_count;}
+   const skew=shape.startsWith('skew'),growing=shape==='skew-growing';
+   const e=sse(6000,19,2,shape==='partial'||skew);if(shape==='neighbour')e.observedAt=new Date(AT+21000).toISOString();
+   if(skew)Object.assign(e.metadata,{'turn.id':'first-response',request_id:'coverage-skew-request'});
    if(shape==='cached'){e.cacheReadTokens=5;e.costUsd=.1;e.costKind='reported';
     Object.assign(e.metadata,{cached_token_count:5,cost_usd:.1});}
    if(shape.startsWith('native-')){await ingest();if(shape==='native-frozen'){const first=f.lease(200000);observe(first);
@@ -78,17 +81,39 @@ async function main(){try{
    assert.equal(f.b.append(e),true);
    if(!shape.startsWith('native-')&&shape!=='held'){const first=f.lease(64000);observe(first);
     f.b.delivery.acknowledge(first.leaseId,first.items.map((i:any)=>i.deliveryId),f.now);}
-   await ingest();const last=f.lease(320000);observe(last);
+   await ingest();
+   if(skew){
+    const complete=sse(5500,growing?23:19,growing?3:2);
+    Object.assign(complete.metadata,{'turn.id':'first-response',request_id:'coverage-skew-request'});
+    complete.inputTokens=growing?23:19;complete.outputTokens=growing?3:2;
+    complete.cacheReadTokens=growing?7:3;complete.cacheCreationTokens=growing?5:2;
+    complete.costUsd=growing?.125:.1;complete.costKind='reported';
+    Object.assign(complete.metadata,{input_token_count:complete.inputTokens,output_token_count:complete.outputTokens,
+     cached_token_count:complete.cacheReadTokens,'gen_ai.usage.cache_creation_input_tokens':complete.cacheCreationTokens,cost_usd:complete.costUsd});
+    assert.equal(f.b.append(complete),true);
+    // Exercise the public stateless snapshot before the late observation's
+    // first lease. The queue must retain those exact captured bytes as well.
+    const snapshot=buildIngestBatch({tenantId:'11111111-1111-4111-8111-111111111111',deviceId:'r8-independent',
+     installKey:'coverage-fixture-key'} as any,f.b,{now:()=>new Date(AT+320000)});
+    assert.ok(snapshot.batch);
+    observe({items:snapshot.batch!.events.map(envelope=>({deliveryId:envelope.event.id,envelope,envelopeJson:JSON.stringify(envelope)}))});
+   }
+   const last=f.lease(320000);observe(last);
    const good=named([...retained.values()]);
    const sum=(k:string)=>good.reduce((n:number,i:any)=>n+(i.envelope.event[k]??0),0);
-   const expectedInput=shape==='neighbour'?51:32,expectedOutput=shape==='neighbour'?7:5;
+   const expectedInput=shape==='neighbour'?51:growing?36:32,expectedOutput=shape==='neighbour'?7:growing?6:5;
+   const expectedCache=skew?(growing?7:3):secondCache,expectedCost=skew?(growing?.125:.1):shape==='cached'?.1:0;
    assert.equal(sum('inputTokens'),expectedInput);assert.equal(sum('outputTokens'),expectedOutput);
-   assert.equal(sum('cacheReadTokens'),secondCache);assert.equal(sum('costUsd'),shape==='cached'?.1:0);
+   assert.equal(sum('cacheReadTokens'),expectedCache);assert.equal(sum('cacheCreationTokens'),skew?(growing?5:2):0);
+   assert.equal(sum('costUsd'),expectedCost);
    for(let i=0;i<40;i++){f.b.projection.runMaintenance(new Date(AT+320000));
     if(f.b.projection.status().parityReady&&!f.b.projection.status().dirty)break;}
    const totals=f.b.database.prepare(`select sum(input_tokens) as input,sum(output_tokens) as output,
     sum(cache_read_tokens) as cache from dashboard_event_facts where source='codex'`).get();
-   assert.deepEqual(totals,{input:expectedInput,output:expectedOutput,cache:secondCache});
+   assert.deepEqual(totals,{input:expectedInput,output:expectedOutput,cache:expectedCache});
+   if(skew){const extra=f.b.database.prepare(`select sum(cache_creation_tokens) as creation,sum(cost_nanos) as costNanos
+    from dashboard_event_facts where source='codex'`).get();
+    assert.deepEqual(extra,{creation:growing?5:2,costNanos:Math.round(expectedCost*1e9)});}
    ensureSessionSummarySchema(f.b.database);
    const read=async (queries:any[])=>queries.flatMap(q=>f.b.database.prepare(q.sql).all(q.params));
    const until=new Date(Math.max(Date.now(),AT+320000)+1000).toISOString();
@@ -96,7 +121,8 @@ async function main(){try{
    for(let i=0;i<40&&!summary.complete;i++)summary=await updateSessionSummary(f.b.database,SESSION,
     until,{read});
    assert.equal(summary.complete,true,JSON.stringify(summary));assert.equal(summary.snapshot!.inputTokens,expectedInput);
-   assert.equal(summary.snapshot!.outputTokens,expectedOutput);assert.equal(summary.snapshot!.cacheReadTokens,secondCache);
+   assert.equal(summary.snapshot!.outputTokens,expectedOutput);assert.equal(summary.snapshot!.cacheReadTokens,expectedCache);
+   if(skew){assert.equal(summary.snapshot!.cacheCreationTokens,growing?5:2);assert.equal(summary.snapshot!.costUsd,expectedCost);}
 
    if(shape==='partial')assert.ok(good.some((i:any)=>i.envelope.event.inputTokens===0&&i.envelope.event.outputTokens===2));
    for(const item of good){const ev=item.envelope.event;

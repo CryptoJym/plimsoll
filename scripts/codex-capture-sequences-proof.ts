@@ -24,8 +24,10 @@ const OPS = ["sse-valid", "sse-invalid", "sse-conflicting", "trace-sol", "trace-
   "rollout-turn", "rollout-no-turn", "neighbour-turn", "history-turn", "history-no-turn",
   "lease", "ack", "expire-retry", "retry", "remote-terminal", "replay", "restamp", "gap-seal",
   "stateless-build", "reopen", "rollback-047", "rollback-048", "upgrade-047", "upgrade-048", "sse-zero", "sse-partial", "sse-cache-cost",
-  "second-turn", "third-turn", "history-multiple", "cache-only-turn", "sse-partial-twin", "sse-zero-complement-twin"] as const;
-type Op = typeof OPS[number];
+  "second-turn", "third-turn", "history-multiple", "cache-only-turn", "sse-partial-twin", "sse-zero-complement-twin",
+  "skew-partial-request", "skew-complete-request", "skew-partial-turn", "skew-complete-turn",
+  "skew-growing", "skew-smaller", "skew-native", "skew-native-update", "request-only-partial", "request-only-complete", "request-only-span"] as const;
+type Op = typeof OPS[number] | "skew-series";
 type Version = "head" | "0.7.47" | "0.7.48";
 const FIELDS = ["inputTokens","outputTokens","cacheReadTokens","cacheCreationTokens","costUsd"] as const;
 type Field = typeof FIELDS[number];
@@ -42,9 +44,19 @@ assert.ok(Number.isSafeInteger(seeds) && seeds >= 200 && seeds <= 2000,"pin at l
 const caseFile = process.argv.find(arg=>arg.startsWith("--case="))?.slice(7);
 const directed = caseFile ? [{file:path.basename(caseFile),...JSON.parse(fs.readFileSync(caseFile,"utf8"))}] : fs.existsSync(fixtureDirectory) ? fs.readdirSync(fixtureDirectory).filter(f=>f.endsWith(".json"))
   .sort().map(file=>({file,...JSON.parse(fs.readFileSync(path.join(fixtureDirectory,file),"utf8"))})) : [];
-const completion = createProofCompletion("codex-capture-sequences",(caseFile?0:seeds)+directed.length);
+const orderGroups: Op[][]=[
+  ["skew-partial-request","skew-native","skew-complete-request"],
+  ["skew-partial-turn","skew-native","skew-complete-turn"],
+  ["skew-partial-request","skew-native","skew-complete-turn"],
+  ["skew-partial-turn","skew-native","skew-complete-request"],
+  ["skew-partial-request","skew-native","skew-growing"],
+  ["skew-smaller","skew-native","skew-growing"],
+  ["request-only-partial","request-only-span","request-only-complete"],
+  ["skew-partial-request","skew-native-update","skew-complete-request"],
+];
+const completion = createProofCompletion("codex-capture-sequences",(caseFile?0:seeds+orderGroups.length*6)+directed.length);
 let Old047: any, Old048: any, runIndex = 0;
-const coverage = new Map<Op,number>(OPS.map(op=>[op,0]));
+const coverage = new Map<Op,number>([...OPS,"skew-series" as const].map(op=>[op,0]));
 let steps = 0, rollbackLeases = 0, terminalReplays = 0, historyImports = 0, historyRefusals = 0, pairingChecks = 0;
 
 function random(seed: number) {
@@ -59,21 +71,26 @@ function sequence(seed: number): Op[] {
   return result;
 }
 const attribute = (key: string,value: string|number) => ({key,value:typeof value==="number"?{intValue:String(value)}:{stringValue:value}});
-function log(model: string,trace: string,at: number,input?: number,output?: number,contradict=false,cache?: number) {
+function log(model: string,trace: string,at: number,input?: number,output?: number,contradict=false,cache?: number,
+  identity?: {turn?:string;request?:string}) {
   return explodeOtlpPayload({resourceLogs:[{resource:{attributes:[attribute("service.name","codex-app-server")]},
     scopeLogs:[{logRecords:[{timeUnixNano:String(BigInt(at)*1000000n),traceId:trace,
       attributes:[attribute("event.name","codex.sse_event"),attribute("conversation.id",SESSION),attribute("model",model),
         ...(input===undefined?[]:[attribute("input_token_count",input)]),
         ...(output===undefined?[]:[attribute("output_token_count",output)]),
-        ...(cache===undefined?[]:[attribute("cached_input_token_count",cache)]),
+        ...(cache===undefined?[]:[attribute("cached_token_count",cache)]),
+        ...(identity?.turn?[attribute("turn.id",identity.turn)]:[]),
+        ...(identity?.request?[attribute("request_id",identity.request)]:[]),
         ...(contradict?[attribute("gen_ai.request.model",OTHER)]:[])]}]}]}]},
     {source:"codex",transportPath:"/v1/logs"}).events[0]!.event;
 }
-function responseSpan(trace: string) {
+function responseSpan(trace: string,identity?: {turn?:string;request?:string},at=6000) {
   return explodeOtlpPayload({resourceSpans:[{resource:{attributes:[attribute("service.name","codex-app-server")]},
     scopeSpans:[{spans:[{name:"handle_responses",traceId:trace,spanId:"1".repeat(16),
-      startTimeUnixNano:String(BigInt(AT+5000)*1000000n),endTimeUnixNano:String(BigInt(AT+6000)*1000000n),
+      startTimeUnixNano:String(BigInt(AT+at-1000)*1000000n),endTimeUnixNano:String(BigInt(AT+at)*1000000n),
       attributes:[attribute("conversation.id",SESSION),attribute("gen_ai.usage.input_tokens",19),
+        ...(identity?.turn?[attribute("turn.id",identity.turn)]:[]),
+        ...(identity?.request?[attribute("request_id",identity.request)]:[]),
         attribute("gen_ai.usage.output_tokens",2)]}]}]}]},{source:"codex",transportPath:"/v1/traces"}).events[0]!.event;
 }
 function financial(e: any) { return [e.inputTokens,e.outputTokens,e.cacheReadTokens,e.cacheCreationTokens,e.costUsd].some(v=>v!==undefined); }
@@ -92,6 +109,7 @@ class World {
   expected = new Map<string,Partial<Record<Field,number>>>();
   knownNative = new Map<string,Partial<Record<Field,number>>>();
   nativeTurns = 1; historyTurns = 0;
+  nativeUpdateWritten=false;
   nativeModels = new Set<string>();
   // The first complete file response establishes its counter/turn knowledge.
   // Later context-only sightings have no new marginal counters to deliver.
@@ -110,8 +128,20 @@ class World {
   register(e:any,response:string,kind:Producer["kind"]) {
     this.producers.set(e.id,{event:e,response,kind});
     const amounts=this.expected.get(response)??{};
-    for(const k of FIELDS)if(e[k]!==undefined)amounts[k]=Math.max(amounts[k]??0,e[k]);
+    // Fixture native counters are deltas. Convert their producer facts into
+    // this response's own amounts before taking maxima with SSE/span reports.
+    const native=this.nativeAmounts(response);
+    for(const k of FIELDS) {
+      if(e[k]!==undefined)amounts[k]=Math.max(amounts[k]??0,e[k]);
+      if(native[k]!==undefined)amounts[k]=Math.max(amounts[k]??0,native[k]!);
+    }
     this.expected.set(response,amounts);
+  }
+  nativeAmounts(response:string,prefix=Infinity) {
+    const producers=[...this.producers.values()].filter(p=>p.response===response&&p.kind==="turn"&&
+      (p.event.metadata.counterOrdinal??Number(p.response.slice(9)))<=prefix);
+    return Object.fromEntries(FIELDS.filter(k=>producers.some(p=>p.event[k]!==undefined))
+      .map(k=>[k,producers.reduce((n,p)=>n+(p.event[k]??0),0)])) as Partial<Record<Field,number>>;
   }
   fact(trace:string,model:string) {
     const models=this.traceModels.get(trace)??new Set<string>();models.add(model);this.traceModels.set(trace,models);
@@ -176,10 +206,23 @@ class World {
       invariant(result.parseErrors===0,"PRODUCER_PARSE",result);
       this.nativeObserved=true;
       for(const p of this.producers.values())if(p.kind==="turn")
-        this.knownNative.set(p.response,Object.fromEntries(FIELDS.filter(k=>p.event[k]!==undefined).map(k=>[k,p.event[k]])));
+        this.knownNative.set(p.response,this.nativeAmounts(p.response));
 
       pairingChecks++;
     } finally {t.close();}
+  }
+  async grow(target:number) {
+    await this.nativeFile(true);
+    const input=[0,19,32,45,45,64],output=[0,2,5,8,8,10],cache=[0,0,5,7,10,10],times=[0,6000,11000,16000,18000,21000];
+    for(let i=this.nativeTurns+1;i<=target;i++) {
+      const row=(type:string,payload:any)=>JSON.stringify({timestamp:new Date(AT+times[i]!).toISOString(),type,payload});
+      fs.appendFileSync(this.rolloutFile,[row("turn_context",{turn_id:i===5?"skew-turn":`unit-turn-${i}`,model:MODEL}),
+        row("event_msg",{type:"token_count",info:{total_token_usage:{input_tokens:input[i]!,
+          output_tokens:output[i]!,cached_input_tokens:cache[i]!}}})].join("\n")+"\n");
+      this.register({id:deterministicEventId(["codex-rollout",SESSION,String(i)]),model:MODEL,
+        inputTokens:input[i]!-input[i-1]!,outputTokens:output[i]!-output[i-1]!,cacheReadTokens:cache[i]!-cache[i-1]!,
+        metadata:{usageSource:"rollout",counterOrdinal:i}},`response-${i}`,"turn");this.nativeTurns=i;
+    }
   }
   async history(withTurn: boolean) {
     await this.nativeFile(withTurn);
@@ -214,14 +257,64 @@ class World {
     // A fenced history snapshot may exclude counters appended later. Its
     // oracle marks only responses inside the native prefix sealed at creation.
     for(const p of this.producers.values())if(p.kind==="turn"&&Number(p.response.slice(9))<=this.historyTurns)
-      this.knownNative.set(p.response,Object.fromEntries(FIELDS.filter(k=>p.event[k]!==undefined).map(k=>[k,p.event[k]])));
+      this.knownNative.set(p.response,this.nativeAmounts(p.response,this.historyTurns));
 
   }
   async operate(op: Op) {
     if(["sse-valid","sse-invalid","sse-conflicting","trace-sol","trace-astra","span","rollout-turn","rollout-no-turn",
       "neighbour-turn","history-turn","history-no-turn","gap-seal","stateless-build","upgrade-047","upgrade-048"].includes(op)) this.head();
     if(["sse-zero","sse-partial","sse-cache-cost","second-turn","third-turn","history-multiple","cache-only-turn","sse-partial-twin","sse-zero-complement-twin"].includes(op))this.head();
+    if(op.startsWith("skew-")||op.startsWith("request-only-"))this.head();
     switch(op) {
+      case "skew-series": {
+        for(let i=1;i<=24;i++){
+          const e=log(MODEL,"b".repeat(32),AT+18000+i*7,19+i,2,false,3,{turn:"skew-turn",request:"skew-request"});
+          this.register(e,"response-5","trace");this.fact("b".repeat(32),MODEL);this.b.append(e);
+          this.lease();this.b.delivery.acknowledge(this.currentLease.leaseId,this.currentLease.items.map((item:any)=>item.deliveryId),this.now);
+          this.assertStep();
+        }
+        break;
+      }
+      case "skew-native": await this.grow(5);await this.tail(this.fileHasTurn);break;
+      case "skew-native-update": {
+        await this.grow(5);
+        if(!this.nativeUpdateWritten) {
+          const row=(type:string,payload:any)=>JSON.stringify({timestamp:new Date(AT+21400).toISOString(),type,payload});
+          fs.appendFileSync(this.rolloutFile,[row("turn_context",{turn_id:"skew-turn",model:MODEL}),
+            row("event_msg",{type:"token_count",info:{total_token_usage:{input_tokens:68,output_tokens:11,cached_input_tokens:17}}})].join("\n")+"\n");
+          this.register({id:deterministicEventId(["codex-rollout",SESSION,"6"]),model:MODEL,inputTokens:4,outputTokens:1,
+            cacheReadTokens:7,metadata:{usageSource:"rollout",counterOrdinal:6}},"response-5","turn");
+          this.nativeTurns=6;this.nativeUpdateWritten=true;
+        }
+        await this.tail(this.fileHasTurn);break;
+      }
+      case "skew-partial-request": case "skew-complete-request": case "skew-partial-turn": case "skew-complete-turn":
+      case "skew-growing": case "skew-smaller": {
+        const partial=op.includes("partial"),growing=op==="skew-growing",smaller=op==="skew-smaller";
+        // Native completion is 21000. Complete reports arrive with EARLIER
+        // clocks; the turn-only observations have a different drift again.
+        const at=growing?19800:smaller?22100:op.endsWith("turn")?partial?21300:20200:partial?21000:20500;
+        const e=log(MODEL,"b".repeat(32),AT+at,smaller?17:growing?23:19,partial?undefined:smaller?1:growing?3:2,false,
+          partial?undefined:smaller?0:growing?7:3,{turn:"skew-turn",...(!op.endsWith("turn")?{request:"skew-request"}:{})});
+        if(!partial) {
+          e.cacheCreationTokens=smaller?0:growing?5:2;e.costUsd=smaller?0:growing?.125:.1;e.costKind="reported";
+          Object.assign(e.metadata,{"gen_ai.usage.cache_creation_input_tokens":e.cacheCreationTokens,cost_usd:e.costUsd});
+        }
+        this.register(e,"response-5","trace");this.fact("b".repeat(32),MODEL);this.b.append(e);break;
+      }
+      case "request-only-partial": case "request-only-complete": case "request-only-span": {
+        const trace="9".repeat(32),identity={request:"request-without-turn"};
+        const e=op==="request-only-span"?responseSpan(trace,identity,48000):
+          log(MODEL,trace,AT+(op==="request-only-partial"?45000:43000),19,op==="request-only-partial"?undefined:2,false,
+            op==="request-only-partial"?undefined:3,identity);
+        if(op==="request-only-complete") {
+          e.cacheCreationTokens=2;e.costUsd=.1;e.costKind="reported";
+          Object.assign(e.metadata,{"gen_ai.usage.cache_creation_input_tokens":2,cost_usd:.1});
+        }
+        this.register(e,"request-only","trace");
+        if(op!=="request-only-span")this.fact(trace,MODEL);
+        this.b.append(e);break;
+      }
       case "sse-zero-complement-twin": {
         const e=log(MODEL,this.trace,AT+6000,19,2,false,0);this.register(e,"response-1","trace");
         if(this.b.append(e)){this.nativeModels.add(MODEL);this.fact(this.trace,MODEL);}break;
@@ -272,18 +365,8 @@ class World {
         this.register(e,op,"trace");this.fact(e.metadata.traceId as string,MODEL);this.b.append(e);break;
       }
       case "second-turn": case "third-turn": case "history-multiple": case "cache-only-turn": {
-        await this.nativeFile(true);
         const target=op==="second-turn"?2:op==="cache-only-turn"?4:3;
-        for(let i=this.nativeTurns+1;i<=target;i++) {
-          const at=i===2?11000:i===3?16000:18000,cache=i===2?5:i===3?7:10;
-          const row=(type:string,payload:any)=>JSON.stringify({timestamp:new Date(AT+at).toISOString(),type,payload});
-          fs.appendFileSync(this.rolloutFile,[row("turn_context",{turn_id:`unit-turn-${i}`,model:MODEL}),
-            row("event_msg",{type:"token_count",info:{total_token_usage:{input_tokens:19+13*(Math.min(i,3)-1),
-              output_tokens:2+3*(Math.min(i,3)-1),cached_input_tokens:cache}}})].join("\n")+"\n");
-          this.register({id:deterministicEventId(["codex-rollout",SESSION,String(i)]),model:MODEL,
-            inputTokens:i===4?0:13,outputTokens:i===4?0:3,cacheReadTokens:i===2?5:i===3?2:3,metadata:{usageSource:"rollout"}},
-            `response-${i}`,"turn");this.nativeTurns=i;
-        }
+        await this.grow(target);
         if(op==="history-multiple")await this.history(this.fileHasTurn);else await this.tail(this.fileHasTurn);break;
       }
       case "neighbour-turn": {
@@ -418,8 +501,24 @@ class World {
         invariant((this.sums(p.response)[k]??0)>=p.event[k],"KNOWN_NATIVE_FINAL",
           {response:p.response,field:k,expected:p.event[k],sum:this.sums(p.response)});
       }
-    for(const [response,expected] of this.knownNative)for(const k of FIELDS)
-      invariant((this.sums(response)[k]??0)===(expected[k]??0),"KNOWN_NATIVE_FINAL",{response,field:k,expected,sum:this.sums(response)});
+    for(const [response,native] of this.knownNative)for(const k of FIELDS) {
+      const expected=Math.max(native[k]??0,this.expected.get(response)?.[k]??0);
+      invariant(Math.abs((this.sums(response)[k]??0)-expected)<1e-12,"KNOWN_NATIVE_FINAL",
+        {response,field:k,expected,sum:this.sums(response)});
+    }
+    // These two isolated response alphabets have explicit native model facts
+    // and no model/account contradictions. A mistakenly gapped complete SSE
+    // must not excuse lost complementary fields. A span gapped before its
+    // first model log remains diagnostic and is not used to raise this floor.
+    for(const response of ["response-5","request-only"]) {
+      const required=this.nativeAmounts(response);
+      for(const p of this.producers.values())if(p.response===response&&p.kind==="trace"&&
+        p.event.metadata.otelEventName==="codex.sse_event"&&this.eligible(p,p.event))
+        for(const k of FIELDS)if(p.event[k]!==undefined)required[k]=Math.max(required[k]??0,p.event[k]);
+      for(const k of FIELDS)if(required[k]!==undefined)invariant(this.sums(response)[k]!==undefined&&
+        Math.abs(this.sums(response)[k]!-required[k]!)<1e-12,"KNOWN_NATIVE_RESPONSE_MAXIMUM",
+        {response,field:k,required,sums:this.sums(response)});
+    }
   }
   close() { this.b?.close();fs.rmSync(this.dir,{recursive:true,force:true}); }
 }
@@ -430,7 +529,9 @@ async function run(operations: Op[],settle=true) {
   try {
     for(index=0;index<operations.length;index++) { await world.operate(operations[index]!);world.assertStep(); }
     if(settle)await world.settle();
-    return {passed:true as const,steps:operations.length,named:[...world.frozen.values()].filter(f=>f.named).length};
+    const totals=Object.fromEntries([...world.expected.keys()].map(response=>[response,world.sums(response)]));
+    return {passed:true as const,steps:operations.length,named:[...world.frozen.values()].filter(f=>f.named).length,totals,
+      expected:Object.fromEntries(world.expected)};
   } catch(error) {
     // Persist enough producer/state evidence to diagnose an accounting error
     // after this disposable world is removed. This is observation, not an
@@ -441,12 +542,14 @@ async function run(operations: Op[],settle=true) {
       raw:db.prepare("select * from buffered_events order by rowid").all(),
       outbox:db.prepare("select * from upload_outbox order by delivery_id").all(),
       receipts:db.prepare("select * from upload_receipts order by delivery_id").all(),
-      frozen:[...world.frozen.values()]};
+      frozen:[...world.frozen.values()],
+      accounting:hasTable(db,"codex_response_coverage")?db.prepare("select * from codex_response_coverage").all():[],
+      decisions:hasTable(db,"codex_capture_decisions")?db.prepare("select raw_id,reason from codex_capture_decisions").all():[]};
     return {passed:false as const,index,error:String(error),snapshot};
   }
   finally { world.close(); }
 }
-function failureTag(error: string) { return error.match(/(?:I[123]_[A-Z_]+|NO_DUPLICATE_USAGE|KNOWN_NATIVE_[A-Z_]+|STATE_ACTIVE_TERMINAL)/)?.[0]; }
+function failureTag(error: string) { return error.match(/(?:I[123]_[A-Z_]+|NO_DUPLICATE_USAGE|KNOWN_NATIVE_[A-Z_]+|STATE_ACTIVE_TERMINAL|ORDER_[A-Z_]+)/)?.[0]; }
 async function shrink(operations: Op[],tag: string) {
   let result=[...operations], attempts=0;
   // Deterministic deletion shrink; every attempt uses a fresh real world.
@@ -461,13 +564,43 @@ async function shrink(operations: Op[],tag: string) {
   }
   return {operations:result,attempts};
 }
+function* permutations(ops:Op[]):Generator<Op[]> {
+  if(!ops.length){yield [];return;}
+  for(let i=0;i<ops.length;i++)for(const rest of permutations([...ops.slice(0,i),...ops.slice(i+1)]))yield [ops[i]!,...rest];
+}
+async function saveFailure(name:string,operations:Op[],result:Extract<Awaited<ReturnType<typeof run>>,{passed:false}>) {
+  const tag=failureTag(result.error),directory=path.join(process.cwd(),"evidence/codex-capture-sequences");fs.mkdirSync(directory,{recursive:true});
+  const file=path.join(directory,`${name}-${tag??"harness"}.json`);
+  fs.writeFileSync(file,JSON.stringify({...result,operations,attempts:0},null,2)+"\n");
+  const reduced=tag?await shrink(operations,tag):{operations,attempts:0};
+  fs.writeFileSync(file,JSON.stringify({...result,...reduced},null,2)+"\n");
+  console.error(JSON.stringify({file,tag,...reduced}));
+}
 async function main() {
   await withReader("a60590559403cace3db7cbbda49812c9e3dbfe62",async({Buffer:B047})=>
     withReader("34d58bcd90865679e09fcbd1ee1703de5effda97",async({Buffer:B048})=>{
       Old047=B047;Old048=B048;
       for(const fixture of directed) {
         const result=await run(fixture.operations);
+        if(!result.passed)await saveFailure(fixture.file,fixture.operations,result);
         invariant(result.passed,"DIRECTED_SEQUENCE",{fixture:fixture.file,result});completion.check(fixture.file);
+      }
+      if(!caseFile)for(let group=0;group<orderGroups.length;group++) {
+        let canonical:Record<string,number>|undefined;
+        const observations=orderGroups[group]!,response=observations[0]!.startsWith("request-only-")?"request-only":"response-5";
+        let permutation=0;
+        for(const order of permutations(observations)) {
+          // ACK after EACH observation so different arrival orders cannot
+          // be repaired by rewriting a delivery that already left.
+          const operations=order.flatMap(op=>[op,"expire-retry","ack"] as Op[]),result=await run(operations);
+          if(!result.passed)await saveFailure(`order-${group}-${permutation}`,operations,result);
+          invariant(result.passed,"ORDER_EXECUTION",result);
+          const totals=result.passed?result.totals[response]!:{},expected=result.passed?result.expected[response]!:{ };
+          for(const k of FIELDS)invariant(expected[k]!==undefined&&totals[k]!==undefined&&Math.abs(totals[k]!-expected[k]!)<1e-12,
+            "ORDER_FIELD_MAXIMUM",{group,order,field:k,totals,expected});
+          if(canonical)for(const k of FIELDS)invariant(Math.abs(totals[k]!-canonical[k]!)<1e-12,"ORDER_INVARIANCE",{order,totals,canonical});
+          canonical=totals;completion.check(`order-${group}-${permutation++}`);
+        }
       }
       for(let seed=0;seed<(caseFile?0:seeds);seed++) {
         const operations=sequence(seed),result=await run(operations);
@@ -488,9 +621,11 @@ async function main() {
     }));
   if(!caseFile)invariant(OPS.every(op=>coverage.get(op)!>0),"OPERATION_COVERAGE",Object.fromEntries(coverage));
   console.log(JSON.stringify({proof:"codex-capture-sequences",seeds,directed:directed.length,steps,
+    orderChecks:caseFile?0:orderGroups.length*6,
     operations:Object.fromEntries(coverage),rollbackLeases,terminalReplays,historyImports,historyRefusals,pairingChecks,
     invariants:["I1 native model or tokenless gap","I2 named ID/bytes final","I3 gap never regains counters",
-      "financial totals bounded per response and field","every known native response retained and eventually named"]},null,2));
+      "financial totals bounded per response and field","every known native response retained and eventually named",
+      "arrival permutations converge to every field maximum with ACKs between observations"]},null,2));
   completion.complete();
 }
 main().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>fs.rmSync(root,{recursive:true,force:true}));

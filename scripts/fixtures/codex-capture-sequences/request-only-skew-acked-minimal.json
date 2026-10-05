@@ -1,0 +1,11 @@
+{
+  "finding": "R10-P0-01",
+  "operations": [
+    "request-only-partial",
+    "expire-retry",
+    "request-only-span",
+    "request-only-complete"
+  ],
+  "shrink": "13 deletion attempts removed ACKs and redundant leases; first paid partial then a captured span still vetoes the native complete log",
+  "intent": "the frozen model-less span cannot hide complementary native SSE fields or supply a model"
+}
