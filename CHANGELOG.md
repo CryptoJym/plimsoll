@@ -8,8 +8,9 @@
   anonymous exact twins retain complementary paid branches. Qualified native fields ACKed
   by released collectors remain paid owners across upgrade; reconciliation
   preserves ACKed finance without inventing missing historical wire bytes.
-- Known limit: two complete SSE reports with disjoint native identities can
-  both be accepted before a later observation links them. Their accepted
+- Known limit: SSE reports with overlapping fields and disjoint native identities
+  can both be accepted before a later observation links them, including partial
+  reports. Their accepted
   overlap requires a cloud accounting contract to correct; local frozen
   delivery bytes remain unchanged.
 

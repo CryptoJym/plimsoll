@@ -13,7 +13,7 @@ type Amounts=Partial<Record<typeof FIELDS[number],number>>;
 const root=proofTempRoot("identity-directed"),AT=Date.now()-10_000_000;
 const SESSION="22222222-2222-4222-8222-222222222222",MODEL="gpt-6.1-sol";
 const minimal=JSON.parse(fs.readFileSync("scripts/fixtures/codex-response-identities/minimal-counterexamples.json","utf8"));
-const completion=createProofCompletion("codex-response-identity-directed",35+minimal.length*2);
+const completion=createProofCompletion("codex-response-identity-directed",65+minimal.length*2);
 let next=0;
 const attr=(key:string,value:string|number)=>({key,value:typeof value==="string"?{stringValue:value}:Number.isInteger(value)?{intValue:String(value)}:{doubleValue:value}});
 const aliases={inputTokens:"input_token_count",outputTokens:"output_token_count",cacheReadTokens:"cached_token_count",cacheCreationTokens:"gen_ai.usage.cache_creation_input_tokens",costUsd:"cost_usd"};
@@ -47,6 +47,21 @@ class Fixture {
   close(){this.b.close();fs.rmSync(this.dir,{recursive:true,force:true});}
 }
 function same(actual:Amounts,expected:Amounts){for(const k of FIELDS){assert.equal(actual[k]===undefined,expected[k]===undefined,k+" known versus absent");if(expected[k]!==undefined)assert.ok(Math.abs(actual[k]!-expected[k]!)<1e-10,k+": "+JSON.stringify({actual,expected}));}}
+function minimalFacts(fixture:any) {
+  const groups:Set<string>[]=[];
+  for(const [index,o] of fixture.observations.entries()) {
+    const group=new Set<string>([1,2,4].filter(bit=>o.mask&bit).map(String));
+    if(!group.size)group.add("anonymous:"+index);
+    for(let n=groups.length-1;n>=0;n--)if([...groups[n]!].some(node=>group.has(node))) {
+      for(const node of groups[n]!)group.add(node);groups.splice(n,1);
+    }
+    groups.push(group);
+  }
+  const expected=Object.fromEntries(FIELDS.filter(k=>fixture.observations.some((o:any)=>o.amount[k]!==undefined))
+    .map(k=>[k,Math.max(...fixture.observations.map((o:any)=>o.amount[k]??0))]));
+  same(expected,fixture.expected);
+  assert.equal(fixture.limit,groups.length>1?"no-linking-evidence":"late-bridge-after-paid-overlap");
+}
 const orders=[[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
 async function main(){
   const native=new Fixture();try{
@@ -71,10 +86,11 @@ async function main(){
     assert.ok(f.appended&&f.leases&&f.acks);completion.check(kind);
   }finally{f.close();}}
   // Measurement adapter only: adjust the existing queue due time in a private
-  // fixture. Product code has no additional SSE hold. A bridge releases this
+  // fixture. 60 seconds is the existing SSE transport hold; 120 seconds is
+  // the proposed extra 60 seconds. Product code adds no hold. A bridge releases this
   // response's pending rows; every actual append/lease/ACK still uses production.
   const measurements:any[]=[];
-  for(const bridgeAt of [40_000,120_000])for(const hold of [0,60_000])for(const order of orders){const f=new Fixture();try{
+  for(const bridgeAt of [40_000,120_000,240_000])for(const hold of [0,60_000,120_000])for(const order of orders){const f=new Fixture();try{
     const arrivals=new Map<string,number>();let bridged=false;
     const pending=()=>f.b.database.prepare("select min(next_attempt_at) as at from upload_outbox where state='pending'").get()?.at;
     const flushUntil=(at:number)=>{for(let n=0;n<8;n++){const due=pending();if(!due||Date.parse(due)>AT+at)break;f.now=new Date(due);f.drain(false);}};
@@ -90,7 +106,7 @@ async function main(){
     flushUntil(bridgeAt+hold);f.verify();const total=f.total();const exposed=total.inputTokens!==19||total.outputTokens!==2;
     const delays=[...f.frozen.values()].filter(v=>v.event.model).map(v=>v.at-AT-(arrivals.get(v.rawId)??0));
     measurements.push({order:order.join(""),bridgeAt,hold,total,exposed,deliveryDelayMs:delays});
-    assert.equal(exposed,order[2]===2&&(hold===0||bridgeAt>hold));
+    assert.equal(exposed,order[2]===2&&bridgeAt>=20_000+hold);
     completion.check(`hold-measurement-${bridgeAt}-${hold}-${order.join("")}`);
   }finally{f.close();}}
   // Every newly shrunk counterexample executes again as a permanent minimal
@@ -98,8 +114,12 @@ async function main(){
   // beside its irretractable paid-prefix result, rather than being waived.
   await withReader("121b55437555c3a3c34bafe5889f4d6d8870509f",async({Buffer})=>{
     for(const [index,fixture] of minimal.entries())for(const [label,Reader] of [["head",LocalEventBuffer],["0.7.50",Buffer]] as const){const f=new Fixture(Reader);try{
+      minimalFacts(fixture);
       for(const o of fixture.observations){const identity={...(o.mask&1?{"turn.id":"T"}:{}),...(o.mask&2?{request_id:"R"}:{}),...(o.mask&4?{call_id:"C"}:{})};f.append(event(identity,o.amount,o.ordinal));if(fixture.ackEach)f.drain();}
-      f.drain();if(label==="head")same(f.total(),fixture.paidPrefix);
+      f.drain();if(label==="head") {
+        same(f.total(),fixture.paidPrefix);
+        assert.ok(FIELDS.some(k=>Math.abs((f.total()[k]??0)-(fixture.expected[k]??0))>1e-10),"each minimal case retains its actual ideal-total failure");
+      }
       for(const k of FIELDS)assert.ok((f.total()[k]??0)>=(fixture.expected[k]??0)-1e-10,"known minimal field retained");
       assert.equal(f.appended,fixture.observations.length);assert.ok(f.leases&&f.acks);completion.check(`minimal-${index}-${label}`);
     }finally{f.close();}}

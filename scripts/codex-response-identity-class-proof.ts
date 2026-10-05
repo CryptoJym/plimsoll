@@ -145,7 +145,13 @@ async function enumerate() {
           let minimal=observations;
           for(const o of [...minimal]) {
             const candidate=minimal.filter(p=>p!==o);
-            if(candidate.length>1&&!equal(oracle(candidate,ackEach).total,maximum(candidate)))minimal=candidate;
+            if(candidate.length>1) {
+              const reduced=oracle(candidate,ackEach);
+              const reducedLimit=reduced.components>1?"no-linking-evidence":"late-bridge-after-paid-overlap";
+              // An accepted-overlap reproducer must retain its explicit
+              // bridge. Removing it changes the failure to missing evidence.
+              if(reducedLimit===limit&&!equal(reduced.total,maximum(candidate)))minimal=candidate;
+            }
           }
           const key=JSON.stringify({ackEach,observations:minimal.map(o=>({mask:o.mask,amount:o.amount}))});
           shrunk.set(key,{ackEach,observations:minimal,limit,expected:maximum(minimal),paidPrefix:oracle(minimal,ackEach).total});

@@ -118,7 +118,9 @@ async function branchWriterStockReader(stockTree: string) {
       actorId: accountId, source: "codex", dataMode: "metadata",
       eventType: "assistant_response", observedAt: now.toISOString(),
       model: "gpt-6.1-sol", inputTokens: 19, outputTokens: 2,
-      metadata: { otelEventName: "codex.sse_event", "gen_ai.request.model": "gpt-6.1-sol",
+      // Preserve main's generic-response shape and its one-second lease.
+      // Native request attributes on this exact trace attest the named model.
+      metadata: { "gen_ai.request.model": "gpt-6.1-sol",
         traceId: "e".repeat(32), "user.account_id": accountId },
     })), true);
     assert.equal(buffer.append(aiInteractionEventSchema.parse({
