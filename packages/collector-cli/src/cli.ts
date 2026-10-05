@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { openLedgerDatabase } from "./ledger-connection";
-import { AutomaticRetentionCadence } from "./retention-cadence";
-import { claudeStatusLineCliMain } from "./claude-status-line-command";
+import type { AutomaticRetentionCadence } from "./retention-cadence";
 import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -52,8 +51,6 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
-import { planFreshLedgerCutover, switchFreshLedger,
-  restoreArchivedLedger, assertReplacementRuntimeCompatible, recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
@@ -77,7 +74,6 @@ import {
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
-import { startClaudeReplayBarrier } from "./claude-replay-barrier";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
@@ -121,7 +117,6 @@ import {
   performJoin,
   resumePendingJoin,
 } from "./join";
-import { createProfileCapture } from "./profile-capture";
 import {
   AutomaticMaintenanceCadence,
   automaticRepairServiceStatus,
@@ -181,7 +176,6 @@ import {
 } from "./capture-root-inventory";
 import { bindDispatch,closeDispatch,countUnlinkableDispatchBindings,restampDispatch } from "./dispatch-command";
 import type { HookSpoolDrain } from "./server";
-import { OtlpIntakeSpool } from "./otlp-spool";
 import { releaseStopWindowListener, runStopWindowListener, withStopWindowRelease } from "./stop-window-listener";
 import {
   HOOK_SPOOL_COLLECTOR_TOO_OLD,
@@ -209,19 +203,7 @@ import {
   recordDeviceSeen,
   recordDeviceUpload,
 } from "./device-identity";
-import {
-  formatSnapshotInventory,
-  lifecycleRetentionKeepAll,
-  runLifecycleCommand,
-  runLifecycleSnapshotCommand,
-} from "./lifecycle-command";
 import { buildPairingIndexesAfterUpdate } from "./lifecycle-pairing-indexes";
-import {
-  composeLifecycleAdapter,
-  otherProcessesWithFilesOpen,
-  resolveArtifactFromBundle,
-  resolveSelfArtifact,
-} from "./lifecycle-adapters";
 import { PURGE_CONFIRMATION } from "./lifecycle";
 import { startStatusSummaryWriter, summaryPendingStatus, type StatusSummaryWriter } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
@@ -2855,10 +2837,12 @@ async function main() {
   }
 
   if (command === "__plimsoll-capacity-statusline-proxy") {
+    const { claudeStatusLineCliMain } = await import("./claude-status-line-command");
     await claudeStatusLineCliMain(process.argv.slice(2));
     return;
   }
   if (command === "setup" && process.argv[3] === "claude-status-line") {
+    const { claudeStatusLineCliMain } = await import("./claude-status-line-command");
     await claudeStatusLineCliMain(["setup-claude-status-line", ...process.argv.slice(4)]);
     return;
   }
@@ -2950,6 +2934,7 @@ async function main() {
       return;
     }
     const { runMaintenanceWorkerService } = await import("./maintenance-worker");
+    const { createProfileCapture } = await import("./profile-capture");
     runMaintenanceWorkerService({
       spawnNonce,
       initialize: () => {
@@ -3458,6 +3443,9 @@ async function main() {
     const { BudgetSampler } = await import("./budget-sampler");
     const { uploadCompletedToolStatsWeek } = await import("./weekly-tool-stats-upload");
     const { createCollectorServer, createHookSpoolDrain } = await import("./server");
+    const { startClaudeReplayBarrier } = await import("./claude-replay-barrier");
+    const { AutomaticRetentionCadence } = await import("./retention-cadence");
+    const { OtlpIntakeSpool } = await import("./otlp-spool");
     let runtimeIdentity: CollectorRuntimeIdentity;
     let ownership: Awaited<ReturnType<typeof acquireCollectorStartOwnership>>;
     try {
@@ -5846,6 +5834,7 @@ async function main() {
   }
 
   if (command === "scan-rollouts") {
+    const { createProfileCapture } = await import("./profile-capture");
     const buffer = openBuffer(config);
     const capture = createProfileCapture(buffer, config);
     const result = await capture.rollout.scan({ scope: "full" });
@@ -5861,6 +5850,7 @@ async function main() {
   }
 
   if (command === "scan-transcripts") {
+    const { createProfileCapture } = await import("./profile-capture");
     const buffer = openBuffer(config);
     const capture = createProfileCapture(buffer, config);
     const result = await capture.transcript.scan({ scope: "full" });
@@ -6253,6 +6243,8 @@ async function main() {
   // those scripts' reviewed semantics: derive the same identity, append, never
   // change an existing root, epoch or enrollment field.
   if (command === "capture-roots") {
+    const { planFreshLedgerCutover, switchFreshLedger,
+      restoreArchivedLedger } = await import("./fresh-ledger-cutover");
     const action = process.argv[3] ?? "";
     if (!["discover", "epoch-plan", "epoch-switch", "epoch-restore", "add", "import-history"].includes(action)) {
       throw new Error("Expected capture-roots discover|epoch-plan|epoch-switch|epoch-restore|add|import-history");
@@ -7597,6 +7589,11 @@ async function main() {
   }
 
   if (command === "lifecycle") {
+    const { formatSnapshotInventory, lifecycleRetentionKeepAll,
+      runLifecycleCommand, runLifecycleSnapshotCommand } = await import("./lifecycle-command");
+    const { composeLifecycleAdapter, otherProcessesWithFilesOpen,
+      resolveArtifactFromBundle, resolveSelfArtifact } = await import("./lifecycle-adapters");
+    const { assertReplacementRuntimeCompatible } = await import("./fresh-ledger-cutover");
     const action = process.argv[3] ?? "";
     if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots", "pairing-indexes"].includes(action)) {
       throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots|pairing-indexes");
@@ -8351,7 +8348,7 @@ async function main() {
   process.exitCode = 1;
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
   if (error?.code === "LEDGER_PUBLICATION_INVALID" && error.cause?.code === "LEDGER_ARCHIVE_HANDLE_IN_USE") {
     // The internal error carries a private recovery path. Known foreign handles
     // refuse without recovery or serializing that error into CLI/daemon logs.
@@ -8362,6 +8359,7 @@ main().catch((error) => {
   if (error?.code === "LEDGER_PUBLICATION_INVALID" &&
       typeof error.ledgerPath === "string") {
     try {
+      const { recoverInvalidLedgerPublication } = await import("./fresh-ledger-cutover");
       recoverInvalidLedgerPublication(error.ledgerPath);
       console.error("replacement_verification_failed; archive restored; command refused");
     } catch (recoveryError) { console.error(recoveryError); }
