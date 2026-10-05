@@ -38,6 +38,8 @@ const WORKTREE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PACKED_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const REMOTE = "https://github.com/CryptoJym/plimsoll.git";
 const REMOTE_LABEL = "github.com/cryptojym/plimsoll";
+const REAL_REMOTE = "https://github.com/Proof-Owner/Real-Project.git";
+const NESTED_REMOTE = "https://github.com/Proof-Owner/Nested-Project.git";
 const LEGACY_COMMIT = "71d6ff27f0d39aa31d188c9bcc31d37bf188c384";
 const LEGACY_RESOLVER_SHA256 = "90455ab531d63287c9716c485f709856648170a9c9bfecc0bdcf6c5612943c5f";
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
@@ -58,12 +60,12 @@ function makeFifo(file: string) {
   assert.equal(made.status, 0, "mkfifo fixture creation failed");
 }
 
-function normalRepo(root: string, name: string, branch = "main", sha = HEAD_SHA) {
+function normalRepo(root: string, name: string, branch = "main", sha = HEAD_SHA, remote = REMOTE) {
   const repo = path.join(root, name);
   const git = path.join(repo, ".git");
   write(path.join(git, "HEAD"), `ref: refs/heads/${branch}\n`);
   write(path.join(git, "refs", "heads", branch), `${sha}\n`);
-  write(path.join(git, "config"), `[remote "origin"]\n\turl = ${REMOTE}\n`);
+  write(path.join(git, "config"), `[remote "origin"]\n\turl = ${remote}\n`);
   return { repo, git };
 }
 
@@ -73,8 +75,8 @@ function withHome<T>(home: string, run: () => T): T {
   try { return run(); } finally { os.homedir = originalHome; }
 }
 
-function fullLinkage(context: GitLinkageContext | undefined, branch = "main", sha = HEAD_SHA) {
-  return context?.remoteUrlHash === remoteLinkageHash(REMOTE) &&
+function fullLinkage(context: GitLinkageContext | undefined, branch = "main", sha = HEAD_SHA, remote = REMOTE) {
+  return context?.remoteUrlHash === remoteLinkageHash(remote) &&
     context.branchHash === branchLinkageHash(branch) && context.headSha === sha;
 }
 
@@ -93,18 +95,20 @@ function proveHomeBoundaries(root: string) {
         { depth, cachedAndUncached: true, linkageAbsent: true });
     }
 
-    const ordinary = normalRepo(home.repo, "ordinary");
+    const ordinary = normalRepo(home.repo, "ordinary", "main", HEAD_SHA, REAL_REMOTE);
     const inner = path.join(ordinary.repo, "src", "deep");
     fs.mkdirSync(inner, { recursive: true, mode: 0o700 });
     check("real_repository_below_git_home_keeps_own_linkage",
-      fullLinkage(resolveGitContext(inner)), { remote: true, branch: true, head: true });
-    const nested = normalRepo(ordinary.repo, "nested", "nested", PACKED_SHA);
+      fullLinkage(resolveGitContext(inner), "main", HEAD_SHA, REAL_REMOTE),
+      { remote: true, branch: true, head: true, distinctFromHomeRemote: true });
+    const nested = normalRepo(ordinary.repo, "nested", "nested", PACKED_SHA, NESTED_REMOTE);
     check("nested_repository_below_git_home_uses_nearest_repository",
-      fullLinkage(resolveGitContext(nested.repo), "nested", PACKED_SHA),
-      { nearestBranchAndHead: true });
-    const twoLevels = normalRepo(home.repo, "projects/real", "two-levels", WORKTREE_SHA);
+      fullLinkage(resolveGitContext(nested.repo), "nested", PACKED_SHA, NESTED_REMOTE),
+      { nearestBranchAndHead: true, distinctFromParentAndHomeRemotes: true });
+    const twoLevels = normalRepo(home.repo, "projects/real", "two-levels", WORKTREE_SHA, REAL_REMOTE);
     check("repository_two_levels_below_git_home_keeps_linkage",
-      fullLinkage(resolveGitContext(twoLevels.repo), "two-levels", WORKTREE_SHA), { levels: 2 });
+      fullLinkage(resolveGitContext(twoLevels.repo), "two-levels", WORKTREE_SHA, REAL_REMOTE),
+      { levels: 2, distinctFromHomeRemote: true });
 
     const worktree = path.join(home.repo, "lanes", "worktree");
     const worktreeGit = path.join(ordinary.git, "worktrees", "home-proof");
@@ -114,8 +118,8 @@ function proveHomeBoundaries(root: string) {
     write(path.join(ordinary.git, "refs", "heads", "home-worktree"), `${WORKTREE_SHA}\n`);
     const worktreeContext = resolveGitContext(worktree);
     check("worktree_below_git_home_keeps_pointer_common_config_and_ref",
-      worktreeContext?.isWorktree && fullLinkage(worktreeContext, "home-worktree", WORKTREE_SHA),
-      { relativePointer: true, commonConfigAndRef: true });
+      worktreeContext?.isWorktree && fullLinkage(worktreeContext, "home-worktree", WORKTREE_SHA, REAL_REMOTE),
+      { relativePointer: true, commonConfigAndRef: true, distinctFromHomeRemote: true });
 
     const alias = path.join(root, "home-alias");
     fs.symlinkSync(home.repo, alias, "dir");
@@ -125,7 +129,8 @@ function proveHomeBoundaries(root: string) {
       { homeAndChild: true });
     withHome(alias, () => {
       check("symlinked_running_user_home_resolves_to_same_boundary",
-        resolveGitContext(home.repo) === undefined && fullLinkage(resolveGitContext(ordinary.repo)),
+        resolveGitContext(home.repo) === undefined &&
+        fullLinkage(resolveGitContext(ordinary.repo), "main", HEAD_SHA, REAL_REMOTE),
         { homeExcluded: true, realRepositoryLinked: true });
     });
     const caseAlias = path.join(parent.repo, "HOME");
@@ -134,7 +139,7 @@ function proveHomeBoundaries(root: string) {
         resolveGitContext(caseAlias) === undefined &&
         resolveGitContextUncached(path.join(caseAlias, "chat-0")) === undefined &&
         withHome(caseAlias, () => resolveGitContextUncached(home.repo)) === undefined &&
-        fullLinkage(resolveGitContext(path.join(caseAlias, "ordinary"))),
+        fullLinkage(resolveGitContext(path.join(caseAlias, "ordinary")), "main", HEAD_SHA, REAL_REMOTE),
         { caseInsensitiveVolume: true, directoryIdentityUsed: true, realRepositoryLinked: true });
     } else {
       check("case_sensitive_volume_has_no_alias_of_home",
@@ -165,9 +170,9 @@ function proveHomeBoundaries(root: string) {
 
     // Changing the running-user home must also change the cache identity.
     check("cache_is_scoped_to_resolved_running_user_home",
-      fullLinkage(resolveGitContext(ordinary.repo)) &&
+      fullLinkage(resolveGitContext(ordinary.repo), "main", HEAD_SHA, REAL_REMOTE) &&
       withHome(ordinary.repo, () => resolveGitContext(ordinary.repo)) === undefined &&
-      fullLinkage(resolveGitContext(ordinary.repo)), { homesSeparated: true });
+      fullLinkage(resolveGitContext(ordinary.repo), "main", HEAD_SHA, REAL_REMOTE), { homesSeparated: true });
   });
 
   for (const kind of ["missing", "relative", "file", "throws"] as const) {
@@ -215,7 +220,7 @@ function proveDiskRootAndOtherVolume(root: string) {
 
   // A mounted-volume namespace is injected onto real fixture metadata; no
   // file is created outside the disposable proof root.
-  const volumeRepo = normalRepo(root, "volume-metadata");
+  const volumeRepo = normalRepo(root, "volume-metadata", "main", HEAD_SHA, REAL_REMOTE);
   const mountedCwd = path.join(diskRoot, "Volumes", "git-context-proof", "project");
   const originalRealpath = fs.realpathSync;
   const originalOpen = fs.openSync;
@@ -236,7 +241,7 @@ function proveDiskRootAndOtherVolume(root: string) {
     originalOpen(translate(file), flags, mode)) as typeof fs.openSync;
   try {
     check("repository_on_another_volume_keeps_linkage",
-      fullLinkage(resolveGitContextUncached(mountedCwd)),
+      fullLinkage(resolveGitContextUncached(mountedCwd), "main", HEAD_SHA, REAL_REMOTE),
       { simulatedMountedVolume: true, realBoundedMetadataReads: true });
   } finally {
     fs.realpathSync = originalRealpath;
@@ -320,7 +325,7 @@ async function proveUpgradeSpanningCapture(root: string) {
     const home = normalRepo(root, "studio0-upgrade-home");
     const chat = path.join(home.repo, "Documents", "Codex", "2026-10-05", "chat");
     fs.mkdirSync(chat, { recursive: true, mode: 0o700 });
-    const real = normalRepo(home.repo, "projects/real", "real-project", PACKED_SHA);
+    const real = normalRepo(home.repo, "projects/real", "real-project", PACKED_SHA, REAL_REMOTE);
     const originalHome = os.homedir;
     os.homedir = () => home.repo;
     const now = new Date("2026-10-05T12:00:00.000Z");
@@ -334,8 +339,9 @@ async function proveUpgradeSpanningCapture(root: string) {
       const oldContext = legacy.resolveGitContext(chat);
       assert.ok(oldContext);
       check("studio0_old_rule_primes_home_linked_cache_while_real_repo_has_own_linkage",
-        fullLinkage(oldContext) && fullLinkage(legacy.resolveGitContext(real.repo), "real-project", PACKED_SHA),
-        { oldChatLinkedToHome: true, realRepositoryLinkedSeparately: true });
+        fullLinkage(oldContext) &&
+        fullLinkage(legacy.resolveGitContext(real.repo), "real-project", PACKED_SHA, REAL_REMOTE),
+        { oldChatLinkedToHome: true, realRepositoryLinkedSeparately: true, distinctProjectRemotes: true });
       const event = (index: number, context?: GitLinkageContext) => aiInteractionEventSchema.parse({
         id: deterministicEventId(["home-upgrade", String(index)]),
         source: "codex", dataMode: "metadata", eventType: "assistant_response",
