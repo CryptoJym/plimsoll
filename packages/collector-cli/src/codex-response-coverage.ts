@@ -203,6 +203,11 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     nativeObservations.reduce((sum,observation)=>sum+
       (related(basis,observation)&&fits(basis,observation)?observation[field]??0:0),0);
   const observations = rows.flatMap(row => {
+    // Covered observations have already supplied their aliases and native
+    // prefix above. They cannot own finance (the candidate filter enforces
+    // the same rule). Avoid re-running a trace capture for every bridge;
+    // capture still reads all duplicate native facts for contradictions.
+    if(row.duplicate&&!frozenCodexCapture(db,row.id))return [];
     const peer=JSON.parse(row.payload) as AiInteractionEvent;
     const identity=originals.get(row.id)!;
     if(!fits(event,identity,row.id===exactPeerId))return [];
