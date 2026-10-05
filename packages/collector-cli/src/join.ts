@@ -166,7 +166,8 @@ function readConfigWithoutCreating(configPath: string): CollectorConfig {
     const home = os.homedir();
     const insideFixture = fixtureRoot && path.resolve(home).startsWith(path.resolve(fixtureRoot) + path.sep);
     return collectorConfigSchema.parse(insideFixture && Number.isSafeInteger(fixturePort) &&
-      fixturePort >= 49300 && fixturePort <= 49399 ? { port: fixturePort } : {});
+      ((fixturePort >= 49300 && fixturePort <= 49399) ||
+       (fixturePort >= 49750 && fixturePort <= 49799)) ? { port: fixturePort } : {});
   }
   return collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
 }
