@@ -195,11 +195,6 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
     const prepare = database.prepare.bind(database);
     database.prepare = ((...args: Parameters<typeof prepare>) => {
       const statement = prepare(...args);
-      // Read-only statements never run the inode write guard. Keep their native
-      // methods instead of allocating four closures on every metadata probe.
-      // SQLite classifies INSERT ... RETURNING as writable, so it still takes
-      // the same guard below even when invoked through get() or all().
-      if (statement.readonly) return statement;
       for (const method of ["run", "get", "all", "iterate"] as const) {
         const invoke = statement[method].bind(statement);
         // Keep the native API writable for instrumentation that wraps a method.

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { openLedgerDatabase } from "./ledger-connection";
-import type { AutomaticRetentionCadence } from "./retention-cadence";
+import { AutomaticRetentionCadence } from "./retention-cadence";
+import { claudeStatusLineCliMain } from "./claude-status-line-command";
+import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -50,9 +52,10 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
         disposition: null,
       };
 
-import type { LocalEventBuffer as LocalEventBufferType } from "./buffer";
-type LocalEventBuffer = LocalEventBufferType;
-let LocalEventBuffer: typeof import("./buffer").LocalEventBuffer;
+import { LocalEventBuffer } from "./buffer";
+import { applyCaptureHistory, planCaptureHistory } from "./capture-history-import";
+import { planFreshLedgerCutover, switchFreshLedger,
+  restoreArchivedLedger, assertReplacementRuntimeCompatible, recoverInvalidLedgerPublication } from "./fresh-ledger-cutover";
 import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
@@ -76,9 +79,11 @@ import {
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
+import { startClaudeReplayBarrier } from "./claude-replay-barrier";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
+import { uploadCompletedToolStatsWeek } from "./weekly-tool-stats-upload";
 import {
   DEFAULT_PRODUCER_ROTATION_GRACE_MS,
   MAX_PRODUCER_ROTATION_GRACE_MS,
@@ -113,7 +118,13 @@ import {
   LifecycleMutationAuthority,
   type LifecycleMutationLease,
 } from "./lifecycle-authority";
-import type { performJoin } from "./join";
+import {
+  cleanupStaleJoinHandshakeDirectories,
+  finalizeActivatedPendingJoin,
+  performJoin,
+  resumePendingJoin,
+} from "./join";
+import { createProfileCapture } from "./profile-capture";
 import {
   AutomaticMaintenanceCadence,
   automaticRepairServiceStatus,
@@ -172,7 +183,8 @@ import {
   type CaptureRoot,
 } from "./capture-root-inventory";
 import { bindDispatch,closeDispatch,countUnlinkableDispatchBindings,restampDispatch } from "./dispatch-command";
-import type { HookSpoolDrain } from "./server";
+import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
+import { OtlpIntakeSpool } from "./otlp-spool";
 import { releaseStopWindowListener, runStopWindowListener, withStopWindowRelease } from "./stop-window-listener";
 import {
   HOOK_SPOOL_COLLECTOR_TOO_OLD,
@@ -192,7 +204,15 @@ import {
   recordMaintenanceDeadlineKill,
   type MaintenanceStarvationCensus,
 } from "./maintenance-starvation";
-import type { AutomaticEnrichmentCadence, IdleEnrichmentScheduler } from "./enrichment-job";
+import { runMaintenanceWorkerService } from "./maintenance-worker";
+import {
+  AutomaticEnrichmentCadence,
+  EnrichmentProcessBoundary,
+  IdleEnrichmentScheduler,
+  lowerEnrichmentProcessPriority,
+  runEnrichmentWorkerService,
+} from "./enrichment-job";
+import { runEnrichmentMaintenanceJob } from "./maintenance-stage-primitives";
 import { readLocalIdentities } from "./local-identity";
 import {
   loadOrCreateDeviceIdentity,
@@ -200,7 +220,19 @@ import {
   recordDeviceSeen,
   recordDeviceUpload,
 } from "./device-identity";
+import {
+  formatSnapshotInventory,
+  lifecycleRetentionKeepAll,
+  runLifecycleCommand,
+  runLifecycleSnapshotCommand,
+} from "./lifecycle-command";
 import { buildPairingIndexesAfterUpdate } from "./lifecycle-pairing-indexes";
+import {
+  composeLifecycleAdapter,
+  otherProcessesWithFilesOpen,
+  resolveArtifactFromBundle,
+  resolveSelfArtifact,
+} from "./lifecycle-adapters";
 import { PURGE_CONFIRMATION } from "./lifecycle";
 import { startStatusSummaryWriter, summaryPendingStatus, type StatusSummaryWriter } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
@@ -257,6 +289,16 @@ import {
   readRejectionAdmission,
   scanProducerProcesses,
 } from "./producer-processes";
+import { runOutcomesSync } from "./outcomes-sync";
+import {
+  GitHubRestOutcomeTimelineAdapter,
+  readRequiredCheckPolicy,
+  runOutcomeTimelineBackfill,
+} from "./github-outcome-backfill";
+import { OutcomeTimelineStore } from "./outcome-timeline-store";
+import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
+import { runLearningMaterialization } from "./learning-materializer";
+import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import {
   advanceLegacySessionSummaryRebuild,
   beginLegacySessionSummaryRebuild,
@@ -277,6 +319,7 @@ import { uploadBufferedEvents } from "./upload";
 import { postDelivery } from "./delivery-post";
 import { deliveryExpectation } from "./delivery-ack";
 import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
+import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
   ACCOUNT_ASSERTION_SOURCES,
   accountAssertionStatus,
@@ -2834,21 +2877,12 @@ async function main() {
   }
 
   if (command === "__plimsoll-capacity-statusline-proxy") {
-    const { claudeStatusLineCliMain } = await import("./claude-status-line-command");
     await claudeStatusLineCliMain(process.argv.slice(2));
     return;
   }
   if (command === "setup" && process.argv[3] === "claude-status-line") {
-    const { claudeStatusLineCliMain } = await import("./claude-status-line-command");
     await claudeStatusLineCliMain(["setup-claude-status-line", ...process.argv.slice(4)]);
     return;
-  }
-
-  // These commands inspect config or delegate enrollment; none calls the
-  // capture-ledger factory. Keep its migrations and model graph out of their
-  // startup. Every ledger command loads the same implementation before use.
-  if (command !== "doctor" && command !== "setup" && command !== "join") {
-    ({ LocalEventBuffer } = await import("./buffer"));
   }
 
   if (command === "__rehearse_ledger_open") {
@@ -2937,8 +2971,6 @@ async function main() {
       process.exitCode = 64;
       return;
     }
-    const { runMaintenanceWorkerService } = await import("./maintenance-worker");
-    const { createProfileCapture } = await import("./profile-capture");
     runMaintenanceWorkerService({
       spawnNonce,
       initialize: () => {
@@ -2974,8 +3006,6 @@ async function main() {
       return;
     }
     let workerBuffer: ReturnType<typeof openBuffer> | null = null;
-    const { lowerEnrichmentProcessPriority, runEnrichmentWorkerService } = await import("./enrichment-job");
-    const { runEnrichmentMaintenanceJob } = await import("./maintenance-stage-primitives");
     lowerEnrichmentProcessPriority();
     runEnrichmentWorkerService({
       spawnNonce,
@@ -3022,7 +3052,6 @@ async function main() {
           "No token was read, no request was sent, and no local state was changed.",
       );
     }
-    const { performJoin, resumePendingJoin } = await import("./join");
     const rawJoinArguments = process.argv.slice(3);
     const noDaemon = rawJoinArguments.includes("--no-daemon");
     if (rawJoinArguments.filter((argument) => argument === "--no-daemon").length > 1) {
@@ -3335,8 +3364,6 @@ async function main() {
   }
 
   if (command === "start") {
-    const { cleanupStaleJoinHandshakeDirectories,
-      finalizeActivatedPendingJoin } = await import("./join");
     cleanupStaleJoinHandshakeDirectories();
     finalizeActivatedPendingJoin();
   }
@@ -3442,17 +3469,6 @@ async function main() {
 
   if (command === "start") {
     let pidPath = "";
-    // Command-specific services are loaded before acquiring resources. Doctor,
-    // setup and join should not parse every daemon and analytics implementation.
-    const { OutcomeTimelineStore } = await import("./outcome-timeline-store");
-    const { AutomaticEnrichmentCadence, EnrichmentProcessBoundary,
-      IdleEnrichmentScheduler } = await import("./enrichment-job");
-    const { BudgetSampler } = await import("./budget-sampler");
-    const { uploadCompletedToolStatsWeek } = await import("./weekly-tool-stats-upload");
-    const { createCollectorServer, createHookSpoolDrain } = await import("./server");
-    const { startClaudeReplayBarrier } = await import("./claude-replay-barrier");
-    const { AutomaticRetentionCadence } = await import("./retention-cadence");
-    const { OtlpIntakeSpool } = await import("./otlp-spool");
     let runtimeIdentity: CollectorRuntimeIdentity;
     let ownership: Awaited<ReturnType<typeof acquireCollectorStartOwnership>>;
     try {
@@ -4648,7 +4664,6 @@ async function main() {
 
   if (command === "status") {
     if (flag("--budget")) {
-      const { budgetCsv, budgetDailyRows, budgetStatus } = await import("./budget-sampler");
       const ledgerPath = collectorBufferPath();
       if (!fs.existsSync(ledgerPath)) {
         console.log(flag("--csv") ? "" : JSON.stringify({ mode: "advisory", latest: null,
@@ -5841,7 +5856,6 @@ async function main() {
   }
 
   if (command === "scan-rollouts") {
-    const { createProfileCapture } = await import("./profile-capture");
     const buffer = openBuffer(config);
     const capture = createProfileCapture(buffer, config);
     const result = await capture.rollout.scan({ scope: "full" });
@@ -5857,7 +5871,6 @@ async function main() {
   }
 
   if (command === "scan-transcripts") {
-    const { createProfileCapture } = await import("./profile-capture");
     const buffer = openBuffer(config);
     const capture = createProfileCapture(buffer, config);
     const result = await capture.transcript.scan({ scope: "full" });
@@ -6250,8 +6263,6 @@ async function main() {
   // those scripts' reviewed semantics: derive the same identity, append, never
   // change an existing root, epoch or enrollment field.
   if (command === "capture-roots") {
-    const { planFreshLedgerCutover, switchFreshLedger,
-      restoreArchivedLedger } = await import("./fresh-ledger-cutover");
     const action = process.argv[3] ?? "";
     if (!["discover", "epoch-plan", "epoch-switch", "epoch-restore", "add", "import-history"].includes(action)) {
       throw new Error("Expected capture-roots discover|epoch-plan|epoch-switch|epoch-restore|add|import-history");
@@ -6264,7 +6275,6 @@ async function main() {
     };
 
     if (action === "import-history") {
-      const { applyCaptureHistory, planCaptureHistory } = await import("./capture-history-import");
       const attemptId = randomUUID();
       const writeAttemptReceipt = (value: Record<string, unknown>, suffix = "") => {
         const receiptDirectory = path.join(collectorHome(), "receipts");
@@ -7047,7 +7057,6 @@ async function main() {
 
   if (command === "export") {
     if (flag("--budget")) {
-      const { budgetCsv, budgetExport } = await import("./budget-sampler");
       const ledgerPath = collectorBufferPath();
       if (!fs.existsSync(ledgerPath)) {
         console.log(flag("--csv") ? "" : JSON.stringify({ schema: "plimsoll-budget-export/v1",
@@ -7127,7 +7136,6 @@ async function main() {
   }
 
   if (command === "upload-history") {
-    const { runAttributionRepair, runWorkspaceHistoryUpload } = await import("./upload-history");
     // Workspace backfill (issue 0035): the full ledger history, read-only,
     // idempotent by event id. Progress and the final reconciliation audit go
     // to stdout; the server response is never echoed (it can contain the
@@ -7230,7 +7238,6 @@ async function main() {
   }
 
   if (command === "push-repo-labels") {
-    const { prepareRepoLabelsPush, pushRepoLabels } = await import("./repo-labels");
     // Repo labels are deliberate owner disclosures (issue 0036): show the
     // exact payload, then require explicit consent before anything is sent.
     const prepared = prepareRepoLabelsPush();
@@ -7279,7 +7286,6 @@ async function main() {
   }
 
   if (command === "sync-outcomes") {
-    const { runOutcomesSync } = await import("./outcomes-sync");
     // Outcomes feed (issue 0038 / cloud Phase D2): push the local session↔PR
     // join for one named repo. The audit table and honest sent/accepted
     // counters go to stdout; the server response is never echoed raw.
@@ -7312,9 +7318,6 @@ async function main() {
   }
 
   if (command === "backfill-outcome-timeline") {
-    const { OutcomeTimelineStore } = await import("./outcome-timeline-store");
-    const { GitHubRestOutcomeTimelineAdapter, readRequiredCheckPolicy,
-      runOutcomeTimelineBackfill } = await import("./github-outcome-backfill");
     const repository = optionValue("--repository");
     const match = repository?.match(/^([^/]+)\/([^/]+)$/);
     if (!match) {
@@ -7359,8 +7362,6 @@ async function main() {
   }
 
   if (command === "backfill-outcome-performance") {
-    const { OutcomeTimelineStore } = await import("./outcome-timeline-store");
-    const { readRequiredCheckPolicy } = await import("./github-outcome-backfill");
     const repository = optionValue("--repository");
     const match = repository?.match(/^([^/]+)\/([^/]+)$/);
     if (repository && !match) {
@@ -7397,8 +7398,6 @@ async function main() {
   }
 
   if (command === "weekly-performance-rollup") {
-    const { OutcomeTimelineStore } = await import("./outcome-timeline-store");
-    const { formatWeeklyPerformanceMarkdown } = await import("./performance-layer");
     const until = optionValue("--until") ?? new Date().toISOString();
     const untilMs = Date.parse(until);
     if (!Number.isFinite(untilMs)) throw new Error(`--until expects an ISO timestamp, got: ${until}`);
@@ -7428,7 +7427,6 @@ async function main() {
   }
 
   if (command === "materialize-learning-evidence") {
-    const { runLearningMaterialization } = await import("./learning-materializer");
     const until = optionValue("--until") ?? new Date().toISOString();
     if (!Number.isFinite(Date.parse(until))) throw new Error(`--until expects an ISO timestamp, got: ${until}`);
     const windowDaysRaw = optionValue("--window-days") ?? "7";
@@ -7596,11 +7594,6 @@ async function main() {
   }
 
   if (command === "lifecycle") {
-    const { formatSnapshotInventory, lifecycleRetentionKeepAll,
-      runLifecycleCommand, runLifecycleSnapshotCommand } = await import("./lifecycle-command");
-    const { composeLifecycleAdapter, otherProcessesWithFilesOpen,
-      resolveArtifactFromBundle, resolveSelfArtifact } = await import("./lifecycle-adapters");
-    const { assertReplacementRuntimeCompatible } = await import("./fresh-ledger-cutover");
     const action = process.argv[3] ?? "";
     if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots", "pairing-indexes"].includes(action)) {
       throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots|pairing-indexes");
@@ -8355,7 +8348,7 @@ async function main() {
   process.exitCode = 1;
 }
 
-main().catch(async (error) => {
+main().catch((error) => {
   if (error?.code === "LEDGER_PUBLICATION_INVALID" && error.cause?.code === "LEDGER_ARCHIVE_HANDLE_IN_USE") {
     // The internal error carries a private recovery path. Known foreign handles
     // refuse without recovery or serializing that error into CLI/daemon logs.
@@ -8366,7 +8359,6 @@ main().catch(async (error) => {
   if (error?.code === "LEDGER_PUBLICATION_INVALID" &&
       typeof error.ledgerPath === "string") {
     try {
-      const { recoverInvalidLedgerPublication } = await import("./fresh-ledger-cutover");
       recoverInvalidLedgerPublication(error.ledgerPath);
       console.error("replacement_verification_failed; archive restored; command refused");
     } catch (recoveryError) { console.error(recoveryError); }
