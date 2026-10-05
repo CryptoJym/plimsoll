@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import assert from 'node:assert/strict';
 import { LocalEventBuffer } from '../packages/collector-cli/src/buffer';
 import { applyProjectAttribution, SessionAttributionBatch } from '../packages/collector-cli/src/session-attribution';
@@ -39,7 +40,10 @@ if (process.argv.includes('--bounds')) {
             update.run(B, id(i));
           }
         })();
-        const usage = event(9000, 600, { eventType });
+        const usage = event(9000, 600, { eventType,
+          ...nativeCodexFixture(id(9000), "attribution-proof-unpriced"),
+          metadata: { ...nativeCodexFixture(id(9000), "attribution-proof-unpriced").metadata,
+            installationEpochId: (ledger.database.prepare("select current_installation_epoch_id as id from collector_workspace_binding where singleton=1").get() as {id:string}).id } });
         ledger.append(usage);
         update.run(A, usage.id);
         const row = ledger.database.prepare('select rowid from buffered_events where id = ?').get(usage.id) as { rowid: number };

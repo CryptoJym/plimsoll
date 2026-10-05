@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 /**
  * eco-6hoxj.163.21: busy sessions inherit their project through a
  * capture-time session context index.
@@ -155,8 +156,11 @@ function tokenEvent(
     actionClass: "other",
     inputTokens: 1_000,
     outputTokens: 50,
-    metadata: {},
+    // These are native requests for attribution, with an intentionally
+    // unpriced model so the independent byte oracle keeps its original cost.
+    ...nativeCodexFixture(id, "attribution-proof-unpriced"),
     ...extra,
+    metadata: { ...nativeCodexFixture(id, "attribution-proof-unpriced").metadata, ...extra.metadata },
   };
 }
 
@@ -202,10 +206,10 @@ function insertRaw(db: Database.Database, rows: RawRow[]) {
        (id, source, event_type, data_mode, observed_at, payload_json,
         suppressed_fields_json, created_at, uploaded_at, session_id, repo_hash,
         branch_hash, input_tokens, output_tokens, workspace_id, device_id,
-        privacy_generation)
+        installation_epoch_id, privacy_generation)
      values (@id, 'codex', @eventType, @dataMode, @observedAt, @payload, '[]',
        @createdAt, @uploadedAt, @sessionId, @repoHash, @branchHash, @inputTokens,
-       @outputTokens, @workspace, @device, 'fixture-generation')`,
+       @outputTokens, @workspace, @device, @epoch, 'fixture-generation')`,
   );
   const span = JSON.stringify({ spanName: "tool.call", attributes: "x".repeat(360) });
   db.transaction(() => {
@@ -228,6 +232,7 @@ function insertRaw(db: Database.Database, rows: RawRow[]) {
         outputTokens: row.tokens ? 50 : null,
         workspace: WORKSPACE,
         device: DEVICE,
+        epoch: row.tokens ? (db.prepare("select current_installation_epoch_id as id from collector_workspace_binding where singleton=1").get() as {id:string}).id : null,
       });
     }
   })();
@@ -1233,6 +1238,7 @@ async function busySession(dir: string) {
       leaseLookupSamples.push(leaseLookups.executions());
       if (sample === 0) leaseItems = leased.items;
       leaseBuffer.close();
+      fs.rmSync(leaseFile, { force: true });
     }
     const leaseMedianMs = median(leaseSamples);
     let indexConsistency: string | number;
