@@ -28,7 +28,7 @@ const OPS = ["sse-valid", "sse-invalid", "sse-conflicting", "trace-sol", "trace-
   "stateless-build", "reopen", "rollback-047", "rollback-048", "upgrade-047", "upgrade-048", "sse-zero", "sse-partial", "sse-cache-cost",
   "second-turn", "third-turn", "history-multiple", "cache-only-turn", "sse-partial-twin", "sse-zero-complement-twin",
   "skew-partial-request", "skew-complete-request", "skew-partial-turn", "skew-complete-turn",
-  "skew-growing", "skew-smaller", "skew-native", "skew-native-update", "request-only-partial", "request-only-complete", "request-only-span", "alias-request", "alias-native", "alias-bridge", "alias-chain",
+  "skew-growing", "skew-smaller", "skew-native", "skew-native-update", "request-only-partial", "request-only-complete", "request-only-span", "alias-request", "alias-native", "alias-bridge", "alias-chain", "call-request-input", "call-request-output", "call-complete",
   "old-acked-047-input-output", "old-acked-047-output-input", "old-acked-048-input-output", "old-acked-048-output-input", "old-acked-pair-047", "old-acked-pair-048"] as const;
 type Op = typeof OPS[number] | "skew-series" | "alias-long-chain";
 type Version = "head" | "0.7.47" | "0.7.48";
@@ -66,6 +66,7 @@ const orderGroups: Op[][]=[
   ["request-only-partial","request-only-span","request-only-complete"],
   ["skew-partial-request","skew-native-update","skew-complete-request"],
   ["alias-request","alias-native","alias-bridge"],
+  ["call-request-input","call-request-output","call-complete"],
 ];
 const completion = createProofCompletion(partition?"codex-capture-sequences-partition":"codex-capture-sequences",
   partition?partition[1]!-partition[0]!:(caseFile?0:seeds+orderGroups.length*6)+directed.length);
@@ -86,7 +87,7 @@ function sequence(seed: number): Op[] {
 }
 const attribute = (key: string,value: string|number) => ({key,value:typeof value==="number"?{intValue:String(value)}:{stringValue:value}});
 function log(model: string,trace: string,at: number,input?: number,output?: number,contradict=false,cache?: number,
-  identity?: {turn?:string;request?:string},session=SESSION) {
+  identity?: {turn?:string;request?:string;call?:string},session=SESSION) {
   return explodeOtlpPayload({resourceLogs:[{resource:{attributes:[attribute("service.name","codex-app-server")]},
     scopeLogs:[{logRecords:[{timeUnixNano:String(BigInt(at)*1000000n),traceId:trace,
       attributes:[attribute("event.name","codex.sse_event"),attribute("conversation.id",session),attribute("model",model),
@@ -95,6 +96,7 @@ function log(model: string,trace: string,at: number,input?: number,output?: numb
         ...(cache===undefined?[]:[attribute("cached_token_count",cache)]),
         ...(identity?.turn?[attribute("turn.id",identity.turn)]:[]),
         ...(identity?.request?[attribute("request_id",identity.request)]:[]),
+        ...(identity?.call?[attribute("call_id",identity.call)]:[]),
         ...(contradict?[attribute("gen_ai.request.model",OTHER)]:[])]}]}]}]},
     {source:"codex",transportPath:"/v1/logs"}).events[0]!.event;
 }
@@ -166,7 +168,9 @@ class World {
     if(p.kind==="invalid")return false;
     if(p.kind==="turn")return e.model===p.event.model;
     const models=this.traceModels.get(p.event.metadata.traceId);
-    return models?.size===1&&models.has(e.model);
+    const sessions=new Set([...this.producers.values()].filter(other=>
+      other.event.metadata.traceId===p.event.metadata.traceId).map(other=>other.event.sessionId).filter(Boolean));
+    return models?.size===1&&models.has(e.model)&&sessions.size<=1;
   }
   nativeProvenance(e:any,rawId:string) {
     const p=this.producers.get(rawId);
@@ -345,7 +349,20 @@ class World {
       "neighbour-turn","history-turn","history-no-turn","gap-seal","stateless-build","upgrade-047","upgrade-048"].includes(op)) this.head();
     if(["sse-zero","sse-partial","sse-cache-cost","second-turn","third-turn","history-multiple","cache-only-turn","sse-partial-twin","sse-zero-complement-twin"].includes(op))this.head();
     if(op.startsWith("skew-")||op.startsWith("request-only-"))this.head();
+    if(op.startsWith("call-"))this.head();
     switch(op) {
+      case "call-request-input": case "call-request-output": case "call-complete": {
+        const input=op!=="call-request-output",output=op!=="call-request-input";
+        const identity={call:"shared-call",request:op==="call-complete"?undefined:op};
+        const e=log(MODEL,"0123456789abcdef".repeat(2),AT+(input?56000:57000),input?19:undefined,output?2:undefined,
+          false,input?0:undefined,identity,"55555555-5555-4555-8555-555555555555");
+        if(op==="call-complete") {
+          e.cacheCreationTokens=3;e.costUsd=.125;e.costKind="reported";
+          Object.assign(e.metadata,{"gen_ai.usage.cache_creation_input_tokens":3,cost_usd:.125});
+        }
+        this.register(e,"call-response","trace");this.fact("0123456789abcdef".repeat(2),MODEL);
+        this.b.append(e);break;
+      }
       case "old-acked-pair-047": case "old-acked-pair-048": await this.oldAckedPair(op);break;
       case "alias-request": this.head();await this.aliasObservation("alias-request-0");break;
       case "alias-bridge": this.head();await this.aliasObservation("alias-request-0","alias-turn-0",62000);break;
@@ -614,7 +631,7 @@ class World {
     // and no model/account contradictions. A mistakenly gapped complete SSE
     // must not excuse lost complementary fields. A span gapped before its
     // first model log remains diagnostic and is not used to raise this floor.
-    for(const response of ["response-5","request-only"]) {
+    for(const response of ["response-5","request-only","call-response"]) {
       const required=this.nativeAmounts(response);
       for(const p of this.producers.values())if(p.response===response&&p.kind==="trace"&&
         p.event.metadata.otelEventName==="codex.sse_event"&&this.eligible(p,p.event))
@@ -731,7 +748,7 @@ async function main() {
       }
       if(!caseFile&&!partition)for(let group=0;group<orderGroups.length;group++) {
         let canonical:Record<string,number>|undefined;
-        const observations=orderGroups[group]!,response=observations[0]!.startsWith("alias-")?"alias-response":observations[0]!.startsWith("request-only-")?"request-only":"response-5";
+        const observations=orderGroups[group]!,response=observations[0]!.startsWith("call-")?"call-response":observations[0]!.startsWith("alias-")?"alias-response":observations[0]!.startsWith("request-only-")?"request-only":"response-5";
         let permutation=0;
         for(const order of permutations(observations)) {
           // ACK after EACH observation so different arrival orders cannot

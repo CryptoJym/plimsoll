@@ -476,7 +476,9 @@
     "proof:capture-history-import-seen_prefix_claude": "tsx scripts/capture-history-import-short-copy-proof.ts seen_prefix_claude",
     "proof:capture-history-import-main-handoff-codex": "tsx scripts/capture-history-import-main-handoff-proof.ts codex",
     "proof:capture-history-import-main-handoff-claude": "tsx scripts/capture-history-import-main-handoff-proof.ts claude",
-    "test:codex-usage-fields": "node --import tsx scripts/codex-usage-fields.test.ts"
+    "test:codex-usage-fields": "node --import tsx scripts/codex-usage-fields.test.ts",
+    "proof:codex-response-identity-class": "tsx scripts/run-proof.ts scripts/codex-response-identity-class-proof.ts",
+    "proof:codex-response-identity-directed": "tsx scripts/run-proof.ts scripts/codex-response-identity-directed-proof.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

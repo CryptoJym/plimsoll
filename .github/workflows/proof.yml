@@ -795,6 +795,12 @@ jobs:
       - name: Prove seeded Codex accounting operation sequences
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-sequences --seeds=200
+      - name: Compare every response identity shape with released 0.7.50
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-response-identity-class
+      - name: Prove identity regressions, minimal counterexamples and bounded-hold measurements
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-response-identity-directed
       - name: Prove per-response native coverage and partial cumulative accounting
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-response-coverage

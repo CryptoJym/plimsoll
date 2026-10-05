@@ -3,9 +3,15 @@
 ## 0.7.51 (unreleased)
 
 - Response aliases remain linked through covered SSE diagnostics, including
-  transitive request/turn chains and restarts. Qualified native fields ACKed
+  every co-present request, call and turn identity, transitive chains and
+  restarts. Cumulative fields retain their maximum across these aliases;
+  anonymous exact twins retain complementary paid branches. Qualified native fields ACKed
   by released collectors remain paid owners across upgrade; reconciliation
   preserves ACKed finance without inventing missing historical wire bytes.
+- Known limit: two complete SSE reports with disjoint native identities can
+  both be accepted before a later observation links them. Their accepted
+  overlap requires a cloud accounting contract to correct; local frozen
+  delivery bytes remain unchanged.
 
 - Codex token-bearing captures now name their model from an exact paired SSE
   log, one unambiguous native trace, or the same local conversation turn. Any
