@@ -48,13 +48,13 @@ try {
   const excluded=open('irrelevant-pairs-'+exclusion);
   try {
    const target={...event(1),...nativeCodexFixture('native-'+exclusion),actorId:'native-account',
-    metadata:{...nativeCodexFixture('native-'+exclusion).metadata,'response.id':'target-response'}};
+    metadata:{...nativeCodexFixture('native-'+exclusion).metadata,request_id:'target-response'}};
    excluded.append(target);
    for(let n=2;n<=501;n++) excluded.append({...event(n),model:'gpt-5.5',
     actorId:exclusion==='different-account'?'other-account':'native-account',
     metadata:{model:'gpt-5.5',otelEventName:'codex.sse_event',
      ...(exclusion==='different-trace'?{traceId:nativeCodexFixture(String(n)).metadata.traceId}:{}),
-     'response.id':exclusion==='different-response'?'other-response':'target-response'}});
+     request_id:exclusion==='different-response'?'other-response':'target-response'}});
    const captured=captureCodexModel(excluded.database,target);
    completion.check('irrelevant_exact_counter_peers_'+exclusion+'_cannot_exhaust_budget',
     !isCaptureGap(captured)&&captured.model===target.model&&captured.inputTokens===0&&captured.outputTokens===7);
