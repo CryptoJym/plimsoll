@@ -174,7 +174,7 @@ export function dispatchHistoryAdoptionRequired(roots: readonly {
 // A bounded binary frame avoids profile/base64/string copies and huge JSON
 // serialization. The parent has already pinned every byte; views are read-only
 // until the real consumers stage their one private filesystem snapshot.
-const READER_DRIVER = `const fs=require('node:fs'),path=require('node:path'),Module=require('node:module'),crypto=require('node:crypto');
+const READER_DRIVER = `try { const fs=require('node:fs'),path=require('node:path'),Module=require('node:module'),crypto=require('node:crypto');
 const bytes=fs.readFileSync(0);if(bytes.length>96*1024*1024||bytes.length<24||bytes.subarray(0,4).toString()!=='DHB2')throw Error('reader_input_bound');
 const lengths=[0,1,2,3,4].map(i=>bytes.readUInt32BE(4+i*4));if(lengths.reduce((a,b)=>a+b,24)!==bytes.length||lengths[0]>65536||lengths[1]>2*1024*1024||lengths.slice(2).some(n=>n>32*1024*1024))throw Error('reader_input_bound');
 let at=24;const views=lengths.map(n=>{const v=bytes.subarray(at,at+n);at+=n;return v;});const meta=JSON.parse(views[0].toString());
@@ -183,7 +183,18 @@ const result=reader.exports.readRollbackSnapshot({profile:views[2],image:views[3
 const hashFile=file=>{const descriptor=fs.openSync(fs.realpathSync(file),fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);try{const stat=fs.fstatSync(descriptor);if(!stat.isFile()||stat.size>256*1024*1024)throw Error('runtime_byte_bound');const chunk=Buffer.alloc(65536),hash=crypto.createHash('sha256');let offset=0;while(offset<stat.size){const n=fs.readSync(descriptor,chunk,0,Math.min(chunk.length,stat.size-offset),offset);if(!n)throw Error('runtime_changed');hash.update(chunk.subarray(0,n));offset+=n;}return hash.digest('hex');}finally{fs.closeSync(descriptor);}};
 const pkgFile=Module.createRequire(filename).resolve('better-sqlite3/package.json'),native=path.join(path.dirname(pkgFile),'build/Release/better_sqlite3.node');
 result.runtime={node:process.versions.node,abi:process.versions.modules,platform:process.platform,arch:process.arch,nodeSha256:hashFile(process.execPath),nativeDependencySha256:hashFile(native),nativeDependencyVersion:JSON.parse(fs.readFileSync(pkgFile)).version,frozenLockSha256:meta.frozenLockSha256};
-process.stdout.write(JSON.stringify(result));`;
+process.stdout.write(JSON.stringify(result));
+} catch(error) {
+const name=typeof error?.name==='string'?error.name.slice(0,80):'UNKNOWN';
+const code=typeof error?.code==='string'?error.code.slice(0,80):null;
+const message=typeof error?.message==='string'&&/^[a-z][a-z0-9_:.-]{0,160}$/.test(error.message)?error.message:null;
+const issues=Array.isArray(error?.issues)?error.issues:null;
+process.stderr.write(JSON.stringify({readerError:{name,code,message,issuesTotal:issues?.length??null,
+issues:issues?.slice(0,8).map(issue=>({code:String(issue.code).slice(0,64),
+path:Array.isArray(issue.path)?issue.path.slice(0,12).map(part=>typeof part==='number'?part:String(part).slice(0,64)):null,
+expected:typeof issue.expected==='string'?issue.expected.slice(0,64):null}))??null}})+'\\n');
+process.exitCode=1;
+}`;
 
 /** Read only the explicitly supplied frozen dependency/source tree. These
  * observable digests are evidence, never an activation or installation grant. */
