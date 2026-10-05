@@ -108,7 +108,7 @@ class Harness {
   }
   open() {
     return new LocalEventBuffer(this.file, {
-      workspaceId: WORKSPACE, enrollmentNow: () => new Date(T0 - 3_600_000),
+      workspaceId: WORKSPACE, deviceId: "usage-pairing-fixture", enrollmentNow: () => new Date(T0 - 3_600_000),
       delivery: { enabled: true, now: () => new Date(this.vnow) },
     });
   }

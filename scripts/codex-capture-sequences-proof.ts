@@ -37,6 +37,7 @@ type Producer = {event:any;response:string;kind:"trace"|"turn"|"invalid"};
 type Frozen = { id: string; rawId: string; bytes: string; event: any; named: boolean; gap: boolean };
 const MODEL = "gpt-6.1-sol", OTHER = "gpt-6-astra";
 const identityQueries=proofProcessIdentity();
+const LEGACY_SESSION="44444444-4444-4444-8444-444444444444";
 const ALIAS_SESSION="33333333-3333-4333-8333-333333333333";
 const SESSION = "22222222-2222-4222-8222-222222222222";
 const WORKSPACE = "11111111-1111-4111-8111-111111111111";
@@ -89,11 +90,11 @@ function log(model: string,trace: string,at: number,input?: number,output?: numb
         ...(contradict?[attribute("gen_ai.request.model",OTHER)]:[])]}]}]}]},
     {source:"codex",transportPath:"/v1/logs"}).events[0]!.event;
 }
-function responseSpan(trace: string,identity?: {turn?:string;request?:string},at=6000) {
+function responseSpan(trace: string,identity?: {turn?:string;request?:string},at=6000,session=SESSION) {
   return explodeOtlpPayload({resourceSpans:[{resource:{attributes:[attribute("service.name","codex-app-server")]},
     scopeSpans:[{spans:[{name:"handle_responses",traceId:trace,spanId:"1".repeat(16),
       startTimeUnixNano:String(BigInt(AT+at-1000)*1000000n),endTimeUnixNano:String(BigInt(AT+at)*1000000n),
-      attributes:[attribute("conversation.id",SESSION),attribute("gen_ai.usage.input_tokens",19),
+      attributes:[attribute("conversation.id",session),attribute("gen_ai.usage.input_tokens",19),
         ...(identity?.turn?[attribute("turn.id",identity.turn)]:[]),
         ...(identity?.request?[attribute("request_id",identity.request)]:[]),
         attribute("gen_ai.usage.output_tokens",2)]}]}]}]},{source:"codex",transportPath:"/v1/traces"}).events[0]!.event;
@@ -298,27 +299,35 @@ class World {
     const version=op.includes("047")?"0.7.47":"0.7.48";
     this.open(version);
     const requestId=op,trace=(op.includes("047")?"6":"7").repeat(32);
-    const partials=[log(MODEL,trace,AT+70000,19,undefined,false,undefined,{request:requestId}),
-      log(MODEL,trace,AT+71000,undefined,2,false,undefined,{request:requestId})];
+    const partials=[log(MODEL,trace,AT+70000,19,undefined,false,undefined,{request:requestId},LEGACY_SESSION),
+      log(MODEL,trace,AT+71000,undefined,2,false,undefined,{request:requestId},LEGACY_SESSION)];
     if(op.endsWith("output-input"))partials.reverse();
     for(const e of partials) {
-      this.register(e,op,"trace");this.fact(trace,MODEL);this.b.append(e);
+      this.register(e,op,"trace");this.fact(trace,MODEL);
+      const appended=this.b.append(e);
+      invariant(appended||Boolean(this.b.database.prepare("select 1 from buffered_events where id=? and uploaded_at is not null").get(e.id)),
+        "OLD_NATIVE_PRODUCER_ADMISSION",{op,id:e.id});
       this.lease();this.b.delivery.acknowledge(this.currentLease.leaseId,this.currentLease.items.map((i:any)=>i.deliveryId),this.now);
       const raw=this.b.database.prepare("select input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_usd,usage_duplicate_reason from buffered_events where id=?").get(e.id);
+      invariant(raw&&[...this.frozen.values()].some(f=>f.rawId===e.id&&f.named),"OLD_NATIVE_ACK_REQUIRED",{op,event:e});
       this.oldAcknowledged.set(e.id,JSON.stringify(raw));
     }
     this.head();
-    const complete=log(MODEL,trace,AT+69000,19,2,false,undefined,{request:requestId});
+    const complete=log(MODEL,trace,AT+69000,19,2,false,undefined,{request:requestId},LEGACY_SESSION);
     this.register(complete,op,"trace");this.b.append(complete);
   }
   async oldAckedPair(op:Op) {
     this.head();this.lease();this.open(op.endsWith("047")?"0.7.47":"0.7.48");
     const trace=(op.endsWith("047")?"4":"5").repeat(32),identity={request:op};
-    const e=log(MODEL,trace,AT+89000,19,2,false,undefined,identity);
-    this.register(e,op,"trace");this.fact(trace,MODEL);this.b.append(e);this.lease();
+    const e=log(MODEL,trace,AT+89000,19,2,false,undefined,identity,LEGACY_SESSION);
+    this.register(e,op,"trace");this.fact(trace,MODEL);
+      const appended=this.b.append(e);
+      invariant(appended||Boolean(this.b.database.prepare("select 1 from buffered_events where id=? and uploaded_at is not null").get(e.id)),
+        "OLD_NATIVE_PRODUCER_ADMISSION",{op,id:e.id});this.lease();
     this.b.delivery.acknowledge(this.currentLease.leaseId,this.currentLease.items.map((i:any)=>i.deliveryId),this.now);
+    invariant([...this.frozen.values()].some(f=>f.rawId===e.id&&f.named),"OLD_NATIVE_ACK_REQUIRED",{op,event:e});
     this.oldAcknowledged.set(e.id,JSON.stringify(this.b.database.prepare("select input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_usd,usage_duplicate_reason from buffered_events where id=?").get(e.id)));
-    this.head();const twin=responseSpan(trace,identity,90000);
+    this.head();const twin=responseSpan(trace,identity,90000,LEGACY_SESSION);
     twin.cacheReadTokens=3;twin.cacheCreationTokens=5;twin.costUsd=.125;twin.costKind="reported";
     Object.assign(twin.metadata,{"gen_ai.usage.cache_read_tokens":3,"gen_ai.usage.cache_creation_input_tokens":5,cost_usd:.125});
     this.register(twin,op,"trace");this.b.append(twin);
@@ -658,9 +667,9 @@ function* permutations(ops:Op[]):Generator<Op[]> {
 async function saveFailure(name:string,operations:Op[],result:Extract<Awaited<ReturnType<typeof run>>,{passed:false}>) {
   const tag=failureTag(result.error),directory=path.join(process.cwd(),"evidence/codex-capture-sequences");fs.mkdirSync(directory,{recursive:true});
   const file=path.join(directory,`${name}-${tag??"harness"}.json`);
-  fs.writeFileSync(file,JSON.stringify({...result,operations,attempts:0},null,2)+"\n");
+  fs.writeFileSync(file,JSON.stringify({...result,originalOperations:operations,operations,attempts:0},null,2)+"\n");
   const reduced=tag?await shrink(operations,tag):{operations,attempts:0};
-  fs.writeFileSync(file,JSON.stringify({...result,...reduced},null,2)+"\n");
+  fs.writeFileSync(file,JSON.stringify({...result,originalOperations:operations,...reduced},null,2)+"\n");
   console.error(JSON.stringify({file,tag,...reduced}));
 }
 async function main() {
@@ -697,9 +706,9 @@ async function main() {
           const file=path.join(evidence,`seed-${seed}-${tag??"harness"}.json`);
           // Save the full counterexample BEFORE shrinking. A proof timeout
           // during reduction must not erase the original failing sequence.
-          fs.writeFileSync(file,JSON.stringify({seed,requestedSeeds:seeds,...result,operations,attempts:0},null,2)+"\n");
+          fs.writeFileSync(file,JSON.stringify({seed,requestedSeeds:seeds,...result,originalOperations:operations,operations,attempts:0},null,2)+"\n");
           const reduced=tag?await shrink(operations,tag):{operations,attempts:0};
-          const counterexample={seed,requestedSeeds:seeds,...result,...reduced};
+          const counterexample={seed,requestedSeeds:seeds,...result,originalOperations:operations,...reduced};
           fs.writeFileSync(file,JSON.stringify(counterexample,null,2)+"\n");
           console.error(JSON.stringify({counterexample,file},null,2));throw new Error(result.error);
         }
