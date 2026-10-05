@@ -1127,6 +1127,31 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:legacy-privacy-parity
 
+      - name: Install the pinned Chrome headless shell for the dashboard browser proof
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        # Full Google Chrome opens hidden native windows even in headless mode, and crashes closing one when the
+        # runner's macOS session does not own the display (another user at the Studio 1 console since 4 Oct 2026).
+        # The headless shell opens none. Pinned build and zip hash; one copy per runner in its tool cache.
+        env:
+          CFT_VERSION: 154.0.8037.92
+          CFT_ZIP_SHA256: 77da14e75d7f2568e6f7898d3df7cdc6faac74b15e903b2c9d486ebb6ca9b929
+        run: |
+          dir="$RUNNER_TOOL_CACHE/chrome-headless-shell/$CFT_VERSION-mac-arm64"
+          exe="$dir/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+          if [ ! -x "$exe" ]; then
+            work="$(mktemp -d "$RUNNER_TEMP/chrome-headless-shell.XXXXXX")"
+            curl -sSfL --retry 3 -o "$work/shell.zip" \
+              "https://storage.googleapis.com/chrome-for-testing-public/$CFT_VERSION/mac-arm64/chrome-headless-shell-mac-arm64.zip"
+            echo "$CFT_ZIP_SHA256  $work/shell.zip" | shasum -a 256 -c -
+            ditto -x -k "$work/shell.zip" "$work/out"
+            mkdir -p "$(dirname "$dir")"
+            rm -rf "$dir"
+            mv "$work/out" "$dir"
+            rm -rf "$work"
+          fi
+          test -x "$exe"
+          echo "PLIMSOLL_DASHBOARD_CHROME=$exe" >> "$GITHUB_ENV"
+
       - name: Prove shipped dashboard browser security
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard-security
