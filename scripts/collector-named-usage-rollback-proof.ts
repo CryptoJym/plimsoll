@@ -9,13 +9,14 @@ import { pathToFileURL } from "node:url";
 import { createProofCompletion } from "./lib/proof-completion";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
-const completion = createProofCompletion("collector-named-usage-rollback", 7);
-// This branch writes the fixture; stock 0.7.49 must recover its expired lease
-// without changing sealed usage. Retain the 0.7.48 and 0.7.47 reader assertions.
+const completion = createProofCompletion("collector-named-usage-rollback", 8);
+// Preserve PR #450's exact writer and all five rollback assertions while
+// testing this scanner branch as an additional reader. No #450 runtime changes
+// or release bump are required in the scanner branch.
 const currentVersion: string = JSON.parse(fs.readFileSync(
   path.resolve("packages/collector-cli/package.json"), "utf8",
 )).version;
-const writerCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const writerCommit = "9f75bdcdf6d19fd477caed838482bb0fe16c8d31";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-named-rollback-"));
 const ledgerPath = path.join(root, "rollback.sqlite");
 const workspaceId = "00000000-0000-4000-8000-000000000001";
@@ -43,12 +44,13 @@ async function leaseWithReader(
   expectedVersion: string,
   nowMs: number,
   acknowledge: boolean,
+  fixtureLedgerPath = ledgerPath,
 ) {
   const reader = await import(pathToFileURL(
     path.join(worktree, "packages/collector-cli/src/buffer.ts"),
   ).href);
   const now = new Date(nowMs);
-  const buffer = new reader.LocalEventBuffer(ledgerPath, {
+  const buffer = new reader.LocalEventBuffer(fixtureLedgerPath, {
     workspaceId,
     deviceId,
     enrollmentNow: () => new Date(baseMs),
@@ -92,16 +94,73 @@ async function leaseWithReader(
   }
 }
 
+async function branchWriterStockReader(stockTree: string) {
+  const { LocalEventBuffer } = await import("../packages/collector-cli/src/buffer");
+  const branchLedger = path.join(root, "branch-writer.sqlite");
+  const now = new Date(baseMs);
+  const buffer = new LocalEventBuffer(branchLedger, {
+    workspaceId, deviceId, enrollmentNow: () => now,
+    delivery: { enabled: true, now: () => now },
+  });
+  try {
+    assert.equal(buffer.append(aiInteractionEventSchema.parse({
+      id: namedId, sessionId: "00000000-0000-4000-8000-000000000911",
+      actorId: accountId, source: "codex", dataMode: "metadata",
+      eventType: "assistant_response", observedAt: now.toISOString(),
+      model: "gpt-6.1-sol", inputTokens: 19, outputTokens: 2,
+    })), true);
+    assert.equal(buffer.append(aiInteractionEventSchema.parse({
+      id: gapId, sessionId: "00000000-0000-4000-8000-000000000912",
+      source: "codex", dataMode: "metadata", eventType: "assistant_response",
+      observedAt: now.toISOString(), metadata: { usageSource: "capture_gap" },
+    })), true);
+  } finally { buffer.close(); }
+  const ownLease = await leaseWithReader(path.resolve("."), currentVersion,
+    baseMs + 1_000, false, branchLedger);
+  const before = new Database(branchLedger, { readonly: true });
+  let sealed: ReturnType<typeof readSealed>;
+  try { sealed = readSealed(before); } finally { before.close(); }
+  const stockLease = await leaseWithReader(stockTree, "0.7.49",
+    baseMs + 122_000, true, branchLedger);
+  assert.notEqual(stockLease.leaseId, ownLease.leaseId);
+  assert.deepEqual(stockLease.itemIds.sort(), ownLease.itemIds.sort());
+  const after = new Database(branchLedger, { readonly: true });
+  try {
+    const counts = after.prepare(`select
+      (select count(*) from upload_outbox) as outbox,
+      (select count(*) from upload_receipts where terminal_state = 'dead') as dead,
+      (select count(*) from buffered_events where uploaded_at is not null) as uploaded`).get();
+    assert.deepEqual(counts, { outbox: 0, dead: 0, uploaded: 2 });
+    assert.equal(sealed.length, 2);
+    assert.equal((after.prepare("select input_tokens as input from buffered_events where id = ?")
+      .get(namedId) as { input: number }).input, 19);
+  } finally { after.close(); }
+  completion.check("branch-writer-to-stock-0.7.49-expired-lease-preserves-all-deliveries");
+  console.log(JSON.stringify({ branchWriterCommit: execFileSync("git", ["rev-parse", "HEAD"],
+    { encoding: "utf8" }).trim(), stockReaderCommit: "275fce73c76f8d2a9898cbc52e8ddf5b7a128c9e",
+    ownLeaseAtMs: baseMs + 1_000, stockLeaseAtMs: baseMs + 122_000, namedInput: 19,
+    preservedDeliveries: stockLease.itemIds.length, dead: 0 }));
+}
+
 async function main() {
+  let writerTree: string | undefined;
   let old049: string | undefined;
   let old048: string | undefined;
   let old047: string | undefined;
   try {
+    try { execFileSync("git", ["cat-file", "-e", `${writerCommit}^{commit}`], { stdio: "ignore" }); }
+    catch {
+      execFileSync("git", ["-c", "credential.helper=", "fetch", "--no-tags",
+        "https://github.com/CryptoJym/plimsoll.git", writerCommit], { stdio: "ignore", timeout: 60_000 });
+    }
+    writerTree = path.join(root, "collector-pr450-writer");
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", writerTree, writerCommit]);
+    fs.symlinkSync(path.resolve("node_modules"), path.join(writerTree, "node_modules"), "dir");
     const { LocalEventBuffer } = await import(pathToFileURL(
-      path.resolve("packages/collector-cli/src/buffer.ts"),
+      path.join(writerTree, "packages/collector-cli/src/buffer.ts"),
     ).href);
     const { captureCodexModel } = await import(pathToFileURL(
-      path.resolve("packages/collector-cli/src/codex-model-capture.ts"),
+      path.join(writerTree, "packages/collector-cli/src/codex-model-capture.ts"),
     ).href);
     let now = new Date(baseMs);
     const buffer = new LocalEventBuffer(ledgerPath, {
@@ -237,6 +296,7 @@ async function main() {
       assert.deepEqual(raw, [{ id: namedId, input: 19 }, { id: gapId, input: 7 }]);
     } finally { finalDb.close(); }
     completion.check("rollback-outbox-receipt-state-is-consistent");
+    await branchWriterStockReader(old049);
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
@@ -246,6 +306,7 @@ async function main() {
     }));
     completion.complete();
   } finally {
+    if (writerTree) closeQuietly(writerTree);
     if (old049) closeQuietly(old049);
     if (old048) closeQuietly(old048);
     if (old047) closeQuietly(old047);
