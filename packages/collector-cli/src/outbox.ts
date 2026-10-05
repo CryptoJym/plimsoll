@@ -509,6 +509,19 @@ function asLimits(input: Partial<DeliveryLimits> | undefined): DeliveryLimits {
 }
 
 export class DeliveryOutbox {
+  private leaseStatements: Map<string, Database.Statement> | undefined;
+  private leaseStatement(sql: string) {
+    const cache = this.leaseStatements;
+    if (!cache) return this.db.prepare(sql);
+    const existing = cache.get(sql);
+    if (existing) return existing;
+    // Only compiled SQL lives for this writer pass. Every get/run rereads
+    // current state with its current bindings and the original ledger guards.
+    // Excess query shapes fall back to ordinary preparation, never less work.
+    const statement = this.db.prepare(sql);
+    if (cache.size < 64) cache.set(sql, statement);
+    return statement;
+  }
   private enabled: boolean;
   private limits: DeliveryLimits;
   private workspaceId: string | null;
@@ -2325,8 +2338,7 @@ export class DeliveryOutbox {
     if (!this.enabled) return { leaseId: "", items: [], locallyDead: 0, blockedBy: "none" };
     const now = options.now ?? new Date();
     const nowIso = now.toISOString();
-    const control = this.db
-      .prepare(
+    const control = this.leaseStatement(
         `select circuit_kind as kind, circuit_until as until
          from upload_control where singleton = 1`,
       )
@@ -2345,15 +2357,13 @@ export class DeliveryOutbox {
     let selectedBytes = 0;
 
     const run = this.db.transaction(() => {
-      this.db
-        .prepare(
+      this.leaseStatement(
           `update upload_outbox set state = 'retry', next_attempt_at = @now,
              lease_id = null, lease_expires_at = null, updated_at = @now
            where state = 'in_flight' and lease_expires_at <= @now`,
         )
         .run({ now: nowIso });
-      const candidates = this.db
-        .prepare(
+      const candidates = this.leaseStatement(
           `select delivery_id as deliveryId, raw_rowid as rawRowid,
              raw_id as rawId, raw_created_at as rawCreatedAt,
              raw_generation as rawGeneration,
@@ -2394,7 +2404,7 @@ export class DeliveryOutbox {
       for (const row of candidates) {
         if (row.sealedEnvelopeJson) continue;
         if (row.rawId && row.rawPayloadJson && this.reconcileCodexResponse(row.rawId)) {
-          const current = this.db.prepare(`select base_envelope_json as base,sealed_envelope_json as sealed,
+          const current = this.leaseStatement(`select base_envelope_json as base,sealed_envelope_json as sealed,
             (select payload_json from buffered_events raw where raw.rowid=upload_outbox.raw_rowid
               and raw.id is upload_outbox.raw_id and raw.created_at is upload_outbox.raw_created_at
               and raw.privacy_generation is upload_outbox.raw_generation) as raw
@@ -2423,7 +2433,7 @@ export class DeliveryOutbox {
       const disposedRawRowids = new Set<number>();
 
       for (const row of candidates) {
-        if (!this.db.prepare("select 1 from upload_outbox where delivery_id=?").get(row.deliveryId)) continue;
+        if (!this.leaseStatement("select 1 from upload_outbox where delivery_id=?").get(row.deliveryId)) continue;
         const authoritativeReason = this.authoritativePrivacyReason(row);
         if (authoritativeReason === "lineage_unresolved") continue;
         if (authoritativeReason) {
@@ -2438,7 +2448,7 @@ export class DeliveryOutbox {
         // parse and byte-for-byte privacy gate below. No metadata flag can
         // create this local validation result.
         let freshNativeEnvelope: AiWorkIngestEvent | undefined;
-        if (!row.sealedEnvelopeJson && envelopeJson) this.db.prepare(`update upload_outbox set
+        if (!row.sealedEnvelopeJson && envelopeJson) this.leaseStatement(`update upload_outbox set
           sealed_envelope_json=?,sealed_bytes=?,updated_at=? where delivery_id=? and sealed_envelope_json is null`)
           .run(envelopeJson,Buffer.byteLength(envelopeJson),nowIso,row.deliveryId);
         if (!envelopeJson) {
@@ -2505,8 +2515,7 @@ export class DeliveryOutbox {
             locallyDead += this.deadActive(row.deliveryId, "local_item_oversize", nowIso, disposedRawRowids);
             continue;
           }
-          this.db
-            .prepare(
+          this.leaseStatement(
               `update upload_outbox set sealed_envelope_json = @envelopeJson,
                  sealed_bytes = @envelopeBytes, updated_at = @now
                where delivery_id = @deliveryId and sealed_envelope_json is null`,
@@ -2590,7 +2599,7 @@ export class DeliveryOutbox {
           // An old, once-attempted request may already have committed remotely.
           // Never rewrite its frozen bytes or retry unknown billable usage.
           // Retire it and send a distinct tokenless gap with the same raw lineage.
-          const owner = this.db.prepare(`select installation_epoch_id as epoch from buffered_events where
+          const owner = this.leaseStatement(`select installation_epoch_id as epoch from buffered_events where
             rowid=? and id is ? and created_at is ? and privacy_generation is ?`).get(
               row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration) as {epoch:string|null}|undefined;
           const prior = {...outboundEnvelope.event,metadata:{...outboundEnvelope.event.metadata,
@@ -2598,7 +2607,7 @@ export class DeliveryOutbox {
           let gapId: string | undefined;
           if (row.rawId && row.rawCreatedAt && row.rawGeneration) for (let attempt=0;attempt<32;attempt++) {
             const id=incarnationDeliveryId(row.rawId,row.rawCreatedAt,row.rawGeneration,attempt);
-            if (!this.db.prepare(`select 1 from buffered_events where id=? union all
+            if (!this.leaseStatement(`select 1 from buffered_events where id=? union all
               select 1 from upload_outbox where delivery_id=? union all
               select 1 from upload_receipts where delivery_id=? union all
               select 1 from upload_replays where delivery_id=? union all
@@ -2618,7 +2627,7 @@ export class DeliveryOutbox {
           }
           const gapJson=JSON.stringify(gap.envelope),gapBytes=Buffer.byteLength(gapJson);
           locallyDead += this.deadActive(row.deliveryId,"local_model_capture_gap",nowIso,disposedRawRowids);
-          if (gapBytes <= this.limits.maxItemBytes) this.db.prepare(`insert or ignore into upload_outbox
+          if (gapBytes <= this.limits.maxItemBytes) this.leaseStatement(`insert or ignore into upload_outbox
             (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,workspace_id,device_id,
              base_envelope_json,base_bytes,repo_hash,branch_hash,state,attempt_count,next_attempt_at,
              last_failure_class,created_at,updated_at)
@@ -2634,8 +2643,7 @@ export class DeliveryOutbox {
         selectedBytes += addedBytes;
         const attemptCount = row.attemptCount + 1;
         if (row.rawId) rememberCodexSpanEmission(this.db, row.rawId, outboundEnvelope.event);
-        this.db
-          .prepare(
+        this.leaseStatement(
             `update upload_outbox set state = 'in_flight', attempt_count = @attemptCount,
                lease_id = @leaseId, lease_expires_at = @leaseExpiresAt,
                updated_at = @now
@@ -2661,7 +2669,9 @@ export class DeliveryOutbox {
         });
       }
     });
-    run();
+    const previousStatements = this.leaseStatements;
+    this.leaseStatements = new Map();
+    try { run(); } finally { this.leaseStatements = previousStatements; }
     return { leaseId, items, locallyDead, blockedBy: "none" };
   }
 
@@ -3416,7 +3426,7 @@ export class DeliveryOutbox {
   private relocateConflictingPrivacyReceipt(lineage: RawLineageSnapshot) {
     if (lineage.rawId === null || lineage.rawCreatedAt === null) return false;
     const run = () => {
-      const receipt = this.db.prepare(`select raw_rowid as rawRowid,
+      const receipt = this.leaseStatement(`select raw_rowid as rawRowid,
         raw_id as rawId,raw_created_at as rawCreatedAt,
         raw_generation as rawGeneration,created_at as createdAt,
         terminal_state as state,reason
@@ -3438,13 +3448,13 @@ export class DeliveryOutbox {
       } else if (receipt.rawRowid === null && receipt.rawId === null &&
           receipt.rawCreatedAt === null && receipt.rawGeneration === null &&
           receipt.createdAt !== lineage.rawCreatedAt) {
-        const current = this.db.prepare(`select rowid as rawRowid,id as rawId,
+        const current = this.leaseStatement(`select rowid as rawRowid,id as rawId,
           created_at as rawCreatedAt,privacy_generation as rawGeneration
           from buffered_events where id=? and created_at=?
             and privacy_disposition=?`).get(
           lineage.rawId, receipt.createdAt, receipt.reason,
         ) as typeof owner;
-        const expired = this.db.prepare(`select raw_rowid as rawRowid,
+        const expired = this.leaseStatement(`select raw_rowid as rawRowid,
           event_id as rawId,raw_created_at as rawCreatedAt,
           raw_generation as rawGeneration from raw_retention_receipts
           where event_id=? and raw_created_at=? limit 2`).all(
@@ -3460,7 +3470,7 @@ export class DeliveryOutbox {
       if (!owner || (owner.rawId === lineage.rawId &&
           owner.rawCreatedAt === lineage.rawCreatedAt &&
           owner.rawGeneration === lineage.rawGeneration)) return false;
-      const occupied = this.db.prepare(`select 1 from buffered_events where id=?
+      const occupied = this.leaseStatement(`select 1 from buffered_events where id=?
         union all select 1 from upload_outbox where delivery_id=?
         union all select 1 from upload_receipts where delivery_id=?
         union all select 1 from upload_replays where delivery_id=?
@@ -3471,7 +3481,7 @@ export class DeliveryOutbox {
           owner.rawCreatedAt, owner.rawGeneration, attempt);
         if (occupied.get(replacement, replacement, replacement, replacement,
           replacement)) continue;
-        return this.db.prepare(`update upload_receipts set delivery_id=?,
+        return this.leaseStatement(`update upload_receipts set delivery_id=?,
           raw_rowid=?,raw_id=?,raw_created_at=?,raw_generation=?
           where delivery_id=? and terminal_state='dead'`).run(
           replacement, owner.rawRowid, owner.rawId, owner.rawCreatedAt,
@@ -3487,7 +3497,7 @@ export class DeliveryOutbox {
     lineage: RawLineageSnapshot,
   ): PrivacyDecision {
     this.relocateConflictingPrivacyReceipt(lineage);
-    const receipt = this.db.prepare(`select terminal_state as state,reason,raw_id as rawId,
+    const receipt = this.leaseStatement(`select terminal_state as state,reason,raw_id as rawId,
       raw_created_at as rawCreatedAt,raw_generation as rawGeneration
       from upload_receipts where delivery_id = ?`).get(lineage.deliveryId) as {
         state: string; reason: DeliveryReceiptReason;
@@ -3506,8 +3516,7 @@ export class DeliveryOutbox {
       return receipt.state === "acknowledged" ? "remote_acknowledged" : receipt.reason;
     }
     if (lineage.rawRowid === null) return "lineage_unresolved";
-    const raw = this.db
-      .prepare(
+    const raw = this.leaseStatement(
         `select id as rawId, created_at as createdAt,
            privacy_generation as privacyGeneration,
            privacy_disposition as privacyDisposition,

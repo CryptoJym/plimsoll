@@ -10,7 +10,7 @@ import { aiInteractionEventSchema, type AiInteractionEvent } from '../packages/s
 import { nativeCodexFixture } from './lib/native-codex-fixture';
 import { ensureCodexNamedCaptures } from '../packages/collector-cli/src/codex-named-capture';
 import { createProofCompletion } from './lib/proof-completion';
-const completion = createProofCompletion('codex-capture-legacy-density',50);
+const completion = createProofCompletion('codex-capture-legacy-density',52);
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-legacy-density-'));
 const at=new Date().toISOString();
 const event=(n:number)=>aiInteractionEventSchema.parse({id:`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,
@@ -201,6 +201,12 @@ try {
  try {
   for(let n=1;n<=500;n++)batch.append({...event(n),...nativeCodexFixture('named-batch-'+n)});
   let schemaSetups=0;
+  let leaseCompiles=0;
+  const prepare=batch.database.prepare.bind(batch.database);
+  batch.database.prepare=((sql:string)=>{
+   if(sql.includes("update upload_outbox set state = 'in_flight', attempt_count"))leaseCompiles++;
+   return prepare(sql);
+  }) as typeof batch.database.prepare;
   const exec=batch.database.exec.bind(batch.database);
   batch.database.exec=((sql:string)=>{
    if(sql.includes('create table if not exists codex_named_capture_origin'))schemaSetups++;
@@ -211,6 +217,8 @@ try {
   completion.check('native_batch_keeps_all_500_named_zero_and_known_observations',leased.items.length===500&&named===500&&
    leased.items.every(item=>item.envelope.event.inputTokens===0&&item.envelope.event.outputTokens===7));
   completion.check('native_named_schema_setup_is_bounded_per_unchanged_schema',schemaSetups<=1);
+  completion.check('native_batch_compiles_lease_update_once_without_caching_results',leaseCompiles===1&&
+   leased.items.every(item=>item.attemptCount===1));
   schemaSetups=0;
   const frozen=batch.database.prepare('select envelope_json from codex_named_captures order by delivery_id').all();
   batch.database.exec('drop table codex_named_capture_origin');
@@ -218,6 +226,13 @@ try {
   ensureCodexNamedCaptures(batch.database);
   const origin=batch.database.prepare('select legacy_native_ack_eligible as eligible from codex_named_capture_origin').get() as {eligible:number};
   completion.check('named_schema_cookie_change_repairs_origin_once_without_restamping',schemaSetups===1&&origin.eligible===0&&
+   JSON.stringify(batch.database.prepare('select envelope_json from codex_named_captures order by delivery_id').all())===JSON.stringify(frozen));
+  batch.database.exec('begin; drop table codex_named_capture_origin');
+  ensureCodexNamedCaptures(batch.database);
+  batch.database.exec('rollback; drop table codex_named_capture_origin; create table fixture_cookie_collision (id integer)');
+  ensureCodexNamedCaptures(batch.database);
+  completion.check('rollback_schema_cookie_collision_cannot_hide_missing_origin',!!batch.database.prepare(
+   "select 1 from sqlite_master where type='table' and name='codex_named_capture_origin'").get()&&
    JSON.stringify(batch.database.prepare('select envelope_json from codex_named_captures order by delivery_id').all())===JSON.stringify(frozen));
  }finally{batch.close();}
  completion.complete();
