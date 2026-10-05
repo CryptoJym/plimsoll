@@ -94,10 +94,17 @@ const cases = [
   }) },
   { name: "a small ready tail precedes a newer oversized file within the shared budget", run: () => fixture(async f => {
     const session = randomUUID();
-    fs.writeFileSync(path.join(f.partition, `rollout-${session}.jsonl`), prefix(session) + usage(100));
+    const smallFile = path.join(f.partition, `rollout-${session}.jsonl`);
+    fs.writeFileSync(smallFile, prefix(session) + usage(100));
+    fs.utimesSync(smallFile, fixtureNow, fixtureNow);
     await new Promise(resolve => setTimeout(resolve, 5));
-    fs.writeFileSync(path.join(f.partition, "rollout-newest-large.jsonl"),
-      JSON.stringify({ type: "fixture_ignored", padding: "x".repeat(600 * 1024) }) + "\n");
+    const largeFile = path.join(f.partition, "rollout-newest-large.jsonl");
+    fs.writeFileSync(largeFile, JSON.stringify({ type: "fixture_ignored", padding: "x".repeat(600 * 1024) }) + "\n");
+    // Fixed mtimes in fixtureNow's UTC day, the large file newest: real mtimes
+    // passed only while the real UTC day equalled the fixture's (until 2026-10-05).
+    const newest = new Date(fixtureNow.getTime() + 60_000);
+    assert.equal(newest.toISOString().slice(0, 10), fixtureNow.toISOString().slice(0, 10));
+    fs.utimesSync(largeFile, newest, newest);
     const result = await f.scan(new CaptureWorkBudget({ ...AUTOMATIC_CAPTURE_LIMITS, maxBytes: 64 * 1024 }));
     assert.ok(f.buffer.database.prepare(
       "select 1 from buffered_events where session_id=? and event_type='usage_rollout' and input_tokens=100",
