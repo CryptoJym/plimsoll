@@ -5,7 +5,14 @@ import type { AiInteractionEvent } from "../../shared/src/index";
 // Only the sealing paths write it, after native capture and privacy validation.
 // It retains the result across ACK/terminal replay and is bound to the complete
 // raw incarnation. Neither event metadata nor a reused ID can attest a capture.
+const namedCaptureSchema = new WeakMap<Database.Database, number>();
 export function ensureCodexNamedCaptures(db: Database.Database) {
+  // Native batch sealing calls this for every observation. Schema shape is
+  // stable until SQLite's schema cookie changes; accounting rows and frozen
+  // bytes are always read/written below, never cached here. A released writer
+  // or migration changing this connection's schema invalidates this check.
+  const schemaVersion = db.pragma("schema_version", { simple: true }) as number;
+  if (namedCaptureSchema.get(db) === schemaVersion) return;
   db.exec(`create table if not exists codex_named_capture_origin (
       singleton integer primary key check(singleton=1),legacy_native_ack_eligible integer not null
     );
@@ -20,6 +27,7 @@ export function ensureCodexNamedCaptures(db: Database.Database) {
   );`);
   if (!(db.pragma("table_info(codex_named_captures)") as Array<{name:string}>).some(c=>c.name==="attempt_count"))
     db.exec("alter table codex_named_captures add column attempt_count integer not null default 0");
+  namedCaptureSchema.set(db, db.pragma("schema_version", { simple: true }) as number);
 }
 
 export function legacyNativeAcknowledgementsEligible(db: Database.Database) {
