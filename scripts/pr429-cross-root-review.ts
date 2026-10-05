@@ -34,7 +34,7 @@ for (const root of roots) fs.mkdirSync(root.directory, { recursive: true, mode: 
 fs.mkdirSync(plimsoll, { recursive: true, mode: 0o700 });
 const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-review", uploadUrl: "http://127.0.0.1:1/unused",
   captureRoots: roots });
-fs.writeFileSync(path.join(plimsoll, "collector.config.json"), JSON.stringify(config) + "\n");
+fs.writeFileSync(path.join(plimsoll, "collector.config.json"), JSON.stringify(config) + "\n", { mode: 0o600 });
 
 const transcriptMetadata = rootEventMetadata(roots[1], "transcript-from-b", observedAt, sessionId);
 // Hook and OTLP intake have only a source-wide credential, no authenticated

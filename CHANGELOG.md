@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.51 — 2026-10-05 (unpublished)
+
+- #453 adds the dispatch binding index, bounded dispatch history and explicit
+  adoption qualification as a rollback bridge. Adoption remains off and is
+  refused against the released 0.7.48 reader; activation requires a later
+  reviewed build and qualification of the actual installed pair.
+- #453 adds test-only join-proof diagnostics without changing proof limits.
+
 ## 0.7.50 — 2026-10-05 (unpublished)
 
 - #458 keeps source-recorded Codex processing-tier metadata readable before

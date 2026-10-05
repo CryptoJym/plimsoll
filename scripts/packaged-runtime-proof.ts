@@ -46,7 +46,7 @@ type Check = {
 
 const checks: Check[] = [];
 const repoRoot = path.resolve(import.meta.dirname, "..");
-const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
 const builderScript = path.join(repoRoot, "scripts", "build-packaged-runtime.ts");
 const evidenceDir = path.join(repoRoot, "evidence");
 const receiptPath = path.join(evidenceDir, "packaged-runtime-proof.json");
@@ -135,7 +135,7 @@ async function main() {
     );
     const brokenRun = spawnSync(
       process.execPath,
-      [tsxCli, builderScript,
+      ["--import", tsxLoader, builderScript,
         "--repo-root", brokenRoot,
         "--entry", path.join(brokenRoot, "broken-entry.ts"),
         "--dist", brokenDist,
@@ -271,7 +271,9 @@ async function main() {
     // ------------------------------------------------------------------
     const realDist = path.join(repoRoot, "packages", "collector-cli", "dist");
     const realManifestPath = path.join(realDist, "runtime-manifest.json");
-    const realBuild = spawnSync(process.execPath, [tsxCli, builderScript], {
+    // Loader registration avoids a second tsx IPC listener under long CI
+    // TMPDIR paths; the built daemon still runs through direct Node below.
+    const realBuild = spawnSync(process.execPath, ["--import", tsxLoader, builderScript], {
       cwd: repoRoot,
       encoding: "utf8",
     });
@@ -553,6 +555,7 @@ async function measurePackagedDaemon(artifact: string): Promise<void> {
   fs.writeFileSync(
     path.join(collectorHome, "collector.config.json"),
     `${JSON.stringify({ port }, null, 2)}\n`,
+    { mode: 0o600 },
   );
   const daemon = spawn(process.execPath, [artifact, "start"], {
     env: {

@@ -19,8 +19,8 @@ const A={rootId:"claude-a",profileId:"profile-a",installationEpochId:fixtureEpoc
   source:"claude_code" as const,directory:path.join(home,".claude-a","projects")};
 const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:fixtureEpochId("epoch-b"),
   source:"claude_code" as const,directory:path.join(home,".claude-b","projects")};
-for(const root of [A,B]) fs.mkdirSync(root.directory,{recursive:true});
-fs.mkdirSync(plimsoll,{recursive:true});
+for(const root of [A,B]) fs.mkdirSync(root.directory,{recursive:true,mode:0o700});
+fs.mkdirSync(plimsoll,{recursive:true,mode:0o700});
 const base=collectorConfigSchema.parse({deviceId:"dev_pr429-r4-legacy",
   uploadUrl:"http://127.0.0.1:1/unused",captureRoots:[A,B]});
 const options={workspaceId:base.tenantId,deviceId:base.deviceId,
@@ -68,7 +68,7 @@ function raw(buffer:HeadBuffer,id:string) {
 function hook(buffer:HeadBuffer,sessionId:string,save=false) {
   const config=collectorConfigSchema.parse({...base,captureRoots:[{...A,dispatch:[binding(sessionId)]},B]});
   const configFile=path.join(plimsoll,"collector.config.json");
-  fs.writeFileSync(`${configFile}.next`,JSON.stringify(config)+"\n");
+  fs.writeFileSync(`${configFile}.next`,JSON.stringify(config)+"\n",{mode:0o600});
   fs.renameSync(`${configFile}.next`,configFile);
   const before=claudeDispatchSkipStatus().otherRootSeen;
   const event=normalizeForwardedHook({id:crypto.randomUUID(),hook_event_name:"AssistantResponse",

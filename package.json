@@ -286,6 +286,8 @@
     "proof:pr426-r17-two-switch-race": "tsx scripts/review-r3-two-switch-race.ts",
     "proof:pr426-r17-open-collector-two-switch": "tsx scripts/pr426-r17-open-collector-two-switch.ts",
     "proof:dispatch-binding": "tsx scripts/run-proof.ts scripts/dispatch-binding-proof.ts",
+    "proof:dispatch-history": "tsx scripts/run-proof.ts scripts/dispatch-history-qualified-proof.ts",
+    "proof:dispatch-history-adoption": "tsx scripts/run-proof.ts scripts/dispatch-history-adoption-proof.ts",
     "proof:claude-dispatch-stamping": "tsx scripts/run-proof.ts scripts/claude-dispatch-stamping-proof.ts",
     "proof:claude-dispatch-review": "tsx scripts/run-proof.ts scripts/claude-dispatch-review-proof.ts",
     "proof:pr429-r2-window-divergence": "tsx scripts/run-proof.ts scripts/pr429-r2-window-divergence-review.ts",

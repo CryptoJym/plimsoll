@@ -1,0 +1,127 @@
+{
+  "sourceCommit": "34d58bcd90865679e09fcbd1ee1703de5effda97",
+  "artifactSha256": "a1a03f1d4130ec435bbab0f37b152f76be1def0f312d2123937c43a76aab4d0c",
+  "bytes": 383227,
+  "inputs": [
+    {
+      "logicalPath": "packages/shared/src/live-usage-metadata.ts",
+      "sha256": "6355dda3dbf581a3df5bca1b607dfbb0f65d207284faebf5a50c210bf1ffeff7",
+      "bytes": 4137
+    },
+    {
+      "logicalPath": "packages/shared/src/schemas.ts",
+      "sha256": "7b6b05ee4f2ea2014a959a9a98116e2c8fb6da122bc6ddb2230c68e8ddbbb0b5",
+      "bytes": 38221
+    },
+    {
+      "logicalPath": "packages/shared/src/linkage.ts",
+      "sha256": "1b3efa286858a57097f01fbacc4a75f1b65eca03fe7b7920fcdba767d6ff1192",
+      "bytes": 2274
+    },
+    {
+      "logicalPath": "packages/shared/src/analytical-metadata.ts",
+      "sha256": "952e77cca882a07071c8af82ec8b07d5cc71dcf55efbe72d8621f4040ef07062",
+      "bytes": 26237
+    },
+    {
+      "logicalPath": "packages/shared/src/suppression-receipt.ts",
+      "sha256": "68e77325bbd916b4bafb68991d673ae8ec70de66fb91938c0389835d94be363a",
+      "bytes": 4099
+    },
+    {
+      "logicalPath": "packages/shared/src/policy.ts",
+      "sha256": "f74af925aa3610e464f382a55fd6cc3598a44a8848569b01cee21a0392629876",
+      "bytes": 8058
+    },
+    {
+      "logicalPath": "packages/shared/src/learning-fact-identity.ts",
+      "sha256": "2ecdece5a6f49a2f38db0a372af8ad324c5efea988984a1451992a94e0960bc9",
+      "bytes": 1980
+    },
+    {
+      "logicalPath": "packages/shared/src/pricing.ts",
+      "sha256": "3098aa2c8694856e7490ec2938c732de79b7628ad81dd8b2ced2b9bc9a5f7b48",
+      "bytes": 5526
+    },
+    {
+      "logicalPath": "packages/shared/src/metric-registry.ts",
+      "sha256": "699045a7dfbaa0fe360ce34310ccde380a73a38eaf013ba672a15f952cfc4cab",
+      "bytes": 60485
+    },
+    {
+      "logicalPath": "packages/shared/src/learning-evidence.ts",
+      "sha256": "007e1e78ae0d47caeafb8d1ebb6b98dc1901046b6582412381a9dd5f1f10496e",
+      "bytes": 53649
+    },
+    {
+      "logicalPath": "packages/shared/src/outcome-timeline.ts",
+      "sha256": "aedbffe0837c1abf8d61719ec4d57ffe0f290522f0ae1657dc61a310f5edba8d",
+      "bytes": 17600
+    },
+    {
+      "logicalPath": "packages/shared/src/lane-receipts.ts",
+      "sha256": "838dda4b0eb7fcd19cab3566ce8e2fb4792ad759d58a27ee59186fff17bfa007",
+      "bytes": 26333
+    },
+    {
+      "logicalPath": "packages/shared/src/fleet-operations.ts",
+      "sha256": "ae08d254dcdd2ad18e656115baeed77fd90e93ddfc005a60435c6e2251afd3a2",
+      "bytes": 27165
+    },
+    {
+      "logicalPath": "packages/shared/src/capacity.ts",
+      "sha256": "cff3091bdad4cd5fe2b14198fb31ce2159b39a88e21c2920f0daf26a6a652a5d",
+      "bytes": 37037
+    },
+    {
+      "logicalPath": "packages/shared/src/provider-capacity-snapshot.ts",
+      "sha256": "f2256f5bd349ed69f3ce92720b2f2e341919dda7eeb7585d1fb70a8fb26af211",
+      "bytes": 22694
+    },
+    {
+      "logicalPath": "packages/shared/src/release-qualification.ts",
+      "sha256": "e3a78aaeaa7743ab67cdd3b5cebba97107bde496e63e0310e1558b4e2701fd23",
+      "bytes": 33965
+    },
+    {
+      "logicalPath": "packages/shared/src/device-registry.ts",
+      "sha256": "38a62dbfc4536ce58eb2c956e0a6980168248306ad05ff9e001cff01023f82a0",
+      "bytes": 13981
+    },
+    {
+      "logicalPath": "packages/shared/src/index.ts",
+      "sha256": "d3a220e2cff2c315dd08f6211a627e53147532e9d017f14201a1bdd9248cf549",
+      "bytes": 1057
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/http-transport.ts",
+      "sha256": "d77e08ef64b6e9256fe713cb447ef35a6cee138e92331876ba19459b20a441c8",
+      "bytes": 14498
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/account-assertion.ts",
+      "sha256": "b632a29af31c5d326d6bda2fe17e5221c16abc737fb987e8f8628a729ef4823d",
+      "bytes": 50303
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/collector-home.ts",
+      "sha256": "676e22487e51217e31fc3dcbb3384e8b51c7f4171f3bf01cc196f54b2eaa9cd4",
+      "bytes": 5446
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-root-inventory.ts",
+      "sha256": "650c48dedcd3df29d23ad802c0248b828ca3facfac464cddc61bd18d1f7941a6",
+      "bytes": 58378
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/config.ts",
+      "sha256": "d0f1cabc84cbf0cc20a17ac175a8feefc05e778170c68085195b9dabb1ba7002",
+      "bytes": 18800
+    },
+    {
+      "logicalPath": "scripts/fixtures/dispatch-history-released-reader-entry.ts",
+      "sha256": "4677ca12e5ccc9d0cd094c82fbb368353677435f1c1899c134c93c95b8273418",
+      "bytes": 937
+    }
+  ]
+}

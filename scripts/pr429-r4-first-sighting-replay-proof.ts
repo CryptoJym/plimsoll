@@ -81,9 +81,9 @@ if(process.argv[2]==="child") {
   await tailer.scan({scope:"full"});
   process.exit(98);
 } else {
-  fs.mkdirSync(plimsoll,{recursive:true});
+  fs.mkdirSync(plimsoll,{recursive:true,mode:0o700});
   fs.mkdirSync(A.directory,{recursive:true});
-  fs.writeFileSync(path.join(plimsoll,"collector.config.json"),JSON.stringify(config)+"\n");
+  fs.writeFileSync(path.join(plimsoll,"collector.config.json"),JSON.stringify(config)+"\n",{mode:0o600});
   const outcomes=[];
   assert.match(process.argv[2]??"",/^phase-(before-insert|after-insert-before-commit)$/);
   const phases=[process.argv[2]!.slice("phase-".length)];

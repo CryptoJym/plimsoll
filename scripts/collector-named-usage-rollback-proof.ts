@@ -10,7 +10,7 @@ import { createProofCompletion } from "./lib/proof-completion";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 
-const completion = createProofCompletion("collector-named-usage-rollback", 13);
+const completion = createProofCompletion("collector-named-usage-rollback", 14);
 // Commit A is a reader-only tier release. Commit B enables tier capture and
 // changes this proof's previous reader to the exact commit A, not stock 0.7.49.
 const recordedTierWriter = false;
@@ -23,6 +23,7 @@ const currentVersion: string = JSON.parse(fs.readFileSync(
   path.resolve("packages/collector-cli/package.json"), "utf8",
 )).version;
 const writerCommit = "9f75bdcdf6d19fd477caed838482bb0fe16c8d31";
+const released050Commit = "121b55437555c3a3c34bafe5889f4d6d8870509f";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-named-rollback-"));
 const ledgerPath = path.join(root, "rollback.sqlite");
 const workspaceId = "00000000-0000-4000-8000-000000000001";
@@ -151,6 +152,7 @@ async function branchWriterStockReader(stockTree: string) {
 
 async function main() {
   let writerTree: string | undefined;
+  let old050: string | undefined;
   let old049: string | undefined;
   let old048: string | undefined;
   let old047: string | undefined;
@@ -252,16 +254,19 @@ async function main() {
 
     const oldRoot = path.join(root, "readers");
     fs.mkdirSync(oldRoot, { recursive: true });
+    old050 = path.join(oldRoot, "collector-0.7.50");
     old049 = path.join(oldRoot, "collector-0.7.49");
     old048 = path.join(oldRoot, "collector-0.7.48");
     old047 = path.join(oldRoot, "collector-0.7.47");
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", old050,
+      released050Commit]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old049,
       "275fce73c76f8d2a9898cbc52e8ddf5b7a128c9e"]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old048,
       "34d58bcd90865679e09fcbd1ee1703de5effda97"]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old047,
       "a60590559403cace3db7cbbda49812c9e3dbfe62"]);
-    for (const worktree of [old049, old048, old047])
+    for (const worktree of [old050, old049, old048, old047])
       fs.symlinkSync(path.resolve("node_modules"), path.join(worktree, "node_modules"), "dir");
 
     const current = await leaseWithReader(path.resolve("."), currentVersion, baseMs + 182_000, false);
@@ -270,20 +275,31 @@ async function main() {
     try { assert.deepEqual(readSealed(afterCurrent), sealedBefore); } finally { afterCurrent.close(); }
     completion.check("scanner-head-reader-preserves-exact-sealed-usage-and-gap");
 
-    const stock = await leaseWithReader(old049, "0.7.49", baseMs + 303_000, false);
+    // Each reader waits 121 seconds: the preceding 120-second lease is expired.
+    const released050 = await leaseWithReader(old050, "0.7.50", baseMs + 303_000, false);
+    assert.notEqual(released050.leaseId, current.leaseId);
+    assert.deepEqual(released050.itemIds.sort(), [gapId, namedId].sort());
+    const after050 = new Database(ledgerPath, { readonly: true });
+    try { assert.deepEqual(readSealed(after050), sealedBefore); } finally { after050.close(); }
+    completion.check("rollback-reader-0.7.50-preserves-usage-after-lease-expiry");
+
+    const stock = await leaseWithReader(old049, "0.7.49", baseMs + 424_000, false);
+    assert.notEqual(stock.leaseId, released050.leaseId);
     assert.deepEqual(stock.itemIds.sort(), [gapId, namedId].sort());
     const after049 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after049), sealedBefore); } finally { after049.close(); }
     completion.check("rollback-reader-0.7.49-preserves-usage-after-lease-expiry");
 
-    const first = await leaseWithReader(old048, "0.7.48", baseMs + 424_000, false);
+    const first = await leaseWithReader(old048, "0.7.48", baseMs + 545_000, false);
+    assert.notEqual(first.leaseId, stock.leaseId);
     assert.deepEqual(first.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.48-preserves-usage");
 
     const after048 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after048), sealedBefore); } finally { after048.close(); }
 
-    const second = await leaseWithReader(old047, "0.7.47", baseMs + 545_000, true);
+    const second = await leaseWithReader(old047, "0.7.47", baseMs + 666_000, true);
+    assert.notEqual(second.leaseId, first.leaseId);
     assert.deepEqual(second.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.47-preserves-usage");
 
@@ -384,7 +400,9 @@ async function main() {
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
-      readers: [`scanner-head-${currentVersion}`, "stock-0.7.49", "main-0.7.48", "0.7.47"],
+      readers: [`scanner-head-${currentVersion}`, "released-0.7.50", "stock-0.7.49", "main-0.7.48", "0.7.47"],
+      readerLeaseOffsetsMs: [182_000, 303_000, 424_000, 545_000, 666_000],
+      released050Commit,
       stagedRollback: { writerCommit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
         previousReaderCommit, previousReaderLabel, recordedTierWriter, sameLedger: true, leaseExpired: true,
         locallyDead: 0, acknowledged: 3 },
@@ -395,6 +413,7 @@ async function main() {
     completion.complete();
   } finally {
     if (writerTree) closeQuietly(writerTree);
+    if (old050) closeQuietly(old050);
     if (old049) closeQuietly(old049);
     if (old048) closeQuietly(old048);
     if (old047) closeQuietly(old047);

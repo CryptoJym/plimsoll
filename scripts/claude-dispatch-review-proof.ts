@@ -87,13 +87,15 @@ const roots = Array.from({ length: 23 }, (_, index) => ({
 const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-index",
   uploadUrl: "http://127.0.0.1:1/unused", captureRoots: roots });
 const configFile = path.join(plimsoll, "collector.config.json");
-fs.writeFileSync(configFile, `${JSON.stringify(config)}\n`);
+fs.writeFileSync(configFile, `${JSON.stringify(config)}\n`, { mode: 0o600 });
+// The private reader uses bounded descriptor reads, so count image opens
+// rather than the former pathname-based readFileSync implementation.
 let configReads = 0;
-const originalRead = fs.readFileSync;
-fs.readFileSync = ((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+const originalOpen = fs.openSync;
+fs.openSync = ((file: fs.PathLike, ...args: unknown[]) => {
   if (file === configFile) configReads += 1;
-  return (originalRead as (...readArgs: unknown[]) => unknown)(file, ...args);
-}) as typeof fs.readFileSync;
+  return (originalOpen as (...openArgs: unknown[]) => unknown)(file, ...args);
+}) as typeof fs.openSync;
 try {
   const snapshot = currentDispatchBindingSnapshot();
   assert.equal(configReads, 1);
@@ -114,7 +116,7 @@ try {
   const changed = structuredClone(config);
   changed.captureRoots![0].dispatch![999].workItemId = "beads:eco-6hoxj.165.98";
   const replacement = `${configFile}.next`;
-  fs.writeFileSync(replacement, `${JSON.stringify(changed)}\n`);
+  fs.writeFileSync(replacement, `${JSON.stringify(changed)}\n`, { mode: 0o600 });
   fs.renameSync(replacement, configFile);
   const next = currentDispatchBindingSnapshot();
   assert.notStrictEqual(next, snapshot, "next batch did not observe config replacement");
@@ -126,6 +128,6 @@ try {
     repeatedEvents: 100, configReads, configUpdateVisibleNextBatch: true }));
   proof.check("indexed_hot_path_is_bounded_and_refreshes_on_next_batch");
 } finally {
-  fs.readFileSync = originalRead;
+  fs.openSync = originalOpen;
 }
 proof.complete();
