@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -58,9 +59,18 @@ function prepareNamedUsageRollbackFixture() {
   try {
     for(const [id,named]of [['00000000-0000-4000-8000-000000000901',true],['00000000-0000-4000-8000-000000000902',false]] as const)
       buffer.append(aiInteractionEventSchema.parse({id,sessionId:'00000000-0000-4000-8000-000000000911',source:'codex',dataMode:'metadata',
-        eventType:'assistant_response',observedAt:base.toISOString(),...(named?{model:'gpt-6.1-sol',inputTokens:19,outputTokens:2}:{}),metadata:named?{}:{usageSource:'capture_gap'}}));
+        eventType:'assistant_response',observedAt:base.toISOString(),...(named?{model:'gpt-6.1-sol',inputTokens:19,outputTokens:2}:{}),// A bare normalized model could be a proximity guess. This producer
+        // records its own native request model in a unique trace.
+        metadata:named?{'gen_ai.request.model':'gpt-6.1-sol',
+          traceId:crypto.createHash('sha256').update(`dispatch-named-fixture:${id}`).digest('hex').slice(0,32)}
+          :{usageSource:'capture_gap'}}));
     const lease=buffer.delivery.lease({now:new Date(base.getTime()+61000)});
     if(lease.items.length!==2||lease.locallyDead!==0)throw new Error('bridge named usage fixture failed to seal');
+    const named=lease.items.find(item=>item.deliveryId==='00000000-0000-4000-8000-000000000901')?.envelope.event;
+    const gap=lease.items.find(item=>item.deliveryId==='00000000-0000-4000-8000-000000000902')?.envelope.event;
+    assert.equal(named?.model,'gpt-6.1-sol');assert.equal(named?.inputTokens,19);assert.equal(named?.outputTokens,2);
+    assert.equal(gap?.model,undefined);assert.equal(gap?.inputTokens,undefined);assert.equal(gap?.outputTokens,undefined);
+    assert.equal(gap?.metadata.usageSource,'capture_gap');
     const sealed=buffer.database.prepare('select delivery_id as id,sealed_envelope_json as sealed from upload_outbox order by delivery_id').all();
     sealedSha256=crypto.createHash('sha256').update(JSON.stringify(sealed)).digest('hex');
   } finally {buffer.close();}
