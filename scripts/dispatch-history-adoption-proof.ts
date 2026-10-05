@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import childProcess, { spawnSync } from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { collectorConfigSchema,collectorConfigPath,readCollectorConfig,
   mutateCollectorConfigTransactionally,writeCollectorConfigTransactionally,rollbackCollectorDispatchHistory,
   reconcileCloudDeviceIdFromIngest } from '../packages/collector-cli/src/config';
@@ -50,12 +50,12 @@ const records:Array<{name:string;elapsedMs:number}>=[];
 async function check(name:string,run:()=>unknown|Promise<unknown>){const start=performance.now();await run();records.push({name,elapsedMs:performance.now()-start});completion.check(name);}
 const qualify=<T>(run:()=>T)=>withDispatchHistoryAdoption(dispatchHistoryAdoptionFixture,run);
 const fresh=()=>bindDispatch(flags(binding(20000)),NOW);
-const readerDriver=`const fs=require('node:fs'),path=require('node:path'),Module=require('node:module');const body=fs.readFileSync(0);let at=20;const chunks=[0,1,2,3].map(i=>{const n=body.readUInt32BE(4+i*4),v=body.subarray(at,at+n);at+=n;return v;});const meta=JSON.parse(chunks[0].toString());const filename=path.join(process.cwd(),'bridge-reader.cjs');const mod=new Module(filename);mod.filename=filename;mod.paths=Module._nodeModulePaths(process.cwd());mod._compile(chunks[1].toString('utf8'),filename);process.stdout.write(JSON.stringify(mod.exports.readRollbackSnapshot({profile:chunks[2],image:chunks[3],scratchRoot:meta.scratchRoot,events:meta.events})));`;
-function reopen(profile:Buffer,image:Buffer,events?:any[]){
+const readerDriver=`const fs=require('node:fs'),path=require('node:path'),Module=require('node:module');const body=fs.readFileSync(0);let at=20;const chunks=[0,1,2,3].map(i=>{const n=body.readUInt32BE(4+i*4),v=body.subarray(at,at+n);at+=n;return v;});const meta=JSON.parse(chunks[0].toString());const filename=path.join(process.cwd(),'bridge-reader.cjs');const mod=new Module(filename);mod.filename=filename;mod.paths=Module._nodeModulePaths(process.cwd());const dependencyRequire=Module.createRequire(filename),sqlitePackage=fs.realpathSync(dependencyRequire.resolve('better-sqlite3/package.json')),sqliteEntry=fs.realpathSync(Module.createRequire(sqlitePackage).resolve('better-sqlite3')),originalRequire=mod.require.bind(mod);mod.require=specifier=>specifier==='better-sqlite3'?dependencyRequire(sqliteEntry):originalRequire(specifier);mod._compile(chunks[1].toString('utf8'),filename);process.stdout.write(JSON.stringify(mod.exports.readRollbackSnapshot({profile:chunks[2],image:chunks[3],scratchRoot:meta.scratchRoot,events:meta.events})));`;
+function reopen(profile:Buffer,image:Buffer,events?:any[],dependencyDirectory=path.resolve('packages/collector-cli')){
   const artifact=fs.readFileSync(path.resolve('scripts/fixtures/dispatch-history-bridge-reader-7f53dd8e.cjs'));
   assert.equal(sha(artifact),DISPATCH_HISTORY_ROLLBACK_READER.artifactSha256);
   const chunks=[Buffer.from(JSON.stringify({scratchRoot:process.env.TMPDIR!,events})),artifact,profile,image],header=Buffer.alloc(20);header.write('DHB2');chunks.forEach((bytes,i)=>header.writeUInt32BE(bytes.length,4+i*4));
-  const started=performance.now(),child=spawnSync(process.execPath,['--eval',readerDriver],{cwd:path.resolve('packages/collector-cli'),
+  const started=performance.now(),child=spawnSync(process.execPath,['--eval',readerDriver],{cwd:dependencyDirectory,
     input:Buffer.concat([header,...chunks]),
     encoding:'utf8',timeout:5000,maxBuffer:16*1024*1024,env:{HOME:process.env.TMPDIR,TMPDIR:process.env.TMPDIR,LANG:'en_US.UTF-8',TZ:'UTC'}});
   assert.equal(child.status,0,child.stderr);assert.equal(child.error,undefined);
@@ -125,6 +125,25 @@ async function main(){
   await check('normal-legacy-bind-does-not-impose-an-unused-history-custody-byte-bound',()=>{fixture([binding(945,true)]);const stored=JSON.parse(bytes().toString());stored.captureRoots[0].directory='/'+ 'x'.repeat(9000);fs.writeFileSync(collectorConfigPath(),JSON.stringify(stored),{mode:0o600});const result=fresh();assert.equal(result.archived,0);assert.equal(currentDispatchCaptureRoots()[0].dispatch!.length,2);assert.equal(currentDispatchCaptureRoots()[0].dispatchHistory,undefined);});
   await check('unqualified-exact-idempotent-bind-at-mixed-cap-needs-no-adoption',()=>{fixture(mixed());bindDispatch(flags(binding(1)),NOW);const r=currentDispatchCaptureRoots()[0];assert.equal(r.dispatch!.length,1000);assert.equal(r.dispatchHistory,undefined);for(const b of mixed())assert.ok(r.dispatch!.some(v=>JSON.stringify(v)===JSON.stringify(b)));});
   await check('1000-all-open-unknown-still-refuses-with-qualified-reader',()=>{const f=fixture(Array.from({length:1000},(_,i)=>binding(i)));refusal(f.home,()=>qualify(fresh),/dispatch_binding_capacity_exceeded/);});
+  await check('cold-synthetic-reader-resolves-transitive-native-dependencies-through-a-physical-package-entry',()=>{
+    fixture([binding(945,true)]);qualify(fresh);
+    const profile=bytes(),root=currentDispatchCaptureRoots()[0],ref=root.dispatchHistory!;
+    const image=fs.readFileSync(path.join(process.env.PLIMSOLL_HOME!,'dispatch-binding-history',ref.sha256+'.sqlite'));
+    // This executable cold-reader fixture retains the installed dependency
+    // bytes and gives the synthetic Module only a pnpm-style package symlink.
+    const directory=path.join(process.env.PLIMSOLL_PROOF_ROOT!,'cold-reader-symlink-layout');
+    fs.mkdirSync(path.join(directory,'node_modules'),{recursive:true,mode:0o700});
+    const pkg=createRequire(import.meta.url).resolve('better-sqlite3/package.json');
+    fs.symlinkSync(path.dirname(fs.realpathSync(pkg)),path.join(directory,'node_modules/better-sqlite3'),'dir');
+    const events=[binding(945,true),binding(20000)].map(b=>({source:'codex',sessionId:b.sessionId,
+      observedAt:b.validUntil?'2026-10-01T00:00:00.000Z':NOW.toISOString(),rootId:root.rootId}));
+    const {result}=reopen(profile,image,events,directory);
+    assert.equal(result.sourceCommit,DISPATCH_HISTORY_ROLLBACK_READER.sourceCommit);
+    assert.equal(result.profileSha256,sha(profile));assert.equal(result.imageSha256,sha(image));
+    assert.equal(result.roots.length,1);assert.equal(result.roots[0].rootDigest,captureRootDigest(root));
+    assert.equal(result.roots[0].hot,1);assert.equal(result.roots[0].historical,1);assert.equal(result.roots[0].total,2);
+    assert.deepEqual(result.events.map((event:any)=>event.binding),[binding(945,true),binding(20000)]);
+  });
   let retainedProfile:Buffer,retainedImage:Buffer,qualifiedContract:unknown;
   await check('future-source-pair-with-real-frozen-bridge-reader-admits-new-binding-under-5s',()=>{
     fixture(mixed(),25);const started=performance.now();

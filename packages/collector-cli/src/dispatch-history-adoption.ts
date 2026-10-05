@@ -178,7 +178,14 @@ const READER_DRIVER = `try { const fs=require('node:fs'),path=require('node:path
 const bytes=fs.readFileSync(0);if(bytes.length>96*1024*1024||bytes.length<24||bytes.subarray(0,4).toString()!=='DHB2')throw Error('reader_input_bound');
 const lengths=[0,1,2,3,4].map(i=>bytes.readUInt32BE(4+i*4));if(lengths.reduce((a,b)=>a+b,24)!==bytes.length||lengths[0]>65536||lengths[1]>2*1024*1024||lengths.slice(2).some(n=>n>32*1024*1024))throw Error('reader_input_bound');
 let at=24;const views=lengths.map(n=>{const v=bytes.subarray(at,at+n);at+=n;return v;});const meta=JSON.parse(views[0].toString());
-const filename=path.join(process.cwd(),'dispatch-history-bridge-reader.cjs');const reader=new Module(filename);reader.filename=filename;reader.paths=Module._nodeModulePaths(process.cwd());reader._compile(views[1].toString('utf8'),filename);
+const filename=path.join(process.cwd(),'dispatch-history-bridge-reader.cjs');const reader=new Module(filename);reader.filename=filename;reader.paths=Module._nodeModulePaths(process.cwd());
+// A synthetic Module has no ordinary parent loader. Canonicalize only its
+// external SQLite entry so pnpm's transitive native dependencies resolve from
+// the physical package; execute the unchanged, already pinned probe bytes.
+const dependencyRequire=Module.createRequire(filename),sqlitePackage=fs.realpathSync(dependencyRequire.resolve('better-sqlite3/package.json'));
+const sqliteEntry=fs.realpathSync(Module.createRequire(sqlitePackage).resolve('better-sqlite3')),originalRequire=reader.require.bind(reader);
+reader.require=specifier=>specifier==='better-sqlite3'?dependencyRequire(sqliteEntry):originalRequire(specifier);
+reader._compile(views[1].toString('utf8'),filename);
 const result=reader.exports.readRollbackSnapshot({profile:views[2],image:views[3],scratchRoot:meta.scratchRoot,namedUsage:{...meta.namedUsage,ledger:views[4]}});
 const hashFile=file=>{const descriptor=fs.openSync(fs.realpathSync(file),fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);try{const stat=fs.fstatSync(descriptor);if(!stat.isFile()||stat.size>256*1024*1024)throw Error('runtime_byte_bound');const chunk=Buffer.alloc(65536),hash=crypto.createHash('sha256');let offset=0;while(offset<stat.size){const n=fs.readSync(descriptor,chunk,0,Math.min(chunk.length,stat.size-offset),offset);if(!n)throw Error('runtime_changed');hash.update(chunk.subarray(0,n));offset+=n;}return hash.digest('hex');}finally{fs.closeSync(descriptor);}};
 const pkgFile=Module.createRequire(filename).resolve('better-sqlite3/package.json'),native=path.join(path.dirname(pkgFile),'build/Release/better_sqlite3.node');
