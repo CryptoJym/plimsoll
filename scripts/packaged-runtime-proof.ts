@@ -16,7 +16,7 @@ const completion = createProofCompletion("packaged-runtime", 35);
  * silently. Every executed check runs against real files; nothing here
  * touches a loaded LaunchAgent, the operator home, or the network.
  */
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "./lib/proof-child-process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";

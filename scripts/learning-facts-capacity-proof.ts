@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

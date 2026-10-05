@@ -31,6 +31,10 @@ jobs:
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
+        with:
+          # One pnpm folder per runner: runners sharing a Mac user raced in the default
+          # ~/setup-pnpm (ENOTEMPTY, 'pnpm: command not found'; eco-6hoxj.165.179.2).
+          dest: ~/setup-pnpm-runners/${{ runner.name }}
 
       - uses: actions/setup-node@v4
         with:
@@ -243,6 +247,10 @@ jobs:
       - name: Prove doctor names producer processes older than their managed config
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:doctor-stale-producers
+
+      - name: Prove tsx IPC pipe collisions cannot block proof children
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:tsx-ipc-pipe
 
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -858,6 +866,13 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-budget
 
+      - name: Prove current-day Codex capture during a multi-GB scan backlog
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:codex-scan-backlog
+          pnpm proof:codex-scan-discovery
+          pnpm proof:collector-named-usage-rollback
+
       - name: Prove Grok usage capture from Grok's own usage files (eco-6hoxj.163.20)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:grok-usage
@@ -1384,6 +1399,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
+        with:
+          # One pnpm folder per runner: runners sharing a Mac user raced in the default
+          # ~/setup-pnpm (ENOTEMPTY, 'pnpm: command not found'; eco-6hoxj.165.179.2).
+          dest: ~/setup-pnpm-runners/${{ runner.name }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22.20.0

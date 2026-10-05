@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./lib/proof-child-process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";

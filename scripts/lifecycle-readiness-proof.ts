@@ -8,7 +8,7 @@
 // parsing paths are exercised, not simulated.
 
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "./lib/proof-child-process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
