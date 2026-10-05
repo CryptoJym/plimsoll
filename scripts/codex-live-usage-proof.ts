@@ -8,7 +8,7 @@ import { buildSync } from "esbuild";
 import Database from "better-sqlite3";
 import { createProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { collectorConfigSchema, saveCollectorConfig } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { loadOrCreateLocalIngestAuth, LOCAL_INGEST_AUTH_FILE } from "../packages/collector-cli/src/local-auth";
 import { provisionLiveProducer, authenticateLiveProducer, LIVE_BINDINGS_FILE, disableLiveProducer } from "../packages/collector-cli/src/codex-live-usage-auth";
@@ -55,6 +55,10 @@ async function fixture() {
       validFrom: epochStart, validUntil: null as string | null, evidenceRef: "work-evidence" }] };
   fs.mkdirSync(root.directory, { mode: 0o700 });
   const config = collectorConfigSchema.parse({ tenantId: workspaceId, deviceId, captureRoots: [root] });
+  // The live reader requires the authoritative private profile, including any
+  // fixture-owned binding changes made before the next observation.
+  const publishConfig = () => saveCollectorConfig(config);
+  publishConfig();
   const ordinary = loadOrCreateLocalIngestAuth(home);
   const localAuthBefore = fs.readFileSync(path.join(home, LOCAL_INGEST_AUTH_FILE));
   const enroll = (producerId = baseline.producerId, credentialId = baseline.credentialId) => {
@@ -69,7 +73,12 @@ async function fixture() {
   const start = async () => { await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); port = (server.address() as AddressInfo).port; };
   await start();
   const headers = (producerId = baseline.producerId, value = token) => ({ "x-plimsoll-producer-id": producerId, "x-plimsoll-token": value });
-  const send = (packet: unknown, extra: Record<string, string | string[]> = {}) => request(port, canonicalJson(packet), { ...headers(), ...extra });
+  const send = (packet: unknown, extra: Record<string, string | string[]> = {}) => {
+    // Invalid runtime inputs still exercise HTTP admission; they cannot be
+    // published as the authoritative profile by the production writer.
+    if (collectorConfigSchema.safeParse(config).success) publishConfig();
+    return request(port, canonicalJson(packet), { ...headers(), ...extra });
+  };
   const count = (table: string) => (buffer.database.prepare(`select count(*) n from ${table}`).get() as {n:number}).n;
   const checkpoint = () => { const row = buffer.database.prepare("select checkpoint_json from codex_live_attachments where checkpoint_json is not null limit 1").get() as any; return row ? JSON.parse(row.checkpoint_json) : null; };
   const events = () => buffer.database.prepare("select payload_json from buffered_events order by rowid").all().map((r: any) => JSON.parse(r.payload_json));

@@ -14,7 +14,7 @@ import { createProofCompletion } from "./lib/proof-completion";
 
 const home=process.env.HOME!,plimsoll=process.env.PLIMSOLL_HOME!;
 const now=Date.now(),observedAt=new Date(now-1_000).toISOString();
-fs.mkdirSync(plimsoll,{recursive:true});
+fs.mkdirSync(plimsoll,{recursive:true,mode:0o700});
 function setup(label:string,missingRoot=false) {
   const sessionId=crypto.randomUUID();
   const A={rootId:`a-${label}`,profileId:`profile-a-${label}`,
@@ -23,8 +23,8 @@ function setup(label:string,missingRoot=false) {
   const B={rootId:`b-${label}`,profileId:`profile-b-${label}`,
     installationEpochId:fixtureEpochId(`epoch-b-${label}`),source:"claude_code" as const,
     directory:path.join(home,`b-${label}`,"projects")};
-  fs.mkdirSync(A.directory,{recursive:true});
-  if(!missingRoot) fs.mkdirSync(B.directory,{recursive:true});
+  fs.mkdirSync(A.directory,{recursive:true,mode:0o700});
+  if(!missingRoot) fs.mkdirSync(B.directory,{recursive:true,mode:0o700});
   const binding=dispatchBindingSchema.parse({sessionId,workItemId:"beads:eco-6hoxj.165.97",
     projectKey:`sha256:${"a".repeat(64)}`,companyRef:null,
     attemptId:crypto.randomUUID(),parentAttemptId:null,acceptedOutcomeId:null,
@@ -33,7 +33,7 @@ function setup(label:string,missingRoot=false) {
   const config=collectorConfigSchema.parse({deviceId:`dev-${label}`,
     uploadUrl:"http://127.0.0.1:1/unused",captureRoots:[{...A,dispatch:[binding]},B]});
   const configFile=path.join(plimsoll,"collector.config.json");
-  fs.writeFileSync(`${configFile}.next`,JSON.stringify(config)+"\n");
+  fs.writeFileSync(`${configFile}.next`,JSON.stringify(config)+"\n",{mode:0o600});
   fs.renameSync(`${configFile}.next`,configFile);
   const file=path.join(plimsoll,`${label}.sqlite`);
   const options={

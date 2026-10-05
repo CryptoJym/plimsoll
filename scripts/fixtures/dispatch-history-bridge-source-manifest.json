@@ -1,0 +1,508 @@
+{
+  "identity": {
+    "sourceCommit": "7f53dd8e1b08b369d95b7471692bb0d83adefd92",
+    "sourceTree": "b6f2df6668d56b9eddd7814b6141bd1a478afdef",
+    "artifactSha256": "3ce6b28122eb9cfd88de8389a798f5a951f8e77201d78cf03beb3342e956a9b8",
+    "artifactBytes": 960408,
+    "consumerSourceSha256": "acf519a3dfbd9af40aa78a40f00d267f0c71badce391327870885f489b9ff6b4",
+    "runtimeSha256": "bbfc9f6dc459566e7f489f86b8afec8b5c6052b3aaff266036e0f124f1cd37a3",
+    "runtimeBytes": 4141523,
+    "lockSha256": "5b07af7eac1bb338f36cd902a7ceb00ddfde64e722a9c2a60ac1fd69dc741a2e",
+    "nodeAbi": "127",
+    "collectorVersion": "0.7.48"
+  },
+  "inputs": [
+    {
+      "logicalPath": "packages/collector-cli/package.json",
+      "sha256": "2c9ceb8c0493b0604169d1dbcc9147396a2142fefbd5aa4380d1a29d0b12ed29",
+      "bytes": 721
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/account-assertion.ts",
+      "sha256": "b632a29af31c5d326d6bda2fe17e5221c16abc737fb987e8f8628a729ef4823d",
+      "bytes": 50303
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/automatic-capture-retry.ts",
+      "sha256": "80e77f9efe3b0f9a4ed2342510dbc1ee2fb5c716ffaabf453056d75f409abdf8",
+      "bytes": 1657
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/bounded-sql-read.ts",
+      "sha256": "ba26339b27da5f89113300198182bd3500eb07535bc7a33da2a4907f7feb583c",
+      "bytes": 1692
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/buffer.ts",
+      "sha256": "13341d52e826bd59f87674674100e403c1ada767ea1635421b3c900f510df6a4",
+      "bytes": 166228
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-baseline.ts",
+      "sha256": "be66da202e41494b422284afeff6c7b124ae2a5e5ae5bb5b00d1c0d04ef1c531",
+      "bytes": 82897
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-dead-letters.ts",
+      "sha256": "5c5b588a5e308c738f819d09fe0118aa02820af9910ef003bdcc88343fdd2b37",
+      "bytes": 4009
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-fairness.ts",
+      "sha256": "009d46a927f76776f274a73dceaccb451ca7c6ee49ab693523b25ccd1497707e",
+      "bytes": 4785
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-frontier.ts",
+      "sha256": "6d0ca884389b4f9ea7204976ca2f5fae8de8f0a419d6715b9890e1d646c4d7c2",
+      "bytes": 44097
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-history-handoff.ts",
+      "sha256": "fb97beb0d88aa0800e380c02de16a859ad1249187d55b54d6515df04929a6a3c",
+      "bytes": 1166
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-record-loss.ts",
+      "sha256": "52663ae823551f00d53784b0f028f4d95ba8e3f02c2297fc8c5c45684dedb4f0",
+      "bytes": 10617
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-revisit-queue.ts",
+      "sha256": "ef52e0e6634426c3d014405672116ba097df57d8fc154ba1cc5a43a04e4c5dae",
+      "bytes": 1226
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/capture-root-inventory.ts",
+      "sha256": "43ff315003469ea52ddee948f07b1436ebf67e61103e7b3a7b988d7c14a4983e",
+      "bytes": 62333
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/codex-live-usage-auth.ts",
+      "sha256": "500cb503c8b94353be2edb619fd0c7e2bc1caf7337be96256fc6355fe4b5db2e",
+      "bytes": 25769
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/codex-live-usage-ledger.ts",
+      "sha256": "32c0fe473a2612a0eb552e5351a041ccb057be2c1bb170c347f65765dd41362a",
+      "bytes": 22825
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/codex-live-usage-protocol.ts",
+      "sha256": "9a8150d94aa30921f7b06f92d52eb59ec6fde0b363056f88107ac267c8b80bea",
+      "bytes": 7231
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/codex-reconciliation.ts",
+      "sha256": "46285e2a0bb2ee222a536ec663cb818004d567cdebb43a1f8c3f9dd989394230",
+      "bytes": 37094
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/codex-usage-pairing.ts",
+      "sha256": "c630830959e6068ad7117ab07e72dce099c73297ec1e36994ca7a46cb2e54f40",
+      "bytes": 22408
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/collector-home.ts",
+      "sha256": "676e22487e51217e31fc3dcbb3384e8b51c7f4171f3bf01cc196f54b2eaa9cd4",
+      "bytes": 5446
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/collector-state-io.ts",
+      "sha256": "0f75c13e2665bb50f7ffdf9ee0941603fb2d1795a347c8ffb720f5a2b9351d99",
+      "bytes": 2804
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/config.ts",
+      "sha256": "0454ea17c13273b04a058b6552d68b2d7904ab01f45aca4644d97999b1403416",
+      "bytes": 24470
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/dashboard-projection.ts",
+      "sha256": "ba2bb7a8a9728102d3999c4d1e87beece67de36ac8087db7ae393279475726ff",
+      "bytes": 252193
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/delivery-ack.ts",
+      "sha256": "2b9bbb6d240205fae74b15a0a72ed2da66a01d8dcf00074987c97d0a067d8cc0",
+      "bytes": 6605
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/delivery-id.ts",
+      "sha256": "1baed2372b76d9e5529e436218af6affc31fc0bfe827ff8cf6f24fba6196e942",
+      "bytes": 1987
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/delivery-post.ts",
+      "sha256": "4dd4b22b2c95d51728ca887bee3a8d75e0aea488bf65c032bf1f0b3ee503d922",
+      "bytes": 981
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/dispatch-binding-index.ts",
+      "sha256": "45ce727411211501ea5b138ed676c34337c96cb71999cf8c47ff541008c36e56",
+      "bytes": 31240
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/dispatch-binding-lifecycle.ts",
+      "sha256": "8d48791d3b922f704a0c4445b50bdacae1daef530ee9242c552c779f4b27ed10",
+      "bytes": 2626
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/dispatch-history-adoption.ts",
+      "sha256": "9a3c8060ceb7c72ff4586eaba686ed07901b90979c3b30f43f9d8295eabf4fe2",
+      "bytes": 13596
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/fresh-ledger-cutover.ts",
+      "sha256": "7b3806960403eb4f8a264c9bc30b997246d91eae689b41d8d80c0a6f1ef72eab",
+      "bytes": 82815
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/git-context.ts",
+      "sha256": "90455ab531d63287c9716c485f709856648170a9c9bfecc0bdcf6c5612943c5f",
+      "bytes": 7898
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/history-coverage.ts",
+      "sha256": "0ad37a6ed04b709831ff520c373ea3cb77c6821fb729d76117a68c4020284e86",
+      "bytes": 29326
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/hook-authority.ts",
+      "sha256": "416d500073673fc46264029c5b5ef95c83bc97803155d639ce6907c05b002b87",
+      "bytes": 5913
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/http-boundary.ts",
+      "sha256": "cdd9d6a874a7b6ff13523b5956e66ea9dbb643ca32e48cb9b0b06d55e1d53a0e",
+      "bytes": 22073
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/http-transport.ts",
+      "sha256": "d77e08ef64b6e9256fe713cb447ef35a6cee138e92331876ba19459b20a441c8",
+      "bytes": 14498
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/incremental-jsonl-discovery.ts",
+      "sha256": "2fe4d7a89c5616c30a4db1822134ef5556e44f172169034188781407c961841f",
+      "bytes": 14567
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/jsonl-byte-tailer.ts",
+      "sha256": "690d624616d1b3f18593df9a2e1965bf0770cd0f77aa34b71cac26e27806f605",
+      "bytes": 38942
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/jsonl-continuation.ts",
+      "sha256": "c540c000cfa785a98610bc5707eb042a00251a796bd6e9ddb5596d30382274b1",
+      "bytes": 37705
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/learning-facts.ts",
+      "sha256": "543eac575972e4b9a43cbabd0cadc0101e705b1fd4218ec611c0d067fc4efaf7",
+      "bytes": 73098
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/ledger-connection.ts",
+      "sha256": "90e15941033ef7608605efdabea780046b6ace38aab2e7e47922218fbbdf0f8d",
+      "bytes": 16591
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/ledger-open-handles.ts",
+      "sha256": "1f92eaaccb8fdf7066b62c9a8c619d464dabcddac8729fedbde17a5d559cd3b2",
+      "bytes": 2224
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/lifecycle-authority.ts",
+      "sha256": "027f23e22596365e0f7ae9913a81c2f498383520117b282e588db4927ca02815",
+      "bytes": 21925
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/local-auth.ts",
+      "sha256": "22cf26f079d06b386ced1d8e511fe1c3913e8da277b8bb01492401cf969a45ec",
+      "bytes": 24638
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/local-identity.ts",
+      "sha256": "4db9fd59062ddc77b94c5bcd2eebc30f7bb6357377e43bd80d7660e74884de7e",
+      "bytes": 13927
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/maintenance-progress.ts",
+      "sha256": "e83d539de07adf799998244b529682749aebaef39be3f90727e9ae84ae77fa43",
+      "bytes": 788
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/normalizer.ts",
+      "sha256": "5b0cf31dfef6b4a4df221f17c65e02b208d6531f942cb86f2e3d038c0a867dfe",
+      "bytes": 23255
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/outbound-envelope.ts",
+      "sha256": "99a293da6e34cc3d3e8c2fa29fac5c3964497e8f28e7d199643b5b89e1ef4a3c",
+      "bytes": 14235
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/outbox.ts",
+      "sha256": "b33e651b17b59d37000a575c3f71ba773431e24db27ded527684fc49d740fe8a",
+      "bytes": 143380
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/oversized-continuity.mjs",
+      "sha256": "e19fd7d8baa059428548dd7107c5a7402171d1ef81dba460331baf8dd2173f7a",
+      "bytes": 3407
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/oversized-extractor.mjs",
+      "sha256": "7e68ce38c977af483f0815b775ba0989170a6380f96de3a9679fdcf576f345c8",
+      "bytes": 13471
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/plan-limit-observation.ts",
+      "sha256": "cde76c2b5078784af40450e8651265145895f8e7ed2993f2c5ea4927a4fd7ba9",
+      "bytes": 6371
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/privacy-disposition.ts",
+      "sha256": "4dc184a4e3675dfd848344ba0411419acb64e9e053bdfe07f091aaa7d44cfc5d",
+      "bytes": 6142
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/projection-validity.ts",
+      "sha256": "e8302180b01b0fcc9cef6c34eba55815799a481e02943e000ed9fd281dad6535",
+      "bytes": 1221
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/repo-context-link-dispositions.ts",
+      "sha256": "6e941221f35f61d5962b7f015fcf06d27dcc1c68fb4a71a9c8b502a3744419d5",
+      "bytes": 10268
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/repo-context.ts",
+      "sha256": "9e95cd4c76915e0c71f682116546e2e88d88ccd83c8447777546f93d597d4301",
+      "bytes": 10872
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/retention-hold-count.ts",
+      "sha256": "6b9b5e8d3594ce3ba59cff469f05bffbb04055153f3ce4624c3ad129975f29c4",
+      "bytes": 2460
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/rollout-tailer.ts",
+      "sha256": "5fd3cff954a096b30b3e2768131e7c11d8909d26ed98005cec7b19a2c229b236",
+      "bytes": 88161
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/runtime-fact-drops.ts",
+      "sha256": "5bebc1e257591361d344c6f0517658d291fa00365c91faa7575901224cde808d",
+      "bytes": 1733
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/runtime-facts.ts",
+      "sha256": "51633654b7c920f34867bc2ef1b37b2bc321ac226f9472443c94cdf785258e9f",
+      "bytes": 11348
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/safe-file-read.ts",
+      "sha256": "fb3785c37d2d7ad97169ef0c6be27dc5954e33e14a3221f830870ee5107f66c5",
+      "bytes": 4284
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/session-attribution.ts",
+      "sha256": "bdf1f28029d436672e05b23722efd7aeb876a85bb9bbd20a54e40c13fda72787",
+      "bytes": 23899
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/session-context-index.ts",
+      "sha256": "9436103635b400cd700de5f7f451cbb34807a74d564168ac6ae6ed2460fe3f5a",
+      "bytes": 30188
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/session-summary.ts",
+      "sha256": "b81050fd69f6636342ad4c20800aed762f907254a06abd235e88d110e0666b42",
+      "bytes": 104040
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/sqlite-contention.ts",
+      "sha256": "7e3e5043c7298059b47c02561ff084f9cb49c015a8f97f9c72cb2578b65a673d",
+      "bytes": 3772
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/transcript-tailer.ts",
+      "sha256": "9118c9436dc0b0f5608d6c28afa3f2fa27046192463545aba90378381a8861ba",
+      "bytes": 83682
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/upload-history.ts",
+      "sha256": "e8d8a627dab38981ef6022f475a5b7c97eca3bcfe1f585f8d1baaf0883f4420e",
+      "bytes": 50642
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/version.ts",
+      "sha256": "8d376410156608ebbe29fa010a20e604c3b8adc993e861aa3b5c9905290972c6",
+      "bytes": 344
+    },
+    {
+      "logicalPath": "packages/collector-cli/src/weekly-tool-stats.ts",
+      "sha256": "667b311066f09220f59acc169d9b3cd878b18234bb1b674fe7f77b4f8c8af223",
+      "bytes": 12113
+    },
+    {
+      "logicalPath": "packages/shared/src/analytical-metadata.ts",
+      "sha256": "952e77cca882a07071c8af82ec8b07d5cc71dcf55efbe72d8621f4040ef07062",
+      "bytes": 26237
+    },
+    {
+      "logicalPath": "packages/shared/src/capacity.ts",
+      "sha256": "cff3091bdad4cd5fe2b14198fb31ce2159b39a88e21c2920f0daf26a6a652a5d",
+      "bytes": 37037
+    },
+    {
+      "logicalPath": "packages/shared/src/device-registry.ts",
+      "sha256": "38a62dbfc4536ce58eb2c956e0a6980168248306ad05ff9e001cff01023f82a0",
+      "bytes": 13981
+    },
+    {
+      "logicalPath": "packages/shared/src/economics/event-adapter.ts",
+      "sha256": "5507d97e8e774405f965ca792e5f5c1101fcfc57309fdf5b6bab39caa47dfa64",
+      "bytes": 3493
+    },
+    {
+      "logicalPath": "packages/shared/src/economics/validation.ts",
+      "sha256": "f58190dea9d2d3fd3212b100336fe27119e9e72d6624ee3cd694a081339a6974",
+      "bytes": 1666
+    },
+    {
+      "logicalPath": "packages/shared/src/fleet-operations.ts",
+      "sha256": "ae08d254dcdd2ad18e656115baeed77fd90e93ddfc005a60435c6e2251afd3a2",
+      "bytes": 27165
+    },
+    {
+      "logicalPath": "packages/shared/src/index.ts",
+      "sha256": "d3a220e2cff2c315dd08f6211a627e53147532e9d017f14201a1bdd9248cf549",
+      "bytes": 1057
+    },
+    {
+      "logicalPath": "packages/shared/src/lane-receipts.ts",
+      "sha256": "838dda4b0eb7fcd19cab3566ce8e2fb4792ad759d58a27ee59186fff17bfa007",
+      "bytes": 26333
+    },
+    {
+      "logicalPath": "packages/shared/src/learning-evidence.ts",
+      "sha256": "007e1e78ae0d47caeafb8d1ebb6b98dc1901046b6582412381a9dd5f1f10496e",
+      "bytes": 53649
+    },
+    {
+      "logicalPath": "packages/shared/src/learning-fact-identity.ts",
+      "sha256": "2ecdece5a6f49a2f38db0a372af8ad324c5efea988984a1451992a94e0960bc9",
+      "bytes": 1980
+    },
+    {
+      "logicalPath": "packages/shared/src/linkage.ts",
+      "sha256": "1b3efa286858a57097f01fbacc4a75f1b65eca03fe7b7920fcdba767d6ff1192",
+      "bytes": 2274
+    },
+    {
+      "logicalPath": "packages/shared/src/live-usage-metadata.ts",
+      "sha256": "6355dda3dbf581a3df5bca1b607dfbb0f65d207284faebf5a50c210bf1ffeff7",
+      "bytes": 4137
+    },
+    {
+      "logicalPath": "packages/shared/src/metric-registry.ts",
+      "sha256": "699045a7dfbaa0fe360ce34310ccde380a73a38eaf013ba672a15f952cfc4cab",
+      "bytes": 60485
+    },
+    {
+      "logicalPath": "packages/shared/src/outcome-timeline.ts",
+      "sha256": "aedbffe0837c1abf8d61719ec4d57ffe0f290522f0ae1657dc61a310f5edba8d",
+      "bytes": 17600
+    },
+    {
+      "logicalPath": "packages/shared/src/policy.ts",
+      "sha256": "f74af925aa3610e464f382a55fd6cc3598a44a8848569b01cee21a0392629876",
+      "bytes": 8058
+    },
+    {
+      "logicalPath": "packages/shared/src/pricing.ts",
+      "sha256": "3098aa2c8694856e7490ec2938c732de79b7628ad81dd8b2ced2b9bc9a5f7b48",
+      "bytes": 5526
+    },
+    {
+      "logicalPath": "packages/shared/src/provider-capacity-snapshot.ts",
+      "sha256": "f2256f5bd349ed69f3ce92720b2f2e341919dda7eeb7585d1fb70a8fb26af211",
+      "bytes": 22694
+    },
+    {
+      "logicalPath": "packages/shared/src/release-qualification.ts",
+      "sha256": "e3a78aaeaa7743ab67cdd3b5cebba97107bde496e63e0310e1558b4e2701fd23",
+      "bytes": 33965
+    },
+    {
+      "logicalPath": "packages/shared/src/schemas.ts",
+      "sha256": "7b6b05ee4f2ea2014a959a9a98116e2c8fb6da122bc6ddb2230c68e8ddbbb0b5",
+      "bytes": 38221
+    },
+    {
+      "logicalPath": "packages/shared/src/suppression-receipt.ts",
+      "sha256": "68e77325bbd916b4bafb68991d673ae8ec70de66fb91938c0389835d94be363a",
+      "bytes": 4099
+    },
+    {
+      "logicalPath": "scripts/fixtures/dispatch-history-bridge-reader-entry.ts",
+      "sha256": "0638ae2a33026769d970e0223f84a4bbd10fe878ba82a9e1e2fb769b5bb00d3d",
+      "bytes": 7335
+    }
+  ],
+  "runtimeManifest": {
+    "schema": "plimsoll.packaged-runtime.v1",
+    "status": "built",
+    "artifact": {
+      "name": "cli.mjs",
+      "bytes": 4141523,
+      "sha256": "bbfc9f6dc459566e7f489f86b8afec8b5c6052b3aaff266036e0f124f1cd37a3"
+    },
+    "companions": [
+      {
+        "name": "dashboard.html",
+        "sha256": "a0990a4e423ca6b063cbe6eb337fc32fb52ae1095a5fe720c722c161fe204525",
+        "bytes": 65479
+      }
+    ],
+    "package": {
+      "name": "@plimsoll/cli",
+      "version": "0.7.48"
+    },
+    "source": {
+      "commit": "7f53dd8e1b08b369d95b7471692bb0d83adefd92",
+      "dirty": false,
+      "entrypoint": "packages/collector-cli/src/cli.ts"
+    },
+    "nodeCompatibility": {
+      "engines": ">=20 <25",
+      "buildTarget": "node20",
+      "runtime": {
+        "node": "22.22.3",
+        "abi": "127",
+        "platform": "darwin",
+        "arch": "arm64"
+      }
+    },
+    "provenance": {
+      "builder": "scripts/build-packaged-runtime.ts",
+      "bundler": {
+        "name": "esbuild",
+        "version": "0.28.0"
+      },
+      "bundle": true,
+      "format": "esm",
+      "platform": "darwin-arm64",
+      "external": [
+        "better-sqlite3"
+      ],
+      "builtAt": "2026-10-04T13:12:08.000Z",
+      "sourceDateEpoch": 1791119528,
+      "lockSha256": "5b07af7eac1bb338f36cd902a7ceb00ddfde64e722a9c2a60ac1fd69dc741a2e",
+      "inputsSha256": "b699c426715f24418a3553d321e294f252a9ce6568ba3d79767c6c3f431270da"
+    }
+  }
+}

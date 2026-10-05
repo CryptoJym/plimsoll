@@ -20,9 +20,9 @@ async function main() {
   const B={rootId:"claude-b",profileId:"profile-b",installationEpochId:fixtureEpochId("epoch-b"),
     source:"claude_code" as const,directory:path.join(home,"claude-b","projects")};
   const project=path.join(B.directory,"-synthetic-project");
-  fs.mkdirSync(A.directory,{recursive:true});
-  fs.mkdirSync(project,{recursive:true});
-  fs.mkdirSync(plimsoll,{recursive:true});
+  fs.mkdirSync(A.directory,{recursive:true,mode:0o700});
+  fs.mkdirSync(project,{recursive:true,mode:0o700});
+  fs.mkdirSync(plimsoll,{recursive:true,mode:0o700});
   const file=path.join(project,`${sessionB}.jsonl`);
   fs.writeFileSync(file,JSON.stringify({type:"assistant",sessionId:sessionB,
     timestamp:new Date(now-1_000).toISOString(),message:{id:"message-b",
@@ -36,7 +36,7 @@ async function main() {
     validUntil:new Date(now+60_000).toISOString(),evidenceRef:"dispatch:r5-startup-eof"});
   const config=collectorConfigSchema.parse({deviceId:"dev-r5-startup-eof",
     uploadUrl:"http://127.0.0.1:1/unused",captureRoots:[{...A,dispatch:[binding]},B]});
-  fs.writeFileSync(path.join(plimsoll,"collector.config.json"),JSON.stringify(config)+"\n");
+  fs.writeFileSync(path.join(plimsoll,"collector.config.json"),JSON.stringify(config)+"\n",{mode:0o600});
   const buffer=new LocalEventBuffer(path.join(plimsoll,"startup-eof.sqlite"),{
     workspaceId:config.tenantId,deviceId:config.deviceId,
     enrollmentNow:()=>new Date(now-3_600_000),delivery:{enabled:true},databaseBusyTimeoutMs:0});

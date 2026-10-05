@@ -27,7 +27,7 @@ fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });
 fs.mkdirSync(plimsoll, { recursive: true, mode: 0o700 });
 const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-privacy",
   uploadUrl: "http://127.0.0.1:1/unused", captureRoots: [root] });
-fs.writeFileSync(path.join(plimsoll, "collector.config.json"), JSON.stringify(config) + "\n");
+fs.writeFileSync(path.join(plimsoll, "collector.config.json"), JSON.stringify(config) + "\n", { mode: 0o600 });
 const buffer = new LocalEventBuffer(path.join(plimsoll, "review-ledger.sqlite"), {
   workspaceId: config.tenantId, deviceId: config.deviceId,
   enrollmentNow: () => new Date(now - 3_600_000), delivery: { enabled: true },

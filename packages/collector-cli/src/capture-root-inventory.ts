@@ -7,6 +7,8 @@ import { accountAssertionContains, accountAssertionV1Schema, type AccountAsserti
 import type { CaptureBaselineFileObservation } from "./capture-baseline";
 import { resolveCollectorHome } from "./collector-home";
 import { workClassSchema, workComplexityBandSchema } from "../../shared/src/schemas";
+import { readPrivateStateFile, MAX_COLLECTOR_PROFILE_BYTES } from "./collector-state-io";
+import { DISPATCH_HISTORY_LIMITS, dispatchHistoryLookupStatus, dispatchHistoryPressure, dispatchHistoryRefSchema, historicalDispatchBindings } from "./dispatch-binding-index";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 export const namespacedWorkItemIdSchema=z.string().max(256).regex(
   /^(?:beads:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|github:(?:sha256:[a-f0-9]{64}|[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?)\/pull\/[1-9][0-9]*|jira:[A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/,
@@ -36,6 +38,8 @@ export const captureRootSchema=z.object({
   source: z.enum(["codex","claude_code"]),directory: z.string().min(1),
   /** Explicit enrollment attestation; no search of neighboring auth stores. */
   dispatch: z.array(dispatchBindingSchema).max(1000).optional(),
+  /** Immutable, generation-bound finite closed intervals; older readers reject this field. */
+  dispatchHistory: dispatchHistoryRefSchema.optional(),
   /** Legacy account rows remain accepted; new enrollments use the additive V1 contract. */
   account: z.union([legacyAccountSchema,accountAssertionV1Schema]).optional(),
   /** Immutable historical account windows hydrated from the maintenance key. */
@@ -65,6 +69,8 @@ export function validateCaptureRoots(input: unknown): CaptureRoot[] {
     if(!path.isAbsolute(root.directory))
       throw new Error("capture_root_requires_absolute_path");
     root.directory=path.resolve(root.directory);
+    if (root.dispatchHistory && root.dispatchHistory.rootDigest !== captureRootDigest(root))
+      throw new Error("dispatch_history_custody_mismatch");
     if(ids.has(root.rootId))
       throw new Error("capture_root_duplicate_id");
     ids.add(root.rootId);
@@ -156,8 +162,12 @@ export type DispatchBindingSnapshot = {
 };
 const dispatchIndexes = new WeakMap<readonly CaptureRoot[], DispatchBindingSnapshot>();
 function dispatchIndex(roots: readonly CaptureRoot[]): DispatchBindingSnapshot {
-  const cached = dispatchIndexes.get(roots);
-  if (cached) return cached;
+  const alreadyIndexed=dispatchIndexes.get(roots);
+  if(alreadyIndexed)return alreadyIndexed;
+  if(roots.length>64||new Set(roots.map(root=>root.rootId)).size!==roots.length||
+      roots.some(root=>(root.dispatch?.length??0)>1000))throw new Error("dispatch_inventory_bound_or_duplicate");
+  const immutable = Object.isFrozen(roots) && roots.every(root => Object.isFrozen(root) &&
+    (!root.dispatch || Object.isFrozen(root.dispatch) && root.dispatch.every(Object.isFrozen)));
   const byRootId = new Map<string, CaptureRoot>();
   const bySession = new Map<string, IndexedBinding[]>();
   const rootDigests = new Map<string,string>();
@@ -168,6 +178,9 @@ function dispatchIndex(roots: readonly CaptureRoot[]): DispatchBindingSnapshot {
     rootDigests.set(root.rootId,digest);
     if(root.source==="claude_code") claudeRootDigests.add(digest);
     for (const binding of root.dispatch ?? []) {
+      if(!Number.isFinite(Date.parse(binding.validFrom))||binding.validUntil!==null&&
+          (!Number.isFinite(Date.parse(binding.validUntil))||Date.parse(binding.validUntil)<=Date.parse(binding.validFrom)))
+        throw new Error("capture_dispatch_window_invalid");
       const key = `${root.source}\0${binding.sessionId}`;
       const entries = bySession.get(key) ?? [];
       entries.push({ root, binding, from: Date.parse(binding.validFrom),
@@ -177,12 +190,24 @@ function dispatchIndex(roots: readonly CaptureRoot[]): DispatchBindingSnapshot {
     }
   }
   const snapshot = { roots, byRootId, bySession, rootDigests, claudeRootDigests };
-  dispatchIndexes.set(roots, snapshot);
+  if (immutable) dispatchIndexes.set(roots, snapshot);
   return snapshot;
+}
+
+function sessionIndexedBindings(snapshot: DispatchBindingSnapshot, source: CaptureRoot["source"], sessionId: string) {
+  const hot=snapshot.bySession.get(`${source}\0${sessionId}`)??[];
+  if(hot.length>DISPATCH_HISTORY_LIMITS.queryRows)throw new Error("dispatch_binding_query_bound_exceeded");
+  const historical = historicalDispatchBindings(snapshot.roots, { source, sessionId }, dispatchBindingSchema.parse);
+  if(hot.length+historical.length>DISPATCH_HISTORY_LIMITS.queryRows)throw new Error("dispatch_binding_query_bound_exceeded");
+  return [...hot, ...historical.map(({ root, binding }) => ({
+    root: root as CaptureRoot, binding, from: Date.parse(binding.validFrom), until: Date.parse(binding.validUntil!),
+    signature: JSON.stringify(binding),
+  }))];
 }
 
 /** The CLI publishes config atomically; the daemon observes its new inode without a restart. */
 let dispatchConfigCache: { file: string; stamp: string; roots: CaptureRoot[] } | null = null;
+let dispatchInventoryFailure: string | null = null;
 let seenConfigFile: string | null = null;
 const seenClaudeSessionRoots = new Map<string, Set<string>>();
 export function currentDispatchCaptureRoots(): CaptureRoot[] {
@@ -192,19 +217,41 @@ export function currentDispatchCaptureRoots(): CaptureRoot[] {
     seenClaudeSessionRoots.clear();
   }
   try {
-    const stat=fs.statSync(file);
+    const stat=fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_COLLECTOR_PROFILE_BYTES ||
+        (stat.mode & 0o7077) !== 0 || (process.getuid && stat.uid !== process.getuid()))
+      throw new Error("dispatch_inventory_file_unsafe");
     const stamp=`${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
     if(dispatchConfigCache?.file===file&&dispatchConfigCache.stamp===stamp)
       return dispatchConfigCache.roots;
-    const parsed=JSON.parse(fs.readFileSync(file,"utf8")) as { captureRoots?: unknown };
+    const parsed=JSON.parse(readPrivateStateFile(file).toString("utf8")) as { captureRoots?: unknown };
     const roots=validateCaptureRoots(parsed.captureRoots??[]);
+    for (const root of roots) {
+      for (const binding of root.dispatch ?? []) Object.freeze(binding);
+      if (root.dispatch) Object.freeze(root.dispatch);
+      if (root.dispatchHistory) Object.freeze(root.dispatchHistory);
+      Object.freeze(root);
+    }
+    Object.freeze(roots);
     dispatchIndex(roots);
     dispatchConfigCache={file,stamp,roots};
+    dispatchInventoryFailure=null;
     return roots;
-  } catch {
+  } catch (error) {
     dispatchConfigCache=null;
+    dispatchInventoryFailure=error instanceof Error ? error.message : "dispatch_inventory_unavailable";
     return [];
   }
+}
+export function currentDispatchInventoryStatus() {
+  currentDispatchCaptureRoots();
+  return { state: dispatchInventoryFailure ? "unknown" : "ready", reason: dispatchInventoryFailure,
+    hotCapacityPerRoot: 1000, provenAvailable: dispatchInventoryFailure ? null : undefined };
+}
+export function currentDispatchPressure() {
+  const roots=currentDispatchCaptureRoots();
+  if(dispatchInventoryFailure)return {state:"unknown" as const,availableHot:null,reason:dispatchInventoryFailure};
+  return dispatchHistoryPressure(roots,dispatchBindingSchema.parse);
 }
 export function currentDispatchBindingSnapshot(): DispatchBindingSnapshot {
   return dispatchIndex(currentDispatchCaptureRoots());
@@ -213,18 +260,21 @@ export function currentDispatchRoot(root: CaptureRoot,snapshot=currentDispatchBi
   const candidate=snapshot.byRootId.get(root.rootId);
   const configured=candidate&&candidate.source===root.source&&candidate.profileId===root.profileId&&
     candidate.installationEpochId===root.installationEpochId&&candidate.directory===root.directory ? candidate : null;
-  return configured ? { ...root,dispatch: configured.dispatch }:root;
+  return configured ? { ...root,dispatch: configured.dispatch,dispatchHistory: configured.dispatchHistory }
+    : { ...root,dispatch: undefined,dispatchHistory: undefined };
 }
 function activeIndexedBindings(snapshot: DispatchBindingSnapshot,source: CaptureRoot["source"],
   sessionId: string,observedAt: string): readonly IndexedBinding[] {
   const at=Date.parse(observedAt);
-  return snapshot.bySession.get(`${source}\0${sessionId}`)?.filter(entry => at>=entry.from&&at<entry.until) ?? [];
+  if (!Number.isFinite(at)) return [];
+  return sessionIndexedBindings(snapshot,source,sessionId).filter(entry => at>=entry.from&&at<entry.until);
 }
 /** Resolve one active attempt, checking every configured copy of that attempt.
  * A retired, disjoint attempt does not disagree with its successor. */
 function claudeCandidateBinding(snapshot: DispatchBindingSnapshot,sessionId: string,observedAt: string) {
-  const entries=snapshot.bySession.get(`claude_code\0${sessionId}`)??[];
   const at=Date.parse(observedAt);
+  if (!Number.isFinite(at)) return { binding:null,conflict:false,rootDigests:new Set<string>() };
+  const entries=sessionIndexedBindings(snapshot,"claude_code",sessionId);
   let candidate: IndexedBinding|undefined;
   for(const entry of entries) {
     if(at<entry.from||at>=entry.until) continue;
@@ -236,7 +286,7 @@ function claudeCandidateBinding(snapshot: DispatchBindingSnapshot,sessionId: str
   const roots=new Set<string>();
   const rootDigests=new Set<string>();
   for(const entry of entries) {
-    if(entry.binding.attemptId===candidate.binding.attemptId) {
+    if(entry.binding.attemptId===candidate.binding.attemptId&&entry.from===candidate.from) {
       if(entry.signature!==candidate.signature||roots.has(entry.root.rootId))
         return { binding:null,conflict:true,rootDigests:new Set<string>() };
       roots.add(entry.root.rootId);
@@ -250,6 +300,8 @@ function claudeCandidateBinding(snapshot: DispatchBindingSnapshot,sessionId: str
 }
 export function dispatchBindingForSession(source: CaptureRoot["source"],sessionId: string,observedAt: string,
   roots: readonly CaptureRoot[]=currentDispatchCaptureRoots()): DispatchBinding|null {
+  if (!Number.isFinite(Date.parse(observedAt))) return null;
+  try {
   const snapshot=dispatchIndex(roots);
   if(source==="claude_code") return claudeCandidateBinding(snapshot,sessionId,observedAt).binding;
   const entries=activeIndexedBindings(snapshot,source,sessionId,observedAt);
@@ -259,6 +311,7 @@ export function dispatchBindingForSession(source: CaptureRoot["source"],sessionI
   const at=Date.parse(observedAt);
   return byRoot.size===entries.length&&signatures.size===1&&at>=entries[0].from&&at<entries[0].until
     ? entries[0].binding : null;
+  } catch { return null; }
 }
 /** A known-root transcript sighting is authoritative; hook/OTLP paths are not. */
 export function observeClaudeRootSession(root: CaptureRoot,sessionId: string) {
@@ -287,7 +340,8 @@ export function countClaudeReplayBytesUnvouched(count=1) {
 /** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
   snapshot=currentDispatchBindingSnapshot(),durableSightings?: ReadonlySet<string>): DispatchBinding|null {
-  const candidate=claudeCandidateBinding(snapshot,sessionId,observedAt);
+  let candidate: ReturnType<typeof claudeCandidateBinding>;
+  try { candidate=claudeCandidateBinding(snapshot,sessionId,observedAt); } catch { return null; }
   if(candidate.conflict) {
     claudeDispatchSkips.conflictingBindings++;
     return null;
@@ -338,8 +392,10 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
   const installationEpochId = accountEpochs.length===1 ? accountEpochs[0].installationEpochId : root.installationEpochId;
   const localIndex=snapshot.byRootId.get(root.rootId)?.dispatch===root.dispatch
     ? snapshot : dispatchIndex([root]);
-  const localMatches=activeIndexedBindings(localIndex,root.source,sessionId??"",observedAt)
-    .filter(entry => entry.root.rootId===root.rootId);
+  let lookupUnknown=false;
+  let localMatches: readonly IndexedBinding[]=[];
+  try { localMatches=activeIndexedBindings(localIndex,root.source,sessionId??"",observedAt)
+    .filter(entry => entry.root.rootId===root.rootId); } catch { lookupUnknown=true; }
   const localBinding={ binding: localMatches.length===1 ? localMatches[0].binding:null,
     conflict: localMatches.length>1 };
   // The known transcript root must supply its own binding. Other roots can
@@ -352,7 +408,8 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
     : localBinding.binding;
   const conflict=localBinding.conflict;
   return {
-    ...(binding? dispatchBindingMetadata(binding):{}),...(conflict? { workAttributionState: "conflict" }:{}),
+    ...(binding? dispatchBindingMetadata(binding):{}),
+    ...(lookupUnknown? { workAttributionState: "unknown" }:conflict? { workAttributionState: "conflict" }:{}),
     captureRootId: root.rootId,captureProfileId: root.profileId,installationEpochId,
     logicalSourceEventId: sourceEventId,sourceIdentityEvidenceRef: "native_runtime_event_v1",
     ...(account ? { captureAccountHash: account.actorHash,accountEvidenceRef: account.evidenceRef } : {}),

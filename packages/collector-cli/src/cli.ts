@@ -444,7 +444,8 @@ Commands:
                         Bind a session before its first event in every enrolled capture root.
                         Unlinkable IDs warn; --strict rejects them.
   dispatch close --attempt-id LANE
-                        Close the lane's binding and prune old bindings
+                        Refuses without an authenticated terminal adapter.
+                        Never infer terminal state from a completed turn or binding age.
   dispatch restamp --attempt-id LANE
                         Correct unsent local rows captured before bind; rows
                         already attempted for upload remain unchanged
