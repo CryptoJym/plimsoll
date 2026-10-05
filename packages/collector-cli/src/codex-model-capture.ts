@@ -605,86 +605,94 @@ export function captureCodexModel(
   if (nativeSseEvent && !directTraceId)
     return capture(event, [{ event, pairedId: null }], "native_sse_event");
   const eligible = terminalPrivacyEligibilitySql(db, "e", { includeUsageDuplicates: true });
-  const raw = db
-    .prepare(
-      `select e.rowid as evidenceRowid, e.id as evidenceId,
-       e.created_at as evidenceCreatedAt, e.privacy_generation as evidenceGeneration,
-       e.payload_json as payload, e.usage_paired_event_id as pairedId,
-       e.usage_duplicate_reason as duplicateReason
-    from buffered_events e indexed by idx_events_observed
-    where e.source='codex' and e.observed_at>=? and e.observed_at<=? and e.id<>?
-      and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
-      -- Different native traces cannot provide a pair or trace model. Keep
-      -- trace-free pair candidates, same-turn context, and competing exact
-      -- spans; count overflow only after those identity filters.
-      and (? is null or
-        case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end is null or
-        case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=? or
-        (e.session_id=? and coalesce(
-          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.codexTurnId') end,
-          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata."turn.id"') end,
-          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.turn_id') end)=?) or
-        (case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='handle_responses' and
-          e.input_tokens is ? and e.output_tokens is ? and
-          e.cache_read_tokens is ? and e.cache_creation_tokens is ?))
-      and ${eligible}
-    order by e.observed_at, e.id limit ${MAX_EVIDENCE_ROWS + 1}`,
-    )
-    .all(
-      new Date(at - WINDOW_MS).toISOString(),
-      new Date(end + WINDOW_MS).toISOString(),
-      rawId,
-      row.workspace,
-      row.device,
-      row.epoch,
-      directTraceId ?? null,
-      directTraceId ?? null,
-      trustedSession(event) ?? null,
-      turn ?? null,
-      event.inputTokens ?? null,
-      event.outputTokens ?? null,
-      event.cacheReadTokens ?? null,
-      event.cacheCreationTokens ?? null,
-    ) as Array<{
-      evidenceRowid: number;
-      evidenceId: string;
-      evidenceCreatedAt: string;
-      evidenceGeneration: string | null;
-      payload: string;
-      pairedId: string | null;
-      duplicateReason: string | null;
-    }>;
-  if (raw.length > MAX_EVIDENCE_ROWS) return gap("evidence_window_overflow");
-  const decodePeers = (rows: typeof raw): Peer[] => rows.flatMap((r) => {
+  type EvidenceRow = {
+    evidenceRowid: number; evidenceId: string; evidenceCreatedAt: string;
+    evidenceGeneration: string | null; payload: string; pairedId: string | null;
+    duplicateReason: string | null;
+  };
+  const decodePeers = (rows: EvidenceRow[]): Peer[] => rows.flatMap((r) => {
     try {
       const parsed = JSON.parse(r.payload) as AiInteractionEvent;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
       const event = parsed.metadata && typeof parsed.metadata === "object" && !Array.isArray(parsed.metadata)
         ? parsed : { ...parsed, metadata: {} };
-      return [
-        {
-          event,
-          pairedId: r.pairedId,
-          duplicate: r.duplicateReason !== null,
-          lineage: {
-            rawRowid: r.evidenceRowid,
-            rawId: r.evidenceId,
-            rawCreatedAt: r.evidenceCreatedAt,
-            rawGeneration: r.evidenceGeneration,
-          },
-        },
-      ];
-    } catch {
-      return [];
-    }
+      return [{ event, pairedId: r.pairedId, duplicate: r.duplicateReason !== null,
+        lineage: { rawRowid: r.evidenceRowid, rawId: r.evidenceId,
+          rawCreatedAt: r.evidenceCreatedAt, rawGeneration: r.evidenceGeneration } }];
+    } catch { return []; }
   });
-  // Native facts survive a financial gap, ACK and replay. Promotion is a
-  // separate decision: derived model guesses and durable gaps cannot supply
-  // a model, but their original attributes still establish contradictions.
-  const peers = decodePeers(raw);
-  const peerEvidence = peers;
   const mayPromote = (p: Peer) => !p.duplicate && !p.event.metadata.modelCaptureSource && !isCaptureGap(p.event) &&
     !(p.lineage && hasCaptureGapDecision(db, p.lineage));
+  const selectEvidence = `select e.rowid as evidenceRowid, e.id as evidenceId,
+    e.created_at as evidenceCreatedAt, e.privacy_generation as evidenceGeneration,
+    e.payload_json as payload, e.usage_paired_event_id as pairedId,
+    e.usage_duplicate_reason as duplicateReason from buffered_events e`;
+  const scope = `e.source='codex' and e.observed_at>=? and e.observed_at<=? and e.id<>?
+    and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?`;
+  const scopeArgs = [new Date(at - WINDOW_MS).toISOString(), new Date(end + WINDOW_MS).toISOString(),
+    rawId, row.workspace, row.device, row.epoch];
+  const counts = `case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.inputTokens') end is ?
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.outputTokens') end is ?
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.cacheReadTokens') end is ?
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.cacheCreationTokens') end is ?`;
+  const countArgs = [event.inputTokens ?? null, event.outputTokens ?? null,
+    event.cacheReadTokens ?? null, event.cacheCreationTokens ?? null];
+  const peersByRow = new Map<number, Peer>();
+  const addPeer = (p: Peer) => {
+    peersByRow.set(p.lineage!.rawRowid, p);
+    return peersByRow.size > MAX_EVIDENCE_ROWS;
+  };
+  // Scan indexed request candidates, counting only facts that can really
+  // participate in this pair or local-turn tier. Unrelated tools, traces,
+  // response identities and accounts cannot spend the evidence budget.
+  // Streaming also keeps candidate memory bounded without selecting a model
+  // from the first 128 rows and hiding a later relevant contradiction.
+  let windowOverflow = false;
+  const pairCandidates: Peer[] = [];
+  for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end
+      in ('codex.sse_event','handle_responses')
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='codex.sse_event'
+    and ${counts} and ${eligible}`).iterate(...scopeArgs,...countArgs) as Iterable<EvidenceRow>) {
+    const p = decodePeers([candidate])[0];
+    if (!p || !compatible(event,p.event) || !sameCounts(event,p.event) ||
+      (codexResponseIdentities(event.metadata).length && codexResponseIdentities(p.event.metadata).length &&
+        !codexResponseIdentityOverlap(event.metadata,p.event.metadata)) ||
+      (p.pairedId && p.pairedId !== rawId) || Math.min(
+        Math.abs(Date.parse(p.event.observedAt) - at), Math.abs(Date.parse(p.event.observedAt) - end)) > 30_000) continue;
+    if (addPeer(p)) { windowOverflow = true; break; }
+    pairCandidates.push(p);
+  }
+  if (windowOverflow) return gap("evidence_window_overflow");
+  const sessionForWindow = trustedSession(event);
+  if (sessionForWindow && turn) for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.usageSource') end
+      in ('codex_local_turn','rollout')
+    and e.session_id=? and coalesce(
+      case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.codexTurnId') end,
+      case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata."turn.id"') end,
+      case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.turn_id') end)=?
+    and ${eligible}`).iterate(...scopeArgs,sessionForWindow,turn) as Iterable<EvidenceRow>) {
+    const p = decodePeers([candidate])[0];
+    if (!p || trustedSession(p.event) !== sessionForWindow) continue;
+    if (addPeer(p)) { windowOverflow = true; break; }
+  }
+  if (windowOverflow) return gap("evidence_window_overflow");
+  const promotablePairs = pairCandidates.filter(mayPromote);
+  if (promotablePairs.length) for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end
+      in ('codex.sse_event','handle_responses')
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='handle_responses'
+    and ${counts} and ${eligible}`).iterate(...scopeArgs,...countArgs) as Iterable<EvidenceRow>) {
+    const p = decodePeers([candidate])[0];
+    if (!p || !sameCounts(event,p.event) || !promotablePairs.some(log => compatible(p.event,log.event))) continue;
+    if (addPeer(p)) { windowOverflow = true; break; }
+  }
+  if (windowOverflow) return gap("evidence_window_overflow");
+  // Native facts survive a financial gap, ACK and replay. Promotion is a
+  // separate decision; the complete native trace is checked below.
+  const peers = [...peersByRow.values()];
+  const peerEvidence = peers;
   const native = peerEvidence.filter(mayPromote);
   const conflicts = (p: Peer) =>
     p.event.metadata.modelEvidenceConflict === true ||
@@ -744,7 +752,7 @@ export function captureCodexModel(
     from buffered_events e where e.source='codex' and e.id<>?
       and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
       and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?
-      and ${eligible} limit ${MAX_EVIDENCE_ROWS + 1}`).all(rawId,row.workspace,row.device,row.epoch,traceId) as typeof raw : [];
+      and ${eligible} limit ${MAX_EVIDENCE_ROWS + 1}`).all(rawId,row.workspace,row.device,row.epoch,traceId) as EvidenceRow[] : [];
   if (traceRows.length > MAX_EVIDENCE_ROWS) return gap("trace_evidence_overflow");
   const tracePeers = decodePeers(traceRows);
   if (tracePeers.some(conflicts)) return gap("conflicting_trace_model_evidence");

@@ -9,7 +9,7 @@ import { rowHasAdmittedUsage } from '../packages/collector-cli/src/usage-authori
 import { aiInteractionEventSchema, type AiInteractionEvent } from '../packages/shared/src/index';
 import { nativeCodexFixture } from './lib/native-codex-fixture';
 import { createProofCompletion } from './lib/proof-completion';
-const completion = createProofCompletion('codex-capture-legacy-density',37);
+const completion = createProofCompletion('codex-capture-legacy-density',44);
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-legacy-density-'));
 const at=new Date().toISOString();
 const event=(n:number)=>aiInteractionEventSchema.parse({id:`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,
@@ -36,6 +36,59 @@ try {
   const captured=captureCodexModel(b.database,last);
   completion.check('unrelated_native_traces_do_not_overflow_evidence',!isCaptureGap(captured)&&captured.model===last.model&&captured.inputTokens===0&&captured.outputTokens===7);
  }finally{b.close();}
+ const unrelated=open('unrelated-null-trace-context');
+ try {
+  for(let n=1;n<=500;n++) unrelated.append({...event(n),eventType:'tool_result',inputTokens:undefined,outputTokens:undefined});
+  const target={...event(501),...nativeCodexFixture('null-trace-neighbours')};unrelated.append(target);
+  const captured=captureCodexModel(unrelated.database,target);
+  completion.check('unrelated_null_trace_context_does_not_overflow_native_request',
+   !isCaptureGap(captured)&&captured.model===target.model&&captured.inputTokens===0&&captured.outputTokens===7);
+ }finally{unrelated.close();}
+ for(const exclusion of ['different-trace','different-response','different-account'] as const) {
+  const excluded=open('irrelevant-pairs-'+exclusion);
+  try {
+   const target={...event(1),...nativeCodexFixture('native-'+exclusion),actorId:'native-account',
+    metadata:{...nativeCodexFixture('native-'+exclusion).metadata,'response.id':'target-response'}};
+   excluded.append(target);
+   for(let n=2;n<=501;n++) excluded.append({...event(n),model:'gpt-5.5',
+    actorId:exclusion==='different-account'?'other-account':'native-account',
+    metadata:{model:'gpt-5.5',otelEventName:'codex.sse_event',
+     ...(exclusion==='different-trace'?{traceId:nativeCodexFixture(String(n)).metadata.traceId}:{}),
+     'response.id':exclusion==='different-response'?'other-response':'target-response'}});
+   const captured=captureCodexModel(excluded.database,target);
+   completion.check('irrelevant_exact_counter_peers_'+exclusion+'_cannot_exhaust_budget',
+    !isCaptureGap(captured)&&captured.model===target.model&&captured.inputTokens===0&&captured.outputTokens===7);
+  }finally{excluded.close();}
+ }
+ const exactPair=open('pair-before-trace-overflow');
+ try {
+  const target={...event(1),metadata:{traceId:'11223344556677881122334455667788',otelEventName:'handle_responses'}};
+  exactPair.append(target);
+  for(let n=2;n<=131;n++) exactPair.append({...event(n),eventType:'tool_result',inputTokens:undefined,outputTokens:undefined,
+   metadata:{traceId:target.metadata.traceId}});
+  exactPair.append({...event(132),model:'gpt-6-sol',metadata:{model:'gpt-6-sol',otelEventName:'codex.sse_event'}});
+  const captured=captureCodexModel(exactPair.database,target);
+  completion.check('exact_native_pair_precedes_trace_tier_overflow',!isCaptureGap(captured)&&captured.model==='gpt-6-sol'&&
+   captured.inputTokens===undefined&&captured.outputTokens===undefined&&captured.metadata.modelCaptureInputTokens===0&&
+   captured.metadata.modelCaptureOutputTokens===7);
+ }finally{exactPair.close();}
+ const manyPairs=open('relevant-pair-overflow');
+ try {
+  const target={...event(1),metadata:{otelEventName:'handle_responses'}};manyPairs.append(target);
+  for(let n=2;n<=131;n++) manyPairs.append({...event(n),model:'gpt-6-sol',metadata:{model:'gpt-6-sol',otelEventName:'codex.sse_event'}});
+  const gap=captureCodexModel(manyPairs.database,target);
+  completion.check('relevant_exact_pairs_still_fail_closed_at_evidence_cap',isCaptureGap(gap)&&
+   gap.metadata.modelGapReason==='evidence_window_overflow'&&gap.inputTokens===undefined&&gap.metadata.modelGapInputTokens===0);
+ }finally{manyPairs.close();}
+ const manyTurns=open('relevant-local-turn-overflow');
+ try {
+  const target={...event(1),sessionId:'local-conversation',eventType:'usage_rollout',model:'gpt-6-sol',
+   metadata:{usageSource:'rollout',codexTurnId:'local-turn'}} as AiInteractionEvent;manyTurns.append(target);
+  for(let n=2;n<=131;n++) manyTurns.append({...target,id:event(n).id,inputTokens:undefined,outputTokens:undefined});
+  const gap=captureCodexModel(manyTurns.database,target);
+  completion.check('relevant_local_turns_still_fail_closed_at_evidence_cap',isCaptureGap(gap)&&
+   gap.metadata.modelGapReason==='evidence_window_overflow'&&gap.inputTokens===undefined&&gap.metadata.modelGapInputTokens===0);
+ }finally{manyTurns.close();}
  const conflicting=open('same-trace');
  try {
   const target={...event(1),...nativeCodexFixture('same')};conflicting.append(target);

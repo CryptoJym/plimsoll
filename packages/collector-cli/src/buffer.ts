@@ -824,6 +824,22 @@ export class LocalEventBuffer {
         (workspace_id,device_id,installation_epoch_id,
          case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end)
         where source='codex';
+      create index if not exists idx_codex_capture_request_candidates on buffered_events
+        (workspace_id,device_id,installation_epoch_id,observed_at)
+        where source='codex' and
+          case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.otelEventName') end
+            in ('codex.sse_event','handle_responses');
+      create index if not exists idx_codex_capture_local_turn_candidates on buffered_events
+        (workspace_id,device_id,installation_epoch_id,session_id,
+          coalesce(
+            case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.codexTurnId') end,
+            case when json_valid(payload_json) then json_extract(payload_json,'$.metadata."turn.id"') end,
+            case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.turn_id') end),observed_at)
+        where source='codex' and
+          case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.usageSource') end
+            in ('codex_local_turn','rollout');
+      create index if not exists idx_codex_native_usage_session on buffered_events (session_id)
+        where source='codex' and event_type in ('usage_rollout','usage_transcript');
       create index if not exists idx_events_retention on buffered_events (created_at, id);
       create index if not exists idx_events_repo on buffered_events (repo_hash, branch_hash);
       create index if not exists idx_raw_retention_expired
