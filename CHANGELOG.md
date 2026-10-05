@@ -8,11 +8,20 @@
   anonymous exact twins retain complementary paid branches. Qualified native fields ACKed
   by released collectors remain paid owners across upgrade; reconciliation
   preserves ACKed finance without inventing missing historical wire bytes.
-- Known limit: SSE reports with overlapping fields and disjoint native identities
-  can both be accepted before a later observation links them, including partial
-  reports. Their accepted
-  overlap requires a cloud accounting contract to correct; local frozen
-  delivery bytes remain unchanged.
+- Known limit (R11-P0-02, #450): when two complete reports of one response
+  use different IDs and both are accepted before any record links them, both
+  stay counted. The collector cannot correct an accepted record; the
+  cloud-side identity-link fix is eco-6hoxj.165.184.14. This also affects SSE
+  reports with overlapping fields and disjoint native identities, including
+  partial reports. Local frozen delivery bytes remain unchanged.
+- Observable exposure in the last 30 days: 0 records and 0 tokens among checkable records. 503,965 complete SSE records lacked device or installation scope and could not be checked, so actual exposure is unknown; the identity-link fix eco-6hoxj.165.184.14 removes the need for this inference.
+- The measured zero is a lower bound: a bridge the collector fully covers
+  locally never reaches the cloud, and bridges more than two days late were
+  not read.
+- The exposure query is not a general token measure (R12-P1-01): bridged
+  rows carry residual amounts, so it can overstate excess tokens when a group
+  is found. Do not reuse it as a token lower bound until
+  eco-6hoxj.165.184.14 keeps the original amounts.
 
 - Codex token-bearing captures now name their model from an exact paired SSE
   log, one unambiguous native trace, or the same local conversation turn. Any
