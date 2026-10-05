@@ -3354,29 +3354,35 @@ export class DashboardProjectionStore {
       // queued_at cannot strand one behind continuously captured repairs.
       // Start from the receipt primary key rather than sorting the whole
       // repair queue on every tick of a duplicate-heavy upgrade.
-      const scanRepairs=hasActiveTime()?this.db.prepare(
+      const fetchScanRepairs=this.db.prepare(
         `select ${repairColumns}
          from codex_duplicate_fact_scan_repairs scan
          join dashboard_projection_repairs r on r.raw_rowid=scan.raw_rowid
          left join buffered_events b on b.rowid=r.raw_rowid
          where ${repairEligible} order by scan.raw_rowid limit ?`,
-      ).all(REPAIR_ROWS) as RepairRow[]:[];
-      const ordinaryRepairs=hasActiveTime()&&scanRepairs.length<REPAIR_ROWS?this.db.prepare(
+      );
+      const fetchOrdinaryRepairs=this.db.prepare(
         `select ${repairColumns}
          from dashboard_projection_repairs r left join buffered_events b on b.rowid=r.raw_rowid
          where ${repairEligible} and not exists (
            select 1 from codex_duplicate_fact_scan_repairs scan where scan.raw_rowid=r.raw_rowid)
          order by r.queued_at,r.raw_rowid limit ?`,
-      ).all(REPAIR_ROWS-scanRepairs.length) as RepairRow[]:[];
-      const repairs=[...scanRepairs,...ordinaryRepairs];
+      );
       const removeRepair=this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`);
       // Apply and acknowledge only complete batches. A timed production pass
       // checks the same active deadline between small batches; an unbudgeted
       // explicit drain retains its original row-count allowance.
       const batchRows = options.maxActiveMs === undefined ? REPAIR_ROWS : TIMED_REPAIR_BATCH_ROWS;
-      for (let offset = 0; offset < repairs.length; offset += batchRows) {
-        if (!hasActiveTime()) break;
-        const batch = repairs.slice(offset, offset + batchRows);
+      // Fetch only the next admitted batch. Reading privacy/provenance for
+      // 250 candidates when a timed pass can commit only 8-16 rows dominated
+      // repair calibration and held the writer on every remaining tick.
+      while (repairRowsVisited < REPAIR_ROWS && hasActiveTime()) {
+        const requested=Math.min(batchRows,REPAIR_ROWS-repairRowsVisited);
+        const scanRepairs=fetchScanRepairs.all(requested) as RepairRow[];
+        const ordinaryRepairs=scanRepairs.length<requested
+          ? fetchOrdinaryRepairs.all(requested-scanRepairs.length) as RepairRow[] : [];
+        const batch=[...scanRepairs,...ordinaryRepairs];
+        if(!batch.length || !hasActiveTime())break;
         const rowsToApply:RawProjectionRow[]=[];
         for (const repair of batch) {
           if(repair.id!==null){
