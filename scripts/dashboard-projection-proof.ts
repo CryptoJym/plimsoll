@@ -89,7 +89,7 @@ function uuid(n: number) {
 // text alone cannot attest Codex usage after #450.
 function projectionFixtureBuffer(file: string, options: ConstructorParameters<typeof LocalEventBuffer>[1] = {}) {
   return new LocalEventBuffer(file, { workspaceId: LOCAL_TENANT_ID,
-    deviceId: uuid(999_999), ...options });
+    deviceId: uuid(999_999), enrollmentNow:()=>new Date("2026-01-01T00:00:00.000Z"), ...options });
 }
 
 let eventSequence = 1;
@@ -114,7 +114,9 @@ function event(input: {
   // Generic financial fixtures test projection arithmetic and cutoffs. Give
   // their native producer a request model; explicit model-less Codex cases
   // still exercise the diagnostic-only capture contract.
-  const model = input.model ?? (!input.source && [input.inputTokens, input.outputTokens,
+  const model = input.model ?? (!Object.hasOwn(input,"model") &&
+    (input.source??"codex")==="codex" && input.eventType!=="usage_live" &&
+    [input.inputTokens, input.outputTokens,
     input.cacheReadTokens, input.cacheCreationTokens, input.costUsd].some(value => value !== undefined)
     ? "gpt-proof" : undefined);
   const native = (input.source ?? "codex") === "codex" && model
