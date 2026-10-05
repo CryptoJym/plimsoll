@@ -1986,15 +1986,23 @@ async function main() {
     compactSeed.close();
     const compactDb=new Database(compactPath);
     dropProjectionState(compactDb);
+    const compactBinding=compactDb.prepare(`select current_workspace_id as workspace,
+      current_device_id as device,current_installation_epoch_id as epoch
+      from collector_workspace_binding where singleton=1`).get() as
+      {workspace:string;device:string;epoch:string};
+    // Measure projection overhead on already captured raw rows. An omitted
+    // binding makes reopen migrate 100k raw rows and queue update receipts;
+    // that is raw enrollment work, not compressed projection storage.
     const compactInsert=compactDb.prepare(
       `insert into buffered_events
-       (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at,action_class)
-       values (?,?,?,?,?,?,?,?,?)`,
+       (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at,action_class,
+        workspace_id,device_id,installation_epoch_id)
+       values (?,?,?,?,?,?,?,?,?,?,?,?)`,
     );
     compactDb.transaction(()=>{
       for(let index=0;index<100_000;index++)compactInsert.run(`compact-${index}`,"codex","otel_span",
         "metadata",new Date(NOW.getTime()-(index%10)*DAY_MS).toISOString(),"{}","[]",NOW.toISOString(),
-        index%20===0?"read":null);
+        index%20===0?"read":null,compactBinding.workspace,compactBinding.device,compactBinding.epoch);
     })();
     compactDb.pragma("wal_checkpoint(TRUNCATE)");
     compactDb.close();
@@ -2146,7 +2154,9 @@ async function main() {
 
     const promotePath=path.join(root,"pending-compact-promote.sqlite");
     let promote=projectionFixtureBuffer(promotePath);
-    const promoteEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other"});
+    // General compact-to-financial arithmetic uses genuine Claude. Updating
+    // bare Codex SQL model/counters cannot create native capture evidence.
+    const promoteEvent=event({source:"claude_code",eventType:"assistant_response",actionClass:"other"});
     promote.append(promoteEvent);
     const promoteRawRowid=(promote.database.prepare(
       `select rowid as rawRowid from buffered_events where id=?`,
@@ -2588,7 +2598,7 @@ async function main() {
     gc.close();
 
     compact.database.prepare(
-      `update buffered_events set session_id=?,model=?,input_tokens=?,output_tokens=?,cost_usd=? where rowid=1`,
+      `update buffered_events set source='claude_code',session_id=?,model=?,input_tokens=?,output_tokens=?,cost_usd=? where rowid=1`,
     ).run("compact-promoted-session","promoted-model",5,1,0.000001);
     compact.database.prepare(`delete from buffered_events where rowid=2`).run();
     const mutationBeforeCrash=compact.projection.status();
@@ -2710,7 +2720,7 @@ async function main() {
     legacyDb.transaction(() => {
       for (let index = 0; index < 2_300; index += 1) {
         const id = `legacy-${String(index).padStart(6, "0")}`;
-        legacyInsert.run(id, "codex", "assistant_response", "metadata",
+        legacyInsert.run(id, "claude_code", "assistant_response", "metadata",
           new Date(NOW.getTime() - (index % 20) * DAY_MS).toISOString(), JSON.stringify({ id }), "[]",
           NOW.toISOString(), `legacy-session-${index % 5}`, "legacy-model", 1, 1, 0.000000001);
       }
@@ -2907,7 +2917,7 @@ async function main() {
     // distinct no_events status instead of being absent or reading healthy.
     const empty = projectionFixtureBuffer(path.join(root, "capture-health-no-events.sqlite"));
     empty.append(event({
-      source: "codex", sessionId: uuid(910_001),
+      source: "codex", model: "gpt-proof", sessionId: uuid(910_001),
       observedAt: new Date(NOW.getTime() - 5 * 60_000).toISOString(),
       inputTokens: 10, outputTokens: 5, costUsd: 0.001,
     }));
@@ -2979,7 +2989,7 @@ async function main() {
     // Restoring the dead `describeCaptureScan` error branch fails both checks.
     const errorScan = projectionFixtureBuffer(path.join(root, "capture-health-scan-error.sqlite"));
     errorScan.append(event({
-      source: "codex", sessionId: uuid(910_101),
+      source: "codex", model: "gpt-proof", sessionId: uuid(910_101),
       observedAt: new Date(NOW.getTime() - 5 * 60_000).toISOString(),
       inputTokens: 10, outputTokens: 5, costUsd: 0.001,
     }));
@@ -3356,7 +3366,7 @@ async function main() {
       });
       fs.writeFileSync(path.join(directory, `rollout-${session}.jsonl`), [
         { type: "session_meta", timestamp: anchorAt, payload: { id: session } },
-        { type: "turn_context", payload: { model: "gpt-5.5" } },
+        { type: "turn_context", payload: { model: "gpt-5.5", turn_id: "health-fixture-turn" } },
         tokenCount(anchorAt, 0),
         tokenCount(at, tokens),
       ].map((record) => JSON.stringify(record)).join("\n") + "\n");
@@ -3440,7 +3450,7 @@ async function main() {
       });
       fs.writeFileSync(path.join(directory, `rollout-${session}.jsonl`), [
         { type: "session_meta", timestamp: anchorAt, payload: { id: session } },
-        { type: "turn_context", payload: { model: "gpt-5.5" } },
+        { type: "turn_context", payload: { model: "gpt-5.5", turn_id: "health-fixture-turn" } },
         tokenCount(anchorAt, 0),
         tokenCount(at, tokens),
       ].map((record) => JSON.stringify(record)).join("\n") + "\n");
@@ -3498,7 +3508,7 @@ async function main() {
     const mtimeAnchorAt = new Date(NOW.getTime() - 60 * 60_000).toISOString();
     fs.writeFileSync(mtimeRolloutFile, [
       { type: "session_meta", timestamp: mtimeAnchorAt, payload: { id: uuid(945_002) } },
-      { type: "turn_context", payload: { model: "gpt-5.5" } },
+      { type: "turn_context", payload: { model: "gpt-5.5", turn_id: "health-fixture-turn" } },
       { type: "event_msg",
         payload: { type: "token_count", info: { total_token_usage: {
           input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
@@ -4099,7 +4109,7 @@ async function main() {
       });
     const codexBuffer = projectionFixtureBuffer(path.join(root, "capture-health-codex.sqlite"));
     codexBuffer.append(event({
-      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_002),
+      source: "codex", model: "gpt-proof", eventType: "usage_rollout", sessionId: uuid(930_002),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
       inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
     }));
@@ -4295,7 +4305,7 @@ async function main() {
     const limitCodexBuffer = projectionFixtureBuffer(
       path.join(root, "capture-health-codex-limit.sqlite"));
     limitCodexBuffer.append(event({
-      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_003),
+      source: "codex", model: "gpt-proof", eventType: "usage_rollout", sessionId: uuid(930_003),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
       inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
     }));
@@ -4419,7 +4429,7 @@ async function main() {
     const multiCodexBuffer = projectionFixtureBuffer(
       path.join(root, "capture-health-codex-limit-multi.sqlite"));
     multiCodexBuffer.append(event({
-      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_005),
+      source: "codex", model: "gpt-proof", eventType: "usage_rollout", sessionId: uuid(930_005),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
       inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
     }));
@@ -4967,7 +4977,7 @@ async function main() {
       installationEpochId: "epoch-codex", source: "codex" as const, directory: unitCodexDir }];
     const unitCodexBuffer = projectionFixtureBuffer(path.join(root, "capture-health-codex-unit.sqlite"));
     unitCodexBuffer.append(event({
-      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_006),
+      source: "codex", model: "gpt-proof", eventType: "usage_rollout", sessionId: uuid(930_006),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
       inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
     }));
@@ -5127,7 +5137,7 @@ async function main() {
     const explicitCodexBuffer = projectionFixtureBuffer(
       path.join(root, "capture-health-codex-explicit.sqlite"));
     explicitCodexBuffer.append(event({
-      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_007),
+      source: "codex", model: "gpt-proof", eventType: "usage_rollout", sessionId: uuid(930_007),
       observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
       inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
     }));
