@@ -52,13 +52,31 @@ export function ensureJsonlContinuationStore(db: Database.Database) {
  ) without rowid;
  create index if not exists jsonl_continuations_file on jsonl_continuations(file_key)`);
 }
+// These statements are private to the continuation reader: callers cannot
+// change their bindings, row mode or iterator state. Reuse preparation, never
+// rows or authority observations; every get()/run() still reads the current
+// ledger and writable statements retain the connection's inode guard.
+const continuationStatements = new WeakMap<Database.Database, Map<string, Database.Statement>>();
+function continuationStatement(db: Database.Database, sql: string): Database.Statement {
+ let statements = continuationStatements.get(db);
+ if (!statements) { statements = new Map(); continuationStatements.set(db, statements); }
+ let statement = statements.get(sql);
+ if (!statement) {
+   statement = db.prepare(sql);
+   // The reader uses a fixed, small SQL vocabulary. Bound future additions
+   // without sharing mutable statements with any other ledger component.
+   if (statements.size >= 32) statements.delete(statements.keys().next().value!);
+   statements.set(sql, statement);
+ }
+ return statement;
+}
 export function jsonlCursorDigest(db: Database.Database, key: string): string {
- const row = db.prepare("select * from rollout_scan_state where file=?").get(jsonlScanStateKey(key)) as Record<string, unknown> | undefined;
+ const row = continuationStatement(db, "select * from rollout_scan_state where file=?").get(jsonlScanStateKey(key)) as Record<string, unknown> | undefined;
  return digest(row ? Object.fromEntries(Object.keys(row).sort().map(k => [k, row[k]])) : null);
 }
 function optionalRow(db: Database.Database, table: string, sql: string, arg?: string) {
- if (!db.prepare("select 1 from sqlite_master where type='table' and name=?").get(table)) return null;
- return (arg === undefined ? db.prepare(sql).get() : db.prepare(sql).get(arg)) ?? null;
+ if (!continuationStatement(db, "select 1 from sqlite_master where type='table' and name=?").get(table)) return null;
+ return (arg === undefined ? continuationStatement(db, sql).get() : continuationStatement(db, sql).get(arg)) ?? null;
 }
 function binding(options: ContinuationOptions, file: string): Binding {
  const db = options.database, source = options.provider === "codex" ? "codex" : "claude_code";
@@ -134,7 +152,7 @@ function snapshot(stat: fs.BigIntStats): Snapshot {
 export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: JsonlScanCursor<T> | undefined,
  limits: JsonlTailReadLimits, io: JsonlTailerIo, options: ContinuationOptions): JsonlTailRead | undefined {
  const db = options.database, b = binding(options, file), priorCursor = jsonlCursorDigest(db, options.cursorKey);
- const previousRaw = (db.prepare("select envelope_json from jsonl_continuations where provider=? and file_key=?").get(options.provider, b.fileKey) as { envelope_json: string } | undefined)?.envelope_json;
+ const previousRaw = (continuationStatement(db, "select envelope_json from jsonl_continuations where provider=? and file_key=?").get(options.provider, b.fileKey) as { envelope_json: string } | undefined)?.envelope_json;
  const maxBytes = Math.min(LIMITS.sliceBytes, Math.max(0, Math.floor(limits.maxBytes ?? LIMITS.sliceBytes)));
  let bytesRead = 0, prefixBytesRead = 0, fd: number | undefined, current: Snapshot | undefined;
  let envelope: Envelope | undefined, initialOffset = cursor?.committedOffset ?? options.initialOffset ?? 0, admittedAncestors: string | undefined;
@@ -142,8 +160,8 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
  let reason: string | null = null, requiredMinimumBytes: number | null = null, pendingFence: string | null = null;
  const close = () => { if (fd !== undefined) { fs.closeSync(fd); fd = undefined; } legacy?.close(); };
  const assertCurrent = () => {
-   const row = db.prepare("select envelope_json from jsonl_continuations where provider=? and file_key=?").get(options.provider, b.fileKey) as {envelope_json:string}|undefined;
-   if (db.prepare("select 1 from jsonl_continuations where file_key=? and provider<>? limit 1").get(b.fileKey, options.provider) || row?.envelope_json !== previousRaw || jsonlCursorDigest(db, options.cursorKey) !== priorCursor || digest(binding(options, file)) !== digest(b)) throw new Error("stale_continuation_proposal");
+   const row = continuationStatement(db, "select envelope_json from jsonl_continuations where provider=? and file_key=?").get(options.provider, b.fileKey) as {envelope_json:string}|undefined;
+   if (continuationStatement(db, "select 1 from jsonl_continuations where file_key=? and provider<>? limit 1").get(b.fileKey, options.provider) || row?.envelope_json !== previousRaw || jsonlCursorDigest(db, options.cursorKey) !== priorCursor || digest(binding(options, file)) !== digest(b)) throw new Error("stale_continuation_proposal");
  };
  const result = (action: ContinuationProposal["action"], lines: string[] = [], committedOffset = cursor?.committedOffset ?? options.initialOffset ?? 0): JsonlTailRead => {
    const nextRaw = action === "checkpoint" ? pendingFence ?? (envelope ? encode(envelope) : null) : null;
@@ -155,9 +173,9 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      applyCheckpoint() {
        assertCurrent();
        if (nextRaw === null) throw new Error("invalid_checkpoint_proposal");
-       db.prepare("insert into jsonl_continuations(provider,file_key,envelope_json) values (?,?,?) on conflict(provider,file_key) do update set envelope_json=excluded.envelope_json").run(options.provider, b.fileKey, nextRaw);
+       continuationStatement(db, "insert into jsonl_continuations(provider,file_key,envelope_json) values (?,?,?) on conflict(provider,file_key) do update set envelope_json=excluded.envelope_json").run(options.provider, b.fileKey, nextRaw);
      },
-     remove() { assertCurrent(); db.prepare("delete from jsonl_continuations where provider=? and file_key=?").run(options.provider, b.fileKey); },
+     remove() { assertCurrent(); continuationStatement(db, "delete from jsonl_continuations where provider=? and file_key=?").run(options.provider, b.fileKey); },
    };
    return { lines, observedSize: snap?.size ?? stat.size, committedOffset,
      deferredBytes: (snap?.size ?? stat.size) - committedOffset,
@@ -225,7 +243,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
    return bytes;
  };
  try {
-   if (previousRaw === undefined && db.prepare("select 1 from jsonl_continuations where file_key=? limit 1").get(b.fileKey)) return park("binding_mismatch");
+   if (previousRaw === undefined && continuationStatement(db, "select 1 from jsonl_continuations where file_key=? limit 1").get(b.fileKey)) return park("binding_mismatch");
    if (previousRaw !== undefined) {
      if (typeof previousRaw !== "string" || Buffer.byteLength(previousRaw) > MAX_ENVELOPE_BYTES) return park("invalid_envelope");
      const retired = retiredReason(previousRaw);
@@ -513,8 +531,8 @@ function retiredReason(raw:string): string | null {
 export function retireJsonlContinuations(db:Database.Database, provider:Provider, roots:CaptureRoot[]|undefined, deadline:number) {
  if (performance.now() >= deadline) return 0;
  const key=`jsonl_continuation_retirement:${provider}`;
- const after=(db.prepare("select value from maintenance_state where key=?").get(key) as {value:string}|undefined)?.value ?? "";
- const rows=db.prepare("select file_key,envelope_json from jsonl_continuations where provider=? and file_key>? order by file_key limit 16").all(provider,after) as Array<{file_key:string;envelope_json:string}>;
+ const after=(continuationStatement(db, "select value from maintenance_state where key=?").get(key) as {value:string}|undefined)?.value ?? "";
+ const rows=continuationStatement(db, "select file_key,envelope_json from jsonl_continuations where provider=? and file_key>? order by file_key limit 16").all(provider,after) as Array<{file_key:string;envelope_json:string}>;
  const rootDigests=roots?.map(captureRootDigest);
  const enrollment=digest(optionalRow(db,"collector_workspace_binding","select current_workspace_id,current_device_id,current_installation_epoch_id,current_installation_epoch_started_at from collector_workspace_binding where singleton=1"));
  let last="",visited=0;
@@ -523,10 +541,10 @@ export function retireJsonlContinuations(db:Database.Database, provider:Provider
    last=row.file_key;visited++;
    let e:Envelope;try{e=decode(row.envelope_json);}catch{continue;}
    if(e.binding.enrollment===enrollment && (!rootDigests || rootDigests.includes(e.binding.root))) continue;
-   db.prepare("update jsonl_continuations set envelope_json=? where provider=? and file_key=? and envelope_json=?").run(
+   continuationStatement(db, "update jsonl_continuations set envelope_json=? where provider=? and file_key=? and envelope_json=?").run(
      sealed({version:1,rollbackVersion:"0.7.4",retired:true,reason:"retired_binding",bindingDigest:digest(e.binding),priorCursor:e.priorCursor}),provider,row.file_key,row.envelope_json);
  }
  if(rows.length<16 && visited===rows.length) last="";
- db.prepare("insert into maintenance_state(key,value,updated_at) values (?,?,?) on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at").run(key,last,new Date().toISOString());
+ continuationStatement(db, "insert into maintenance_state(key,value,updated_at) values (?,?,?) on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at").run(key,last,new Date().toISOString());
  return visited;
 }
