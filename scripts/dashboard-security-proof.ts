@@ -23,7 +23,10 @@ import {
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), "..");
 const dashboardPath = path.join(repoRoot, "packages/collector-cli/src/dashboard.html");
-const chromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+// CI sets PLIMSOLL_DASHBOARD_CHROME to the pinned Chrome headless shell (proof.yml). Full Chrome opens hidden native
+// windows even when headless and crashes closing one when the runner's macOS session does not own the display.
+const chromePath =
+  process.env.PLIMSOLL_DASHBOARD_CHROME || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const BROWSER_PROTOCOL_CLOSE_MS = 1_000;
 const BROWSER_SIGNAL_GRACE_MS = 1_500;
 const BROWSER_PROOF_WALL_MS = 30_000;
