@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { frozenCodexCapture } from "./codex-named-capture";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
-import { estimateCostUsd, providerAccountKey, usageFieldKeys, validatedMetadataAttribute,
+import { estimateCostUsd, codexResponseIdentities, codexResponseIdentityOverlap, providerAccountKey, usageFieldKeys, validatedMetadataAttribute,
   type AiInteractionEvent } from "../../shared/src/index";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 
@@ -71,11 +71,8 @@ function compatible(span: Row, rollout: Row) {
   const start = Date.parse(span.at), at = Date.parse(rollout.at);
   const a = account(span.event), b = account(rollout.event);
   const spanTurn = turn(span.event), rolloutTurn = turn(rollout.event);
-  const spanRequest=span.event.metadata.request_id??span.event.metadata.call_id;
-  const rolloutRequest=rollout.event.metadata.request_id??rollout.event.metadata.call_id;
-  if(spanRequest&&rolloutRequest&&spanRequest!==rolloutRequest)return false;
-  if((spanTurn||spanRequest)&&(rolloutTurn||rolloutRequest)&&
-    !(spanTurn&&spanTurn===rolloutTurn||spanRequest&&spanRequest===rolloutRequest))return false;
+  if(codexResponseIdentities(span.event.metadata).length && codexResponseIdentities(rollout.event.metadata).length &&
+    !codexResponseIdentityOverlap(span.event.metadata,rollout.event.metadata))return false;
   const nativeModels = new Set(nativeValues(span.event, usageFieldKeys.model));
   return span.workspace !== null && span.epoch !== null && span.device !== null &&
     span.workspace === rollout.workspace && span.epoch === rollout.epoch && span.device === rollout.device &&
@@ -84,7 +81,8 @@ function compatible(span: Row, rollout: Row) {
     span.input + span.output > 0 &&
     Number.isFinite(end) && end >= start && end - start <= MAX_SPAN_MS && Math.abs(end - at) <= WINDOW_MS &&
     (!session(span.event) || session(span.event) === session(rollout.event)) &&
-    (!spanTurn || !rolloutTurn || spanTurn === rolloutTurn) &&
+    (!spanTurn || !rolloutTurn || spanTurn === rolloutTurn ||
+      codexResponseIdentityOverlap(span.event.metadata,rollout.event.metadata)) &&
     (!span.event.metadata.traceId || !rollout.event.metadata.traceId ||
       span.event.metadata.traceId === rollout.event.metadata.traceId) &&
     (a.size === 0 || b.size === 0 || [...a].some(value => b.has(value))) &&

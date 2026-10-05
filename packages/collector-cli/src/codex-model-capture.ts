@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import {
   estimateCostUsd,
+  codexResponseIdentities,
+  codexResponseIdentityOverlap,
   providerAccountKey,
   usageFieldKeys,
   validatedMetadataAttribute,
@@ -652,13 +654,8 @@ export function captureCodexModel(
   const pair = logs.filter(
     (p) =>
       compatible(event, p.event) &&
-      (() => {
-        const a=event.metadata,b=p.event.metadata;
-        const at=a.codexTurnId??a["turn.id"]??a.turn_id,bt=b.codexTurnId??b["turn.id"]??b.turn_id;
-        const ar=a.request_id??a.call_id,br=b.request_id??b.call_id;
-        return !(at&&bt&&at!==bt||ar&&br&&ar!==br) &&
-          !((at||ar)&&(bt||br)&&!(at&&at===bt||ar&&ar===br));
-      })() &&
+      !(codexResponseIdentities(event.metadata).length && codexResponseIdentities(p.event.metadata).length &&
+        !codexResponseIdentityOverlap(event.metadata,p.event.metadata)) &&
       sameCounts(event, p.event) &&
       (!p.pairedId || p.pairedId === rawId) &&
       Math.min(

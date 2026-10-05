@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { frozenCodexCapture } from "./codex-named-capture";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
 
-import { estimateCostUsd, type AiInteractionEvent } from "../../shared/src/index";
+import { estimateCostUsd, codexResponseIdentities, codexResponseIdentityOverlap, type AiInteractionEvent } from "../../shared/src/index";
 import { refreshUnsentRawDelivery, retirePairedSpanDelivery } from "./outbox";
 import { isSqliteContentionError } from "./sqlite-contention";
 
@@ -104,8 +104,7 @@ type Shape = {
   traceId: string | null;
   spanEndAt: string | null;
   authoritativeSession: boolean;
-  turnId: unknown;
-  requestId: unknown;
+  identities: Record<string, unknown>;
 };
 
 function shape(row: UsageRow): Shape | null {
@@ -124,8 +123,7 @@ function shape(row: UsageRow): Shape | null {
       spanEndAt: typeof metadata.otelSpanEndAt === "string" ? metadata.otelSpanEndAt : null,
       authoritativeSession: metadata.sessionLinkBasis === "otel_trace" ||
         metadata.sessionLinkBasis === "span_attribute",
-      turnId: metadata.codexTurnId ?? metadata["turn.id"] ?? metadata.turn_id,
-      requestId: metadata.request_id ?? metadata.call_id,
+      identities: metadata,
     };
   } catch {
     return null;
@@ -140,9 +138,8 @@ function isUsageRow(row: UsageRow) {
 
 function compatible(log: UsageRow, span: UsageRow, logShape: Shape, spanShape: Shape) {
   if (logShape.kind !== "log" || spanShape.kind !== "span") return false;
-  const lt=logShape.turnId,st=spanShape.turnId,lr=logShape.requestId,sr=spanShape.requestId;
-  if(lt&&st&&lt!==st||lr&&sr&&lr!==sr)return false;
-  if((lt||lr)&&(st||sr)&&!(lt&&lt===st||lr&&lr===sr))return false;
+  if(codexResponseIdentities(logShape.identities).length && codexResponseIdentities(spanShape.identities).length &&
+    !codexResponseIdentityOverlap(logShape.identities,spanShape.identities))return false;
   // Historical pairing also classifies old diagnostics with no install
   // columns. Missing identity cannot promote their model: capture admission
   // separately checks its complete boundary. Known installs never cross.

@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { providerAccountKey, usageFieldKeys, type AiInteractionEvent } from "../../shared/src/index";
+import { providerAccountKey, usageFieldKeys, codexResponseIdentities, codexResponseIdentityOverlap, codexResponseIdentityConflict, type AiInteractionEvent } from "../../shared/src/index";
 import { captureCodexModel, codexHasUsage, isCaptureGap } from "./codex-model-capture";
 import { frozenCodexCapture } from "./codex-named-capture";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -23,14 +23,9 @@ type Row = { rowid: number; id: string; created: string; generation: string; wor
 const columns = `e.rowid,e.id,e.created_at as created,e.privacy_generation as generation,
   e.workspace_id as workspace,e.device_id as device,e.installation_epoch_id as epoch,
   e.payload_json as payload,e.usage_duplicate_reason as duplicate,e.uploaded_at as uploaded`;
-const turn = (e: AiInteractionEvent) => e.metadata.codexTurnId ?? e.metadata["turn.id"] ?? e.metadata.turn_id;
-const request = (e: AiInteractionEvent) => e.metadata.request_id ?? e.metadata.call_id;
-const key = (value: unknown): value is string => typeof value === "string" && value.length > 0;
-const explicitIdentity = (e: AiInteractionEvent) => key(request(e)) || key(turn(e));
-function sameResponse(a: AiInteractionEvent, b: AiInteractionEvent) {
-  const ar=request(a),br=request(b),at=turn(a),bt=turn(b);
-  return key(ar)&&ar===br || key(at)&&at===bt;
-}
+const identityKeys = (e: AiInteractionEvent) => codexResponseIdentities(e.metadata).map(node => node.kind+":"+node.value);
+const explicitIdentity = (e: AiInteractionEvent) => identityKeys(e).length > 0;
+const sameResponse = (a: AiInteractionEvent, b: AiInteractionEvent) => codexResponseIdentityOverlap(a.metadata,b.metadata);
 const native = (e: AiInteractionEvent) => e.eventType === "usage_rollout" && e.metadata.usageSource === "rollout";
 const sse = (e: AiInteractionEvent) => e.metadata.otelEventName === "codex.sse_event";
 const span = (e: AiInteractionEvent) => e.metadata.otelEventName === "handle_responses";
@@ -61,10 +56,7 @@ function compatible(a: AiInteractionEvent, b: AiInteractionEvent, exactPair = fa
       !(native(a) && otlp(b) || otlp(a) && native(b) || sse(a) && otlp(b) || otlp(a) && sse(b) ||
         explicit && (native(a)&&native(b) || otlp(a)&&otlp(b)))) return false;
   if (!explicit && !exactPair && otlp(a) && otlp(b) && (!a.metadata.traceId || a.metadata.traceId !== b.metadata.traceId)) return false;
-  const requestA=request(a),requestB=request(b);
-  if (!explicit && requestA && requestB && requestA !== requestB) return false;
-  const at = turn(a), bt = turn(b);
-  if (!explicit && at && bt && at !== bt) return false;
+  if (!explicit && codexResponseIdentityConflict(a.metadata,b.metadata)) return false;
   // Native cumulative counters can retain a complete earlier SSE portion.
   // This is a directional exact-counter match, never a nearest-time choice:
   // a future SSE cannot consume an older native counter. Partial reports
@@ -117,26 +109,30 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     // Read the transitive closure of admitted aliases, including financially
     // covered OTLP rows. A zero-remainder bridge is still native identity
     // evidence. Every read is scoped to this incarnation's boundary/privacy;
-    // request and turn namespaces remain separate. Page both keys and rows.
+    // request, call and turn namespaces remain separate. Page both keys and rows.
     const identityEligible=terminalPrivacyEligibilitySql(db,"e",{includeUsageDuplicates:true});
-    const pending: Array<{kind:"request"|"turn";value:string}>=[];
+    const pending: Array<{kind:"request"|"call"|"turn";value:string}>=[];
     const seenKeys=new Set<string>(),seenRows=new Set<number>();
     const enqueue=(observation:AiInteractionEvent)=>{
-      for(const [kind,value] of [["request",request(observation)],["turn",turn(observation)]] as const)
-        if(key(value)&&!seenKeys.has(kind+":"+value)) {
+      for(const {kind,value} of codexResponseIdentities(observation.metadata))
+        if(!seenKeys.has(kind+":"+value)) {
           seenKeys.add(kind+":"+value);pending.push({kind,value});
         }
     };
     enqueue(event);rows=[];
     while(pending.length) {
       const batch=pending.splice(0,64),matches:string[]=[],values:string[]=[];
-      for(const kind of ["request","turn"] as const) {
+      for(const kind of ["request","call","turn"] as const) {
         const keys=batch.filter(k=>k.kind===kind).map(k=>k.value);
         if(!keys.length)continue;
-        const expression=kind==="request"
-          ? "coalesce(json_extract(e.payload_json,'$.metadata.request_id'),json_extract(e.payload_json,'$.metadata.call_id'))"
-          : "coalesce(json_extract(e.payload_json,'$.metadata.codexTurnId'),json_extract(e.payload_json,'$.metadata.\"turn.id\"'),json_extract(e.payload_json,'$.metadata.turn_id'))";
-        matches.push(expression+" in ("+keys.map(()=>"?").join(",")+")");values.push(...keys);
+        const expressions=kind==="turn" ? [
+          "json_extract(e.payload_json,'$.metadata.codexTurnId')",
+          "json_extract(e.payload_json,'$.metadata.\"turn.id\"')",
+          "json_extract(e.payload_json,'$.metadata.turn_id')",
+        ] : ["json_extract(e.payload_json,'$.metadata."+(kind==="request"?"request_id":"call_id")+"')"];
+        for(const expression of expressions) {
+          matches.push(expression+" in ("+keys.map(()=>"?").join(",")+")");values.push(...keys);
+        }
       }
       const query=`select ${columns} from buffered_events e where e.source='codex' and e.session_id=?
         and e.id<>? and e.workspace_id=? and e.device_id=? and e.installation_epoch_id=? and ${identityEligible}
@@ -175,22 +171,18 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
   const originals=new Map(rows.map(row=>[row.id,
     originalCoveredResponse(db,row.id)??JSON.parse(row.payload) as AiInteractionEvent]));
   const responseKeys=new Set<string>();
-  const addKeys=(e:AiInteractionEvent)=>{
-    if(key(request(e)))responseKeys.add("request:"+request(e));
-    if(key(turn(e)))responseKeys.add("turn:"+turn(e));
-  };
+  const addKeys=(e:AiInteractionEvent)=>{for(const value of identityKeys(e))responseKeys.add(value);};
   addKeys(event);
-  // Closure rows above are identity facts; exact anonymous candidates below
-  // never turn unrelated explicit identities into aliases.
+  // Every admitted observation links every co-present identity, including
+  // zero-remainder diagnostics. These persisted links survive ACK and restart.
   let changed=true;
   while(changed) {
     changed=false;
-    for(const identity of originals.values())if(
-      responseKeys.has("request:"+request(identity))||responseKeys.has("turn:"+turn(identity))) {
+    for(const identity of originals.values())if(identityKeys(identity).some(value=>responseKeys.has(value))) {
       const before=responseKeys.size;addKeys(identity);changed ||= before!==responseKeys.size;
     }
   }
-  const inResponse=(e:AiInteractionEvent)=>responseKeys.has("request:"+request(e))||responseKeys.has("turn:"+turn(e));
+  const inResponse=(e:AiInteractionEvent)=>identityKeys(e).some(value=>responseKeys.has(value));
   const related=(a:AiInteractionEvent,b:AiInteractionEvent)=>sameResponse(a,b)||inResponse(a)&&inResponse(b);
   const fits=(a:AiInteractionEvent,b:AiInteractionEvent,exact=false)=>compatible(a,b,exact,related(a,b));
   // A released ACK has no recoverable envelope bytes. Its qualified native

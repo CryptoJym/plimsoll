@@ -4,6 +4,32 @@ import {
 } from "./schemas";
 import { linkageHash } from "./linkage";
 
+/** Producer identities have separate namespaces. Co-present values are links,
+ * including a call shared by observations with different request IDs. The
+ * collector scopes any union to workspace/device/install/session/account. */
+export function codexResponseIdentities(metadata: Record<string, unknown>) {
+  const nodes: Array<{ kind: "request" | "call" | "turn"; value: string }> = [];
+  for (const [kind, aliases] of [
+    ["request", ["request_id"]], ["call", ["call_id"]],
+    ["turn", ["codexTurnId", "turn.id", "turn_id"]],
+  ] as const) for (const alias of aliases) {
+    const value = metadata[alias];
+    if (typeof value === "string" && value.trim() &&
+        !nodes.some(node => node.kind === kind && node.value === value)) nodes.push({ kind, value });
+  }
+  return nodes;
+}
+export function codexResponseIdentityOverlap(a: Record<string, unknown>, b: Record<string, unknown>) {
+  const right = codexResponseIdentities(b);
+  return codexResponseIdentities(a).some(left => right.some(node =>
+    left.kind === node.kind && left.value === node.value));
+}
+export function codexResponseIdentityConflict(a: Record<string, unknown>, b: Record<string, unknown>) {
+  if (codexResponseIdentityOverlap(a, b)) return false;
+  const right = codexResponseIdentities(b);
+  return codexResponseIdentities(a).some(left => right.some(node => left.kind === node.kind));
+}
+
 const SESSION_ID_KEYS = [
   "sessionId",
   "session_id",
