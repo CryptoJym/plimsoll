@@ -9,7 +9,7 @@ import { rowHasAdmittedUsage } from '../packages/collector-cli/src/usage-authori
 import { aiInteractionEventSchema, type AiInteractionEvent } from '../packages/shared/src/index';
 import { nativeCodexFixture } from './lib/native-codex-fixture';
 import { createProofCompletion } from './lib/proof-completion';
-const completion = createProofCompletion('codex-capture-legacy-density',44);
+const completion = createProofCompletion('codex-capture-legacy-density',47);
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-legacy-density-'));
 const at=new Date().toISOString();
 const event=(n:number)=>aiInteractionEventSchema.parse({id:`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,
@@ -172,5 +172,29 @@ try {
    isCaptureGap(gap)&&gap.metadata.modelGapReason==='conflicting_pair_model_evidence'&&
    gap.inputTokens===undefined&&gap.outputTokens===undefined&&gap.metadata.modelGapInputTokens===0&&gap.metadata.modelGapOutputTokens===7);
  }finally{paired.close();}
+ const fresh=open('fresh-native-canonical-validation');
+ try {
+  const good={...event(1),...nativeCodexFixture('fresh-canonical')};fresh.append(good);
+  const lease=fresh.delivery.lease({now:new Date(Date.now()+61_000)});
+  const item=lease.items.find(item=>item.rawId===good.id);
+  completion.check('fresh_native_zero_and_known_counters_keep_canonical_delivery',!!item&&
+   item.envelope.event.model===good.model&&item.envelope.event.inputTokens===0&&item.envelope.event.outputTokens===7&&
+   item.envelopeJson===JSON.stringify(item.envelope));
+  assert.ok(item);
+  const badBytes=JSON.stringify({...item.envelope,event:{...item.envelope.event,
+   metadata:{...item.envelope.event.metadata,serviceName:'sk_live_fixture_123456789012345678901234'}}});
+  fresh.database.prepare(`update upload_outbox set state='retry',lease_id=null,lease_expires_at=null,
+   next_attempt_at=?,sealed_envelope_json=?,sealed_bytes=? where delivery_id=?`).run(at,badBytes,Buffer.byteLength(badBytes),item.deliveryId);
+  const retry=fresh.delivery.lease({now:new Date(Date.now()+62_000)});
+  completion.check('frozen_named_retry_still_rejects_unsafe_bytes',retry.items.length===0&&retry.locallyDead===1);
+ }finally{fresh.close();}
+ const unsafeFresh=open('unsafe-fresh-native');
+ try {
+  const good={...event(1),...nativeCodexFixture('unsafe-fresh')};unsafeFresh.append(good);
+  unsafeFresh.database.prepare('update buffered_events set payload_json=? where id=?').run(JSON.stringify({...good,
+   metadata:{...good.metadata,serviceName:'sk_live_fixture_123456789012345678901234'}}),good.id);
+  const lease=unsafeFresh.delivery.lease({now:new Date(Date.now()+61_000)});
+  completion.check('fresh_native_capture_still_rejects_unsafe_raw_metadata',lease.items.length===0&&lease.locallyDead===1);
+ }finally{unsafeFresh.close();}
  completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}

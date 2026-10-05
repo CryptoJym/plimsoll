@@ -2433,6 +2433,11 @@ export class DeliveryOutbox {
         const namedWitness = frozenCodexDelivery(this.db,row);
         let envelopeJson = row.sealedEnvelopeJson ??
           namedWitness?.envelopeJson;
+        // Only this iteration's freshly validated native Codex result can
+        // reuse its canonical object. Frozen/retry bytes still pass the full
+        // parse and byte-for-byte privacy gate below. No metadata flag can
+        // create this local validation result.
+        let freshNativeEnvelope: AiWorkIngestEvent | undefined;
         if (!row.sealedEnvelopeJson && envelopeJson) this.db.prepare(`update upload_outbox set
           sealed_envelope_json=?,sealed_bytes=?,updated_at=? where delivery_id=? and sealed_envelope_json is null`)
           .run(envelopeJson,Buffer.byteLength(envelopeJson),nowIso,row.deliveryId);
@@ -2508,12 +2513,14 @@ export class DeliveryOutbox {
             )
             .run({ deliveryId: row.deliveryId, envelopeJson, envelopeBytes, now: nowIso });
           rememberFrozenCodexCapture(this.db,row.rawId ?? parsed.event.id,row.deliveryId,envelopeJson,captured);
+          if (captured.source === "codex" && captured.model && captured.metadata.modelCaptureSource &&
+              !isCaptureGap(captured) && codexHasUsage(captured)) freshNativeEnvelope = sealed.envelope;
         }
         // Older builds may already have sealed an evidence-marked item. The
         // sealed copy is not trusted merely because it predates this gate.
         let outboundEnvelope: AiWorkIngestEvent;
         try {
-          outboundEnvelope = aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
+          outboundEnvelope = freshNativeEnvelope ?? aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
         } catch {
           locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso, disposedRawRowids);
           continue;
@@ -2534,10 +2541,12 @@ export class DeliveryOutbox {
           );
           continue;
         }
-        const revalidated = sealOutboundEnvelope(outboundEnvelope);
-        if (!revalidated.ok || JSON.stringify(revalidated.envelope) !== envelopeJson) {
-          locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
-          continue;
+        if (!freshNativeEnvelope) {
+          const revalidated = sealOutboundEnvelope(outboundEnvelope);
+          if (!revalidated.ok || JSON.stringify(revalidated.envelope) !== envelopeJson) {
+            locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
+            continue;
+          }
         }
         let sealedOriginGap = false;
         if (row.sealedEnvelopeJson && codexHasUsage(outboundEnvelope.event)) {
