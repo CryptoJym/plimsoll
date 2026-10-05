@@ -1,4 +1,6 @@
+import { createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -19,6 +21,9 @@ import { readBoundedRegularFile, type BoundedRegularFileRead } from "./safe-file
  */
 
 const cache = new Map<string, { at: number; context: GitLinkageContext | undefined }>();
+// Process-local, opaque cache identities only. Neither raw paths nor a stable
+// working-directory digest are retained, persisted or sent to a reader.
+const cacheKeySalt = randomBytes(32);
 const CACHE_TTL_MS = 30_000;
 const POINTER_LIMIT_BYTES = 4 * 1024;
 const HEAD_LIMIT_BYTES = 4 * 1024;
@@ -27,6 +32,7 @@ const CONFIG_LIMIT_BYTES = 256 * 1024;
 const PACKED_REFS_LIMIT_BYTES = 1024 * 1024;
 
 type LocatedGitDir = { gitDir: string; commonDir: string; isWorktree: boolean };
+type HomeBoundary = { directory: string; device: bigint; inode: bigint };
 type GitLookup<T> = { kind: "ok"; value: T } | { kind: "missing" } | { kind: "unsafe" };
 
 function readText(filePath: string, limitBytes: number): BoundedRegularFileRead {
@@ -45,9 +51,34 @@ function containedGitPath(root: string, relative: string) {
   return resolved.startsWith(`${resolvedRoot}${path.sep}`) ? resolved : undefined;
 }
 
-function findGitDir(startDir: string): GitLookup<LocatedGitDir> {
-  let dir = path.resolve(startDir);
+function resolvedUserHome(): HomeBoundary | undefined {
+  try {
+    const home = os.homedir();
+    if (!home || !path.isAbsolute(home)) return undefined;
+    const resolved = fs.realpathSync(home);
+    const stat = fs.statSync(resolved, { bigint: true });
+    return stat.isDirectory()
+      ? { directory: resolved, device: stat.dev, inode: stat.ino }
+      : undefined;
+  } catch {
+    // Without a verified home boundary, no filesystem-derived linkage is safe.
+    return undefined;
+  }
+}
+
+function findGitDir(startDir: string, home: HomeBoundary): GitLookup<LocatedGitDir> {
+  let dir = fs.realpathSync(path.resolve(startDir));
   for (let depth = 0; depth < 24; depth += 1) {
+    // Test the boundary BEFORE inspecting .git, including when cwd is the
+    // boundary itself. Never discover a repository above the user's home.
+    if (dir === home.directory || dir === path.parse(dir).root) return { kind: "missing" };
+    // realpath can preserve spelling on case-insensitive volumes. Directory
+    // identity also catches case/Unicode aliases of the same home folder.
+    const directoryStat = fs.statSync(dir, { bigint: true });
+    if (!directoryStat.isDirectory()) return { kind: "unsafe" };
+    if (directoryStat.dev === home.device && directoryStat.ino === home.inode) {
+      return { kind: "missing" };
+    }
     const dotGit = path.join(dir, ".git");
     let stat: fs.BigIntStats | undefined;
     try {
@@ -160,10 +191,10 @@ function resolveRemoteUrl(commonDir: string): GitLookup<string | undefined> {
   return { kind: "ok", value: firstRemoteUrl };
 }
 
-function resolveGitContextCore(cwd: string): GitLinkageContext | undefined {
+function resolveGitContextCore(cwd: string, home: HomeBoundary): GitLinkageContext | undefined {
   let context: GitLinkageContext | undefined;
   try {
-    const located = findGitDir(cwd);
+    const located = findGitDir(cwd, home);
     if (located.kind === "ok") {
       const { gitDir, commonDir, isWorktree } = located.value;
       const head = resolveHead(gitDir, commonDir);
@@ -198,24 +229,37 @@ function resolveGitContextCore(cwd: string): GitLinkageContext | undefined {
  */
 export function resolveGitContextUncached(cwd: string | undefined): GitLinkageContext | undefined {
   if (!cwd || typeof cwd !== "string") return undefined;
-  return resolveGitContextCore(cwd);
+  const home = resolvedUserHome();
+  return home ? resolveGitContextCore(cwd, home) : undefined;
 }
 
 export function resolveGitContext(cwd: string | undefined): GitLinkageContext | undefined {
   if (!cwd || typeof cwd !== "string") return undefined;
 
-  const cached = cache.get(cwd);
+  const home = resolvedUserHome();
+  if (!home) return undefined;
+  const key = createHmac("sha256", cacheKeySalt)
+    .update(JSON.stringify([home.directory, home.device.toString(), home.inode.toString(), cwd]))
+    .digest("hex");
+  const cached = cache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
     return cached.context;
   }
 
-  const context = resolveGitContextCore(cwd);
+  const context = resolveGitContextCore(cwd, home);
 
-  cache.set(cwd, { at: Date.now(), context });
+  cache.set(key, { at: Date.now(), context });
   return context;
 }
 
 /** Numeric-only proof seam. Raw cache keys and values remain inaccessible. */
 export function gitContextCacheSizeForProof() {
   return cache.size;
+}
+
+/** Numeric-only privacy seam; it never exposes a cache key or raw path. */
+export function gitContextCacheNonDigestKeyCountForProof() {
+  let count = 0;
+  for (const key of cache.keys()) if (!/^[0-9a-f]{64}$/.test(key)) count += 1;
+  return count;
 }

@@ -1,24 +1,45 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { pathToFileURL } from "node:url";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { resolveGitContext } from "../packages/collector-cli/src/git-context";
+import {
+  gitContextCacheNonDigestKeyCountForProof,
+  gitContextCacheSizeForProof,
+  resolveGitContext,
+  resolveGitContextUncached,
+} from "../packages/collector-cli/src/git-context";
+import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
+import {
+  attachRepoContextId,
+  attachRepoContextSidecar,
+  REPO_CONTEXT_RESOLVER_VERSION,
+  resolveRepoContextRequests,
+} from "../packages/collector-cli/src/repo-context";
 import { readBoundedRegularFile } from "../packages/collector-cli/src/safe-file-read";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
-import { branchLinkageHash, remoteLinkageHash } from "../packages/shared/src/index";
+import {
+  aiInteractionEventSchema,
+  branchLinkageHash,
+  remoteLinkageHash,
+  type GitLinkageContext,
+} from "../packages/shared/src/index";
 
 const HEAD_SHA = "918424fd85571dc1368400ab06ca7540f44127e1";
 const WORKTREE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PACKED_SHA = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const REMOTE = "https://github.com/CryptoJym/plimsoll.git";
 const REMOTE_LABEL = "github.com/cryptojym/plimsoll";
+const LEGACY_COMMIT = "71d6ff27f0d39aa31d188c9bcc31d37bf188c384";
+const LEGACY_RESOLVER_SHA256 = "90455ab531d63287c9716c485f709856648170a9c9bfecc0bdcf6c5612943c5f";
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
 
 function check(name: string, condition: unknown, detail: Record<string, unknown>) {
@@ -44,6 +65,388 @@ function normalRepo(root: string, name: string, branch = "main", sha = HEAD_SHA)
   write(path.join(git, "refs", "heads", branch), `${sha}\n`);
   write(path.join(git, "config"), `[remote "origin"]\n\turl = ${REMOTE}\n`);
   return { repo, git };
+}
+
+function withHome<T>(home: string, run: () => T): T {
+  const originalHome = os.homedir;
+  os.homedir = () => home;
+  try { return run(); } finally { os.homedir = originalHome; }
+}
+
+function fullLinkage(context: GitLinkageContext | undefined, branch = "main", sha = HEAD_SHA) {
+  return context?.remoteUrlHash === remoteLinkageHash(REMOTE) &&
+    context.branchHash === branchLinkageHash(branch) && context.headSha === sha;
+}
+
+function proveHomeBoundaries(root: string) {
+  const parent = normalRepo(root, "home-boundary-parent");
+  const home = normalRepo(parent.repo, "home");
+  withHome(home.repo, () => {
+    check("home_git_itself_sends_no_remote_branch_or_head",
+      resolveGitContext(home.repo) === undefined && resolveGitContextUncached(home.repo) === undefined,
+      { cachedAndUncached: true, linkageAbsent: true });
+    for (const depth of [1, 4, 30]) {
+      const chat = path.join(home.repo, ...Array.from({ length: depth }, (_, i) => `chat-${i}`));
+      fs.mkdirSync(chat, { recursive: true, mode: 0o700 });
+      check(`home_only_chat_at_depth_${depth}_sends_no_linkage`,
+        resolveGitContext(chat) === undefined && resolveGitContextUncached(chat) === undefined,
+        { depth, cachedAndUncached: true, linkageAbsent: true });
+    }
+
+    const ordinary = normalRepo(home.repo, "ordinary");
+    const inner = path.join(ordinary.repo, "src", "deep");
+    fs.mkdirSync(inner, { recursive: true, mode: 0o700 });
+    check("real_repository_below_git_home_keeps_own_linkage",
+      fullLinkage(resolveGitContext(inner)), { remote: true, branch: true, head: true });
+    const nested = normalRepo(ordinary.repo, "nested", "nested", PACKED_SHA);
+    check("nested_repository_below_git_home_uses_nearest_repository",
+      fullLinkage(resolveGitContext(nested.repo), "nested", PACKED_SHA),
+      { nearestBranchAndHead: true });
+    const twoLevels = normalRepo(home.repo, "projects/real", "two-levels", WORKTREE_SHA);
+    check("repository_two_levels_below_git_home_keeps_linkage",
+      fullLinkage(resolveGitContext(twoLevels.repo), "two-levels", WORKTREE_SHA), { levels: 2 });
+
+    const worktree = path.join(home.repo, "lanes", "worktree");
+    const worktreeGit = path.join(ordinary.git, "worktrees", "home-proof");
+    write(path.join(worktree, ".git"), `gitdir: ${path.relative(worktree, worktreeGit)}\n`);
+    write(path.join(worktreeGit, "commondir"), "../..\n");
+    write(path.join(worktreeGit, "HEAD"), "ref: refs/heads/home-worktree\n");
+    write(path.join(ordinary.git, "refs", "heads", "home-worktree"), `${WORKTREE_SHA}\n`);
+    const worktreeContext = resolveGitContext(worktree);
+    check("worktree_below_git_home_keeps_pointer_common_config_and_ref",
+      worktreeContext?.isWorktree && fullLinkage(worktreeContext, "home-worktree", WORKTREE_SHA),
+      { relativePointer: true, commonConfigAndRef: true });
+
+    const alias = path.join(root, "home-alias");
+    fs.symlinkSync(home.repo, alias, "dir");
+    check("symlinked_cwd_at_home_and_below_home_cannot_bypass_boundary",
+      resolveGitContext(alias) === undefined &&
+      resolveGitContext(path.join(alias, "chat-0")) === undefined,
+      { homeAndChild: true });
+    withHome(alias, () => {
+      check("symlinked_running_user_home_resolves_to_same_boundary",
+        resolveGitContext(home.repo) === undefined && fullLinkage(resolveGitContext(ordinary.repo)),
+        { homeExcluded: true, realRepositoryLinked: true });
+    });
+    const caseAlias = path.join(parent.repo, "HOME");
+    if (fs.existsSync(caseAlias)) {
+      check("case_alias_of_home_and_home_only_chat_sends_no_linkage",
+        resolveGitContext(caseAlias) === undefined &&
+        resolveGitContextUncached(path.join(caseAlias, "chat-0")) === undefined &&
+        withHome(caseAlias, () => resolveGitContextUncached(home.repo)) === undefined &&
+        fullLinkage(resolveGitContext(path.join(caseAlias, "ordinary"))),
+        { caseInsensitiveVolume: true, directoryIdentityUsed: true, realRepositoryLinked: true });
+    } else {
+      check("case_sensitive_volume_has_no_alias_of_home",
+        !fs.existsSync(caseAlias), { caseInsensitiveVolume: false });
+    }
+
+    // Remove home's .git to prove that discovery cannot continue into the
+    // parent repository. Observe both forbidden metadata paths directly.
+    fs.renameSync(home.git, path.join(home.repo, "saved-git"));
+    const originalLstat = fs.lstatSync;
+    let forbiddenReads = 0;
+    fs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) => {
+      if (String(file) === home.git || String(file) === parent.git) forbiddenReads += 1;
+      return originalLstat(file, options);
+    }) as typeof fs.lstatSync;
+    try {
+      check("walk_stops_before_home_metadata_and_never_reaches_parent_repository",
+        resolveGitContextUncached(path.join(home.repo, "chat-0")) === undefined && forbiddenReads === 0,
+        { forbiddenMetadataReads: forbiddenReads });
+    } finally { fs.lstatSync = originalLstat; }
+    write(home.git, `gitdir: ${parent.git}\n`);
+    check("home_git_file_pointer_is_excluded_before_following_it",
+      resolveGitContextUncached(home.repo) === undefined &&
+      resolveGitContextUncached(path.join(home.repo, "chat-0")) === undefined,
+      { homeAndChild: true, pointerNotFollowed: true });
+    fs.unlinkSync(home.git);
+    fs.renameSync(path.join(home.repo, "saved-git"), home.git);
+
+    // Changing the running-user home must also change the cache identity.
+    check("cache_is_scoped_to_resolved_running_user_home",
+      fullLinkage(resolveGitContext(ordinary.repo)) &&
+      withHome(ordinary.repo, () => resolveGitContext(ordinary.repo)) === undefined &&
+      fullLinkage(resolveGitContext(ordinary.repo)), { homesSeparated: true });
+  });
+
+  for (const kind of ["missing", "relative", "file", "throws"] as const) {
+    const homeFile = path.join(root, "home-is-file");
+    write(homeFile, "fixture\n");
+    const originalHome = os.homedir;
+    os.homedir = () => {
+      if (kind === "throws") throw new Error("home resolution unavailable");
+      return kind === "missing" ? path.join(root, "missing-home")
+        : kind === "relative" ? "relative-home" : homeFile;
+    };
+    try {
+      check(`unresolved_${kind}_home_fails_closed_even_for_real_repository`,
+        resolveGitContext(parent.repo) === undefined && resolveGitContextUncached(parent.repo) === undefined,
+        { cachedAndUncached: true, linkageAbsent: true });
+    } finally { os.homedir = originalHome; }
+  }
+}
+
+function proveDiskRootAndOtherVolume(root: string) {
+  const fakeGit = normalRepo(root, "root-git-metadata");
+  const child = path.join(root, "root-only-child", "deeper");
+  fs.mkdirSync(child, { recursive: true, mode: 0o700 });
+  const diskRoot = path.parse(fs.realpathSync(root)).root;
+  const originalLstat = fs.lstatSync;
+  let rootGitReads = 0;
+  fs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) => {
+    if (String(file) === path.join(diskRoot, ".git")) {
+      rootGitReads += 1;
+      return originalLstat(fakeGit.git, options);
+    }
+    if (path.basename(String(file)) === ".git") {
+      throw Object.assign(new Error("fixture missing"), { code: "ENOENT" });
+    }
+    return originalLstat(file, options);
+  }) as typeof fs.lstatSync;
+  try {
+    withHome(fakeGit.repo, () => {
+      check("disk_root_git_is_never_read_at_root_or_from_descendants",
+        resolveGitContextUncached(diskRoot) === undefined &&
+        resolveGitContextUncached(child) === undefined && rootGitReads === 0,
+        { rootAndDescendant: true, syntheticRootGit: true, rootGitReads });
+    });
+  } finally { fs.lstatSync = originalLstat; }
+
+  // A mounted-volume namespace is injected onto real fixture metadata; no
+  // file is created outside the disposable proof root.
+  const volumeRepo = normalRepo(root, "volume-metadata");
+  const mountedCwd = path.join(diskRoot, "Volumes", "git-context-proof", "project");
+  const originalRealpath = fs.realpathSync;
+  const originalOpen = fs.openSync;
+  const originalStat = fs.statSync;
+  const translate = (file: fs.PathLike) => {
+    const value = String(file);
+    return value === mountedCwd || value.startsWith(`${mountedCwd}${path.sep}`)
+      ? path.join(volumeRepo.repo, path.relative(mountedCwd, value)) : file;
+  };
+  fs.realpathSync = Object.assign(((file: fs.PathLike) =>
+    String(file) === mountedCwd ? mountedCwd : originalRealpath(file)) as typeof fs.realpathSync,
+  { native: originalRealpath.native });
+  fs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) =>
+    originalLstat(translate(file), options)) as typeof fs.lstatSync;
+  fs.statSync = ((file: fs.PathLike, options?: fs.StatOptions) =>
+    originalStat(translate(file), options)) as typeof fs.statSync;
+  fs.openSync = ((file: fs.PathLike, flags: string | number, mode?: fs.Mode) =>
+    originalOpen(translate(file), flags, mode)) as typeof fs.openSync;
+  try {
+    check("repository_on_another_volume_keeps_linkage",
+      fullLinkage(resolveGitContextUncached(mountedCwd)),
+      { simulatedMountedVolume: true, realBoundedMetadataReads: true });
+  } finally {
+    fs.realpathSync = originalRealpath;
+    fs.lstatSync = originalLstat;
+    fs.statSync = originalStat;
+    fs.openSync = originalOpen;
+  }
+}
+
+function proveCacheAndPrivacy(root: string) {
+  const home = normalRepo(root, "cache-home");
+  const repo = normalRepo(home.repo, "real");
+  const empty = path.join(home.repo, "new-repo");
+  fs.mkdirSync(empty, { mode: 0o700 });
+  const originalNow = Date.now;
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  const messages: unknown[][] = [];
+  const uncachedSizeBefore = gitContextCacheSizeForProof();
+  withHome(home.repo, () => {
+    resolveGitContextUncached(repo.repo);
+    resolveGitContextUncached(empty);
+  });
+  check("uncached_real_and_home_only_lookups_retain_no_cache_entry",
+    gitContextCacheSizeForProof() === uncachedSizeBefore, { cacheGrowth: 0 });
+  let now = 1_000_000;
+  Date.now = () => now;
+  console.log = console.warn = console.error = (...args: unknown[]) => { messages.push(args); };
+  try {
+    withHome(home.repo, () => {
+      const first = resolveGitContext(repo.repo);
+      const absent = resolveGitContext(empty);
+      write(path.join(repo.git, "refs", "heads", "main"), `${WORKTREE_SHA}\n`);
+      normalRepo(home.repo, "new-repo", "new", PACKED_SHA);
+      now += 29_999;
+      check("thirty_second_cache_keeps_positive_and_negative_results_until_expiry",
+        fullLinkage(first) && absent === undefined && fullLinkage(resolveGitContext(repo.repo)) &&
+        resolveGitContext(empty) === undefined, { ttlMs: 30_000, elapsedMs: 29_999 });
+      now += 1;
+      check("thirty_second_cache_refreshes_positive_and_negative_results_at_expiry",
+        fullLinkage(resolveGitContext(repo.repo), "main", WORKTREE_SHA) &&
+        fullLinkage(resolveGitContext(empty), "new", PACKED_SHA), { ttlMs: 30_000, elapsedMs: 30_000 });
+    });
+  } finally {
+    Date.now = originalNow;
+    console.log = originalLog;
+    console.warn = originalWarn;
+    console.error = originalError;
+  }
+  check("compatibility_cache_retains_only_opaque_keys_and_resolver_logs_no_raw_paths",
+    gitContextCacheNonDigestKeyCountForProof() === 0 && messages.length === 0,
+    { nonOpaqueCacheKeys: gitContextCacheNonDigestKeyCountForProof(), logMessages: messages.length });
+}
+
+async function proveUpgradeSpanningCapture(root: string) {
+  const resolverPath = "packages/collector-cli/src/git-context.ts";
+  const bufferPath = "packages/collector-cli/src/buffer.ts";
+  const legacySource = execFileSync("git", ["show", `${LEGACY_COMMIT}:${resolverPath}`],
+    { encoding: "utf8", maxBuffer: 1024 * 1024 });
+  const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+  const legacyTree = path.join(root, "released-0.7.51");
+  execFileSync("git", ["worktree", "add", "--detach", "--quiet", legacyTree, LEGACY_COMMIT]);
+  try {
+    fs.symlinkSync(path.resolve("node_modules"), path.join(legacyTree, "node_modules"), "dir");
+    check("upgrade_fixture_uses_pinned_0751_resolver_and_released_collector",
+      hash(legacySource) === LEGACY_RESOLVER_SHA256 &&
+      hash(fs.readFileSync(path.join(legacyTree, resolverPath))) === LEGACY_RESOLVER_SHA256 &&
+      JSON.parse(fs.readFileSync(path.join(legacyTree, "packages/collector-cli/package.json"), "utf8")).version === "0.7.51",
+      { legacyCommit: LEGACY_COMMIT, resolverSha256: LEGACY_RESOLVER_SHA256, legacyVersion: "0.7.51" });
+    const legacy = await import(pathToFileURL(path.join(legacyTree, resolverPath)).href) as {
+      resolveGitContext: typeof resolveGitContext;
+      resolveGitContextUncached: typeof resolveGitContextUncached;
+    };
+    const previous = await import(pathToFileURL(path.join(legacyTree, bufferPath)).href) as {
+      LocalEventBuffer: typeof LocalEventBuffer;
+    };
+    const previousContexts = await import(pathToFileURL(
+      path.join(legacyTree, "packages/collector-cli/src/repo-context.ts"),
+    ).href) as { attachRepoContextSidecar: typeof attachRepoContextSidecar };
+    const home = normalRepo(root, "studio0-upgrade-home");
+    const chat = path.join(home.repo, "Documents", "Codex", "2026-10-05", "chat");
+    fs.mkdirSync(chat, { recursive: true, mode: 0o700 });
+    const real = normalRepo(home.repo, "projects/real", "real-project", PACKED_SHA);
+    const originalHome = os.homedir;
+    os.homedir = () => home.repo;
+    const now = new Date("2026-10-05T12:00:00.000Z");
+    const options = {
+      workspaceId: "00000000-0000-4000-8000-000000000001", deviceId: "git-upgrade-fixture",
+      enrollmentNow: () => now, delivery: { enabled: true, now: () => now },
+    };
+    const ledger = path.join(root, "home-upgrade.sqlite");
+    let buffer: LocalEventBuffer | undefined;
+    try {
+      const oldContext = legacy.resolveGitContext(chat);
+      assert.ok(oldContext);
+      check("studio0_old_rule_primes_home_linked_cache_while_real_repo_has_own_linkage",
+        fullLinkage(oldContext) && fullLinkage(legacy.resolveGitContext(real.repo), "real-project", PACKED_SHA),
+        { oldChatLinkedToHome: true, realRepositoryLinkedSeparately: true });
+      const event = (index: number, context?: GitLinkageContext) => aiInteractionEventSchema.parse({
+        id: deterministicEventId(["home-upgrade", String(index)]),
+        source: "codex", dataMode: "metadata", eventType: "assistant_response",
+        observedAt: now.toISOString(), sessionId: "00000000-0000-4000-8000-000000000913",
+        actorId: "sha256:0123456789abcdef", model: "gpt-6.1-sol", inputTokens: 19, outputTokens: 2,
+        metadata: context ? { git: {
+          remoteUrlHash: context.remoteUrlHash, branchHash: context.branchHash, headSha: context.headSha,
+        } } : {},
+      });
+      buffer = new previous.LocalEventBuffer(ledger, options);
+      const acked = event(0, oldContext);
+      assert.equal(buffer.append(acked), true);
+      const firstLease = buffer.delivery.lease({ now });
+      assert.deepEqual(firstLease.items.map(item => item.deliveryId), [acked.id]);
+      assert.equal(buffer.delivery.acknowledge(firstLease.leaseId!, [acked.id], now).acknowledged, 1);
+
+      const saved = event(1);
+      assert.equal(previousContexts.attachRepoContextSidecar(saved, "legacy-home-context", chat), true);
+      assert.equal(buffer.append(saved), true);
+      const savedRequests = buffer.beginRepoContextResolution(buffer.takeRepoContextBatch());
+      assert.equal(savedRequests.length, 1);
+      const savedContextId = savedRequests[0]!.contextId;
+      assert.equal(buffer.applyRepoContextResults([{
+        contextId: savedContextId, repoHash: oldContext.remoteUrlHash!,
+        branchHash: oldContext.branchHash!, headSha: oldContext.headSha!,
+        resolvedAt: now.toISOString(), resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+      }]).resultsInserted, 1);
+      const sealed = event(2, oldContext);
+      assert.equal(buffer.append(sealed), true);
+      const oldLease = buffer.delivery.lease({ now });
+      assert.deepEqual(oldLease.items.map(item => item.deliveryId).sort(), [saved.id, sealed.id].sort());
+      const unsealed = event(3, oldContext);
+      assert.equal(buffer.append(unsealed), true);
+      const pending = event(4);
+      assert.equal(previousContexts.attachRepoContextSidecar(pending, "queued-before-upgrade", chat), true);
+      assert.equal(buffer.append(pending), true);
+      const preUpgradeDeferred = buffer.beginRepoContextResolution(buffer.takeRepoContextBatch());
+      assert.equal(preUpgradeDeferred.length, 1);
+      const oldIds = [acked.id, saved.id, sealed.id, unsealed.id, pending.id].sort();
+      const snapshot = () => ({
+        rows: JSON.stringify(buffer!.database.prepare(
+          "select * from buffered_events where id in (?,?,?,?,?) order by id",
+        ).all(...oldIds)),
+        outbox: JSON.stringify(buffer!.database.prepare(
+          "select * from upload_outbox where delivery_id in (?,?,?,?,?) order by delivery_id",
+        ).all(...oldIds)),
+        receipts: JSON.stringify(buffer!.database.prepare(
+          "select * from upload_receipts order by delivery_id",
+        ).all()),
+        savedResults: JSON.stringify(buffer!.database.prepare(
+          "select * from repo_context_results order by context_id",
+        ).all()),
+      });
+      const before = snapshot();
+      buffer.close();
+      buffer = new LocalEventBuffer(ledger, options); // collector restart at upgrade
+      check("upgrade_restart_discards_old_thirty_second_cache_without_waiting_for_expiry",
+        resolveGitContext(chat) === undefined && fullLinkage(legacy.resolveGitContext(chat)),
+        { legacyCacheStillLinked: true, upgradedCacheHasNoLinkage: true, ttlMs: 30_000 });
+
+      const fresh = event(5, resolveGitContext(chat));
+      assert.equal(buffer.append(fresh), true);
+      const reused = event(6);
+      assert.equal(attachRepoContextId(reused, savedContextId), true);
+      assert.equal(buffer.append(reused), true);
+      const newOccurrence = event(7);
+      assert.equal(attachRepoContextSidecar(newOccurrence, "fresh-after-upgrade", chat), true);
+      assert.equal(buffer.append(newOccurrence), true);
+      const newRequests = buffer.beginRepoContextResolution(buffer.takeRepoContextBatch());
+      const results = resolveRepoContextRequests([...preUpgradeDeferred, ...newRequests]);
+      const applied = buffer.applyRepoContextResults(results);
+      const after = snapshot();
+      check("upgrade_keeps_all_five_earlier_captured_rows_byte_identical",
+        after.rows === before.rows, { capturedRows: 5, includesAckedSealedUnsealedAndPending: true });
+      check("upgrade_keeps_earlier_sealed_and_unsealed_outbox_rows_byte_identical",
+        after.outbox === before.outbox, { frozenEnvelopes: 2, pendingUnsealedRows: 2 });
+      check("upgrade_keeps_acked_receipt_and_saved_linkage_result_byte_identical",
+        after.receipts === before.receipts && after.savedResults === before.savedResults,
+        { ackedReceipts: 1, savedLinkageResults: 1 });
+      check("upgrade_deferred_home_lookups_return_null_without_filling_earlier_rows",
+        results.length === 2 && results.every(result =>
+          result.repoHash === null && result.branchHash === null && result.headSha === null) &&
+        applied.unknownResults === 2 && applied.rowsFilled === 0,
+        { queuedBeforeUpgrade: 1, queuedAfterUpgrade: 1, unknownResults: applied.unknownResults, rowsFilled: applied.rowsFilled });
+      const read = buffer.database.prepare(
+        "select repo_hash as repo, branch_hash as branch, head_sha as head, input_tokens as input, output_tokens as output from buffered_events where id = ?",
+      );
+      const noLinkage = { repo: null, branch: null, head: null, input: 19, output: 2 };
+      check("upgrade_new_home_resolutions_keep_usage_and_omit_all_linkage",
+        JSON.stringify(read.get(fresh.id)) === JSON.stringify(noLinkage) &&
+        JSON.stringify(read.get(newOccurrence.id)) === JSON.stringify(noLinkage),
+        { freshLookups: 2, inputTokensEach: 19, outputTokensEach: 2 });
+      check("upgrade_later_event_reusing_saved_context_keeps_old_linkage_until_new_occurrence",
+        JSON.stringify(read.get(reused.id)) === JSON.stringify({
+          repo: oldContext.remoteUrlHash, branch: oldContext.branchHash, head: oldContext.headSha, input: 19, output: 2,
+        }) && JSON.stringify(read.get(newOccurrence.id)) === JSON.stringify(noLinkage),
+        { reusedContextStillLinked: true, freshContextNotLinked: true });
+      const retained = JSON.stringify({
+        payloads: buffer.database.prepare("select payload_json from buffered_events").all(),
+        results, receipt: applied, queue: buffer.repoContextQueueStatus(),
+      });
+      check("upgrade_payloads_results_and_queue_receipts_retain_no_raw_working_path",
+        !retained.includes(home.repo) && !retained.includes(chat) && !retained.includes(root),
+        { rawWorkingPathsAbsent: true });
+    } finally {
+      buffer?.close();
+      os.homedir = originalHome;
+    }
+  } finally {
+    execFileSync("git", ["worktree", "remove", "--force", legacyTree], { stdio: "ignore" });
+  }
 }
 
 function withHardDeadline<T>(promise: Promise<T>, milliseconds: number, reason: string) {
@@ -449,6 +852,10 @@ async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "git-ctx-"));
   try {
     proveValidRepositories(root);
+    proveHomeBoundaries(root);
+    proveDiskRootAndOtherVolume(root);
+    proveCacheAndPrivacy(root);
+    await proveUpgradeSpanningCapture(root);
     await proveUnsafeMetadata(root);
     proveReplacementAndBounds(root);
     await proveMaintenanceTailerLatency(root);
