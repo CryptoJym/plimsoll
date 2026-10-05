@@ -8,8 +8,14 @@ import { pathToFileURL } from "node:url";
 
 import { createProofCompletion } from "./lib/proof-completion";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 
-const completion = createProofCompletion("collector-named-usage-rollback", 6);
+const completion = createProofCompletion("collector-named-usage-rollback", 11);
+// Commit A is a reader-only tier release. Commit B enables tier capture and
+// changes this proof's previous reader to the exact commit A, not stock 0.7.49.
+const recordedTierWriter = false;
+const previousReaderCommit = "275fce73c76f8d2a9898cbc52e8ddf5b7a128c9e";
+const previousReaderLabel = "stock-0.7.49";
 // Preserve PR #450's exact writer and all five rollback assertions while
 // testing this scanner branch as an additional reader. No #450 runtime changes
 // or release bump are required in the scanner branch.
@@ -97,6 +103,7 @@ async function main() {
   let writerTree: string | undefined;
   let old048: string | undefined;
   let old047: string | undefined;
+  let old049: string | undefined;
   try {
     try { execFileSync("git", ["cat-file", "-e", `${writerCommit}^{commit}`], { stdio: "ignore" }); }
     catch {
@@ -237,11 +244,96 @@ async function main() {
       assert.deepEqual(raw, [{ id: namedId, input: 19 }, { id: gapId, input: 7 }]);
     } finally { finalDb.close(); }
     completion.check("rollback-outbox-receipt-state-is-consistent");
+
+    // Retain every legacy PR #450 assertion, then use this branch's actual
+    // OTLP writer. A -> stock and B -> A are distinct staged rollback gates.
+    old049 = path.join(oldRoot, "previous-reader");
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", old049,
+      previousReaderCommit]);
+    fs.symlinkSync(path.resolve("node_modules"), path.join(old049, "node_modules"), "dir");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(old049, "packages/collector-cli/package.json"), "utf8")).version, "0.7.49");
+    const currentReader = await import(pathToFileURL(path.resolve("packages/collector-cli/src/buffer.ts")).href);
+    const tierIds = ["00000000-0000-4000-8000-000000000921", "00000000-0000-4000-8000-000000000922",
+      "00000000-0000-4000-8000-000000000923"];
+    const tierStart = baseMs + 1_000_000;
+    let tierNow = new Date(tierStart);
+    const tierWriter = new currentReader.LocalEventBuffer(ledgerPath, { workspaceId, deviceId,
+      enrollmentNow: () => new Date(baseMs), delivery: { enabled: true, now: () => tierNow } });
+    let tierSealed: Array<{ id: string; sealed: string | null }>;
+    let tierClaim: { dead: number; cursor: number };
+    try {
+      for (const [i, id] of tierIds.entries()) {
+        const fields = { "event.name": "codex.sse_event", "event.kind": "response.completed",
+          "conversation.id": id, "user.account_id": accountId, model: "gpt-6.1-sol",
+          input_token_count: "19", output_token_count: "2",
+          ...(i === 2 ? {} : { cached_token_count: i === 0 ? 0 : 7,
+            service_tier: i === 0 ? "fast" : "flex" }) };
+        const parsed = explodeOtlpPayload({ resourceLogs: [{ resource: { attributes: [
+          { key: "service.name", value: { stringValue: "codex-app-server" } } ] },
+          scopeLogs: [{ logRecords: [{ timeUnixNano: String(BigInt(tierStart) * 1_000_000n),
+            attributes: Object.entries(fields).map(([key, value]) => ({ key,
+              value: typeof value === "number" ? { intValue: String(value) } : { stringValue: value } }))
+          }] }] }] }, { source: "codex", transportPath: "/v1/logs" });
+        assert.equal(parsed.parseFailures, 0);
+        assert.equal(parsed.events.length, 1);
+        const event = aiInteractionEventSchema.parse({ ...parsed.events[0].event, id });
+        assert.equal(event.metadata.serviceTier, recordedTierWriter && i !== 2 ? i === 0 ? "priority" : "flex" : undefined);
+        assert.equal(event.metadata.service_tier, recordedTierWriter && i !== 2 ? i === 0 ? "fast" : "flex" : undefined);
+        assert.equal(tierWriter.append(event), true);
+      }
+      tierNow = new Date(tierStart + 61_000);
+      const lease = tierWriter.delivery.lease({ now: tierNow });
+      assert.equal(lease.locallyDead, 0);
+      assert.deepEqual(lease.items.map((item: any) => item.deliveryId).sort(), tierIds);
+      assert.equal(lease.items.find((item: any) => item.deliveryId === tierIds[0]).envelope.event.metadata.serviceTier,
+        recordedTierWriter ? "priority" : undefined);
+      completion.check(recordedTierWriter ? "branch-writer-seals-zero-and-recorded-processing-tier" : "reader-first-writer-seals-zero-with-no-tier-key");
+      tierClaim = tierWriter.delivery.captureClaim(tierIds, { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      assert.ok(tierClaim);
+      assert.equal(tierClaim.dead, 0);
+      tierSealed = readSealed(tierWriter.database);
+      completion.check("branch-writer-seals-capture-claim-with-no-dead-usage");
+    } finally { tierWriter.close(); }
+    const previous = await import(pathToFileURL(path.join(old049, "packages/collector-cli/src/buffer.ts")).href);
+    tierNow = new Date(tierStart + 182_000); // the branch writer's lease has expired
+    const previousReader = new previous.LocalEventBuffer(ledgerPath, { workspaceId, deviceId,
+      enrollmentNow: () => new Date(baseMs), delivery: { enabled: true, now: () => tierNow } });
+    try {
+      const lease = previousReader.delivery.lease({ now: tierNow });
+      assert.equal(lease.locallyDead, 0);
+      assert.deepEqual(lease.items.map((item: any) => item.deliveryId).sort(), tierIds);
+      for (const [i, id] of tierIds.entries()) {
+        const event = lease.items.find((item: any) => item.deliveryId === id).envelope.event;
+        assert.equal(event.model, "gpt-6.1-sol");
+        assert.equal(event.inputTokens, 19);
+        assert.equal(event.outputTokens, 2);
+        assert.equal(event.cacheReadTokens, i === 2 ? undefined : i === 0 ? 0 : 7);
+        assert.equal(event.metadata.serviceTier, recordedTierWriter && i !== 2 ? i === 0 ? "priority" : "flex" : undefined);
+        assert.equal(event.metadata.service_tier, recordedTierWriter && i !== 2 ? i === 0 ? "fast" : "flex" : undefined);
+      }
+      completion.check(`${previousReaderLabel}-preserves-exact-metadata-and-unknown-count`);
+      assert.deepEqual(readSealed(previousReader.database), tierSealed);
+      const oldClaim = previousReader.delivery.captureClaim(tierIds,
+        { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      assert.equal(oldClaim.dead, 0);
+      assert.ok(oldClaim.cursor > tierClaim.cursor);
+      completion.check(`${previousReaderLabel}-keeps-frozen-envelopes-and-continues-claims`);
+      const acknowledged = previousReader.delivery.acknowledge(lease.leaseId, tierIds, tierNow);
+      assert.equal(acknowledged.locallyDead, 0);
+      assert.equal(acknowledged.acknowledged, 3);
+      assert.equal((previousReader.database.prepare("select count(*) as n from upload_receipts where terminal_state='dead'").get() as { n: number }).n, 0);
+      assert.equal((previousReader.database.prepare("select count(*) as n from buffered_events where uploaded_at is not null and id in (?,?,?)").get(...tierIds) as { n: number }).n, 3);
+      completion.check(`${previousReaderLabel}-delivers-all-new-usage-with-zero-retirements`);
+    } finally { previousReader.close(); }
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
-      readers: [`scanner-head-${currentVersion}`, "main-0.7.48", "0.7.47"],
+      readers: [`scanner-head-${currentVersion}`, "main-0.7.48", "0.7.47", previousReaderLabel],
+      stagedRollback: { writerCommit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+        previousReaderCommit, previousReaderLabel, recordedTierWriter, sameLedger: true, leaseExpired: true,
+        locallyDead: 0, acknowledged: 3 },
       claim,
+      tierClaim,
       frozenEnvelopes: sealedBefore.length,
     }));
     completion.complete();
@@ -249,6 +341,7 @@ async function main() {
     if (writerTree) closeQuietly(writerTree);
     if (old048) closeQuietly(old048);
     if (old047) closeQuietly(old047);
+    if (old049) closeQuietly(old049);
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
