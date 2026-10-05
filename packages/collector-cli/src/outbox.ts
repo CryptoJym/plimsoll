@@ -2256,8 +2256,9 @@ export class DeliveryOutbox {
   freezeSessionCoverage(rawId: string): boolean {
     const freeze = () => {
       if (frozenCodexCapture(this.db,rawId)) return true;
-      const raw=this.db.prepare(`select payload_json as payload,uploaded_at as uploadedAt from buffered_events where id=?`)
-        .get(rawId) as {payload:string;uploadedAt:string|null}|undefined;
+      const raw=this.db.prepare(`select payload_json as payload,uploaded_at as uploadedAt,
+        suppressed_fields_json as suppressed,repo_hash as repo,branch_hash as branch from buffered_events where id=?`)
+        .get(rawId) as {payload:string;uploadedAt:string|null;suppressed:string;repo:string|null;branch:string|null}|undefined;
       if(!raw)return false;
       const captured=captureCodexModel(this.db,aiInteractionEventSchema.parse(JSON.parse(raw.payload)),rawId,false,false);
       if(!codexHasUsage(captured)||isCaptureGap(captured))return false;
@@ -2268,7 +2269,22 @@ export class DeliveryOutbox {
           and raw_created_at=(select created_at from buffered_events where id=?)
           and raw_generation=(select privacy_generation from buffered_events where id=?) limit 1`)
         .get(rawId,rawId,rawId,rawId) as {deliveryId:string;base:string;sealed:string|null;repo:string|null;branch:string|null}|undefined;
-      if(!row)throw new Error("codex_usage_coverage_delivery_pending");
+      if(!row) {
+        // Stateless capture can retain accounting before an outbox exists.
+        // Freeze the same native/privacy-validated envelope its snapshot would
+        // send. An enabled but pending queue, or an older terminal delivery,
+        // cannot acquire fabricated replacement bytes through this fallback.
+        if(this.enabled||this.db.prepare(`select 1 from upload_receipts where raw_id=? or delivery_id=? limit 1`)
+          .get(rawId,rawId))return false;
+        const attribution=new SessionAttributionBatch(this.db,[{event:captured,repoHash:canonicalLinkage(raw.repo)}]);
+        const sealed=sealOutboundEnvelope(attachFillOnlyLinkage({event:captured,suppressedFields:JSON.parse(raw.suppressed)},
+          canonicalLinkage(raw.repo),canonicalLinkage(raw.branch),attribution,new Set()));
+        if(!sealed.ok)throw new Error("codex_usage_coverage_seal_refused");
+        const bytes=JSON.stringify(sealed.envelope);
+        if(Buffer.byteLength(bytes)>this.limits.maxItemBytes)throw new Error("codex_usage_coverage_item_oversize");
+        rememberFrozenCodexCapture(this.db,rawId,sealed.envelope.event.id,bytes,captured);
+        return true;
+      }
       if(row.sealed) {
         const prior=aiWorkIngestEventSchema.parse(JSON.parse(row.sealed));
         if(isCaptureGap(prior.event))return false;

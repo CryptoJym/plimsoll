@@ -14,7 +14,7 @@ import { buildIngestBatch } from '../packages/collector-cli/src/upload';
 
 const base=false;
 const Reader=LocalEventBuffer, Tailer=RolloutTailer;
-const completion=createProofCompletion('codex-response-coverage',26);
+const completion=createProofCompletion('codex-response-coverage',28);
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'r8-own-'));
 const AT=Date.now()-600000, SESSION='22222222-2222-4222-8222-222222222222';
 const SOL='gpt-6.1-sol', ASTRA='gpt-6-astra';
@@ -26,7 +26,7 @@ function sse(at=6000,input=19,output=2,partial=false){return explodeOtlpPayload(
 }]}]}]},{source:'codex',transportPath:'/v1/logs'}).events[0]!.event;}
 class Fixture {
  dir=path.join(root,String(++index)); file=path.join(this.dir,'ledger.sqlite'); sessions=path.join(this.dir,'sessions'); b:any; now=new Date(AT+2000); native='';
- constructor(){fs.mkdirSync(this.dir);this.b=new Reader(this.file,{workspaceId:'11111111-1111-4111-8111-111111111111',deviceId:'r8-independent',enrollmentNow:()=>new Date(AT-1000000),delivery:{enabled:true,now:()=>this.now}});}
+ constructor(enabled=true){fs.mkdirSync(this.dir);this.b=new Reader(this.file,{workspaceId:'11111111-1111-4111-8111-111111111111',deviceId:'r8-independent',enrollmentNow:()=>new Date(AT-1000000),delivery:{enabled,now:()=>this.now}});}
  write(records:Array<[number,string,any]>){const day=path.join(this.sessions,...new Date(AT).toISOString().slice(0,10).split('-'));fs.mkdirSync(day,{recursive:true});this.native=path.join(day,`rollout-review-${SESSION}.jsonl`);fs.writeFileSync(this.native,records.map(([offset,type,payload])=>JSON.stringify({timestamp:new Date(AT+offset).toISOString(),type,payload})).join('\n')+'\n');}
  lease(offset:number){this.now=new Date(AT+offset);return this.b.delivery.lease({now:this.now});}
  async history(){const db=this.b.database;const rootIdentity={...deriveCaptureRootIdentity('r8-independent','codex',this.sessions),source:'codex' as const,directory:this.sessions,installationEpochId:this.b.workspaceBinding().currentInstallationEpochId};
@@ -38,6 +38,27 @@ const tokens=(input:number,output:number,cache=0)=>({type:'token_count',info:{to
 const named=(items:any[])=>items.filter(i=>i.envelope.event.model&&i.envelope.event.metadata.usageSource!=='capture_gap'&&(i.envelope.event.inputTokens!==undefined||i.envelope.event.outputTokens!==undefined));
 async function check(name:string,body:()=>Promise<any>){try{outcomes.push({name,...await body()});}catch(error){outcomes.push({name,passed:false,error:String(error)});}}
 async function main(){try{
+ for(const order of ['native-first','SSE-first'])await check('disabled-outbox-response-maxima-'+order,async()=>{
+  const f=new Fixture(false);try{
+   const partial=sse(6000,19,2,true);Object.assign(partial.metadata,{'turn.id':'first-response',request_id:'disabled-request'});
+   if(order==='SSE-first')assert.equal(f.b.append(partial),true);
+   f.write([[5000,'session_meta',{id:SESSION}],[5000,'turn_context',{turn_id:'first-response',model:SOL}],
+    [5000,'event_msg',tokens(0,0)],[6000,'event_msg',tokens(19,2)],[6100,'event_msg',tokens(23,3,7)]]);
+   const t=new Tailer(f.b,f.sessions,()=>[]);try{const scan=await t.scan({scope:'full',now:new Date(AT+65000)});assert.equal(scan.parseErrors,0);}finally{t.close();}
+   if(order==='native-first')assert.equal(f.b.append(partial),true);
+   const complete=sse(5500,23,3);Object.assign(complete.metadata,{'turn.id':'first-response',request_id:'disabled-request'});
+   complete.cacheReadTokens=7;complete.cacheCreationTokens=5;complete.costUsd=.125;complete.costKind='reported';
+   Object.assign(complete.metadata,{cached_token_count:7,'gen_ai.usage.cache_creation_input_tokens':5,cost_usd:.125});
+   assert.equal(f.b.append(complete),true);
+   const snapshot=buildIngestBatch({tenantId:'11111111-1111-4111-8111-111111111111',deviceId:'r8-independent',installKey:'disabled-fixture'} as any,
+    f.b,{now:()=>new Date(Date.now()+64000)});assert.ok(snapshot.batch);
+   const events=snapshot.batch!.events.map(e=>e.event).filter(e=>e.model&&e.metadata.usageSource!=='capture_gap');
+   for(const [key,value] of Object.entries({inputTokens:23,outputTokens:3,cacheReadTokens:7,cacheCreationTokens:5,costUsd:.125}))
+    assert.equal(events.reduce((n:number,e:any)=>n+(e[key]??0),0),value,key);
+   assert.equal(f.b.database.prepare('select count(*) as n from upload_outbox').get().n,0);
+   return {passed:true,order,events};
+  }finally{f.close();}
+ });
  for(const mode of ['tailer','history'])await check('two-native-responses-after-one-ACKed-SSE-'+mode,async()=>{
   const f=new Fixture();try{
    const e=sse();assert.equal(f.b.append(e),true);const first=f.lease(64000);const firstNamed=named(first.items);assert.equal(firstNamed.length,1);assert.equal(firstNamed[0].envelope.event.inputTokens,19);assert.equal(firstNamed[0].envelope.event.outputTokens,2);f.b.delivery.acknowledge(first.leaseId,first.items.map((i:any)=>i.deliveryId),f.now);

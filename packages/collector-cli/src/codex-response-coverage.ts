@@ -272,7 +272,6 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     else if(admitted.model!==captured.model&&!explicit)return undefined;
     if(isCaptureGap(admitted)&&!reservationOnly)return undefined;
   }
-  if (commit && contributors.some(c=>!commit(c.row.id))) return undefined;
   const remaining = {...budget, metadata: {...event.metadata}};
   for (const k of FIELDS) if (budget[k] !== undefined && contributors.some(c=>c.captured[k] !== undefined))
     remaining[k] = Math.max(0,budget[k]! - contributors.reduce((n,c)=>n+(c.captured[k]??0),0));
@@ -306,6 +305,11 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     contributors.some(c => c.captured[k] !== undefined));
   const covered = amountsCovered && fieldsKnown;
   if(reservationOnly&&!amountsCovered)return undefined;
+  // Native marginals already add correctly without borrowing custody when
+  // the result is exactly their own observation. In particular a disabled
+  // outbox must not turn a harmless second native delta into a failed append.
+  if(native(event)&&!covered&&FIELDS.every(k=>remaining[k]===event[k]))return undefined;
+  if (commit && contributors.some(c=>!commit(c.row.id))) return undefined;
   // Keep the first retained root visible to the anonymous once-per-counter
   // guard. A newer zero/complement owner must not hide that its older paid
   // SSE root already covered another native counter with equal amounts.
