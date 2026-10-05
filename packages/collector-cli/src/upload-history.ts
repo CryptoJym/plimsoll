@@ -997,7 +997,18 @@ export async function runWorkspaceHistoryUpload(
               from buffered_events where rowid=? and id=? and created_at=?`)
               .get(row.rowid,row.id,row.createdAt) as {payload:string;duplicate:string|null}|undefined;
             if(current?.duplicate){skipQueue.push({rowid:row.rowid,reason:"usage_duplicate"});continue;}
-            if(current)preparedRow.event=aiInteractionEventSchema.parse(JSON.parse(current.payload));
+            if(current) {
+              // Reconciliation may reduce counters, but the refreshed raw
+              // payload still needs history's null-field/legacy-ID repairs.
+              // Parsing it directly discarded those repairs and wedged the
+              // oldest page on .48's null session/model fields.
+              const refreshed = prepareHistoryEvent({ ...row, payloadJson: current.payload });
+              if (!refreshed.ok || !refreshed.event) {
+                skipQueue.push({ rowid: row.rowid, reason: refreshed.ok ? "schema_invalid" : refreshed.reason });
+                continue;
+              }
+              Object.assign(preparedRow, refreshed);
+            }
           }
         }
         if (unresolvedCapture(preparedRow.event)) {

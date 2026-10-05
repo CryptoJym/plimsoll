@@ -3,8 +3,7 @@ import { performance } from "node:perf_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
-import { CODEX_SESSION_AUTHORITY_SQL } from "./codex-span-rollout-pairing";
-import { hasSessionUsageAuthority, rowHasAdmittedUsage } from "./usage-authority";
+import { admittedUsageForRow, hasSessionUsageAuthority } from "./usage-authority";
 import { ensureUuidEventId } from "./upload-history";
 import { readLiveUsageEventObservation } from "../../shared/src/live-usage-metadata";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
@@ -281,7 +280,6 @@ function isUsageTailerEventType(eventType: string) {
 
 /** A raw row that is live-class and carries usage (the predicate above, unqualified). */
 const LIVE_USAGE_ROW_SQL = `event_type not in ('usage_rollout','usage_transcript')
-  and ${CODEX_SESSION_AUTHORITY_SQL}
   and (input_tokens is not null or output_tokens is not null
     or cache_read_tokens is not null or cache_creation_tokens is not null
     or cost_usd is not null)`;
@@ -1147,6 +1145,14 @@ export class DashboardProjectionStore {
     // Snapshot publication holds the writer. Keep the usage-authority
     // intersection on small covering indexes instead of reading every raw
     // event's payload-bearing table page once per dashboard window.
+    // The index describes raw counter rows, not financial admission. Adding
+    // Codex's JSON provenance predicate made legacy raw-count readers fall
+    // back to every payload page of the session. Keep admission in queries
+    // and rowHasAdmittedUsage, and repair the short-lived restrictive index.
+    const liveCounterIndex = this.db.prepare(`select sql from sqlite_master
+      where type='index' and name='idx_events_usage_authority_live'`).get() as {sql:string} | undefined;
+    if (liveCounterIndex?.sql.includes("json_extract"))
+      this.db.exec("drop index idx_events_usage_authority_live");
     this.db.exec(`
       create index if not exists idx_events_usage_authority_tailer
         on buffered_events (source, session_id, observed_at)
@@ -1970,8 +1976,7 @@ export class DashboardProjectionStore {
         // writer from winning after this tailer row is admitted.
         const usageSuppressed = historyImportNoLiveSibling && isUsageTailerEventType(row.eventType)
           ? false : backfillUsageSuppressed(this.db, row);
-        const captureGap = row.source === "codex" && carriesUsage(row) && !rowHasAdmittedUsage(this.db, row.id);
-        this.applyFact(factFromRaw(row, usageSuppressed || captureGap, captureGap), now);
+        this.applyFact(this.capturedProjectionFact(row,usageSuppressed), now);
       }
     }
     if (compactRows.length) this.addCompactRows(compactRows);
@@ -1985,6 +1990,21 @@ export class DashboardProjectionStore {
            and exists (select 1 from dashboard_event_facts f where f.raw_rowid = b.rowid)`,
       ).run(now.toISOString(), source, sessionId);
     }
+  }
+
+  private capturedProjectionFact(row: RawProjectionRow, usageSuppressed: boolean) {
+    const captured = row.source === "codex" && carriesUsage(row)
+      ? admittedUsageForRow(this.db, row.id) : undefined;
+    const captureGap = row.source === "codex" && carriesUsage(row) && !captured;
+    // Both projection and its parity oracle consume the admitted capture,
+    // including its native model and derived price, without restamping raw
+    // diagnostics. Runtime intervals keep their unqualified semantics.
+    const admitted = captured && row.eventType !== "usage_live" ? { ...row,
+      model: captured.model ?? null, inputTokens: captured.inputTokens ?? null,
+      outputTokens: captured.outputTokens ?? null, cacheReadTokens: captured.cacheReadTokens ?? null,
+      cacheCreationTokens: captured.cacheCreationTokens ?? null,
+      costUsd: captured.costUsd ?? null, costKind: captured.costKind ?? null } : row;
+    return factFromRaw(admitted,usageSuppressed || captureGap,captureGap);
   }
 
   /**
@@ -3554,8 +3574,7 @@ export class DashboardProjectionStore {
         windows,
         rows.filter((row) => Boolean(row.privacyEligible))
           .map((row) => {
-            const captureGap = row.source === "codex" && carriesUsage(row) && !rowHasAdmittedUsage(this.db, row.id);
-            return factFromRaw(row, captureGap || backfillUsageSuppressed(this.db, row), captureGap);
+            return this.capturedProjectionFact(row,backfillUsageSuppressed(this.db, row));
           }),
       );
       for(const _row of rows)onWorkRowForProof?.("parity");
@@ -4187,7 +4206,7 @@ export class DashboardProjectionStore {
    */
   private usageAuthoritySummary(cutoff: string) {
     const dualSessions = this.db.prepare(
-      `select source,session_id as sessionId from (
+      `select count(*) as n from (
          select source, session_id from buffered_events indexed by idx_events_usage_authority_tailer
           where observed_at >= ? and session_id is not null
             and event_type in ('usage_rollout','usage_transcript')
@@ -4197,15 +4216,14 @@ export class DashboardProjectionStore {
          intersect
          select source, session_id from buffered_events indexed by idx_events_usage_authority_live
           where session_id is not null
-            and ${CODEX_SESSION_AUTHORITY_SQL}
+            and source <> 'codex'
             and event_type not in ('usage_rollout','usage_transcript')
             and (input_tokens is not null or output_tokens is not null
               or cache_read_tokens is not null or cache_creation_tokens is not null
               or cost_usd is not null)
        )`,
-    ).all(cutoff) as Array<{ source: string; sessionId: string }>;
-    return { rule: USAGE_AUTHORITY_RULE, backfillSessionsSuppressed: dualSessions.filter(row =>
-      hasSessionUsageAuthority(this.db, row.source, row.sessionId, "live") === true).length };
+    ).get(cutoff) as { n: number };
+    return { rule: USAGE_AUTHORITY_RULE, backfillSessionsSuppressed: dualSessions.n };
   }
 
   private lifetimeStats() {

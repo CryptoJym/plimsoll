@@ -6,27 +6,37 @@ import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 
 // Raw counters are diagnostics until the capture contract admits usage. The
 // same predicate governs ingest, the native tailer and projection suppression.
-export function rowHasAdmittedUsage(db: Database.Database, rawId: string, sessionAuthority = false): boolean {
-  const row = db.prepare(`select payload_json as payload,usage_duplicate_reason as duplicate,workspace_id as workspace,
+export function admittedUsageForRow(db: Database.Database, rawId: string, sessionAuthority = false): AiInteractionEvent | undefined {
+  const row = db.prepare(`select source,payload_json as payload,usage_duplicate_reason as duplicate,workspace_id as workspace,
     device_id as device,installation_epoch_id as epoch
-    from buffered_events where id=?`).get(rawId) as { payload: string; duplicate: string | null; workspace: string | null; device: string | null; epoch: string | null } | undefined;
-  if (!row || row.duplicate) return false;
+    from buffered_events where id=?`).get(rawId) as { source: string; payload: string; duplicate: string | null; workspace: string | null; device: string | null; epoch: string | null } | undefined;
+  if (!row || row.duplicate) return undefined;
   let event: AiInteractionEvent;
-  try { event = JSON.parse(row.payload); } catch { return false; }
-  if (event.source !== "codex" && !codexMisfiledUnderClaude(event)) return true;
+  try { event = JSON.parse(row.payload); } catch { return undefined; }
+  if (!event || typeof event !== "object" || Array.isArray(event)) return undefined;
+  // A malformed/legacy payload cannot turn a Codex SQL row into a different
+  // provider and bypass model admission. Genuine legacy Claude rows keep the
+  // original authority even when their payload predates normalized metadata.
+  if (event.source && event.source !== row.source) return undefined;
+  if (row.source !== "codex" && !codexMisfiledUnderClaude(event)) return event;
+  if (event.source !== "codex" && !codexMisfiledUnderClaude(event)) return undefined;
   if (sessionAuthority) {
     const binding = db.prepare(`select current_workspace_id as workspace,current_device_id as device,
       current_installation_epoch_id as epoch from collector_workspace_binding where singleton=1`).get() as
       {workspace:string;device:string|null;epoch:string|null} | undefined;
     if (!binding?.epoch || row.workspace !== binding.workspace || row.device !== binding.device || row.epoch !== binding.epoch)
-      return false;
+      return undefined;
   }
-  if (event.eventType === "usage_live") return !sessionAuthority;
-  if (!codexHasUsage(event) || (sessionAuthority && isCodexResponseSpan(event))) return false;
+  if (event.eventType === "usage_live") return sessionAuthority ? undefined : event;
+  if (!codexHasUsage(event) || (sessionAuthority && isCodexResponseSpan(event))) return undefined;
   const captured = captureCodexModel(db, event, rawId, false, false);
   return !isCaptureGap(captured) &&
     [captured.inputTokens, captured.outputTokens, captured.cacheReadTokens,
-      captured.cacheCreationTokens, captured.costUsd].some(value => value !== undefined);
+      captured.cacheCreationTokens, captured.costUsd].some(value => value !== undefined) ? captured : undefined;
+}
+
+export function rowHasAdmittedUsage(db: Database.Database, rawId: string, sessionAuthority = false): boolean {
+  return admittedUsageForRow(db, rawId, sessionAuthority) !== undefined;
 }
 
 export function rowCanOwnSessionUsage(db: Database.Database, rawId: string) {

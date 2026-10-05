@@ -20,7 +20,7 @@ const text = (value: unknown): string | undefined =>
 /** A capture gap is a durable accounting decision. Its raw counters remain
  * local diagnostics and must never become usage again on a later read. */
 export function isCaptureGap(event: AiInteractionEvent): boolean {
-  return event.metadata.usageSource === "capture_gap" || event.metadata.captureGap === true;
+  return event.metadata?.usageSource === "capture_gap" || event.metadata?.captureGap === true;
 }
 export function codexHasUsage(event: AiInteractionEvent): boolean {
   // Native runtime intervals deliberately carry no per-request model and are
@@ -40,7 +40,7 @@ export function codexHasUsage(event: AiInteractionEvent): boolean {
 }
 
 function nestedOtelAttributes(event: AiInteractionEvent): Record<string, unknown> {
-  const value = event.metadata.otelAttributes;
+  const value = event.metadata?.otelAttributes;
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
@@ -51,7 +51,7 @@ function valuesForAliases(
   aliases: readonly string[],
 ): string[] {
   return [
-    ...aliases.map((key) => event.metadata[key]),
+    ...aliases.map((key) => event.metadata?.[key]),
     ...aliases.map((key) => nestedOtelAttributes(event)[key]),
   ].filter(
     (value): value is string => typeof value === "string" && !!value.trim(),
@@ -123,7 +123,7 @@ export function legacyFrozenNativeCapture(raw: AiInteractionEvent, frozen: AiInt
 export function codexMisfiledUnderClaude(event: AiInteractionEvent): boolean {
   return (
     event.source === "claude_code" &&
-    /^(codex[-_.]|codex$)/i.test(String(event.metadata.serviceName ?? ""))
+    /^(codex[-_.]|codex$)/i.test(String(event.metadata?.serviceName ?? ""))
   );
 }
 export function unresolvedCapture(event: AiInteractionEvent): boolean {
@@ -132,7 +132,7 @@ export function unresolvedCapture(event: AiInteractionEvent): boolean {
     (!text(event.model) ||
       nativeModels(event).size === 0 ||
       codexMisfiledUnderClaude(event) ||
-      event.metadata.modelEvidenceConflict === true ||
+      event.metadata?.modelEvidenceConflict === true ||
       nativeModels(event).size > 1 ||
       modelAttributeConflict(event))
   );
@@ -426,6 +426,15 @@ export function rememberCaptureGap(
 ) {
   const lineage = captureLineage(db, rawId);
   if (!lineage || db.readonly) return false;
+  return rememberCaptureGapForLineage(db,lineage,reason,at);
+}
+
+/** A retained delivery may outlive its raw row. Persist its old decision
+ * against that complete incarnation, never a later reuse of the same ID. */
+export function rememberCaptureGapForLineage(
+  db: Database.Database, lineage: CaptureLineage, reason: string, at = new Date(),
+) {
+  if (db.readonly) return false;
   ensureCaptureDecisionTable(db);
   db.prepare(`insert or replace into codex_capture_decisions
     (raw_rowid,raw_id,raw_created_at,raw_generation,decision,reason,decided_at)
@@ -434,7 +443,9 @@ export function rememberCaptureGap(
     "gap",
     reason, at.toISOString(),
   );
-  queueCodexAuthorityProjectionRepairs(db, rawId);
+  const current=captureLineage(db,lineage.rawId);
+  if(current && current.rawRowid===lineage.rawRowid && current.rawCreatedAt===lineage.rawCreatedAt &&
+      current.rawGeneration===lineage.rawGeneration) queueCodexAuthorityProjectionRepairs(db,lineage.rawId);
   return true;
 }
 
@@ -450,6 +461,11 @@ export function captureCodexModel(
   persistDecision = false,
   recordDiagnostics = true,
 ): AiInteractionEvent {
+  // Released readers and raw-ledger migrations can leave metadata absent.
+  // An absent producer record supplies no model evidence; it must still go
+  // through the tokenless-gap decision rather than crash a repair/lease.
+  if (!event.metadata || typeof event.metadata !== "object" || Array.isArray(event.metadata))
+    event = { ...event, metadata: {} };
   if (!codexHasUsage(event)) return event;
   let row:
     | {
@@ -542,8 +558,8 @@ export function captureCodexModel(
   }
   // Some native exporters put the request model directly on the response
   // span. Treat that as trace evidence only when the event carries a bounded
-  // trace id and the native model attribute agrees with the normalized model
-  // field. A bare model field is still untrusted, which keeps 0.7.48's
+  // trace id and the native model attribute agrees with any normalized model
+  // field the producer supplied. A bare model field is still untrusted, which keeps 0.7.48's
   // reconciliation output tokenless. The evidence is joined below with every
   // native row on that trace so a conflicting session, account, or model can
   // never be hidden by this self-attested value.
@@ -553,9 +569,8 @@ export function captureCodexModel(
   ];
   const directTraceModelEvidence = Boolean(
     directTraceId &&
-    text(event.model) &&
     directTraceModels.length === 1 &&
-    directTraceModels[0] === event.model &&
+    (!text(event.model) || directTraceModels[0] === event.model) &&
     nativeModels(event).size === 1,
   );
   const nativeSseEvent =
@@ -584,6 +599,11 @@ export function captureCodexModel(
     end - at > WINDOW_MS
   )
     return gap("evidence_window_invalid");
+  // A trace-free native SSE supplies its own request model. Neighbouring
+  // requests cannot contradict that direct observation or exhaust its peer
+  // budget. Bare/proximity-restamped models never satisfy nativeSseEvent.
+  if (nativeSseEvent && !directTraceId)
+    return capture(event, [{ event, pairedId: null }], "native_sse_event");
   const eligible = terminalPrivacyEligibilitySql(db, "e", { includeUsageDuplicates: true });
   const raw = db
     .prepare(
@@ -594,6 +614,19 @@ export function captureCodexModel(
     from buffered_events e indexed by idx_events_observed
     where e.source='codex' and e.observed_at>=? and e.observed_at<=? and e.id<>?
       and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
+      -- Different native traces cannot provide a pair or trace model. Keep
+      -- trace-free pair candidates, same-turn context, and competing exact
+      -- spans; count overflow only after those identity filters.
+      and (? is null or
+        case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end is null or
+        case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=? or
+        (e.session_id=? and coalesce(
+          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.codexTurnId') end,
+          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata."turn.id"') end,
+          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.turn_id') end)=?) or
+        (case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='handle_responses' and
+          e.input_tokens is ? and e.output_tokens is ? and
+          e.cache_read_tokens is ? and e.cache_creation_tokens is ?))
       and ${eligible}
     order by e.observed_at, e.id limit ${MAX_EVIDENCE_ROWS + 1}`,
     )
@@ -604,6 +637,14 @@ export function captureCodexModel(
       row.workspace,
       row.device,
       row.epoch,
+      directTraceId ?? null,
+      directTraceId ?? null,
+      trustedSession(event) ?? null,
+      turn ?? null,
+      event.inputTokens ?? null,
+      event.outputTokens ?? null,
+      event.cacheReadTokens ?? null,
+      event.cacheCreationTokens ?? null,
     ) as Array<{
       evidenceRowid: number;
       evidenceId: string;
@@ -616,9 +657,13 @@ export function captureCodexModel(
   if (raw.length > MAX_EVIDENCE_ROWS) return gap("evidence_window_overflow");
   const decodePeers = (rows: typeof raw): Peer[] => rows.flatMap((r) => {
     try {
+      const parsed = JSON.parse(r.payload) as AiInteractionEvent;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+      const event = parsed.metadata && typeof parsed.metadata === "object" && !Array.isArray(parsed.metadata)
+        ? parsed : { ...parsed, metadata: {} };
       return [
         {
-          event: JSON.parse(r.payload) as AiInteractionEvent,
+          event,
           pairedId: r.pairedId,
           duplicate: r.duplicateReason !== null,
           lineage: {
@@ -706,7 +751,7 @@ export function captureCodexModel(
     // hold before and after sealing; otherwise lease order changes capture.
     // A model written by an older binary still supplies no native evidence.
     p.event.metadata.otelEventName !== "handle_responses" || nativeModel(p.event) !== undefined);
-  const traced = tracedPeers.filter(p=>p.event.metadata.otelEventName === "codex.sse_event");
+  const traced = tracedPeers;
   const traceEvidence =
     traceId && (directTraceModelEvidence || nativeSseEvent)
       ? [{ event, pairedId: null }, ...traced]
@@ -717,7 +762,7 @@ export function captureCodexModel(
   if (
     (directTraceModelEvidence || nativeSseEvent) &&
     nativeTraceModels.length === 1 &&
-    nativeTraceModels[0] !== event.model
+    nativeTraceModels[0] !== nativeModel(event)
   )
     return gap("ambiguous_trace_model");
   // Every peer participating in the trace tier must carry one native
@@ -738,10 +783,6 @@ export function captureCodexModel(
     traceEvidence.every((p) => compatible(event, p.event))
   )
     return capture(event, traceEvidence, "unique_trace_sse_event");
-  // A native SSE log without a trace is still an exact named source. There is
-  // no trace boundary to join, so only this row's own model can qualify it.
-  if (nativeSseEvent && !traceId)
-    return capture(event, [{ event, pairedId: null }], "native_sse_event");
   const session = trustedSession(event);
   const local =
     session && turn

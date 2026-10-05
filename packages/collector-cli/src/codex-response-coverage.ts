@@ -87,6 +87,9 @@ function compatible(a: AiInteractionEvent, b: AiInteractionEvent, exactPair = fa
  * Anonymous exact-counter joins still consume a witness once per counter. */
 export function codexResponseCoverage(db: Database.Database, event: AiInteractionEvent,
   commit?: (rawId: string) => boolean, raw?: Row, exactPeerId?: string) {
+  // Historical raw JSON is not necessarily a current normalized event.
+  // Without native metadata there can be no response-identity witness.
+  if (!event?.metadata || typeof event.metadata !== "object" || Array.isArray(event.metadata)) return undefined;
   if (event.source !== "codex" || !codexHasUsage(event) || !(native(event) || otlp(event)) ||
       (!event.sessionId && !exactPeerId) || event.metadata.counterLineage) return undefined;
   let binding: Pick<Row, "workspace" | "device" | "epoch"> | undefined;
@@ -98,6 +101,17 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
     throw error;
   }
   if (!binding?.epoch || !binding.device) return undefined;
+  // Native file records already carry marginal, cursor-fenced counters.
+  // Without any OTLP response in this exact native boundary there is no
+  // second producer to cover. Leave those marginals intact, and read their
+  // complete prefix when an OTLP observation subsequently arrives. This
+  // avoids repeatedly capturing every older counter in a long native turn.
+  if(native(event)&&!exactPeerId&&!statement(db,`select 1 from buffered_events e
+    where e.source='codex' and e.session_id=? and e.workspace_id=? and e.device_id=?
+      and e.installation_epoch_id=? and json_valid(e.payload_json)
+      and json_extract(e.payload_json,'$.metadata.otelEventName') in ('codex.sse_event','handle_responses')
+      and ${terminalPrivacyEligibilitySql(db,"e",{includeUsageDuplicates:true})} limit 1`)
+      .get(event.sessionId,binding.workspace,binding.device,binding.epoch))return undefined;
   const eligible = terminalPrivacyEligibilitySql(db, "e");
   const at = completion(event);
   if (typeof at !== "string" || !Number.isFinite(Date.parse(at))) return undefined;
@@ -303,7 +317,12 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
       const original=originals.get(c.row.id)??originalCoveredResponse(db,c.row.id)??JSON.parse(c.row.payload) as AiInteractionEvent;
       // A native marginal belongs to its source response, independently of
       // a smaller incoming SSE. Its own prefix decides whether it can freeze.
-      return FIELDS.every(k=>c.captured[k]===undefined || original[k]!==undefined&&c.captured[k]!<=
+      return FIELDS.every(k=>c.captured[k]===undefined ||
+        // Capture can price a native model before the raw producer reports a
+        // cost. That local estimate must not disqualify an otherwise exact
+        // owner and make its same response's priced rollout count again.
+        (k==="costUsd" && original.costUsd===undefined && c.captured.costKind==="estimated") ||
+        original[k]!==undefined&&c.captured[k]!<=
         Math.max(0,(native(original)&&related(event,original)?nativeAmount(original,k):original[k]!)-paidAmounts[k]!));
     });
     contributors=[...frozen,...(first?[first]:[])];
@@ -386,7 +405,11 @@ export function applyCodexResponseCoverage(db: Database.Database, rawId: string,
   // Unsealed older remainders may overlap a subsequently captured branch.
   // Reconcile their original observation again before freezing; never use
   // the already-reduced payload as a new response amount.
-  const event = original??JSON.parse(raw.payload) as AiInteractionEvent;
+  let event: AiInteractionEvent;
+  try { event = original ?? JSON.parse(raw.payload) as AiInteractionEvent; }
+  catch { return false; } // Invalid legacy bytes cannot attest another response.
+  if (!event || typeof event !== "object" || Array.isArray(event) ||
+      !event.metadata || typeof event.metadata !== "object" || Array.isArray(event.metadata)) return false;
   const coverage = codexResponseCoverage(db,event,freeze,raw,exactPeerId);
   if (!coverage) return false;
   if (coverage.reservationOnly) return false;

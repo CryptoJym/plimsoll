@@ -849,6 +849,12 @@ jobs:
       - name: Retain the 0.7.48 replay-restamp defect control
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-replay-restamp-base-origin
+      - name: Prove legacy metadata fails closed and unrelated native traces do not lose usage
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-legacy-density
+      - name: Prove admitted native prices and priced rollout twins survive every frozen delivery state
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-admitted-projection
       - name: Prove the bound A03 plan window keeps valid usage billable
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-a03-directed

@@ -1,5 +1,5 @@
 import type { AiInteractionEvent } from "../../shared/src/index";
-import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, legacyFrozenNativeCapture, rememberCaptureGap, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, legacyFrozenNativeCapture, rememberCaptureGap, rememberCaptureGapForLineage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
 import { frozenCodexCapture, frozenCodexDelivery, installCodexFrozenCompatibility, rememberFrozenCodexCapture } from "./codex-named-capture";
 import { rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
@@ -317,6 +317,13 @@ type RawLineageSnapshot = Pick<
   ActiveDeliveryRow,
   "deliveryId" | "rawRowid" | "rawId" | "rawCreatedAt" | "rawGeneration" | "deviceId"
 >;
+
+function rememberDeliveryCaptureGap(db: Database.Database, row: Pick<ActiveDeliveryRow,
+  "rawRowid" | "rawId" | "rawCreatedAt" | "rawGeneration">, reason: string) {
+  if(row.rawRowid===null || row.rawId===null || row.rawCreatedAt===null)return false;
+  return rememberCaptureGapForLineage(db,{rawRowid:row.rawRowid,rawId:row.rawId,
+    rawCreatedAt:row.rawCreatedAt,rawGeneration:row.rawGeneration},reason);
+}
 
 type PrivacyDecision = DeliveryReceiptReason | "lineage_unresolved" | null;
 
@@ -2352,7 +2359,9 @@ export class DeliveryOutbox {
              raw_generation as rawGeneration,
              base_envelope_json as baseEnvelopeJson,
              (select payload_json from buffered_events raw
-               where raw.rowid = upload_outbox.raw_rowid) as rawPayloadJson,
+               where raw.rowid = upload_outbox.raw_rowid and raw.id is upload_outbox.raw_id
+                 and raw.created_at is upload_outbox.raw_created_at
+                 and raw.privacy_generation is upload_outbox.raw_generation) as rawPayloadJson,
              sealed_envelope_json as sealedEnvelopeJson,
              repo_hash as repoHash, branch_hash as branchHash,
              device_id as deviceId,
@@ -2384,10 +2393,13 @@ export class DeliveryOutbox {
       const unsealed = new Map<string, AiWorkIngestEvent | null>();
       for (const row of candidates) {
         if (row.sealedEnvelopeJson) continue;
-        if (row.rawId && this.reconcileCodexResponse(row.rawId)) {
+        if (row.rawId && row.rawPayloadJson && this.reconcileCodexResponse(row.rawId)) {
           const current = this.db.prepare(`select base_envelope_json as base,sealed_envelope_json as sealed,
-            (select payload_json from buffered_events where id=?) as raw from upload_outbox where delivery_id=?`)
-            .get(row.rawId,row.deliveryId) as {base:string;sealed:string|null;raw:string}|undefined;
+            (select payload_json from buffered_events raw where raw.rowid=upload_outbox.raw_rowid
+              and raw.id is upload_outbox.raw_id and raw.created_at is upload_outbox.raw_created_at
+              and raw.privacy_generation is upload_outbox.raw_generation) as raw
+              from upload_outbox where delivery_id=?`)
+            .get(row.deliveryId) as {base:string;sealed:string|null;raw:string|null}|undefined;
           if (!current) continue;
           row.baseEnvelopeJson=current.base;row.rawPayloadJson=current.raw;row.sealedEnvelopeJson=current.sealed;
         }
@@ -2456,9 +2468,11 @@ export class DeliveryOutbox {
           }
           const captured = isCaptureGap(parsed.event)
             ? parsed.event
+            : codexHasUsage(captureInput) && !row.rawPayloadJson
+            ? codexModelGap(this.db,captureInput,"capture_row_missing")
             : captureCodexModel(this.db, captureInput, row.rawId ?? parsed.event.id, true);
           if (isCaptureGap(parsed.event) && row.rawId) {
-            rememberCaptureGap(this.db, row.rawId,
+            rememberDeliveryCaptureGap(this.db, row,
               String(parsed.event.metadata.modelGapReason ?? "legacy_capture_gap"));
           }
           parsed.event = { ...captured, id: parsed.event.id };
@@ -2509,7 +2523,7 @@ export class DeliveryOutbox {
         // terminal deletion or replay can remove that envelope.
         if (row.rawId) {
           const reason = captureGapReason(envelopeJson);
-          if (reason) rememberCaptureGap(this.db, row.rawId, reason);
+          if (reason) rememberDeliveryCaptureGap(this.db, row, reason);
         }
         if (outboundEnvelope.event.dataMode === "evidence") {
           locallyDead += this.deadActive(
@@ -2965,7 +2979,7 @@ export class DeliveryOutbox {
         if (!row) continue;
         const reason = captureGapReason(row.sealedEnvelopeJson) ??
           captureGapReason(row.baseEnvelopeJson);
-        if (row.rawId && reason) rememberCaptureGap(this.db, row.rawId, reason);
+        if (row.rawId && reason) rememberDeliveryCaptureGap(this.db, row, reason);
         this.rememberReplayLineage({
           deliveryId: id,
           rawRowid: row.rawRowid,
@@ -3359,7 +3373,7 @@ export class DeliveryOutbox {
     }
     const gapReason = captureGapReason(row.sealedEnvelopeJson) ??
       captureGapReason(row.baseEnvelopeJson);
-    if (row.rawId && gapReason) rememberCaptureGap(this.db, row.rawId, gapReason);
+    if (row.rawId && gapReason) rememberDeliveryCaptureGap(this.db, row, gapReason);
     let siblingReceipts = 0;
     if (row.rawRowid !== null && isTerminalPrivacyReason(reason)) {
       const owner = this.db.prepare(`select id from buffered_events

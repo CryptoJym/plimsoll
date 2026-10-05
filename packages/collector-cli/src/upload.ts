@@ -392,7 +392,10 @@ let captureClaimFailureLogged = false;
  * synchronous turn, 200-270 ms on the Studio0 ledger; the daemon claims the
  * same batch in slices under one lease id and yields between them.
  */
-export const LEASE_SLICE_ROWS = 125;
+// Native model capture adds work to each sealed item. Keep the wire batch at
+// 500 while yielding more often inside leasing and acknowledgment; the 125-row
+// ceiling and 250 ms responsiveness gate remain unchanged.
+export const LEASE_SLICE_ROWS = 64;
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
