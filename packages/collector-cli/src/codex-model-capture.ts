@@ -383,9 +383,10 @@ function captureLineage(db: Database.Database, rawId: string): CaptureLineage | 
   } catch { return undefined; }
 }
 
-export function hasCaptureGapDecision(db: Database.Database, lineage: CaptureLineage): boolean {
+export function hasCaptureGapDecision(db: Database.Database, lineage: CaptureLineage,
+  prepare = (sql: string) => db.prepare(sql)): boolean {
   return hasDurableCaptureGap(db, { rowid: lineage.rawRowid, id: lineage.rawId,
-    created: lineage.rawCreatedAt, generation: lineage.rawGeneration });
+    created: lineage.rawCreatedAt, generation: lineage.rawGeneration }, prepare);
 }
 
 /** Re-derive existing local facts when native trace facts or a gap change
@@ -460,6 +461,7 @@ export function captureCodexModel(
   rawId = event.id,
   persistDecision = false,
   recordDiagnostics = true,
+  prepare = (sql: string) => db.prepare(sql),
 ): AiInteractionEvent {
   // Released readers and raw-ledger migrations can leave metadata absent.
   // An absent producer record supplies no model evidence; it must still go
@@ -481,8 +483,7 @@ export function captureCodexModel(
       }
     | undefined;
   try {
-    row = db
-      .prepare(
+    row = prepare(
         `select rowid as rawRowid,id as rawId,created_at as rawCreatedAt,
       privacy_generation as rawGeneration, workspace_id as workspace, device_id as device,
       installation_epoch_id as epoch, usage_paired_event_id as pairedId,uploaded_at as uploadedAt
@@ -502,13 +503,13 @@ export function captureCodexModel(
       };
   // An earlier validated native capture is an immutable accounting result.
   // Its raw attributes remain available to contradict OTHER new captures.
-  const frozen = row && frozenCodexCapture(db,rawId);
+  const frozen = row && frozenCodexCapture(db,rawId,prepare);
   if (frozen) return frozen.event;
   const gap = (reason: string) => {
     const result = codexModelGap(db, event, reason, recordDiagnostics);
     if (persistDecision && row && !db.readonly) {
       ensureCaptureDecisionTable(db);
-      db.prepare(`insert or replace into codex_capture_decisions
+      prepare(`insert or replace into codex_capture_decisions
         (raw_rowid,raw_id,raw_created_at,raw_generation,decision,reason,decided_at)
         values (?,?,?,?,?,?,?)`).run(
         row.rawRowid, row.rawId, row.rawCreatedAt, row.rawGeneration,
@@ -519,13 +520,13 @@ export function captureCodexModel(
     }
     return result;
   };
-  if (row && hasCaptureGapDecision(db, row))
+  if (row && hasCaptureGapDecision(db, row, prepare))
     return gap("persisted_capture_gap");
   // A native retry frozen by an older binary is final even before this
   // binary's first lease. Readers must not consume a rollout against a
   // mutable re-evaluation of that same, already-frozen request.
-  if (row && db.prepare("select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) {
-    const prior = db.prepare(`select delivery_id as id,sealed_envelope_json as bytes from upload_outbox
+  if (row && prepare("select 1 from sqlite_master where type='table' and name='upload_outbox'").get()) {
+    const prior = prepare(`select delivery_id as id,sealed_envelope_json as bytes from upload_outbox
       where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ?
         and sealed_envelope_json is not null limit 1`).get(row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration) as
       {id:string;bytes:string}|undefined;
@@ -540,7 +541,7 @@ export function captureCodexModel(
   // is deliberately ineligible for this inference: an ACK may be for a gap.
   // Bare/proximity models and conflicting native attributes never qualify.
   if (row?.uploadedAt && event.metadata.otelEventName === "codex.sse_event" &&
-      legacyNativeAcknowledgementsEligible(db) && legacyFrozenNativeCapture(event,event))
+      legacyNativeAcknowledgementsEligible(db,prepare) && legacyFrozenNativeCapture(event,event))
     return capture(event,[{event,pairedId:null}],"legacy_native_acknowledged");
   if (nativeModels(event).size > 1 || modelAttributeConflict(event) || accountConflict(event) ||
     event.metadata.modelEvidenceConflict === true)
@@ -550,7 +551,7 @@ export function captureCodexModel(
   // A saved pair cannot override an accounting gap or contradictory native
   // attributes. In particular the raw diagnostics behind a frozen gap still
   // carry their original counters.
-  const responsePair = codexSpanRolloutDecision(db, rawId);
+  const responsePair = codexSpanRolloutDecision(db, rawId,prepare);
   if (responsePair && (responsePair.ownerId !== rawId || isCodexResponseSpan(event))) {
     const captured = { ...event, model: responsePair.model,
       metadata: { ...event.metadata, modelCaptureSource: "paired_rollout_event" } };
@@ -622,7 +623,7 @@ export function captureCodexModel(
     } catch { return []; }
   });
   const mayPromote = (p: Peer) => !p.duplicate && !p.event.metadata.modelCaptureSource && !isCaptureGap(p.event) &&
-    !(p.lineage && hasCaptureGapDecision(db, p.lineage));
+    !(p.lineage && hasCaptureGapDecision(db, p.lineage, prepare));
   const selectEvidence = `select e.rowid as evidenceRowid, e.id as evidenceId,
     e.created_at as evidenceCreatedAt, e.privacy_generation as evidenceGeneration,
     e.payload_json as payload, e.usage_paired_event_id as pairedId,
@@ -649,7 +650,7 @@ export function captureCodexModel(
   // from the first 128 rows and hiding a later relevant contradiction.
   let windowOverflow = false;
   const pairCandidates: Peer[] = [];
-  for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+  for (const candidate of prepare(`${selectEvidence} where ${scope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end
       in ('codex.sse_event','handle_responses')
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='codex.sse_event'
@@ -665,7 +666,7 @@ export function captureCodexModel(
   }
   if (windowOverflow) return gap("evidence_window_overflow");
   const sessionForWindow = trustedSession(event);
-  if (sessionForWindow && turn) for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+  if (sessionForWindow && turn) for (const candidate of prepare(`${selectEvidence} where ${scope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.usageSource') end
       in ('codex_local_turn','rollout')
     and e.session_id=? and coalesce(
@@ -679,7 +680,7 @@ export function captureCodexModel(
   }
   if (windowOverflow) return gap("evidence_window_overflow");
   const promotablePairs = pairCandidates.filter(mayPromote);
-  if (promotablePairs.length) for (const candidate of db.prepare(`${selectEvidence} where ${scope}
+  if (promotablePairs.length) for (const candidate of prepare(`${selectEvidence} where ${scope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end
       in ('codex.sse_event','handle_responses')
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.otelEventName') end='handle_responses'
@@ -746,7 +747,7 @@ export function captureCodexModel(
   // A native trace is an identity boundary, not a nearest-time window.
   // Inspect its complete admitted fact set, bounded by overflow rather than
   // silently dropping a more distant contradictory model or account.
-  const traceRows = traceId ? db.prepare(`select e.rowid as evidenceRowid,e.id as evidenceId,
+  const traceRows = traceId ? prepare(`select e.rowid as evidenceRowid,e.id as evidenceId,
     e.created_at as evidenceCreatedAt,e.privacy_generation as evidenceGeneration,
     e.payload_json as payload,e.usage_paired_event_id as pairedId,e.usage_duplicate_reason as duplicateReason
     from buffered_events e where e.source='codex' and e.id<>?
@@ -831,14 +832,12 @@ export function captureCodexModel(
   if (
     session &&
     turn &&
-    db
-      .prepare(
+    prepare(
         "select 1 from sqlite_master where type='table' and name='codex_turn_model_evidence'",
       )
       .get()
   ) {
-    const names = db
-      .prepare(
+    const names = prepare(
         `select model, count(distinct nullif(account_key,'')) as accounts,
       min(nullif(account_key,'')) as account from codex_turn_model_evidence where
       workspace_id=? and device_id is ? and installation_epoch_id=? and session_id=? and turn_id=? group by model limit 2`,

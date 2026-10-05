@@ -48,9 +48,9 @@ export function ensureCodexNamedCaptures(db: Database.Database) {
   });
 }
 
-export function legacyNativeAcknowledgementsEligible(db: Database.Database) {
-  if (!db.prepare("select 1 from sqlite_master where name='codex_named_capture_origin' and type='table'").get()) return false;
-  return (db.prepare("select legacy_native_ack_eligible as eligible from codex_named_capture_origin where singleton=1")
+export function legacyNativeAcknowledgementsEligible(db: Database.Database, prepare = (sql: string) => db.prepare(sql)) {
+  if (!prepare("select 1 from sqlite_master where name='codex_named_capture_origin' and type='table'").get()) return false;
+  return (prepare("select legacy_native_ack_eligible as eligible from codex_named_capture_origin where singleton=1")
     .get() as {eligible:number}|undefined)?.eligible === 1;
 }
 
@@ -149,10 +149,10 @@ export function installCodexFrozenCompatibility(db: Database.Database) {
   `);
 }
 
-export function frozenCodexCapture(db: Database.Database, rawId: string) {
-  if (!db.prepare("select 1 from sqlite_master where name='codex_named_captures' and type='table'").get())
+export function frozenCodexCapture(db: Database.Database, rawId: string, prepare = (sql: string) => db.prepare(sql)) {
+  if (!prepare("select 1 from sqlite_master where name='codex_named_captures' and type='table'").get())
     return undefined;
-  const witness = db.prepare(`select w.delivery_id as deliveryId,w.envelope_json as envelopeJson,
+  const witness = prepare(`select w.delivery_id as deliveryId,w.envelope_json as envelopeJson,
       w.captured_event_json as capturedEventJson
     from codex_named_captures w join buffered_events e on e.rowid=w.raw_rowid and e.id=w.raw_id
       and e.created_at=w.raw_created_at and e.privacy_generation=w.raw_generation

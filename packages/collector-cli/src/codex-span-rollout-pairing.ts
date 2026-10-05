@@ -35,8 +35,8 @@ const COLUMNS = `e.rowid,e.id,e.created_at as created,e.privacy_generation as ge
   e.cache_read_tokens as cache,e.cache_creation_tokens as write,
   e.usage_paired_event_id as paired,e.payload_json as payload`;
 const decode = (row: Omit<Row, "event">): Row => ({ ...row, event: JSON.parse(row.payload) });
-const table = (db: Database.Database, name: string) =>
-  Boolean(db.prepare("select 1 from sqlite_master where type='table' and name=?").get(name));
+const table = (db: Database.Database, name: string, prepare = (sql: string) => db.prepare(sql)) =>
+  Boolean(prepare("select 1 from sqlite_master where type='table' and name=?").get(name));
 const turn = (event: AiInteractionEvent) => event.metadata.codexTurnId ?? event.metadata["turn.id"] ?? event.metadata.turn_id;
 function kind(row: Row): "span" | "rollout" | null {
   if (isCodexResponseSpan(row.event) && row.event.eventType === "assistant_response") return "span";
@@ -115,9 +115,9 @@ export function rememberCodexSpanEmission(db: Database.Database, rawId: string, 
       raw_generation=excluded.raw_generation,model=excluded.model`).run(event.model, rawId);
 }
 
-export function codexSpanRolloutDecision(db: Database.Database, rawId: string) {
-  if (!table(db, "codex_span_rollout_pairs")) return undefined;
-  return db.prepare(`select p.owner_id as ownerId,p.model,e.id as eventId
+export function codexSpanRolloutDecision(db: Database.Database, rawId: string, prepare = (sql: string) => db.prepare(sql)) {
+  if (!table(db, "codex_span_rollout_pairs", prepare)) return undefined;
+  return prepare(`select p.owner_id as ownerId,p.model,e.id as eventId
     from codex_span_rollout_pairs p join buffered_events e on
       (e.id=p.span_id and e.rowid=p.span_rowid and e.created_at=p.span_created_at and e.privacy_generation is p.span_generation)
       or (e.id=p.rollout_id and e.rowid=p.rollout_rowid and e.created_at=p.rollout_created_at and e.privacy_generation is p.rollout_generation)
@@ -157,19 +157,19 @@ function isCaptureGapEnvelope(payload: string | null | undefined) {
  * history, not a new pairing candidate. The raw row deliberately retains its
  * counters for diagnostics, while gap envelopes and replay lineage retain the
  * frozen tokenless result. */
-export function hasDurableCaptureGap(db: Database.Database, row: Pick<Row, "rowid" | "id" | "created" | "generation">) {
-  if (table(db, "codex_capture_decisions") && db.prepare(`select 1
+export function hasDurableCaptureGap(db: Database.Database, row: Pick<Row, "rowid" | "id" | "created" | "generation">, prepare = (sql: string) => db.prepare(sql)) {
+  if (table(db, "codex_capture_decisions", prepare) && prepare(`select 1
       from codex_capture_decisions where raw_rowid=? and raw_id=? and raw_created_at=?
         and raw_generation is ? limit 1`).get(row.rowid, row.id, row.created, row.generation)) return true;
   try {
-    if (table(db, "upload_outbox")) {
-      const envelopes = db.prepare(`select base_envelope_json as base, sealed_envelope_json as sealed
+    if (table(db, "upload_outbox", prepare)) {
+      const envelopes = prepare(`select base_envelope_json as base, sealed_envelope_json as sealed
         from upload_outbox where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ?`)
         .all(row.rowid, row.id, row.created, row.generation) as Array<{ base: string; sealed: string | null }>;
       if (envelopes.some(value => isCaptureGapEnvelope(value.sealed) || isCaptureGapEnvelope(value.base))) return true;
     }
-    if (table(db, "upload_replays")) {
-      const replays = db.prepare(`select frozen_envelope_json as frozen
+    if (table(db, "upload_replays", prepare)) {
+      const replays = prepare(`select frozen_envelope_json as frozen
         from upload_replays where raw_rowid=? and raw_id=? and raw_created_at=? and raw_generation is ?`)
         .all(row.rowid, row.id, row.created, row.generation) as Array<{ frozen: string | null }>;
       if (replays.some(value => isCaptureGapEnvelope(value.frozen))) return true;

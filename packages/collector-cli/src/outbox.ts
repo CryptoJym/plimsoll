@@ -2400,6 +2400,7 @@ export class DeliveryOutbox {
       // Session inheritance is applied here, where envelopes are sealed. Parse
       // every unsealed envelope first so the batch plans one bounded lookup
       // per session instead of one ledger scan per token row.
+      const capturePrepare = (sql: string) => this.leaseStatement(sql);
       const unsealed = new Map<string, AiWorkIngestEvent | null>();
       for (const row of candidates) {
         if (row.sealedEnvelopeJson) continue;
@@ -2485,7 +2486,7 @@ export class DeliveryOutbox {
             ? parsed.event
             : codexHasUsage(captureInput) && !row.rawPayloadJson
             ? codexModelGap(this.db,captureInput,"capture_row_missing")
-            : captureCodexModel(this.db, captureInput, row.rawId ?? parsed.event.id, true);
+            : captureCodexModel(this.db, captureInput, row.rawId ?? parsed.event.id, true, true, capturePrepare);
           if (isCaptureGap(parsed.event) && row.rawId) {
             rememberDeliveryCaptureGap(this.db, row,
               String(parsed.event.metadata.modelGapReason ?? "legacy_capture_gap"));
@@ -2582,7 +2583,7 @@ export class DeliveryOutbox {
                   String(rawLineage.metadata.modelGapReason ?? "legacy_capture_gap"));
                 sealedOriginGap = true;
               } else if (codexHasUsage(rawLineage)) {
-                const validated = captureCodexModel(this.db, rawLineage, row.rawId, true);
+                const validated = captureCodexModel(this.db, rawLineage, row.rawId, true, true, capturePrepare);
                 sealedOriginGap = isCaptureGap(validated) ||
                   typeof validated.model !== "string" || !validated.model.trim() ||
                   validated.model !== outboundEnvelope.event.model;

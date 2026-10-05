@@ -10,7 +10,7 @@ import { aiInteractionEventSchema, type AiInteractionEvent } from '../packages/s
 import { nativeCodexFixture } from './lib/native-codex-fixture';
 import { ensureCodexNamedCaptures } from '../packages/collector-cli/src/codex-named-capture';
 import { createProofCompletion } from './lib/proof-completion';
-const completion = createProofCompletion('codex-capture-legacy-density',52);
+const completion = createProofCompletion('codex-capture-legacy-density',53);
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-legacy-density-'));
 const at=new Date().toISOString();
 const event=(n:number)=>aiInteractionEventSchema.parse({id:`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,
@@ -202,9 +202,12 @@ try {
   for(let n=1;n<=500;n++)batch.append({...event(n),...nativeCodexFixture('named-batch-'+n)});
   let schemaSetups=0;
   let leaseCompiles=0;
+  const captureCompiles=new Map<string,number>();
   const prepare=batch.database.prepare.bind(batch.database);
   batch.database.prepare=((sql:string)=>{
    if(sql.includes("update upload_outbox set state = 'in_flight', attempt_count"))leaseCompiles++;
+   if(sql.includes('evidenceRowid')&&sql.includes('from buffered_events e'))
+    captureCompiles.set(sql,(captureCompiles.get(sql)??0)+1);
    return prepare(sql);
   }) as typeof batch.database.prepare;
   const exec=batch.database.exec.bind(batch.database);
@@ -219,6 +222,8 @@ try {
   completion.check('native_named_schema_setup_is_bounded_per_unchanged_schema',schemaSetups<=1);
   completion.check('native_batch_compiles_lease_update_once_without_caching_results',leaseCompiles===1&&
    leased.items.every(item=>item.attemptCount===1));
+  completion.check('native_batch_compiles_capture_queries_once_without_caching_evidence',captureCompiles.size>=2&&
+   [...captureCompiles.values()].every(count=>count===1));
   schemaSetups=0;
   const frozen=batch.database.prepare('select envelope_json from codex_named_captures order by delivery_id').all();
   batch.database.exec('drop table codex_named_capture_origin');
