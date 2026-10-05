@@ -92,6 +92,24 @@ export const usageFieldKeys = {
   sessionId: SESSION_ID_KEYS,
 } as const;
 
+export type CodexServiceTier = "standard" | "priority" | "flex" | "batch";
+
+/** Only a source-recorded tier is evidence; a plan type or an absent tier is not.
+ * Codex Fast => priority and explicit default => standard:
+ * https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/protocol/src/config_types.rs#L484-L509
+ * The same mapping is present at rust-v0.154.0-alpha.6.2:527-552 and
+ * rust-v0.155.0-alpha.9.2:528-553. Canonical catalog values pass through.
+ */
+export function codexServiceTier(value: unknown): CodexServiceTier | undefined {
+  switch (value) {
+    case "fast": case "priority": return "priority";
+    case "default": case "standard": return "standard";
+    case "flex": return "flex";
+    case "batch": return "batch";
+    default: return undefined;
+  }
+}
+
 export type AdmittedCost = {
   value: number | undefined;
   kind: EventCostKind | undefined;
@@ -383,6 +401,10 @@ const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
 ];
 
 const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
+  // Reader-first release: accept frozen tier keys without admitting producer
+  // attributes. A later writer release moves service_tier onto record intake.
+  ["service_tier", "classification"],
+  ["serviceTier", "classification"],
   ["planLimitSource", "classification"],
   ["planLimitWindow", "classification"],
   ["planLimitResetsAt", "timestamp"],
@@ -684,6 +706,13 @@ export function safeMetadataStringAttribute(key: string, value: unknown, receive
   const disposition = metadataKeyDisposition(key);
   if (!disposition || disposition.valueKind !== "string") return null;
   if (key === "workItemId") return safeWorkItemId(value);
+  if (key === "service_tier") {
+    return codexServiceTier(value) !== undefined ? value as string : null;
+  }
+  if (key === "serviceTier") {
+    const canonical = codexServiceTier(value);
+    return canonical !== undefined && canonical === value ? canonical : null;
+  }
   const kind = disposition.stringKind;
   if (kind === "signal") {
     const lowCardinality = safeStringByPattern(value, SAFE_COMPONENT_NAME, 160, {

@@ -183,7 +183,7 @@ export type RolloutScanResult = {
   };
 };
 
-type TokenTotals = { input: number; cachedInput: number; output: number; reasoningOutput: number };
+type TokenTotals = { input: number; cachedInput?: number; output: number; reasoningOutput: number };
 
 export type RolloutScanOptions = {
   scope: "recent" | "full";
@@ -247,7 +247,12 @@ function totalsFrom(usage: Record<string, unknown> | undefined): TokenTotals | u
   };
   return {
     input: n("input_tokens"),
-    cachedInput: n("cached_input_tokens"),
+    // Codex serializes this integer even when API input details are absent:
+    // rust-v0.146.0/codex-rs/codex-api/src/sse/responses.rs:123-153.
+    // A missing rollout field is therefore unknown, not a reported zero.
+    cachedInput: typeof usage.cached_input_tokens === "number" &&
+      Number.isSafeInteger(usage.cached_input_tokens) && usage.cached_input_tokens >= 0
+      ? usage.cached_input_tokens : undefined,
     output: n("output_tokens"),
     reasoningOutput: n("reasoning_output_tokens"),
   };
@@ -258,7 +263,9 @@ function diff(current: TokenTotals, previous: TokenTotals): TokenTotals {
   // rewrite can only under-count, never fabricate usage.
   return {
     input: Math.max(0, current.input - previous.input),
-    cachedInput: Math.max(0, current.cachedInput - previous.cachedInput),
+    cachedInput: current.cachedInput !== undefined && previous.cachedInput !== undefined &&
+      current.cachedInput >= previous.cachedInput
+      ? current.cachedInput - previous.cachedInput : undefined,
     output: Math.max(0, current.output - previous.output),
     reasoningOutput: Math.max(0, current.reasoningOutput - previous.reasoningOutput),
   };
@@ -355,7 +362,9 @@ function optionalString(value: unknown): string | undefined | null {
 function isTokenTotals(value: unknown): value is TokenTotals {
   if (!isRecord(value)) return false;
   if (!hasOnlyKeys(value, ["input", "cachedInput", "output", "reasoningOutput"])) return false;
-  return ["input", "cachedInput", "output", "reasoningOutput"].every((key) => {
+  if (value.cachedInput !== undefined &&
+      (typeof value.cachedInput !== "number" || !Number.isSafeInteger(value.cachedInput) || value.cachedInput < 0)) return false;
+  return ["input", "output", "reasoningOutput"].every((key) => {
     const total = value[key];
     return typeof total === "number" && Number.isSafeInteger(total) && total >= 0;
   });
@@ -1982,7 +1991,9 @@ export class RolloutTailer {
       // Validated marginal consumption excludes the unclassified first
       // counter entirely; the raw source observation is preserved in the
       // row metadata below. Unvalidated usage is never priced.
-      const marginal: TokenTotals = unvalidated ? ZERO : entry.delta;
+      const marginal: TokenTotals = unvalidated
+        ? { ...ZERO, cachedInput: entry.delta.cachedInput === undefined ? undefined : 0 }
+        : entry.delta;
       const priced = unvalidated
         ? undefined
         : estimateCostUsd({
@@ -2005,7 +2016,8 @@ export class RolloutTailer {
       if (unvalidated && entry.lineageFirstUnknown) {
         metadata.counterLineage = "unknown_nonzero_first";
         metadata.sourceCumulativeInput = entry.lineageFirstUnknown.input;
-        metadata.sourceCumulativeCachedInput = entry.lineageFirstUnknown.cachedInput;
+        if (entry.lineageFirstUnknown.cachedInput !== undefined)
+          metadata.sourceCumulativeCachedInput = entry.lineageFirstUnknown.cachedInput;
         metadata.sourceCumulativeOutput = entry.lineageFirstUnknown.output;
         metadata.sourceCumulativeReasoningOutput = entry.lineageFirstUnknown.reasoningOutput;
       } else if (entry.delta.reasoningOutput > 0) {
@@ -2048,7 +2060,7 @@ export class RolloutTailer {
       if (inserted) {
         result.eventsAppended += 1;
         result.tokensAppended.input += marginal.input;
-        result.tokensAppended.cachedInput += marginal.cachedInput;
+        result.tokensAppended.cachedInput += marginal.cachedInput ?? 0;
         result.tokensAppended.output += marginal.output;
         if (clamped.clamped || (clamped.observedAt === undefined && fallbackObservedAt.clamped)) {
           result.futureTimestampClampedEvents = (result.futureTimestampClampedEvents ?? 0) + 1;
@@ -2057,7 +2069,7 @@ export class RolloutTailer {
           result.unvalidatedFirstRows = (result.unvalidatedFirstRows ?? 0) + 1;
           result.tokensUnvalidated = {
             input: (result.tokensUnvalidated?.input ?? 0) + entry.delta.input,
-            cachedInput: (result.tokensUnvalidated?.cachedInput ?? 0) + entry.delta.cachedInput,
+            cachedInput: (result.tokensUnvalidated?.cachedInput ?? 0) + (entry.delta.cachedInput ?? 0),
             output: (result.tokensUnvalidated?.output ?? 0) + entry.delta.output,
           };
         }

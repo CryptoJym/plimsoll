@@ -96,13 +96,14 @@
   skewed partial/complete and growing reports. This finite coverage complements the matrix;
   it does not claim every possible producer shape or operation sequence.
 
-## 0.7.49 — 2026-10-04
+## 0.7.50 — 2026-10-05
 
-- Bound automatic Codex capture to four slices per file per cadence. Fresh
-  current-day tails receive service beside the historical backlog, and deferred
-  discovery and JSONL work resumes in later cadences (#454).
-- Run proof children with Node's tsx loader so stale macOS tsx CLI IPC pipes
-  cannot block them (#455).
+- #458 keeps source-recorded Codex processing-tier metadata readable before
+  enabling any tier writer, and preserves reported cached-input counts,
+  including zero, while absent counts remain unknown.
+- #460 reads distinct queued session IDs and checks for each session's first
+  ready event, preventing a blocked session's backlog from forcing full
+  session re-sends.
 
 ## 0.7.48 — 2026-10-03 (unpublished)
 

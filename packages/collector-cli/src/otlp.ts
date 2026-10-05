@@ -132,6 +132,25 @@ function intTokens(value: number | undefined) {
   return Math.round(value);
 }
 
+/** A trace carries completion attributes on span.events, not necessarily on
+ * the span itself. Use only one completion with the span's exact usage counts;
+ * several matching events or incomplete identity are not proof of a twin.
+ * https://github.com/openai/codex/blob/rust-v0.155.0-alpha.9.2/codex-rs/otel/src/events/shared.rs#L34-L61
+ */
+function codexTraceCompletion(span: Record<string, unknown>, attrs: Record<string, unknown>) {
+  const input = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
+  const output = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
+  if (input === undefined || output === undefined || !Array.isArray(span.events)) return undefined;
+  const candidates = span.events.map(asRecord).filter((event) => {
+    const raw = flattenOtelAttributes(event.attributes);
+    return raw["event.name"] === "codex.sse_event" && raw["event.kind"] === "response.completed";
+  }).map((event) => metadataSafeOtlpAttributes(flattenOtelAttributes(event.attributes), "metadata").attrs)
+    .filter((event) => intTokens(numberField(event, [...usageFieldKeys.inputTokens])) === input &&
+      intTokens(numberField(event, [...usageFieldKeys.outputTokens])) === output &&
+      (!attrs["conversation.id"] || event["conversation.id"] === attrs["conversation.id"]));
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
 function sourceForOtlpService(value: unknown): ToolSource | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string") return "unknown";
@@ -491,7 +510,9 @@ function buildSpanEvent(
     : null;
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
-  const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
+  const completion = eventSource === "codex" ? codexTraceCompletion(safeSpan, attrs) : undefined;
+  const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens])) ??
+    (completion ? intTokens(numberField(completion, [...usageFieldKeys.cacheReadTokens])) : undefined);
   const cacheCreationTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheCreationTokens]));
   const capturedCost = admittedCost([attrs]);
   let costUsd = capturedCost.value;
