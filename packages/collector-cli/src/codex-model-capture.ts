@@ -652,6 +652,13 @@ export function captureCodexModel(
   const pair = logs.filter(
     (p) =>
       compatible(event, p.event) &&
+      (() => {
+        const a=event.metadata,b=p.event.metadata;
+        const at=a.codexTurnId??a["turn.id"]??a.turn_id,bt=b.codexTurnId??b["turn.id"]??b.turn_id;
+        const ar=a.request_id??a.call_id,br=b.request_id??b.call_id;
+        return !(at&&bt&&at!==bt||ar&&br&&ar!==br) &&
+          !((at||ar)&&(bt||br)&&!(at&&at===bt||ar&&ar===br));
+      })() &&
       sameCounts(event, p.event) &&
       (!p.pairedId || p.pairedId === rawId) &&
       Math.min(
@@ -673,8 +680,14 @@ export function captureCodexModel(
     pair.length === 1 &&
     pairModels.length === 1 &&
     competingSpans.length === 0
-  )
-    return pairedObservation(capture(event, pair, "paired_sse_event"));
+  ) {
+    const captured=capture(event,pair,"paired_sse_event");
+    // A native counter/SSE is not a duplicate span. Its accounting is reduced
+    // only by response coverage against retained, capture-qualified owners.
+    // A model witness alone must not erase good native usage when that log
+    // will subsequently be refused for contradictory trace evidence.
+    return isCodexResponseSpan(event)?pairedObservation(captured):captured;
+  }
   const traceId = text(event.metadata.traceId);
   // A native trace is an identity boundary, not a nearest-time window.
   // Inspect its complete admitted fact set, bounded by overflow rather than
@@ -689,7 +702,13 @@ export function captureCodexModel(
   if (traceRows.length > MAX_EVIDENCE_ROWS) return gap("trace_evidence_overflow");
   const tracePeers = decodePeers(traceRows);
   if (tracePeers.some(conflicts)) return gap("conflicting_trace_model_evidence");
-  const tracedPeers = tracePeers.filter(mayPromote);
+  const tracedPeers = tracePeers.filter(mayPromote).filter(p =>
+    // A model-less response span is an observation of usage, not a model
+    // producer. It remains in tracePeers for EVERY conflict/session/account
+    // check, but cannot veto a native SSE's complementary fields. This must
+    // hold before and after sealing; otherwise lease order changes capture.
+    // A model written by an older binary still supplies no native evidence.
+    p.event.metadata.otelEventName !== "handle_responses" || nativeModel(p.event) !== undefined);
   const traced = tracedPeers.filter(p=>p.event.metadata.otelEventName === "codex.sse_event");
   const traceEvidence =
     traceId && (directTraceModelEvidence || nativeSseEvent)

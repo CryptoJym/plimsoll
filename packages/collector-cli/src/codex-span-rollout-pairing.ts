@@ -71,6 +71,11 @@ function compatible(span: Row, rollout: Row) {
   const start = Date.parse(span.at), at = Date.parse(rollout.at);
   const a = account(span.event), b = account(rollout.event);
   const spanTurn = turn(span.event), rolloutTurn = turn(rollout.event);
+  const spanRequest=span.event.metadata.request_id??span.event.metadata.call_id;
+  const rolloutRequest=rollout.event.metadata.request_id??rollout.event.metadata.call_id;
+  if(spanRequest&&rolloutRequest&&spanRequest!==rolloutRequest)return false;
+  if((spanTurn||spanRequest)&&(rolloutTurn||rolloutRequest)&&
+    !(spanTurn&&spanTurn===rolloutTurn||spanRequest&&spanRequest===rolloutRequest))return false;
   const nativeModels = new Set(nativeValues(span.event, usageFieldKeys.model));
   return span.workspace !== null && span.epoch !== null && span.device !== null &&
     span.workspace === rollout.workspace && span.epoch === rollout.epoch && span.device === rollout.device &&
