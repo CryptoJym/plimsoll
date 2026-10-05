@@ -174,7 +174,10 @@ async function queuedRowsPendingReadStartsFromTheQueue() {
     const plan = (buffer.database.prepare(`explain query plan
       ${SESSION_SUMMARY_QUEUED_ROWS_PENDING_SQL.replace(BOUNDED_SQL_READ_PREDICATE, "1")}`)
       .all({ until }) as Array<{ detail: string }>).map((row) => row.detail);
-    assert.match(plan[0] ?? "", /^(?:SCAN|SEARCH) r\b/, JSON.stringify(plan));
+    assert.ok(plan.some((detail) => /^SCAN session_sync_summary_rows USING COVERING INDEX/.test(detail)),
+      JSON.stringify(plan));
+    assert.ok(plan.some((detail) => /^SEARCH r USING COVERING INDEX idx_session_summary_rows_session/.test(detail)),
+      JSON.stringify(plan));
     assert.ok(plan.some((detail) => /^SEARCH e USING INTEGER PRIMARY KEY/.test(detail)), JSON.stringify(plan));
     completion.check("queued_rows_pending_read_starts_from_the_queue");
   } finally { buffer.close(); }

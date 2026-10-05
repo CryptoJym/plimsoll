@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.50 — 2026-10-05 (unpublished)
+
+- #458 keeps source-recorded Codex processing-tier metadata readable before
+  enabling any tier writer, and preserves reported cached-input counts,
+  including zero, while absent counts remain unknown.
+- #460 reads distinct queued session IDs and checks for each session's first
+  ready event, preventing a blocked session's backlog from forcing full
+  session re-sends.
+
 ## 0.7.48 — 2026-10-03 (unpublished)
 
 - Skip plan-limit observations without an account binding. Rollout commit
