@@ -693,10 +693,10 @@ export function captureCodexModel(
     accountConflict(p.event);
   // An internally conflicting peer remains evidence of ambiguity. Dropping
   // it before counting models could leave one clean log and select its model.
-  const logs = native.filter(
+  const logs = peerEvidence.filter(
     (p) => p.event.metadata.otelEventName === "codex.sse_event",
   );
-  const pair = logs.filter(
+  const pairFacts = logs.filter(
     (p) =>
       compatible(event, p.event) &&
       !(codexResponseIdentities(event.metadata).length && codexResponseIdentities(p.event.metadata).length &&
@@ -708,8 +708,12 @@ export function captureCodexModel(
         Math.abs(Date.parse(p.event.observedAt) - end),
       ) <= 30_000,
   );
-  if (pair.some((p) => nativeModel(p.event) === undefined || conflicts(p)))
+  // A terminal gap cannot name a pair, but its original native attributes
+  // remain contradictions. Inspect the full exact-counter candidate set
+  // before selecting promotable witnesses, just as the trace tier does.
+  if (pairFacts.some((p) => nativeModel(p.event) === undefined || conflicts(p)))
     return gap("conflicting_pair_model_evidence");
+  const pair = pairFacts.filter(mayPromote);
   const pairModels = unique(pair, (e) => nativeModel(e));
   if (pairModels.length > 1) return gap("ambiguous_pair_model");
   const competingSpans = peers.filter(

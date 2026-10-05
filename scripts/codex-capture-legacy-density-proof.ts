@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { LocalEventBuffer } from '../packages/collector-cli/src/buffer';
-import { captureCodexModel, isCaptureGap } from '../packages/collector-cli/src/codex-model-capture';
+import { captureCodexModel, isCaptureGap, rememberCaptureGap } from '../packages/collector-cli/src/codex-model-capture';
 import { codexResponseCoverage } from '../packages/collector-cli/src/codex-response-coverage';
 import { rowHasAdmittedUsage } from '../packages/collector-cli/src/usage-authority';
 import { aiInteractionEventSchema, type AiInteractionEvent } from '../packages/shared/src/index';
 import { nativeCodexFixture } from './lib/native-codex-fixture';
 import { createProofCompletion } from './lib/proof-completion';
-const completion = createProofCompletion('codex-capture-legacy-density',36);
+const completion = createProofCompletion('codex-capture-legacy-density',37);
 const root=fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-legacy-density-'));
 const at=new Date().toISOString();
 const event=(n:number)=>aiInteractionEventSchema.parse({id:`00000000-0000-4000-8000-${String(n).padStart(12,'0')}`,
@@ -105,5 +105,19 @@ try {
   sse.append(guessed);
   completion.check('bare_trace_free_sse_still_cannot_guess_a_model',isCaptureGap(captureCodexModel(sse.database,guessed)));
  }finally{sse.close();}
+ const paired=open('gap-decided-exact-pair-contradiction');
+ try {
+  const bad={...event(1),model:'gpt-6-sol',eventType:'unknown' as const,
+   metadata:{model:'gpt-6-sol','gen_ai.request.model':'gpt-5.5',otelEventName:'codex.sse_event'}};
+  paired.append(bad);rememberCaptureGap(paired.database,bad.id,'conflicting_model_attributes');
+  const clean={...event(2),model:'gpt-6-sol',eventType:'unknown' as const,
+   metadata:{model:'gpt-6-sol',otelEventName:'codex.sse_event'}};
+  paired.append(clean);
+  const target={...event(3),metadata:{otelEventName:'handle_responses'}};paired.append(target);
+  const gap=captureCodexModel(paired.database,target);
+  completion.check('gap_decided_exact_pair_retains_native_model_contradiction',
+   isCaptureGap(gap)&&gap.metadata.modelGapReason==='conflicting_pair_model_evidence'&&
+   gap.inputTokens===undefined&&gap.outputTokens===undefined&&gap.metadata.modelGapInputTokens===0&&gap.metadata.modelGapOutputTokens===7);
+ }finally{paired.close();}
  completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}
