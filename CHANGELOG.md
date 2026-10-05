@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.51 (unreleased)
+## 0.7.52 (unreleased)
 
 - Response aliases remain linked through covered SSE diagnostics, including
   every co-present request, call and turn identity, transitive chains and
@@ -111,6 +111,14 @@
   Public tailer/history, snapshot, projection and summary fixtures also cover
   skewed partial/complete and growing reports. This finite coverage complements the matrix;
   it does not claim every possible producer shape or operation sequence.
+
+## 0.7.51 — 2026-10-05
+
+- #453 adds the dispatch binding index, bounded dispatch history and explicit
+  adoption qualification as a rollback bridge. Adoption remains off and is
+  refused against the released 0.7.48 reader; activation requires a later
+  reviewed build and qualification of the actual installed pair.
+- #453 adds test-only join-proof diagnostics without changing proof limits.
 
 ## 0.7.50 — 2026-10-05
 

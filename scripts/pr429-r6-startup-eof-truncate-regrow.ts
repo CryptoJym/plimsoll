@@ -39,10 +39,10 @@ const config=collectorConfigSchema.parse({deviceId:`dev-r6-${scenario}`,
   uploadUrl:"http://127.0.0.1:1/unused",captureRoots:[{...A,dispatch:[bound]},B]});
 fs.mkdirSync(A.directory,{recursive:true});
 fs.mkdirSync(path.dirname(file),{recursive:true});
-fs.mkdirSync(process.env.PLIMSOLL_HOME!,{recursive:true});
+fs.mkdirSync(process.env.PLIMSOLL_HOME!,{recursive:true,mode:0o700});
 fs.writeFileSync(file,original);
 fs.writeFileSync(path.join(process.env.PLIMSOLL_HOME!,"collector.config.json"),
-  JSON.stringify(config)+"\n");
+  JSON.stringify(config)+"\n",{mode:0o600});
 const initial=fs.statSync(file);
 const buffer=new LocalEventBuffer(path.join(process.env.PLIMSOLL_HOME!,`r6-${scenario}.sqlite`),{
   workspaceId:config.tenantId,deviceId:config.deviceId,

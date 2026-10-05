@@ -34,7 +34,7 @@ const publish = (roots: Array<typeof bareRoots[number] & { dispatch?: ReturnType
   const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-edge-controls",
     uploadUrl: "http://127.0.0.1:1/unused", captureRoots: roots });
   const next = `${file}.next`;
-  fs.writeFileSync(next, `${JSON.stringify(config)}\n`);
+  fs.writeFileSync(next, `${JSON.stringify(config)}\n`, { mode: 0o600 });
   fs.renameSync(next, file);
   return config;
 };
@@ -93,7 +93,7 @@ const hook = (snapshot: typeof oldSnapshot) => normalizeForwardedHook(hookPayloa
 assert.equal(hook(oldSnapshot), null);
 bindDispatch(["--session-id", raced, "--work-item-id", work,
   "--project-key", `sha256:${"a".repeat(64)}`, "--attempt-id", attempt,
-  "--valid-from", at(-60), "--valid-until", at(60)], new Date(now));
+  "--valid-from", at(-60)], new Date(now));
 const newSnapshot = currentDispatchBindingSnapshot();
 assert.notStrictEqual(newSnapshot, oldSnapshot);
 assert.equal(hook(oldSnapshot), null);

@@ -13,7 +13,9 @@ import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { LocalEventBuffer as HeadBuffer } from "../packages/collector-cli/src/buffer";
 import { captureCodexModel as headCapture } from "../packages/collector-cli/src/codex-model-capture";
 
-const completion = createProofCompletion("collector-named-usage-rollback", 20);
+// Retain all 20 PR checks, main's additional 0.7.50 check, and the current
+// branch writer -> exact released 0.7.51 reader check.
+const completion = createProofCompletion("collector-named-usage-rollback", 22);
 // Commit A is a reader-only tier release. Commit B enables tier capture and
 // changes this proof's previous reader to the exact commit A, not stock 0.7.49.
 const recordedTierWriter = false;
@@ -26,6 +28,8 @@ const currentVersion: string = JSON.parse(fs.readFileSync(
   path.resolve("packages/collector-cli/package.json"), "utf8",
 )).version;
 const writerCommit = "9f75bdcdf6d19fd477caed838482bb0fe16c8d31";
+const released050Commit = "121b55437555c3a3c34bafe5889f4d6d8870509f";
+const released051Commit = "71d6ff27f0d39aa31d188c9bcc31d37bf188c384";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-named-rollback-"));
 const ledgerPath = path.join(root, "rollback.sqlite");
 const workspaceId = "00000000-0000-4000-8000-000000000001";
@@ -254,10 +258,13 @@ async function rollbackFixture(
     try { assert.deepEqual(readSealed(afterCurrent), sealedBefore); } finally { afterCurrent.close(); }
     check("scanner-head-reader-preserves-exact-sealed-usage-and-gap");
 
+    let previousLeaseId = current.leaseId;
     for (const [index, reader] of readers.entries()) {
       const nowMs = fixtureStart + 303_000 + index * 121_000;
       const lease = await leaseWithReader(reader.tree, reader.version, nowMs,
         index === readers.length - 1, ledgerPath);
+      assert.notEqual(lease.leaseId, previousLeaseId, `${reader.version} waits for lease expiry`);
+      previousLeaseId = lease.leaseId;
       assert.deepEqual(lease.itemIds.sort(), [gapId, namedId].sort());
       const db = new Database(ledgerPath, { readonly: true });
       try {
@@ -287,7 +294,9 @@ async function rollbackFixture(
       fixture: name,
       writerCommit,
       readers: [`scanner-head-${currentVersion}`, ...readers.map((reader) => reader.version)],
-      leaseOffsets: [3_061_000, 3_182_000, 3_303_000, 3_424_000, 3_545_000],
+      leaseOffsets: [fixtureStart - baseMs + 61_000, fixtureStart - baseMs + 182_000,
+        ...readers.map((_, index) => fixtureStart - baseMs + 303_000 + index * 121_000)],
+      released051Commit,
       claim,
       frozenEnvelopes: sealedBefore.length,
     }));
@@ -295,8 +304,9 @@ async function rollbackFixture(
 }
 
 async function main() {
-  let old050: string | undefined;
   let writerTree: string | undefined;
+  let old051: string | undefined;
+  let old050: string | undefined;
   let old049: string | undefined;
   let old048: string | undefined;
   let old047: string | undefined;
@@ -398,16 +408,22 @@ async function main() {
 
     const oldRoot = path.join(root, "readers");
     fs.mkdirSync(oldRoot, { recursive: true });
+    old051 = path.join(oldRoot, "collector-0.7.51");
+    old050 = path.join(oldRoot, "collector-0.7.50");
     old049 = path.join(oldRoot, "collector-0.7.49");
     old048 = path.join(oldRoot, "collector-0.7.48");
     old047 = path.join(oldRoot, "collector-0.7.47");
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", old051,
+      released051Commit]);
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", old050,
+      released050Commit]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old049,
       "275fce73c76f8d2a9898cbc52e8ddf5b7a128c9e"]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old048,
       "34d58bcd90865679e09fcbd1ee1703de5effda97"]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old047,
       "a60590559403cace3db7cbbda49812c9e3dbfe62"]);
-    for (const worktree of [old049, old048, old047])
+    for (const worktree of [old051, old050, old049, old048, old047])
       fs.symlinkSync(path.resolve("node_modules"), path.join(worktree, "node_modules"), "dir");
 
     const current = await leaseWithReader(path.resolve("."), currentVersion, baseMs + 182_000, false);
@@ -416,20 +432,31 @@ async function main() {
     try { assert.deepEqual(readSealed(afterCurrent), sealedBefore); } finally { afterCurrent.close(); }
     completion.check("scanner-head-reader-preserves-exact-sealed-usage-and-gap");
 
-    const stock = await leaseWithReader(old049, "0.7.49", baseMs + 303_000, false);
+    // Each reader waits 121 seconds: the preceding 120-second lease is expired.
+    const released050 = await leaseWithReader(old050, "0.7.50", baseMs + 303_000, false);
+    assert.notEqual(released050.leaseId, current.leaseId);
+    assert.deepEqual(released050.itemIds.sort(), [gapId, namedId].sort());
+    const after050 = new Database(ledgerPath, { readonly: true });
+    try { assert.deepEqual(readSealed(after050), sealedBefore); } finally { after050.close(); }
+    completion.check("rollback-reader-0.7.50-preserves-usage-after-lease-expiry");
+
+    const stock = await leaseWithReader(old049, "0.7.49", baseMs + 424_000, false);
+    assert.notEqual(stock.leaseId, released050.leaseId);
     assert.deepEqual(stock.itemIds.sort(), [gapId, namedId].sort());
     const after049 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after049), sealedBefore); } finally { after049.close(); }
     completion.check("rollback-reader-0.7.49-preserves-usage-after-lease-expiry");
 
-    const first = await leaseWithReader(old048, "0.7.48", baseMs + 424_000, false);
+    const first = await leaseWithReader(old048, "0.7.48", baseMs + 545_000, false);
+    assert.notEqual(first.leaseId, stock.leaseId);
     assert.deepEqual(first.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.48-preserves-usage");
 
     const after048 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after048), sealedBefore); } finally { after048.close(); }
 
-    const second = await leaseWithReader(old047, "0.7.47", baseMs + 545_000, true);
+    const second = await leaseWithReader(old047, "0.7.47", baseMs + 666_000, true);
+    assert.notEqual(second.leaseId, first.leaseId);
     assert.deepEqual(second.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.47-preserves-usage");
 
@@ -530,7 +557,9 @@ async function main() {
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
-      readers: [`scanner-head-${currentVersion}`, "stock-0.7.49", "main-0.7.48", "0.7.47"],
+      readers: [`scanner-head-${currentVersion}`, "released-0.7.50", "stock-0.7.49", "main-0.7.48", "0.7.47"],
+      readerLeaseOffsetsMs: [182_000, 303_000, 424_000, 545_000, 666_000],
+      released050Commit,
       stagedRollback: { writerCommit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
         previousReaderCommit, previousReaderLabel, recordedTierWriter, sameLedger: true, leaseExpired: true,
         locallyDead: 0, acknowledged: 3 },
@@ -538,20 +567,18 @@ async function main() {
       tierClaim,
       frozenEnvelopes: sealedBefore.length,
     }));
-    old050 = path.join(root, "collector-0.7.50");
-    execFileSync("git", ["worktree", "add", "--detach", "--quiet", old050,
-      "121b55437555c3a3c34bafe5889f4d6d8870509f"]);
-    fs.symlinkSync(path.resolve("node_modules"), path.join(old050, "node_modules"), "dir");
     await rollbackFixture("head-writer-released-readers", {
       LocalEventBuffer: HeadBuffer, captureCodexModel: headCapture,
     }, execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), [
+      { tree: old051, version: "0.7.51" },
       { tree: old050, version: "0.7.50" }, { tree: old049, version: "0.7.49" },
       { tree: old048, version: "0.7.48" },
     ]);
     completion.complete();
   } finally {
-    if (old050) closeQuietly(old050);
+    if (old051) closeQuietly(old051);
     if (writerTree) closeQuietly(writerTree);
+    if (old050) closeQuietly(old050);
     if (old049) closeQuietly(old049);
     if (old048) closeQuietly(old048);
     if (old047) closeQuietly(old047);

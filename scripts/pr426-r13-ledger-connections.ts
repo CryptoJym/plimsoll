@@ -238,7 +238,7 @@ async function main(variant: string) {
   const config = collectorConfigSchema.parse({ tenantId: workspace, deviceId: device,
     installKey: "fixture-install-key", port: 49613, captureRoots: [{ source: "codex", rootId: "codex",
       profileId: "fixture", directory: root, installationEpochId: epoch }] });
-  fs.writeFileSync(path.join(data, "collector.config.json"), JSON.stringify(config));
+  fs.writeFileSync(path.join(data, "collector.config.json"), JSON.stringify(config), { mode: 0o600 });
   const env = { ...process.env, HOME: home, USERPROFILE: home, PLIMSOLL_HOME: data,
     CODEX_HOME: path.join(home, ".codex"), CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
     GROK_HOME: path.join(home, ".grok"), NEXT_TELEMETRY_DISABLED: "1" };

@@ -26,8 +26,8 @@ const rootA = { rootId: "claude-a", profileId: "profile-a", installationEpochId:
   source: "claude_code" as const, directory: path.join(home, ".claude-a", "projects"), dispatch: [] as ReturnType<typeof makeBinding>[] };
 const rootB = { rootId: "claude-b", profileId: "profile-b", installationEpochId: fixtureEpochId("epoch-b"),
   source: "claude_code" as const, directory: path.join(home, ".claude-b", "projects") };
-for (const root of [rootA, rootB]) fs.mkdirSync(root.directory, { recursive: true });
-fs.mkdirSync(plimsoll, { recursive: true });
+for (const root of [rootA, rootB]) fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });
+fs.mkdirSync(plimsoll, { recursive: true, mode: 0o700 });
 const baseConfig = collectorConfigSchema.parse({ deviceId: "dev_pr429-r3-atomicity",
   uploadUrl: "http://127.0.0.1:1/unused", captureRoots: [rootA, rootB] });
 const options = { workspaceId: baseConfig.tenantId, deviceId: baseConfig.deviceId,
@@ -46,7 +46,7 @@ function hook(buffer: LocalEventBuffer, sessionId: string) {
   const config = collectorConfigSchema.parse({ deviceId: options.deviceId,
     uploadUrl: "http://127.0.0.1:1/unused", captureRoots: [{ ...rootA, dispatch: [makeBinding(sessionId)] }, rootB] });
   const configFile = path.join(plimsoll, "collector.config.json");
-  fs.writeFileSync(`${configFile}.next`, `${JSON.stringify(config)}\n`);
+  fs.writeFileSync(`${configFile}.next`, `${JSON.stringify(config)}\n`, { mode: 0o600 });
   fs.renameSync(`${configFile}.next`, configFile);
   const before = claudeDispatchSkipStatus().otherRootSeen;
   const event = normalizeForwardedHook({ id: crypto.randomUUID(), hook_event_name: "AssistantResponse",

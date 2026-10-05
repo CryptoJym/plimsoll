@@ -494,7 +494,7 @@ function proofClockWindowFixture(): ProofClockWindowResult {
 
 function proofClockMatrix() {
   const script = process.argv[1];
-  const tsx = path.join(process.cwd(), "node_modules", ".bin", "tsx");
+  const tsxLoader = path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs");
   const cases = [
     { now: "2026-06-15T12:00:00.000Z", tz: "UTC" },
     { now: "2028-06-15T12:00:00.000Z", tz: "UTC" },
@@ -502,7 +502,7 @@ function proofClockMatrix() {
     { now: "2028-06-15T12:00:00.000Z", tz: "America/Denver" },
   ];
   const results = cases.map((entry) => {
-    const child = spawnSync(tsx, [script], {
+    const child = spawnSync(process.execPath, ["--import", tsxLoader, script], {
       encoding: "utf8",
       env: {
         ...process.env,

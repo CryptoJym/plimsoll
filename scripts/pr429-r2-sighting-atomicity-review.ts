@@ -34,7 +34,7 @@ const roots = [
 for (const root of roots) fs.mkdirSync(root.directory, { recursive: true, mode: 0o700 });
 const config = collectorConfigSchema.parse({ deviceId: "dev_pr429-sighting-atomicity",
   uploadUrl: "http://127.0.0.1:1/unused", captureRoots: roots });
-fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`);
+fs.writeFileSync(path.join(plimsoll, "collector.config.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
 const file = path.join(plimsoll, "sighting-atomicity.sqlite");
 const options = { workspaceId: config.tenantId, deviceId: config.deviceId,
   enrollmentNow: () => new Date(now - 3_600_000), delivery: { enabled: true } };

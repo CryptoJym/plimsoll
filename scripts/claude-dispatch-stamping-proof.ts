@@ -8,7 +8,7 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { appendRootObservation, currentDispatchCaptureRoots, dispatchBindingMetadata,
   rootEventMetadata, type DispatchBinding } from "../packages/collector-cli/src/capture-root-inventory";
-import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { collectorConfigSchema, rollbackCollectorDispatchHistory } from "../packages/collector-cli/src/config";
 import { bindDispatch, restampDispatch } from "../packages/collector-cli/src/dispatch-command";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
@@ -109,11 +109,18 @@ async function main() {
     { rootId: "codex", profileId: "codex", installationEpochId, source: "codex" as const, directory: codex },
   ];
   const configPath = path.join(plimsoll, "collector.config.json");
-  fs.writeFileSync(configPath, JSON.stringify(collectorConfigSchema.parse({ ...base, captureRoots: roots })) + "\n");
-  const bind = (session: string, attempt: string, work = workItemId) => bindDispatch([
+  fs.writeFileSync(configPath, JSON.stringify(collectorConfigSchema.parse({ ...base, captureRoots: roots })) + "\n", { mode: 0o600 });
+  const bind = (session: string, attempt: string, work = workItemId) => {
+    const result = bindDispatch([
     "--session-id", session, "--work-item-id", work, "--project-key", projectKey,
     "--attempt-id", attempt, "--valid-from", at(-10), "--valid-until", at(10),
-  ]);
+    ]);
+    // The later fanout/conflict cases intentionally edit legacy hot arrays.
+    // Materialize through the production lossless downgrade helper first;
+    // never delete or rewrite immutable historical membership to seed them.
+    rollbackCollectorDispatchHistory();
+    return result;
+  };
   assert.equal(bind(sessionId, attemptId).roots, 4);
   const rooted = (session: string, eventType: "session_start" | "tool_use", rootIndex = 0) => {
     const id = crypto.randomUUID();
