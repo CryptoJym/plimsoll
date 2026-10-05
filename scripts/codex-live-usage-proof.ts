@@ -66,7 +66,7 @@ async function fixture() {
   let token = enroll();
   let server = createCollectorServer(config, buffer, { localAuth: ordinary, liveProducerHome: home, perSourceRequestLimit: 10000 });
   let port = 0;
-  const start = async () => { await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); port = (server.address() as AddressInfo).port; };
+  const start = async () => { await new Promise<void>(resolve => server.listen(49794, "127.0.0.1", resolve)); port = (server.address() as AddressInfo).port; };
   await start();
   const headers = (producerId = baseline.producerId, value = token) => ({ "x-plimsoll-producer-id": producerId, "x-plimsoll-token": value });
   const send = (packet: unknown, extra: Record<string, string | string[]> = {}) => request(port, canonicalJson(packet), { ...headers(), ...extra });

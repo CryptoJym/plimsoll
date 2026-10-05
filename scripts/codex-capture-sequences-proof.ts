@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
@@ -46,6 +47,12 @@ const root = proofTempRoot("capture-sequences");
 const fixtureDirectory = path.join(process.cwd(),"scripts/fixtures/codex-capture-sequences");
 const seeds = Number(process.argv.find(arg=>arg.startsWith("--seeds="))?.slice(8) ?? 200);
 assert.ok(Number.isSafeInteger(seeds) && seeds >= 200 && seeds <= 2000,"pin at least 200 bounded seeds");
+const partitionArg=process.argv.find(arg=>arg.startsWith("--partition="))?.slice(12);
+const partition=partitionArg?partitionArg.split(":").map(Number):undefined;
+if(partition)assert.ok(partition.length===2&&partition.every(Number.isSafeInteger)&&partition[0]!>=0&&
+  partition[1]!>partition[0]!&&partition[1]!<=seeds,"bounded internal seed partition");
+const workerSummary=process.argv.find(arg=>arg.startsWith("--worker-summary="))?.slice(17);
+if(partition)assert.ok(workerSummary&&path.resolve(workerSummary).startsWith(process.env.PLIMSOLL_PROOF_ROOT!+path.sep),"worker summary is private");
 const caseFile = process.argv.find(arg=>arg.startsWith("--case="))?.slice(7);
 const directed = caseFile ? [{file:path.basename(caseFile),...JSON.parse(fs.readFileSync(caseFile,"utf8"))}] : fs.existsSync(fixtureDirectory) ? fs.readdirSync(fixtureDirectory).filter(f=>f.endsWith(".json"))
   .sort().map(file=>({file,...JSON.parse(fs.readFileSync(path.join(fixtureDirectory,file),"utf8"))})) : [];
@@ -60,7 +67,8 @@ const orderGroups: Op[][]=[
   ["skew-partial-request","skew-native-update","skew-complete-request"],
   ["alias-request","alias-native","alias-bridge"],
 ];
-const completion = createProofCompletion("codex-capture-sequences",(caseFile?0:seeds+orderGroups.length*6)+directed.length);
+const completion = createProofCompletion(partition?"codex-capture-sequences-partition":"codex-capture-sequences",
+  partition?partition[1]!-partition[0]!:(caseFile?0:seeds+orderGroups.length*6)+directed.length);
 let Old047: any, Old048: any, runIndex = 0;
 const coverage = new Map<Op,number>([...OPS,"skew-series" as const,"alias-long-chain" as const].map(op=>[op,0]));
 let steps = 0, rollbackLeases = 0, terminalReplays = 0, historyImports = 0, historyRefusals = 0, pairingChecks = 0;
@@ -672,16 +680,56 @@ async function saveFailure(name:string,operations:Op[],result:Extract<Awaited<Re
   fs.writeFileSync(file,JSON.stringify({...result,originalOperations:operations,...reduced},null,2)+"\n");
   console.error(JSON.stringify({file,tag,...reduced}));
 }
+function completionSeedNames(from:number,to:number) {return Array.from({length:to-from},(_,n)=>`seed-${from+n}`);}
+async function parallelSeeds() {
+  const split=Math.ceil(seeds/2),ranges=[[0,split],[split,seeds]] as const;
+  const children: ReturnType<typeof spawn>[]=[];
+  try {
+    const summaries=await Promise.all(ranges.map(async([from,to])=>{
+      const directory=path.join(process.env.PLIMSOLL_PROOF_ROOT!,`seed-worker-${from}`);fs.mkdirSync(directory,{mode:0o700});
+      const summary=path.join(directory,"summary.json"),receipt=path.join(directory,"completion.json");
+      const child=spawn(process.execPath,["--import",path.join(process.cwd(),"node_modules/tsx/dist/loader.mjs"),
+        path.join(process.cwd(),"scripts/codex-capture-sequences-proof.ts"),`--seeds=${seeds}`,`--partition=${from}:${to}`,`--worker-summary=${summary}`],
+        {cwd:process.cwd(),env:{...process.env,PLIMSOLL_PROOF_RECEIPT:receipt},stdio:["ignore","ignore","inherit"]});
+      children.push(child);
+      await new Promise<void>((resolve,reject)=>{
+        child.once("error",reject);child.once("exit",(code,signal)=>code===0?resolve():reject(new Error(`seed partition ${from}:${to} exit ${code}/${signal}`)));
+      });
+      const actual=JSON.parse(fs.readFileSync(receipt,"utf8")),expected=completionSeedNames(from,to);
+      invariant(actual.completed===true&&actual.status==="passed"&&actual.runId===process.env.PLIMSOLL_PROOF_RUN_ID&&
+        actual.expectedChecks===to-from&&actual.counts.passed===to-from&&actual.counts.failed===0&&
+        JSON.stringify(actual.checks)===JSON.stringify(expected.map(name=>({name,passed:true}))),"SEED_PARTITION_RECEIPT",actual);
+      const result=JSON.parse(fs.readFileSync(summary,"utf8"));
+      invariant(result.from===from&&result.to===to&&JSON.stringify(result.seeds)===JSON.stringify(expected),"SEED_PARTITION_RANGE",result);
+      return result;
+    }));
+    const all=summaries.flatMap(s=>s.seeds);
+    invariant(JSON.stringify(all)===JSON.stringify(completionSeedNames(0,seeds))&&new Set(all).size===seeds,"EVERY_PINNED_SEED_ONCE",all);
+    for(const summary of summaries) {
+      for(const name of summary.seeds)completion.check(name);
+      steps+=summary.steps;rollbackLeases+=summary.rollbackLeases;terminalReplays+=summary.terminalReplays;
+      historyImports+=summary.historyImports;historyRefusals+=summary.historyRefusals;pairingChecks+=summary.pairingChecks;
+      for(const [op,count] of Object.entries(summary.operations))coverage.set(op as Op,coverage.get(op as Op)!+(count as number));
+    }
+    console.log(JSON.stringify({seedPartitions:summaries.map(s=>({from:s.from,to:s.to,steps:s.steps,processIdentity:s.processIdentity})),everySeedOnce:true}));
+  } finally {
+    // On any partition failure, terminate only owned fixture children and await
+    // their exits before the disposable proof root can be removed.
+    for(const child of children)if(child.exitCode===null&&child.signalCode===null) {
+      const done=new Promise<void>(resolve=>child.once("exit",()=>resolve()));child.kill("SIGTERM");await done;
+    }
+  }
+}
 async function main() {
   await withReader("a60590559403cace3db7cbbda49812c9e3dbfe62",async({Buffer:B047})=>
     withReader("34d58bcd90865679e09fcbd1ee1703de5effda97",async({Buffer:B048})=>{
       Old047=B047;Old048=B048;
-      for(const fixture of directed) {
+      for(const fixture of partition?[]:directed) {
         const result=await run(fixture.operations);
         if(!result.passed)await saveFailure(fixture.file,fixture.operations,result);
         invariant(result.passed,"DIRECTED_SEQUENCE",{fixture:fixture.file,result});completion.check(fixture.file);
       }
-      if(!caseFile)for(let group=0;group<orderGroups.length;group++) {
+      if(!caseFile&&!partition)for(let group=0;group<orderGroups.length;group++) {
         let canonical:Record<string,number>|undefined;
         const observations=orderGroups[group]!,response=observations[0]!.startsWith("alias-")?"alias-response":observations[0]!.startsWith("request-only-")?"request-only":"response-5";
         let permutation=0;
@@ -698,7 +746,7 @@ async function main() {
           canonical=totals;completion.check(`order-${group}-${permutation++}`);
         }
       }
-      for(let seed=0;seed<(caseFile?0:seeds);seed++) {
+      for(let seed=partition?.[0]??0;seed<(partition?.[1]??0);seed++) {
         const operations=sequence(seed),result=await run(operations);
         if(!result.passed) {
           const tag=failureTag(result.error);
@@ -715,6 +763,13 @@ async function main() {
         completion.check(`seed-${seed}`);
       }
     }));
+  if(!caseFile&&!partition)await parallelSeeds();
+  if(partition) {
+    const summary={from:partition[0],to:partition[1],seeds:completionSeedNames(partition[0]!,partition[1]!),
+      steps,operations:Object.fromEntries(coverage),rollbackLeases,terminalReplays,historyImports,historyRefusals,pairingChecks,
+      processIdentity:identityQueries.stats()};
+    fs.writeFileSync(workerSummary!,JSON.stringify(summary)+"\n");
+  }
   if(!caseFile)invariant(OPS.every(op=>coverage.get(op)!>0),"OPERATION_COVERAGE",Object.fromEntries(coverage));
   console.log(JSON.stringify({proof:"codex-capture-sequences",seeds,directed:directed.length,steps,
     orderChecks:caseFile?0:orderGroups.length*6,
