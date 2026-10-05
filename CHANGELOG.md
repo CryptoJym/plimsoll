@@ -50,8 +50,18 @@
   Codex coverage is per native response and financial field: an exact twin
   consumes only retained accounting, preserves the first delivery's bytes,
   and leaves later cumulative turn deltas billable on tailing and history.
-  Partial SSE/span updates retain only unpaid fields; newly reported zeros
-  remain known even beside an already-frozen owner with that field absent.
+  Within one conversation and workspace/device/install/account boundary,
+  shared explicit request or turn identity joins observations before time or
+  residual-counter filters. Native counter marginals sum within that response
+  before competing with SSE/span observations. Each financial field accounts
+  for its largest reported response amount, preserving absence versus zero;
+  only distinct responses add. Late, earlier-timestamped partial/complete or
+  smaller/larger updates emit only the unpaid fields across all frozen owners.
+  Newly reported zeros remain known beside an owner whose field was absent.
+  Known but unshared request/turn identities cannot acquire a twin through
+  equal counts. Anonymous established twins retain the exact-completion and
+  directional counter checks. A model-less span remains contradiction evidence
+  without vetoing an explicit native SSE's complementary cache/cost fields.
   Late SSE and rollout twins preserve an already-frozen named span as the
   counted owner, including an actual 0.7.48 writer running during rollback.
   Stateless and history snapshots also freeze their matching queue copy so
@@ -69,7 +79,12 @@
   actual 0.7.47/0.7.48 readers. It checks accounting after every operation and
   retains directed counterexamples. Its independent producer oracle checks
   every financial field, including diagnostic, zero, partial and cache/cost
-  signals. This finite coverage complements the matrix;
+  signals, request-only/turn-only/mixed identities, timestamp drift, repeated
+  counters within a native turn and late arrivals with earlier timestamps.
+  Eight three-observation groups check all arrival permutations with an ACK
+  after each observation; a long update case crosses the legacy ancestry bound.
+  Public tailer/history, snapshot, projection and summary fixtures also cover
+  skewed partial/complete and growing reports. This finite coverage complements the matrix;
   it does not claim every possible producer shape or operation sequence.
 
 ## 0.7.48 — 2026-10-03 (unpublished)
