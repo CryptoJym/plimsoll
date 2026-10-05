@@ -1210,6 +1210,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:upload-timer-bounds
 
+      - name: Test Codex cached-count and recorded-tier capture
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm test:codex-usage-fields
+
       - name: Prove rollout lineage and reasoning-token upload
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:token-lineage
