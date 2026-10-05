@@ -71,8 +71,10 @@ import { codexPlanLimitWindows, PlanLimitEmitter, type PlanLimitWindow } from ".
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
+  codexServiceTier,
   estimateCostUsd,
   type AiInteractionEvent,
+  type CodexServiceTier,
 } from "../../shared/src/index";
 
 /**
@@ -207,6 +209,7 @@ type RolloutParserState = {
   cliVersion?: string;
   model?: string;
   planType?: string;
+  serviceTier?: CodexServiceTier;
   previous: TokenTotals;
   tokenCountIndex: number;
   counterUncertain?: boolean;
@@ -281,6 +284,7 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
       "cliVersion",
       "model",
       "planType",
+      "serviceTier",
       "previous",
       "tokenCountIndex",
       "counterUncertain",
@@ -321,6 +325,8 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
   const cliVersion = optionalString(value.cliVersion);
   const model = optionalString(value.model);
   const planType = optionalString(value.planType);
+  const serviceTier = codexServiceTier(value.serviceTier);
+  if (value.serviceTier !== undefined && value.serviceTier !== serviceTier) return undefined;
   if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType].includes(null)) {
     return undefined;
   }
@@ -343,6 +349,7 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
     ...(cliVersion ? { cliVersion } : {}),
     ...(model ? { model } : {}),
     ...(planType ? { planType } : {}),
+    ...(serviceTier ? { serviceTier } : {}),
     ...(typeof value.activeRepoContextId === "string"
       ? { activeRepoContextId: value.activeRepoContextId }
       : {}),
@@ -1814,6 +1821,7 @@ export class RolloutTailer {
       observedAt: string | undefined;
       delta: TokenTotals;
       model: string | undefined;
+      serviceTier: CodexServiceTier | undefined;
       repoContext: ActiveContext;
       lineageFirstUnknown?: TokenTotals;
     }> = [];
@@ -1846,7 +1854,8 @@ export class RolloutTailer {
       const isMeta = line.includes('"session_meta"');
       const isTurn = line.includes('"turn_context"');
       const isCount = line.includes('"token_count"');
-      if (!isMeta && !isTurn && !isCount) continue;
+      const isSettings = line.includes('"thread_settings_applied"');
+      if (!isMeta && !isTurn && !isCount && !isSettings) continue;
       let parsed: Record<string, unknown>;
       try {
         parsed = JSON.parse(line) as Record<string, unknown>;
@@ -1871,6 +1880,15 @@ export class RolloutTailer {
           for (const entry of pending) entry.model ??= state.model;
         }
         activeRepoContext = observeContext("turn_context", payload.cwd);
+      } else if (type === "event_msg" && payload.type === "thread_settings_applied") {
+        // Snapshots copied into a fork can retain their original owner.
+        // codex-rs/protocol/src/protocol.rs:2191-2205 at rust-v0.155.0-alpha.9.2.
+        // Older snapshots lack thread_id; never accept an explicit other owner.
+        if (payload.thread_id === undefined ||
+            typeof payload.thread_id === "string" && payload.thread_id.toLowerCase() === state.conversationId) {
+          const settings = isRecord(payload.thread_settings) ? payload.thread_settings : {};
+          state.serviceTier = codexServiceTier(settings.service_tier);
+        }
       } else if (type === "event_msg" && payload.type === "token_count") {
         state.tokenCountIndex += 1;
         const info = (payload.info ?? {}) as Record<string, unknown>;
@@ -1903,6 +1921,7 @@ export class RolloutTailer {
           observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
           delta,
           model: state.model,
+          serviceTier: state.serviceTier,
           repoContext: activeRepoContext,
           ...(lineageFirstUnknown ? { lineageFirstUnknown } : {}),
         });
@@ -2005,6 +2024,7 @@ export class RolloutTailer {
           this.accountAttributionEnabled()),
         usageSource: "rollout",
         turnIndex: entry.index,
+        ...(entry.serviceTier ? { serviceTier: entry.serviceTier } : {}),
         ...(accountKey ? { "user.account_id": accountKey } : {}),
       };
       if (state.originator) metadata.originator = state.originator;

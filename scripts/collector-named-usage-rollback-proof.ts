@@ -13,9 +13,9 @@ import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 const completion = createProofCompletion("collector-named-usage-rollback", 11);
 // Commit A is a reader-only tier release. Commit B enables tier capture and
 // changes this proof's previous reader to the exact commit A, not stock 0.7.49.
-const recordedTierWriter = false;
-const previousReaderCommit = "275fce73c76f8d2a9898cbc52e8ddf5b7a128c9e";
-const previousReaderLabel = "stock-0.7.49";
+const recordedTierWriter = true;
+const previousReaderCommit = "4b2b23ed7990cd74bba4f73167f60017e07092f0";
+const previousReaderLabel = "commit-A-reader-first";
 // Preserve PR #450's exact writer and all five rollback assertions while
 // testing this scanner branch as an additional reader. No #450 runtime changes
 // or release bump are required in the scanner branch.

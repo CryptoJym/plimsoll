@@ -291,6 +291,8 @@ const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
 // Camel-case entries below are explicit legacy producer aliases, not a
 // case-insensitive contract: only the literal map key receives admission.
 const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
+  // Bounded processing vocabulary, validated separately below.
+  ["service_tier", "classification"],
   ...ACTOR_ID_KEYS.filter((key) => key !== "user.email").map(
     (key) => [key, "identifier"] as const,
   ),
@@ -389,9 +391,6 @@ const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
 ];
 
 const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
-  // Reader-first release: accept frozen tier keys without admitting producer
-  // attributes. A later writer release moves service_tier onto record intake.
-  ["service_tier", "classification"],
   ["serviceTier", "classification"],
   ["planLimitSource", "classification"],
   ["planLimitWindow", "classification"],

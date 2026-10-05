@@ -5,6 +5,7 @@ import {
   admittedMetadataAttributes,
   aiInteractionEventSchema,
   canonicalizeSuppressionReceipts,
+  codexServiceTier,
   estimateCostUsd,
   sanitizeForPolicy,
   suppressionReceiptForAttributeKey,
@@ -397,6 +398,7 @@ function buildLogEvent(
   const observedAt = recordTimestamp(safeRecord, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
   const eventSource = eventSourceFor(context.source, context.serviceSource);
+  const serviceTier = eventSource === "codex" ? codexServiceTier(attrs.service_tier) : undefined;
   // OTLP log records can carry the trace context of the response span. Keep
   // this bounded identifier so the two usage shapes can be paired without
   // guessing from token counts across concurrent Codex sessions.
@@ -444,6 +446,7 @@ function buildLogEvent(
     ...(costUsd !== undefined && costUsd >= 0 ? { costUsd, costKind } : {}),
     metadata: {
       ...metadataAttrs.attrs,
+      ...(serviceTier ? { serviceTier } : {}),
       ...(dispatchBinding ? dispatchBindingMetadata(dispatchBinding) : {}),
       ...(otelEventName ? { otelEventName } : {}),
       ...(toolName ? { toolName } : {}),
@@ -513,6 +516,10 @@ function buildSpanEvent(
   const completion = eventSource === "codex" ? codexTraceCompletion(safeSpan, attrs) : undefined;
   const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens])) ??
     (completion ? intTokens(numberField(completion, [...usageFieldKeys.cacheReadTokens])) : undefined);
+  const spanTier = eventSource === "codex" ? codexServiceTier(attrs.service_tier) : undefined;
+  const completionTier = codexServiceTier(completion?.service_tier);
+  const serviceTier = spanTier && completionTier && spanTier !== completionTier
+    ? undefined : spanTier ?? completionTier;
   const cacheCreationTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheCreationTokens]));
   const capturedCost = admittedCost([attrs]);
   let costUsd = capturedCost.value;
@@ -618,6 +625,7 @@ function buildSpanEvent(
     ...(costUsd !== undefined && costUsd >= 0 ? { costUsd, costKind } : {}),
     metadata: {
       ...metadataAttrs.attrs,
+      ...(serviceTier ? { serviceTier } : {}),
       ...(dispatchBinding ? dispatchBindingMetadata(dispatchBinding) : {}),
       ...(costEstimated ? { costEstimated: true } : {}),
       ...(spanName ? { otelEventName: spanName } : {}),
