@@ -212,7 +212,7 @@ async function cloud(mode: "ack" | "no_ack" | "refuse" | "timeout_once") {
     });
   });
   let port = 0;
-  for (let candidate = 49300; candidate <= 49399; candidate += 1) {
+  for (let candidate = 49750; candidate <= 49799; candidate += 1) {
     try {
       await new Promise<void>((resolve, reject) => {
         server.once("error", reject);
@@ -227,7 +227,7 @@ async function cloud(mode: "ack" | "no_ack" | "refuse" | "timeout_once") {
       if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
     }
   }
-  assert.ok(port, "No fixture port available in 49300-49399");
+  assert.ok(port, "No fixture port available in 49750-49799");
   return { port, uploads, joins, uniqueEvents, close: async () => {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -235,7 +235,7 @@ async function cloud(mode: "ack" | "no_ack" | "refuse" | "timeout_once") {
 }
 
 async function collectorPort(except: number) {
-  for (let candidate = 49300; candidate <= 49399; candidate += 1) {
+  for (let candidate = 49750; candidate <= 49799; candidate += 1) {
     if (candidate === except) continue;
     const probe = net.createServer();
     try {
@@ -249,7 +249,7 @@ async function collectorPort(except: number) {
       if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
     }
   }
-  throw new Error("No collector fixture port available in 49300-49399");
+  throw new Error("No collector fixture port available in 49750-49799");
 }
 
 async function waitForCollector(port: number) {
