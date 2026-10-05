@@ -2185,14 +2185,14 @@ export class DashboardProjectionStore {
   }
 
   private removeStoredFact(previous:ProjectionFact,now:Date){
-    const bounds=this.db.prepare(
+    const bounds=this.captureStatement(
       `select oldest_observed_at as oldest,newest_observed_at as newest from dashboard_lifetime_totals where singleton=1`,
     ).get() as {oldest:string|null;newest:string|null};
-    const sourceLatest=this.db.prepare(
+    const sourceLatest=this.captureStatement(
       `select last_event_at as lastEventAt,last_token_event_at as lastTokenAt
        from dashboard_source_lifetime where source=?`,
     ).get(previous.source) as {lastEventAt:string|null;lastTokenAt:string|null}|undefined;
-    const windows=this.db.prepare(
+    const windows=this.captureStatement(
       `select days,cutoff_at as cutoffAt,target_cutoff_at as targetCutoffAt,
         expiry_cursor_at as expiryCursorAt,expiry_cursor_id as expiryCursorId from dashboard_window_control`,
     ).all() as Array<{days:number;cutoffAt:string;targetCutoffAt:string|null;expiryCursorAt:string|null;expiryCursorId:string|null}>;
@@ -2206,11 +2206,11 @@ export class DashboardProjectionStore {
       ?"dashboard_post_highwater_window":reference.parityCursor>=previous.rawRowid?"dashboard_parity_window":null):null;
     if(table)for(const window of windows)if(DASHBOARD_WINDOWS.includes(window.days as typeof DASHBOARD_WINDOWS[number])&&previous.observedAt>=(window.targetCutoffAt??window.cutoffAt))this.applyReferenceDelta(table,window.days,previous,-1);
     this.applyLifetimeDelta(previous,-1);
-    this.db.prepare(`delete from dashboard_event_facts where projection_id=?`).run(previous.projectionId);
+    this.captureStatement(`delete from dashboard_event_facts where projection_id=?`).run(previous.projectionId);
     if(bounds.oldest===previous.observedAt||bounds.newest===previous.observedAt)this.refreshLifetimeBounds();
     if(sourceLatest&&(sourceLatest.lastEventAt===previous.observedAt||
       (previous.inputTokens!==null&&sourceLatest.lastTokenAt===previous.observedAt)))this.refreshSourceLatest(previous.source);
-    this.db.prepare(`update dashboard_projection_control set dirty=1,
+    this.captureStatement(`update dashboard_projection_control set dirty=1,
       projection_rows_visited=projection_rows_visited+1,projection_rows_written=projection_rows_written+1 where singleton=1`).run();
     markFinancePublicationDirty(this.db, now.toISOString());
   }
@@ -3055,7 +3055,7 @@ export class DashboardProjectionStore {
   private compactBoundary(direction:"oldest"|"newest"){
     const column=direction==="oldest"?"min_observed_at":"max_observed_at";
     const order=direction==="oldest"?"asc":"desc";
-    const row=this.db.prepare(
+    const row=this.captureStatement(
       `select ${column} as boundary from dashboard_compact_day_source
        where event_count>0 order by ${column} ${order},bucket_day ${order},source ${order} limit 1`,
     ).get() as {boundary:string}|undefined;
@@ -3113,7 +3113,7 @@ export class DashboardProjectionStore {
   }
 
   private compactSourceLatest(source:string){
-    const row=this.db.prepare(
+    const row=this.captureStatement(
       `select max_observed_at as boundary from dashboard_compact_day_source
        where source=? and event_count>0 order by max_observed_at desc,bucket_day desc limit 1`,
     ).get(source) as {boundary:string}|undefined;
@@ -3121,23 +3121,23 @@ export class DashboardProjectionStore {
   }
 
   private refreshSourceLatest(source:string){
-    const fact=this.db.prepare(
+    const fact=this.captureStatement(
       `select
         (select observed_at from dashboard_event_facts where source=? order by observed_at desc,projection_id desc limit 1) as lastEventAt,
         (select observed_at from dashboard_event_facts where source=? and input_tokens is not null
          order by observed_at desc,projection_id desc limit 1) as lastTokenAt`,
     ).get(source,source) as {lastEventAt:string|null;lastTokenAt:string|null};
     const latest=[fact.lastEventAt,this.compactSourceLatest(source)].filter((v):v is string=>Boolean(v)).sort().at(-1)??null;
-    if(latest||fact.lastTokenAt)this.db.prepare(
+    if(latest||fact.lastTokenAt)this.captureStatement(
       `insert into dashboard_source_lifetime (source,last_event_at,last_token_event_at) values (?,?,?)
        on conflict(source) do update set last_event_at=excluded.last_event_at,
         last_token_event_at=excluded.last_token_event_at`,
     ).run(source,latest,fact.lastTokenAt);
-    else this.db.prepare(`delete from dashboard_source_lifetime where source=?`).run(source);
+    else this.captureStatement(`delete from dashboard_source_lifetime where source=?`).run(source);
   }
 
   private refreshLifetimeBounds(){
-    const facts=this.db.prepare(
+    const facts=this.captureStatement(
       `select
         (select observed_at from dashboard_event_facts order by observed_at,projection_id limit 1) as oldest,
         (select observed_at from dashboard_event_facts order by observed_at desc,projection_id desc limit 1) as newest`,
@@ -3145,7 +3145,7 @@ export class DashboardProjectionStore {
     const compactOldest=this.compactBoundary("oldest"),compactNewest=this.compactBoundary("newest");
     const oldest=[facts.oldest,compactOldest].filter((v):v is string=>Boolean(v)).sort()[0]??null;
     const newest=[facts.newest,compactNewest].filter((v):v is string=>Boolean(v)).sort().at(-1)??null;
-    this.db.prepare(`update dashboard_lifetime_totals set oldest_observed_at=?,newest_observed_at=? where singleton=1`).run(oldest,newest);
+    this.captureStatement(`update dashboard_lifetime_totals set oldest_observed_at=?,newest_observed_at=? where singleton=1`).run(oldest,newest);
   }
 
   runMaintenance(now = new Date(Date.now()), options: {
@@ -3238,30 +3238,38 @@ export class DashboardProjectionStore {
       const duplicateScan = this.db.prepare(`select cursor_raw_rowid as cursor, complete
         from codex_duplicate_fact_scan where singleton=1`).get() as
         { cursor: number; complete: number };
-      // The first scan row is the admitted unit for this transaction. Even if
-      // control-row setup spent the clock, visit one row and yield afterward.
+      // The bounded SELECT page is the first admitted unit. It is already
+      // read before its rows reach JS; persist that page and its cursor
+      // together even when fetching it exhausted the admission allowance.
+      // Later phases still check the same deadline. Splitting this cheap
+      // page at each JS row made GC pauses add scan ticks after the read had
+      // already held the writer, without reducing that hold.
       if (!duplicateScan.complete) {
-        const candidates = this.db.prepare(`select f.raw_rowid as rawRowid,
+        const candidates = this.captureStatement(`select f.raw_rowid as rawRowid,
             b.usage_duplicate_reason as duplicateReason,b.source
           from dashboard_event_facts f
           left join buffered_events b on b.rowid=f.raw_rowid
           where f.raw_rowid > ? order by f.raw_rowid limit ?`
         ).all(duplicateScan.cursor, DUPLICATE_FACT_SCAN_ROWS) as
           Array<{ rawRowid: number; duplicateReason: string | null; source: string | null }>;
-        const queue = this.db.prepare(`insert or ignore into dashboard_projection_repairs
-          (raw_rowid, reason, queued_at) values (?, 'legacy_usage_duplicate', ?)`);
-        const oweRepair = this.db.prepare(`insert or ignore into
-          codex_duplicate_fact_scan_repairs (raw_rowid) values (?)`);
+        const owing:number[]=[];
         for (const candidate of candidates) {
-          // The cursor advances over exactly the prefix admitted in this
-          // transaction. A later tick resumes the rest of the fetched page.
-          if (duplicateFactScanRowsVisited > 0 && !hasActiveTime()) break;
           if (candidate.duplicateReason !== null || candidate.source === "codex") {
-            queue.run(candidate.rawRowid, now.toISOString());
-            oweRepair.run(candidate.rawRowid);
+            owing.push(candidate.rawRowid);
           }
           duplicateFactScanRowsVisited += 1;
           options.onWorkRowForProof?.("scan");
+        }
+        // The admitted page is one transaction. Persist its two debt sets
+        // together in SQL instead of crossing JS/SQLite twice for every row.
+        // Progress counts and the 1,000-row scan cap remain exact.
+        if(owing.length) {
+          const debt=JSON.stringify(owing);
+          this.captureStatement(`insert or ignore into dashboard_projection_repairs
+            (raw_rowid,reason,queued_at) select value,'legacy_usage_duplicate',? from json_each(?)`)
+            .run(now.toISOString(),debt);
+          this.captureStatement(`insert or ignore into codex_duplicate_fact_scan_repairs
+            (raw_rowid) select value from json_each(?)`).run(debt);
         }
         duplicateFactScanExhausted = candidates.length < DUPLICATE_FACT_SCAN_ROWS &&
           duplicateFactScanRowsVisited === candidates.length;
