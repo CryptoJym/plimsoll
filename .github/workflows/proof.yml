@@ -798,6 +798,15 @@ jobs:
       - name: Prove per-response native coverage and partial cumulative accounting
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-response-coverage
+      - name: Preserve process identity refusals with proof scheduling allowance
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-history-process-identity
+      - name: Preserve paid fields when a late twin adds cache or cost
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-acked-pairing-fields
+      - name: Preserve actual released ACKed partial fields through upgrade
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-legacy-acked-fields
       - name: Prove bounded automatic capture preserves response accounting
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-bounded-response-accounting

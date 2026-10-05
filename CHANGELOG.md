@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.7.50 (unreleased)
+## 0.7.51 (unreleased)
+
+- Response aliases remain linked through covered SSE diagnostics, including
+  transitive request/turn chains and restarts. Qualified native fields ACKed
+  by released collectors remain paid owners across upgrade; reconciliation
+  preserves ACKed finance without inventing missing historical wire bytes.
 
 - Codex token-bearing captures now name their model from an exact paired SSE
   log, one unambiguous native trace, or the same local conversation turn. Any

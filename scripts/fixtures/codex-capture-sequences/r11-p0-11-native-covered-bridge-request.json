@@ -1,0 +1,15 @@
+{
+  "finding": "r11-p0-11-native-covered-bridge-request",
+  "operations": [
+    "alias-native",
+    "expire-retry",
+    "ack",
+    "alias-bridge",
+    "expire-retry",
+    "ack",
+    "reopen",
+    "alias-request",
+    "expire-retry",
+    "ack"
+  ]
+}

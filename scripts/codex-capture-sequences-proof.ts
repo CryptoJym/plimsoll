@@ -11,6 +11,7 @@ import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline, sealCa
 import { deriveCaptureRootIdentity } from "../packages/collector-cli/src/capture-root-inventory";
 import { planCaptureHistory, applyCaptureHistory } from "../packages/collector-cli/src/capture-history-import";
 import { createProofCompletion } from "./lib/proof-completion";
+import { proofProcessIdentity } from "./lib/proof-process-identity";
 import { proofTempRoot, withReader } from "./lib/legacy-reader";
 
 /** Multiple economic responses, cumulative turns and independent diagnostics.
@@ -26,14 +27,17 @@ const OPS = ["sse-valid", "sse-invalid", "sse-conflicting", "trace-sol", "trace-
   "stateless-build", "reopen", "rollback-047", "rollback-048", "upgrade-047", "upgrade-048", "sse-zero", "sse-partial", "sse-cache-cost",
   "second-turn", "third-turn", "history-multiple", "cache-only-turn", "sse-partial-twin", "sse-zero-complement-twin",
   "skew-partial-request", "skew-complete-request", "skew-partial-turn", "skew-complete-turn",
-  "skew-growing", "skew-smaller", "skew-native", "skew-native-update", "request-only-partial", "request-only-complete", "request-only-span"] as const;
-type Op = typeof OPS[number] | "skew-series";
+  "skew-growing", "skew-smaller", "skew-native", "skew-native-update", "request-only-partial", "request-only-complete", "request-only-span", "alias-request", "alias-native", "alias-bridge", "alias-chain",
+  "old-acked-047-input-output", "old-acked-047-output-input", "old-acked-048-input-output", "old-acked-048-output-input", "old-acked-pair-047", "old-acked-pair-048"] as const;
+type Op = typeof OPS[number] | "skew-series" | "alias-long-chain";
 type Version = "head" | "0.7.47" | "0.7.48";
 const FIELDS = ["inputTokens","outputTokens","cacheReadTokens","cacheCreationTokens","costUsd"] as const;
 type Field = typeof FIELDS[number];
 type Producer = {event:any;response:string;kind:"trace"|"turn"|"invalid"};
 type Frozen = { id: string; rawId: string; bytes: string; event: any; named: boolean; gap: boolean };
 const MODEL = "gpt-6.1-sol", OTHER = "gpt-6-astra";
+const identityQueries=proofProcessIdentity();
+const ALIAS_SESSION="33333333-3333-4333-8333-333333333333";
 const SESSION = "22222222-2222-4222-8222-222222222222";
 const WORKSPACE = "11111111-1111-4111-8111-111111111111";
 const AT = Date.now() - 900_000;
@@ -53,10 +57,11 @@ const orderGroups: Op[][]=[
   ["skew-smaller","skew-native","skew-growing"],
   ["request-only-partial","request-only-span","request-only-complete"],
   ["skew-partial-request","skew-native-update","skew-complete-request"],
+  ["alias-request","alias-native","alias-bridge"],
 ];
 const completion = createProofCompletion("codex-capture-sequences",(caseFile?0:seeds+orderGroups.length*6)+directed.length);
 let Old047: any, Old048: any, runIndex = 0;
-const coverage = new Map<Op,number>([...OPS,"skew-series" as const].map(op=>[op,0]));
+const coverage = new Map<Op,number>([...OPS,"skew-series" as const,"alias-long-chain" as const].map(op=>[op,0]));
 let steps = 0, rollbackLeases = 0, terminalReplays = 0, historyImports = 0, historyRefusals = 0, pairingChecks = 0;
 
 function random(seed: number) {
@@ -72,10 +77,10 @@ function sequence(seed: number): Op[] {
 }
 const attribute = (key: string,value: string|number) => ({key,value:typeof value==="number"?{intValue:String(value)}:{stringValue:value}});
 function log(model: string,trace: string,at: number,input?: number,output?: number,contradict=false,cache?: number,
-  identity?: {turn?:string;request?:string}) {
+  identity?: {turn?:string;request?:string},session=SESSION) {
   return explodeOtlpPayload({resourceLogs:[{resource:{attributes:[attribute("service.name","codex-app-server")]},
     scopeLogs:[{logRecords:[{timeUnixNano:String(BigInt(at)*1000000n),traceId:trace,
-      attributes:[attribute("event.name","codex.sse_event"),attribute("conversation.id",SESSION),attribute("model",model),
+      attributes:[attribute("event.name","codex.sse_event"),attribute("conversation.id",session),attribute("model",model),
         ...(input===undefined?[]:[attribute("input_token_count",input)]),
         ...(output===undefined?[]:[attribute("output_token_count",output)]),
         ...(cache===undefined?[]:[attribute("cached_token_count",cache)]),
@@ -114,6 +119,8 @@ class World {
   // The first complete file response establishes its counter/turn knowledge.
   // Later context-only sightings have no new marginal counters to deliver.
   fileWritten = false; fileHasTurn = false; nativeObserved = false;
+  oldAcknowledged = new Map<string,string>();
+  aliasWritten=false;
   currentLease: any = {leaseId:"no-lease",items:[]};
   rootIdentity: any;
   constructor() { fs.mkdirSync(this.dir,{recursive:true});this.open("head"); }
@@ -260,12 +267,88 @@ class World {
       this.knownNative.set(p.response,this.nativeAmounts(p.response,this.historyTurns));
 
   }
+  async aliasObservation(requestId:string,turnId?:string,at=59000) {
+    const e=log(MODEL,"8".repeat(32),AT+at,29,7,false,3,{request:requestId,turn:turnId},ALIAS_SESSION);
+    e.cacheCreationTokens=5;e.costUsd=.125;e.costKind="reported";
+    Object.assign(e.metadata,{"gen_ai.usage.cache_creation_input_tokens":5,cost_usd:.125});
+    // Producer facts designate one physical response independently of the
+    // collector's alias query. Each new alias is explicitly linked on input.
+    this.register(e,"alias-response","trace");this.fact("8".repeat(32),MODEL);this.b.append(e);
+  }
+  async aliasNative() {
+    this.head();const sessions=path.join(this.dir,"alias-sessions"),day=path.join(sessions,...new Date(AT).toISOString().slice(0,10).split("-"));
+    fs.mkdirSync(day,{recursive:true});
+    if(!this.aliasWritten) {
+      const row=(at:number,type:string,payload:any)=>JSON.stringify({timestamp:new Date(AT+at).toISOString(),type,payload});
+      const count=(i:number,o:number,c:number)=>({type:"token_count",info:{total_token_usage:{input_tokens:i,output_tokens:o,cached_input_tokens:c}}});
+      fs.writeFileSync(path.join(day,`rollout-alias-${ALIAS_SESSION}.jsonl`),[
+        row(60000,"session_meta",{id:ALIAS_SESSION}),row(60000,"turn_context",{turn_id:"alias-turn-0",model:MODEL}),
+        row(60000,"event_msg",count(0,0,0)),row(61000,"event_msg",count(29,7,3))].join("\n")+"\n");
+      this.register({id:deterministicEventId(["codex-rollout",ALIAS_SESSION,"1"]),model:MODEL,
+        inputTokens:29,outputTokens:7,cacheReadTokens:3,metadata:{usageSource:"rollout",counterOrdinal:1}},"alias-response","turn");
+      this.aliasWritten=true;
+    }
+    const tailer=new RolloutTailer(this.b,sessions,()=>[]);
+    try {const scan=await tailer.scan({scope:"full",now:this.now});invariant(scan.parseErrors===0,"ALIAS_FILE_PARSE",scan);}
+    finally {tailer.close();}
+    this.knownNative.set("alias-response",this.nativeAmounts("alias-response"));
+  }
+  async oldAcked(op:Op) {
+    this.head();this.lease();
+    const version=op.includes("047")?"0.7.47":"0.7.48";
+    this.open(version);
+    const requestId=op,trace=(op.includes("047")?"6":"7").repeat(32);
+    const partials=[log(MODEL,trace,AT+70000,19,undefined,false,undefined,{request:requestId}),
+      log(MODEL,trace,AT+71000,undefined,2,false,undefined,{request:requestId})];
+    if(op.endsWith("output-input"))partials.reverse();
+    for(const e of partials) {
+      this.register(e,op,"trace");this.fact(trace,MODEL);this.b.append(e);
+      this.lease();this.b.delivery.acknowledge(this.currentLease.leaseId,this.currentLease.items.map((i:any)=>i.deliveryId),this.now);
+      const raw=this.b.database.prepare("select input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_usd,usage_duplicate_reason from buffered_events where id=?").get(e.id);
+      this.oldAcknowledged.set(e.id,JSON.stringify(raw));
+    }
+    this.head();
+    const complete=log(MODEL,trace,AT+69000,19,2,false,undefined,{request:requestId});
+    this.register(complete,op,"trace");this.b.append(complete);
+  }
+  async oldAckedPair(op:Op) {
+    this.head();this.lease();this.open(op.endsWith("047")?"0.7.47":"0.7.48");
+    const trace=(op.endsWith("047")?"4":"5").repeat(32),identity={request:op};
+    const e=log(MODEL,trace,AT+89000,19,2,false,undefined,identity);
+    this.register(e,op,"trace");this.fact(trace,MODEL);this.b.append(e);this.lease();
+    this.b.delivery.acknowledge(this.currentLease.leaseId,this.currentLease.items.map((i:any)=>i.deliveryId),this.now);
+    this.oldAcknowledged.set(e.id,JSON.stringify(this.b.database.prepare("select input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_usd,usage_duplicate_reason from buffered_events where id=?").get(e.id)));
+    this.head();const twin=responseSpan(trace,identity,90000);
+    twin.cacheReadTokens=3;twin.cacheCreationTokens=5;twin.costUsd=.125;twin.costKind="reported";
+    Object.assign(twin.metadata,{"gen_ai.usage.cache_read_tokens":3,"gen_ai.usage.cache_creation_input_tokens":5,cost_usd:.125});
+    this.register(twin,op,"trace");this.b.append(twin);
+  }
   async operate(op: Op) {
     if(["sse-valid","sse-invalid","sse-conflicting","trace-sol","trace-astra","span","rollout-turn","rollout-no-turn",
       "neighbour-turn","history-turn","history-no-turn","gap-seal","stateless-build","upgrade-047","upgrade-048"].includes(op)) this.head();
     if(["sse-zero","sse-partial","sse-cache-cost","second-turn","third-turn","history-multiple","cache-only-turn","sse-partial-twin","sse-zero-complement-twin"].includes(op))this.head();
     if(op.startsWith("skew-")||op.startsWith("request-only-"))this.head();
     switch(op) {
+      case "old-acked-pair-047": case "old-acked-pair-048": await this.oldAckedPair(op);break;
+      case "alias-request": this.head();await this.aliasObservation("alias-request-0");break;
+      case "alias-bridge": this.head();await this.aliasObservation("alias-request-0","alias-turn-0",62000);break;
+      case "alias-native": await this.aliasNative();break;
+      case "alias-chain": case "alias-long-chain": {
+        this.head();await this.aliasObservation("alias-request-0","alias-turn-0",62000);
+        // Sixty-four covered bridges, alternating key namespaces. Freeze/ACK
+        // and restart between links, then query only the final request alias.
+        const length=op==="alias-long-chain"?32:8;
+        for(let n=1;n<=length;n++) {
+          await this.aliasObservation(`alias-request-${n-1}`,`alias-turn-${n}`,62000+n*2);
+          this.lease();this.b.delivery.acknowledge(this.currentLease.leaseId,this.currentLease.items.map((i:any)=>i.deliveryId),this.now);this.assertStep();
+          await this.aliasObservation(`alias-request-${n}`,`alias-turn-${n}`,62001+n*2);
+          this.lease();this.b.delivery.acknowledge(this.currentLease.leaseId,this.currentLease.items.map((i:any)=>i.deliveryId),this.now);this.assertStep();
+          if(n%8===0)this.open("head");
+        }
+        await this.aliasObservation(`alias-request-${length}`,undefined,58000);break;
+      }
+      case "old-acked-047-input-output": case "old-acked-047-output-input":
+      case "old-acked-048-input-output": case "old-acked-048-output-input": await this.oldAcked(op);break;
       case "skew-series": {
         for(let i=1;i<=24;i++){
           const e=log(MODEL,"b".repeat(32),AT+18000+i*7,19+i,2,false,3,{turn:"skew-turn",request:"skew-request"});
@@ -460,6 +543,10 @@ class World {
       const frozen=this.frozen.get(row.id);
       if(frozen)invariant(row.bytes===frozen.bytes,"I2_STORED_BYTES",{id:row.id,version:this.version});
     }
+    for(const [id,fields] of this.oldAcknowledged) {
+      const raw=db.prepare("select input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_usd,usage_duplicate_reason from buffered_events where id=?").get(id);
+      invariant(JSON.stringify(raw)===fields,"I2_OLD_ACK_FINANCE",{id,before:fields,after:raw});
+    }
     const named=[...this.frozen.values()].filter(f=>f.named);
     for(const [response,expected] of this.expected) {
       const sum=this.sums(response);
@@ -587,7 +674,7 @@ async function main() {
       }
       if(!caseFile)for(let group=0;group<orderGroups.length;group++) {
         let canonical:Record<string,number>|undefined;
-        const observations=orderGroups[group]!,response=observations[0]!.startsWith("request-only-")?"request-only":"response-5";
+        const observations=orderGroups[group]!,response=observations[0]!.startsWith("alias-")?"alias-response":observations[0]!.startsWith("request-only-")?"request-only":"response-5";
         let permutation=0;
         for(const order of permutations(observations)) {
           // ACK after EACH observation so different arrival orders cannot
@@ -622,10 +709,10 @@ async function main() {
   if(!caseFile)invariant(OPS.every(op=>coverage.get(op)!>0),"OPERATION_COVERAGE",Object.fromEntries(coverage));
   console.log(JSON.stringify({proof:"codex-capture-sequences",seeds,directed:directed.length,steps,
     orderChecks:caseFile?0:orderGroups.length*6,
-    operations:Object.fromEntries(coverage),rollbackLeases,terminalReplays,historyImports,historyRefusals,pairingChecks,
+    operations:Object.fromEntries(coverage),rollbackLeases,terminalReplays,historyImports,historyRefusals,pairingChecks,processIdentity:identityQueries.stats(),
     invariants:["I1 native model or tokenless gap","I2 named ID/bytes final","I3 gap never regains counters",
       "financial totals bounded per response and field","every known native response retained and eventually named",
       "arrival permutations converge to every field maximum with ACKs between observations"]},null,2));
   completion.complete();
 }
-main().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>fs.rmSync(root,{recursive:true,force:true}));
+main().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>{identityQueries.restore();fs.rmSync(root,{recursive:true,force:true});});

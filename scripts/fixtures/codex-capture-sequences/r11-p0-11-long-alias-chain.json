@@ -1,0 +1,13 @@
+{
+  "finding": "r11-p0-11-long-alias-chain",
+  "operations": [
+    "alias-native",
+    "expire-retry",
+    "ack",
+    "alias-long-chain",
+    "expire-retry",
+    "ack",
+    "reopen",
+    "alias-request"
+  ]
+}

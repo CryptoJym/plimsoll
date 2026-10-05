@@ -1,0 +1,9 @@
+{
+  "finding": "r11-p0-12-old-048-ack-input-output",
+  "operations": [
+    "old-acked-048-input-output",
+    "expire-retry",
+    "ack",
+    "reopen"
+  ]
+}

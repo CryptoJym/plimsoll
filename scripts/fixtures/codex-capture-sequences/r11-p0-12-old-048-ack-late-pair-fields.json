@@ -1,0 +1,9 @@
+{
+  "finding": "R10-P0-12 whole class: paid SSE cannot absorb a late span field",
+  "operations": [
+    "old-acked-pair-048",
+    "expire-retry",
+    "ack",
+    "reopen"
+  ]
+}
