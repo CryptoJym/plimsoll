@@ -141,8 +141,12 @@ try {
   completion.check('neighbouring_tool_model_does_not_name_another_trace',isCaptureGap(captureCodexModel(trace.database,foreign)));
   // session_stop is the real hook schema type; a bare model and explicit
   // zero counters still cannot attest a native request model.
-  const hook=aiInteractionEventSchema.parse({...event(6),eventType:'session_stop',model:'gpt-6-sol',metadata:{input_tokens:0,output_tokens:0},inputTokens:0,outputTokens:0});trace.append(hook);
-  completion.check('explicit_zero_hook_with_no_native_model_is_gap',isCaptureGap(captureCodexModel(trace.database,hook)));
+  const hook=aiInteractionEventSchema.parse({...event(6),eventType:'session_stop',model:'gpt-6-sol',metadata:{input_tokens:0,output_tokens:0},inputTokens:0,outputTokens:0});
+  assert.equal(trace.append(hook),true,'the real zero-counter hook must be stored before capture');
+  const hookGap=captureCodexModel(trace.database,hook);
+  completion.check('explicit_zero_hook_with_no_native_model_is_gap',isCaptureGap(hookGap)&&hookGap.model===undefined&&
+   hookGap.inputTokens===undefined&&hookGap.outputTokens===undefined&&
+   hookGap.metadata.modelGapInputTokens===0&&hookGap.metadata.modelGapOutputTokens===0);
   const resourceOnly={...event(7),model:'gpt-6-sol',metadata:{traceId:'aabbccddeeffaabbccddeeffaabbccddee',otelResourceAttributes:{model:'gpt-6-sol'}}};trace.append(resourceOnly);
   completion.check('resource_model_is_not_request_model',isCaptureGap(captureCodexModel(trace.database,resourceOnly)));
  }finally{trace.close();}
