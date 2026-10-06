@@ -7,7 +7,7 @@ import {captureCodexModel,isCaptureGap,recordCodexTurnModel} from '../packages/c
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',139);
+const completion=createProofCompletion('codex-capture-veto',171);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -98,6 +98,30 @@ try{
   f.append(make(2,{otelEventName:'codex.sse_event',codexTurnId:'T',model:MODEL},{model:MODEL}));
   f.deliver(target,disagree);
  });
+ // A target need not carry its exact SSE witness's trace or typed identity.
+ // Fresh pair finance still depends on ALL of that witness's native facts.
+ for(const noise of [0,129])for(const kind of ['generic','span'] as const)
+  for(const conflict of ['model','account','session','none'] as const)
+   cell(`pair-source-trace/${kind}/${conflict}/${noise}`,noise,f=>{
+    if(conflict!=='none')f.append(make(3,{traceId:f.trace,model:conflict==='model'?OTHER:MODEL},
+     {eventType:'tool_result',model:conflict==='model'?OTHER:MODEL,inputTokens:undefined,outputTokens:undefined,
+      actorId:conflict==='account'?B:A,sessionId:conflict==='session'?uuid(997):SESSION,
+      observedAt:new Date(AT-3_600_000).toISOString()}));
+    f.append(make(2,{traceId:f.trace,model:MODEL,otelEventName:'codex.sse_event'},{model:MODEL}));
+    const target=f.append(make(1,kind==='span'?{otelEventName:'handle_responses'}:{}));
+    f.deliver(target,conflict!=='none',kind==='span'&&conflict==='none');
+   });
+ for(const noise of [0,129])for(const identity of ['request','call','turn','native-turn-table'] as const)
+  for(const conflict of ['model','account'] as const)
+   cell(`pair-source-identity/${identity}/${conflict}/${noise}`,noise,f=>{
+    const key=identity==='request'?'request_id':identity==='call'?'call_id':'codexTurnId';
+    if(identity==='native-turn-table')recordCodexTurnModel(f.b.database,SESSION,'source',conflict==='model'?OTHER:MODEL,conflict==='account'?B:A);
+    else f.append(make(3,{[key]:'source',model:conflict==='model'?OTHER:MODEL},
+     {eventType:'tool_result',model:conflict==='model'?OTHER:MODEL,actorId:conflict==='account'?B:A,
+      inputTokens:undefined,outputTokens:undefined}));
+    f.append(make(2,{[key]:'source',model:MODEL,otelEventName:'codex.sse_event'},{model:MODEL}));
+    f.deliver(f.append(make(1,{})),true);
+   });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
  // producer bytes restored together, no paid capture/coverage witness injected.
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
@@ -174,6 +198,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,139,'every declared matrix cell executes');
+ assert.equal(executed,171,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}

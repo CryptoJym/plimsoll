@@ -701,12 +701,13 @@ export function captureCodexModel(
   // a counterless/gap/ACK row remains a fact, never a promotable witness.
   // Trace-bearing requests use their complete trace, plus their own native
   // turn context; an unrelated trace-free account cannot rename that trace.
-  if (!traceId) {
+  const checkLinkedFacts = (seed: AiInteractionEvent): string | undefined => {
+    const seedSession = trustedSession(seed);
     const pending: ReturnType<typeof codexResponseIdentities> = [];
     const seenKeys = new Set<string>();
     const enqueue = (e: AiInteractionEvent) => {
       for (const node of codexResponseIdentities(e.metadata)) {
-        if (node.kind === "turn" && !trustedSession(event)) continue;
+        if (node.kind === "turn" && !seedSession) continue;
         const key = node.kind + ":" + node.value;
         if (seenKeys.has(key)) continue;
         if (seenKeys.size === MAX_EVIDENCE_ROWS) return false;
@@ -714,7 +715,8 @@ export function captureCodexModel(
       }
       return true;
     };
-    if (!enqueue(event)) return gap("linked_identity_overflow");
+    if (!enqueue(seed)) return "linked_identity_overflow";
+    let reasonFound: string | undefined;
     linkedVeto: for (let index = 0; index < pending.length; index++) {
       const node = pending[index]!;
       const aliases = node.kind === "request" ? ["request_id"] : node.kind === "call" ? ["call_id"] :
@@ -723,50 +725,62 @@ export function captureCodexModel(
         json_extract(e.payload_json,'$.metadata."${alias}"') end=?`);
       const turnScope = node.kind === "turn" ? " and e.session_id is ?" : "";
       const args = [...nativeScopeArgs,...aliases.map(() => node.value),
-        ...(node.kind === "turn" ? [trustedSession(event)] : [])];
+        ...(node.kind === "turn" ? [seedSession] : [])];
       for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
         and (${matches.join(" or ")})${turnScope}`).iterate(...args) as Iterable<EvidenceRow>) {
         const p = decodePeers([candidate])[0];
         if (!p) continue;
         const reason = veto(p,"linked");
-        if (reason) { vetoReason = reason; break linkedVeto; }
-        if (!enqueue(p.event)) { vetoReason = "linked_identity_overflow"; break linkedVeto; }
+        if (reason) { reasonFound = reason; break linkedVeto; }
+        if (!enqueue(p.event)) { reasonFound = "linked_identity_overflow"; break linkedVeto; }
       }
     }
-  }
+    return reasonFound;
+  };
+  if (!traceId) vetoReason = checkLinkedFacts(event);
   if (vetoReason) return gap(vetoReason);
   const nativeSession = trustedSession(event);
-  if (nativeSession && turn) {
+  type TurnName = { model: string; account: string | null; accounts: number };
+  const boundary = row;
+  const checkLocalFacts = (seed: AiInteractionEvent): { reason?: string; names: TurnName[] } => {
+    const seedSession = trustedSession(seed);
+    const seedTurn = text(seed.metadata.codexTurnId) ?? text(seed.metadata["turn.id"]) ?? text(seed.metadata.turn_id);
+    if (!seedSession || !seedTurn) return { names: [] };
+    let reasonFound: string | undefined;
     for (const candidate of prepare(`${selectEvidence} where ${nativeScope} and e.session_id=?
       and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.usageSource') end
         in ('codex_local_turn','rollout') and coalesce(
           case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.codexTurnId') end,
           case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata."turn.id"') end,
           case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.turn_id') end)=?`)
-      .iterate(...nativeScopeArgs,nativeSession,turn) as Iterable<EvidenceRow>) {
+      .iterate(...nativeScopeArgs,seedSession,seedTurn) as Iterable<EvidenceRow>) {
       const p = decodePeers([candidate])[0];
       if (!p) continue;
       const reason = veto(p,"local");
-      if (reason) { vetoReason = reason; break; }
+      if (reason) { reasonFound = reason; break; }
     }
-  }
-  if (vetoReason) return gap(vetoReason);
-  let nativeTurnNames: Array<{ model: string; account: string | null; accounts: number }> = [];
-  if (nativeSession && turn && prepare(
+    if (reasonFound) return { reason: reasonFound, names: [] };
+    let names: TurnName[] = [];
+    if (prepare(
     "select 1 from sqlite_master where type='table' and name='codex_turn_model_evidence'",
   ).get()) {
-    nativeTurnNames = prepare(`select model,count(distinct nullif(account_key,'')) as accounts,
+    names = prepare(`select model,count(distinct nullif(account_key,'')) as accounts,
       min(nullif(account_key,'')) as account from codex_turn_model_evidence where
       workspace_id=? and device_id is ? and installation_epoch_id=? and session_id=? and turn_id=?
-      group by model limit 2`).all(row.workspace,row.device,row.epoch,nativeSession,turn) as typeof nativeTurnNames;
-    if (nativeTurnNames.some(name => name.accounts > 1)) return gap("ambiguous_local_turn_identity");
-    if (nativeTurnNames.length > 1) return gap("ambiguous_local_turn_model");
-    for (const name of nativeTurnNames) {
-      const reason = veto({event:{...event,model:name.model,actorId:name.account ?? undefined,
+      group by model limit 2`).all(boundary.workspace,boundary.device,boundary.epoch,seedSession,seedTurn) as TurnName[];
+    if (names.some(name => name.accounts > 1)) return { reason: "ambiguous_local_turn_identity", names };
+    if (names.length > 1) return { reason: "ambiguous_local_turn_model", names };
+    for (const name of names) {
+      const reason = veto({event:{...seed,model:name.model,actorId:name.account ?? undefined,
         metadata:{model:name.model}},pairedId:null},"local");
-      if (reason) return gap(reason);
+      if (reason) return { reason, names };
     }
   }
+    return { names };
+  };
+  const targetLocalFacts = checkLocalFacts(event);
+  if (targetLocalFacts.reason) return gap(targetLocalFacts.reason);
+  const nativeTurnNames = targetLocalFacts.names;
   if (responsePair && vetoModel && responsePair.model !== vetoModel)
     return gap("conflicting_pair_target_model");
   if (responsePair && (responsePair.ownerId !== rawId || isCodexResponseSpan(event))) {
@@ -839,7 +853,7 @@ export function captureCodexModel(
   }
   if (windowOverflow) return gap("evidence_window_overflow");
   // Native facts survive a financial gap, ACK and replay. Promotion is a
-  // separate decision; the complete native trace is checked below.
+  // separate decision; each exact witness's own provenance must also agree.
   const peers = [...peersByRow.values()];
   const peerEvidence = peers;
   const native = peerEvidence.filter(mayPromote);
@@ -865,6 +879,30 @@ export function captureCodexModel(
   // before selecting promotable witnesses, just as the trace tier does.
   if (pairFacts.some((p) => nativeModel(p.event) === undefined || conflicts(p)))
     return gap("conflicting_pair_model_evidence");
+  // A trace-free target can select a traced SSE, or one with request/turn
+  // identities absent from the target. Those identities must not conceal a
+  // contradiction that would refuse the witness's own fresh capture. Read
+  // facts directly, without recursive capture or trusting a frozen peer's
+  // financial decision; finalized peers remain facts for a new target.
+  for (const source of pairFacts) {
+    let reason = veto(source,"trace");
+    if (reason) return gap(reason);
+    const sourceTrace = text(source.event.metadata.traceId);
+    if (sourceTrace && !vetoTraces.has(sourceTrace)) {
+      for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
+        and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?`)
+        .iterate(...nativeScopeArgs,sourceTrace) as Iterable<EvidenceRow>) {
+        const fact = decodePeers([candidate])[0];
+        if (!fact) continue;
+        reason = veto(fact,"trace");
+        if (reason) break;
+      }
+      vetoTraces.add(sourceTrace);
+    } else if (!sourceTrace) reason = checkLinkedFacts(source.event);
+    if (reason) return gap(reason); // every SQLite iterator has closed.
+    const local = checkLocalFacts(source.event);
+    if (local.reason) return gap(local.reason);
+  }
   const pair = pairFacts.filter(mayPromote);
   const pairModels = unique(pair, (e) => nativeModel(e));
   if (pairModels.length > 1) return gap("ambiguous_pair_model");
@@ -884,8 +922,8 @@ export function captureCodexModel(
     const captured=capture(event,pair,"paired_sse_event");
     // A native counter/SSE is not a duplicate span. Its accounting is reduced
     // only by response coverage against retained, capture-qualified owners.
-    // A model witness alone must not erase good native usage when that log
-    // will subsequently be refused for contradictory trace evidence.
+    // The witness's native facts were checked above; paired counters remain
+    // owned once and only a true span becomes an observation.
     return isCodexResponseSpan(event)?pairedObservation(captured):captured;
   }
   if (traceOverflow) return gap("trace_evidence_overflow");
