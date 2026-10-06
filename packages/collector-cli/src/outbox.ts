@@ -1658,7 +1658,8 @@ export class DeliveryOutbox {
         suppressed_fields_json as suppressedFieldsJson,repo_hash as repoHash,branch_hash as branchHash,
         workspace_id as workspaceId,device_id as deviceId,privacy_generation as privacyGeneration,
         privacy_disposition as privacyDisposition from buffered_events where id=?`).get(rawId) as RawDeliveryRow|undefined;
-      if (!row || row.uploadedAt || row.privacyDisposition || frozenCodexCapture(this.db,rawId)) return false;
+      if (!row || isHistoricalRaw(this.db, row.rawRowid) || row.uploadedAt ||
+          row.privacyDisposition || frozenCodexCapture(this.db,rawId)) return false;
       if (hasCaptureGapDecision(this.db, {
         rawRowid: row.rawRowid, rawId: row.rawId, rawCreatedAt: row.createdAt,
         rawGeneration: row.privacyGeneration,

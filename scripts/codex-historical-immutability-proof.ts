@@ -13,9 +13,10 @@ import { withReader } from "./lib/legacy-reader";
 import { createProofCompletion } from "./lib/proof-completion";
 
 const redAdditions = process.argv.includes("--red-additions");
+const redRestamp = process.argv.includes("--red-restamp");
 const selected = new Set(["reviewer-native-old-observation-and-ACK-owner", "historical-pending-native-ACK-does-not-restamp-raw",
   "late-new-SSE-preserves-historical-span", "released-0747-boundary-holds-through-restart"]);
-const completion = createProofCompletion("codex-historical-immutability", redAdditions ? 4 : 8);
+const completion = createProofCompletion("codex-historical-immutability", redRestamp ? 1 : redAdditions ? 4 : 9);
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "historical-immutability-"));
 const AT = Date.now() - 600_000;
 const NOW = Date.now() + 121_001;
@@ -76,6 +77,7 @@ async function main() {
   const outcomes: Array<{ name: string; passed: boolean; error?: string }> = [];
   try {
     async function check(name: string, body: (file: string) => Promise<void>) {
+        if (redRestamp && name !== "historical-restamp-preserves-raw-and-envelope") return;
         if (redAdditions && !selected.has(name)) return;
         try { await body(path.join(root, name + ".sqlite")); outcomes.push({ name, passed: true }); }
         catch (error) { outcomes.push({ name, passed: false, error: error instanceof Error ? error.stack : String(error) }); }
@@ -181,6 +183,26 @@ async function main() {
           const lease = b.delivery.lease({ now: new Date(NOW + 121_001) }); assert.equal(lease.items.length, 1);
           assert.equal(lease.items[0].envelope.event.model, "gpt-6.1-sol"); assert.equal(lease.items[0].envelope.event.inputTokens, 19);
         } finally { b.close(); }
+      });
+      await check("historical-restamp-preserves-raw-and-envelope", async file => {
+        let b:any=new old.Buffer(file,{...seedOptions,delivery:{...seedOptions.delivery,enabled:true}});let before:string,queue:string;
+        try{assert.equal(b.append(sse(1,19,2)),true);completeMigration(b);before=snapshot(b);
+          queue=JSON.stringify(b.database.prepare("select * from upload_outbox order by delivery_id").all());}
+        finally{b.close();}
+        b=open(file);try{
+          const raw=JSON.parse(b.database.prepare("select payload_json from buffered_events where id=?").get(uuid(1)).payload_json);
+          const corrected={...raw,inputTokens:31,metadata:{...raw.metadata,"gen_ai.usage.input_tokens":"31"}};
+          assert.equal(b.delivery.restampUnsentRaw(uuid(1),JSON.stringify(corrected)),false,"historical correction requires reviewed opt-in");
+          assert.equal(snapshot(b),before!);assert.equal(JSON.stringify(b.database.prepare("select * from upload_outbox order by delivery_id").all()),queue!);
+          // Preserve today's correction behavior for a genuinely new raw row.
+          assert.equal(b.append(sse(100,23,3,"new-restamp-response")),true);
+          const fresh=JSON.parse(b.database.prepare("select payload_json from buffered_events where id=?").get(uuid(100)).payload_json);
+          assert.equal(b.delivery.restampUnsentRaw(uuid(100),JSON.stringify({...fresh,inputTokens:29,
+            metadata:{...fresh.metadata,"gen_ai.usage.input_tokens":"29"}})),true);
+          assert.equal(b.database.prepare("select input_tokens,payload_json from buffered_events where id=?").get(uuid(100)).input_tokens,23,
+            "new restamp keeps the existing promoted-column contract");
+          assert.equal(JSON.parse(b.database.prepare("select payload_json from buffered_events where id=?").get(uuid(100)).payload_json).inputTokens,29);
+        }finally{b.close();}
       });
       await check("late-new-SSE-preserves-historical-span", async file => {
         let b: any = new old.Buffer(file,seedOptions); let before: string;
