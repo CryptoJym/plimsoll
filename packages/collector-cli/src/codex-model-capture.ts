@@ -762,12 +762,6 @@ export function captureCodexModel(
     }
     return reasonFound;
   };
-  vetoReason = checkLinkedFacts(event);
-  if (vetoReason) return gap(vetoReason);
-  if (pairedSpan) {
-    vetoReason = checkLinkedFacts(pairedSpan.event);
-    if (vetoReason) return gap(vetoReason);
-  }
   const nativeSession = trustedSession(event);
   type TurnName = { model: string; account: string | null; accounts: number };
   const boundary = row;
@@ -812,6 +806,14 @@ export function captureCodexModel(
   if (pairedSpan) {
     const spanLocalFacts = checkLocalFacts(pairedSpan.event);
     if (spanLocalFacts.reason) return gap(spanLocalFacts.reason);
+  }
+  // Preserve the native local-turn diagnostic when it is already decisive.
+  // Typed links still veto every otherwise eligible target and saved source.
+  vetoReason = checkLinkedFacts(event);
+  if (vetoReason) return gap(vetoReason);
+  if (pairedSpan) {
+    vetoReason = checkLinkedFacts(pairedSpan.event);
+    if (vetoReason) return gap(vetoReason);
   }
   const nativeTurnNames = targetLocalFacts.names;
   if (responsePair && vetoModel && responsePair.model !== vetoModel)
