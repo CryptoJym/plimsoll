@@ -857,6 +857,9 @@ jobs:
       - name: Retain the 0.7.48 replay-restamp defect control
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-replay-restamp-base-origin
+      - name: Prove complete native contradictions veto every fresh promotion
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-veto
       - name: Prove legacy metadata fails closed and unrelated native traces do not lose usage
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-legacy-density

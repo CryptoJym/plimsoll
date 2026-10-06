@@ -213,9 +213,8 @@ function nativeTraceCompatible(db: Database.Database, span: Row, rollout: Row) {
     where e.source='codex' and ${eligible}
       and e.workspace_id is ? and e.device_id is ? and e.installation_epoch_id is ?
       and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?
-      limit ${MAX_ROWS + 1}`)
-    .all(span.workspace, span.device, span.epoch, traceId) as Array<{ payload: string }>;
-  if (rows.length > MAX_ROWS) return false;
+      `)
+    .iterate(span.workspace, span.device, span.epoch, traceId) as Iterable<{ payload: string }>;
   const models = new Set<string>();
   for (const row of rows) {
     const peer = JSON.parse(row.payload) as AiInteractionEvent;
@@ -225,7 +224,10 @@ function nativeTraceCompatible(db: Database.Database, span: Row, rollout: Row) {
         (session(peer) && session(peer) !== session(rollout.event))) return false;
     const a = account(peer), b = account(rollout.event);
     if (a.size && b.size && ![...a].some(value => b.has(value))) return false;
-    for (const value of nativeValues(peer, usageFieldKeys.model)) models.add(value);
+    for (const value of nativeValues(peer, usageFieldKeys.model)) {
+      models.add(value);
+      if (models.size > 1 || !models.has(rollout.event.model ?? "")) return false;
+    }
   }
   return models.size === 0 || models.size === 1 && models.has(rollout.event.model ?? "");
 }

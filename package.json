@@ -127,6 +127,7 @@
     "proof:codex-legacy-acked-fields": "tsx scripts/run-proof.ts scripts/codex-legacy-acked-fields-proof.ts",
     "proof:codex-response-coverage": "tsx scripts/run-proof.ts scripts/codex-response-coverage-proof.ts",
     "proof:codex-bounded-response-accounting": "tsx scripts/run-proof.ts scripts/codex-bounded-response-accounting-proof.ts",
+    "proof:codex-capture-veto": "tsx scripts/run-proof.ts scripts/codex-capture-veto-proof.ts",
     "proof:codex-capture-legacy-density": "tsx scripts/run-proof.ts scripts/codex-capture-legacy-density-proof.ts",
     "proof:codex-admitted-projection": "tsx scripts/run-proof.ts scripts/codex-admitted-projection-proof.ts",
     "proof:codex-model-capture": "tsx scripts/run-proof.ts scripts/codex-model-capture-proof.ts",
