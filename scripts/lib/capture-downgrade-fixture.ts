@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { DEFAULT_JSONL_TAILER_IO } from "../../packages/collector-cli/src/jsonl-byte-tailer";
 import { remoteLinkageHash } from "../../packages/shared/src/index";
+import { REPO_CONTEXT_CAPTURE_POLICY_GENERATION } from "../../packages/collector-cli/src/repo-context";
 
 const releases = [
   { version: "0.7.51", commit: "71d6ff27f0d39aa31d188c9bcc31d37bf188c384", reupgrade: true },
@@ -143,7 +144,7 @@ export async function runCaptureDowngradeFixtures() {
             if (index === 0) assert.equal(latest.repo, remoteLinkageHash(remote));
             if (usingHead) {
               assert.equal(latest.repo, null);
-              assert.equal(JSON.parse(latest.payload).metadata.repoContextPolicyGeneration, 2);
+              assert.equal(JSON.parse(latest.payload).metadata.repoContextPolicyGeneration, REPO_CONTEXT_CAPTURE_POLICY_GENERATION);
             }
             const lease = buffer.delivery.lease({ now: new Date(now) });
             assert.equal(lease.locallyDead, 0);

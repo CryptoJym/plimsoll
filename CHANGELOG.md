@@ -8,8 +8,9 @@
   repositories and mounted-volume roots remain attributable. Existing usage
   and saved results stay unchanged. Policy receipts keep released capture
   checkpoints readable after downgrade, every upload route honours excluded
-  contexts, and directory-form worktrees check their common directory. Lookup
-  cache keys retain no raw paths
+  contexts, and directory-form worktrees check their common directory. New
+  generation-3 bindings cannot reuse generation-2 results from older capture.
+  Lookup cache keys retain no raw paths
   (`eco-6hoxj.165.213.1`).
 
 ## 0.7.51 — 2026-10-05 (unpublished)

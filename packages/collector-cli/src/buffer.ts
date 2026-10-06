@@ -1535,7 +1535,7 @@ export class LocalEventBuffer {
   repoContextUnknownId(source: AiInteractionEvent["source"], occurrence: string) {
     if (!validRepoContextOccurrence(occurrence)) throw new Error("repo_context_occurrence_invalid");
     return `repoctx:v1:${crypto.createHmac("sha256", this.repoContextHmacKey())
-      .update("repoctx:terminal-unknown:v2\0").update(source).update("\0")
+      .update(`repoctx:terminal-unknown:v${REPO_CONTEXT_CAPTURE_POLICY_GENERATION}\0`).update(source).update("\0")
       .update(occurrence).digest("hex")}`;
   }
 

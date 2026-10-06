@@ -7,7 +7,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
-import { attachRepoContextSidecar, resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
+import { attachRepoContextSidecar, REPO_CONTEXT_CAPTURE_POLICY_GENERATION, resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
 import { buildIngestBatch, attachRepoLinkage } from "../packages/collector-cli/src/upload";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { prepareHistoryEvent, sealHistoryEvent, normalizeHistoryEvent } from "../packages/collector-cli/src/upload-history";
@@ -102,7 +102,7 @@ async function main() {
     // with the earlier home-tagged tool still present in this session.
     const captured = buffer.listUnuploaded({ maxRows: 100 }).find(row => row.id === raw.id)!;
     assert.ok(captured);
-    assert.equal(captured.payload.metadata.repoContextPolicyGeneration, 2);
+    assert.equal(captured.payload.metadata.repoContextPolicyGeneration, REPO_CONTEXT_CAPTURE_POLICY_GENERATION);
     const batchAttribution = new SessionAttributionBatch(buffer.database,
       [{ event: captured.payload, repoHash: captured.repoHash }]);
     const historyInput = { payloadJson: JSON.stringify(captured.payload),
@@ -141,6 +141,23 @@ async function main() {
       assert.ok(!JSON.stringify(envelope).includes("repoContextPolicyGeneration"), name);
       assert.ok(!JSON.stringify(envelope).includes(chat), name);
     }
+    // An existing generation-2 exclusion stays excluded after this policy
+    // advances. The older raw receipt is never rewritten to generation 3.
+    const legacyReceipt = { ...captured.payload, metadata: { ...captured.payload.metadata, repoContextPolicyGeneration: 2 } };
+    const legacyAttribution = sealOutboundEnvelope({ event: batchAttribution.attribute(legacyReceipt, {
+      repoHash: null }).event, suppressedFields: [] });
+    assert.ok(legacyAttribution.ok);
+    const legacyHistoryInput = { ...historyInput, payloadJson: JSON.stringify(legacyReceipt) };
+    const legacyPrepared = prepareHistoryEvent(legacyHistoryInput);
+    assert.ok(legacyPrepared.ok);
+    const legacyHistory = sealHistoryEvent(legacyPrepared, { ...legacyHistoryInput, attribution: batchAttribution });
+    assert.ok(legacyHistory.ok);
+    for (const envelope of [legacyAttribution.envelope, legacyHistory.envelope]) {
+      assert.equal(envelope.event.projectKey, undefined);
+      assert.equal(envelope.event.metadata.projectBasis, "unallocated");
+      assert.ok(!JSON.stringify(envelope).includes("repoContextPolicyGeneration"));
+    }
+    assert.equal(legacyReceipt.metadata.repoContextPolicyGeneration, 2);
     // An explicit dispatch/session assignment remains stronger than the
     // filesystem exclusion; a real repository is checked later below.
     const explicit = applyProjectAttribution({ ...captured.payload,
@@ -243,7 +260,7 @@ async function main() {
     assert.equal(positiveRequests.length, 1);
     buffer.applyRepoContextResults(resolveRepoContextRequests(positiveRequests));
     const positiveRaw = buffer.listUnuploaded({ maxRows: 100 }).find(row => row.id === positive.id)!;
-    assert.equal(positiveRaw.payload.metadata.repoContextPolicyGeneration, 2);
+    assert.equal(positiveRaw.payload.metadata.repoContextPolicyGeneration, REPO_CONTEXT_CAPTURE_POLICY_GENERATION);
     const positiveDelivery = buffer.delivery.lease({ now: new Date(fakeNow) }).items
       .find(item => item.deliveryId === positive.id)!.envelope;
     const positiveNoMark = buildIngestBatch(config, buffer).batch!.events.find(item => item.event.id === positive.id)!;
@@ -264,6 +281,7 @@ async function main() {
       sessionInheritanceWindowMs: 6 * 3_600_000, savedActiveContextWasNotReused: true,
       inlineNullOtlpEnvelopeUnlinked: true,
       captureReceiptHonouredByAllAttributionRoutes: Object.keys(routes), explicitAssignmentPreserved: true,
+      legacyGenerationTwoExclusionPreserved: true,
       realPlimsollRepoPreserved: true, positiveReceiptKeepsAllGitFieldsOnEveryUploadPath: true }, null, 2));
   } finally { tailer?.close(); buffer?.close(); os.homedir = originalHome; fs.rmSync(root, { recursive: true, force: true }); }
 }

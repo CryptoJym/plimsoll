@@ -45,7 +45,8 @@ type TokenField = (typeof TOKEN_FIELDS)[number];
 
 /** Consume the private capture receipt before outbound sealing strips it. */
 export function captureRepoContextExcluded(generation: unknown, repoHash: string | null | undefined) {
-  return generation === REPO_CONTEXT_CAPTURE_POLICY_GENERATION && !canonicalLinkage(repoHash);
+  return typeof generation === "number" && Number.isSafeInteger(generation) &&
+    generation >= 2 && generation <= REPO_CONTEXT_CAPTURE_POLICY_GENERATION && !canonicalLinkage(repoHash);
 }
 
 export type ProjectAttributionBasis =
