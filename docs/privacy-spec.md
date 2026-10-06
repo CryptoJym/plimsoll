@@ -12,6 +12,13 @@ The shipped collector runs data mode `metadata`
 Managed or upload-enabled installs are locked to that mode; see
 [ADR-0004](architecture/0004-managed-metadata-only-privacy.md).
 
+## Project intent receipt contract (P02)
+
+The separate versioned project intent boundary admits only: `schema`, `receiptId`, `installId`, `source`, `sourceRootKey`, `accountKey`, `sessionId`, `nativeSessionKey`, `sessionEpochKey`, `rootAttemptId`, `attemptId`, `parentAttemptId`, `workItemKey`, `projectKey`, `projectRegistryRevision`, `observedRepoKey`, `effectiveFrom`, `effectiveUntil`, `basis`, `evidenceRef`, `adapterId`, `adapterVersion`.
+All fields are required, including nullable keys. Opaque linkage is exactly sha256 plus 64 lowercase hexadecimal characters. Business registration is checked by the cloud, never inferred from hash shape or the observed repo. The cloud stores receipts beside its existing session ledger; this collector contract adds no local database table or automatic upload path.
+Local only: `prompts`, `replies`, `code`, `commands`, `fileNames`, `cwd`, `sourceRootPath`, `rawNativeSessionId`, `rawAccountId`, `accountEmail`, `rawWorkItemId`, `environmentValues`, `credentials`. Credentials are transport headers, never receipt fields. Unexpected fields are rejected, not forwarded. Provider lifecycle and delivery adapters are separate build lanes.
+Source: `packages/shared/src/project-intent.ts`; executable privacy and identity fixtures: `tests/contracts/project-intent.contract.ts` (CI: `contracts:project-intent`).
+
 ## The four buckets
 
 | Bucket | Rule (derived, mechanical) | Source of truth |

@@ -1,0 +1,87 @@
+{
+  "schema": "plimsoll-project-intent-fixtures/v1",
+  "baseReceipt": {
+    "schema": "plimsoll-project-intent/v1",
+    "receiptId": "24000000-0000-4000-8000-000000000001",
+    "installId": "24000000-0000-4000-8000-000000000002",
+    "source": "codex",
+    "sourceRootKey": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "accountKey": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "sessionId": "24000000-0000-4000-8000-000000000003",
+    "nativeSessionKey": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "sessionEpochKey": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "rootAttemptId": "24000000-0000-4000-8000-000000000004",
+    "attemptId": "24000000-0000-4000-8000-000000000004",
+    "parentAttemptId": null,
+    "workItemKey": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "projectKey": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "projectRegistryRevision": 1,
+    "observedRepoKey": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "effectiveFrom": "2026-10-06T18:00:00.000Z",
+    "effectiveUntil": null,
+    "basis": "routed_launch",
+    "evidenceRef": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "adapterId": "routed-launch",
+    "adapterVersion": "1.0.0"
+  },
+  "cases": [
+    {
+      "name": "resume",
+      "patch": {
+        "receiptId": "24000000-0000-4000-8000-000000000005",
+        "effectiveFrom": "2026-10-06T19:00:00.000Z"
+      },
+      "expected": "accepted"
+    },
+    {
+      "name": "account_rotation",
+      "patch": {
+        "receiptId": "24000000-0000-4000-8000-000000000006",
+        "effectiveFrom": "2026-10-06T19:00:00.000Z",
+        "attemptId": "24000000-0000-4000-8000-000000000007",
+        "parentAttemptId": "24000000-0000-4000-8000-000000000004",
+        "accountKey": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "sourceRootKey": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "expected": "accepted"
+    },
+    {
+      "name": "reused_native_id",
+      "patch": {
+        "receiptId": "24000000-0000-4000-8000-000000000008",
+        "sessionEpochKey": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "effectiveFrom": "2026-10-06T19:00:00.000Z"
+      },
+      "expected": "session_identity_conflict"
+    },
+    {
+      "name": "missing_key",
+      "patch": {
+        "receiptId": "24000000-0000-4000-8000-000000000009",
+        "projectKey": null,
+        "projectRegistryRevision": null
+      },
+      "expected": "unknown"
+    },
+    {
+      "name": "conflicting_evidence",
+      "patch": {
+        "receiptId": "24000000-0000-4000-8000-000000000010",
+        "basis": "repo_observation",
+        "adapterId": "repo-observation",
+        "projectKey": null,
+        "projectRegistryRevision": null,
+        "effectiveFrom": "2026-10-06T19:00:00.000Z",
+        "observedRepoKey": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "expected": "preserve_explicit_intent"
+    },
+    {
+      "name": "unsupported_adapter",
+      "patch": {
+        "adapterVersion": "99.0.0"
+      },
+      "expected": "unsupported_adapter"
+    }
+  ]
+}

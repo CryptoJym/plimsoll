@@ -2,6 +2,7 @@ export * from "./policy";
 export * from "./analytical-metadata";
 export * from "./live-usage-metadata";
 export * from "./schemas";
+export * from "./project-intent";
 export * from "./learning-fact-identity";
 export * from "./linkage";
 export * from "./pricing";
