@@ -3,11 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {LocalEventBuffer} from '../packages/collector-cli/src/buffer';
-import {captureCodexModel,isCaptureGap,recordCodexTurnModel} from '../packages/collector-cli/src/codex-model-capture';
+import {captureCodexModel,isCaptureGap,recordCodexTurnModel,CODEX_NATIVE_LINKED_SCOPE_SQL} from '../packages/collector-cli/src/codex-model-capture';
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',243);
+const completion=createProofCompletion('codex-capture-veto',244);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -64,6 +64,17 @@ function cell(name:string,noise:number,run:(f:Fixture)=>void){const f=new Fixtur
  try{run(f);completion.check(name);console.log('PASS '+name);}catch(e){failures.push({name,error:String(e)});completion.check(name,false);console.error('FAIL '+name+' '+e);}
  finally{f.close();}}
 try{
+ cell('linked-native-scope-is-indexed',0,f=>{
+  const binding=f.b.workspaceBinding()!;
+  const plans=f.b.database.prepare(`explain query plan select id from buffered_events where
+   source='codex' and workspace_id is ? and device_id is ? and installation_epoch_id is ?
+   and ${CODEX_NATIVE_LINKED_SCOPE_SQL}=0`).all(binding.currentWorkspaceId,binding.currentDeviceId,
+    binding.currentInstallationEpochId) as Array<{detail:string}>;
+  assert.ok(plans.some(p=>p.detail.includes('idx_codex_capture_linked_native_scope')),
+   'uncertain facts use the indexed bucket, not a cross-conversation scan');
+  f.deliver(f.append(make(1,{traceId:f.trace,'conversation.id':SESSION,request_id:'own',model:MODEL,
+   otelEventName:'codex.sse_event'},{model:MODEL})),false);
+ });
  // All twelve reviewer wire cells, expanded to session and retained-state contradictions.
  for(const noise of [0,129])for(const kind of ['generic','span'] as const)
   for(const conflict of ['model','account','session','none'] as const)
@@ -289,6 +300,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,243,'every declared matrix cell executes');
+ assert.equal(executed,244,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}

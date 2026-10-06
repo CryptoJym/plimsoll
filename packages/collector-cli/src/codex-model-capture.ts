@@ -17,6 +17,21 @@ const WINDOW_MS = 10 * 60_000;
 const MAX_EVIDENCE_ROWS = 128;
 const text = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim() ? value : undefined;
+// A conservative indexed subset of independentLinkedResponse's native
+// conversation boundary. Uncertain representations stay in the zero bucket.
+// Keep the expression identical in the index and the qualified query.
+const linkedTrace = "json_extract(payload_json,'$.metadata.traceId')";
+const linkedSession = "json_extract(payload_json,'$.sessionId')";
+const linkedProducer = `coalesce(json_extract(payload_json,'$.metadata."conversation.id"'),
+  json_extract(payload_json,'$.metadata.otelAttributes."conversation.id"'))`;
+export const CODEX_NATIVE_LINKED_SCOPE_SQL = `case when json_valid(payload_json) then
+  case when typeof(${linkedTrace})='text' and ${linkedTrace} glob '*[A-Za-z0-9]*'
+    and typeof(${linkedSession})='text' and ${linkedSession} glob '*[A-Za-z0-9]*'
+    and ${linkedSession}=session_id and json_extract(payload_json,'$.metadata.stitched') is not 'time_window'
+    and typeof(${linkedProducer})='text' and ${linkedProducer}=${linkedSession}
+  then 1 else 0 end else 0 end`;
+const linkedScopeQuery = CODEX_NATIVE_LINKED_SCOPE_SQL.replaceAll("payload_json","e.payload_json")
+  .replaceAll("session_id","e.session_id");
 /** A capture gap is a durable accounting decision. Its raw counters remain
  * local diagnostics and must never become usage again on a later read. */
 export function isCaptureGap(event: AiInteractionEvent): boolean {
@@ -729,23 +744,7 @@ export function captureCodexModel(
     const seedSession = trustedSession(seed);
     const seedTrace = text(seed.metadata.traceId);
     const producerSession = text(seed.metadata["conversation.id"] ?? nestedOtelAttributes(seed)["conversation.id"]);
-    // Apply the already-proven independent native-conversation boundary
-    // before decoding rows. Reused local aliases otherwise force every fresh
-    // capture to decode unrelated conversations. This is conservative: only
-    // explicit string values containing an ASCII alphanumeric qualify here;
-    // all unknown, stitched, malformed or other representations still stream
-    // through independentLinkedResponse and the complete contradiction veto.
-    const jsonFact = (key: string) => `case when json_valid(e.payload_json) then
-      json_extract(e.payload_json,'${key}') end`;
-    const factTrace = jsonFact("$.metadata.traceId"), factSession = jsonFact("$.sessionId");
-    const factProducer = `coalesce(${jsonFact('$.metadata."conversation.id"')},
-      ${jsonFact('$.metadata.otelAttributes."conversation.id"')})`;
-    const independentConversation = seedTrace && seedSession && producerSession === seedSession
-      ? ` and not coalesce((typeof(${factTrace})='text' and ${factTrace} glob '*[A-Za-z0-9]*'
-          and ${factTrace}<>? and typeof(${factSession})='text' and ${factSession} glob '*[A-Za-z0-9]*'
-          and ${factSession}<>? and ${jsonFact('$.metadata.stitched')} is not 'time_window'
-          and typeof(${factProducer})='text' and ${factProducer}=${factSession}),0)` : "";
-    const independentArgs = independentConversation ? [seedTrace,seedSession] : [];
+    const scopedConversation = Boolean(seedTrace && seedSession && producerSession === seedSession);
     const pending: ReturnType<typeof codexResponseIdentities> = [];
     const seenKeys = new Set<string>();
     const enqueue = (e: AiInteractionEvent) => {
@@ -759,6 +758,7 @@ export function captureCodexModel(
       return true;
     };
     if (!enqueue(seed)) return "linked_identity_overflow";
+    if (!pending.length) return undefined;
     let reasonFound: string | undefined;
     linkedVeto: for (let index = 0; index < pending.length; index++) {
       const node = pending[index]!;
@@ -767,10 +767,24 @@ export function captureCodexModel(
       const matches = aliases.map(alias => `case when json_valid(e.payload_json) then
         json_extract(e.payload_json,'$.metadata."${alias}"') end=?`);
       const turnScope = node.kind === "turn" ? " and e.session_id is ?" : "";
-      const args = [...nativeScopeArgs,...independentArgs,...aliases.map(() => node.value),
-        ...(node.kind === "turn" ? [seedSession] : [])];
-      for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
-        ${independentConversation} and (${matches.join(" or ")})${turnScope}`).iterate(...args) as Iterable<EvidenceRow>) {
+      const suffix = ` and (${matches.join(" or ")})${turnScope}`;
+      const suffixArgs = [...aliases.map(() => node.value),...(node.kind === "turn" ? [seedSession] : [])];
+      const branch = (condition: string, args: unknown[]) => ({
+        sql: `${selectEvidence} where ${nativeScope}${condition}${suffix}`,
+        args: [...nativeScopeArgs,...args,...suffixArgs],
+      });
+      // Indexed disjoint branches retain ALL uncertain rows, same-session
+      // rows and same-trace rows. Only proven independent conversations are
+      // omitted. No component or contradiction fact is capped by row count.
+      const branches = scopedConversation ? [
+        branch(` and ${linkedScopeQuery}=0`,[]),
+        branch(` and ${linkedScopeQuery}=1 and e.session_id is ?`,[seedSession]),
+        branch(` and ${linkedScopeQuery}=1 and e.session_id is not ? and
+          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?`,
+          [seedSession,seedTrace]),
+      ] : [branch("",[])];
+      for (const candidate of prepare(branches.map(b => b.sql).join(" union all "))
+        .iterate(...branches.flatMap(b => b.args)) as Iterable<EvidenceRow>) {
         const p = decodePeers([candidate])[0];
         if (!p) continue;
         if (independentLinkedResponse(seed,p.event)) continue;
