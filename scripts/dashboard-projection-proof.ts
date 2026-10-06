@@ -56,7 +56,7 @@ import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
-import { ANALYTICAL_METADATA_LIMITS, LOCAL_TENANT_ID, aiInteractionEventSchema } from "../packages/shared/src/index";
+import { ANALYTICAL_METADATA_LIMITS, LOCAL_TENANT_ID, aiInteractionEventSchema, readLiveUsageEventObservation } from "../packages/shared/src/index";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = new Date("2026-07-15T12:00:00.000Z");
@@ -1618,10 +1618,16 @@ async function main() {
     // Exercise the previously unreachable usage_live branch. Observer counters
     // cannot make the fixture invent native finance evidence, and metadata alone
     // cannot grant the authenticated app-server append capability.
-    const liveObserver = event({eventType:"usage_live", inputTokens:44, outputTokens:4,
-      cacheReadTokens:0, cacheCreationTokens:0, metadata:{
-        sourceVersion:"codex.app-server.usage.v1",liveObservationKind:"observed_interval",
-        liveFinanceEligibility:"unqualified_observer",liveAttributionState:"unresolved"}});
+    const liveEnd = new Date(NOW.getTime()-DAY_MS).toISOString();
+    const liveObserver = event({eventType:"usage_live",observedAt:liveEnd,inputTokens:44,outputTokens:4,
+      cacheReadTokens:0,cacheCreationTokens:0,metadata:{
+        sourceVersion:"codex.app-server.usage.v1",sourceIdentityEvidenceRef:"native_runtime_observed_interval_v1",
+        liveObservationKind:"observed_interval",liveFinanceEligibility:"unqualified_observer",liveAttributionState:"unresolved",
+        liveIntervalStart:new Date(Date.parse(liveEnd)-1000).toISOString(),liveIntervalEnd:liveEnd,
+        liveTotalTokens:48,liveReasoningOutputTokens:0,sourceEventId:"projection-runtime-1",
+        logicalSourceEventId:"projection-runtime-1",captureRootId:"projection-runtime",captureProfileId:"projection-profile",
+        installationEpochId:buffer.workspaceBinding().currentInstallationEpochId!,sourcePayloadDigest:"a".repeat(64)}});
+    check("live_observer_fixture_is_a_valid_native_interval",readLiveUsageEventObservation(liveObserver)!==null);
     check("live_observer_fixture_does_not_invent_request_model",liveObserver.model===undefined &&
       liveObserver.metadata.model===undefined && liveObserver.metadata.traceId===undefined);
     check("live_observer_fixture_retains_reported_counters",liveObserver.inputTokens===44 &&
