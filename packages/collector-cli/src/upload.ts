@@ -23,6 +23,7 @@ import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
 import {
   applyProjectAttribution,
+  captureRepoContextExcluded,
   SessionAttributionBatch,
 } from "./session-attribution";
 
@@ -62,6 +63,7 @@ export function buildIngestBatch(
   );
   for (const row of candidateRows) {
     const attributed = attribution.attribute(row.payload, {
+      repoContextExcluded: captureRepoContextExcluded(row.payload.metadata?.repoContextPolicyGeneration, row.repoHash),
       repoHash: row.repoHash,
       branchHash: row.branchHash,
     });

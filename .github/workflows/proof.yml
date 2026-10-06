@@ -838,6 +838,17 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:git-context
 
+      - name: Prove new home capture and sealed delivery exclusions (PR 464)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:home-capture-downgrade
+          pnpm proof:home-context-upgrade
+          pnpm proof:home-claude-context-upgrade
+          pnpm proof:home-grok-context-upgrade
+          pnpm proof:home-context-delivery
+          pnpm proof:home-worktree-boundary
+          pnpm proof:mounted-root-git
+
       - name: Prove deferred repository context transaction and privacy bounds
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:repo-context
