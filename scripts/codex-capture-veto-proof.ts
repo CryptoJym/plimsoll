@@ -44,7 +44,7 @@ class Fixture {
   assert.equal(wire.inputTokens,gap||paired?undefined:19);assert.equal(wire.outputTokens,gap||paired?undefined:2);
   if(gap)assert.equal(wire.metadata.modelGapInputTokens,undefined,'diagnostic counters stay local');
   this.b.delivery.acknowledge(lease.leaseId,lease.items.map(i=>i.deliveryId),new Date(AT+62_000));
-  const custody=this.b.database.prepare('select state from upload_receipts where delivery_id=?').get(item.deliveryId) as {state:string};
+  const custody=this.b.database.prepare('select terminal_state as state from upload_receipts where delivery_id=?').get(item.deliveryId) as {state:string};
   assert.equal(custody.state,'acknowledged');
  }
  freezeFact(e:AiInteractionEvent,ack:boolean){
