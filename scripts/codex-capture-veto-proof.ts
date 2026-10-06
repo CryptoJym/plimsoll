@@ -257,7 +257,24 @@ try{
      f.append(make(3,{[identity]:malformed,model:OTHER},{model:OTHER,eventType:'tool_result',
       inputTokens:undefined,outputTokens:undefined,observedAt:new Date(AT-3_600_000).toISOString()}));
      const native={traceId:f.trace,'conversation.id':SESSION,[identity]:literal,model:MODEL,otelEventName:'codex.sse_event'};
-     if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL})),false);
+     if(targetKind==='native-target'&&identity!=='codexTurnId'){
+      const target=f.append(make(1,native,{model:MODEL})),captured=f.capture(target);
+      assert.equal(isCaptureGap(captured),false);assert.equal(captured.model,MODEL);
+      assert.equal(captured.inputTokens,19);assert.equal(captured.outputTokens,2);
+      // Literal JSON punctuation is prohibited in these public opaque IDs.
+      // Preserve that existing wire rule as well as the capture type rule;
+      // codexTurnId and a selected witness's IDs remain local diagnostics.
+      f.b.delivery.configure({enabled:true});f.b.delivery.repairRawById(target.id);
+      const terminal=()=>f.b.database.prepare('select terminal_state as state,reason from upload_receipts where raw_id=?')
+       .get(target.id) as {state:string;reason:string};
+      assert.deepEqual(terminal(),{state:'dead',reason:'local_privacy_violation'});
+      assert.equal(f.b.database.prepare('select 1 from upload_outbox where raw_id=?').get(target.id),undefined);
+      // A real valid native response still takes the complete wire/ACK path.
+      f.deliver(f.append(make(4,{traceId:'c'.repeat(32),'conversation.id':SESSION,request_id:'privacy-control',
+       model:MODEL,otelEventName:'codex.sse_event'},{model:MODEL})),false);
+      assert.deepEqual(terminal(),{state:'dead',reason:'local_privacy_violation'});
+     }
+     else if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL})),false);
      else{f.append(make(2,native,{model:MODEL}));f.deliver(f.append(make(1,{})),false);}
     });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
