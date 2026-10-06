@@ -76,8 +76,15 @@ the separately persisted `expectedRevision`; three stale recoveries exhaust the
 durable retry budget and remain for review. Other permanent refusals do not loop
 on upload cycles. Registry stale refetches choices but retains refused evidence;
 a new explicit declaration can supersede that refused queue item with a new ID
-and evidence reference. Ambiguous delivery is never superseded. Refused evidence
-still counts in local queued/review totals after renewal. Revocation invalidates
+and evidence reference. A refused, never-admitted proposal cannot anchor the new
+attempt: renewal uses the last admissible accepted or ambiguous receipt. With no
+such prefix, the renewed receipt has a fresh root/attempt and null parent, even
+after root/account rotation. Native identity, session epoch and old receipt facts
+remain unchanged. Only a new declaration renews authority; rebinding the refused
+launch cannot do so. Ambiguous delivery is never superseded. Superseded refusals
+remain in review and the separate `retainedRefusals` count; `queued` counts active
+pending receipts. Existing invalid lineage remains pending with
+`intent_lineage_unproved`, rather than rewriting earlier facts. Revocation invalidates
 cached authority and stops sending. No refusal switches project or adapter.
 
 `intent sync` examines up to eight session documents, round-robin, with at most
@@ -101,10 +108,16 @@ not `declare`. `launch` returns the child's exit status once spawning starts.
 
 The helper adds a per-invocation `--settings` command hook for
 `startup|resume|clear|compact`. It consumes only native session ID/start reason,
-never exports its raw input, and performs local queueing only. Repeated events
-reuse the receipt, while clear with another ID binds a new incarnation. A launch
-must be active and its wrapper process must be an ancestor of the hook process;
-stale inherited launch IDs print Needs a project. No MCP hook, user/seat settings
+never exports its raw input, and performs local queueing only. Before spawning,
+it pins a native UUID and supplies Claude's `--session-id`, or pins an explicit
+`--session-id` / UUID `--resume` target. Initial hooks must match that exact native
+ID and launched provider PID/start fingerprint through command shells. Every
+unrelated startup, including one beneath an active parent with its inherited
+launch ID, prints Needs a project. Repeated startup, resume and compact reuse
+the binding. Once the matching session has been seen, a clear from that exact
+provider process may bind its next native ID as a new incarnation. Unknown
+interactive resume/continue/fork targets stay pending for explicit `intent bind`;
+a hook cannot claim whichever ID arrives first. No MCP hook, user/seat settings
 installation or exporter env-file change is required.
 
 Reviewed rollout snippet (replace the script path with an absolute installed
@@ -131,8 +144,11 @@ describes command SessionStart and review of non-managed hooks. Config/feature
 acceptance is verified; actual provider hook firing is not verified here.
 
 Codex launches save the same pending receipt and leave existing hooks/config
-intact. Bind via the producer's `intent bind` once the actual native ID is known,
-or use this reviewed snippet during the release owner's later rollout:
+intact. Pin the actual native ID through the producer's `intent bind` first; the
+helper does not know that ID before launch. A hook with an inherited launch ID
+cannot supply the first arbitrary native ID. After the explicit bind, this reviewed
+snippet can maintain the exact active provider binding during the release owner's
+later rollout:
 
 ```toml
 [[hooks.SessionStart]]
@@ -145,6 +161,9 @@ timeout = 10
 
 Non-managed hooks require Codex review/trust. The helper never bypasses trust,
 uses legacy profiles, relies on repo-local OTel settings, or assumes an env file
-reconfigures a parent exporter. There is no claim of automatic Codex native
-binding without the reviewed hook or explicit bind. Codex desktop coverage and
-live rollout belong to P08/P15.
+reconfigures a parent exporter. There is no claim of automatic initial Codex
+native binding. Actual Claude/Codex hook process ancestry and live firing remain
+unverified by these synthetic provider fixtures; unsupported ancestry fails
+closed as Needs a project. Codex desktop coverage and live rollout belong to
+P08/P15. The [collector lint profile](collector-lint.md) documents the reproducible
+changed-file check, including the transport's `_label` argument.

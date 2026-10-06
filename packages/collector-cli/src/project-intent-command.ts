@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
@@ -8,7 +9,7 @@ import { readCollectorConfig } from "./config";
 import {
   ProjectIntentProducer, type IntentChoice, type IntentLaunch, type IntentSession,
 } from "./project-intent-producer";
-import { canonicalSourceRoot, intentDigest, IntentError, type IntentSource } from "./project-intent-identity";
+import { canonicalIdentity, canonicalSourceRoot, intentDigest, IntentError, type IntentSource } from "./project-intent-identity";
 
 export const INTENT_COMMAND_HELP = `
   intent choices [--offline]
@@ -24,7 +25,7 @@ export const INTENT_COMMAND_HELP = `
   intent sync
   intent folder-default (--project KEY | --clear) [--offline]
   launch claude|codex [--project KEY | --needs-project | --use-folder-default] [--offline] [-- PROVIDER_ARGS...]
-      Persists intent before spawning, preserving cwd. Codex binds via a reviewed hook or intent bind.
+      Persists intent before spawning, preserving cwd. Codex initial binding uses intent bind.
       Exit codes: 0 delivered/saved; 2 bad input/refused; 3 pending native/root; 4 queued for replay/review.
       launch preserves the provider's exit code after the child starts.
 `;
@@ -90,21 +91,48 @@ async function hookInput() {
     const input = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
     if (input.hook_event_name !== "SessionStart" || typeof input.session_id !== "string" ||
       !["startup", "resume", "clear", "compact"].includes(String(input.source))) throw new IntentError("invalid_intent_hook");
-    return { nativeId: input.session_id, continuation: input.source === "resume" || input.source === "compact" };
+    return { nativeId: input.session_id, reason: input.source as "startup" | "resume" | "clear" | "compact" };
   } finally { clearTimeout(timer); }
 }
 function hookOwnerFingerprint(pid: number): string {
   try { return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 500, env: { ...process.env, TZ: "UTC" } }).trim(); }
   catch { return ""; }
 }
-type HookOwner = { pid: number; fingerprint: string };
-function ownedHook(p: ProjectIntentProducer, launchId: string): boolean {
-  const owner = p.store.read<HookOwner>("defaults", `owner-${launchId}`);
+type HookOwner = { pid: number; fingerprint: string; providerPid: number | null; providerFingerprint: string;
+  nativeSessionKey: string | null; nativeSeen: boolean };
+async function ownedHook(p: ProjectIntentProducer, launchId: string, source: IntentSource,
+  native: Awaited<ReturnType<typeof hookInput>>): Promise<boolean> {
+  const stateId = `owner-${launchId}`;
+  let owner = p.store.read<HookOwner>("defaults", stateId);
+  // The expected ID is saved before spawning; wait only for publication of the child PID.
+  const deadline = performance.now() + 1000;
+  while (owner && owner.providerPid === null && performance.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    owner = p.store.read<HookOwner>("defaults", stateId);
+  }
   if (!owner || !owner.fingerprint || owner.fingerprint !== hookOwnerFingerprint(owner.pid)) return false;
+  if (!owner.providerPid || !owner.providerFingerprint ||
+    owner.providerFingerprint !== hookOwnerFingerprint(owner.providerPid) || !owner.nativeSessionKey) return false;
   let pid = process.ppid;
   for (let depth = 0; depth < 12 && pid > 1; depth++) {
-    if (pid === owner.pid) return true;
-    try { pid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 500 }).trim()); }
+    if (pid === owner.providerPid) {
+      const nativeSessionKey = intentDigest("native-session", [p.scope.installId, source, canonicalIdentity(native.nativeId)]);
+      return p.store.mutate<HookOwner, boolean>("defaults", stateId, current => {
+        if (!current || current.providerPid !== owner!.providerPid || current.providerFingerprint !== owner!.providerFingerprint)
+          throw new IntentError("intent_hook_owner_changed");
+        if (current.nativeSessionKey !== nativeSessionKey && !(native.reason === "clear" && current.nativeSeen))
+          return { state: current, result: false };
+        // Only this exact native process can prove a clear into its next lifetime.
+        current.nativeSessionKey = nativeSessionKey; current.nativeSeen = true;
+        return { state: current, result: true };
+      });
+    }
+    try {
+      const row = execFileSync("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { encoding: "utf8", timeout: 500 }).trim();
+      const match = /^(\d+)\s+(.+)$/.exec(row);
+      if (!match || !["sh", "bash", "zsh", "dash", "timeout"].includes(path.basename(match[2]))) return false;
+      pid = Number(match[1]);
+    }
     catch { return false; }
   }
   return false;
@@ -165,6 +193,33 @@ export function launchEnvironment(env: NodeJS.ProcessEnv, launchId: string): Nod
   return clean;
 }
 
+/** Pin the native ID before the first hook; a hook may never claim the first arbitrary ID it sees. */
+function claudeSessionArguments(args: string[]): { args: string[]; nativeId: string | null } {
+  const separator = args.indexOf("--");
+  const options = separator === -1 ? args : args.slice(0, separator);
+  const flag = (names: string[]) => {
+    const occurrences = options.map((value, index) => ({ value, index }))
+      .filter(row => names.some(name => row.value === name || row.value.startsWith(`${name}=`)));
+    if (occurrences.length > 1) throw new IntentError("invalid_native_session_arguments");
+    if (!occurrences.length) return null;
+    const { value, index } = occurrences[0];
+    return { value: value.includes("=") ? value.slice(value.indexOf("=") + 1) : options[index + 1] };
+  };
+  const explicit = flag(["--session-id"]);
+  if (explicit) {
+    const parsed = z.string().uuid().safeParse(explicit.value);
+    if (!parsed.success) throw new IntentError("invalid_native_session_arguments");
+    return { args, nativeId: parsed.data.toLowerCase() };
+  }
+  const resume = flag(["--resume", "-r"]);
+  if (resume || options.includes("--continue") || options.includes("-c") || options.includes("--fork-session")) {
+    const parsed = z.string().uuid().safeParse(resume?.value);
+    return { args, nativeId: parsed.success && !options.includes("--fork-session") ? parsed.data.toLowerCase() : null };
+  }
+  const nativeId = crypto.randomUUID();
+  return { args: ["--session-id", nativeId, ...args], nativeId };
+}
+
 async function launchProvider(args: string[]): Promise<number> {
   if (process.platform === "win32") throw new IntentError("intent_launch_platform_unsupported");
   const name = args[0];
@@ -176,15 +231,18 @@ async function launchProvider(args: string[]): Promise<number> {
   const p = producer();
   const selection = await selectedChoice(p, parsed, true);
   const source = name === "claude" ? "claude_code" : "codex";
+  const nativeBinding = name === "claude" ? claudeSessionArguments(nativeArgs) : { args: nativeArgs, nativeId: null };
   const launch = p.declare({ source, sourceRoot: sourceStateRoot(source), project: selection.project, basis: selection.basis });
-  const owner = { pid: process.pid, fingerprint: hookOwnerFingerprint(process.pid) };
+  const owner: HookOwner = { pid: process.pid, fingerprint: hookOwnerFingerprint(process.pid), providerPid: null,
+    providerFingerprint: "", nativeSeen: false,
+    nativeSessionKey: nativeBinding.nativeId ? intentDigest("native-session", [p.scope.installId, source, nativeBinding.nativeId]) : null };
   p.store.mutate<HookOwner, void>("defaults", `owner-${launch.launchId}`, () => ({ state: owner, result: undefined }));
   // Claude merges this additional per-invocation settings object. No files/settings are installed.
   const providerArgs = name === "claude" ? ["--settings", JSON.stringify({ hooks: { SessionStart: [
     { matcher: "startup|resume|clear|compact", hooks: [{ type: "command", command: ownIntentHookCommand(launch.launchId, source), timeout: 10 }] },
-  ] } }), ...nativeArgs] : nativeArgs;
+  ] } }), ...nativeBinding.args] : nativeArgs;
   process.stderr.write(`${launchView(launch).projectState}${selection.project ? `: ${JSON.stringify(selection.project.projectLabel)}` : ""}${selection.cached ? " (offline registry copy)" : ""}\n`);
-  process.stderr.write(`Plimsoll launch ${launch.launchId}${name === "codex" ? ": native binding needs a reviewed SessionStart hook or intent bind" : ""}\n`);
+  process.stderr.write(`Plimsoll launch ${launch.launchId}${name === "codex" ? ": initial native binding needs intent bind" : ""}\n`);
   let child: ReturnType<typeof spawn> | undefined;
   const relay = (signal: NodeJS.Signals) => { child?.kill(signal); };
   const interrupt = () => relay("SIGINT"), terminate = () => relay("SIGTERM");
@@ -194,6 +252,9 @@ async function launchProvider(args: string[]): Promise<number> {
       child = spawn(name, providerArgs, { cwd: process.cwd(), env: launchEnvironment(process.env, launch.launchId), stdio: "inherit" });
       child.once("error", () => resolve(2));
       child.once("exit", (code, signal) => resolve(code ?? (signal === "SIGINT" ? 130 : 143)));
+      if (child.pid) p.store.mutate<HookOwner, void>("defaults", `owner-${launch.launchId}`, current => ({
+        state: { ...current!, providerPid: child!.pid!, providerFingerprint: hookOwnerFingerprint(child!.pid!) }, result: undefined,
+      }));
     });
   } finally {
     process.off("SIGINT", interrupt); process.off("SIGTERM", terminate);
@@ -214,10 +275,10 @@ export async function projectIntentCommand(args: string[]): Promise<number> {
       if (!launchId || !z.string().uuid().safeParse(launchId).success) { output({ systemMessage: "Needs a project" }); return 0; }
       const p = producer();
       const launch = p.store.read<IntentLaunch>("launches", launchId.toLowerCase());
-      if (!launch || !launch.active || launch.receiptDraft.source !== source || !ownedHook(p, launchId)) {
+      if (!launch || !launch.active || launch.receiptDraft.source !== source || !await ownedHook(p, launchId.toLowerCase(), source, native)) {
         output({ systemMessage: "Needs a project: launch binding unavailable" }); return 0;
       }
-      const receipt = p.bind(launchId, native.nativeId, { continuation: native.continuation, hook: true,
+      const receipt = p.bind(launchId, native.nativeId, { continuation: native.reason === "resume" || native.reason === "compact", hook: true,
         sourceRoot: sourceStateRoot(source) });
       if (!receipt) output({ systemMessage: "Needs a project: provider state or collector binding unavailable" });
       return 0;
@@ -251,6 +312,10 @@ export async function projectIntentCommand(args: string[]): Promise<number> {
         continuation: Boolean(parsed["--continuation"]), sourceRoot: value(parsed, "--source-root"), principal: value(parsed, "--principal"),
       });
       if (!receipt) { output({ localState: "awaiting_native_binding", reason: "native_binding_unavailable" }); return 3; }
+      const stateId = `owner-${required(parsed, "--launch-id").toLowerCase()}`;
+      if (p.store.read<HookOwner>("defaults", stateId)) p.store.mutate<HookOwner, void>("defaults", stateId, current => ({
+        state: { ...current!, nativeSessionKey: receipt.nativeSessionKey, nativeSeen: true }, result: undefined,
+      }));
       return delivery(p, receipt.sessionId, Boolean(parsed["--queue-only"]));
     }
     if (action === "sync") {
@@ -266,7 +331,8 @@ export async function projectIntentCommand(args: string[]): Promise<number> {
         sessions: sessionIds.slice(-128).map(id => {
           const session = p.store.read<IntentSession>("sessions", id)!;
           return { sessionId: id, observedRevision: session.observedRevision,
-            queued: session.receipts.filter(row => !row.delivered).length,
+            queued: session.receipts.filter(row => !row.delivered && !row.supersededBy).length,
+            retainedRefusals: session.receipts.filter(row => !row.delivered && row.supersededBy !== null).length,
             review: session.receipts.filter(row => row.review).map(row => ({ receiptId: row.receipt.receiptId, reason: row.review })) };
         }), localOnly: true, limit: 128,
         inventoryCoverage: launchIds.length > 128 || sessionIds.length > 128 ? "partial" : "complete",

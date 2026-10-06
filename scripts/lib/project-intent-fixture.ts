@@ -85,11 +85,13 @@ export async function createIntentFixture() {
 const fs=require('node:fs');
 const cp=require('node:child_process');
 const args=process.argv.slice(2);
+const sessionFlag=args.indexOf('--session-id');
+const nativeSession=sessionFlag>=0?args[sessionFlag+1]:process.env.FIXTURE_NATIVE_SESSION;
 const i=args.indexOf('--settings');
 if(i>=0) {
  const hooks=JSON.parse(args[i+1]).hooks.SessionStart[0].hooks;
  for(const source of ['startup','resume','clear','compact']) for(const hook of hooks) {
-  const sessionId=['clear','compact'].includes(source)?process.env.FIXTURE_CLEAR_NATIVE_SESSION??process.env.FIXTURE_NATIVE_SESSION:process.env.FIXTURE_NATIVE_SESSION;
+  const sessionId=['clear','compact'].includes(source)?process.env.FIXTURE_CLEAR_NATIVE_SESSION??nativeSession:nativeSession;
   const input=JSON.stringify({hook_event_name:'SessionStart',session_id:sessionId,source,
     cwd:process.cwd(),transcript_path:'/private/PROMPT_PATH_DO_NOT_EXPORT',prompt:'PROMPT_DO_NOT_EXPORT',secret:'SECRET_DO_NOT_EXPORT'});
   const result=cp.spawnSync('/bin/sh',['-c',hook.command],{input,env:process.env,encoding:'utf8',timeout:10000});

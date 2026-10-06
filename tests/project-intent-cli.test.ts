@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { appendProjectIntentReceipt, selectedProjectIntent } from "../packages/shared/src/project-intent";
+import { appendProjectIntentReceipt, selectedProjectIntent, type ProjectIntentReceipt } from "../packages/shared/src/project-intent";
 import { canonicalIdentity, intentDigest } from "../packages/collector-cli/src/project-intent-identity";
 import { ProjectIntentProducer, type IntentLaunch, type IntentSession } from "../packages/collector-cli/src/project-intent-producer";
 import { ensureUuidSessionId } from "../packages/collector-cli/src/session-sync";
@@ -197,7 +197,7 @@ test("Claude clear with a different native ID binds a fresh incarnation within o
   const f = await createIntentFixture();
   try {
     const firstId = nativeId(), clearedId = nativeId();
-    const result = await f.run(["launch", "claude", "--project", INTENT_FIXTURE_PROJECTS[0].projectKey], {
+    const result = await f.run(["launch", "claude", "--project", INTENT_FIXTURE_PROJECTS[0].projectKey, "--", "--session-id", firstId], {
       env: { FIXTURE_NATIVE_SESSION: firstId, FIXTURE_CLEAR_NATIVE_SESSION: clearedId },
     });
     assert.equal(result.code, 0, result.stdout + result.stderr);
@@ -266,6 +266,7 @@ test("cross-process delivery lease serializes a session and reports a busy queue
     const second = new ProjectIntentProducer(f.config, { directory: path.join(f.root, "collector") });
     const results = await Promise.all([f.p.sendSession(row.sessionId), second.sendSession(row.sessionId)]);
     assert.equal(results[0].delivered, 1); assert.equal(results[1].reason, "intent_delivery_busy"); assert.equal(results[1].queued, null);
+    assert.equal(results[0].retainedRefusals, 0); assert.equal(results[1].retainedRefusals, null);
     assert.equal(f.calls.filter(call => call.method === "POST").length, 1);
   } finally { await f.close(); }
 });
@@ -301,12 +302,14 @@ test("bounded replay reports a known zero, partial coverage and unexamined rows 
   try {
     const empty = await f.p.replay();
     assert.equal(empty.queued, 0); assert.equal(empty.queueCoverage, "complete"); assert.equal(empty.unexaminedSessions, 0);
+    assert.equal(empty.retainedRefusals, 0);
     for (let count = 0; count < 2; count++) {
       const launch = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot, project: null });
       f.p.bind(launch.launchId, nativeId());
     }
     const bounded = await f.p.replay(1, 1);
     assert.equal(bounded.delivered, 1); assert.equal(bounded.queueCoverage, "partial"); assert.equal(bounded.unexaminedSessions, 1);
+    assert.equal(bounded.retainedRefusals, 0, "count covers only examined sessions, alongside partial coverage");
     f.setPost(() => ({ status: 403, body: { error: "device_revoked" } }));
     const revoked = await f.p.replay();
     assert.equal(revoked.queued, 1); assert.equal(revoked.queueCoverage, "partial"); assert.equal(revoked.unexaminedSessions, 1);
@@ -327,4 +330,151 @@ test("lost durable session binding stays pending and exhausted stale recovery do
     assert.throws(() => f.p.bind(launch.launchId, id), /intent_continuity_unproved/);
     assert.equal(f.p.store.read<IntentSession>("sessions", id), null);
   } finally { await f.close(); }
+});
+
+// Ported from check-r1/checks/nested-start-repro.ts: the parent is still active.
+test("P04-R1-01 direct startup under an active parent never borrows its project", async () => {
+  const f = await createIntentFixture();
+  try {
+    const first = nativeId(), unrelated = nativeId();
+    fs.writeFileSync(path.join(f.root, "bin", "claude"), `#!${process.execPath}\n${String.raw`
+const cp = require('node:child_process');
+const args = process.argv.slice(2);
+const hook = JSON.parse(args[args.indexOf('--settings') + 1]).hooks.SessionStart[0].hooks[0].command;
+const input = id => JSON.stringify({hook_event_name:'SessionStart', source:'startup', session_id:id});
+const early = cp.spawnSync('/bin/sh', ['-c', hook], {input:input(process.env.UNRELATED_ID), env:process.env, encoding:'utf8'});
+const primary = cp.spawnSync('/bin/sh', ['-c', hook], {input:input(process.env.FIRST_ID), env:process.env, encoding:'utf8'});
+if (primary.status !== 0) process.exit(91);
+const direct = cp.spawnSync(process.execPath, ['-e',
+ "const cp=require('node:child_process');const r=cp.spawnSync('/bin/sh',['-c',process.env.INHERITED_HOOK_COMMAND],{input:process.env.UNRELATED_HOOK_INPUT,env:process.env,encoding:'utf8'});process.stdout.write(r.stdout);process.exit(r.status);"],
+ {env:{...process.env, INHERITED_HOOK_COMMAND:hook, UNRELATED_HOOK_INPUT:input(process.env.UNRELATED_ID)}, encoding:'utf8'});
+// Also exercise the environment-only shipped hook operation from the intended provider.
+const environmentHook = hook.replace(/ '--launch-id' '[0-9a-f-]+'$/, '');
+const other = cp.spawnSync('/bin/sh', ['-c', environmentHook], {input:input(process.env.UNRELATED_ID), env:process.env, encoding:'utf8'});
+const childClear = cp.spawnSync(process.execPath, ['-e',
+ "const cp=require('node:child_process');const r=cp.spawnSync('/bin/sh',['-c',process.env.INHERITED_HOOK_COMMAND],{input:process.env.UNRELATED_HOOK_INPUT,env:process.env,encoding:'utf8'});process.stdout.write(r.stdout);process.exit(r.status);"],
+ {env:{...process.env, INHERITED_HOOK_COMMAND:hook, UNRELATED_HOOK_INPUT:JSON.stringify({hook_event_name:'SessionStart',source:'clear',session_id:process.env.UNRELATED_ID})}, encoding:'utf8'});
+console.log('ACTIVE_PARENT:'+JSON.stringify({primary:primary.status, direct:direct.status, directOutput:direct.stdout,
+ environment:other.status, environmentOutput:other.stdout, early:early.status, earlyOutput:early.stdout,
+ childClear:childClear.status, childClearOutput:childClear.stdout}));
+process.exit(early.status || direct.status || other.status || childClear.status);
+`}`, { mode: 0o700 });
+    const launched = await f.run(["launch", "claude", "--project", INTENT_FIXTURE_PROJECTS[0].projectKey,
+      "--", "--session-id", first], { env: { FIRST_ID: first, UNRELATED_ID: unrelated } });
+    assert.equal(launched.code, 0, launched.stdout + launched.stderr);
+    const evidence = JSON.parse(launched.stdout.split("\n").find(line => line.startsWith("ACTIVE_PARENT:"))!.slice(14));
+    assert.equal(evidence.primary, 0); assert.equal(evidence.direct, 0); assert.equal(evidence.environment, 0);
+    assert.equal(evidence.early, 0); assert.match(evidence.earlyOutput, /Needs a project/);
+    assert.equal(evidence.childClear, 0); assert.match(evidence.childClearOutput, /Needs a project/);
+    assert.match(evidence.directOutput, /Needs a project/);
+    assert.match(evidence.environmentOutput, /Needs a project/);
+    assert.equal(f.p.store.ids("launches").length, 1);
+    const session = f.p.store.read<IntentSession>("sessions", first)!;
+    assert.equal(session.receipts.length, 1); assert.equal(session.receipts[0].receipt.projectKey, INTENT_FIXTURE_PROJECTS[0].projectKey);
+    assert.equal(f.p.store.read<IntentSession>("sessions", unrelated), null);
+    assert.equal(f.p.store.ids("sessions").length, 1);
+  } finally { await f.close(); }
+});
+
+test("an unknown Claude resume target cannot claim the first native hook ID", async () => {
+  const f = await createIntentFixture();
+  try {
+    const result = await f.run(["launch", "claude", "--project", INTENT_FIXTURE_PROJECTS[0].projectKey,
+      "--", "--resume"], { env: { FIXTURE_NATIVE_SESSION: nativeId() } });
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.equal(result.stdout.match(/Needs a project/g)?.length, 4, "no lifecycle hook may claim an unknown initial ID");
+    const launches = f.p.store.ids("launches");
+    assert.equal(launches.length, 1); assert.equal(f.p.store.ids("sessions").length, 0);
+    const launch = f.p.store.read<IntentLaunch>("launches", launches[0])!;
+    assert.equal(launch.localState, "awaiting_native_binding"); assert.deepEqual(launch.bindings, []);
+  } finally { await f.close(); }
+});
+
+// Ported from check-r1/checks/recovery-edge-repro.ts; ACK only after unchanged P02 admission.
+test("P04-R1-02 registry renewal plus root/account rotation drains a valid first attempt", async () => {
+  for (const rotation of ["both", "root", "account"]) {
+    const f = await createIntentFixture();
+    try {
+      const project = (await f.p.choices()).projects[0];
+      const launch = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot, project });
+      const native = nativeId(), refused = f.p.bind(launch.launchId, native)!;
+      f.setProjects(INTENT_FIXTURE_PROJECTS.map(p => ({ ...p, projectRegistryRevision: 2 })));
+      f.setPost(() => ({ status: 409, body: { error: "project_registry_stale" } }));
+      assert.equal((await f.p.sendSession(native)).reason, "project_registry_stale");
+      const renewed = f.p.declare({ source: "codex", project: (await f.p.choices()).projects[0],
+        sourceRoot: rotation === "account" ? f.sourceRoot : path.join(f.root, "codex-rotated"),
+        principal: rotation === "root" ? undefined : "rotated-authoritative-principal" });
+      const next = f.p.bind(renewed.launchId, native, { continuation: true })!;
+      let admitted = false;
+      f.setPost(body => {
+        try { appendProjectIntentReceipt([], body.receipt); }
+        catch { return { status: 409, body: { error: "attempt_lineage_invalid" } }; }
+        admitted = true;
+        return { status: 202, body: fixtureIntentAck(body.receipt) };
+      });
+      const before = f.calls.filter(c => c.method === "POST").length;
+      const delivery = await f.p.sendSession(native);
+      assert.equal(delivery.delivered, 1, JSON.stringify({ rotation, delivery }));
+      assert.equal(f.calls.filter(c => c.method === "POST").length, before + 1);
+      assert.equal(admitted, true); assert.equal(delivery.queued, 0);
+      assert.equal(delivery.retainedRefusals, 1);
+      assert.equal(next.sessionId, refused.sessionId); assert.equal(next.nativeSessionKey, refused.nativeSessionKey);
+      assert.equal(next.sessionEpochKey, refused.sessionEpochKey);
+      assert.equal(next.rootAttemptId, next.attemptId); assert.equal(next.parentAttemptId, null);
+      assert.notEqual(next.attemptId, refused.attemptId); assert.notEqual(next.evidenceRef, refused.evidenceRef);
+      const state = f.p.store.read<IntentSession>("sessions", native)!;
+      assert.deepEqual(state.receipts[0].receipt, refused);
+      assert.equal(state.receipts[0].supersededBy, next.receiptId); assert.equal(state.receipts[0].delivered, false);
+      assert.equal(state.receipts[1].delivered, true);
+    } finally { await f.close(); }
+  }
+});
+
+test("registry renewal anchors rotation to admitted history, and ambiguity never becomes a fresh root", async () => {
+  const f = await createIntentFixture();
+  try {
+    const project = (await f.p.choices()).projects[0];
+    const firstLaunch = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot, project });
+    const native = nativeId(), first = f.p.bind(firstLaunch.launchId, native)!;
+    let admitted: ProjectIntentReceipt[] = [];
+    const admit = (body: { receipt: ProjectIntentReceipt; expectedRevision: number }) => {
+      assert.equal(body.expectedRevision, admitted.length);
+      try { admitted = appendProjectIntentReceipt(admitted, body.receipt).receipts; }
+      catch { return { status: 409, body: { error: "attempt_lineage_invalid" } }; }
+      return { status: 202, body: fixtureIntentAck(body.receipt, admitted.length) };
+    };
+    f.setPost(admit);
+    assert.equal((await f.p.sendSession(native)).delivered, 1);
+    const rejectedLaunch = f.p.declare({ source: "codex", sourceRoot: path.join(f.root, "codex-rotated"), project, principal: "rejected-principal" });
+    const rejected = f.p.bind(rejectedLaunch.launchId, native, { continuation: true })!;
+    f.setProjects(INTENT_FIXTURE_PROJECTS.map(p => ({ ...p, projectRegistryRevision: 2 })));
+    f.setPost(() => ({ status: 409, body: { error: "project_registry_stale" } }));
+    assert.equal((await f.p.sendSession(native)).reason, "project_registry_stale");
+    const renewed = f.p.declare({ source: "codex", sourceRoot: path.join(f.root, "codex-rotated"),
+      project: (await f.p.choices()).projects[0], principal: "renewed-principal" });
+    const next = f.p.bind(renewed.launchId, native, { continuation: true })!;
+    assert.equal(next.rootAttemptId, first.rootAttemptId); assert.equal(next.parentAttemptId, first.attemptId);
+    assert.notEqual(next.parentAttemptId, rejected.attemptId);
+    f.setPost(admit);
+    const delivered = await f.p.sendSession(native);
+    assert.equal(delivered.delivered, 1); assert.equal(delivered.queued, 0); assert.equal(delivered.retainedRefusals, 1);
+    assert.equal(admitted.length, 2);
+    const state = f.p.store.read<IntentSession>("sessions", native)!;
+    assert.deepEqual(state.receipts[0].receipt, first); assert.deepEqual(state.receipts[1].receipt, rejected);
+    assert.equal(state.receipts[1].supersededBy, next.receiptId);
+  } finally { await f.close(); }
+  const g = await createIntentFixture();
+  try {
+    const project = (await g.p.choices()).projects[0];
+    const launch = g.p.declare({ source: "codex", sourceRoot: g.sourceRoot, project });
+    const native = nativeId(), ambiguous = g.p.bind(launch.launchId, native)!;
+    g.setPost(body => ({ status: 202, body: { ...fixtureIntentAck(body.receipt), sessionId: nativeId() } }));
+    assert.equal((await g.p.sendSession(native)).reason, "invalid_intent_ack");
+    const renewed = g.p.declare({ source: "codex", sourceRoot: path.join(g.root, "codex-rotated"), project, principal: "changed-principal" });
+    const next = g.p.bind(renewed.launchId, native, { continuation: true })!;
+    assert.equal(next.rootAttemptId, ambiguous.rootAttemptId); assert.equal(next.parentAttemptId, ambiguous.attemptId);
+    const state = g.p.store.read<IntentSession>("sessions", native)!;
+    assert.equal(state.receipts[0].supersededBy, null); assert.deepEqual(state.receipts[0].receipt, ambiguous);
+    assert.doesNotThrow(() => appendProjectIntentReceipt([ambiguous], next));
+  } finally { await g.close(); }
 });

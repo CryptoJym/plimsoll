@@ -66,6 +66,20 @@ export type IntentSession = {
 };
 const sameScope = (a: Scope, b: Scope) => JSON.stringify(a) === JSON.stringify(b);
 
+/** Refused proposals remain evidence, but may not anchor a server attempt that was never admitted. */
+function admissionHistory(rows: QueuedReceipt[], renewing: QueuedReceipt[] = []): ProjectIntentReceipt[] {
+  let history: ProjectIntentReceipt[] = [];
+  for (const row of rows) {
+    if (row.supersededBy || renewing.includes(row)) {
+      if (row.delivered || row.review !== "project_registry_stale") throw new IntentError("intent_supersession_unproved");
+      continue;
+    }
+    try { history = appendProjectIntentReceipt(history, row.receipt).receipts; }
+    catch { throw new IntentError("intent_lineage_unproved"); }
+  }
+  return history;
+}
+
 /** Every remote call uses the joined upload audience and install signature. No credential arguments. */
 export class ProjectIntentProducer {
   readonly store: IntentStore;
@@ -232,14 +246,20 @@ export class ProjectIntentProducer {
         }
         const session: IntentSession = previous ?? { scope: this.scope, source: draft.source, sessionId, nativeSessionKey,
           incarnationId: crypto.randomUUID(), observedRevision: 0, receipts: [], lease: null };
-        const last = session.receipts.at(-1)?.receipt;
         const accountKey = input.principal === undefined ? draft.accountKey : intentAccountKey(draft.source, input.principal);
+        // Recover publication across a crash without reviving a superseded declaration.
+        const existing = session.receipts.filter(item => item.launchId === launchId).at(-1);
+        if (existing && existing.receipt.accountKey === accountKey && existing.receipt.sourceRootKey === sourceRootKey)
+          return { state: session, result: existing.receipt };
+        if (existing?.supersededBy) throw new IntentError("intent_declaration_superseded");
+        const renewing = session.receipts.filter(item => !item.delivered && !item.supersededBy && item.review === "project_registry_stale");
+        if (renewing.some(item => item.launchId === launchId))
+          throw new IntentError("intent_registry_renewal_requires_new_declaration");
+        if (renewing.length && session.lease && session.lease.until > Date.now()) throw new IntentError("intent_delivery_busy");
+        // Include accepted and ambiguous facts. Only an explicit new declaration can replace a proved refusal.
+        const history = admissionHistory(session.receipts, renewing);
+        const last = history.at(-1);
         const sameAttempt = last && last.accountKey === accountKey && last.sourceRootKey === sourceRootKey;
-        if (sameAttempt) {
-          // Recover publication across a crash after saving the session but before saving its launch link.
-          const existing = session.receipts.filter(item => item.launchId === launchId).at(-1);
-          if (existing) return { state: session, result: existing.receipt };
-        }
         const attemptId = sameAttempt ? last.attemptId : crypto.randomUUID();
         const effectiveFrom = priorLaunchBinding || launch.bindings.length > 0 ? this.now().toISOString() : draft.effectiveFrom;
         const receipt = sealIntentReceipt({
@@ -253,9 +273,8 @@ export class ProjectIntentProducer {
           adapterId: draft.basis === "routed_launch" ? "routed-launch" : draft.basis === "repo_observation" ? "repo-observation" : "hand-start",
           adapterVersion: "1.0.0",
         });
-        appendProjectIntentReceipt(session.receipts.map(item => item.receipt), receipt);
-        const refused = session.receipts.at(-1);
-        if (refused?.review === "project_registry_stale" && sameAttempt) refused.supersededBy = receipt.receiptId;
+        appendProjectIntentReceipt(history, receipt);
+        for (const refused of renewing) refused.supersededBy = receipt.receiptId;
         session.receipts.push({ receipt, launchId, staleRecoveries: 0, supersededBy: null, expectedRevision: session.observedRevision, delivered: false, ack: null,
           review: null, evidence: { sourceRootPath: root, incarnationId: session.incarnationId } });
         return { state: session, result: receipt };
@@ -285,7 +304,7 @@ export class ProjectIntentProducer {
           const from = new Date(Math.max(Date.parse(until), Date.parse(last.effectiveFrom) + 1)).toISOString();
           const receipt = sealIntentReceipt({ ...last, receiptId: crypto.randomUUID(), projectKey: null,
             projectRegistryRevision: null, effectiveFrom: from, effectiveUntil: null, basis: "hand_start", adapterId: "hand-start" });
-          appendProjectIntentReceipt(session.receipts.map(item => item.receipt), receipt);
+          appendProjectIntentReceipt(admissionHistory(session.receipts), receipt);
           session.receipts.push({ receipt, launchId: `${launchId}-close`, staleRecoveries: 0, supersededBy: null, expectedRevision: session.observedRevision, delivered: false, ack: null,
             review: null, evidence: session.receipts.at(-1)!.evidence });
           return { state: session, result: undefined };
@@ -304,7 +323,9 @@ export class ProjectIntentProducer {
       return { state, result: undefined };
     });
   }
-  async sendSession(sessionId: string, maxRequests = 3): Promise<{ delivered: number; queued: number | null; reason: string | null }> {
+  async sendSession(sessionId: string, maxRequests = 3): Promise<{
+    delivered: number; queued: number | null; retainedRefusals: number | null; reason: string | null;
+  }> {
     this.assertNotRevoked();
     const leaseId = crypto.randomUUID();
     const acquired = this.store.mutate<IntentSession, boolean>("sessions", sessionId, state => {
@@ -314,7 +335,7 @@ export class ProjectIntentProducer {
       state.lease = { id: leaseId, until: Date.now() + 120_000 };
       return { state, result: true };
     });
-    if (!acquired) return { delivered: 0, queued: null, reason: "intent_delivery_busy" };
+    if (!acquired) return { delivered: 0, queued: null, retainedRefusals: null, reason: "intent_delivery_busy" };
     let delivered = 0, reason: string | null = null;
     try {
       for (let send = 0; send < Math.min(3, maxRequests); send++) {
@@ -378,11 +399,13 @@ export class ProjectIntentProducer {
         return { state, result: undefined };
       });
     }
-    const queued = this.store.read<IntentSession>("sessions", sessionId)!.receipts.filter(item => !item.delivered).length;
-    return { delivered, queued, reason: queued ? reason : null };
+    const receipts = this.store.read<IntentSession>("sessions", sessionId)!.receipts;
+    const queued = receipts.filter(item => !item.delivered && !item.supersededBy).length;
+    const retainedRefusals = receipts.filter(item => !item.delivered && item.supersededBy !== null).length;
+    return { delivered, queued, retainedRefusals, reason: queued ? reason : null };
   }
   async replay(maxSessions: number = INTENT_STATE_LIMITS.replaySessions, maxRequests = 3) {
-    let delivered = 0, queued = 0;
+    let delivered = 0, queued = 0, retainedRefusals = 0;
     const reasons: string[] = [];
     const ids = this.store.ids("sessions");
     const cursor = this.store.read<{ after: string | null }>("registry", "replay")?.after;
@@ -394,13 +417,14 @@ export class ProjectIntentProducer {
       if (!this.store.read<IntentSession>("sessions", sessionId)?.receipts.some(row => !row.delivered)) continue;
       const result = await this.sendSession(sessionId, maxRequests);
       delivered += result.delivered; queued += result.queued ?? 0;
+      retainedRefusals += result.retainedRefusals ?? 0;
       if (result.reason) reasons.push(result.reason);
       if (result.reason === "device_revoked" || result.reason === "unauthorized" || result.reason === "install_tenant_mismatch") break;
     }
     this.store.mutate<{ after: string | null }, void>("registry", "replay", () => ({
       state: { after: examined.at(-1) ?? null }, result: undefined,
     }));
-    return { delivered, queued, queueCoverage: ids.length > examined.length || reasons.includes("intent_delivery_busy") ? "partial" : "complete",
+    return { delivered, queued, retainedRefusals, queueCoverage: ids.length > examined.length || reasons.includes("intent_delivery_busy") ? "partial" : "complete",
       unexaminedSessions: ids.length - examined.length, reasons };
   }
 }
@@ -409,5 +433,5 @@ export class ProjectIntentProducer {
 export async function replayProjectIntentsIfPresent(config: CollectorConfig) {
   if (!fs.existsSync(path.join(collectorHome(), INTENT_STATE_DIRECTORY))) return null;
   try { return await new ProjectIntentProducer(config).replay(1, 1); }
-  catch (error) { return { delivered: 0, queued: null, reasons: [error instanceof IntentError ? error.code : "intent_replay_deferred"] }; }
+  catch (error) { return { delivered: 0, queued: null, retainedRefusals: null, reasons: [error instanceof IntentError ? error.code : "intent_replay_deferred"] }; }
 }
