@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 
 import type { AiInteractionEvent } from "../../shared/src/index";
+import { REPO_CONTEXT_CAPTURE_POLICY_GENERATION } from "./repo-context";
 import {
   markSessionContextIndexInvalid,
   sessionContextIndexComplete,
@@ -41,6 +42,11 @@ const TOKEN_FIELDS = [
   "cacheCreationTokens",
 ] as const;
 type TokenField = (typeof TOKEN_FIELDS)[number];
+
+/** Consume the private capture receipt before outbound sealing strips it. */
+export function captureRepoContextExcluded(generation: unknown, repoHash: string | null | undefined) {
+  return generation === REPO_CONTEXT_CAPTURE_POLICY_GENERATION && !canonicalLinkage(repoHash);
+}
 
 export type ProjectAttributionBasis =
   | "explicit"
@@ -492,10 +498,12 @@ export class SessionAttributionBatch {
       excludedRowids?: ReadonlySet<number>;
     } = {},
   ): ProjectAttributionResult {
-    const scan = options.repoContextExcluded ? { rows: [], truncated: false }
+    const repoContextExcluded = options.repoContextExcluded ||
+      captureRepoContextExcluded(event.metadata?.repoContextPolicyGeneration, options.repoHash);
+    const scan = repoContextExcluded ? { rows: [], truncated: false }
       : this.sessionContexts(event, options.repoHash, options.excludedRowids);
     return applyProjectAttribution(event, {
-      repoContextExcluded: options.repoContextExcluded,
+      repoContextExcluded,
       repoHash: options.repoHash,
       branchHash: options.branchHash,
       sessionContexts: scan.rows,
@@ -554,7 +562,7 @@ export function applyProjectAttribution(
   if (event.projectKey && !replaceable) {
     return { event: withBasis(event, "explicit", event.projectKey), basis: "explicit" };
   }
-  if (options.repoContextExcluded) {
+  if (options.repoContextExcluded || captureRepoContextExcluded(event.metadata?.repoContextPolicyGeneration, options.repoHash)) {
     const metadata = { ...event.metadata };
     delete metadata.git;
     delete metadata.branchHash;

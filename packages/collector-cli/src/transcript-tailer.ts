@@ -11,7 +11,6 @@ import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
-  REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
   validRepoContextId,
   type RepoContextRequest,
 } from "./repo-context";
@@ -169,7 +168,6 @@ type TranscriptParserState = {
   sessionId?: string;
   pending?: TranscriptPendingUsage;
   usageRevisions?: TranscriptUsageRevision[];
-  repoContextPolicyGeneration?: number;
 };
 
 type TranscriptUsageRevision = Pick<
@@ -181,7 +179,6 @@ type TranscriptUsageRevision = Pick<
   | "output"
   | "repoContextId"
   | "contextConflict"
-  | "repoContextPolicyGeneration"
 >;
 
 type TranscriptPendingUsage = {
@@ -194,7 +191,6 @@ type TranscriptPendingUsage = {
   output: number;
   repoContextId?: string;
   contextConflict?: boolean;
-  repoContextPolicyGeneration?: number;
 };
 
 const PARSER_KIND = "claude-transcript-v3";
@@ -219,6 +215,8 @@ export type TranscriptScanOptions = {
 
 export function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
   if (!isRecord(value)) return undefined;
+  // Accept the unreleased r2 keys for migration, but never write them: the
+  // released 0.7.50/0.7.51 validators require the original checkpoint shape.
   if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git", "pending", "usageRevisions", "repoContextPolicyGeneration"])) {
     return undefined;
   }
@@ -241,8 +239,6 @@ export function validateTranscriptParserState(value: unknown): TranscriptParserS
     ...(value.sessionId ? { sessionId: value.sessionId.toLowerCase() } : {}),
     ...(pending ? { pending } : {}),
     ...(usageRevisions?.length ? { usageRevisions } : {}),
-    ...(typeof value.repoContextPolicyGeneration === "number"
-      ? { repoContextPolicyGeneration: value.repoContextPolicyGeneration } : {}),
   };
 }
 
@@ -263,7 +259,6 @@ function validateUsageRevisions(value: unknown): TranscriptUsageRevision[] | und
       output: normalized.output,
       ...(normalized.repoContextId ? { repoContextId: normalized.repoContextId } : {}),
       ...(normalized.contextConflict ? { contextConflict: true } : {}),
-      ...(normalized.repoContextPolicyGeneration ? { repoContextPolicyGeneration: normalized.repoContextPolicyGeneration } : {}),
     });
   }
   return revisions;
@@ -309,8 +304,6 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
     output: Number(value.output),
     ...(typeof value.repoContextId === "string" ? { repoContextId: value.repoContextId } : {}),
     ...(value.contextConflict === true ? { contextConflict: true } : {}),
-    ...(typeof value.repoContextPolicyGeneration === "number"
-      ? { repoContextPolicyGeneration: value.repoContextPolicyGeneration } : {}),
   };
 }
 
@@ -1598,18 +1591,6 @@ export class TranscriptTailer {
     flushAtStableEof: boolean,
     fallbackObservedAt: { observedAt: string; clamped: boolean },
   ) {
-    if (state.repoContextPolicyGeneration !== REPO_CONTEXT_CAPTURE_POLICY_GENERATION) {
-      const migrate = (usage: TranscriptPendingUsage) => {
-        const next = { ...usage, repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
-          repoContextId: this.buffer.repoContextUnknownId("claude_code", ["transcript-capture-policy",
-            state.sessionId ?? "unknown", this.messageKey(usage.messageId)].join(":")) };
-        delete next.contextConflict;
-        return next;
-      };
-      if (state.pending) state.pending = migrate(state.pending);
-      state.usageRevisions = state.usageRevisions?.map(migrate);
-      state.repoContextPolicyGeneration = REPO_CONTEXT_CAPTURE_POLICY_GENERATION;
-    }
     // Upgrade an old v3 pending snapshot into the durable revision model
     // before processing new bytes. This keeps existing cursors compatible.
     if (state.pending) {
@@ -1728,12 +1709,13 @@ export class TranscriptTailer {
       output: entry.output - (previous?.output ?? 0),
     };
     const storedContextId = previous?.repoContextId;
-    const currentBinding = Boolean(storedContextId && (
-      this.buffer.repoContextHasCurrentCapturePolicy(storedContextId) ||
-      (statePrevious?.repoContextPolicyGeneration === REPO_CONTEXT_CAPTURE_POLICY_GENERATION &&
-        statePrevious.repoContextId === storedContextId &&
-        (previous?.contextConflict || this.buffer.canBindRepoContextId(storedContextId)))
-    ));
+    const capturedEventIds = previous ? [eventBaseId, deterministicEventId([
+      "claude-transcript-revision", state.sessionId, entry.messageId, String(previous.input),
+      String(previous.cacheRead), String(previous.cacheCreation), String(previous.output),
+    ])] : [];
+    const currentBinding = Boolean(storedContextId &&
+      this.buffer.repoContextHasCurrentCapturePolicy(storedContextId, capturedEventIds) &&
+      (previous?.contextConflict || this.buffer.canBindRepoContextId(storedContextId)));
     const priorContextId = currentBinding ? storedContextId : undefined;
     const candidateContextId = repoContextRequest?.contextId;
     const contextConflict = Boolean(
@@ -1759,7 +1741,6 @@ export class TranscriptTailer {
         output: entry.output,
         ...(repoContextId ? { repoContextId } : {}),
         ...(contextConflict ? { contextConflict: true } : {}),
-        repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
       },
     ].slice(-64);
     this.buffer.database.prepare(

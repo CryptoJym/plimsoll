@@ -72,12 +72,18 @@ function pointedGitDirs(dotGit: string, directory: string): GitLookup<LocatedGit
   const pointer = singleLine(pointerRead.value)?.match(/^gitdir:[ \t]*(.+?)[ \t]*$/)?.[1];
   if (!pointer) return { kind: "unsafe" };
   const gitDir = path.resolve(directory, pointer);
+  return commonGitDirs(gitDir, true);
+}
+
+/** Both directory-form and pointer-form git dirs can name a common dir. */
+function commonGitDirs(gitDir: string, isWorktree: boolean): GitLookup<LocatedGitDir> {
   const commonRead = readText(path.join(gitDir, "commondir"), POINTER_LIMIT_BYTES);
   if (commonRead.kind === "unsafe") return { kind: "unsafe" };
   const commonPointer = commonRead.kind === "ok" ? singleLine(commonRead.value)?.trim() : undefined;
   if (commonRead.kind === "ok" && !commonPointer) return { kind: "unsafe" };
   return { kind: "ok", value: {
-    gitDir, commonDir: commonPointer ? path.resolve(gitDir, commonPointer) : gitDir, isWorktree: true,
+    gitDir, commonDir: commonPointer ? path.resolve(gitDir, commonPointer) : gitDir,
+    isWorktree: isWorktree || Boolean(commonPointer),
   } };
 }
 
@@ -102,9 +108,8 @@ function boundaryRepository(directory: string): GitLookup<HomeBoundary> {
     const code = (error as NodeJS.ErrnoException).code;
     return { kind: code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unsafe" };
   }
-  if (stat.isDirectory()) return { kind: "ok", value: directoryIdentity(dotGit) };
-  if (!stat.isFile()) return { kind: "unsafe" };
-  const located = pointedGitDirs(dotGit, directory);
+  if (!stat.isDirectory() && !stat.isFile()) return { kind: "unsafe" };
+  const located = stat.isDirectory() ? commonGitDirs(dotGit, false) : pointedGitDirs(dotGit, directory);
   return located.kind === "ok"
     ? { kind: "ok", value: directoryIdentity(located.value.commonDir) } : located;
 }
@@ -142,7 +147,7 @@ function findGitDir(startDir: string, home: HomeBoundary): GitLookup<LocatedGitD
     }
 
     if (stat?.isDirectory()) {
-      return { kind: "ok", value: { gitDir: dotGit, commonDir: dotGit, isWorktree: false } };
+      return commonGitDirs(dotGit, false);
     }
 
     if (stat?.isFile()) {
@@ -238,6 +243,15 @@ function resolveGitContextCore(cwd: string, home: HomeBoundary): GitLinkageConte
   try {
     const located = findGitDir(cwd, home);
     if (located.kind === "ok") {
+      // Git's explicit process environment overrides commondir. Interpret
+      // relative values from this event's cwd, then check ownership before
+      // HEAD/config. Boundary repositories keep their on-disk identity.
+      const environmentCommon = process.env.GIT_COMMON_DIR;
+      if (environmentCommon !== undefined) {
+        if (!environmentCommon || Buffer.byteLength(environmentCommon) > POINTER_LIMIT_BYTES ||
+            /[\0\r\n]/.test(environmentCommon)) return undefined;
+        located.value.commonDir = path.resolve(cwd, environmentCommon);
+      }
       if (!allowedRepository(located.value, home)) return undefined;
       const { gitDir, commonDir, isWorktree } = located.value;
       const head = resolveHead(gitDir, commonDir);
@@ -282,7 +296,7 @@ export function resolveGitContext(cwd: string | undefined): GitLinkageContext | 
   const home = resolvedUserHome();
   if (!home) return undefined;
   const key = createHmac("sha256", cacheKeySalt)
-    .update(JSON.stringify([home.directory, home.device.toString(), home.inode.toString(), cwd]))
+    .update(JSON.stringify([home.directory, home.device.toString(), home.inode.toString(), cwd, process.env.GIT_COMMON_DIR]))
     .digest("hex");
   const cached = cache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) {

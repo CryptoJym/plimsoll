@@ -9,7 +9,7 @@ import { TranscriptTailer } from "../packages/collector-cli/src/transcript-taile
 import { GrokUsageTailer, GROK_USAGE_LIMITS } from "../packages/collector-cli/src/grok-usage-tailer";
 import { AUTOMATIC_CAPTURE_LIMITS, CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byte-tailer";
-import { REPO_CONTEXT_CAPTURE_POLICY_GENERATION, REPO_CONTEXT_RESOLVER_VERSION,
+import { REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests, type RepoContextRequest } from "../packages/collector-cli/src/repo-context";
 import { remoteLinkageHash } from "../packages/shared/src/index";
 import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
@@ -130,9 +130,11 @@ async function main() {
         const state = JSON.parse(checkpoint.state) as { repoContextPolicyGeneration: number;
           usageRevisions: Array<{ messageId: string; input: number; output: number; repoContextId: string;
             repoContextPolicyGeneration: number }> };
-        assert.equal(state.repoContextPolicyGeneration, REPO_CONTEXT_CAPTURE_POLICY_GENERATION);
+        assert.equal(state.repoContextPolicyGeneration, undefined);
+        assert.ok(oldClaude.validateTranscriptParserState(state));
         assert.equal(state.usageRevisions.length, 1);
-        assert.equal(state.usageRevisions[0]!.repoContextPolicyGeneration, REPO_CONTEXT_CAPTURE_POLICY_GENERATION);
+        assert.equal(state.usageRevisions[0]!.repoContextPolicyGeneration, undefined);
+        assert.equal(buffer!.repoContextHasCurrentCapturePolicy(state.usageRevisions[0]!.repoContextId, [latest.id]), true);
         assert.equal(state.usageRevisions[0]!.messageId, "growing-message");
         assert.equal(state.usageRevisions[0]!.input, 19 * (i + 2));
         assert.equal(state.usageRevisions[0]!.output, 2 * (i + 2));

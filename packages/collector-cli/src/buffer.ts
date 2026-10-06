@@ -1648,13 +1648,26 @@ export class LocalEventBuffer {
     }
   }
 
-  /** Indexed result provenance check; never revises an earlier result. */
-  repoContextHasCurrentCapturePolicy(contextId: string) {
+  /** Backward-compatible local provenance, never a parser checkpoint key.
+   * Released readers ignore the raw metadata receipt and tolerate the result
+   * version. Exact event IDs keep the raw receipt lookup a bounded PK read. */
+  repoContextHasCurrentCapturePolicy(contextId: string, capturedEventIds: readonly string[] = []) {
     if (!validRepoContextId(contextId)) return false;
     const row = this.db.prepare(
       `select resolver_version as resolverVersion from repo_context_results where context_id = ?`,
     ).get(contextId) as { resolverVersion: string } | undefined;
-    return row?.resolverVersion === REPO_CONTEXT_RESOLVER_VERSION;
+    if (row) return row.resolverVersion === REPO_CONTEXT_RESOLVER_VERSION;
+    if (this.activeRepoContextCommitScope?.selectedIds.has(contextId)) return true;
+    if (capturedEventIds.length > 2) throw new Error("repo_context_provenance_lookup_unbounded");
+    const receipt = this.db.prepare(
+      `select 1 from repo_context_event_links l
+       join buffered_events e on e.id = l.event_id
+       where l.event_id = ? and l.context_id = ?
+         and case when json_valid(e.payload_json)
+           then json_extract(e.payload_json, '$.metadata.repoContextPolicyGeneration') end = ?
+       limit 1`,
+    );
+    return capturedEventIds.some(eventId => Boolean(receipt.get(eventId, contextId, REPO_CONTEXT_CAPTURE_POLICY_GENERATION)));
   }
 
   private resolvedRepoContext(contextId: string | null, currentCaptureOnly = false) {

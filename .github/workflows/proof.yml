@@ -841,6 +841,7 @@ jobs:
       - name: Prove new home capture and sealed delivery exclusions (PR 464)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
+          pnpm proof:home-capture-downgrade
           pnpm proof:home-context-upgrade
           pnpm proof:home-claude-context-upgrade
           pnpm proof:home-grok-context-upgrade

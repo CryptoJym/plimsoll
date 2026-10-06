@@ -104,7 +104,9 @@ async function main() {
         tokenCountIndex: number; previous: Record<string, number>; model: string };
       assert.ok(checkpoint.offset > priorOffset);
       assert.equal(checkpoint.offset, fs.statSync(rollout).size);
-      assert.equal(parser.repoContextPolicyGeneration, 2);
+      assert.equal(parser.repoContextPolicyGeneration, undefined);
+      assert.ok(previousTailer.validateRolloutParserState(parser));
+      assert.equal(buffer.repoContextHasCurrentCapturePolicy(parser.activeRepoContextId, [latest.id]), true);
       assert.notEqual(parser.activeRepoContextId, previousState.activeRepoContextId);
       assert.equal(parser.tokenCountIndex, previousState.tokenCountIndex + index + 1);
       assert.equal(parser.model, previousState.model);

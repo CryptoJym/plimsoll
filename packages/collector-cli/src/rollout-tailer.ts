@@ -213,7 +213,6 @@ type RolloutParserState = {
   counterUncertain?: boolean;
   contextOccurrenceIndex: number;
   activeRepoContextId?: string;
-  repoContextPolicyGeneration?: number;
 };
 
 /**
@@ -288,7 +287,7 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
       "counterUncertain",
       "contextOccurrenceIndex",
       "activeRepoContextId",
-      "repoContextPolicyGeneration",
+      "repoContextPolicyGeneration", // Unreleased r2 input only; stripped on write.
       // Accepted only to migrate old checkpoints without rebuilding or
       // carrying their parser-wide attribution forward.
       "git",
@@ -354,8 +353,6 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
     ...(typeof value.activeRepoContextId === "string"
       ? { activeRepoContextId: value.activeRepoContextId }
       : {}),
-    ...(typeof value.repoContextPolicyGeneration === "number"
-      ? { repoContextPolicyGeneration: value.repoContextPolicyGeneration } : {}),
   };
 }
 
@@ -1829,14 +1826,17 @@ export class RolloutTailer {
     }> = [];
     const accountHome = this.activeCaptureRoot?.directory ?? this.sessionsDir;
     const planReadings: Array<{ observedAt?: string; window: PlanLimitWindow; planType?: string; limitId?: string }> = [];
-    if (state.repoContextPolicyGeneration !== REPO_CONTEXT_CAPTURE_POLICY_GENERATION) {
+    const capturedEventId = state.conversationId
+      ? deterministicEventId(["codex-rollout", state.conversationId, String(state.tokenCountIndex)]) : undefined;
+    if (!state.activeRepoContextId || !this.buffer.repoContextHasCurrentCapturePolicy(
+      state.activeRepoContextId, capturedEventId ? [capturedEventId] : [],
+    )) {
       // Preserve the cursor, counters, model and event indices. Only the old
       // context binding migrates; the saved result and its earlier rows stay.
       state.activeRepoContextId = this.buffer.repoContextUnknownId("codex", [
         fileIdentity, "capture-policy", REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
         state.activeRepoContextId ?? "unknown", state.contextOccurrenceIndex,
       ].join(":"));
-      state.repoContextPolicyGeneration = REPO_CONTEXT_CAPTURE_POLICY_GENERATION;
     }
     let activeRepoContext: ActiveContext = state.activeRepoContextId
       ? { kind: "persisted", contextId: state.activeRepoContextId }

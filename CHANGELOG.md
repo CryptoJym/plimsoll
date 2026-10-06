@@ -6,7 +6,10 @@
   system root, including their backed worktrees. Migrate only resumed capture
   bindings and keep new excluded cwd events out of session inheritance. Real
   repositories and mounted-volume roots remain attributable. Existing usage
-  and saved results stay unchanged; lookup cache keys retain no raw paths
+  and saved results stay unchanged. Policy receipts keep released capture
+  checkpoints readable after downgrade, every upload route honours excluded
+  contexts, and directory-form worktrees check their common directory. Lookup
+  cache keys retain no raw paths
   (`eco-6hoxj.165.213.1`).
 
 ## 0.7.51 — 2026-10-05 (unpublished)

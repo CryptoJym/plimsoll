@@ -15,8 +15,7 @@ import {
 import { collisionSafeDeliveryId, ensureUuidEventId, incarnationDeliveryId,
   isCollisionSafeDeliveryId,
   normalizeHistoryEvent } from "./upload-history";
-import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
-import { REPO_CONTEXT_CAPTURE_POLICY_GENERATION } from "./repo-context";
+import { applyProjectAttribution, captureRepoContextExcluded, SessionAttributionBatch } from "./session-attribution";
 import {
   CAPTURE_WRITE_LAG_MS,
   captureFrontier,
@@ -333,6 +332,8 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number, resolvedId?:
   const normalized = normalizeHistoryEvent({
     payloadJson: row.payloadJson,
     suppressedFieldsJson: row.suppressedFieldsJson,
+    repoHash: row.repoHash,
+    branchHash: row.branchHash,
   });
   if (normalized.ok === false) {
     const reason =
@@ -431,7 +432,7 @@ function attachFillOnlyLinkage(
   captureRepoContextPolicyGeneration: number | null | undefined,
 ): AiWorkIngestEvent {
   const attributed = attribution.attribute(envelope.event, {
-    repoContextExcluded: captureRepoContextPolicyGeneration === REPO_CONTEXT_CAPTURE_POLICY_GENERATION && !repoHash,
+    repoContextExcluded: captureRepoContextExcluded(captureRepoContextPolicyGeneration, repoHash),
     repoHash,
     branchHash,
     excludedRowids: disposedRawRowids,

@@ -7,7 +7,12 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
-import { resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
+import { attachRepoContextSidecar, resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
+import { buildIngestBatch, attachRepoLinkage } from "../packages/collector-cli/src/upload";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { prepareHistoryEvent, sealHistoryEvent, normalizeHistoryEvent } from "../packages/collector-cli/src/upload-history";
+import { applyProjectAttribution, SessionAttributionBatch } from "../packages/collector-cli/src/session-attribution";
+import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
 import { aiInteractionEventSchema, branchLinkageHash, remoteLinkageHash } from "../packages/shared/src/index";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "independent-null-delivery-"));
@@ -31,7 +36,8 @@ async function main() {
     os.homedir = () => home;
     const baseMs = Date.parse("2026-10-05T10:00:00.000Z");
     let fakeNow = baseMs;
-    const options = { delivery: { enabled: true, now: () => new Date(fakeNow) } };
+    const config = collectorConfigSchema.parse({ uploadUrl: "http://127.0.0.1:1/ingest", installKey: "fixture-install" });
+    const options = { workspaceId: config.tenantId, enrollmentNow: () => new Date(baseMs), delivery: { enabled: true, now: () => new Date(fakeNow) } };
     const sessionId = "019f8000-0000-7000-8000-000000000465";
     const oldId = "00000000-0000-4000-8000-000000000466";
     const ledger = path.join(root, "fixture.sqlite");
@@ -92,6 +98,57 @@ async function main() {
     assert.equal(newDelivery.envelope.suppressedFields.includes("repoContextPolicyGeneration"), false);
     assert.equal(newDelivery.envelope.event.inputTokens, 19);
     assert.equal(newDelivery.envelope.event.outputTokens, 2);
+    // Every attribution reader sees the same actual raw GEN2/null receipt,
+    // with the earlier home-tagged tool still present in this session.
+    const captured = buffer.listUnuploaded({ maxRows: 100 }).find(row => row.id === raw.id)!;
+    assert.ok(captured);
+    assert.equal(captured.payload.metadata.repoContextPolicyGeneration, 2);
+    const batchAttribution = new SessionAttributionBatch(buffer.database,
+      [{ event: captured.payload, repoHash: captured.repoHash }]);
+    const historyInput = { payloadJson: JSON.stringify(captured.payload),
+      suppressedFieldsJson: JSON.stringify(captured.suppressedFields),
+      repoHash: captured.repoHash, branchHash: captured.branchHash };
+    const prepared = prepareHistoryEvent(historyInput);
+    assert.ok(prepared.ok);
+    const history = sealHistoryEvent(prepared, { ...historyInput, attribution: batchAttribution });
+    assert.ok(history.ok);
+    const historyWithoutBatch = normalizeHistoryEvent(historyInput);
+    assert.ok(historyWithoutBatch.ok);
+    const noMark = buildIngestBatch(config, buffer).batch!.events.find(item => item.event.id === raw.id)!;
+    assert.ok(noMark);
+    const direct = sealOutboundEnvelope({ event: batchAttribution.attribute(captured.payload, {
+      repoHash: captured.repoHash, branchHash: captured.branchHash }).event, suppressedFields: [] });
+    assert.ok(direct.ok);
+    const own = sealOutboundEnvelope({ event: applyProjectAttribution(captured.payload, {
+      repoHash: captured.repoHash, branchHash: captured.branchHash }).event, suppressedFields: [] });
+    assert.ok(own.ok);
+    const attached = sealOutboundEnvelope({ event: attachRepoLinkage(captured.payload, captured.repoHash,
+      captured.branchHash), suppressedFields: [] });
+    assert.ok(attached.ok);
+    const routes = { outbox: newDelivery.envelope, noMark, history: history.envelope,
+      historyWithoutBatch: historyWithoutBatch.envelope, batchAttribution: direct.envelope,
+      directAttribution: own.envelope, attachRepoLinkage: attached.envelope };
+    console.log(JSON.stringify({ sealRoutes: Object.fromEntries(Object.entries(routes).map(([name, envelope]) =>
+      [name, { project: envelope.event.projectKey ?? null, basis: envelope.event.metadata.projectBasis,
+        input: envelope.event.inputTokens, output: envelope.event.outputTokens }])) }));
+    for (const [name, envelope] of Object.entries(routes)) {
+      assert.equal(envelope.event.projectKey, undefined, `${name} honours the capture-time exclusion`);
+      assert.equal(envelope.event.metadata.projectBasis, "unallocated", name);
+      assert.equal(envelope.event.metadata.git, undefined, name);
+      assert.equal(envelope.event.metadata.branchHash, undefined, name);
+      assert.equal(envelope.event.metadata.headSha, undefined, name);
+      assert.equal(envelope.event.inputTokens, 19, name); assert.equal(envelope.event.outputTokens, 2, name);
+      assert.ok(!JSON.stringify(envelope).includes("repoContextPolicyGeneration"), name);
+      assert.ok(!JSON.stringify(envelope).includes(chat), name);
+    }
+    // An explicit dispatch/session assignment remains stronger than the
+    // filesystem exclusion; a real repository is checked later below.
+    const explicit = applyProjectAttribution({ ...captured.payload,
+      projectKey: remoteLinkageHash("https://example.invalid/explicit/owner.git") }, { repoHash: null }).event;
+    const explicitSeal = sealOutboundEnvelope({ event: explicit, suppressedFields: [] });
+    assert.ok(explicitSeal.ok);
+    assert.equal(explicitSeal.envelope.event.projectKey, explicit.projectKey);
+    assert.equal(explicitSeal.envelope.event.metadata.projectBasis, "explicit");
     assert.deepEqual({ row: oldRow(), seal: oldSeal() }, before);
     const insideWindow = { freshHomeLookupReturnsNull: true, rawRepoBranchHeadNull: true,
       actualProjectKey: newDelivery.envelope.event.projectKey, actualBasis: newDelivery.envelope.event.metadata.projectBasis,
@@ -174,11 +231,40 @@ async function main() {
     assert.equal(realDelivery.envelope.event.metadata.projectBasis, "repo_context");
     assert.equal(realDelivery.envelope.event.inputTokens, 19);
     assert.equal(realDelivery.envelope.event.outputTokens, 2);
+    fakeNow += 121_001;
+    const positive = aiInteractionEventSchema.parse({ id: "00000000-0000-4000-8000-000000000478",
+      sessionId: "00000000-0000-4000-8000-000000000479", source: "codex", dataMode: "metadata",
+      eventType: "assistant_response", observedAt: new Date(fakeNow).toISOString(), model: "gpt-6.1-sol",
+      inputTokens: 19, outputTokens: 2, metadata: { git: { remoteUrlHash: remoteLinkageHash(remote),
+        branchHash: branchLinkageHash("main"), headSha: "b".repeat(40) } } });
+    assert.equal(attachRepoContextSidecar(positive, "real-inline-positive", real), true);
+    assert.equal(buffer.append(positive), true);
+    const positiveRequests = buffer.beginRepoContextResolution(buffer.takeRepoContextBatch());
+    assert.equal(positiveRequests.length, 1);
+    buffer.applyRepoContextResults(resolveRepoContextRequests(positiveRequests));
+    const positiveRaw = buffer.listUnuploaded({ maxRows: 100 }).find(row => row.id === positive.id)!;
+    assert.equal(positiveRaw.payload.metadata.repoContextPolicyGeneration, 2);
+    const positiveDelivery = buffer.delivery.lease({ now: new Date(fakeNow) }).items
+      .find(item => item.deliveryId === positive.id)!.envelope;
+    const positiveNoMark = buildIngestBatch(config, buffer).batch!.events.find(item => item.event.id === positive.id)!;
+    const positiveHistory = normalizeHistoryEvent({ payloadJson: JSON.stringify(positiveRaw.payload),
+      suppressedFieldsJson: "[]", repoHash: positiveRaw.repoHash, branchHash: positiveRaw.branchHash });
+    assert.ok(positiveHistory.ok);
+    for (const envelope of [positiveDelivery, positiveNoMark, positiveHistory.envelope]) {
+      assert.equal(envelope.event.projectKey, remoteLinkageHash(remote));
+      assert.equal((envelope.event.metadata.git as { remoteUrlHash: string }).remoteUrlHash, remoteLinkageHash(remote));
+      assert.equal((envelope.event.metadata.git as { branchHash: string }).branchHash, branchLinkageHash("main"));
+      assert.equal((envelope.event.metadata.git as { headSha: string }).headSha, "b".repeat(40));
+      assert.equal(envelope.event.inputTokens, 19); assert.equal(envelope.event.outputTokens, 2);
+      assert.ok(!JSON.stringify(envelope).includes("repoContextPolicyGeneration"));
+    }
+    assert.deepEqual({ row: oldRow(), seal: oldSeal() }, before);
     console.log(JSON.stringify({ proof: "independent-fresh-home-delivery", status: "PASS",
       insideWindow, beyondWindow: { elapsedMs: 7 * 3_600_000, projectAbsent: true, inputTokens: 19, outputTokens: 2 },
       sessionInheritanceWindowMs: 6 * 3_600_000, savedActiveContextWasNotReused: true,
       inlineNullOtlpEnvelopeUnlinked: true,
-      realPlimsollRepoPreserved: true }, null, 2));
+      captureReceiptHonouredByAllAttributionRoutes: Object.keys(routes), explicitAssignmentPreserved: true,
+      realPlimsollRepoPreserved: true, positiveReceiptKeepsAllGitFieldsOnEveryUploadPath: true }, null, 2));
   } finally { tailer?.close(); buffer?.close(); os.homedir = originalHome; fs.rmSync(root, { recursive: true, force: true }); }
 }
-main().catch(error => { console.error(error instanceof Error ? error.message : "delivery witness failed"); process.exitCode = 1; });
+main().catch(error => { console.error(error); process.exitCode = 1; });

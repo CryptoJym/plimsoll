@@ -14,6 +14,7 @@ const patchableFs = fs as { statSync: typeof fs.statSync; lstatSync: typeof fs.l
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "independent-home-"));
 const originalHome = os.homedir;
 const originalEnvHome = process.env.HOME;
+const originalCommonDir = process.env.GIT_COMMON_DIR;
 const observations: Record<string, unknown> = {};
 const remote = "https://github.com/CryptoJym/plimsoll.git";
 const write = (file: string, value: string) => {
@@ -34,8 +35,8 @@ try {
   process.env.HOME = home;
   os.homedir = () => home;
   git(home, ["init", "-q"]);
-  git(home, ["config", "user.name", "Review Fixture"]);
-  git(home, ["config", "user.email", "review@example.invalid"]);
+  git(home, ["config", "user.name", "James Brady"]);
+  git(home, ["config", "user.email", "131711520+CryptoJym@users.noreply.github.com"]);
   git(home, ["commit", "-q", "--allow-empty", "-m", "fixture"]);
   git(home, ["remote", "add", "origin", remote]);
   const lane = path.join(home, "lanes/home-worktree");
@@ -90,7 +91,94 @@ try {
     inputTokens: delivery.envelope.event.inputTokens,
     outputTokens: delivery.envelope.event.outputTokens, locallyDead: lease.locallyDead,
     earlierRowAndSealByteIdentical: true };
+
+  // Native Git also accepts a worktree whose administration lives in a
+  // directory-form checkout/.git. Its local config copy is ignored by Git.
+  const directoryCheckout = path.join(home, "lanes/directory-worktree");
+  git(home, ["worktree", "add", "--quiet", "--detach", directoryCheckout, "HEAD"]);
+  const directoryDotGit = path.join(directoryCheckout, ".git");
+  const administration = fs.readFileSync(directoryDotGit, "utf8").trim().replace(/^gitdir: /, "");
+  fs.unlinkSync(directoryDotGit);
+  fs.renameSync(administration, directoryDotGit);
+  write(path.join(directoryDotGit, "commondir"), path.join(home, ".git") + "\n");
+  fs.copyFileSync(path.join(home, ".git/config"), path.join(directoryDotGit, "config"));
+  assert.equal(fs.realpathSync(git(directoryCheckout, ["rev-parse", "--git-common-dir"]).toString().trim()),
+    fs.realpathSync(path.join(home, ".git")));
+  assert.equal(git(directoryCheckout, ["remote", "get-url", "origin"]).toString().trim(), remote);
+  const originalDirectoryOpen = fs.openSync;
+  let directoryForbiddenReads = 0;
+  const forbiddenFiles = [home, directoryCheckout].flatMap(directory =>
+    ["HEAD", "config"].map(file => path.join(directory, ".git", file)));
+  fs.openSync = ((file: fs.PathLike, flags: string | number, mode?: fs.Mode) => {
+    if (forbiddenFiles.includes(String(file))) directoryForbiddenReads += 1;
+    return originalDirectoryOpen(file, flags, mode);
+  }) as typeof fs.openSync;
+  let directoryCached, directoryUncached;
+  const directoryEvent = aiInteractionEventSchema.parse({ ...event,
+    id: "00000000-0000-4000-8000-000000000474", observedAt: new Date(baseMs + 244_000).toISOString() });
+  let directoryFill;
+  try {
+    directoryCached = resolveGitContext(directoryCheckout);
+    directoryUncached = resolveGitContextUncached(directoryCheckout);
+    assert.equal(attachRepoContextSidecar(directoryEvent, "directory-home-worktree", directoryCheckout), true);
+    assert.equal(buffer.append(directoryEvent), true);
+    const directoryRequests = buffer.beginRepoContextResolution(buffer.takeRepoContextBatch());
+    assert.equal(directoryRequests.length, 1);
+    directoryFill = buffer.applyRepoContextResults(resolveRepoContextRequests(directoryRequests));
+  } finally { fs.openSync = originalDirectoryOpen; }
+  const directoryDelivery = buffer.delivery.lease({ now: new Date(baseMs + 244_000) }).items
+    .find(item => item.deliveryId === directoryEvent.id)!;
+  assert.ok(directoryDelivery);
+  console.log(JSON.stringify({ directoryWorktree: { nativeGitAccepts: true,
+    cachedLinkagePresent: Boolean(directoryCached), uncachedLinkagePresent: Boolean(directoryUncached),
+    rowsFilled: directoryFill.rowsFilled, forbiddenMetadataReads: directoryForbiddenReads,
+    project: directoryDelivery.envelope.event.projectKey ?? null,
+    input: directoryDelivery.envelope.event.inputTokens, output: directoryDelivery.envelope.event.outputTokens } }));
+  assert.equal(directoryCached, undefined); assert.equal(directoryUncached, undefined);
+  assert.equal(directoryFill.rowsFilled, 0); assert.equal(directoryForbiddenReads, 0);
+  assert.equal(directoryDelivery.envelope.event.projectKey, undefined);
+  assert.equal(directoryDelivery.envelope.event.metadata.git, undefined);
+  assert.equal(directoryDelivery.envelope.event.metadata.branchHash, undefined);
+  assert.equal(directoryDelivery.envelope.event.metadata.headSha, undefined);
+  assert.equal(directoryDelivery.envelope.event.inputTokens, 19); assert.equal(directoryDelivery.envelope.event.outputTokens, 2);
+  assert.deepEqual(archived(), before);
+  observations.directoryHomeWorktree = { nativeGitAccepts: true, cachedAndUncachedExcluded: true,
+    rowsFilled: 0, forbiddenMetadataReads: 0, sealedProjectAbsent: true, marginalInput: 19, marginalOutput: 2 };
   buffer.close(); buffer = undefined;
+
+  const realOwner = path.join(home, "projects/native-real");
+  fs.mkdirSync(realOwner, { recursive: true, mode: 0o700 });
+  git(realOwner, ["init", "-q"]);
+  git(realOwner, ["config", "user.name", "James Brady"]);
+  git(realOwner, ["config", "user.email", "131711520+CryptoJym@users.noreply.github.com"]);
+  git(realOwner, ["commit", "-q", "--allow-empty", "-m", "fixture"]);
+  git(realOwner, ["remote", "add", "origin", remote]);
+  const realWorktree = path.join(home, "lanes/native-real-worktree");
+  git(realOwner, ["worktree", "add", "--quiet", "--detach", realWorktree, "HEAD"]);
+  assert.equal(resolveGitContext(realOwner)?.remoteUrlHash, remoteLinkageHash(remote));
+  assert.equal(resolveGitContextUncached(realWorktree)?.remoteUrlHash, remoteLinkageHash(remote));
+  const coreWorktree = path.join(home, "core-worktree");
+  fs.mkdirSync(coreWorktree, { mode: 0o700 });
+  git(realOwner, ["config", "core.worktree", coreWorktree]);
+  assert.equal(fs.realpathSync(git(realOwner, ["rev-parse", "--git-common-dir"]).toString().trim().startsWith("/")
+    ? git(realOwner, ["rev-parse", "--git-common-dir"]).toString().trim() : path.join(realOwner, ".git")),
+  fs.realpathSync(path.join(realOwner, ".git")));
+  assert.equal(resolveGitContextUncached(realOwner)?.remoteUrlHash, remoteLinkageHash(remote));
+  git(realOwner, ["config", "--unset", "core.worktree"]);
+  observations.realRepositoryAndWorktree = { bothKeepPlimsollLinkage: true, coreWorktreeDoesNotChangeCommonDir: true };
+  process.env.GIT_COMMON_DIR = path.join(home, ".git");
+  assert.equal(fs.realpathSync(git(realOwner, ["rev-parse", "--git-common-dir"]).toString().trim()),
+    fs.realpathSync(path.join(home, ".git")));
+  assert.equal(resolveGitContext(realOwner), undefined);
+  assert.equal(resolveGitContextUncached(realOwner), undefined);
+  process.env.GIT_COMMON_DIR = ".git";
+  assert.equal(resolveGitContext(realOwner)?.remoteUrlHash, remoteLinkageHash(remote));
+  process.env.GIT_COMMON_DIR = "";
+  assert.equal(resolveGitContextUncached(realOwner), undefined);
+  delete process.env.GIT_COMMON_DIR;
+  assert.equal(resolveGitContext(realOwner)?.remoteUrlHash, remoteLinkageHash(remote));
+  observations.environmentCommonDirectory = { nativeGitOverrideConfirmed: true, homeOwnedOverrideExcluded: true,
+    relativeOwnCommonDirPreserved: true, emptyOverrideFailsClosed: true, cacheIncludesEnvironment: true };
 
   const alternate = path.join(root, "environment-home");
   fs.mkdirSync(alternate, { mode: 0o700 });
@@ -174,6 +262,14 @@ try {
   observations.pointerOwnership = { symlinkAlias: true, directGitdir: true,
     homeGitFileCommonDirectory: true, realGitWorktreeRetainedInRoundOneProof: true };
 
+  // Resolve commondir on the home boundary itself, including a directory
+  // wrapper and an alias, before comparing a checkout's common identity.
+  fs.unlinkSync(homeGit);
+  write(path.join(homeGit, "commondir"), backing + "\n");
+  assert.equal(resolveGitContextUncached(pointerCheckout), undefined);
+  assert.equal(resolveGitContext(directoryCheckout), undefined);
+  observations.directoryBoundaryCommonDirectory = { homeDirectoryCommondirResolved: true, ownedCheckoutExcluded: true };
+
   // System-root ownership is injected; never create or read a real /.git.
   const systemMetadata = path.join(root, "system-root-repository");
   makeRepo(path.join(root, "system-root-fixture"), remote);
@@ -228,5 +324,7 @@ try {
   os.homedir = originalHome;
   if (originalEnvHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalEnvHome;
+  if (originalCommonDir === undefined) delete process.env.GIT_COMMON_DIR;
+  else process.env.GIT_COMMON_DIR = originalCommonDir;
   fs.rmSync(root, { recursive: true, force: true });
 }
