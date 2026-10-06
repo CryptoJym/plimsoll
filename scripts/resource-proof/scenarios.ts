@@ -3480,8 +3480,11 @@ function requireRegularDirectory(candidate: string, errorCode: string) {
   if (!stat.isDirectory() || stat.isSymbolicLink()) buildFailure(errorCode);
 }
 
-function resourceFixtureManifest(root: string) {
+export function resourceFixtureManifest(root: string) {
   const entries = new Map<string, string>();
+  // Capture fixtures include two 500 MiB sparse files. Hash their contents
+  // without retaining whole-file Buffers in the proof controller's RSS.
+  const bytes = Buffer.allocUnsafe(64 * 1024);
   const visit = (current: string) => {
     for (const entry of fs
       .readdirSync(current, { withFileTypes: true })
@@ -3493,7 +3496,17 @@ function resourceFixtureManifest(root: string) {
         entries.set(relative, `directory:${stat.mode & 0o777}`);
         visit(full);
       } else if (entry.isFile()) {
-        const digest = createHash("sha256").update(fs.readFileSync(full)).digest("hex");
+        const hash = createHash("sha256");
+        const descriptor = fs.openSync(full, "r");
+        try {
+          let count: number;
+          while ((count = fs.readSync(descriptor, bytes, 0, bytes.length, null)) > 0) {
+            hash.update(bytes.subarray(0, count));
+          }
+        } finally {
+          fs.closeSync(descriptor);
+        }
+        const digest = hash.digest("hex");
         entries.set(relative, `file:${stat.mode & 0o777}:${stat.size}:${digest}`);
       } else if (entry.isSymbolicLink()) {
         entries.set(relative, `symlink:${fs.readlinkSync(full)}`);
