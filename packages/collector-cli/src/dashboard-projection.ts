@@ -3186,7 +3186,12 @@ export class DashboardProjectionStore {
     const clock = options.clock ?? (() => performance.now());
     const deadline = options.maxActiveMs === undefined ? Infinity :
       clock() + Math.max(1, options.maxActiveMs);
-    const hasActiveTime = () => clock() < deadline;
+    // Injected row cost supplements the production wall deadline. A held
+    // proof clock must not let real SQLite work admit further batches after
+    // the physical allowance has elapsed; production already uses that clock.
+    const wallDeadline = options.clock && options.maxActiveMs !== undefined
+      ? performance.now() + Math.max(1, options.maxActiveMs) : Infinity;
+    const hasActiveTime = () => clock() < deadline && performance.now() < wallDeadline;
     // Migration and expiry can use the whole allowance in bounded batches.
     // Repairs retain their smaller deadline-sensitive admission units.
     const migrationBatchRows = options.maxActiveMs === undefined ?

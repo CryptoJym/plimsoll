@@ -962,6 +962,35 @@ function proveMillionFactVersionFenceCost(root: string) {
 }
 
 type MillionFactRowCosts = {scanMsPerRow:number;repairMsPerRow:number};
+function provePhysicalDeadlineWithInjectedClock(root: string) {
+  const buffer = projectionFixtureBuffer(path.join(root,"held-clock-repair.sqlite"));
+  try {
+    buffer.projection.runMaintenance(NOW);
+    for (let n=0;n<80;n++) {
+      buffer.projection.failNextApplyForProof();
+      assert.equal(buffer.append(event({source:"claude_code",eventType:"assistant_response",
+        model:"claude-proof",inputTokens:19,outputTokens:2})),true);
+    }
+    let delayed=false;
+    const receipt=buffer.projection.runMaintenance(NOW,{maxActiveMs:25,clock:()=>0,
+      onWorkRowForProof:phase=>{
+        if(phase==="repair"&&!delayed){
+          delayed=true;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,60);
+        }
+      }});
+    const pending=(buffer.database.prepare("select count(*) as n from dashboard_projection_repairs")
+      .get() as {n:number}).n;
+    check("held_proof_clock_preserves_physical_production_admission",
+      delayed && receipt.repairRowsVisited>0 && receipt.repairRowsVisited<=8 &&
+      pending===80-receipt.repairRowsVisited,{receipt,pending});
+    settle(buffer);
+    const facts=buffer.database.prepare(`select count(*) as n,sum(input_tokens) as input,
+      sum(output_tokens) as output from dashboard_event_facts`).get() as {n:number;input:number;output:number};
+    check("physical_deadline_preserves_all_deferred_claude_usage",
+      facts.n===80 && facts.input===80*19 && facts.output===80*2 &&
+      !buffer.database.prepare("select 1 from dashboard_projection_repairs limit 1").get(),facts);
+  } finally { buffer.close(); }
+}
 async function proveMillionFactDuplicateRepairCadence(root: string, slow = false,
   reference?: MillionFactRowCosts): Promise<MillionFactRowCosts> {
   const prefix = slow ? "slow-" : "";
@@ -1634,6 +1663,7 @@ async function main() {
       liveObserver.outputTokens===4 && liveObserver.cacheReadTokens===0 && liveObserver.cacheCreationTokens===0);
     check("live_observer_metadata_cannot_forge_authenticated_admission",buffer.append(liveObserver)===false &&
       !buffer.database.prepare("select 1 from buffered_events where id=?").get(liveObserver.id));
+    provePhysicalDeadlineWithInjectedClock(root);
     proveDuplicateFactRepair(root);
     await proveDuplicateScanUpgradeAndDrain(root);
     await proveScanSettlesUnderSteadyCapture(root);
