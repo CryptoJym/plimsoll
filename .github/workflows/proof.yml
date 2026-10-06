@@ -150,6 +150,9 @@ jobs:
         id: typecheck
         run: pnpm exec tsc --noEmit
 
+      - name: Prove the shared project intent contract and privacy boundary
+        run: pnpm contracts:project-intent
+
       # eco-6hoxj.164.4 (lean Plimsoll B0): contract tests that FAIL today by design.
       # Each is declared pending("<bead>") (node:test todo), so the step prints every
       # failure and exits 0 until the named bead removes the marker; from then on the

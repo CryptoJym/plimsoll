@@ -22,6 +22,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PROJECT_INTENT_OUTBOUND_FIELDS, PROJECT_INTENT_LOCAL_ONLY_FIELDS } from "../packages/shared/src/project-intent";
 
 import {
   aiWorkIngestBatchSchema,
@@ -412,6 +413,13 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`(\`DEFAULT_POLICY.version = ${model.policyVersion}\`, \`${SOURCE_POLICY}\`).`);
   lines.push(`Managed or upload-enabled installs are locked to that mode; see`);
   lines.push(`[ADR-0004](architecture/0004-managed-metadata-only-privacy.md).`);
+  lines.push(``);
+  lines.push(`## Project intent receipt contract (P02)`);
+  lines.push(``);
+  lines.push(`The separate versioned project intent boundary admits only: ${PROJECT_INTENT_OUTBOUND_FIELDS.map(field => "\`" + field + "\`").join(", ")}.`);
+  lines.push(`All fields are required, including nullable keys. Opaque linkage is exactly sha256 plus 64 lowercase hexadecimal characters. Business registration is checked by the cloud, never inferred from hash shape or the observed repo. The cloud stores receipts beside its existing session ledger; this collector contract adds no local database table or automatic upload path.`);
+  lines.push(`Local only: ${PROJECT_INTENT_LOCAL_ONLY_FIELDS.map(field => "\`" + field + "\`").join(", ")}. Credentials are transport headers, never receipt fields. Unexpected fields are rejected, not forwarded. Provider lifecycle and delivery adapters are separate build lanes.`);
+  lines.push(`Source: \`packages/shared/src/project-intent.ts\`; executable privacy and identity fixtures: \`tests/contracts/project-intent.contract.ts\` (CI: \`contracts:project-intent\`).`);
   lines.push(``);
   lines.push(`## The four buckets`);
   lines.push(``);
