@@ -215,7 +215,9 @@ export type TranscriptScanOptions = {
 
 export function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
   if (!isRecord(value)) return undefined;
-  if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git", "pending", "usageRevisions"])) {
+  // Accept the unreleased r2 keys for migration, but never write them: the
+  // released 0.7.50/0.7.51 validators require the original checkpoint shape.
+  if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git", "pending", "usageRevisions", "repoContextPolicyGeneration"])) {
     return undefined;
   }
   if (value.parserKind !== PARSER_KIND || value.checkpointVersion !== CHECKPOINT_VERSION) {
@@ -225,6 +227,8 @@ export function validateTranscriptParserState(value: unknown): TranscriptParserS
     if (typeof value.sessionId !== "string" || !UUID_EXACT_RE.test(value.sessionId)) return undefined;
   }
   if (value.git !== undefined && !validLegacyPersistedGit(value.git)) return undefined;
+  if (value.repoContextPolicyGeneration !== undefined &&
+      (!Number.isSafeInteger(value.repoContextPolicyGeneration) || Number(value.repoContextPolicyGeneration) < 1)) return undefined;
   const pending = validatePendingUsage(value.pending);
   if (value.pending !== undefined && !pending) return undefined;
   const usageRevisions = validateUsageRevisions(value.usageRevisions);
@@ -273,6 +277,7 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
       "output",
       "repoContextId",
       "contextConflict",
+      "repoContextPolicyGeneration",
     ]) ||
     typeof value.messageId !== "string" ||
     value.messageId.length === 0 ||
@@ -287,6 +292,8 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
   if (value.model !== undefined && typeof value.model !== "string") return undefined;
   if (value.repoContextId !== undefined && !validRepoContextId(value.repoContextId)) return undefined;
   if (value.contextConflict !== undefined && typeof value.contextConflict !== "boolean") return undefined;
+  if (value.repoContextPolicyGeneration !== undefined &&
+      (!Number.isSafeInteger(value.repoContextPolicyGeneration) || Number(value.repoContextPolicyGeneration) < 1)) return undefined;
   return {
     messageId: value.messageId,
     ...(typeof value.observedAt === "string" ? { observedAt: value.observedAt } : {}),
@@ -1408,6 +1415,7 @@ export class TranscriptTailer {
   }
 
   private recentDiscovery(limit?: number, _options?: TranscriptScanOptions) {
+    void _options;
     const resume = loadCaptureSweepResume(this.buffer.database, "claude_code");
     return new IncrementalJsonlDiscovery(this.directories, {
       recursive: true,
@@ -1700,15 +1708,24 @@ export class TranscriptTailer {
       cacheCreation: entry.cacheCreation - (previous?.cacheCreation ?? 0),
       output: entry.output - (previous?.output ?? 0),
     };
-    const priorContextId = previous?.repoContextId;
+    const storedContextId = previous?.repoContextId;
+    const capturedEventIds = previous ? [eventBaseId, deterministicEventId([
+      "claude-transcript-revision", state.sessionId, entry.messageId, String(previous.input),
+      String(previous.cacheRead), String(previous.cacheCreation), String(previous.output),
+    ])] : [];
+    const currentBinding = Boolean(storedContextId &&
+      this.buffer.repoContextHasCurrentCapturePolicy(storedContextId, capturedEventIds) &&
+      (previous?.contextConflict || this.buffer.canBindRepoContextId(storedContextId)));
+    const priorContextId = currentBinding ? storedContextId : undefined;
     const candidateContextId = repoContextRequest?.contextId;
     const contextConflict = Boolean(
-      previous?.contextConflict ||
+      (currentBinding && previous?.contextConflict) ||
       forceContextConflict ||
       (priorContextId && candidateContextId && priorContextId !== candidateContextId),
     );
-    const repoContextId = priorContextId ?? candidateContextId;
-    if (contextConflict && !previous?.contextConflict && repoContextId) {
+    const repoContextId = priorContextId ?? candidateContextId ?? this.buffer.repoContextUnknownId("claude_code",
+      ["transcript-capture-policy", state.sessionId ?? "unknown", this.messageKey(entry.messageId)].join(":"));
+    if (contextConflict && !(currentBinding && previous?.contextConflict) && repoContextId) {
       this.buffer.suppressRepoContextId(repoContextId);
     }
     if (!contextConflict && repoContextRequest) {

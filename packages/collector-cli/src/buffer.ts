@@ -31,7 +31,7 @@ import {
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
-import { ensureUuidEventId, registerRetentionDeliveryId } from "./delivery-id";
+import { registerRetentionDeliveryId } from "./delivery-id";
 import { countRetentionHoldsOffThread } from "./retention-hold-count";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -44,6 +44,7 @@ import { legacyNullLineageReceiptMatchSql, terminalPrivacyEligibilitySql } from 
 import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
 import {
   canonicalRepoContextCwd,
+  REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
   peekRepoContextSidecar,
   peekRepoContextId,
   REPO_CONTEXT_RESOLVER_VERSION,
@@ -1441,8 +1442,8 @@ export class LocalEventBuffer {
       .get() as { count: number }).count;
 
     const resolverExpression = hasResolverVersion
-      ? `coalesce(resolver_version, '${REPO_CONTEXT_RESOLVER_VERSION}')`
-      : `'${REPO_CONTEXT_RESOLVER_VERSION}'`;
+      ? "coalesce(resolver_version, 'git-context:v1')"
+      : "'git-context:v1'";
     const acceptedExpression = hasAcceptedAt ? "accepted_at" : "resolved_at";
     this.db.transaction(() => {
       this.db.exec(`
@@ -1505,7 +1506,7 @@ export class LocalEventBuffer {
     if (!validRepoContextOccurrence(occurrence) || !canonicalCwd) return null;
     const digest = crypto
       .createHmac("sha256", this.repoContextHmacKey())
-      .update("repoctx:v1\0", "utf8")
+      .update(`repoctx:v1:capture-policy:${REPO_CONTEXT_CAPTURE_POLICY_GENERATION}\0`, "utf8")
       .update(source, "utf8")
       .update("\0", "utf8")
       .update(occurrence, "utf8")
@@ -1530,6 +1531,14 @@ export class LocalEventBuffer {
     return this.deriveRepoContextRequest(source, occurrence, cwd);
   }
 
+  /** A fresh path-free terminal binding; it owns no resolver work or result. */
+  repoContextUnknownId(source: AiInteractionEvent["source"], occurrence: string) {
+    if (!validRepoContextOccurrence(occurrence)) throw new Error("repo_context_occurrence_invalid");
+    return `repoctx:v1:${crypto.createHmac("sha256", this.repoContextHmacKey())
+      .update(`repoctx:terminal-unknown:v${REPO_CONTEXT_CAPTURE_POLICY_GENERATION}\0`).update(source).update("\0")
+      .update(occurrence).digest("hex")}`;
+  }
+
   stageRepoContextRequest(request: RepoContextRequest) {
     if (!this.activeRepoContextCommitScope) {
       throw new Error("repo_context_commit_scope_required");
@@ -1537,7 +1546,8 @@ export class LocalEventBuffer {
     if (!validRepoContextRequest(request)) throw new Error("repo_context_request_invalid");
     const resolved = this.resolvedRepoContext(request.contextId);
     if (resolved.suppressed) return null;
-    if (resolved.exists) return request.contextId;
+    if (resolved.exists) return this.repoContextHasCurrentCapturePolicy(request.contextId)
+      ? request.contextId : null;
     return this.reserveRepoContextHandoff(request, this.activeRepoContextCommitScope)
       ? request.contextId
       : null;
@@ -1638,7 +1648,29 @@ export class LocalEventBuffer {
     }
   }
 
-  private resolvedRepoContext(contextId: string | null) {
+  /** Backward-compatible local provenance, never a parser checkpoint key.
+   * Released readers ignore the raw metadata receipt and tolerate the result
+   * version. Exact event IDs keep the raw receipt lookup a bounded PK read. */
+  repoContextHasCurrentCapturePolicy(contextId: string, capturedEventIds: readonly string[] = []) {
+    if (!validRepoContextId(contextId)) return false;
+    const row = this.db.prepare(
+      `select resolver_version as resolverVersion from repo_context_results where context_id = ?`,
+    ).get(contextId) as { resolverVersion: string } | undefined;
+    if (row) return row.resolverVersion === REPO_CONTEXT_RESOLVER_VERSION;
+    if (this.activeRepoContextCommitScope?.selectedIds.has(contextId)) return true;
+    if (capturedEventIds.length > 2) throw new Error("repo_context_provenance_lookup_unbounded");
+    const receipt = this.db.prepare(
+      `select 1 from repo_context_event_links l
+       join buffered_events e on e.id = l.event_id
+       where l.event_id = ? and l.context_id = ?
+         and case when json_valid(e.payload_json)
+           then json_extract(e.payload_json, '$.metadata.repoContextPolicyGeneration') end = ?
+       limit 1`,
+    );
+    return capturedEventIds.some(eventId => Boolean(receipt.get(eventId, contextId, REPO_CONTEXT_CAPTURE_POLICY_GENERATION)));
+  }
+
+  private resolvedRepoContext(contextId: string | null, currentCaptureOnly = false) {
     if (!contextId) {
       return {
         exists: false,
@@ -1651,6 +1683,7 @@ export class LocalEventBuffer {
     const row = this.db
       .prepare(
         `select r.repo_hash as repoHash, r.branch_hash as branchHash, r.head_sha as headSha,
+           r.resolver_version as resolverVersion,
            exists(select 1 from repo_context_suppressions s where s.context_id = ?) as suppressed
          from repo_context_results r where r.context_id = ?`,
       )
@@ -1659,15 +1692,18 @@ export class LocalEventBuffer {
         branchHash: string | null;
         headSha: string | null;
         suppressed: number;
+        resolverVersion: string;
       } | undefined;
     if (row) {
       const suppressed = row.suppressed === 1;
+      const excluded = suppressed ||
+        (currentCaptureOnly && row.resolverVersion !== REPO_CONTEXT_RESOLVER_VERSION);
       return {
         exists: true,
         suppressed,
-        repoHash: suppressed ? null : row.repoHash,
-        branchHash: suppressed ? null : row.branchHash,
-        headSha: suppressed ? null : row.headSha,
+        repoHash: excluded ? null : row.repoHash,
+        branchHash: excluded ? null : row.branchHash,
+        headSha: excluded ? null : row.headSha,
       };
     }
     const suppressed = Boolean(this.db
@@ -2648,7 +2684,7 @@ export class LocalEventBuffer {
       ? this.canBindRepoContextId(boundRepoContextId)
       : true;
     const existingRepoHash = gitField(event, "remoteUrlHash");
-    const resolvedRepoContext = this.resolvedRepoContext(repoContextId);
+    const resolvedRepoContext = this.resolvedRepoContext(repoContextId, true);
     const repoContextConflict = Boolean(
       existingRepoHash && resolvedRepoContext.repoHash &&
       existingRepoHash !== resolvedRepoContext.repoHash,
@@ -2665,7 +2701,11 @@ export class LocalEventBuffer {
     const projectKey = canonicalProjectKey(event.projectKey);
     const costKind = admittedCostKind(event);
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
-    const payloadJson = JSON.stringify(event);
+    // Only new context-bound captures carry this local-only policy receipt.
+    // Sealing reads it from the exact raw lineage; it is not an outbound field.
+    const payloadJson = JSON.stringify(repoContextId ? {
+      ...event, metadata: { ...event.metadata, repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION },
+    } : event);
     const insert = this.insertEventStatement ??= this.db.prepare(
         `insert or ignore into buffered_events
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,

@@ -14,7 +14,7 @@ import {
 } from "./config";
 import { deterministicEventId, ensureUuidEventId } from "./delivery-id";
 export { ensureUuidEventId, POSTGRES_UUID_RE } from "./delivery-id";
-import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
+import { applyProjectAttribution, captureRepoContextExcluded, SessionAttributionBatch } from "./session-attribution";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
@@ -219,7 +219,8 @@ export function sealHistoryEvent(
 ): NormalizedHistoryEvent {
   const { candidate, idDerived } = prepared;
   if (prepared.event) {
-    const linkage = { repoHash: row.repoHash, branchHash: row.branchHash };
+    const linkage = { repoHash: row.repoHash, branchHash: row.branchHash,
+      repoContextExcluded: captureRepoContextExcluded(prepared.event.metadata?.repoContextPolicyGeneration, row.repoHash) };
     const attributed = row.attribution
       ? row.attribution.attribute(prepared.event, linkage)
       : applyProjectAttribution(prepared.event, linkage);
