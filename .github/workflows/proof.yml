@@ -863,6 +863,9 @@ jobs:
       - name: Prove growing Codex rollout capture survives released reader downgrade
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-rollout-downgrade
+      - name: Prove known disjoint Codex accounts retain separate response usage
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-account-boundary
       - name: Prove legacy metadata fails closed and unrelated native traces do not lose usage
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-legacy-density

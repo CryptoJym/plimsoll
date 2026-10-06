@@ -703,6 +703,28 @@ export function captureCodexModel(
   // a counterless/gap/ACK row remains a fact, never a promotable witness.
   // Trace, typed links and native turn context are cumulative veto sources.
   // A trace never makes an otherwise linked native contradiction irrelevant.
+  const independentLinkedResponse = (seed: AiInteractionEvent, candidate: AiInteractionEvent) => {
+    const seedTrace = text(seed.metadata.traceId), candidateTrace = text(candidate.metadata.traceId);
+    // Contradictory native attributes inside one trace always remain vetoes.
+    if (seedTrace && seedTrace === candidateTrace) return false;
+    const seedSession = trustedSession(seed), candidateSession = trustedSession(candidate);
+    const producerSession = (e: AiInteractionEvent) =>
+      text(e.metadata["conversation.id"] ?? nestedOtelAttributes(e)["conversation.id"]);
+    // Request/call text is scoped by an independently reported native
+    // conversation. Two different native conversations AND traces do not
+    // become one response merely because their local request text repeats.
+    if (seedTrace && candidateTrace && seedSession && candidateSession && seedSession !== candidateSession &&
+        producerSession(seed) === seedSession && producerSession(candidate) === candidateSession)
+      return true;
+    const seedRequest = text(seed.metadata.request_id), candidateRequest = text(candidate.metadata.request_id);
+    const seedAccounts = nativeAccounts(seed), candidateAccounts = nativeAccounts(candidate);
+    // A shared call/turn alias cannot merge two explicitly different requests
+    // across known disjoint accounts. Same-request or unknown-boundary facts
+    // still veto; account disagreement alone never excuses a contradiction.
+    return Boolean(seedRequest && candidateRequest && seedRequest !== candidateRequest &&
+      !accountConflict(seed) && !accountConflict(candidate) && seedAccounts.size && candidateAccounts.size &&
+      ![...seedAccounts].some(value => candidateAccounts.has(value)));
+  };
   const checkLinkedFacts = (seed: AiInteractionEvent): string | undefined => {
     const seedSession = trustedSession(seed);
     const pending: ReturnType<typeof codexResponseIdentities> = [];
@@ -732,6 +754,7 @@ export function captureCodexModel(
         and (${matches.join(" or ")})${turnScope}`).iterate(...args) as Iterable<EvidenceRow>) {
         const p = decodePeers([candidate])[0];
         if (!p) continue;
+        if (independentLinkedResponse(seed,p.event)) continue;
         const reason = veto(p,"linked");
         if (reason) { reasonFound = reason; break linkedVeto; }
         if (!enqueue(p.event)) { reasonFound = "linked_identity_overflow"; break linkedVeto; }

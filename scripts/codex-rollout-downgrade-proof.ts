@@ -106,9 +106,9 @@ async function main(){
    check(`${version}/fresh-turn-real-wire-and-ack`,()=>{
     b.delivery.configure({enabled:true});b.delivery.repairRawById(fresh.raw.id);
     const now=new Date(Date.now()+62_000);b.database.prepare('update upload_outbox set next_attempt_at=?').run(now.toISOString());
-    const lease=b.delivery.lease({now});const item=lease.items.find(i=>i.envelope.event.id===fresh.raw.id);assert.ok(item);
+    const lease=b.delivery.lease({now});const item=lease.items.find((i:any)=>i.envelope.event.id===fresh.raw.id);assert.ok(item);
     assert.equal(item.envelope.event.model,OTHER);assert.equal(item.envelope.event.inputTokens,19);assert.equal(item.envelope.event.outputTokens,2);
-    const ack=b.delivery.acknowledge(lease.leaseId,lease.items.map(i=>i.deliveryId),now);assert.equal(ack.locallyDead,0);
+    const ack=b.delivery.acknowledge(lease.leaseId,lease.items.map((i:any)=>i.deliveryId),now);assert.equal(ack.locallyDead,0);
     assert.equal((b.database.prepare('select terminal_state as state from upload_receipts where delivery_id=?').get(item.deliveryId) as {state:string}).state,'acknowledged');
    });
    // Deliberately restore only the known r15 checkpoint key to exercise its

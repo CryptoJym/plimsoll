@@ -7,7 +7,7 @@ import {captureCodexModel,isCaptureGap,recordCodexTurnModel} from '../packages/c
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',225);
+const completion=createProofCompletion('codex-capture-veto',231);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -174,6 +174,27 @@ try{
    f.append(make(2,{traceId:f.trace,codexTurnId:'source',model:MODEL,otelEventName:'codex.sse_event'},{model:MODEL}));
    f.deliver(f.append(make(1,{})),true);
   });
+ // Reused request/call text across separately reported native conversations
+ // is not a physical-response link. This is also the released-floor boundary.
+ for(const identity of ['request_id','call_id'] as const)
+  cell(`independent-native-conversation/${identity}`,0,f=>{
+   const otherSession=uuid(997);
+   const prior=f.append(make(3,{traceId:'e'.repeat(32),'conversation.id':otherSession,
+    [identity]:'reused',model:OTHER,otelEventName:'codex.sse_event'},{sessionId:otherSession,model:OTHER}));
+   const frozen=f.freezeFact(prior,true);assert.equal(isCaptureGap(frozen.event),false);
+   f.deliver(f.append(make(1,{traceId:f.trace,'conversation.id':SESSION,[identity]:'reused',model:MODEL,
+    otelEventName:'codex.sse_event'},{model:MODEL})),false);f.frozenUnchanged(frozen);
+  });
+ for(const noise of [0,129])for(const conflict of ['model','account'] as const)
+  cell(`same-native-conversation-request-contradiction/${conflict}/${noise}`,noise,f=>{
+   const model=conflict==='model'?OTHER:MODEL;
+   f.append(make(3,{traceId:'e'.repeat(32),'conversation.id':SESSION,request_id:'physical-source',model},
+    {model,eventType:'tool_result',actorId:conflict==='account'?B:A,inputTokens:undefined,outputTokens:undefined,
+     observedAt:new Date(AT-3_600_000).toISOString()}));
+   f.append(make(2,{traceId:f.trace,'conversation.id':SESSION,request_id:'physical-source',model:MODEL,
+    otelEventName:'codex.sse_event'},{model:MODEL}));
+   f.deliver(f.append(make(1,{})),true);
+  });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
  // producer bytes restored together, no paid capture/coverage witness injected.
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
@@ -250,6 +271,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,225,'every declared matrix cell executes');
+ assert.equal(executed,231,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}
