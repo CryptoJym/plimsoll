@@ -633,6 +633,7 @@ export function captureCodexModel(
       ? text(e.model) : undefined;
   const targetNativeModel = nativeModel(event) ?? nativeTurnModel(event);
   const traceId = directTraceId;
+  const responsePair = codexSpanRolloutDecision(db, rawId,prepare);
   const tracePeers: Peer[] = [];
   let traceOverflow = false;
   let vetoModel = targetNativeModel;
@@ -661,13 +662,33 @@ export function captureCodexModel(
   const nativeScope = `e.source='codex' and e.id<>? and e.workspace_id is ?
     and e.device_id is ? and e.installation_epoch_id is ? and ${eligible}`;
   const nativeScopeArgs = [rawId,row.workspace,row.device,row.epoch];
-  if (traceId) for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
+  const vetoTraces = new Set<string>(traceId ? [traceId] : []);
+  // A mutable saved rollout owner also depends on its exact span's trace.
+  // Follow only the saved span incarnation, never a reused ID or another
+  // workspace/device/install. That trace remains a veto after pairing.
+  if (responsePair && responsePair.spanId !== rawId) {
+    const spanRow = prepare(`${selectEvidence} where ${nativeScope}
+      and e.rowid=? and e.id=? and e.created_at=? and e.privacy_generation is ?`)
+      .get(...nativeScopeArgs,responsePair.spanRowid,responsePair.spanId,
+        responsePair.spanCreatedAt,responsePair.spanGeneration) as EvidenceRow | undefined;
+    if (spanRow) {
+      const span = decodePeers([spanRow])[0];
+      if (span) {
+        const reason = veto(span,"trace");
+        if (reason) return gap(reason);
+        const spanTrace = text(span.event.metadata.traceId);
+        if (spanTrace) vetoTraces.add(spanTrace);
+      }
+    }
+  }
+  for (const vetoTrace of vetoTraces) for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?`)
-    .iterate(...nativeScopeArgs,traceId) as Iterable<EvidenceRow>) {
+    .iterate(...nativeScopeArgs,vetoTrace) as Iterable<EvidenceRow>) {
     const p = decodePeers([candidate])[0];
     if (!p) continue;
     const reason = veto(p,"trace");
     if (reason) return gap(reason);
+    if (vetoTrace !== traceId) continue; // veto-only partner facts never promote.
     if (tracePeers.length < MAX_EVIDENCE_ROWS + 1) tracePeers.push(p);
     else traceOverflow = true;
   }
@@ -741,7 +762,6 @@ export function captureCodexModel(
       if (reason) return gap(reason);
     }
   }
-  const responsePair = codexSpanRolloutDecision(db, rawId,prepare);
   if (responsePair && vetoModel && responsePair.model !== vetoModel)
     return gap("conflicting_pair_target_model");
   if (responsePair && (responsePair.ownerId !== rawId || isCodexResponseSpan(event))) {

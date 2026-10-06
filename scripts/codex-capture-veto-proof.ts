@@ -150,7 +150,8 @@ try{
   assert.ok(f.b.database.prepare('select 1 from codex_span_rollout_pairs where span_id=?').get(span.id),'saved pair must exist');
   if(contradiction)f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   if(contradiction){const gap=f.capture(span);assert.equal(isCaptureGap(gap),true);
-   assert.equal(gap.model,undefined);assert.equal(gap.inputTokens,undefined);assert.equal(gap.metadata.modelGapInputTokens,19);}
+   assert.equal(gap.model,undefined);assert.equal(gap.inputTokens,undefined);assert.equal(gap.metadata.modelGapInputTokens,19);
+   const rollout=make(2,{usageSource:'rollout',codexTurnId:'T'},{eventType:'usage_rollout',model:MODEL});f.deliver(rollout,true);}
   else {const observation=f.capture(span);assert.equal(isCaptureGap(observation),false);assert.equal(observation.model,MODEL);
    assert.equal(observation.inputTokens,undefined);assert.equal(observation.metadata.modelCaptureInputTokens,19);
    const rollout=make(2,{usageSource:'rollout',codexTurnId:'T'},{eventType:'usage_rollout',model:MODEL});f.deliver(rollout,false);}

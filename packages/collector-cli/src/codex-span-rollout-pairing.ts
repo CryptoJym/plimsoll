@@ -117,12 +117,14 @@ export function rememberCodexSpanEmission(db: Database.Database, rawId: string, 
 
 export function codexSpanRolloutDecision(db: Database.Database, rawId: string, prepare = (sql: string) => db.prepare(sql)) {
   if (!table(db, "codex_span_rollout_pairs", prepare)) return undefined;
-  return prepare(`select p.owner_id as ownerId,p.model,e.id as eventId
+  return prepare(`select p.owner_id as ownerId,p.model,e.id as eventId,
+      p.span_id as spanId,p.span_rowid as spanRowid,p.span_created_at as spanCreatedAt,p.span_generation as spanGeneration
     from codex_span_rollout_pairs p join buffered_events e on
       (e.id=p.span_id and e.rowid=p.span_rowid and e.created_at=p.span_created_at and e.privacy_generation is p.span_generation)
       or (e.id=p.rollout_id and e.rowid=p.rollout_rowid and e.created_at=p.rollout_created_at and e.privacy_generation is p.rollout_generation)
     where e.id=? and (p.span_id=? or p.rollout_id=?) limit 1`).get(rawId, rawId, rawId) as
-      { ownerId: string; model: string; eventId: string } | undefined;
+      { ownerId: string; model: string; eventId: string; spanId: string; spanRowid: number;
+        spanCreatedAt: string; spanGeneration: string | null } | undefined;
 }
 
 function emittedSpanModel(db: Database.Database, row: Row): string | undefined {
