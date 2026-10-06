@@ -1,5 +1,6 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-retention", 75);
+const CLONE_CONSUMPTION_ONLY = process.argv.includes("--clone-consumption-only");
+const completion = createProofCompletion("lifecycle-retention", CLONE_CONSUMPTION_ONLY ? 20 : 75);
 /**
  * eco-6hoxj.163.30: lifecycle update snapshots are bounded and cheap.
  *
@@ -95,18 +96,39 @@ function attachPrivateProofVolume() {
   }
 }
 
-function detachPrivateProofVolume() {
+function detachPrivateProofVolume(terminating = false) {
+  if (!fs.existsSync(IMAGE_ROOT)) return;
   if (fs.statSync(ROOT).dev !== fs.statSync(IMAGE_ROOT).dev) {
-    const result = spawnSync("/usr/bin/hdiutil", ["detach", ROOT, "-quiet"], {
+    // A terminating proof may still hold its own SQLite descriptor. Force is
+    // limited to this private mount; the process exits immediately afterwards.
+    const result = spawnSync("/usr/bin/hdiutil", ["detach", ROOT, ...(terminating ? ["-force"] : []), "-quiet"], {
       encoding: "utf8", timeout: 60_000,
     });
     if (result.status !== 0 || result.error) {
       // Retain the backing image if detach fails; never unlink a mounted image.
-      throw new Error(`private APFS proof volume detach failed: ${result.error?.message ?? result.stderr}`);
+      throw new Error(`private APFS proof volume detach failed status=${result.status}: ${result.error?.message ?? result.stderr}`);
     }
   }
   fs.rmSync(IMAGE_ROOT, { recursive: true, force: true });
 }
+
+// The wrapper terminates an overdue proof with SIGTERM. Detach our volume
+// before it removes the disposable root; a killed proof must still fail.
+let activeWriter: ReturnType<typeof spawn> | undefined;
+process.once("SIGTERM", async () => {
+  try {
+    // Only this proof's ChildProcess can hold a live ledger descriptor here.
+    // Reap it before detach, including termination during writer startup.
+    const writer = activeWriter;
+    if (writer && writer.exitCode === null && writer.signalCode === null) {
+      const closed = new Promise<void>((resolve) => writer.once("close", () => resolve()));
+      writer.kill("SIGKILL");
+      await closed;
+    }
+    detachPrivateProofVolume(true);
+  } catch (error) { console.error(error); }
+  finally { process.exit(143); }
+});
 
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const freeBytes = (directory: string) => {
@@ -584,6 +606,14 @@ async function main() {
     check("crash_left_wal_is_checkpointed_into_the_clone_and_emptied",
       killedWith === "SIGKILL" && walBeforeU6 > 0 && inspectSnapshotDatabase(primary, "u6").digest === beforeU6 &&
       walBytes(primary.ledger) === 0, { killedWith, walBeforeU6, walAfter: walBytes(primary.ledger) });
+    if (CLONE_CONSUMPTION_ONLY) {
+      console.log(JSON.stringify({ proof: "lifecycle-retention-clone-consumption", measurements: {
+        consumptionVolume: "private-apfs-sparse-image", ledgerBytes,
+        cloneConsumedBytes: probedSamples[0]!.consumed, fullCopyConsumedBytes: fullCopyConsumed,
+      }, liveStateTouched: false }));
+      completion.complete();
+      return;
+    }
 
     // ---- Forced clone failure uses the online backup; a live writer is refused
     const fallbackSamples: Array<{ method: string | null; consumed: number }> = [];
@@ -608,6 +638,8 @@ async function main() {
       process.stdout.write("ready\\n");
       process.stdin.on("data", () => {});
       process.stdin.on("end", () => { db.close(); process.exit(0); });`], { stdio: ["pipe", "pipe", "inherit"] });
+    activeWriter = writer;
+    writer.once("close", () => { if (activeWriter === writer) activeWriter = undefined; });
     await new Promise<void>((resolve, reject) => {
       writer.stdout!.once("data", () => resolve());
       writer.once("exit", () => reject(new Error("live writer exited early")));
