@@ -690,10 +690,11 @@ async function main() {
       }
     }
     await run(
-      "paired-model-first",
+      "paired-model-cannot-overwrite-native-trace",
       (b) => {
-        // Missing typed pairing shape on an older ledger: the exact SSE is still
-        // the first source, and the span must not become a second token row.
+        // Missing typed pairing shape on an older ledger cannot hide a
+        // contradictory native model on the target trace. The target gaps;
+        // the independently native SSE keeps its own financial custody.
         const nativeLog = log("gpt-6.1-sol", false, true);
         b.append(nativeLog);
         b.database
@@ -704,8 +705,8 @@ async function main() {
         b.append(log("gpt-6-astra", true));
         return span();
       },
-      "gpt-6.1-sol",
-      "paired_sse_event",
+      null,
+      "conflicting_pair_target_model",
     );
     await run(
       "two-model-pair",
