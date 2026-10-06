@@ -1619,7 +1619,7 @@ async function main() {
     // cannot make the fixture invent native finance evidence, and metadata alone
     // cannot grant the authenticated app-server append capability.
     const liveEnd = new Date(NOW.getTime()-DAY_MS).toISOString();
-    const liveObserver = event({eventType:"usage_live",observedAt:liveEnd,inputTokens:44,outputTokens:4,
+    const liveObserver = event({eventType:"usage_live",sessionId:"projection-runtime-session",observedAt:liveEnd,inputTokens:44,outputTokens:4,
       cacheReadTokens:0,cacheCreationTokens:0,metadata:{
         sourceVersion:"codex.app-server.usage.v1",sourceIdentityEvidenceRef:"native_runtime_observed_interval_v1",
         liveObservationKind:"observed_interval",liveFinanceEligibility:"unqualified_observer",liveAttributionState:"unresolved",
