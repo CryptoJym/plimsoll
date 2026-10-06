@@ -52,6 +52,7 @@ import {
 } from "./lifecycle";
 import { STATUS_SUMMARY_FILE } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
+import { INTENT_STATE_DIRECTORY } from "./project-intent-store";
 
 /**
  * Production composition of the lifecycle transaction boundary (#103/#158).
@@ -1522,7 +1523,7 @@ export function managedLifecyclePaths(options: {
     // Issue #103 slice: the real adapter owns no embedded tool-config
     // fragments yet; surgical fragment removal is still open work.
     ownedToolFragments: [],
-    history: [defaultBackfillStatePath(options.homeDir)],
+    history: [defaultBackfillStatePath(options.homeDir), path.join(collectorHome(options.homeDir), INTENT_STATE_DIRECTORY)],
     statusSummary: path.join(collectorHome(options.homeDir), STATUS_SUMMARY_FILE),
   };
 }

@@ -457,7 +457,9 @@
     "proof:capture-history-import-main-handoff-codex": "tsx scripts/capture-history-import-main-handoff-proof.ts codex",
     "proof:capture-history-import-main-handoff-claude": "tsx scripts/capture-history-import-main-handoff-proof.ts claude",
     "test:codex-usage-fields": "node --import tsx scripts/codex-usage-fields.test.ts",
-    "contracts:project-intent": "node --import tsx --test tests/contracts/project-intent.contract.ts"
+    "contracts:project-intent": "node --import tsx --test tests/contracts/project-intent.contract.ts",
+    "test:project-intent-cli": "node --import tsx --test tests/project-intent-cli.test.ts",
+    "proof:project-intent-privacy": "tsx scripts/project-intent-privacy-proof.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

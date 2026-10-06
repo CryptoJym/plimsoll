@@ -207,6 +207,16 @@ export async function buildRuntime(options: {
     const identity = sha256File(destination);
     companions.push({ name: path.basename(destination), sha256: identity.digest, bytes: identity.bytes });
   }
+  // P04 command wrappers travel with the published dist and its source-hashed manifest.
+  for (const name of ["claude-project-intent-session-start.sh", "codex-project-intent-session-start.sh"]) {
+    const sourcePath = path.join(repoRoot, "scripts", name);
+    if (!fs.existsSync(sourcePath)) continue; // Synthetic builder fixtures need no provider adapter.
+    const destination = path.join(dist, name);
+    fs.copyFileSync(sourcePath, destination);
+    fs.chmodSync(destination, 0o755);
+    const identity = sha256File(destination);
+    companions.push({ name, sha256: identity.digest, bytes: identity.bytes });
+  }
 
   const artifact = sha256File(outfile);
   const pkg = readPackageManifest(packageManifestPath);

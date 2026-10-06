@@ -23,6 +23,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROJECT_INTENT_OUTBOUND_FIELDS, PROJECT_INTENT_LOCAL_ONLY_FIELDS } from "../packages/shared/src/project-intent";
+import { INTENT_STATE_DIRECTORY, INTENT_STATE_LIMITS } from "../packages/collector-cli/src/project-intent-store";
 
 import {
   aiWorkIngestBatchSchema,
@@ -417,9 +418,11 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`## Project intent receipt contract (P02)`);
   lines.push(``);
   lines.push(`The separate versioned project intent boundary admits only: ${PROJECT_INTENT_OUTBOUND_FIELDS.map(field => "\`" + field + "\`").join(", ")}.`);
-  lines.push(`All fields are required, including nullable keys. Opaque linkage is exactly sha256 plus 64 lowercase hexadecimal characters. Business registration is checked by the cloud, never inferred from hash shape or the observed repo. The cloud stores receipts beside its existing session ledger; this collector contract adds no local database table or automatic upload path.`);
-  lines.push(`Local only: ${PROJECT_INTENT_LOCAL_ONLY_FIELDS.map(field => "\`" + field + "\`").join(", ")}. Credentials are transport headers, never receipt fields. Unexpected fields are rejected, not forwarded. Provider lifecycle and delivery adapters are separate build lanes.`);
+  lines.push(`All fields are required, including nullable keys. Opaque linkage is exactly sha256 plus 64 lowercase hexadecimal characters. Business registration is checked by the cloud, never inferred from hash shape or the observed repo. The cloud stores receipts beside its existing session ledger. P04 queues receipts under the private collector-home directory \`${INTENT_STATE_DIRECTORY}/\`; it adds no usage ledger or outbound schema fields. Normal uploads replay this separate signed endpoint after session sync, one bounded request per cycle.`);
+  lines.push(`Local only: ${PROJECT_INTENT_LOCAL_ONLY_FIELDS.map(field => "\`" + field + "\`").join(", ")}, pending launch drafts, incarnation nonces, process-owner evidence, folder suggestions, registry copies and delivery ACK/review state. Credentials are transport headers, never receipt fields or queue documents. Hook input is bounded to 64 KiB and only its native ID/start reason is consumed; no raw hook envelope is stored. Unexpected receipt fields are rejected, not forwarded.`);
+  lines.push(`Local state uses owner-only directories/files, no-follow bounded reads, mutation locks and fsynced atomic publication. Each JSON file is bounded to ${INTENT_STATE_LIMITS.maxFileBytes} bytes, each state kind to ${INTENT_STATE_LIMITS.maxFilesPerKind} documents, and explicit replay to ${INTENT_STATE_LIMITS.replaySessions} session documents. ACKs persist beside immutable receipts before delivery is cleared; refusals remain visible. Both lifecycle purge and purge-local-data include this entire local directory. Erasure loses continuity evidence; a resume cannot rebuild an epoch from a native ID alone.`);
   lines.push(`Source: \`packages/shared/src/project-intent.ts\`; executable privacy and identity fixtures: \`tests/contracts/project-intent.contract.ts\` (CI: \`contracts:project-intent\`).`);
+  lines.push(`Producer/helper fixtures: \`tests/project-intent-cli.test.ts\` (CI: \`test:project-intent-cli\`); planted outbound-content proof: \`scripts/project-intent-privacy-proof.ts\` (CI: \`proof:project-intent-privacy\`).`);
   lines.push(``);
   lines.push(`## The four buckets`);
   lines.push(``);
