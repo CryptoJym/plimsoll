@@ -727,6 +727,25 @@ export function captureCodexModel(
   };
   const checkLinkedFacts = (seed: AiInteractionEvent): string | undefined => {
     const seedSession = trustedSession(seed);
+    const seedTrace = text(seed.metadata.traceId);
+    const producerSession = text(seed.metadata["conversation.id"] ?? nestedOtelAttributes(seed)["conversation.id"]);
+    // Apply the already-proven independent native-conversation boundary
+    // before decoding rows. Reused local aliases otherwise force every fresh
+    // capture to decode unrelated conversations. This is conservative: only
+    // explicit string values containing an ASCII alphanumeric qualify here;
+    // all unknown, stitched, malformed or other representations still stream
+    // through independentLinkedResponse and the complete contradiction veto.
+    const jsonFact = (key: string) => `case when json_valid(e.payload_json) then
+      json_extract(e.payload_json,'${key}') end`;
+    const factTrace = jsonFact("$.metadata.traceId"), factSession = jsonFact("$.sessionId");
+    const factProducer = `coalesce(${jsonFact('$.metadata."conversation.id"')},
+      ${jsonFact('$.metadata.otelAttributes."conversation.id"')})`;
+    const independentConversation = seedTrace && seedSession && producerSession === seedSession
+      ? ` and not coalesce((typeof(${factTrace})='text' and ${factTrace} glob '*[A-Za-z0-9]*'
+          and ${factTrace}<>? and typeof(${factSession})='text' and ${factSession} glob '*[A-Za-z0-9]*'
+          and ${factSession}<>? and ${jsonFact('$.metadata.stitched')} is not 'time_window'
+          and typeof(${factProducer})='text' and ${factProducer}=${factSession}),0)` : "";
+    const independentArgs = independentConversation ? [seedTrace,seedSession] : [];
     const pending: ReturnType<typeof codexResponseIdentities> = [];
     const seenKeys = new Set<string>();
     const enqueue = (e: AiInteractionEvent) => {
@@ -748,10 +767,10 @@ export function captureCodexModel(
       const matches = aliases.map(alias => `case when json_valid(e.payload_json) then
         json_extract(e.payload_json,'$.metadata."${alias}"') end=?`);
       const turnScope = node.kind === "turn" ? " and e.session_id is ?" : "";
-      const args = [...nativeScopeArgs,...aliases.map(() => node.value),
+      const args = [...nativeScopeArgs,...independentArgs,...aliases.map(() => node.value),
         ...(node.kind === "turn" ? [seedSession] : [])];
       for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
-        and (${matches.join(" or ")})${turnScope}`).iterate(...args) as Iterable<EvidenceRow>) {
+        ${independentConversation} and (${matches.join(" or ")})${turnScope}`).iterate(...args) as Iterable<EvidenceRow>) {
         const p = decodePeers([candidate])[0];
         if (!p) continue;
         if (independentLinkedResponse(seed,p.event)) continue;

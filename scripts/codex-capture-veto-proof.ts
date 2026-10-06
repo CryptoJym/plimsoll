@@ -7,7 +7,7 @@ import {captureCodexModel,isCaptureGap,recordCodexTurnModel} from '../packages/c
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',231);
+const completion=createProofCompletion('codex-capture-veto',243);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -195,6 +195,24 @@ try{
     otelEventName:'codex.sse_event'},{model:MODEL}));
    f.deliver(f.append(make(1,{})),true);
   });
+ // The SQL independent-conversation prefilter must retain every uncertain
+ // representation and same-trace fact; only the exact independent native
+ // boundary may avoid decoding. Exercise the optimized path, not just aliases.
+ for(const noise of [0,129])for(const boundary of ['missing-producer','mismatched-producer',
+   'stitched-session','blank-trace','nested-independent','same-trace'] as const)
+  cell(`linked-query-boundary/${boundary}/${noise}`,noise,f=>{
+   const otherSession=uuid(997);
+   const metadata:Record<string,unknown>={traceId:boundary==='same-trace'?f.trace:
+     boundary==='blank-trace'?' \t ':'e'.repeat(32),request_id:'reused',model:OTHER};
+   if(boundary==='nested-independent')metadata.otelAttributes={'conversation.id':otherSession};
+   else if(boundary!=='missing-producer')metadata['conversation.id']=
+     boundary==='mismatched-producer'?uuid(996):otherSession;
+   if(boundary==='stitched-session')metadata.stitched='time_window';
+   f.append(make(3,metadata,{sessionId:otherSession,model:OTHER,eventType:'tool_result',
+    inputTokens:undefined,outputTokens:undefined,observedAt:new Date(AT-3_600_000).toISOString()}));
+   f.deliver(f.append(make(1,{traceId:f.trace,'conversation.id':SESSION,request_id:'reused',model:MODEL,
+    otelEventName:'codex.sse_event'},{model:MODEL})),boundary!=='nested-independent');
+  });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
  // producer bytes restored together, no paid capture/coverage witness injected.
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
@@ -271,6 +289,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,231,'every declared matrix cell executes');
+ assert.equal(executed,243,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}
