@@ -153,6 +153,12 @@ jobs:
       - name: Prove the shared project intent contract and privacy boundary
         run: pnpm contracts:project-intent
 
+      - name: Prove project intent CLI and hand-start helpers
+        run: pnpm test:project-intent-cli
+
+      - name: Prove project intent content privacy and local erasure
+        run: pnpm proof:project-intent-privacy
+
       # eco-6hoxj.164.4 (lean Plimsoll B0): contract tests that FAIL today by design.
       # Each is declared pending("<bead>") (node:test todo), so the step prints every
       # failure and exits 0 until the named bead removes the marker; from then on the

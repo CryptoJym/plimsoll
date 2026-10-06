@@ -2,6 +2,10 @@
 import { openLedgerDatabase } from "./ledger-connection";
 import { AutomaticRetentionCadence } from "./retention-cadence";
 import { claudeStatusLineCliMain } from "./claude-status-line-command";
+import { projectIntentCommand, INTENT_COMMAND_HELP } from "./project-intent-command";
+import { replayProjectIntentsIfPresent } from "./project-intent-producer";
+import { INTENT_STATE_DIRECTORY } from "./project-intent-store";
+import { assertPrivateStateDirectory } from "./collector-state-io";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
@@ -264,7 +268,6 @@ import {
   type DiscoveredFileIdentity,
 } from "../../collector-config/src/index";
 import {
-  DEFAULT_MANAGED_CONFIG_RECONCILE_INTERVAL_SECONDS,
   type ManagedConfigDriftReport,
   type ManagedConfigReadback,
   type ManagedConfigReconcileDecision,
@@ -772,14 +775,13 @@ function readSecretFromPrompt() {
   process.stderr.write("Join token (input hidden): ");
   return new Promise<string>((resolve, reject) => {
     let secret = "";
-    let onData: (chunk: Buffer | string) => void;
     const cleanup = () => {
       process.stdin.removeListener("data", onData);
       process.stdin.setRawMode?.(false);
       process.stdin.pause();
       process.stderr.write("\n");
     };
-    onData = (chunk: Buffer | string) => {
+    const onData = (chunk: Buffer | string) => {
       for (const character of String(chunk)) {
         if (character === "\u0003") {
           cleanup();
@@ -2872,8 +2874,13 @@ function readInstallationEpochId(roots: readonly CaptureRoot[]): string | null {
 }
 
 async function main() {
+  if (command === "intent" || command === "launch") {
+    process.exitCode = await projectIntentCommand(process.argv.slice(2));
+    return;
+  }
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
+    console.log(INTENT_COMMAND_HELP);
     return;
   }
 
@@ -3565,10 +3572,6 @@ async function main() {
       outcomeTimelineStore.close();
       outcomeTimelineStoreClosed = true;
     };
-    let scheduler: CoalescingMaintenanceScheduler<MaintenanceAttemptOutcome> | undefined;
-    let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceAttemptOutcome> | undefined;
-    let enrichmentScheduler: IdleEnrichmentScheduler | undefined;
-    let enrichmentCadence: AutomaticEnrichmentCadence | undefined;
     let cachedBaseline = captureBaselineStatus(buffer.database);
     const maintenanceBoundary = new MaintenanceProcessBoundary({
       entryPath: process.argv[1]!,
@@ -3646,7 +3649,6 @@ async function main() {
     }
     let refreshStatusSnapshot: (failure?: "maintenance_failed") => boolean = () => false;
     let markMaintenanceSuccess: () => void = () => {};
-    let retentionCadence: AutomaticRetentionCadence | undefined;
     // The starvation census counts two queue tables (~280k pending links on
     // the Studio0 ledger, ~0.8 s cold), so it runs on a read-only worker
     // together with the kill counter it is judged against. /status labels the
@@ -3711,7 +3713,6 @@ async function main() {
     };
     // Bead eco-6hoxj.61. Created before the listener so /status can read its
     // cached snapshot, armed with the other cadences below.
-    let hookSpoolDrain: HookSpoolDrain | undefined;
     // Bead eco-6hoxj.163.17: an OTLP export the ledger cannot take in time is
     // written here (normalized, bounded) instead of being refused, and the
     // drain armed below replays it. PLIMSOLL_OTLP_SPOOL=off disables both.
@@ -4066,6 +4067,10 @@ async function main() {
         } finally {
           lastSessionPassAt = performance.now();
         }
+        // P04 receipts join the session row this cycle just synchronized.
+        // One bounded send per cycle; immutable offline state survives all refusals.
+        const intentReplay = await replayProjectIntentsIfPresent(config);
+        if (intentReplay) console.log(JSON.stringify({ status: "project_intent_replay", ...intentReplay }));
       } catch (error) {
         await carrySessions();
         const scheduling = syncBackoff.failure(error, uploaded, Date.now(), maintenanceBoundary.status().state === "circuit_open");
@@ -4106,7 +4111,7 @@ async function main() {
     // First boot records a metadata-only, whole-generation exclusion baseline.
     // Later automatic cadences tail only new generations within hard work
     // limits; full history remains an explicit operator command.
-    scheduler = new CoalescingMaintenanceScheduler(async () => {
+    const scheduler = new CoalescingMaintenanceScheduler(async () => {
       // If the low-priority child won the idle check immediately before this
       // main trigger, let that single bounded row finish or be reaped first.
       await enrichmentScheduler?.waitForIdle();
@@ -4183,7 +4188,7 @@ async function main() {
       }
       return result;
     });
-    retentionCadence = new AutomaticRetentionCadence(
+    const retentionCadence = new AutomaticRetentionCadence(
       () => buffer.prune(config.retentionDays, { maxRows: 128 }),
       {
         canRun: () => !scheduler?.status().inFlight && !enrichmentScheduler?.status().inFlight,
@@ -4193,7 +4198,7 @@ async function main() {
         onError: () => console.warn(JSON.stringify({ warning: "prune_failed" })),
       },
     );
-    maintenanceCadence = new AutomaticMaintenanceCadence(
+    const maintenanceCadence = new AutomaticMaintenanceCadence(
       scheduler,
       () => cachedBaseline,
       {
@@ -4249,7 +4254,7 @@ async function main() {
         },
       },
     );
-    enrichmentScheduler = new IdleEnrichmentScheduler(
+    const enrichmentScheduler = new IdleEnrichmentScheduler(
       () => !scheduler!.status().inFlight,
       async () => {
         const result = await enrichmentBoundary.run({ acceptPartial: true });
@@ -4261,7 +4266,7 @@ async function main() {
         return result;
       },
     );
-    enrichmentCadence = new AutomaticEnrichmentCadence(enrichmentScheduler, {
+    const enrichmentCadence = new AutomaticEnrichmentCadence(enrichmentScheduler, {
       intervalMs: 5 * 60_000,
       onError: (error) => {
         if (shuttingDown && error instanceof Error &&
@@ -4365,7 +4370,7 @@ async function main() {
     // busy ledger or a restarting collector could not take, through the hook
     // route's own callable. It never runs when PLIMSOLL_HOOK_SPOOL=off, and it
     // holds no timer at all in that case.
-    hookSpoolDrain = createHookSpoolDrain(config, buffer, { home: collectorHome() });
+    const hookSpoolDrain: HookSpoolDrain = createHookSpoolDrain(config, buffer, { home: collectorHome() });
     hookSpoolDrain.start();
     // OTLP intake-spool drain: every 2 s, at most 250 ms of 16-row writer
     // turns through the live route's own `appendMany`, stopping at the first
@@ -7114,6 +7119,7 @@ async function main() {
       }
     }
     if (uploadedEvents > 0) recordDeviceUpload();
+    const intentReplay = markUploaded ? await replayProjectIntentsIfPresent(config) : null;
     console.log(
       JSON.stringify(
         {
@@ -7127,6 +7133,7 @@ async function main() {
           signedUpload: lastResult?.signedUpload ?? false,
           response: lastResult?.response ?? null,
           localBufferRetained: true,
+          ...(intentReplay ? { projectIntents: intentReplay } : {}),
         },
         null,
         2,
@@ -7902,6 +7909,7 @@ async function main() {
     const confirmed = flag("--confirm");
     const includeConfig = flag("--include-config");
     const ledgerPath = collectorBufferPath();
+    const intentStatePath = path.join(collectorHome(), INTENT_STATE_DIRECTORY);
     const targets = [
       {
         exists: fs.existsSync(ledgerPath),
@@ -7915,6 +7923,12 @@ async function main() {
         path: `${ledgerPath}${suffix}`,
         purged: false,
       })),
+      {
+        exists: fs.existsSync(intentStatePath),
+        label: "project intent evidence and queue",
+        path: intentStatePath,
+        purged: false,
+      },
       {
         exists: fs.existsSync(collectorLogPath("collector.pid")),
         label: "foreground daemon pid file",
@@ -7953,7 +7967,8 @@ async function main() {
       }
       for (const target of targets) {
         if (!fs.existsSync(target.path)) continue;
-        fs.rmSync(target.path, { force: true, recursive: false });
+        if (target.path === intentStatePath) assertPrivateStateDirectory(intentStatePath);
+        fs.rmSync(target.path, { force: true, recursive: target.path === intentStatePath });
         target.purged = true;
       }
       if ([ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`].some((file) => fs.existsSync(file))) {

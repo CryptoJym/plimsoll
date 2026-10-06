@@ -57,8 +57,6 @@ function directLoopbackFetch(url: URL, init: RequestInit): Promise<Response> {
   const agent = url.protocol === "https:" ? directHttpsAgent : directHttpAgent;
   const request = url.protocol === "https:" ? https.request : http.request;
   return new Promise<Response>((resolve, reject) => {
-    let connectTimer: ReturnType<typeof setTimeout>;
-    let headersTimer: ReturnType<typeof setTimeout>;
     const clearDeadlines = () => { clearTimeout(connectTimer); clearTimeout(headersTimer); };
     const outgoing = request(url, {
       method: init.method ?? "GET", headers: Object.fromEntries(headers),
@@ -84,9 +82,9 @@ function directLoopbackFetch(url: URL, init: RequestInit): Promise<Response> {
         reject(error);
       }
     });
-    connectTimer = setTimeout(() => outgoing.destroy(directTimeoutError("UND_ERR_CONNECT_TIMEOUT")),
+    const connectTimer = setTimeout(() => outgoing.destroy(directTimeoutError("UND_ERR_CONNECT_TIMEOUT")),
       DIRECT_CONNECT_TIMEOUT_MS);
-    headersTimer = setTimeout(() => outgoing.destroy(directTimeoutError("UND_ERR_HEADERS_TIMEOUT")),
+    const headersTimer = setTimeout(() => outgoing.destroy(directTimeoutError("UND_ERR_HEADERS_TIMEOUT")),
       DIRECT_HEADERS_TIMEOUT_MS);
     outgoing.once("socket", (socket) => {
       const connected = () => clearTimeout(connectTimer);
@@ -185,6 +183,8 @@ export const MAX_RESPONSE_BYTES = 256 * 1024;
 export const DEFAULT_POST_TIMEOUT_MS = 30_000;
 
 export type JsonPostOptions = {
+  /** GET signs an empty body and sends no request body. */
+  method?: "POST" | "GET";
   url: string;
   body: string;
   headers?: Record<string, string>;
@@ -224,8 +224,8 @@ export async function postJson(input: JsonPostOptions): Promise<JsonPostResult> 
   const read = async (): Promise<JsonPostResult> => {
     if (input.beforeSend && !input.beforeSend()) throw new TransportError("source_changed");
     const response = await fetchCollectorUrl(url, {
-      method: "POST", redirect: "manual", headers: input.headers,
-      body: input.body, signal: controller.signal,
+      method: input.method ?? "POST", redirect: "manual", headers: input.headers,
+      body: input.method === "GET" ? undefined : input.body, signal: controller.signal,
     }, input.fetchImpl);
     // A late response from an injected fetch still needs to release its body.
     if (controller.signal.aborted) {
@@ -292,4 +292,11 @@ export function authenticatedJsonPost(input: JsonPostOptions & {
     }
   }
   return postJson({ ...input, headers });
+}
+
+/** Project choices share the uploader's signing, audience and bounded read path. */
+export function authenticatedJsonGet(input: Omit<JsonPostOptions, "body" | "method"> & {
+  installKey: string; signingSecret: string; now?: () => Date;
+}) {
+  return authenticatedJsonPost({ ...input, method: "GET", body: "" });
 }
