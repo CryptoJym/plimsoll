@@ -24,11 +24,15 @@ const linkedTrace = "json_extract(payload_json,'$.metadata.traceId')";
 const linkedSession = "json_extract(payload_json,'$.sessionId')";
 const linkedProducer = `coalesce(json_extract(payload_json,'$.metadata."conversation.id"'),
   json_extract(payload_json,'$.metadata.otelAttributes."conversation.id"'))`;
+const linkedProducerType = `coalesce(nullif(json_type(payload_json,'$.metadata."conversation.id"'),'null'),
+  json_type(payload_json,'$.metadata.otelAttributes."conversation.id"'))`;
+// json_extract returns encoded arrays/objects as SQL text too. Only a JSON
+// string has the same identity meaning as the native text() reader.
 export const CODEX_NATIVE_LINKED_SCOPE_SQL = `case when json_valid(payload_json) then
-  case when typeof(${linkedTrace})='text' and ${linkedTrace} glob '*[A-Za-z0-9]*'
-    and typeof(${linkedSession})='text' and ${linkedSession} glob '*[A-Za-z0-9]*'
+  case when json_type(payload_json,'$.metadata.traceId')='text' and ${linkedTrace} glob '*[A-Za-z0-9]*'
+    and json_type(payload_json,'$.sessionId')='text' and ${linkedSession} glob '*[A-Za-z0-9]*'
     and ${linkedSession}=session_id and json_extract(payload_json,'$.metadata.stitched') is not 'time_window'
-    and typeof(${linkedProducer})='text' and ${linkedProducer}=${linkedSession}
+    and ${linkedProducerType}='text' and ${linkedProducer}=${linkedSession}
   then 1 else 0 end else 0 end`;
 const linkedScopeQuery = CODEX_NATIVE_LINKED_SCOPE_SQL.replaceAll("payload_json","e.payload_json")
   .replaceAll("session_id","e.session_id");
@@ -700,7 +704,8 @@ export function captureCodexModel(
   }
   let vetoReason: string | undefined;
   traceVeto: for (const vetoTrace of vetoTraces) for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
-    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?`)
+    and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?
+    and case when json_valid(e.payload_json) then json_type(e.payload_json,'$.metadata.traceId') end='text'`)
     .iterate(...nativeScopeArgs,vetoTrace) as Iterable<EvidenceRow>) {
     const p = decodePeers([candidate])[0];
     if (!p) continue;
@@ -765,7 +770,8 @@ export function captureCodexModel(
       const aliases = node.kind === "request" ? ["request_id"] : node.kind === "call" ? ["call_id"] :
         ["codexTurnId","turn.id","turn_id"];
       const matches = aliases.map(alias => `case when json_valid(e.payload_json) then
-        json_extract(e.payload_json,'$.metadata."${alias}"') end=?`);
+        json_extract(e.payload_json,'$.metadata."${alias}"')=? and
+        json_type(e.payload_json,'$.metadata."${alias}"')='text' end`);
       const turnScope = node.kind === "turn" ? " and e.session_id is ?" : "";
       const suffix = ` and (${matches.join(" or ")})${turnScope}`;
       const suffixArgs = [...aliases.map(() => node.value),...(node.kind === "turn" ? [seedSession] : [])];
@@ -962,7 +968,8 @@ export function captureCodexModel(
     const sourceTrace = text(source.event.metadata.traceId);
     if (sourceTrace && !vetoTraces.has(sourceTrace)) {
       for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
-        and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?`)
+        and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?
+        and case when json_valid(e.payload_json) then json_type(e.payload_json,'$.metadata.traceId') end='text'`)
         .iterate(...nativeScopeArgs,sourceTrace) as Iterable<EvidenceRow>) {
         const fact = decodePeers([candidate])[0];
         if (!fact) continue;

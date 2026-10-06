@@ -824,7 +824,7 @@ export class LocalEventBuffer {
         (workspace_id,device_id,installation_epoch_id,
          case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end)
         where source='codex';
-      create index if not exists idx_codex_capture_linked_native_scope on buffered_events
+      create index if not exists idx_codex_capture_linked_native_scope_v2 on buffered_events
         (workspace_id,device_id,installation_epoch_id,${CODEX_NATIVE_LINKED_SCOPE_SQL},session_id)
         where source='codex';
       create index if not exists idx_codex_capture_request_candidates on buffered_events

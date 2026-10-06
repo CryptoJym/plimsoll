@@ -7,7 +7,7 @@ import {captureCodexModel,isCaptureGap,recordCodexTurnModel,CODEX_NATIVE_LINKED_
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',244);
+const completion=createProofCompletion('codex-capture-veto',340);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -70,7 +70,7 @@ try{
    source='codex' and workspace_id is ? and device_id is ? and installation_epoch_id is ?
    and ${CODEX_NATIVE_LINKED_SCOPE_SQL}=0`).all(binding.currentWorkspaceId,binding.currentDeviceId,
     binding.currentInstallationEpochId) as Array<{detail:string}>;
-  assert.ok(plans.some(p=>p.detail.includes('idx_codex_capture_linked_native_scope')),
+  assert.ok(plans.some(p=>p.detail.includes('idx_codex_capture_linked_native_scope_v2')),
    'uncertain facts use the indexed bucket, not a cross-conversation scan');
   f.deliver(f.append(make(1,{traceId:f.trace,'conversation.id':SESSION,request_id:'own',model:MODEL,
    otelEventName:'codex.sse_event'},{model:MODEL})),false);
@@ -222,8 +222,44 @@ try{
    f.append(make(3,metadata,{sessionId:otherSession,model:OTHER,eventType:'tool_result',
     inputTokens:undefined,outputTokens:undefined,observedAt:new Date(AT-3_600_000).toISOString()}));
    f.deliver(f.append(make(1,{traceId:f.trace,'conversation.id':SESSION,request_id:'reused',model:MODEL,
-    otelEventName:'codex.sse_event'},{model:MODEL})),boundary!=='nested-independent');
+   otelEventName:'codex.sse_event'},{model:MODEL})),boundary!=='nested-independent');
   });
+ // A JSON array/object is unknown native evidence even when SQLite renders it
+ // as text. It must stay in the uncertain bucket and veto a genuinely linked
+ // target or selected SSE source. Invalid producer metadata cannot partition.
+ for(const noise of [0,129])for(const targetKind of ['native-target','selected-source'] as const)
+  for(const identity of ['request_id','call_id'] as const)for(const conflict of ['model','account'] as const)
+   for(const representation of ['trace-array','trace-object','producer-array','producer-object'] as const)
+    cell(`linked-json-unknown/${targetKind}/${identity}/${conflict}/${representation}/${noise}`,noise,f=>{
+     const otherSession=uuid(997),model=conflict==='model'?OTHER:MODEL;
+     const metadata:Record<string,unknown>={traceId:'e'.repeat(32),'conversation.id':otherSession,[identity]:'reused',model};
+     if(representation==='trace-array')metadata.traceId=['e'.repeat(32)];
+     if(representation==='trace-object')metadata.traceId={value:'e'.repeat(32)};
+     if(representation==='producer-array')metadata['conversation.id']=[otherSession];
+     if(representation==='producer-object')metadata['conversation.id']={value:otherSession};
+     const fact=f.append(make(3,metadata,{sessionId:otherSession,model,eventType:'tool_result',
+      actorId:conflict==='account'?B:A,inputTokens:undefined,outputTokens:undefined,
+      observedAt:new Date(AT-3_600_000).toISOString()}));
+     assert.equal((f.b.database.prepare(`select ${CODEX_NATIVE_LINKED_SCOPE_SQL} as bucket
+      from buffered_events where id=?`).get(fact.id) as {bucket:number}).bucket,0);
+     const native={[identity]:'reused',traceId:f.trace,'conversation.id':SESSION,model:MODEL,otelEventName:'codex.sse_event'};
+     if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL})),true);
+     else{f.append(make(2,native,{model:MODEL}));f.deliver(f.append(make(1,{})),true);}
+    });
+ // SQL-rendered containers must not invent an alias to a literal native text
+ // id either. Keep exact JSON string matching in complete-trace and typed
+ // request/call/turn selectors as well as the independent-conversation index.
+ for(const noise of [0,129])for(const targetKind of ['native-target','selected-source'] as const)
+  for(const identity of ['traceId','request_id','call_id','codexTurnId'] as const)
+   for(const representation of ['array','object'] as const)
+    cell(`linked-json-unlinked/${targetKind}/${identity}/${representation}/${noise}`,noise,f=>{
+     const malformed=representation==='array'?['literal']:{value:'literal'},literal=JSON.stringify(malformed);
+     f.append(make(3,{[identity]:malformed,model:OTHER},{model:OTHER,eventType:'tool_result',
+      inputTokens:undefined,outputTokens:undefined,observedAt:new Date(AT-3_600_000).toISOString()}));
+     const native={traceId:f.trace,'conversation.id':SESSION,[identity]:literal,model:MODEL,otelEventName:'codex.sse_event'};
+     if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL})),false);
+     else{f.append(make(2,native,{model:MODEL}));f.deliver(f.append(make(1,{})),false);}
+    });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
  // producer bytes restored together, no paid capture/coverage witness injected.
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
@@ -300,6 +336,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,244,'every declared matrix cell executes');
+ assert.equal(executed,340,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}
