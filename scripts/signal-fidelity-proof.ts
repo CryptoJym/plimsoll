@@ -572,7 +572,9 @@ async function main() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "wi-signal-fidelity-"));
   // Keep config writes off the real machine and declare the fixture root the
   // managed-config apply guard enforces for the section 13 applies below.
-  useFixtureRoot(tempDir, { plimsollHome: tempDir });
+  const fixtureRoot = useFixtureRoot(tempDir, { plimsollHome: tempDir });
+  // Home ownership must be resolvable before testing real repository linkage.
+  fs.mkdirSync(fixtureRoot.home, { recursive: true, mode: 0o700 });
   const bufferPath = path.join(tempDir, "work-ledger.sqlite");
   const buffer = new LocalEventBuffer(bufferPath);
   const config = collectorConfigSchema.parse({});
@@ -2658,6 +2660,7 @@ async function main() {
     check(
       "history_upload_bodies_stay_metadata_only",
       historyBodies.length > 0 &&
+        historyRequests === historyBodies.length && historyForbiddenHits === 0 &&
         [HISTORY_RAW_SENTINEL, ...historyAdversarialSentinels].every((sentinel) =>
           historyBodies.every((requestBody) => !requestBody.includes(sentinel)) &&
           historyLogs.every((line) => !line.includes(sentinel)) &&
