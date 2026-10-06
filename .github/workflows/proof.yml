@@ -1324,6 +1324,9 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:privacy-mode --receipt evidence/privacy-mode-proof.json
 
+      - name: Prove fixture join ports refuse invalid defaults before staging
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-fixture-port
       - name: Prove transactional join and workspace isolation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-isolation

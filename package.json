@@ -485,7 +485,8 @@
     "proof:capture-history-import-main-handoff-claude": "tsx scripts/capture-history-import-main-handoff-proof.ts claude",
     "test:codex-usage-fields": "node --import tsx scripts/codex-usage-fields.test.ts",
     "proof:codex-response-identity-class": "tsx scripts/run-proof.ts scripts/codex-response-identity-class-proof.ts",
-    "proof:codex-response-identity-directed": "tsx scripts/run-proof.ts scripts/codex-response-identity-directed-proof.ts"
+    "proof:codex-response-identity-directed": "tsx scripts/run-proof.ts scripts/codex-response-identity-directed-proof.ts",
+    "proof:join-fixture-port": "tsx scripts/run-proof.ts scripts/join-fixture-port-proof.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

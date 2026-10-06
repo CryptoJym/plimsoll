@@ -157,19 +157,33 @@ export type JoinResult =
     };
 
 function readConfigWithoutCreating(configPath: string): CollectorConfig {
-  if (!fs.existsSync(configPath)) {
-    // Fixture proofs must never bind the operator's live default port. This
-    // override is unavailable unless the home is inside the declared proof
-    // root, and it has no effect on an installed or configured collector.
-    const fixtureRoot = process.env.PLIMSOLL_FIXTURE_ROOT;
-    const fixturePort = Number(process.env.PLIMSOLL_PROOF_JOIN_PORT);
-    const home = os.homedir();
-    const insideFixture = fixtureRoot && path.resolve(home).startsWith(path.resolve(fixtureRoot) + path.sep);
-    return collectorConfigSchema.parse(insideFixture && Number.isSafeInteger(fixturePort) &&
-      ((fixturePort >= 49300 && fixturePort <= 49399) ||
-       (fixturePort >= 49750 && fixturePort <= 49799)) ? { port: fixturePort } : {});
+  const fixtureRoot = process.env.PLIMSOLL_FIXTURE_ROOT;
+  const fixtureMode = fixtureRoot !== undefined;
+  const validFixturePort = (port: number) => Number.isSafeInteger(port) &&
+    ((port >= 49300 && port <= 49399) || (port >= 49750 && port <= 49799));
+  const override = process.env.PLIMSOLL_PROOF_JOIN_PORT;
+  const fixturePort = Number(override);
+  if (fixtureMode) {
+    const root = path.resolve(fixtureRoot);
+    const home = path.resolve(os.homedir());
+    const file = path.resolve(configPath);
+    if (!fixtureRoot || !(home === root || home.startsWith(root + path.sep)) ||
+        !file.startsWith(root + path.sep))
+      throw new Error("Join fixture home and config must be inside the declared fixture root.");
+    if (override !== undefined && !validFixturePort(fixturePort))
+      throw new Error("Join fixture port override must be in 49300–49399 or 49750–49799.");
   }
-  return collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+  if (fs.existsSync(configPath)) {
+    const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    if (fixtureMode && !validFixturePort(config.port))
+      throw new Error("Join fixture config must explicitly select an allowed fixture port.");
+    return config;
+  }
+  // A missing fixture config must never fall through to the live default.
+  // Ordinary installed collectors retain their existing config/defaults.
+  if (fixtureMode && !validFixturePort(fixturePort))
+    throw new Error("Join fixture requires an allowed PLIMSOLL_PROOF_JOIN_PORT before staging.");
+  return collectorConfigSchema.parse(fixtureMode ? { port: fixturePort } : {});
 }
 
 function activeConfigFingerprint(configPath: string) {

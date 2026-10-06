@@ -762,7 +762,6 @@ export function captureCodexModel(
     }
     return reasonFound;
   };
-  const nativeSession = trustedSession(event);
   type TurnName = { model: string; account: string | null; accounts: number };
   const boundary = row;
   const checkLocalFacts = (seed: AiInteractionEvent): { reason?: string; names: TurnName[] } => {
