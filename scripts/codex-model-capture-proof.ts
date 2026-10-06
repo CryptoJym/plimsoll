@@ -693,8 +693,8 @@ async function main() {
       "paired-model-cannot-overwrite-native-trace",
       (b) => {
         // Missing typed pairing shape on an older ledger cannot hide a
-        // contradictory native model on the target trace. The target gaps;
-        // the independently native SSE keeps its own financial custody.
+        // contradictory native model on the target or witness trace. The
+        // target gaps before fresh pair finance can be selected.
         const nativeLog = log("gpt-6.1-sol", false, true);
         b.append(nativeLog);
         b.database
@@ -706,7 +706,7 @@ async function main() {
         return span();
       },
       null,
-      "conflicting_pair_target_model",
+      "ambiguous_trace_model",
     );
     await run(
       "two-model-pair",
