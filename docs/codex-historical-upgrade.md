@@ -21,6 +21,18 @@ Delivery status exposes `historical_receipt_recovery_requires_opt_in` or
 `historical_migration_requires_opt_in`, with `historical_repair_hold` degradation.
 Existing queue work and new captures can continue; a repeated historical raw ID
 does not authorize new delivery repair.
+When delivery was disabled at capture, a separate durable cursor scans only
+raw rowids above the recorded boundary. Each pass keeps the existing row and
+byte budgets and a bounded writer turn, and uses the same admission, delivery
+ID and sealing rules. It does not advance the historical migration cursor or
+recover historical receipt lineage. Migration reports its new-row progress
+separately while retaining the historical hold and incomplete status. Restart
+resumes this cursor; the complete historical migration path is unchanged.
+New appends also allocate above its watermark when retention has removed the
+already-processed new raws, so delivery-disabled captures remain discoverable.
+If a separately reviewed operator repair later resumes historical migration,
+existing queue incarnations and ACK receipts prevent requeueing new rows that
+this cursor already admitted.
 Explicit replay also holds archived candidates before changing terminal receipts.
 Its dry run reports historicalHeld instead of promising a forbidden requeue.
 

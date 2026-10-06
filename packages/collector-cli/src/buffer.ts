@@ -2740,13 +2740,17 @@ export class LocalEventBuffer {
       ...event, metadata: { ...event.metadata, repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION },
     } : event);
     const insert = this.insertEventStatement ??= this.db.prepare(
+        // Retention may delete every post-boundary raw. Its durable migration
+        // cursor still reserves those rowids so a disabled append cannot land
+        // behind the next new-row scan. Complete-history hosts keep the same IDs.
         `insert or ignore into buffered_events
           (rowid, id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, first_received_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
            machine, account_hash, workspace_id, device_id, installation_epoch_id, project_key, cost_kind, privacy_generation)
         values
-          ((select max(coalesce(max(rowid),0),@historicalHighWater)+1 from buffered_events),
+          ((select max(coalesce(max(rowid),0),@historicalHighWater,
+              (select cursor_rowid from upload_new_row_migration where singleton=1))+1 from buffered_events),
            @id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @firstReceivedAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,

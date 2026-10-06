@@ -53,10 +53,21 @@ const open = (file: string) => new LocalEventBuffer(file, { ...options,
   delivery: { enabled: true, now: options.delivery.now } });
 async function advance(b: LocalEventBuffer, before: string, allowSend = false) {
   const now = options.delivery.now();
+  const assertNewCursor = () => {
+    const row = b.database.prepare(`select boundary_rowid as boundary,cursor_rowid as cursor
+      from upload_new_row_migration where singleton=1`).get() as {boundary:number;cursor:number};
+    const boundary = b.database.prepare(`select historical_high_water_rowid as n
+      from collector_historical_raw_boundary where singleton=1`).get() as {n:number};
+    assert.equal(row.boundary,boundary.n);
+    assert(row.cursor>=boundary.n,"new-row cursor must never enter immutable history");
+  };
+  assertNewCursor();
   assert.equal(snapshot(b), before, "head open must preserve every historical raw column");
   b.delivery.migrateLegacy({ now, maxRows: 32, maxWriterMs: 100 });
+  assertNewCursor();
   assert.equal(snapshot(b), before, "migration must preserve historical raw bytes");
   b.delivery.lease({ now });
+  assertNewCursor();
   assert.equal(snapshot(b), before, "lease must preserve historical raw bytes");
   let calls = 0;
   const result = await uploadBufferedEvents(config, b, { now: () => now,
@@ -68,8 +79,10 @@ async function advance(b: LocalEventBuffer, before: string, allowSend = false) {
         { status: 200, headers: { "content-type": "application/json" } });
     } });
   assert.equal(snapshot(b), before, "upload must preserve historical raw bytes");
+  assertNewCursor();
   for (let turn = 0; turn < 5; turn++) {
     b.projection.runMaintenance(now, { maxActiveMs: 100 });
+    assertNewCursor();
     assert.equal(snapshot(b), before, `maintenance turn ${turn + 1} must preserve historical raw bytes`);
   }
   return { calls, result };

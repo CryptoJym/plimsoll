@@ -141,6 +141,7 @@
     "proof:codex-admitted-projection": "tsx scripts/run-proof.ts scripts/codex-admitted-projection-proof.ts",
     "proof:codex-model-capture": "tsx scripts/run-proof.ts scripts/codex-model-capture-proof.ts",
     "proof:codex-historical-immutability": "tsx scripts/run-proof.ts scripts/codex-historical-immutability-proof.ts",
+    "proof:codex-post-upgrade-migration": "tsx scripts/run-proof.ts scripts/codex-post-upgrade-migration-proof.ts",
     "proof:codex-span-rollout-pairing": "tsx scripts/run-proof.ts scripts/codex-span-rollout-pairing-proof.ts",
     "proof:codex-capture-invariants-matrix": "tsx scripts/run-proof.ts scripts/codex-capture-invariants-matrix-proof.ts",
     "proof:codex-good-retry": "tsx scripts/good-retry-directed.ts",

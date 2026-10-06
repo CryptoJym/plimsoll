@@ -3,7 +3,7 @@ import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClau
 import { frozenCodexCapture, frozenCodexDelivery, installCodexFrozenCompatibility, rememberFrozenCodexCapture } from "./codex-named-capture";
 import { rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
-import { ensureHistoricalMutationBoundary, historicalRawProjection, historicalRepairHold, isHistoricalRaw, type HistoricalRepairHold } from "./historical-raw";
+import { ensureHistoricalMutationBoundary, historicalRawHighWater, historicalRawProjection, historicalRepairHold, isHistoricalRaw, type HistoricalRepairHold } from "./historical-raw";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -1230,6 +1230,29 @@ export class DeliveryOutbox {
        where singleton = 1 and privacy_migration_version < 1`,
      ).run({ now: this.clock().toISOString() });
     installCodexFrozenCompatibility(this.db);
+    // A held historical cursor cannot cover new captures made while delivery
+    // was disabled. This independent cursor starts at the immutable boundary;
+    // rollback readers ignore it and still use their original migration path.
+    this.db.exec(`create table if not exists upload_new_row_migration (
+      singleton integer primary key check(singleton=1),
+      boundary_rowid integer not null check(boundary_rowid>=0),
+      cursor_rowid integer not null check(cursor_rowid>=boundary_rowid),
+      paused_reason text,
+      last_visited integer not null default 0,
+      last_bytes integer not null default 0,
+      last_enqueued integer not null default 0,
+      last_dead integer not null default 0,
+      last_skipped_uploaded integer not null default 0,
+      updated_at text not null
+    );
+    create trigger if not exists trg_new_row_migration_boundary
+      before update on upload_new_row_migration
+      when new.boundary_rowid is not old.boundary_rowid or new.cursor_rowid<old.cursor_rowid
+      begin select raise(abort,'new_row_migration_boundary_is_immutable'); end;`);
+    const boundary = historicalRawHighWater(this.db);
+    this.db.prepare(`insert or ignore into upload_new_row_migration
+      (singleton,boundary_rowid,cursor_rowid,updated_at) values (1,?,?,?)`)
+      .run(boundary,boundary,this.clock().toISOString());
    }
 
   /** Only dead NULL-lineage receipts ahead of the durable cursor block attestation. */
@@ -2081,27 +2104,37 @@ export class DeliveryOutbox {
     return this.db.inTransaction ? fill() : this.db.transaction(fill).immediate();
   }
 
-  migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}) {
+  migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}): {
+    visited:number; bytes?:number; enqueued:number; dead:number; skippedUploaded:number;
+    quarantinedEvidence:number; complete:boolean;
+    paused:"pressure" | "slice_budget_too_small" | "receipt_lineage_pending" | HistoricalRepairHold | null;
+    newRows?:{cursorRowid:number;boundaryRowid:number;complete:boolean;
+      paused:"slice_budget_too_small" | "receipt_lineage_pending" | null};
+  } {
     const held = historicalRepairHold(this.db);
-    if (held) {
-      this.db.prepare(`update upload_control set migration_paused_reason=? where singleton=1`).run(held);
-      return {visited:0,enqueued:0,dead:0,skippedUploaded:0,quarantinedEvidence:0,complete:false,paused:held};
-    }
-    const receiptBackfill = this.backfillLegacyReceiptLineage({
+    // A hold protects history, not post-boundary backlog. Reuse the same
+    // candidate/queue/sealing rules with an independent durable watermark.
+    // Constructor receipt recovery remains held; this path never repairs it.
+    const newRowsOnly = held !== null;
+    const receiptBackfill = newRowsOnly ? {complete:false} : this.backfillLegacyReceiptLineage({
       maxRows: Math.min(options.maxRows ?? 256, 256),
       maxWriterMs: Math.min(options.maxWriterMs ?? 100, 100),
     });
-    if (!this.enabled) return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: null };
+    if (!this.enabled) {
+      if (held) this.db.prepare(`update upload_control set migration_paused_reason=? where singleton=1`).run(held);
+      return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: held };
+    }
     const now = options.now ?? new Date();
     const nowIso = now.toISOString();
     const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? this.limits.migrationBatchRows), 5_000));
     // The daemon bounds each writer turn below the OTLP 750 ms retry window.
     // Start the migration turn's clock after the candidate read: a cold large
     // ledger must not spend the whole writer budget on read-only work.
-    const writerBudgetMs = options.maxWriterMs === undefined
+    const requestedWriterMs = options.maxWriterMs ?? (newRowsOnly ? 100 : undefined);
+    const writerBudgetMs = requestedWriterMs === undefined
       ? undefined
-      : Math.max(1, Math.min(Math.trunc(options.maxWriterMs), 1_000));
-    const lineageDead = this.db.transaction(() =>
+      : Math.max(1, Math.min(Math.trunc(requestedWriterMs), 1_000));
+    const lineageDead = newRowsOnly ? 0 : this.db.transaction(() =>
       this.quarantineUnprovenLineage(Math.min(maxRows, 500), nowIso,
         writerBudgetMs === undefined ? undefined : performance.now() + writerBudgetMs),
     )();
@@ -2116,12 +2149,19 @@ export class DeliveryOutbox {
       return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: "pressure" as const };
     }
 
-    const control = this.db
+    const control: {cursorRowid:number;complete:number;boundaryRowid?:number} = newRowsOnly ? this.db.prepare(`select cursor_rowid as cursorRowid,0 as complete,
+      boundary_rowid as boundaryRowid from upload_new_row_migration where singleton=1`).get() as
+      { cursorRowid: number; complete: number; boundaryRowid: number } : this.db
       .prepare(
         `select migration_cursor_rowid as cursorRowid, migration_complete as complete
          from upload_control where singleton = 1`,
       )
       .get() as { cursorRowid: number; complete: number };
+    if (newRowsOnly && (!Number.isSafeInteger(control.cursorRowid) ||
+        control.cursorRowid < historicalRawHighWater(this.db) ||
+        control.boundaryRowid !== historicalRawHighWater(this.db))) {
+      throw new Error("new_row_migration_boundary_invalid");
+    }
     if (control.complete) {
       return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0,
         quarantinedEvidence: 0, complete: this.receiptLineageComplete(),
@@ -2270,7 +2310,15 @@ export class DeliveryOutbox {
         paused = "receipt_lineage_pending";
       }
       const complete = !writerBudgetExhausted && paused === null &&
-        this.receiptLineageComplete() && rows.length < maxRows && visited === rows.length;
+        (newRowsOnly || this.receiptLineageComplete()) && rows.length < maxRows && visited === rows.length;
+      if (newRowsOnly) {
+        this.db.prepare(`update upload_new_row_migration set cursor_rowid=@cursor,
+          paused_reason=@paused,last_visited=@visited,last_bytes=@bytes,last_enqueued=@enqueued,
+          last_dead=@dead,last_skipped_uploaded=@skippedUploaded,updated_at=@now where singleton=1`)
+          .run({cursor,paused,visited,bytes,enqueued,dead,skippedUploaded,now:nowIso});
+        this.db.prepare(`update upload_control set migration_paused_reason=? where singleton=1`).run(held);
+        return complete;
+      }
       this.db
         .prepare(
           `update upload_control set
@@ -2300,6 +2348,9 @@ export class DeliveryOutbox {
       return complete;
     });
     const complete = run();
+    if (newRowsOnly) return { visited, bytes, enqueued, dead, skippedUploaded, quarantinedEvidence,
+      complete:false,paused:held,
+      newRows:{cursorRowid:cursor,boundaryRowid:historicalRawHighWater(this.db),complete,paused} };
     return { visited, bytes, enqueued, dead, skippedUploaded, quarantinedEvidence, complete, paused };
   }
 

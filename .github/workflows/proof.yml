@@ -794,6 +794,9 @@ jobs:
       - name: Prove historical raw immutability and default migration and recovery holds
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-historical-immutability
+      - name: Prove new usage drains above held history with durable bounded progress
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-post-upgrade-migration
       - name: Prove gap-decided Codex rows cannot claim authority or erase native conflicts
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-authority
