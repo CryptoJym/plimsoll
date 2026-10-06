@@ -9,6 +9,7 @@ import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
+  REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
   validRepoContextId,
   type RepoContextRequest,
 } from "./repo-context";
@@ -286,6 +287,7 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
       "counterUncertain",
       "contextOccurrenceIndex",
       "activeRepoContextId",
+      "repoContextPolicyGeneration", // Unreleased r2 input only; stripped on write.
       // Accepted only to migrate old checkpoints without rebuilding or
       // carrying their parser-wide attribution forward.
       "git",
@@ -327,6 +329,11 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
   if (conversationId && !isCodexUuid(conversationId)) return undefined;
   if (value.git !== undefined && !validLegacyPersistedGit(value.git)) return undefined;
   if (value.activeRepoContextId !== undefined && !validRepoContextId(value.activeRepoContextId)) {
+    return undefined;
+  }
+  if (value.repoContextPolicyGeneration !== undefined &&
+      (!Number.isSafeInteger(value.repoContextPolicyGeneration) ||
+        typeof value.repoContextPolicyGeneration !== "number" || value.repoContextPolicyGeneration < 1)) {
     return undefined;
   }
 
@@ -1819,6 +1826,18 @@ export class RolloutTailer {
     }> = [];
     const accountHome = this.activeCaptureRoot?.directory ?? this.sessionsDir;
     const planReadings: Array<{ observedAt?: string; window: PlanLimitWindow; planType?: string; limitId?: string }> = [];
+    const capturedEventId = state.conversationId
+      ? deterministicEventId(["codex-rollout", state.conversationId, String(state.tokenCountIndex)]) : undefined;
+    if (!state.activeRepoContextId || !this.buffer.repoContextHasCurrentCapturePolicy(
+      state.activeRepoContextId, capturedEventId ? [capturedEventId] : [],
+    )) {
+      // Preserve the cursor, counters, model and event indices. Only the old
+      // context binding migrates; the saved result and its earlier rows stay.
+      state.activeRepoContextId = this.buffer.repoContextUnknownId("codex", [
+        fileIdentity, "capture-policy", REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
+        state.activeRepoContextId ?? "unknown", state.contextOccurrenceIndex,
+      ].join(":"));
+    }
     let activeRepoContext: ActiveContext = state.activeRepoContextId
       ? { kind: "persisted", contextId: state.activeRepoContextId }
       : undefined;
@@ -1829,7 +1848,6 @@ export class RolloutTailer {
     ): ActiveContext => {
       state.contextOccurrenceIndex += 1;
       state.activeRepoContextId = undefined;
-      if (typeof cwd !== "string") return undefined;
       const occurrence = [
         "codex-rollout",
         fileIdentity,
@@ -1837,8 +1855,10 @@ export class RolloutTailer {
         type,
         String(state.contextOccurrenceIndex),
       ].join(":");
-      const request = this.buffer.repoContextOccurrenceRequest("codex", occurrence, cwd);
-      return request ? { kind: "request", request } : undefined;
+      const request = typeof cwd === "string"
+        ? this.buffer.repoContextOccurrenceRequest("codex", occurrence, cwd) : null;
+      return request ? { kind: "request", request }
+        : { kind: "persisted", contextId: this.buffer.repoContextUnknownId("codex", occurrence) };
     };
 
     for (const line of lines) {
