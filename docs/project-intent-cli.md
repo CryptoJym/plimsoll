@@ -75,14 +75,25 @@ Timeouts replay identical receipt IDs/facts. A matching stale 409 advances only
 the separately persisted `expectedRevision`; three stale recoveries exhaust the
 durable retry budget and remain for review. Other permanent refusals do not loop
 on upload cycles. Registry stale refetches choices but retains refused evidence;
-a new explicit declaration can supersede that refused queue item with a new ID
-and evidence reference. A refused, never-admitted proposal cannot anchor the new
+a new explicit declaration can supersede the proved unadmitted queue branch with
+a new ID and evidence reference. This includes never-sent rotations, declarations
+on the same attempt and folder-default null cutovers queued after the refused
+head. Receipt facts, ACKs, review reasons and local source evidence stay immutable;
+each retired row gains a local link to the refusal and replacement. A refused,
+never-admitted proposal cannot anchor the new
 attempt: renewal uses the last admissible accepted or ambiguous receipt. With no
 such prefix, the renewed receipt has a fresh root/attempt and null parent, even
 after root/account rotation. Native identity, session epoch and old receipt facts
-remain unchanged. Only a new declaration renews authority; rebinding the refused
+remain unchanged. The producer saves local dispatch evidence before each POST;
+an outstanding dispatch or prior ambiguous result remains potentially admitted
+even after a later definite refusal. Missing legacy dispatch evidence has unknown
+attempt count and cannot prove non-admission. Such renewal stays pending with
+`intent_renewal_admission_unproved`; it never drops uncertain facts. These dispatch
+and supersession fields are local only and never enter the v1 receipt or request.
+Only a new declaration renews authority; rebinding the refused
 launch cannot do so. Ambiguous delivery is never superseded. Superseded refusals
-remain in review and the separate `retainedRefusals` count; `queued` counts active
+remain as evidence in the separate `retainedRefusals` count, which also includes
+unsent dependent proposals; their original review reasons are preserved. `queued` counts active
 pending receipts. Existing invalid lineage remains pending with
 `intent_lineage_unproved`, rather than rewriting earlier facts. Revocation invalidates
 cached authority and stops sending. No refusal switches project or adapter.

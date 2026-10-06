@@ -478,3 +478,161 @@ test("registry renewal anchors rotation to admitted history, and ambiguity never
     assert.doesNotThrow(() => appendProjectIntentReceipt([ambiguous], next));
   } finally { await g.close(); }
 });
+
+// Ported from check-r2/checks/renewal-dependent-queue-repro.ts: B is queued before A's first POST.
+test("P04-R2-01 explicit renewal supersedes a refused head and its never-sent rotated child", async () => {
+  const f = await createIntentFixture();
+  try {
+    const project = (await f.p.choices()).projects[0], native = nativeId();
+    const firstLaunch = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot, project });
+    const first = f.p.bind(firstLaunch.launchId, native)!;
+    const childRoot = path.join(f.root, "codex-rotated");
+    const childLaunch = f.p.declare({ source: "codex", sourceRoot: childRoot, project, principal: "offline-rotated-principal" });
+    const child = f.p.bind(childLaunch.launchId, native, { continuation: true })!;
+    assert.equal(child.parentAttemptId, first.attemptId);
+    f.setProjects(INTENT_FIXTURE_PROJECTS.map(p => ({ ...p, projectRegistryRevision: 2 })));
+    f.setPost(() => ({ status: 409, body: { error: "project_registry_stale" } }));
+    assert.equal((await f.p.sendSession(native)).reason, "project_registry_stale");
+    const old = f.p.store.read<IntentSession>("sessions", native)!;
+    assert.equal(f.calls.filter(c => c.method === "POST").length, 1);
+    assert.equal(old.receipts[1].review, null); assert.equal(old.receipts[1].ack, null);
+    const renewed = f.p.declare({ source: "codex", sourceRoot: childRoot,
+      project: (await f.p.choices()).projects[0], principal: "offline-rotated-principal" });
+    const next = f.p.bind(renewed.launchId, native, { continuation: true })!;
+    let admitted = false;
+    f.setPost(body => {
+      assert.equal(body.expectedRevision, 0);
+      try { appendProjectIntentReceipt([], body.receipt); }
+      catch { return { status: 409, body: { error: "attempt_lineage_invalid" } }; }
+      admitted = true;
+      return { status: 202, body: fixtureIntentAck(body.receipt) };
+    });
+    const delivery = await f.p.sendSession(native);
+    assert.equal(admitted, true); assert.equal(delivery.delivered, 1); assert.equal(delivery.queued, 0);
+    assert.equal(delivery.retainedRefusals, 2);
+    assert.deepEqual(f.calls.filter(c => c.method === "POST").map(c => JSON.parse(c.body).receipt.receiptId),
+      [first.receiptId, next.receiptId], "never dispatch the superseded child");
+    assert.equal(next.rootAttemptId, next.attemptId); assert.equal(next.parentAttemptId, null);
+    assert.equal(next.nativeSessionKey, first.nativeSessionKey); assert.equal(next.sessionEpochKey, first.sessionEpochKey);
+    const state = f.p.store.read<IntentSession>("sessions", native)!;
+    for (let index = 0; index < 2; index++) {
+      const row = state.receipts[index], prior = old.receipts[index];
+      assert.equal(row.supersededBy, next.receiptId); assert.equal(row.delivered, false);
+      assert.deepEqual(row.receipt, prior.receipt); assert.deepEqual(row.evidence, prior.evidence);
+      assert.deepEqual(row.ack, prior.ack); assert.equal(row.review, prior.review);
+    }
+    assert.equal(state.receipts[2].delivered, true);
+    assert.equal(state.receipts[0].dispatch!.attempts, 1); assert.equal(state.receipts[1].dispatch!.attempts, 0);
+    assert.equal(state.receipts[1].supersession!.refusedReceiptId, first.receiptId);
+    const restarted = new ProjectIntentProducer(f.config, { directory: path.join(f.root, "collector") });
+    const replay = await restarted.replay();
+    assert.equal(replay.queued, 0); assert.equal(replay.retainedRefusals, 2);
+    assert.equal(f.calls.filter(c => c.method === "POST").length, 2);
+  } finally { await f.close(); }
+});
+
+test("dispatch proof survives restart before POST and ambiguous, interrupted or legacy facts cannot be superseded", async () => {
+  for (const mode of ["lost_ack", "interrupted", "legacy"]) {
+    const f = await createIntentFixture();
+    try {
+      const project = (await f.p.choices()).projects[0], native = nativeId();
+      const launch = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot, project });
+      const first = f.p.bind(launch.launchId, native)!;
+      const childLaunch = f.p.declare({ source: "codex", sourceRoot: path.join(f.root, "codex-rotated"), project, principal: "queued-principal" });
+      const child = f.p.bind(childLaunch.launchId, native, { continuation: true })!;
+      if (mode !== "lost_ack") f.p.store.mutate<IntentSession, void>("sessions", native, state => {
+        if (mode === "legacy") delete state!.receipts[0].dispatch;
+        else {
+          state!.receipts[0].dispatch = { attempts: 1, pending: true, possibleAdmission: false };
+          state!.lease = { id: nativeId(), until: 0 }; // durable marker after a sender interrupted before saving its outcome
+        }
+        return { state: state!, result: undefined };
+      });
+      let observedPending = 0;
+      const restarted = new ProjectIntentProducer(f.config, { directory: path.join(f.root, "collector"),
+        fetchImpl: async (url, init) => {
+          if (init?.method !== "POST") return fetch(url, init);
+          const saved = new ProjectIntentProducer(f.config, { directory: path.join(f.root, "collector") })
+            .store.read<IntentSession>("sessions", native)!;
+          assert.equal(saved.receipts[0].dispatch!.pending, true, "persisted before even entering transport");
+          const body = JSON.parse(String(init!.body));
+          assert.deepEqual(Object.keys(body).sort(), ["expectedRevision", "receipt", "tenantId"]);
+          assert.equal("dispatch" in body.receipt, false); assert.equal("supersession" in body.receipt, false);
+          observedPending++;
+          return fetch(url, init);
+        } });
+      if (mode === "lost_ack") {
+        f.setPost(body => ({ status: 202, body: { ...fixtureIntentAck(body.receipt), sessionId: nativeId() } }));
+        assert.equal((await restarted.sendSession(native)).reason, "invalid_intent_ack");
+      }
+      f.setProjects(INTENT_FIXTURE_PROJECTS.map(p => ({ ...p, projectRegistryRevision: 2 })));
+      f.setPost(() => ({ status: 409, body: { error: "project_registry_stale" } }));
+      assert.equal((await restarted.sendSession(native)).reason, "project_registry_stale");
+      assert.ok(observedPending > 0);
+      const before = f.p.store.read<IntentSession>("sessions", native)!;
+      assert.equal(before.receipts[0].dispatch!.possibleAdmission, true);
+      assert.equal(before.receipts[0].dispatch!.attempts, mode === "legacy" ? null : 2);
+      const renewal = f.p.declare({ source: "codex", sourceRoot: path.join(f.root, "codex-rotated"),
+        project: (await f.p.choices()).projects[0], principal: "queued-principal" });
+      assert.throws(() => f.p.bind(renewal.launchId, native, { continuation: true }), /intent_renewal_admission_unproved/);
+      const after = f.p.store.read<IntentSession>("sessions", native)!;
+      assert.deepEqual(after, before, `${mode}: no receipt, ACK, evidence or dispatch proof is overwritten`);
+      assert.deepEqual(after.receipts.map(row => row.receipt), [first, child]);
+      assert.ok(after.receipts.every(row => row.supersededBy === null));
+      assert.equal(f.p.store.read<IntentLaunch>("launches", renewal.launchId)!.localState, "awaiting_native_binding");
+    } finally { await f.close(); }
+  }
+});
+
+test("renewal retires multiple queued rotations and a default cutover while preserving an admitted prefix", async () => {
+  for (const suffix of ["rotations", "default_cutover"]) {
+    const f = await createIntentFixture();
+    try {
+      const project = (await f.p.choices()).projects[0], native = nativeId();
+      const rootLaunch = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot, project });
+      const root = f.p.bind(rootLaunch.launchId, native)!;
+      assert.equal((await f.p.sendSession(native)).delivered, 1);
+      const refusedLaunch = f.p.declare({ source: "codex", sourceRoot: path.join(f.root, "codex-rotated"), project, principal: "refused-principal" });
+      const refused = f.p.bind(refusedLaunch.launchId, native, { continuation: true })!;
+      for (let count = 0; count < 2; count++) {
+        const queued = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot, project, principal: `queued-principal-${count}`,
+          basis: suffix === "default_cutover" && count === 1 ? "trusted_folder_default" : "hand_start" });
+        f.p.bind(queued.launchId, native, { continuation: true });
+        if (suffix === "default_cutover" && count === 1) f.p.close(queued.launchId);
+      }
+      f.setProjects(INTENT_FIXTURE_PROJECTS.map(p => ({ ...p, projectRegistryRevision: 2 })));
+      // A definite earlier session absence cannot poison the later registry refusal's proof.
+      f.setPost(() => ({ status: 404, body: { error: "session_not_found" } }));
+      assert.equal((await f.p.sendSession(native)).reason, "session_not_found");
+      f.setPost(() => ({ status: 409, body: { error: "project_registry_stale" } }));
+      assert.equal((await f.p.sendSession(native)).reason, "project_registry_stale");
+      const before = f.p.store.read<IntentSession>("sessions", native)!;
+      const renewal = f.p.declare({ source: "codex", sourceRoot: f.sourceRoot,
+        project: (await f.p.choices()).projects[0], principal: "renewed-principal" });
+      const next = f.p.bind(renewal.launchId, native, { continuation: true })!;
+      assert.equal(next.rootAttemptId, root.rootAttemptId); assert.equal(next.parentAttemptId, root.attemptId);
+      assert.equal(next.sessionEpochKey, root.sessionEpochKey);
+      f.setPost(body => {
+        assert.equal(body.expectedRevision, 1);
+        const admitted = appendProjectIntentReceipt([root], body.receipt);
+        return { status: 202, body: fixtureIntentAck(body.receipt, admitted.receipts.length) };
+      });
+      const delivery = await f.p.sendSession(native);
+      assert.equal(delivery.delivered, 1); assert.equal(delivery.queued, 0);
+      assert.equal(delivery.retainedRefusals, before.receipts.length - 1);
+      const after = f.p.store.read<IntentSession>("sessions", native)!;
+      assert.deepEqual(after.receipts[0], before.receipts[0], "accepted fact, ACK and evidence are immutable");
+      for (let index = 1; index < before.receipts.length; index++) {
+        const archived = after.receipts[index];
+        assert.deepEqual({ ...archived, supersededBy: null, supersession: undefined },
+          { ...before.receipts[index], supersession: undefined });
+        assert.equal(archived.supersededBy, next.receiptId);
+        assert.equal(archived.supersession!.refusedReceiptId, refused.receiptId);
+      }
+      const posted = f.calls.filter(c => c.method === "POST").map(c => JSON.parse(c.body).receipt.receiptId);
+      assert.deepEqual(posted, [root.receiptId, refused.receiptId, refused.receiptId, next.receiptId]);
+      assert.equal((await f.p.replay()).queued, 0, "replaying archived branch evidence makes no new POST");
+      assert.equal(f.calls.filter(c => c.method === "POST").length, 4);
+    } finally { await f.close(); }
+  }
+});

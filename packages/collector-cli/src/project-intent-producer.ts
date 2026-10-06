@@ -19,6 +19,8 @@ import { INTENT_STATE_DIRECTORY, INTENT_STATE_LIMITS, IntentStore } from "./proj
 const key = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const revision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const uuid = z.string().uuid();
+const dispatchSchema = z.object({ attempts: revision.nullable(), pending: z.boolean(), possibleAdmission: z.boolean() }).strict();
+const newDispatch = (): z.infer<typeof dispatchSchema> => ({ attempts: 0, pending: false, possibleAdmission: false });
 export const intentChoiceSchema = z.object({ projectKey: key, projectLabel: z.string().max(200),
   projectRegistryRevision: revision.refine(value => value > 0) }).strict();
 const choicesSchema = z.object({ schema: z.literal("plimsoll-project-intent-projects/v1"),
@@ -42,6 +44,10 @@ function refusal(body: unknown): string {
   const value = body && typeof body === "object" ? (body as { error?: unknown }).error : null;
   return typeof value === "string" && REFUSALS.has(value) ? value : "intent_remote_refused";
 }
+function definitiveRefusal(status: number, body: unknown): boolean {
+  return status >= 400 && status < 500 && body !== null && typeof body === "object" &&
+    Object.keys(body).length === 1 && refusal(body) !== "intent_remote_refused" && refusal(body) !== "service_unavailable";
+}
 
 type Scope = { installId: string; tenantId: string; audience: string; ledgerEpoch: string | null };
 type Registry = { scope: Scope; fetchedAt: string; projects: IntentChoice[]; refused: string | null };
@@ -59,6 +65,7 @@ export type IntentLaunch = {
 type QueuedReceipt = { receipt: ProjectIntentReceipt; expectedRevision: number; delivered: boolean;
   launchId: string;
   staleRecoveries: number; supersededBy: string | null;
+  dispatch?: z.infer<typeof dispatchSchema>; supersession?: { refusedReceiptId: string };
   ack: z.infer<typeof ackSchema> | null; review: string | null; evidence: { sourceRootPath: string; incarnationId: string } };
 export type IntentSession = {
   scope: Scope; source: IntentSource; sessionId: string; nativeSessionKey: string; incarnationId: string;
@@ -66,12 +73,35 @@ export type IntentSession = {
 };
 const sameScope = (a: Scope, b: Scope) => JSON.stringify(a) === JSON.stringify(b);
 
-/** Refused proposals remain evidence, but may not anchor a server attempt that was never admitted. */
+function provedUnadmitted(row: QueuedReceipt): boolean {
+  const parsed = dispatchSchema.safeParse(row.dispatch);
+  return !row.delivered && row.ack === null && parsed.success && parsed.data.attempts !== null &&
+    !parsed.data.pending && !parsed.data.possibleAdmission;
+}
+/** A refused queue head also blocks every later proposal. Retire the branch only with durable non-admission proof. */
+function renewalBranch(rows: QueuedReceipt[]): QueuedReceipt[] {
+  const start = rows.findIndex(row => !row.delivered && !row.supersededBy && row.review === "project_registry_stale");
+  if (start === -1) return [];
+  const branch = rows.slice(start).filter(row => !row.supersededBy);
+  if (branch.some(row => !provedUnadmitted(row))) throw new IntentError("intent_renewal_admission_unproved");
+  return branch;
+}
+function settleDispatch(row: QueuedReceipt, unadmitted: boolean): void {
+  const parsed = dispatchSchema.safeParse(row.dispatch);
+  if (!parsed.success) throw new IntentError("intent_dispatch_evidence_invalid");
+  row.dispatch = { ...parsed.data, pending: false, possibleAdmission: parsed.data.possibleAdmission || !unadmitted };
+}
+/** Superseded proposals remain immutable evidence outside the admissible P02 history. */
 function admissionHistory(rows: QueuedReceipt[], renewing: QueuedReceipt[] = []): ProjectIntentReceipt[] {
   let history: ProjectIntentReceipt[] = [];
   for (const row of rows) {
     if (row.supersededBy || renewing.includes(row)) {
-      if (row.delivered || row.review !== "project_registry_stale") throw new IntentError("intent_supersession_unproved");
+      // Keep compatibility with already-superseded R2 refusals; new branch links require explicit proof.
+      const legacyRefusal = row.supersededBy && !row.supersession && row.review === "project_registry_stale";
+      const refusal = rows.find(candidate => candidate.receipt.receiptId === row.supersession?.refusedReceiptId);
+      const branchProof = refusal?.review === "project_registry_stale" && provedUnadmitted(refusal) && provedUnadmitted(row);
+      if (row.delivered || row.ack !== null || !(legacyRefusal || branchProof || renewing.includes(row) && provedUnadmitted(row)))
+        throw new IntentError("intent_supersession_unproved");
       continue;
     }
     try { history = appendProjectIntentReceipt(history, row.receipt).receipts; }
@@ -252,11 +282,11 @@ export class ProjectIntentProducer {
         if (existing && existing.receipt.accountKey === accountKey && existing.receipt.sourceRootKey === sourceRootKey)
           return { state: session, result: existing.receipt };
         if (existing?.supersededBy) throw new IntentError("intent_declaration_superseded");
-        const renewing = session.receipts.filter(item => !item.delivered && !item.supersededBy && item.review === "project_registry_stale");
+        const renewing = renewalBranch(session.receipts);
         if (renewing.some(item => item.launchId === launchId))
           throw new IntentError("intent_registry_renewal_requires_new_declaration");
         if (renewing.length && session.lease && session.lease.until > Date.now()) throw new IntentError("intent_delivery_busy");
-        // Include accepted and ambiguous facts. Only an explicit new declaration can replace a proved refusal.
+        // Include accepted and ambiguous facts. Only a new declaration can retire the proved unadmitted suffix.
         const history = admissionHistory(session.receipts, renewing);
         const last = history.at(-1);
         const sameAttempt = last && last.accountKey === accountKey && last.sourceRootKey === sourceRootKey;
@@ -274,9 +304,12 @@ export class ProjectIntentProducer {
           adapterVersion: "1.0.0",
         });
         appendProjectIntentReceipt(history, receipt);
-        for (const refused of renewing) refused.supersededBy = receipt.receiptId;
+        for (const refused of renewing) {
+          refused.supersededBy = receipt.receiptId;
+          refused.supersession = { refusedReceiptId: renewing[0].receipt.receiptId };
+        }
         session.receipts.push({ receipt, launchId, staleRecoveries: 0, supersededBy: null, expectedRevision: session.observedRevision, delivered: false, ack: null,
-          review: null, evidence: { sourceRootPath: root, incarnationId: session.incarnationId } });
+          dispatch: newDispatch(), review: null, evidence: { sourceRootPath: root, incarnationId: session.incarnationId } });
         return { state: session, result: receipt };
       });
       launch.localState = "bound";
@@ -306,7 +339,7 @@ export class ProjectIntentProducer {
             projectRegistryRevision: null, effectiveFrom: from, effectiveUntil: null, basis: "hand_start", adapterId: "hand-start" });
           appendProjectIntentReceipt(admissionHistory(session.receipts), receipt);
           session.receipts.push({ receipt, launchId: `${launchId}-close`, staleRecoveries: 0, supersededBy: null, expectedRevision: session.observedRevision, delivered: false, ack: null,
-            review: null, evidence: session.receipts.at(-1)!.evidence });
+            dispatch: newDispatch(), review: null, evidence: session.receipts.at(-1)!.evidence });
           return { state: session, result: undefined };
         });
         launch.receiptDraft.effectiveUntil = until;
@@ -315,10 +348,11 @@ export class ProjectIntentProducer {
       return { state: launch, result: undefined };
     });
   }
-  private review(sessionId: string, receiptId: string, code: string, leaseId: string) {
+  private review(sessionId: string, receiptId: string, code: string, leaseId: string, unadmitted = false) {
     this.store.mutate<IntentSession, void>("sessions", sessionId, state => {
       if (!state || state.lease?.id !== leaseId) throw new IntentError("intent_delivery_lease_lost");
       const item = state.receipts.find(row => row.receipt.receiptId === receiptId)!;
+      settleDispatch(item, unadmitted);
       item.review = code;
       return { state, result: undefined };
     });
@@ -351,6 +385,20 @@ export class ProjectIntentProducer {
           throw new IntentError("intent_receipt_changed");
         const body = JSON.stringify(projectIntentRequestSchema.parse({ tenantId: this.scope.tenantId,
           expectedRevision: Math.max(session.observedRevision, pending.expectedRevision), receipt: parsed }));
+        // Save before the network call: an interrupted dispatch or any prior ambiguity cannot be renewed away.
+        this.store.mutate<IntentSession, void>("sessions", sessionId, state => {
+          if (!state || state.lease?.id !== leaseId || state.lease.until <= Date.now())
+            throw new IntentError("intent_delivery_lease_lost");
+          const item = state.receipts.find(row => row.receipt.receiptId === parsed.receiptId)!;
+          if (item.delivered || item.supersededBy) throw new IntentError("intent_delivery_lease_lost");
+          const recorded = dispatchSchema.safeParse(item.dispatch);
+          if (item.dispatch !== undefined && !recorded.success) throw new IntentError("intent_dispatch_evidence_invalid");
+          const prior = recorded.success ? recorded.data : { attempts: null, pending: false, possibleAdmission: true };
+          if (prior.attempts === Number.MAX_SAFE_INTEGER) throw new IntentError("intent_dispatch_limit");
+          item.dispatch = { attempts: prior.attempts === null ? null : prior.attempts + 1, pending: true,
+            possibleAdmission: prior.possibleAdmission || prior.pending };
+          return { state, result: undefined };
+        });
         let response;
         try { response = await authenticatedJsonPost({ ...this.requestOptions(), url: this.endpoint, body }); }
         catch { reason = "intent_transport_deferred"; this.review(sessionId, parsed.receiptId, reason, leaseId); break; }
@@ -359,6 +407,7 @@ export class ProjectIntentProducer {
           this.store.mutate<IntentSession, void>("sessions", sessionId, state => {
             if (!state || state.lease?.id !== leaseId) throw new IntentError("intent_delivery_lease_lost");
             const item = state.receipts.find(row => row.receipt.receiptId === parsed.receiptId)!;
+            settleDispatch(item, false);
             item.ack = ack.data; item.delivered = true;
             item.review = ack.data.project.reason ?? ack.data.project.companyReason;
             state.observedRevision = Math.max(state.observedRevision, ack.data.revision);
@@ -372,6 +421,7 @@ export class ProjectIntentProducer {
             if (!state || state.lease?.id !== leaseId) throw new IntentError("intent_delivery_lease_lost");
             state.observedRevision = Math.max(state.observedRevision, stale.data.revision);
             const item = state.receipts.find(row => row.receipt.receiptId === parsed.receiptId)!;
+            settleDispatch(item, true);
             item.expectedRevision = state.observedRevision;
             item.staleRecoveries++;
             item.review = item.staleRecoveries >= 3 ? "intent_revision_retry_exhausted" : "intent_revision_stale";
@@ -381,7 +431,7 @@ export class ProjectIntentProducer {
           continue;
         }
         reason = response.status === 202 ? "invalid_intent_ack" : refusal(response.body);
-        this.review(sessionId, parsed.receiptId, reason, leaseId);
+        this.review(sessionId, parsed.receiptId, reason, leaseId, definitiveRefusal(response.status, response.body));
         if (response.status === 401 || response.status === 403)
           this.store.mutate<Registry, void>("registry", "current", () => ({ state: {
             scope: this.scope, fetchedAt: this.now().toISOString(), projects: [], refused: reason,
