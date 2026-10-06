@@ -73,7 +73,11 @@ try{
      if(conflict!=='none'){
       const model=conflict==='model'?OTHER:MODEL;
       const meta:Record<string,unknown>={traceId:f.trace,model};
-      if(state==='gap')meta['gen_ai.request.model']=model===MODEL?OTHER:MODEL;
+      // Make a real gap from a conflicting trace fact that will AGREE with
+      // the later target. Only the retained gap's single native attributes
+      // can then veto the fresh pair; no internal-model conflict masks it.
+      if(state==='gap')f.append(make(4,{traceId:f.trace,model:MODEL},
+       {eventType:'tool_result',model:MODEL,inputTokens:undefined,outputTokens:undefined}));
       const fact=f.append(make(3,meta,{eventType:state==='counterless'||state==='distant'?'tool_result':'assistant_response',
        model,actorId:conflict==='account'?B:A,sessionId:conflict==='session'?uuid(997):SESSION,
        ...(state==='counterless'||state==='distant'?{inputTokens:undefined,outputTokens:undefined}:{inputTokens:7,outputTokens:1}),
@@ -112,7 +116,8 @@ try{
    cell(`linked/${identity}/${conflict}/${state}/${noise}`,noise,f=>{
     const key=identity==='request'?'request_id':identity==='call'?'call_id':'codexTurnId';
     const model=conflict==='model'?OTHER:MODEL,meta:Record<string,unknown>={[key]:'physical',model};
-    if(state==='gap')meta['gen_ai.request.model']=model===MODEL?OTHER:MODEL;
+    if(state==='gap')f.append(make(4,{[key]:'physical',model:MODEL},
+     {eventType:'tool_result',model:MODEL,inputTokens:undefined,outputTokens:undefined}));
     const fact=f.append(make(3,meta,{eventType:state==='acked'||state==='gap'?'assistant_response':'tool_result',
      model,actorId:conflict==='account'?B:A,sessionId:conflict==='session'?uuid(997):SESSION,
      ...(state==='acked'||state==='gap'?{inputTokens:7,outputTokens:1}:{inputTokens:undefined,outputTokens:undefined}),
