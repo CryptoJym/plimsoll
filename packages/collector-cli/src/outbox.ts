@@ -3,6 +3,7 @@ import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClau
 import { frozenCodexCapture, frozenCodexDelivery, installCodexFrozenCompatibility, rememberFrozenCodexCapture } from "./codex-named-capture";
 import { rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
+import { ensureHistoricalMutationBoundary, historicalRawProjection, historicalRepairHold, isHistoricalRaw, type HistoricalRepairHold } from "./historical-raw";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
@@ -134,6 +135,7 @@ export type DeliveryStatus = {
     | "remote_rejected"
     | "auth_circuit"
     | "contract_circuit"
+    | "historical_repair_hold"
   >;
   remainingDelivery: number;
   active: {
@@ -158,7 +160,7 @@ export type DeliveryStatus = {
   migration: {
     cursorRowid: number;
     complete: boolean;
-    pausedReason: "pressure" | "slice_budget_too_small" | "receipt_lineage_pending" | null;
+    pausedReason: "pressure" | "slice_budget_too_small" | "receipt_lineage_pending" | HistoricalRepairHold | null;
     progressMode: "bounded_rowid_watermark_no_exact_remaining";
     sliceBudget: { rows: number; bytes: number; uploadBatchesPerCycle: number };
     lastSlice: {
@@ -444,6 +446,9 @@ export function refreshUnsentRawDelivery(
      from buffered_events where id = ?`,
   ).get(rawId) as RawDeliveryRow | undefined;
   if (!raw || raw.uploadedAt || raw.usageDuplicateReason) return false;
+  const derived = historicalRawProjection(db,rawId);
+  if (derived?.duplicate) return false;
+  if (derived) raw.payloadJson = JSON.stringify(derived.event);
   const linked = db.prepare(`select delivery_id as id,base_envelope_json as baseEnvelopeJson from upload_outbox
     where raw_rowid=? and raw_id=? and raw_created_at=?
       and raw_generation is ? limit 1`).get(raw.rawRowid, raw.rawId,
@@ -556,6 +561,7 @@ export class DeliveryOutbox {
     this.onHoldChange = options.onHoldChange;
     this.workspaceId = options.workspaceId?.trim() || null;
     this.deviceId = options.deviceId?.trim() || null;
+    ensureHistoricalMutationBoundary(this.db);
     this.initializeSchema();
     if (this.enabled) this.reopenMigrationPastWatermark();
   }
@@ -1247,6 +1253,9 @@ export class DeliveryOutbox {
    * unresolved; it cannot extend a writer slice or claim false uniqueness.
    */
   backfillLegacyReceiptLineage(options: { maxRows?: number; maxWriterMs?: number } = {}) {
+    const held = historicalRepairHold(this.db);
+    if (held === "historical_receipt_recovery_requires_opt_in")
+      return {visited:0,bound:0,complete:false,held};
     const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? 256), 5_000));
     const maxWriterMs = Math.max(1, Math.min(Math.trunc(options.maxWriterMs ?? 100), 500));
     const deadline = performance.now() + maxWriterMs;
@@ -1493,6 +1502,7 @@ export class DeliveryOutbox {
   }
 
   enqueueRaw(row: RawDeliveryRow) {
+    if (isHistoricalRaw(this.db,row.rawRowid)) return {enqueued:0,dead:0,held:"historical_repair_requires_opt_in" as const};
     if (!this.enabled || row.uploadedAt) return { enqueued: 0, dead: 0 };
     if (row.privacyDisposition) return { enqueued: 0, dead: 0 };
     if (row.usageDuplicateReason) return { enqueued: 0, dead: 0 };
@@ -2059,6 +2069,11 @@ export class DeliveryOutbox {
   }
 
   migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}) {
+    const held = historicalRepairHold(this.db);
+    if (held) {
+      this.db.prepare(`update upload_control set migration_paused_reason=? where singleton=1`).run(held);
+      return {visited:0,enqueued:0,dead:0,skippedUploaded:0,quarantinedEvidence:0,complete:false,paused:held};
+    }
     const receiptBackfill = this.backfillLegacyReceiptLineage({
       maxRows: Math.min(options.maxRows ?? 256, 256),
       maxWriterMs: Math.min(options.maxWriterMs ?? 100, 100),
@@ -2835,10 +2850,15 @@ export class DeliveryOutbox {
           workspaceId: this.workspaceId,
           deviceId: this.deviceId,
         };
-        const marked = authoritativeReason === "local_usage_duplicate"
+        const historical = isHistoricalRaw(this.db,row.rawRowid);
+        const historicalEligible = historical && this.db.prepare(`select 1 from buffered_events
+          where rowid=@rawRowid and id=@rawId and created_at=@rawCreatedAt
+            and privacy_generation is @rawGeneration and workspace_id is @workspaceId
+            and device_id is @deviceId and ${privacyEligible}`).get(markParams);
+        const marked = historical ? 0 : authoritativeReason === "local_usage_duplicate"
           ? markAcceptedPairedSpan.run(markParams).changes
           : markRaw.run(markParams).changes;
-        if (marked !== 1 && !this.rawRetentionExpired(row)) {
+        if (marked !== 1 && !historicalEligible && !this.rawRetentionExpired(row)) {
           locallyDead += this.deadActive(id, authoritativeReason ?? "local_privacy_violation", terminalAt);
           continue;
         }
@@ -3221,6 +3241,8 @@ export class DeliveryOutbox {
     if (control.pausedReason === "slice_budget_too_small") {
       degradedReasons.push("migration_slice_budget");
     }
+    const historicalHold = historicalRepairHold(this.db);
+    if (historicalHold) degradedReasons.push("historical_repair_hold");
     return {
       enabled: this.enabled,
       degraded: degradedReasons.length > 0,
@@ -3245,7 +3267,7 @@ export class DeliveryOutbox {
       migration: {
         cursorRowid: control.cursorRowid,
         complete: Boolean(control.complete) && receiptLineageComplete,
-        pausedReason: receiptLineageComplete ? control.pausedReason : "receipt_lineage_pending",
+        pausedReason: historicalHold ?? (receiptLineageComplete ? control.pausedReason : "receipt_lineage_pending"),
         progressMode: "bounded_rowid_watermark_no_exact_remaining",
         sliceBudget: {
           rows: this.limits.migrationBatchRows,

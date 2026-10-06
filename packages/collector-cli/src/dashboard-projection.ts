@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
+import { historicalRawProjection } from "./historical-raw";
 import { admittedUsageForRow, hasSessionUsageAuthority } from "./usage-authority";
 import { ensureUuidEventId } from "./upload-history";
 import { readLiveUsageEventObservation } from "../../shared/src/live-usage-metadata";
@@ -1951,8 +1952,14 @@ export class DashboardProjectionStore {
       // Historical mixed rows use the same response coverage as append and
       // send. A bounded repair can restore an uncovered old turn without
       // making its already-accounted twin contribute a second time.
-      const row=initial.source === "codex" && carriesUsage(initial) &&
+      let row=initial.source === "codex" && carriesUsage(initial) &&
         this.reconcileCodexResponse?.(initial.id) ? this.rawRow(initial.rawRowid) ?? initial : initial;
+      const derived = row.source === "codex" ? historicalRawProjection(this.db,row.id) : undefined;
+      if (derived) row = {...row,eventType:derived.event.eventType,payloadJson:JSON.stringify(derived.event),
+        model:derived.event.model ?? null,inputTokens:derived.event.inputTokens ?? null,
+        outputTokens:derived.event.outputTokens ?? null,cacheReadTokens:derived.event.cacheReadTokens ?? null,
+        cacheCreationTokens:derived.event.cacheCreationTokens ?? null,costUsd:derived.event.costUsd ?? null,
+        costKind:derived.event.costKind ?? null};
       // Raw rowids can be reused before a queued prune repair runs. The retained
       // live fact already has independent event identity; release its old slot.
       const formerLive = this.captureStatement(`select projection_id as id from dashboard_event_facts

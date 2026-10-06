@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { frozenCodexCapture } from "./codex-named-capture";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
+import { ensureHistoricalMutationBoundary, isHistoricalRaw, rememberHistoricalRawProjection } from "./historical-raw";
 import { estimateCostUsd, codexResponseIdentities, codexResponseIdentityOverlap, providerAccountKey, usageFieldKeys, validatedMetadataAttribute,
   type AiInteractionEvent } from "../../shared/src/index";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -239,6 +240,7 @@ function nativeTraceCompatible(db: Database.Database, span: Row, rollout: Row) {
  * counts, lineage-first totals, different devices/epochs and near-twins stay
  * unpaired; time proximity by itself never proves response identity. */
 export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string) {
+  ensureHistoricalMutationBoundary(db);
   const raw = db.prepare(`select ${COLUMNS} from buffered_events e where e.id=?`).get(eventId) as
     Omit<Row, "event"> | undefined;
   if (!raw || raw.paired || raw.input === null || raw.output === null) return null;
@@ -292,12 +294,17 @@ export function pairCodexSpanRolloutEvent(db: Database.Database, eventId: string
   db.prepare(`insert into codex_span_rollout_pairs values (?,?,?,?,?,?,?,?,?,?,?)`).run(
     span.id, span.rowid, span.created, span.generation, rollout.id, rollout.rowid, rollout.created, rollout.generation,
     owner.id, rollout.event.model!, "unique_exact_marginal_completion/v1");
-  db.prepare(`update buffered_events set usage_paired_event_id=?,usage_duplicate_reason=?,
+  if (isHistoricalRaw(db,duplicate.rowid)) rememberHistoricalRawProjection(db,duplicate.id,
+    {...duplicate.event,eventType:"otel_span",inputTokens:undefined,outputTokens:undefined,
+      cacheReadTokens:undefined,cacheCreationTokens:undefined,costUsd:undefined},CODEX_SPAN_ROLLOUT_DUPLICATE,owner.id);
+  else db.prepare(`update buffered_events set usage_paired_event_id=?,usage_duplicate_reason=?,
     event_type='otel_span',input_tokens=null,output_tokens=null,cache_read_tokens=null,
     cache_creation_tokens=null,cost_usd=null where id=?`).run(owner.id, CODEX_SPAN_ROLLOUT_DUPLICATE, duplicate.id);
   const price = estimateCostUsd({ model: rollout.event.model, inputTokens: owner.input, outputTokens: owner.output,
     cacheReadTokens: owner.cache ?? 0, cacheCreationTokens: owner.write ?? 0 });
-  if(owner.uploaded||ownerCapture)db.prepare("update buffered_events set usage_paired_event_id=? where id=?").run(duplicate.id,owner.id);
+  if(isHistoricalRaw(db,owner.rowid)) rememberHistoricalRawProjection(db,owner.id,
+    {...owner.event,model:owner.uploaded||ownerCapture ? owner.event.model : rollout.event.model},null,duplicate.id);
+  else if(owner.uploaded||ownerCapture)db.prepare("update buffered_events set usage_paired_event_id=? where id=?").run(duplicate.id,owner.id);
   else db.prepare(`update buffered_events set usage_paired_event_id=?,model=?,cost_usd=coalesce(cost_usd,?),
     cost_kind=case when cost_usd is null and ? is not null then 'estimated' else cost_kind end where id=?`)
     .run(duplicate.id, rollout.event.model!, price?.costUsd ?? null, price?.costUsd ?? null, owner.id);

@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { ensureHistoricalMutationBoundary, historicalRawProjection, isHistoricalRaw, rememberHistoricalRawProjection } from "./historical-raw";
 import { providerAccountKey, usageFieldKeys, codexResponseIdentities, codexResponseIdentityOverlap, codexResponseIdentityConflict, type AiInteractionEvent } from "../../shared/src/index";
 import { captureCodexModel, codexHasUsage, isCaptureGap } from "./codex-model-capture";
 import { frozenCodexCapture } from "./codex-named-capture";
@@ -208,7 +209,9 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
   const nativeAmount=(basis: AiInteractionEvent,field: typeof FIELDS[number]) =>
     nativeObservations.reduce((sum,observation)=>sum+
       (related(basis,observation)&&fits(basis,observation)?observation[field]??0:0),0);
-  const observations = rows.flatMap(row => {
+  const observations = rows.flatMap(rawRow => {
+    const derived = historicalRawProjection(db,rawRow.id);
+    const row = derived ? {...rawRow,payload:JSON.stringify(derived.event),duplicate:derived.duplicate} : rawRow;
     // Covered observations have already supplied their aliases and native
     // prefix above. They cannot own finance (the candidate filter enforces
     // the same rule). Avoid re-running a trace capture for every bridge;
@@ -398,6 +401,7 @@ export function codexResponseCoverage(db: Database.Database, event: AiInteractio
  * keep their ID/bytes; only the newly admitted twin's unsealed counters move. */
 export function applyCodexResponseCoverage(db: Database.Database, rawId: string, freeze: (id: string) => boolean,
   exactPeerId?: string) {
+  ensureHistoricalMutationBoundary(db);
   const raw = statement(db,`select ${columns} from buffered_events e where e.id=?`).get(rawId) as Row | undefined;
   if (!raw || raw.uploaded || raw.duplicate || frozenCodexCapture(db,rawId)) return false;
   const original=originalCoveredResponse(db,rawId);
@@ -414,7 +418,12 @@ export function applyCodexResponseCoverage(db: Database.Database, rawId: string,
   if (!coverage) return false;
   if (coverage.reservationOnly) return false;
   const e = coverage.remaining;
-  statement(db,`update buffered_events set payload_json=?,event_type=?,usage_duplicate_reason=?,
+  if (isHistoricalRaw(db,raw.rowid)) {
+    const derived = coverage.covered ? {...event,eventType:"otel_span" as const,
+      inputTokens:undefined,outputTokens:undefined,cacheReadTokens:undefined,
+      cacheCreationTokens:undefined,costUsd:undefined} : e;
+    rememberHistoricalRawProjection(db,rawId,derived,coverage.covered ? CODEX_RESPONSE_DUPLICATE : null);
+  } else statement(db,`update buffered_events set payload_json=?,event_type=?,usage_duplicate_reason=?,
     input_tokens=?,output_tokens=?,cache_read_tokens=?,cache_creation_tokens=?,cost_usd=? where id=?`)
     .run(coverage.covered ? raw.payload : JSON.stringify(e),coverage.covered ? "otel_span" : event.eventType,
       coverage.covered ? CODEX_RESPONSE_DUPLICATE : null,

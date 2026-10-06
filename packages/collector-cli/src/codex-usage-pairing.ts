@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { frozenCodexCapture } from "./codex-named-capture";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
+import { ensureHistoricalMutationBoundary, isHistoricalRaw, rememberHistoricalRawProjection } from "./historical-raw";
 
 import { estimateCostUsd, codexResponseIdentities, codexResponseIdentityOverlap, type AiInteractionEvent } from "../../shared/src/index";
 import { refreshUnsentRawDelivery, retirePairedSpanDelivery } from "./outbox";
@@ -258,9 +259,14 @@ function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): Codex
     }
     // Ownership is accounting history. A later exact SSE supplies native
     // evidence but cannot retire the already frozen named response span.
-    db.prepare(`update buffered_events set usage_paired_event_id=? where id=?
+    if (isHistoricalRaw(db,span.rowid)) rememberHistoricalRawProjection(db,span.id,
+      JSON.parse(span.payloadJson),null,log.id);
+    else db.prepare(`update buffered_events set usage_paired_event_id=? where id=?
       and usage_paired_event_id is null`).run(log.id,span.id);
-    db.prepare(`update buffered_events set usage_paired_event_id=?,usage_duplicate_reason=?,
+    if (isHistoricalRaw(db,log.rowid)) rememberHistoricalRawProjection(db,log.id,
+      {...nativeLog,eventType:"otel_span",inputTokens:undefined,outputTokens:undefined,
+        cacheReadTokens:undefined,cacheCreationTokens:undefined,costUsd:undefined},CODEX_USAGE_DUPLICATE_REASON,span.id);
+    else db.prepare(`update buffered_events set usage_paired_event_id=?,usage_duplicate_reason=?,
       event_type='otel_span',input_tokens=null,output_tokens=null,cache_read_tokens=null,
       cache_creation_tokens=null,cost_usd=null where id=? and usage_paired_event_id is null`)
       .run(span.id,CODEX_USAGE_DUPLICATE_REASON,log.id);
@@ -283,7 +289,9 @@ function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): Codex
   if (cacheReadTokens !== null) logPayload.cacheReadTokens = cacheReadTokens;
   if (cacheCreationTokens !== null) logPayload.cacheCreationTokens = cacheCreationTokens;
   if (costUsd !== null && costUsd !== log.costUsd) logPayload.costUsd = costUsd;
-  const pairedLog = db.prepare(
+  const historicalLog = isHistoricalRaw(db,log.rowid);
+  const pairedLog = historicalLog ? Number(rememberHistoricalRawProjection(db,log.id,
+    logPayload as unknown as AiInteractionEvent,null,span.id)) : db.prepare(
     `update buffered_events set usage_paired_event_id = @spanId,
        cache_read_tokens = @cacheReadTokens,
        cache_creation_tokens = @cacheCreationTokens,
@@ -294,7 +302,10 @@ function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): Codex
     cacheCreationTokens, costUsd, payloadJson: JSON.stringify(logPayload),
   }).changes;
   if (pairedLog !== 1) throw new Error("codex_usage_pair_lost_log");
-  const pairedSpan = db.prepare(
+  const historicalSpan = isHistoricalRaw(db,span.rowid);
+  const pairedSpan = historicalSpan ? Number(rememberHistoricalRawProjection(db,span.id,
+    {...JSON.parse(span.payloadJson),eventType:"otel_span",inputTokens:undefined,outputTokens:undefined,
+      cacheReadTokens:undefined,cacheCreationTokens:undefined,costUsd:undefined},CODEX_USAGE_DUPLICATE_REASON,log.id)) : db.prepare(
     `update buffered_events set usage_paired_event_id = @logId,
        usage_duplicate_reason = @reason, event_type = 'otel_span',
        input_tokens = null, output_tokens = null,
@@ -319,6 +330,7 @@ export function pairCodexUsageEvent(
   db: Database.Database,
   eventId: string,
 ): (CodexUsagePair & { pairCount: number }) | null {
+  ensureHistoricalMutationBoundary(db);
   if (!indexesReady(db)) return null;
   const row = db.prepare(`select ${ROW_COLUMNS} from buffered_events where id = ?`)
     .get(eventId) as UsageRow | undefined;

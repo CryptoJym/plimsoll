@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { historicalRawProjection } from "./historical-raw";
 import {
   estimateCostUsd,
   codexResponseIdentities,
@@ -509,6 +510,7 @@ export function captureCodexModel(
       from buffered_events where id=?`,
       )
       .get(rawId) as typeof row;
+    if (row) row.pairedId ??= historicalRawProjection(db,rawId)?.paired ?? null;
   } catch (error) {
     // Explicit history uploads also support pre-install-identity ledgers.
     // They remain read-only and cannot invent a native join boundary.

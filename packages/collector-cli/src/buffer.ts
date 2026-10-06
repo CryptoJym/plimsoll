@@ -29,6 +29,7 @@ import {
 } from "./codex-usage-pairing";
 import { isCodexResponseSpan, pairCodexSpanRolloutEvent } from "./codex-span-rollout-pairing";
 import { applyCodexResponseCoverage } from "./codex-response-coverage";
+import { historicalRawHighWater, initializeHistoricalRawBoundary } from "./historical-raw";
 import { queueCodexAuthorityProjectionRepairs, CODEX_NATIVE_LINKED_SCOPE_SQL } from "./codex-model-capture";
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
@@ -375,6 +376,7 @@ export class LocalEventBuffer {
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
       .get();
+    initializeHistoricalRawBoundary(this.db, !newLedger);
     markOpenStep("ledger.sqlite_open");
     this.db.exec(`
       create table if not exists buffered_events (
@@ -2739,18 +2741,20 @@ export class LocalEventBuffer {
     } : event);
     const insert = this.insertEventStatement ??= this.db.prepare(
         `insert or ignore into buffered_events
-          (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
+          (rowid, id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, first_received_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
            machine, account_hash, workspace_id, device_id, installation_epoch_id, project_key, cost_kind, privacy_generation)
         values
-          (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
+          ((select max(coalesce(max(rowid),0),@historicalHighWater)+1 from buffered_events),
+           @id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @firstReceivedAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
            @machine, @accountHash, @workspaceId, @deviceId, @installationEpochId, @projectKey, @costKind, @privacyGeneration)`,
       );
     const result = insert
       .run({
+        historicalHighWater: historicalRawHighWater(this.db),
         id: event.id,
         source: event.source,
         eventType: event.eventType,

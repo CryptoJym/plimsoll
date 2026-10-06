@@ -3,6 +3,7 @@ import type { AiInteractionEvent } from "../../shared/src/index";
 import { captureCodexModel, codexHasUsage, codexMisfiledUnderClaude, isCaptureGap } from "./codex-model-capture";
 import { CODEX_SESSION_AUTHORITY_SQL, isCodexResponseSpan } from "./codex-span-rollout-pairing";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import { historicalRawProjection } from "./historical-raw";
 
 // Raw counters are diagnostics until the capture contract admits usage. The
 // same predicate governs ingest, the native tailer and projection suppression.
@@ -11,8 +12,10 @@ export function admittedUsageForRow(db: Database.Database, rawId: string, sessio
     device_id as device,installation_epoch_id as epoch
     from buffered_events where id=?`).get(rawId) as { source: string; payload: string; duplicate: string | null; workspace: string | null; device: string | null; epoch: string | null } | undefined;
   if (!row || row.duplicate) return undefined;
+  const derived = historicalRawProjection(db,rawId);
+  if (derived?.duplicate) return undefined;
   let event: AiInteractionEvent;
-  try { event = JSON.parse(row.payload); } catch { return undefined; }
+  try { event = derived?.event ?? JSON.parse(row.payload); } catch { return undefined; }
   if (!event || typeof event !== "object" || Array.isArray(event)) return undefined;
   // A malformed/legacy payload cannot turn a Codex SQL row into a different
   // provider and bypass model admission. Genuine legacy Claude rows keep the

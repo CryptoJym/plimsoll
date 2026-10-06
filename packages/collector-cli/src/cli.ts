@@ -540,6 +540,8 @@ Config tools:
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|gemini-cli|grok|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
+    --no-mark explicitly sends historical NULL-marked rows outside the outbox;
+    it can persist capture/coverage decisions and does not satisfy an ACK drain.
       --url here and on upload-history, push-repo-labels and sync-outcomes must be on the
       joined workspace's origin; without a joined workspace it is refused. For a test server
       on this machine, add --dev-loopback-url to that one command: it allows only a plainly
