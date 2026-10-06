@@ -97,7 +97,7 @@ function event(input: {
   observedAt?: string;
   sessionId?: string;
   source?: "claude_code" | "codex" | "grok";
-  eventType?: "assistant_response" | "tool_use" | "tool_result" | "usage_rollout";
+  eventType?: "assistant_response" | "tool_use" | "tool_result" | "usage_rollout" | "usage_live";
   actionClass?: string;
   model?: string;
   inputTokens?: number;
@@ -1615,6 +1615,19 @@ async function main() {
       console.log(JSON.stringify({status:"pass",checks},null,2));
       return;
     }
+    // Exercise the previously unreachable usage_live branch. Observer counters
+    // cannot make the fixture invent native finance evidence, and metadata alone
+    // cannot grant the authenticated app-server append capability.
+    const liveObserver = event({eventType:"usage_live", inputTokens:44, outputTokens:4,
+      cacheReadTokens:0, cacheCreationTokens:0, metadata:{
+        sourceVersion:"codex.app-server.usage.v1",liveObservationKind:"observed_interval",
+        liveFinanceEligibility:"unqualified_observer",liveAttributionState:"unresolved"}});
+    check("live_observer_fixture_does_not_invent_request_model",liveObserver.model===undefined &&
+      liveObserver.metadata.model===undefined && liveObserver.metadata.traceId===undefined);
+    check("live_observer_fixture_retains_reported_counters",liveObserver.inputTokens===44 &&
+      liveObserver.outputTokens===4 && liveObserver.cacheReadTokens===0 && liveObserver.cacheCreationTokens===0);
+    check("live_observer_metadata_cannot_forge_authenticated_admission",buffer.append(liveObserver)===false &&
+      !buffer.database.prepare("select 1 from buffered_events where id=?").get(liveObserver.id));
     proveDuplicateFactRepair(root);
     await proveDuplicateScanUpgradeAndDrain(root);
     await proveScanSettlesUnderSteadyCapture(root);

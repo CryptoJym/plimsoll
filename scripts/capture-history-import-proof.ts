@@ -208,8 +208,8 @@ async function main() {
       hookPlan.skippedLiveSessions === 0);
     const hookImport = await applyCaptureHistory(buffer, captureRoot);
     assert.equal(hookImport.importedRows, 2);
-    assert.equal(buffer.database.prepare(`select sum(input_tokens) as n from buffered_events
-      where session_id=? and event_type='usage_rollout'`).get(hookOnly)?.n, 150);
+    assert.equal((buffer.database.prepare(`select sum(input_tokens) as n from buffered_events
+      where session_id=? and event_type='usage_rollout'`).get(hookOnly) as { n: number | null } | undefined)?.n, 150);
 
     const pruned = "019d0000-0000-7000-8000-000000000004";
     const prunedFile = codexFile(directory, pruned, [[100, 10], [150, 15]]);

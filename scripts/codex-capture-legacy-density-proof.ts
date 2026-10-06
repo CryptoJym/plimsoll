@@ -139,7 +139,9 @@ try {
   completion.check('two_native_tool_models_in_trace_still_gap',isCaptureGap(captureCodexModel(trace.database,span)));
   const foreign={...event(5),metadata:{traceId:'fedcba0987654321fedcba0987654321',otelEventName:'handle_responses'}};trace.append(foreign);
   completion.check('neighbouring_tool_model_does_not_name_another_trace',isCaptureGap(captureCodexModel(trace.database,foreign)));
-  const hook={...event(6),eventType:'session_end' as const,model:'gpt-6-sol',metadata:{input_tokens:0,output_tokens:0},inputTokens:0,outputTokens:0};trace.append(hook);
+  // session_stop is the real hook schema type; a bare model and explicit
+  // zero counters still cannot attest a native request model.
+  const hook=aiInteractionEventSchema.parse({...event(6),eventType:'session_stop',model:'gpt-6-sol',metadata:{input_tokens:0,output_tokens:0},inputTokens:0,outputTokens:0});trace.append(hook);
   completion.check('explicit_zero_hook_with_no_native_model_is_gap',isCaptureGap(captureCodexModel(trace.database,hook)));
   const resourceOnly={...event(7),model:'gpt-6-sol',metadata:{traceId:'aabbccddeeffaabbccddeeffaabbccddee',otelResourceAttributes:{model:'gpt-6-sol'}}};trace.append(resourceOnly);
   completion.check('resource_model_is_not_request_model',isCaptureGap(captureCodexModel(trace.database,resourceOnly)));
