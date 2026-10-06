@@ -810,11 +810,11 @@ export function captureCodexModel(
     let reasonFound: string | undefined;
     for (const candidate of prepare(`${selectEvidence} where ${nativeScope} and e.session_id=?
       and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.usageSource') end
-        in ('codex_local_turn','rollout') and coalesce(
-          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.codexTurnId') end,
-          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata."turn.id"') end,
-          case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.turn_id') end)=?`)
-      .iterate(...nativeScopeArgs,seedSession,seedTurn) as Iterable<EvidenceRow>) {
+        in ('codex_local_turn','rollout') and (${['codexTurnId','turn.id','turn_id'].map(alias =>
+          `case when json_valid(e.payload_json) then
+            json_type(e.payload_json,'$.metadata."${alias}"')='text' and
+            json_extract(e.payload_json,'$.metadata."${alias}"')=? end`).join(' or ')})`)
+      .iterate(...nativeScopeArgs,seedSession,seedTurn,seedTurn,seedTurn) as Iterable<EvidenceRow>) {
       const p = decodePeers([candidate])[0];
       if (!p) continue;
       const reason = veto(p,"local");

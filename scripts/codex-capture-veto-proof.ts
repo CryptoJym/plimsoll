@@ -7,7 +7,7 @@ import {captureCodexModel,isCaptureGap,recordCodexTurnModel,CODEX_NATIVE_LINKED_
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',340);
+const completion=createProofCompletion('codex-capture-veto',484);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -277,6 +277,26 @@ try{
      else if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL})),false);
      else{f.append(make(2,native,{model:MODEL}));f.deliver(f.append(make(1,{})),false);}
     });
+ // A JSON container is not a native local-turn string. Exercise the local
+ // veto for every producer alias, both native source markers, both target
+ // paths, both contradiction attributes and both streaming noise bounds.
+ for(const noise of [0,129])for(const targetKind of ['native-target','selected-source'] as const)
+  for(const alias of ['codexTurnId','turn.id','turn_id'] as const)
+   for(const usageSource of ['codex_local_turn','rollout'] as const)
+    for(const conflict of ['model','account'] as const)
+     for(const representation of ['array','object','native-string'] as const)
+      cell(`local-json-turn/${targetKind}/${alias}/${usageSource}/${conflict}/${representation}/${noise}`,noise,f=>{
+       const malformed=representation==='object'?{value:'literal'}:['literal'];
+       const literal=JSON.stringify(malformed),linked=representation==='native-string';
+       f.append(make(3,{[alias]:linked?literal:malformed,usageSource,model:conflict==='model'?OTHER:MODEL},
+        {model:conflict==='model'?OTHER:MODEL,actorId:conflict==='account'?B:A,
+         eventType:'tool_result',inputTokens:undefined,outputTokens:undefined,
+         observedAt:new Date(AT-3_600_000).toISOString()}));
+       const native={traceId:f.trace,'conversation.id':SESSION,[alias]:literal,
+        model:MODEL,otelEventName:'codex.sse_event'};
+       if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL})),linked);
+       else{f.append(make(2,native,{model:MODEL}));f.deliver(f.append(make(1,{})),linked);}
+      });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
  // producer bytes restored together, no paid capture/coverage witness injected.
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
@@ -353,6 +373,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,340,'every declared matrix cell executes');
+ assert.equal(executed,484,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}
