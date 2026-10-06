@@ -25,6 +25,7 @@ import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
 import {
   applyProjectAttribution,
+  captureRepoContextExcluded,
   SessionAttributionBatch,
 } from "./session-attribution";
 
@@ -73,6 +74,7 @@ export function buildIngestBatch(
         (options.now?.() ?? new Date()).getTime() < Date.parse(row.createdAt) + CODEX_MODEL_WAIT_MS) continue;
     const captured = captureCodexModel(buffer.database,row.payload,row.id,true);
     const attributed = attribution.attribute(captured, {
+      repoContextExcluded: captureRepoContextExcluded(captured.metadata?.repoContextPolicyGeneration, row.repoHash),
       repoHash: row.repoHash,
       branchHash: row.branchHash,
     });

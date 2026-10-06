@@ -7,15 +7,16 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createProofCompletion } from "./lib/proof-completion";
+import { runCaptureDowngradeFixtures } from "./lib/capture-downgrade-fixture";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 
 import { LocalEventBuffer as HeadBuffer } from "../packages/collector-cli/src/buffer";
 import { captureCodexModel as headCapture } from "../packages/collector-cli/src/codex-model-capture";
 
-// Retain all 20 PR checks, main's additional 0.7.50 check, and the current
-// branch writer -> exact released 0.7.51 reader check.
-const completion = createProofCompletion("collector-named-usage-rollback", 22);
+// Keep the fourteen shared checks, eight additional #450 head-writer checks,
+// and #464's .51 writer retry plus four growing Codex/Claude reader checks.
+const completion = createProofCompletion("collector-named-usage-rollback", 27);
 // Commit A is a reader-only tier release. Commit B enables tier capture and
 // changes this proof's previous reader to the exact commit A, not stock 0.7.49.
 const recordedTierWriter = false;
@@ -61,7 +62,7 @@ async function leaseWithReader(
 ) {
   const reader = await import(pathToFileURL(
     path.join(worktree, "packages/collector-cli/src/buffer.ts"),
-  ).href);
+  ).href) as typeof import("../packages/collector-cli/src/buffer");
   const now = new Date(nowMs);
   const buffer = new reader.LocalEventBuffer(fixtureLedgerPath, {
     workspaceId,
@@ -77,8 +78,8 @@ async function leaseWithReader(
     const lease = buffer.delivery.lease({ now });
     assert.equal(lease.locallyDead, 0, `${expectedVersion} did not retire usage`);
     assert.equal(lease.items.length, 2, `${expectedVersion} read both sealed deliveries`);
-    const named = lease.items.find((item: any) => item.deliveryId === namedId)?.envelope.event;
-    const gap = lease.items.find((item: any) => item.deliveryId === gapId)?.envelope.event;
+    const named = lease.items.find((item) => item.deliveryId === namedId)?.envelope.event;
+    const gap = lease.items.find((item) => item.deliveryId === gapId)?.envelope.event;
     assert.equal(named?.model, "gpt-6.1-sol");
     assert.equal(named?.inputTokens, 19);
     assert.equal(named?.outputTokens, 2);
@@ -89,7 +90,7 @@ async function leaseWithReader(
     if (acknowledge) {
       const acknowledged = buffer.delivery.acknowledge(
         lease.leaseId,
-        lease.items.map((item: any) => item.deliveryId),
+        lease.items.map((item) => item.deliveryId),
         now,
       );
       assert.equal(acknowledged.locallyDead, 0);
@@ -97,7 +98,7 @@ async function leaseWithReader(
     }
     return {
       leaseId: lease.leaseId,
-      itemIds: lease.items.map((item: any) => item.deliveryId),
+      itemIds: lease.items.map((item) => item.deliveryId),
       namedModel: named?.model,
       namedInput: named?.inputTokens,
       gapInput: gap?.inputTokens,
@@ -321,7 +322,7 @@ async function main() {
     fs.symlinkSync(path.resolve("node_modules"), path.join(writerTree, "node_modules"), "dir");
     const { LocalEventBuffer } = await import(pathToFileURL(
       path.join(writerTree, "packages/collector-cli/src/buffer.ts"),
-    ).href);
+    ).href) as typeof import("../packages/collector-cli/src/buffer");
     const { captureCodexModel } = await import(pathToFileURL(
       path.join(writerTree, "packages/collector-cli/src/codex-model-capture.ts"),
     ).href);
@@ -383,8 +384,8 @@ async function main() {
       const lease = buffer.delivery.lease({ now });
       assert.equal(lease.locallyDead, 0);
       assert.equal(lease.items.length, 2);
-      const namedWire = lease.items.find((item: any) => item.deliveryId === namedId)?.envelope.event;
-      const gapWire = lease.items.find((item: any) => item.deliveryId === gapId)?.envelope.event;
+      const namedWire = lease.items.find((item) => item.deliveryId === namedId)?.envelope.event;
+      const gapWire = lease.items.find((item) => item.deliveryId === gapId)?.envelope.event;
       assert.equal(namedWire?.model, "gpt-6.1-sol");
       assert.equal(namedWire?.inputTokens, 19);
       assert.equal(namedWire?.metadata.modelCaptureSource, undefined);
@@ -393,7 +394,7 @@ async function main() {
       completion.check("new-reader-seals-named-usage-and-tokenless-gap");
 
       claim = buffer.delivery.captureClaim(
-        lease.items.map((item: any) => item.deliveryId),
+        lease.items.map((item) => item.deliveryId),
         { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false },
         now,
       );
@@ -447,15 +448,22 @@ async function main() {
     try { assert.deepEqual(readSealed(after049), sealedBefore); } finally { after049.close(); }
     completion.check("rollback-reader-0.7.49-preserves-usage-after-lease-expiry");
 
-    const first = await leaseWithReader(old048, "0.7.48", baseMs + 545_000, false);
-    assert.notEqual(first.leaseId, stock.leaseId);
+    const released051 = await leaseWithReader(old051, "0.7.51", baseMs + 545_000, false);
+    assert.notEqual(released051.leaseId, stock.leaseId);
+    assert.deepEqual(released051.itemIds.sort(), [gapId, namedId].sort());
+    const after051 = new Database(ledgerPath, { readonly: true });
+    try { assert.deepEqual(readSealed(after051), sealedBefore); } finally { after051.close(); }
+    completion.check("rollback-reader-0.7.51-preserves-usage-after-lease-expiry");
+
+    const first = await leaseWithReader(old048, "0.7.48", baseMs + 666_000, false);
+    assert.notEqual(first.leaseId, released051.leaseId);
     assert.deepEqual(first.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.48-preserves-usage");
 
     const after048 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after048), sealedBefore); } finally { after048.close(); }
 
-    const second = await leaseWithReader(old047, "0.7.47", baseMs + 666_000, true);
+    const second = await leaseWithReader(old047, "0.7.47", baseMs + 787_000, true);
     assert.notEqual(second.leaseId, first.leaseId);
     assert.deepEqual(second.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.47-preserves-usage");
@@ -480,7 +488,7 @@ async function main() {
     // Retain every legacy PR #450 assertion, then use this branch's actual
     // OTLP writer. A -> stock and B -> A are distinct staged rollback gates.
     assert.equal(JSON.parse(fs.readFileSync(path.join(old049, "packages/collector-cli/package.json"), "utf8")).version, "0.7.49");
-    const currentReader = await import(pathToFileURL(path.resolve("packages/collector-cli/src/buffer.ts")).href);
+    const currentReader = await import(pathToFileURL(path.resolve("packages/collector-cli/src/buffer.ts")).href) as typeof import("../packages/collector-cli/src/buffer");
     const tierIds = ["00000000-0000-4000-8000-000000000921", "00000000-0000-4000-8000-000000000922",
       "00000000-0000-4000-8000-000000000923"];
     const tierStart = baseMs + 1_000_000;
@@ -512,26 +520,28 @@ async function main() {
       tierNow = new Date(tierStart + 61_000);
       const lease = tierWriter.delivery.lease({ now: tierNow });
       assert.equal(lease.locallyDead, 0);
-      assert.deepEqual(lease.items.map((item: any) => item.deliveryId).sort(), tierIds);
-      assert.equal(lease.items.find((item: any) => item.deliveryId === tierIds[0]).envelope.event.metadata.serviceTier,
+      assert.deepEqual(lease.items.map((item) => item.deliveryId).sort(), tierIds);
+      assert.equal(lease.items.find((item) => item.deliveryId === tierIds[0])!.envelope.event.metadata.serviceTier,
         recordedTierWriter ? "priority" : undefined);
       completion.check(recordedTierWriter ? "branch-writer-seals-zero-and-recorded-processing-tier" : "reader-first-writer-seals-zero-with-no-tier-key");
-      tierClaim = tierWriter.delivery.captureClaim(tierIds, { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      const tierCaptureClaim = tierWriter.delivery.captureClaim(tierIds, { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      assert.ok(tierCaptureClaim);
+      tierClaim = tierCaptureClaim;
       assert.ok(tierClaim);
       assert.equal(tierClaim.dead, 0);
       tierSealed = readSealed(tierWriter.database);
       completion.check("branch-writer-seals-capture-claim-with-no-dead-usage");
     } finally { tierWriter.close(); }
-    const previous = await import(pathToFileURL(path.join(old049, "packages/collector-cli/src/buffer.ts")).href);
+    const previous = await import(pathToFileURL(path.join(old049, "packages/collector-cli/src/buffer.ts")).href) as typeof import("../packages/collector-cli/src/buffer");
     tierNow = new Date(tierStart + 182_000); // the branch writer's lease has expired
     const previousReader = new previous.LocalEventBuffer(ledgerPath, { workspaceId, deviceId,
       enrollmentNow: () => new Date(baseMs), delivery: { enabled: true, now: () => tierNow } });
     try {
       const lease = previousReader.delivery.lease({ now: tierNow });
       assert.equal(lease.locallyDead, 0);
-      assert.deepEqual(lease.items.map((item: any) => item.deliveryId).sort(), tierIds);
+      assert.deepEqual(lease.items.map((item) => item.deliveryId).sort(), tierIds);
       for (const [i, id] of tierIds.entries()) {
-        const event = lease.items.find((item: any) => item.deliveryId === id).envelope.event;
+        const event = lease.items.find((item) => item.deliveryId === id)!.envelope.event;
         assert.equal(event.model, "gpt-6.1-sol");
         assert.equal(event.inputTokens, 19);
         assert.equal(event.outputTokens, 2);
@@ -543,6 +553,7 @@ async function main() {
       assert.deepEqual(readSealed(previousReader.database), tierSealed);
       const oldClaim = previousReader.delivery.captureClaim(tierIds,
         { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      assert.ok(oldClaim);
       assert.equal(oldClaim.dead, 0);
       assert.ok(oldClaim.cursor > tierClaim.cursor);
       completion.check(`${previousReaderLabel}-keeps-frozen-envelopes-and-continues-claims`);
@@ -554,12 +565,18 @@ async function main() {
       completion.check(`${previousReaderLabel}-delivers-all-new-usage-with-zero-retirements`);
     } finally { previousReader.close(); }
     await branchWriterStockReader(old049);
+    const continuedCapture = await runCaptureDowngradeFixtures();
+    assert.equal(continuedCapture.length, 4);
+    for (const fixture of continuedCapture) completion.check(
+      `continued-${fixture.kind}-capture-after-downgrade-${fixture.releasedVersion}`);
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
-      readers: [`scanner-head-${currentVersion}`, "released-0.7.50", "stock-0.7.49", "main-0.7.48", "0.7.47"],
-      readerLeaseOffsetsMs: [182_000, 303_000, 424_000, 545_000, 666_000],
+      readers: [`scanner-head-${currentVersion}`, "released-0.7.50", "stock-0.7.49", "released-0.7.51", "main-0.7.48", "0.7.47"],
+      readerLeaseOffsetsMs: [182_000, 303_000, 424_000, 545_000, 666_000, 787_000],
       released050Commit,
+      released051Commit,
+      continuedCapture,
       stagedRollback: { writerCommit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
         previousReaderCommit, previousReaderLabel, recordedTierWriter, sameLedger: true, leaseExpired: true,
         locallyDead: 0, acknowledged: 3 },

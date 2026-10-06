@@ -21,7 +21,7 @@ import {
 import { collisionSafeDeliveryId, ensureUuidEventId, incarnationDeliveryId,
   isCollisionSafeDeliveryId,
   normalizeHistoryEvent } from "./upload-history";
-import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
+import { applyProjectAttribution, captureRepoContextExcluded, SessionAttributionBatch } from "./session-attribution";
 import {
   CAPTURE_WRITE_LAG_MS,
   captureFrontier,
@@ -301,6 +301,7 @@ type ActiveDeliveryRow = {
   branchHash: string | null;
   attemptCount: number;
   deviceId: string | null;
+  captureRepoContextPolicyGeneration?: number | null;
 };
 
 type RawPrivacyRow = {
@@ -346,6 +347,8 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number, resolvedId?:
   const normalized = normalizeHistoryEvent({
     payloadJson: row.payloadJson,
     suppressedFieldsJson: row.suppressedFieldsJson,
+    repoHash: row.repoHash,
+    branchHash: row.branchHash,
   });
   if (normalized.ok === false) {
     const reason =
@@ -485,8 +488,10 @@ function attachFillOnlyLinkage(
   branchHash: string | null,
   attribution: SessionAttributionBatch,
   disposedRawRowids: ReadonlySet<number>,
+  captureRepoContextPolicyGeneration: number | null | undefined,
 ): AiWorkIngestEvent {
   const attributed = attribution.attribute(envelope.event, {
+    repoContextExcluded: captureRepoContextExcluded(captureRepoContextPolicyGeneration, repoHash),
     repoHash,
     branchHash,
     excludedRowids: disposedRawRowids,
@@ -2277,8 +2282,11 @@ export class DeliveryOutbox {
     const freeze = () => {
       if (frozenCodexCapture(this.db,rawId)) return true;
       const raw=this.db.prepare(`select payload_json as payload,uploaded_at as uploadedAt,
-        suppressed_fields_json as suppressed,repo_hash as repo,branch_hash as branch from buffered_events where id=?`)
-        .get(rawId) as {payload:string;uploadedAt:string|null;suppressed:string;repo:string|null;branch:string|null}|undefined;
+        suppressed_fields_json as suppressed,repo_hash as repo,branch_hash as branch,
+        case when json_valid(payload_json) then json_extract(payload_json, '$.metadata.repoContextPolicyGeneration') end
+          as captureRepoContextPolicyGeneration from buffered_events where id=?`)
+        .get(rawId) as {payload:string;uploadedAt:string|null;suppressed:string;repo:string|null;branch:string|null;
+          captureRepoContextPolicyGeneration:number|null}|undefined;
       if(!raw)return false;
       const captured=captureCodexModel(this.db,aiInteractionEventSchema.parse(JSON.parse(raw.payload)),rawId,false,false);
       if(!codexHasUsage(captured)||isCaptureGap(captured))return false;
@@ -2301,7 +2309,7 @@ export class DeliveryOutbox {
           .get(rawId,rawId))return false;
         const attribution=new SessionAttributionBatch(this.db,[{event:captured,repoHash:canonicalLinkage(raw.repo)}]);
         const sealed=sealOutboundEnvelope(attachFillOnlyLinkage({event:captured,suppressedFields:JSON.parse(raw.suppressed)},
-          canonicalLinkage(raw.repo),canonicalLinkage(raw.branch),attribution,new Set()));
+          canonicalLinkage(raw.repo),canonicalLinkage(raw.branch),attribution,new Set(),raw.captureRepoContextPolicyGeneration));
         if(!sealed.ok)throw new Error("codex_usage_coverage_seal_refused");
         const bytes=JSON.stringify(sealed.envelope);
         if(Buffer.byteLength(bytes)>this.limits.maxItemBytes)throw new Error("codex_usage_coverage_item_oversize");
@@ -2317,7 +2325,7 @@ export class DeliveryOutbox {
       const base=aiWorkIngestEventSchema.parse(JSON.parse(row.base));
       const attribution=new SessionAttributionBatch(this.db,[{event:captured,repoHash:canonicalLinkage(row.repo)}]);
       const sealed=sealOutboundEnvelope(attachFillOnlyLinkage({...base,event:{...captured,id:base.event.id}},
-        canonicalLinkage(row.repo),canonicalLinkage(row.branch),attribution,new Set()));
+        canonicalLinkage(row.repo),canonicalLinkage(row.branch),attribution,new Set(),raw.captureRepoContextPolicyGeneration));
       if(!sealed.ok)throw new Error("codex_usage_coverage_seal_refused");
       const bytes=JSON.stringify(sealed.envelope);
       if(Buffer.byteLength(bytes)>this.limits.maxItemBytes)throw new Error("codex_usage_coverage_item_oversize");
@@ -2375,7 +2383,13 @@ export class DeliveryOutbox {
              sealed_envelope_json as sealedEnvelopeJson,
              repo_hash as repoHash, branch_hash as branchHash,
              device_id as deviceId,
-             attempt_count as attemptCount
+             attempt_count as attemptCount,
+             (select case when json_valid(e.payload_json) then
+                json_extract(e.payload_json, '$.metadata.repoContextPolicyGeneration') end
+              from buffered_events e where e.rowid = upload_outbox.raw_rowid
+                and e.id is upload_outbox.raw_id and e.created_at is upload_outbox.raw_created_at
+                and e.privacy_generation is upload_outbox.raw_generation)
+               as captureRepoContextPolicyGeneration
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= @now
              and not exists (select 1 from claude_replay_hooks held
@@ -2499,6 +2513,7 @@ export class DeliveryOutbox {
               canonicalLinkage(row.branchHash),
               attribution,
               disposedRawRowids,
+              row.captureRepoContextPolicyGeneration,
             ),
           );
           if (!sealed.ok) {

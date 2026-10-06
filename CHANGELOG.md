@@ -2,6 +2,17 @@
 
 ## 0.7.52 (unreleased)
 
+- Stop filesystem git linkage at the running user's resolved home folder and
+  system root, including their backed worktrees. Migrate only resumed capture
+  bindings and keep new excluded cwd events out of session inheritance. Real
+  repositories and mounted-volume roots remain attributable. Existing usage
+  and saved results stay unchanged. Policy receipts keep released capture
+  checkpoints readable after downgrade, every upload route honours excluded
+  contexts, and directory-form worktrees check their common directory. New
+  generation-3 bindings cannot reuse generation-2 results from older capture.
+  Lookup cache keys retain no raw paths
+  (`eco-6hoxj.165.213.1`).
+
 - Response aliases remain linked through covered SSE diagnostics, including
   every co-present request, call and turn identity, transitive chains and
   restarts. Cumulative fields retain their maximum across these aliases;
