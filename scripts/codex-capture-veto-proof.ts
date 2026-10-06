@@ -7,7 +7,7 @@ import {captureCodexModel,isCaptureGap,recordCodexTurnModel,CODEX_NATIVE_LINKED_
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',484);
+const completion=createProofCompletion('codex-capture-veto',596);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -297,6 +297,36 @@ try{
        if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL})),linked);
        else{f.append(make(2,native,{model:MODEL}));f.deliver(f.append(make(1,{})),linked);}
       });
+ // The native local-turn raw facts use the same known-account response
+ // boundary as typed links, including an exact selected witness. Foreign
+ // model/account facts never name another response, even behind ACKs.
+ for(const noise of [0,129])for(const targetKind of ['native-target','selected-source'] as const)
+  for(const alias of ['codexTurnId','turn.id','turn_id'] as const)
+   for(const usageSource of ['codex_local_turn','rollout'] as const)
+    for(const traced of [false,true])for(const otherModel of [false,true])
+     cell(`local-account-independent/${targetKind}/${alias}/${usageSource}/${traced}/${otherModel}/${noise}`,noise,f=>{
+      f.append(make(3,{[alias]:'T',usageSource,request_id:'R1',model:otherModel?OTHER:MODEL,
+       ...(traced?{traceId:'f'.repeat(32),'conversation.id':SESSION}:{})},
+       {model:otherModel?OTHER:MODEL,eventType:'tool_result',inputTokens:undefined,outputTokens:undefined,
+        observedAt:new Date(AT-3_600_000).toISOString()}));
+      const native={[alias]:'T',request_id:'R2',model:MODEL,otelEventName:'codex.sse_event',
+       ...(traced?{traceId:f.trace,'conversation.id':SESSION}:{})};
+      if(targetKind==='native-target')f.deliver(f.append(make(1,native,{model:MODEL,actorId:B})),false);
+      else{f.append(make(2,native,{model:MODEL,actorId:B}));
+       f.deliver(f.append(make(1,{request_id:'R2'},{actorId:B})),false);}
+     });
+ for(const noise of [0,129])for(const usageSource of ['codex_local_turn','rollout'] as const)
+  for(const hard of ['same-request','unknown-request','same-trace','unbound-turn-table'] as const)
+   cell(`local-account-hard-veto/${usageSource}/${hard}/${noise}`,noise,f=>{
+    f.append(make(3,{codexTurnId:'T',usageSource,model:MODEL,
+     ...(hard==='unknown-request'?{}:{request_id:hard==='same-request'?'R2':'R1'}),
+     ...(hard==='same-trace'?{traceId:f.trace,'conversation.id':SESSION}:{})},
+     {model:MODEL,eventType:'tool_result',inputTokens:undefined,outputTokens:undefined,
+      observedAt:new Date(AT-3_600_000).toISOString()}));
+    if(hard==='unbound-turn-table')recordCodexTurnModel(f.b.database,SESSION,'T',MODEL,A);
+    f.deliver(f.append(make(1,{traceId:f.trace,'conversation.id':SESSION,codexTurnId:'T',
+     request_id:'R2',model:MODEL,otelEventName:'codex.sse_event'},{model:MODEL,actorId:B})),true);
+   });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
  // producer bytes restored together, no paid capture/coverage witness injected.
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
@@ -373,6 +403,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,484,'every declared matrix cell executes');
+ assert.equal(executed,596,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}

@@ -817,6 +817,10 @@ export function captureCodexModel(
       .iterate(...nativeScopeArgs,seedSession,seedTurn,seedTurn,seedTurn) as Iterable<EvidenceRow>) {
       const p = decodePeers([candidate])[0];
       if (!p) continue;
+      // A native turn is still a coarse alias when two explicit requests
+      // belong to known disjoint accounts. Keep the same response boundary
+      // as typed links; same-trace/request and unknown facts still veto.
+      if (independentLinkedResponse(seed,p.event)) continue;
       const reason = veto(p,"local");
       if (reason) { reasonFound = reason; break; }
     }
@@ -1057,14 +1061,16 @@ export function captureCodexModel(
             (p.event.metadata.usageSource === "codex_local_turn" ||
               p.event.metadata.usageSource === "rollout") &&
             p.event.sessionId === session &&
-            p.event.metadata.codexTurnId === turn,
+            p.event.metadata.codexTurnId === turn &&
+            !independentLinkedResponse(event,p.event),
           ),
         ]
       : [];
   const localFacts = session && turn ? peerEvidence.filter((p) =>
     (p.event.metadata.usageSource === "codex_local_turn" || p.event.metadata.usageSource === "rollout") &&
     trustedSession(p.event) === session &&
-    (p.event.metadata.codexTurnId ?? p.event.metadata["turn.id"] ?? p.event.metadata.turn_id) === turn) : [];
+    (p.event.metadata.codexTurnId ?? p.event.metadata["turn.id"] ?? p.event.metadata.turn_id) === turn &&
+    !independentLinkedResponse(event,p.event)) : [];
   const localFactModels = unique(localFacts, (e) => nativeModel(e) ??
     (e.metadata.usageSource === "rollout" ? text(e.model) : undefined));
   if (localFacts.some(conflicts) || localFactModels.length > 1)
