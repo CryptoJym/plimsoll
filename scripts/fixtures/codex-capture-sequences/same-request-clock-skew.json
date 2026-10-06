@@ -1,0 +1,10 @@
+{
+  "finding": "B-P0-04",
+  "operations": [
+    "skew-partial-request",
+    "skew-native",
+    "skew-complete-request"
+  ],
+  "shrink": "three indispensable observations; the explicit retry is unnecessary because settlement executes actual leases",
+  "intent": "same explicit request and turn are one physical response despite a late earlier timestamp; retain per-field maxima and immutable owners"
+}

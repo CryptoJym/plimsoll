@@ -1,0 +1,11 @@
+{
+  "finding": "R7-P0-01",
+  "operations": [
+    "sse-valid",
+    "expire-retry",
+    "ack",
+    "trace-astra",
+    "rollout-turn",
+    "expire-retry"
+  ]
+}

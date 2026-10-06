@@ -7,6 +7,7 @@ import type net from "node:net";
 import path from "node:path";
 
 import { createProofCompletion } from "./lib/proof-completion";
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
@@ -105,7 +106,7 @@ function seedUpload(home: string, uploadUrl?: string) {
     uploadSigningSecret: "fixture-loopback-signing-secret-0123456789", ...(uploadUrl ? { uploadUrl } : {}) }), { mode: 0o600 });
   const buffer = new LocalEventBuffer(path.join(collectorHome, "work-ledger.sqlite"), { workspaceId: tenantId });
   try {
-    buffer.append(aiInteractionEventSchema.parse({ id: uuid(100), sessionId: uuid(101), source: "codex",
+    buffer.append(aiInteractionEventSchema.parse({ id: uuid(100), sessionId: uuid(101), source: "codex", ...nativeCodexFixture(uuid(100)),
       eventType: "assistant_response", observedAt: new Date().toISOString(), inputTokens: 7 }));
   } finally {
     buffer.close();

@@ -1,6 +1,6 @@
 /**
  * eco-6hoxj.163.24 (round 2): an upload batch claimed and acknowledged in
- * 125-row slices keeps the delivery guarantees of the single lease it replaced.
+ * bounded slices keep the delivery guarantees of the single lease it replaced.
  *
  * Scenarios from the independent review's fault harness (slice-faults.mts):
  *   S1 the wall clock jumps past the 120 s lease between two lease slices
@@ -23,7 +23,7 @@ import type Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { LEASE_SLICE_ROWS, uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 
@@ -144,8 +144,8 @@ async function main() {
     await assert.rejects(uploadBufferedEvents(cfg, buffer, {
       fetchImpl: cloud(requests), now: () => new Date(baseMs), includeLegacyRemainingUnuploaded: false,
     }), /injected_failure_between_ack_slices/);
-    assert.equal(acknowledged(buffer.database).n, 125, "the first acknowledge slice did not stay settled");
-    assert.equal(outbox(buffer.database).in_flight, 275);
+    assert.equal(acknowledged(buffer.database).n, LEASE_SLICE_ROWS, "the first acknowledge slice did not stay settled");
+    assert.equal(outbox(buffer.database).in_flight, 400 - LEASE_SLICE_ROWS);
     buffer.close();
     const reopened = ledger(cfg, file).buffer;
     try {
@@ -156,7 +156,7 @@ async function main() {
         fetchImpl: cloud(requests), now: () => new Date(baseMs + 121_000), includeLegacyRemainingUnuploaded: false,
       });
       assert.equal(beforeExpiry.uploadedEvents, 0, "leased rows were re-sent before their lease expired");
-      assert.equal(afterExpiry.uploadedEvents, 275);
+      assert.equal(afterExpiry.uploadedEvents, 400 - LEASE_SLICE_ROWS);
       assert.deepEqual(acknowledged(reopened.database), { n: 400, distinctIds: 400 });
       assert.equal(uploadedRaw(reopened.database), 400);
       assert.deepEqual(outbox(reopened.database), {});
@@ -183,15 +183,15 @@ async function main() {
         fetchImpl: cloud(requests), now: () => new Date(baseMs), includeLegacyRemainingUnuploaded: false,
       }), /injected_failure_between_lease_slices/);
       buffer.delivery.lease = lease;
-      assert.equal(outbox(buffer.database).in_flight, 125, "the claimed slice is not held by its lease");
+      assert.equal(outbox(buffer.database).in_flight, LEASE_SLICE_ROWS, "the claimed slice is not held by its lease");
       const immediate = await uploadBufferedEvents(cfg, buffer, {
         fetchImpl: cloud(requests), now: () => new Date(baseMs + 1_000), includeLegacyRemainingUnuploaded: false,
       });
       const expired = await uploadBufferedEvents(cfg, buffer, {
         fetchImpl: cloud(requests), now: () => new Date(baseMs + 121_000), includeLegacyRemainingUnuploaded: false,
       });
-      assert.equal(immediate.uploadedEvents, 175);
-      assert.equal(expired.uploadedEvents, 125);
+      assert.equal(immediate.uploadedEvents, 300 - LEASE_SLICE_ROWS);
+      assert.equal(expired.uploadedEvents, LEASE_SLICE_ROWS);
       assert.deepEqual(acknowledged(buffer.database), { n: 300, distinctIds: 300 });
       assert.deepEqual(outbox(buffer.database), {});
       assert.equal(new Set(requests.flat()).size, requests.flat().length, "an event was sent twice");

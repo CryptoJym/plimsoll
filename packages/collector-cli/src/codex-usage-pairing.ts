@@ -1,6 +1,9 @@
 import type Database from "better-sqlite3";
+import { frozenCodexCapture } from "./codex-named-capture";
+import { applyCodexResponseCoverage } from "./codex-response-coverage";
+import { ensureHistoricalMutationBoundary, isHistoricalRaw, rememberHistoricalRawProjection } from "./historical-raw";
 
-import { estimateCostUsd } from "../../shared/src/index";
+import { estimateCostUsd, codexResponseIdentities, codexResponseIdentityOverlap, type AiInteractionEvent } from "../../shared/src/index";
 import { refreshUnsentRawDelivery, retirePairedSpanDelivery } from "./outbox";
 import { isSqliteContentionError } from "./sqlite-contention";
 
@@ -91,8 +94,10 @@ type UsageRow = {
   accountHash: string | null;
   workspaceId: string | null;
   deviceId: string | null;
+  installationEpochId: string | null;
   payloadJson: string;
   usagePairedEventId: string | null;
+  uploadedAt: string | null;
 };
 
 type Shape = {
@@ -100,6 +105,7 @@ type Shape = {
   traceId: string | null;
   spanEndAt: string | null;
   authoritativeSession: boolean;
+  identities: Record<string, unknown>;
 };
 
 function shape(row: UsageRow): Shape | null {
@@ -118,6 +124,7 @@ function shape(row: UsageRow): Shape | null {
       spanEndAt: typeof metadata.otelSpanEndAt === "string" ? metadata.otelSpanEndAt : null,
       authoritativeSession: metadata.sessionLinkBasis === "otel_trace" ||
         metadata.sessionLinkBasis === "span_attribute",
+      identities: metadata,
     };
   } catch {
     return null;
@@ -132,6 +139,13 @@ function isUsageRow(row: UsageRow) {
 
 function compatible(log: UsageRow, span: UsageRow, logShape: Shape, spanShape: Shape) {
   if (logShape.kind !== "log" || spanShape.kind !== "span") return false;
+  if(codexResponseIdentities(logShape.identities).length && codexResponseIdentities(spanShape.identities).length &&
+    !codexResponseIdentityOverlap(logShape.identities,spanShape.identities))return false;
+  // Historical pairing also classifies old diagnostics with no install
+  // columns. Missing identity cannot promote their model: capture admission
+  // separately checks its complete boundary. Known installs never cross.
+  if (log.installationEpochId && span.installationEpochId &&
+      log.installationEpochId !== span.installationEpochId) return false;
   if (log.workspaceId && span.workspaceId && log.workspaceId !== span.workspaceId) return false;
   if (log.deviceId && span.deviceId && log.deviceId !== span.deviceId) return false;
   if (log.cacheReadTokens !== null && span.cacheReadTokens !== null &&
@@ -158,8 +172,8 @@ const ROW_COLUMNS = `rowid, id, source, event_type as eventType,
   cache_read_tokens as cacheReadTokens,
   cache_creation_tokens as cacheCreationTokens, cost_usd as costUsd,
   cost_kind as costKind, account_hash as accountHash,
-  workspace_id as workspaceId, device_id as deviceId, payload_json as payloadJson,
-  usage_paired_event_id as usagePairedEventId`;
+  workspace_id as workspaceId, device_id as deviceId, installation_epoch_id as installationEpochId, payload_json as payloadJson,
+  usage_paired_event_id as usagePairedEventId,uploaded_at as uploadedAt`;
 
 function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
   const time = Date.parse(row.observedAt);
@@ -180,12 +194,17 @@ function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
       ? [[time - PAIR_WINDOW_MS, time + PAIR_WINDOW_MS],
          [spanEnd - PAIR_WINDOW_MS, spanEnd + PAIR_WINDOW_MS]]
       : [[time - PAIR_WINDOW_MS, time + PAIR_WINDOW_MS]];
+  const capturedOwner = wanted === "span" && db.prepare(
+    "select 1 from sqlite_master where type='table' and name='codex_named_captures'").get()
+    ? `or exists(select 1 from codex_named_captures w where w.raw_id=buffered_events.id
+        and w.raw_rowid=buffered_events.rowid and w.raw_created_at=buffered_events.created_at
+        and w.raw_generation is buffered_events.privacy_generation)` : "";
   const query = db.prepare(
     `select ${ROW_COLUMNS} from buffered_events indexed by ${index}
      where observed_at >= @start and observed_at <= @end
        and ${predicate}
        and input_tokens = @inputTokens and output_tokens = @outputTokens
-       and usage_duplicate_reason is null and usage_paired_event_id is null
+       and usage_duplicate_reason is null and (usage_paired_event_id is null ${capturedOwner})
        and id != @id
      order by observed_at, id limit ${MAX_NEARBY_ROWS + 1}`,
   );
@@ -216,7 +235,44 @@ function nearby(db: Database.Database, row: UsageRow, wanted: "log" | "span") {
 
 export type CodexUsagePair = { logId: string; spanId: string };
 
-function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): CodexUsagePair {
+function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): CodexUsagePair | null {
+  const frozenSpan = frozenCodexCapture(db,span.id),frozenLog=frozenCodexCapture(db,log.id);
+  // Paid owners cannot absorb new cache/cost fields in raw diagnostics or be
+  // NULLed as twins. Shared coverage emits only the newly known remainder;
+  // it separately validates legacy native ACK eligibility and incarnation.
+  if((log.uploadedAt||frozenLog)&&(span.uploadedAt||frozenSpan))return null;
+  if(log.uploadedAt||frozenLog) {
+    return applyCodexResponseCoverage(db,span.id,id=>Boolean(frozenCodexCapture(db,id))||
+      Boolean(db.prepare("select 1 from buffered_events where id=? and uploaded_at is not null").get(id)),log.id)
+      ? {logId:log.id,spanId:span.id}:null;
+  }
+  // Missing historical span bytes cannot attest its former emitted model.
+  if(span.uploadedAt&&!frozenSpan)return null;
+  if (frozenSpan && frozenSpan.event.inputTokens === span.inputTokens &&
+      frozenSpan.event.outputTokens === span.outputTokens) {
+    const nativeLog = JSON.parse(log.payloadJson) as AiInteractionEvent;
+    if (["cacheReadTokens","cacheCreationTokens","costUsd"]
+      .some(k => nativeLog[k as keyof AiInteractionEvent] !== undefined &&
+        frozenSpan.event[k as keyof AiInteractionEvent] === undefined)) {
+      if (!applyCodexResponseCoverage(db,log.id,id => Boolean(frozenCodexCapture(db,id)),span.id)) return null;
+      return {logId:log.id,spanId:span.id};
+    }
+    // Ownership is accounting history. A later exact SSE supplies native
+    // evidence but cannot retire the already frozen named response span.
+    if (isHistoricalRaw(db,span.rowid)) rememberHistoricalRawProjection(db,span.id,
+      JSON.parse(span.payloadJson),null,log.id);
+    else db.prepare(`update buffered_events set usage_paired_event_id=? where id=?
+      and usage_paired_event_id is null`).run(log.id,span.id);
+    if (isHistoricalRaw(db,log.rowid)) rememberHistoricalRawProjection(db,log.id,
+      {...nativeLog,eventType:"otel_span",inputTokens:undefined,outputTokens:undefined,
+        cacheReadTokens:undefined,cacheCreationTokens:undefined,costUsd:undefined},CODEX_USAGE_DUPLICATE_REASON,span.id);
+    else db.prepare(`update buffered_events set usage_paired_event_id=?,usage_duplicate_reason=?,
+      event_type='otel_span',input_tokens=null,output_tokens=null,cache_read_tokens=null,
+      cache_creation_tokens=null,cost_usd=null where id=? and usage_paired_event_id is null`)
+      .run(span.id,CODEX_USAGE_DUPLICATE_REASON,log.id);
+    retirePairedSpanDelivery(db,log.id);
+    return {logId:log.id,spanId:span.id};
+  }
   const cacheReadTokens = log.cacheReadTokens ?? span.cacheReadTokens;
   const cacheCreationTokens = log.cacheCreationTokens ?? span.cacheCreationTokens;
   let costUsd = log.costUsd;
@@ -233,7 +289,9 @@ function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): Codex
   if (cacheReadTokens !== null) logPayload.cacheReadTokens = cacheReadTokens;
   if (cacheCreationTokens !== null) logPayload.cacheCreationTokens = cacheCreationTokens;
   if (costUsd !== null && costUsd !== log.costUsd) logPayload.costUsd = costUsd;
-  const pairedLog = db.prepare(
+  const historicalLog = isHistoricalRaw(db,log.rowid);
+  const pairedLog = historicalLog ? Number(rememberHistoricalRawProjection(db,log.id,
+    logPayload as unknown as AiInteractionEvent,null,span.id)) : db.prepare(
     `update buffered_events set usage_paired_event_id = @spanId,
        cache_read_tokens = @cacheReadTokens,
        cache_creation_tokens = @cacheCreationTokens,
@@ -244,7 +302,10 @@ function commitPair(db: Database.Database, log: UsageRow, span: UsageRow): Codex
     cacheCreationTokens, costUsd, payloadJson: JSON.stringify(logPayload),
   }).changes;
   if (pairedLog !== 1) throw new Error("codex_usage_pair_lost_log");
-  const pairedSpan = db.prepare(
+  const historicalSpan = isHistoricalRaw(db,span.rowid);
+  const pairedSpan = historicalSpan ? Number(rememberHistoricalRawProjection(db,span.id,
+    {...JSON.parse(span.payloadJson),eventType:"otel_span",inputTokens:undefined,outputTokens:undefined,
+      cacheReadTokens:undefined,cacheCreationTokens:undefined,costUsd:undefined},CODEX_USAGE_DUPLICATE_REASON,log.id)) : db.prepare(
     `update buffered_events set usage_paired_event_id = @logId,
        usage_duplicate_reason = @reason, event_type = 'otel_span',
        input_tokens = null, output_tokens = null,
@@ -269,6 +330,7 @@ export function pairCodexUsageEvent(
   db: Database.Database,
   eventId: string,
 ): (CodexUsagePair & { pairCount: number }) | null {
+  ensureHistoricalMutationBoundary(db);
   if (!indexesReady(db)) return null;
   const row = db.prepare(`select ${ROW_COLUMNS} from buffered_events where id = ?`)
     .get(eventId) as UsageRow | undefined;
@@ -282,7 +344,7 @@ export function pairCodexUsageEvent(
   let pairs: CodexUsagePair[];
   if (candidates.length === 1 && reciprocal.length === 1 && reciprocal[0]!.id === row.id) {
     pairs = [commitPair(db, rowShape.kind === "log" ? row : candidates[0]!,
-      rowShape.kind === "span" ? row : candidates[0]!)];
+      rowShape.kind === "span" ? row : candidates[0]!)].filter((pair): pair is CodexUsagePair => pair !== null);
   } else {
     // Every member must see the same complete bipartite candidate set. A
     // missing report makes the sizes differ, so no uncertain row is dropped.
@@ -301,7 +363,7 @@ export function pairCodexUsageEvent(
       const other = others[index]!;
       return commitPair(db, rowShape.kind === "log" ? member : other,
         rowShape.kind === "span" ? member : other);
-    });
+    }).filter((pair): pair is CodexUsagePair => pair !== null);
   }
   const own = pairs.find((pair) => pair.logId === eventId || pair.spanId === eventId);
   return own ? { ...own, pairCount: pairs.length } : null;

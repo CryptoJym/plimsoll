@@ -610,12 +610,12 @@ function proveDeterministicNearestContextTies(root: string) {
   const reverse = runOrder("reverse", [...contexts].reverse());
   const expected = {
     sessionId: "019e9100-0000-7000-8000-000000000013",
-    model: "gpt-5.5",
+    model: null,
   };
   const stable = (result: typeof forward) =>
     result.promoted.sessionId === expected.sessionId &&
     result.promoted.model === expected.model &&
-    result.promoted.costUsd !== null &&
+    result.promoted.costUsd === null &&
     JSON.stringify(result.promoted) === JSON.stringify(result.afterReplay) &&
     JSON.stringify(result.promoted) === JSON.stringify(result.reopened) &&
     JSON.stringify(result.promoted) === JSON.stringify(result.afterIdle) &&
@@ -704,7 +704,7 @@ function provePriorDraftCandidatePriorityMigration(root: string) {
            from buffered_events where id = 'migration-fresh'`,
         )
         .get() as { sessionId: string | null; model: string | null; costUsd: number | null };
-      if (row.sessionId && row.model && row.costUsd !== null) {
+      if (row.sessionId && row.model === null && row.costUsd === null) {
         resolutionCycle = cycle;
         break;
       }
@@ -1007,7 +1007,7 @@ function proveAdversarialMixedBackfill(root: string) {
            from buffered_events where id = 'mixed-fresh-usage'`,
         )
         .get() as { sessionId: string | null; model: string | null; costUsd: number | null };
-      if (fresh.sessionId && fresh.model && fresh.costUsd !== null) {
+      if (fresh.sessionId && fresh.model === null && fresh.costUsd === null) {
         freshResolutionCycle = cycle;
         resolutionStatus = afterContext.status;
         break;
@@ -1251,8 +1251,8 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
         resolved.every(
           (row) =>
             row.sessionId === "019e9100-0000-7000-8000-000000000001" &&
-            row.model === "gpt-5.5" &&
-            row.costUsd !== null,
+            row.model === null &&
+            row.costUsd === null,
         ) &&
         audit.length === candidateIds.length &&
         audit.every((row) => row.updates === 1) &&

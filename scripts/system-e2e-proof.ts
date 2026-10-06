@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 
 /**
  * Source-only integrated release proof for issue #105.
@@ -512,6 +513,7 @@ function event(input: {
     sessionId: SESSION_A,
     actorId: MACHINE_A,
     source: "codex",
+    model: nativeCodexFixture(input.id).model,
     dataMode: "metadata",
     eventType: input.eventType,
     observedAt: input.observedAt,
@@ -521,7 +523,8 @@ function event(input: {
     ...(input.costUsd === undefined ? {} : { costUsd: input.costUsd }),
     ...(input.projectKey ? { projectKey: input.projectKey } : {}),
     // These fixtures represent normalized, collector-validated protocol signals.
-    metadata: { ...(input.git ? { git: input.git } : {}), ...input.protocol },
+    metadata: { ...nativeCodexFixture(input.id).metadata,
+      ...(input.git ? { git: input.git } : {}), ...input.protocol },
   });
 }
 
@@ -544,6 +547,7 @@ async function runSharedFlow() {
     uploadUrl: "http://127.0.0.1:1/api/work-intelligence/ingest",
     tenantId: WORKSPACE_A,
     installKey: "source-e2e-install-a",
+    deviceId: MACHINE_A,
     delivery: {
       maxOldestAgeDays: 3650,
       maxBackoffSeconds: 30,
@@ -558,10 +562,11 @@ async function runSharedFlow() {
       now: () => new Date(FLOW_DELIVERY_CLOCK),
     },
     workspaceId: WORKSPACE_A,
+    deviceId: MACHINE_A,
     enrollmentNow: () => new Date(FLOW_TIME.start),
   });
   const bufferB = new LocalEventBuffer(machineBLedger, {
-    workspaceId: WORKSPACE_B, enrollmentNow: () => new Date(FLOW_TIME.start),
+    workspaceId: WORKSPACE_B, deviceId:MACHINE_B, enrollmentNow: () => new Date(FLOW_TIME.start),
   });
   const timelineStore = new OutcomeTimelineStore(timelineLedger);
   const sqliteChanges = () => {
@@ -643,6 +648,7 @@ async function runSharedFlow() {
     for (const captured of events) bufferA.append(captured);
     bufferB.append(aiInteractionEventSchema.parse({
       id: CONTROL_EVENT_ID,
+      model: nativeCodexFixture(CONTROL_EVENT_ID).model,
       sessionId: SESSION_B,
       actorId: MACHINE_B,
       source: "codex",
@@ -653,7 +659,7 @@ async function runSharedFlow() {
       inputTokens: 0,
       outputTokens: 0,
       projectKey: REPO_A,
-      metadata: { machineFixture: MACHINE_B },
+      metadata: { ...nativeCodexFixture(CONTROL_EVENT_ID).metadata, machineFixture: MACHINE_B },
     }));
     const workspaceARow = bufferA.database
       .prepare(`select workspace_id as workspaceId from buffered_events where id = ?`)
@@ -709,6 +715,14 @@ async function runSharedFlow() {
       fetchImpl: async (_input, init) => {
         const ids = requestIds(init);
         reconnectRequests.push(ids);
+        const wire = JSON.parse(String(init?.body ?? "{}")).events as Array<{event:AiInteractionEvent}>;
+        for (const entry of wire) {
+          const native = events.find(event => event.id===entry.event.id);
+          assert.ok(native,"reconnect wire must refer to its captured native request");
+          assert.equal(entry.event.model,native.model);
+          assert.equal(entry.event.inputTokens,native.inputTokens);
+          assert.equal(entry.event.outputTokens,native.outputTokens);
+        }
         if (ids.includes(poisonId)) {
           return new Response(JSON.stringify({ code: "fixture_validation" }), {
             status: 422,

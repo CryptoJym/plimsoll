@@ -19,6 +19,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { captureCodexModel } from "../packages/collector-cli/src/codex-model-capture";
 import { runCodexReconciliationMaintenance } from "../packages/collector-cli/src/codex-reconciliation";
 import {
   buildCodexUsagePairingIndexes,
@@ -107,7 +108,7 @@ class Harness {
   }
   open() {
     return new LocalEventBuffer(this.file, {
-      workspaceId: WORKSPACE, enrollmentNow: () => new Date(T0 - 3_600_000),
+      workspaceId: WORKSPACE, deviceId: "usage-pairing-fixture", enrollmentNow: () => new Date(T0 - 3_600_000),
       delivery: { enabled: true, now: () => new Date(this.vnow) },
     });
   }
@@ -321,11 +322,18 @@ async function main() {
     try {
       h.at(200); h.append(kind === "log" ? logEvent(R()) : spanEvent(R()));
       const local = h.observe();
-      check(`lone_${kind}_counts_once`, once(local) && (kind !== "log" || local.local.cache === R().cache),
-        local);
+      if (kind === "span") check("lone_span_retains_diagnostics_without_projected_usage",
+        local.local.usageRows === 1 && local.local.input === R().input && local.local.output === R().output &&
+        local.local.cache === R().cache && local.dashboard.tokenEvents === 0 &&
+        local.dashboard.input === 0 && local.dashboard.output === 0 && local.dashboard.cache === 0 &&
+        local.dashboard.usageFacts === 0, local);
+      else check("lone_log_counts_once", once(local) && local.local.cache === R().cache, local);
       h.at(30_000); check(`lone_${kind}_held`, h.upload().items.length === 0);
       h.at(61_500); h.upload();
-      check(`lone_${kind}_uploads_once`, h.observe().cloud.rows === 1);
+      const observed = h.observe();
+      if (kind === "span") check("lone_span_uploads_capture_gap_once", observed.cloud.rows === 0 &&
+        h.cloud.size === 1, observed);
+      else check("lone_log_uploads_once", observed.cloud.rows === 1);
     } finally { h.close(); }
   }
 
@@ -585,9 +593,17 @@ async function main() {
   {
     const h = new Harness("late-span-first");
     try {
-      h.at(200); h.append(spanEvent(R()));
-      h.at(61_500); const lease = h.upload({ ack: false });
+      h.at(200); const spanId = h.append(spanEvent(R()));
+      h.at(61_500);
+      const rawSpan = JSON.parse((h.buffer.database.prepare(
+        `select payload_json as payload from buffered_events where id = ?`,
+      ).get(spanId) as { payload: string }).payload);
+      const localGap = captureCodexModel(h.buffer.database, rawSpan);
+      const lease = h.upload({ ack: false });
       check("late_pair_span_first_leases_before_counterpart", lease.items.length === 1);
+      // The held lease survives a collector crash/restart. Reopen the same
+      // ledger before the late counterpart arrives and before the receipt flush.
+      h.restart();
       h.at(62_000); h.append(logEvent(R()));
       h.buffer.delivery.acknowledge(lease.leaseId,
         lease.items.map((item) => item.deliveryId), new Date(h.vnow));
@@ -598,8 +614,14 @@ async function main() {
         receipt?.state === "acknowledged" && receipt.reason === "remote_acknowledged", receipt);
       h.at(123_000); h.upload();
       const o = h.observe();
-      check("late_pair_local_once_but_cloud_has_two_without_retraction",
-        once(o) && o.cloud.rows === 2, o);
+      const wireGapEvent = lease.items[0]!.envelope.event;
+      check("late_pair_uploads_gap_then_one_log_without_retraction",
+        once(o) && o.cloud.rows === 1 && o.cloud.input === R().input && h.cloud.size === 2 &&
+          localGap.metadata.captureGap === true &&
+          localGap.metadata.modelGapInputTokens === R().input &&
+          wireGapEvent.metadata.usageSource === "capture_gap" &&
+          wireGapEvent.metadata.captureGap === undefined &&
+          wireGapEvent.inputTokens === undefined, o);
     } finally { h.close(); }
   }
 

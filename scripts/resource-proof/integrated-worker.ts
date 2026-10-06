@@ -295,6 +295,7 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
   const config = collectorConfigSchema.parse({
     uploadUrl: "http://127.0.0.1/fake-ingest",
     installKey: "resource-proof-install",
+    deviceId: "00000000-0000-4000-8000-000000000081",
     delivery: { maxOldestAgeDays: 3650, requestTimeoutSeconds: 1 },
   });
   const checks: Record<string, boolean> = {};
@@ -323,6 +324,7 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
     // quarantined and is invisible to every upload lease.
     buffer = new LocalEventBuffer(ledger, {
       workspaceId: config.tenantId,
+      deviceId: config.deviceId,
       delivery: { enabled: true, limits: config.delivery },
     });
     server = createCollectorServer(config, buffer);
@@ -343,17 +345,27 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
       counters.eventsObserved === 2 &&
       counters.eventsAdmitted === 1 &&
       counters.eventsDropped === 1;
+    const atomicRepairRows=(buffer.database.prepare(`select count(*) as n
+      from dashboard_projection_repairs r join buffered_events b on b.rowid=r.raw_rowid`)
+      .get() as {n:number}).n;
     checks.atomicCapture =
       counters.rawEventWrites === 1 &&
       counters.projectionRowsWritten > 0 &&
       counters.outboxRowsEnqueued === 1 &&
       afterAdmission.raw === 1 &&
       afterAdmission.facts - before.facts === 1 &&
-      afterAdmission.repairs === 0 &&
-      afterAdmission.repairBacklog === 0 &&
+      // Native trace capture queues one authority refresh after applying the
+      // inline fact. The raw/fact/outbox/debt share this same transaction.
+      afterAdmission.repairs === 1 &&
+      afterAdmission.repairBacklog === 1 &&
+      atomicRepairRows === 1 &&
       afterAdmission.outbox === 1;
 
     projectionSlices = drainProjection(buffer);
+    const afterRepair=durableState(buffer);
+    checks.authorityRepairDrainsOnce = projectionSlices===1 &&
+      afterRepair.repairs===0 && afterRepair.repairBacklog===0 &&
+      afterRepair.raw===1 && afterRepair.facts===1 && afterRepair.outbox===1;
     const snapshotResponse = await fetch(`http://127.0.0.1:${port}/api/snapshot?days=30`);
     const snapshot = (await snapshotResponse.json()) as {
       summary?: { totals?: { events?: number } };
@@ -402,6 +414,7 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
     // quarantined and is invisible to every upload lease.
     buffer = new LocalEventBuffer(ledger, {
       workspaceId: config.tenantId,
+      deviceId: config.deviceId,
       delivery: { enabled: true, limits: config.delivery },
     });
     const reopened = durableState(buffer);
@@ -458,6 +471,9 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
       afterUpload.outbox === 0 &&
       afterUpload.raw === 1 &&
       afterUpload.facts === 1;
+    const delivered = JSON.parse(uploadBodies[0] ?? "{}").events?.[0]?.event;
+    checks.nativeUsageRetainsModelAndCounters = delivered?.model === "resource-proof-model" &&
+      delivered?.inputTokens === 81 && delivered?.outputTokens === 8;
 
     if (mode === "privacy") {
       const malformed = [

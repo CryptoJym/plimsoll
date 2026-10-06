@@ -1,0 +1,4 @@
+{
+  "finding": "R10-P0-05",
+  "operations": ["skew-native-update", "skew-complete-request", "stateless-build"]
+}

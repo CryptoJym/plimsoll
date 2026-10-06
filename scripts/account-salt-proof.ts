@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 
 /** Contract proof for hosted tenant account-actor salt acquisition. */
 import assert from "node:assert/strict";
@@ -373,7 +374,8 @@ async function main() {
       actionClass: "other",
       inputTokens: 1,
       outputTokens: 1,
-      metadata: { proof: true },
+      ...nativeCodexFixture(id),
+      metadata: { ...nativeCodexFixture(id).metadata, proof: true },
     }));
     const echoed = (deviceId: string): typeof fetch => {
       const acknowledged = acknowledgingFetch(async (_input, init) => {
@@ -454,7 +456,8 @@ async function main() {
       actionClass: "other",
       inputTokens: 1,
       outputTokens: 1,
-      metadata: { proof: true },
+      ...nativeCodexFixture("deferred-account-salt"),
+      metadata: { ...nativeCodexFixture("deferred-account-salt").metadata, proof: true },
     }));
     const deferredDiagnostics: string[] = [];
     const deferredOriginalWarn = console.warn;

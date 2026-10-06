@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { LocalEventBuffer } from "./buffer";
-import type { LiveAuthenticatedBinding, LiveSourceContext } from "./codex-live-usage-auth";
+import type { LiveAuthenticatedBinding } from "./codex-live-usage-auth";
 import { isAuthenticatedLiveBinding } from "./codex-live-usage-auth";
 import { currentDispatchRoot,dispatchBindingMetadata,type CaptureRoot } from "./capture-root-inventory";
 import { AccountBindingHistory, CodexAccountKeyCache } from "./local-identity";
@@ -120,6 +120,14 @@ function pinMatches(pin: Pin | undefined, auth: LiveAuthenticatedBinding) {
   // retains the same session authority instead of conflicting with its own
   // immutable pre-failover pin (whose context_json records the old epoch).
   return Boolean(pin && pin.producer_id === auth.context.producerId && pin.context_digest === auth.contextDigest);
+}
+function observerSessionAuthority(db: DB, sessionId: string) {
+  // This provisioned observation protocol owns an immutable producer pin,
+  // including its zero-delta baseline. Its ownership check is separate from
+  // whether an OTLP/raw row proves model-bearing financial session coverage.
+  return (db.prepare(`select authority from session_usage_authority
+    where source='codex' and session_id=?`).get(sessionId) as
+    { authority: "live" | "tailer" } | undefined)?.authority ?? null;
 }
 const liveEventCapabilities = new WeakMap<AiInteractionEvent, { database: DB; auth: LiveAuthenticatedBinding }>();
 /** Read-only source-epoch sidecar; request JSON cannot manufacture it. */
@@ -264,7 +272,7 @@ export function ingestLiveUsage(buffer: LocalEventBuffer, packet: LivePacket, di
         .get(...identity) as { packet_digest: string } | undefined;
       if (known || (attachment && attachment.thread_id !== packet.threadId)) return record("collision", prior, true);
       const pin = readPin(db, packet.threadId);
-      const authority = buffer.sessionUsageAuthority("codex", packet.threadId);
+      const authority = observerSessionAuthority(db, packet.threadId);
       const legacyTokens = !pin && (db.prepare(`select 1 from buffered_events where source='codex' and session_id=? and
         (input_tokens is not null or output_tokens is not null
          or cache_read_tokens is not null or cache_creation_tokens is not null) limit 1`).get(packet.threadId) ||
@@ -285,7 +293,7 @@ export function ingestLiveUsage(buffer: LocalEventBuffer, packet: LivePacket, di
           .run(packet.threadId, packet.capturedAt);
         db.prepare(`insert into codex_live_pins values('codex',?,?,?,?,?) on conflict do nothing`)
           .run(packet.threadId, auth.context.producerId, auth.contextDigest, canonicalJson(auth.context), packet.capturedAt);
-        if (!pinMatches(readPin(db, packet.threadId), auth) || buffer.sessionUsageAuthority("codex", packet.threadId) !== "live")
+        if (!pinMatches(readPin(db, packet.threadId), auth) || observerSessionAuthority(db, packet.threadId) !== "live")
           throw new Error("live_authority_race");
       }
       const current = snapshot(auth, packet);

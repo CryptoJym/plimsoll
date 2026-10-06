@@ -1,0 +1,5 @@
+{
+  "finding": "R8-P0-07",
+  "operations": ["trace-sol", "span", "expire-retry", "sse-valid"],
+  "contract": "An already frozen native span owns its exact SSE twin; pairing does not retire or duplicate the owner."
+}

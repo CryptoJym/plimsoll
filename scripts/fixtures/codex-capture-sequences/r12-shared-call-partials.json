@@ -1,0 +1,14 @@
+{
+  "operations": [
+    "call-request-input",
+    "expire-retry",
+    "ack",
+    "call-request-output",
+    "expire-retry",
+    "ack",
+    "reopen",
+    "call-complete",
+    "expire-retry",
+    "ack"
+  ]
+}

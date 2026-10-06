@@ -23,15 +23,18 @@ import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import {
-  CODEX_USAGE_DUPLICATE_REASON,
   buildCodexUsagePairingIndexes,
   ensureCodexUsagePairingSchema,
   pairCodexUsageEvent,
 } from "./codex-usage-pairing";
+import { isCodexResponseSpan, pairCodexSpanRolloutEvent } from "./codex-span-rollout-pairing";
+import { applyCodexResponseCoverage } from "./codex-response-coverage";
+import { historicalRawHighWater, initializeHistoricalRawBoundary } from "./historical-raw";
+import { queueCodexAuthorityProjectionRepairs, CODEX_NATIVE_LINKED_SCOPE_SQL } from "./codex-model-capture";
 import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
-import { ensureUuidEventId, registerRetentionDeliveryId } from "./delivery-id";
+import { registerRetentionDeliveryId } from "./delivery-id";
 import { countRetentionHoldsOffThread } from "./retention-hold-count";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -44,6 +47,7 @@ import { legacyNullLineageReceiptMatchSql, terminalPrivacyEligibilitySql } from 
 import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
 import {
   canonicalRepoContextCwd,
+  REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
   peekRepoContextSidecar,
   peekRepoContextId,
   REPO_CONTEXT_RESOLVER_VERSION,
@@ -372,6 +376,7 @@ export class LocalEventBuffer {
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
       .get();
+    initializeHistoricalRawBoundary(this.db, !newLedger);
     markOpenStep("ledger.sqlite_open");
     this.db.exec(`
       create table if not exists buffered_events (
@@ -818,6 +823,29 @@ export class LocalEventBuffer {
         on buffered_events (workspace_id, uploaded_at, created_at);
       create index if not exists idx_events_session on buffered_events (session_id, observed_at);
       create index if not exists idx_events_observed on buffered_events (observed_at);
+      create index if not exists idx_codex_capture_trace_facts on buffered_events
+        (workspace_id,device_id,installation_epoch_id,
+         case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.traceId') end)
+        where source='codex';
+      create index if not exists idx_codex_capture_linked_native_scope_v2 on buffered_events
+        (workspace_id,device_id,installation_epoch_id,${CODEX_NATIVE_LINKED_SCOPE_SQL},session_id)
+        where source='codex';
+      create index if not exists idx_codex_capture_request_candidates on buffered_events
+        (workspace_id,device_id,installation_epoch_id,observed_at)
+        where source='codex' and
+          case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.otelEventName') end
+            in ('codex.sse_event','handle_responses');
+      create index if not exists idx_codex_capture_local_turn_candidates on buffered_events
+        (workspace_id,device_id,installation_epoch_id,session_id,
+          coalesce(
+            case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.codexTurnId') end,
+            case when json_valid(payload_json) then json_extract(payload_json,'$.metadata."turn.id"') end,
+            case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.turn_id') end),observed_at)
+        where source='codex' and
+          case when json_valid(payload_json) then json_extract(payload_json,'$.metadata.usageSource') end
+            in ('codex_local_turn','rollout');
+      create index if not exists idx_codex_native_usage_session on buffered_events (session_id)
+        where source='codex' and event_type in ('usage_rollout','usage_transcript');
       create index if not exists idx_events_retention on buffered_events (created_at, id);
       create index if not exists idx_events_repo on buffered_events (repo_hash, branch_hash);
       create index if not exists idx_raw_retention_expired
@@ -1016,6 +1044,7 @@ export class LocalEventBuffer {
     markOpenStep("ledger.learning_schema");
     this.projection = new DashboardProjectionStore(this.db, {
       newLedger,
+      reconcileCodexResponse: id => this.delivery.reconcileCodexResponse(id),
       onOpenStep: options.onOpenStep
         ? (step) => options.onOpenStep!({
             ...step,
@@ -1441,8 +1470,8 @@ export class LocalEventBuffer {
       .get() as { count: number }).count;
 
     const resolverExpression = hasResolverVersion
-      ? `coalesce(resolver_version, '${REPO_CONTEXT_RESOLVER_VERSION}')`
-      : `'${REPO_CONTEXT_RESOLVER_VERSION}'`;
+      ? "coalesce(resolver_version, 'git-context:v1')"
+      : "'git-context:v1'";
     const acceptedExpression = hasAcceptedAt ? "accepted_at" : "resolved_at";
     this.db.transaction(() => {
       this.db.exec(`
@@ -1505,7 +1534,7 @@ export class LocalEventBuffer {
     if (!validRepoContextOccurrence(occurrence) || !canonicalCwd) return null;
     const digest = crypto
       .createHmac("sha256", this.repoContextHmacKey())
-      .update("repoctx:v1\0", "utf8")
+      .update(`repoctx:v1:capture-policy:${REPO_CONTEXT_CAPTURE_POLICY_GENERATION}\0`, "utf8")
       .update(source, "utf8")
       .update("\0", "utf8")
       .update(occurrence, "utf8")
@@ -1530,6 +1559,14 @@ export class LocalEventBuffer {
     return this.deriveRepoContextRequest(source, occurrence, cwd);
   }
 
+  /** A fresh path-free terminal binding; it owns no resolver work or result. */
+  repoContextUnknownId(source: AiInteractionEvent["source"], occurrence: string) {
+    if (!validRepoContextOccurrence(occurrence)) throw new Error("repo_context_occurrence_invalid");
+    return `repoctx:v1:${crypto.createHmac("sha256", this.repoContextHmacKey())
+      .update(`repoctx:terminal-unknown:v${REPO_CONTEXT_CAPTURE_POLICY_GENERATION}\0`).update(source).update("\0")
+      .update(occurrence).digest("hex")}`;
+  }
+
   stageRepoContextRequest(request: RepoContextRequest) {
     if (!this.activeRepoContextCommitScope) {
       throw new Error("repo_context_commit_scope_required");
@@ -1537,7 +1574,8 @@ export class LocalEventBuffer {
     if (!validRepoContextRequest(request)) throw new Error("repo_context_request_invalid");
     const resolved = this.resolvedRepoContext(request.contextId);
     if (resolved.suppressed) return null;
-    if (resolved.exists) return request.contextId;
+    if (resolved.exists) return this.repoContextHasCurrentCapturePolicy(request.contextId)
+      ? request.contextId : null;
     return this.reserveRepoContextHandoff(request, this.activeRepoContextCommitScope)
       ? request.contextId
       : null;
@@ -1638,7 +1676,29 @@ export class LocalEventBuffer {
     }
   }
 
-  private resolvedRepoContext(contextId: string | null) {
+  /** Backward-compatible local provenance, never a parser checkpoint key.
+   * Released readers ignore the raw metadata receipt and tolerate the result
+   * version. Exact event IDs keep the raw receipt lookup a bounded PK read. */
+  repoContextHasCurrentCapturePolicy(contextId: string, capturedEventIds: readonly string[] = []) {
+    if (!validRepoContextId(contextId)) return false;
+    const row = this.db.prepare(
+      `select resolver_version as resolverVersion from repo_context_results where context_id = ?`,
+    ).get(contextId) as { resolverVersion: string } | undefined;
+    if (row) return row.resolverVersion === REPO_CONTEXT_RESOLVER_VERSION;
+    if (this.activeRepoContextCommitScope?.selectedIds.has(contextId)) return true;
+    if (capturedEventIds.length > 2) throw new Error("repo_context_provenance_lookup_unbounded");
+    const receipt = this.db.prepare(
+      `select 1 from repo_context_event_links l
+       join buffered_events e on e.id = l.event_id
+       where l.event_id = ? and l.context_id = ?
+         and case when json_valid(e.payload_json)
+           then json_extract(e.payload_json, '$.metadata.repoContextPolicyGeneration') end = ?
+       limit 1`,
+    );
+    return capturedEventIds.some(eventId => Boolean(receipt.get(eventId, contextId, REPO_CONTEXT_CAPTURE_POLICY_GENERATION)));
+  }
+
+  private resolvedRepoContext(contextId: string | null, currentCaptureOnly = false) {
     if (!contextId) {
       return {
         exists: false,
@@ -1651,6 +1711,7 @@ export class LocalEventBuffer {
     const row = this.db
       .prepare(
         `select r.repo_hash as repoHash, r.branch_hash as branchHash, r.head_sha as headSha,
+           r.resolver_version as resolverVersion,
            exists(select 1 from repo_context_suppressions s where s.context_id = ?) as suppressed
          from repo_context_results r where r.context_id = ?`,
       )
@@ -1659,15 +1720,18 @@ export class LocalEventBuffer {
         branchHash: string | null;
         headSha: string | null;
         suppressed: number;
+        resolverVersion: string;
       } | undefined;
     if (row) {
       const suppressed = row.suppressed === 1;
+      const excluded = suppressed ||
+        (currentCaptureOnly && row.resolverVersion !== REPO_CONTEXT_RESOLVER_VERSION);
       return {
         exists: true,
         suppressed,
-        repoHash: suppressed ? null : row.repoHash,
-        branchHash: suppressed ? null : row.branchHash,
-        headSha: suppressed ? null : row.headSha,
+        repoHash: excluded ? null : row.repoHash,
+        branchHash: excluded ? null : row.branchHash,
+        headSha: excluded ? null : row.headSha,
       };
     }
     const suppressed = Boolean(this.db
@@ -2648,7 +2712,7 @@ export class LocalEventBuffer {
       ? this.canBindRepoContextId(boundRepoContextId)
       : true;
     const existingRepoHash = gitField(event, "remoteUrlHash");
-    const resolvedRepoContext = this.resolvedRepoContext(repoContextId);
+    const resolvedRepoContext = this.resolvedRepoContext(repoContextId, true);
     const repoContextConflict = Boolean(
       existingRepoHash && resolvedRepoContext.repoHash &&
       existingRepoHash !== resolvedRepoContext.repoHash,
@@ -2665,21 +2729,36 @@ export class LocalEventBuffer {
     const projectKey = canonicalProjectKey(event.projectKey);
     const costKind = admittedCostKind(event);
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
-    const payloadJson = JSON.stringify(event);
+    // OTLP resource spans do not carry an install; stamp the actual ledger
+    // binding rather than leaving the already-known machine in a local column.
+    if (event.source === "codex" && installationEpochId && !event.metadata.installationEpochId) {
+      event = { ...event, metadata: { ...event.metadata, installationEpochId } };
+    }
+    // Only new context-bound captures carry this local-only policy receipt.
+    // Sealing reads it from the exact raw lineage; it is not an outbound field.
+    const payloadJson = JSON.stringify(repoContextId ? {
+      ...event, metadata: { ...event.metadata, repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION },
+    } : event);
     const insert = this.insertEventStatement ??= this.db.prepare(
+        // Retention may delete every post-boundary raw. Its durable migration
+        // cursor still reserves those rowids so a disabled append cannot land
+        // behind the next new-row scan. Complete-history hosts keep the same IDs.
         `insert or ignore into buffered_events
-          (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
+          (rowid, id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, first_received_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
            machine, account_hash, workspace_id, device_id, installation_epoch_id, project_key, cost_kind, privacy_generation)
         values
-          (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
+          ((select max(coalesce(max(rowid),0),@historicalHighWater,
+              (select cursor_rowid from upload_new_row_migration where singleton=1))+1 from buffered_events),
+           @id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @firstReceivedAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
            @machine, @accountHash, @workspaceId, @deviceId, @installationEpochId, @projectKey, @costKind, @privacyGeneration)`,
       );
     const result = insert
       .run({
+        historicalHighWater: historicalRawHighWater(this.db),
         id: event.id,
         source: event.source,
         eventType: event.eventType,
@@ -2710,12 +2789,21 @@ export class LocalEventBuffer {
         privacyGeneration,
       });
     if (result.changes > 0) {
+      // Codex needs the admitted raw row to evaluate native provenance. An
+      // invalid live row remains diagnostic evidence without taking authority.
+      if (event.source === "codex" && !this.claimSessionUsageAuthority(event, createdAt, true)) {
+        this.db.prepare("delete from buffered_events where id=?").run(event.id);
+        return { appended: false, repoContextRequest: null };
+      }
       this.budgetAttemptedRows += 1;
       const usagePair = pairCodexUsageEvent(this.db, event.id);
-      const pairedLogPayload = usagePair?.logId === event.id
-        ? (this.db.prepare(`select payload_json as payloadJson from buffered_events where id = ?`)
-            .get(event.id) as { payloadJson: string }).payloadJson
-        : payloadJson;
+      const rolloutPair = event.source === "codex" ? pairCodexSpanRolloutEvent(this.db, event.id) : null;
+      const responseCoverage = event.source === "codex" ? applyCodexResponseCoverage(this.db,event.id,
+        id => this.delivery.freezeSessionCoverage(id)) : false;
+      const pairedRaw = usagePair || rolloutPair || responseCoverage
+        ? this.db.prepare(`select payload_json as payloadJson,usage_duplicate_reason as duplicate
+            from buffered_events where id=?`).get(event.id) as {payloadJson:string;duplicate:string|null}
+        : {payloadJson,duplicate:null};
       if (repoContextId) {
         this.db.prepare(
           `insert into repo_context_event_links
@@ -2739,15 +2827,14 @@ export class LocalEventBuffer {
         dataMode: event.dataMode,
         createdAt,
         uploadedAt: null,
-        payloadJson: pairedLogPayload,
+        payloadJson: pairedRaw.payloadJson,
         suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         repoHash,
         branchHash,
         workspaceId: this.workspaceId,
         privacyGeneration,
         privacyDisposition: null,
-        usageDuplicateReason: usagePair?.spanId === event.id
-          ? CODEX_USAGE_DUPLICATE_REASON : null,
+        usageDuplicateReason: pairedRaw.duplicate,
         deviceId: this.deviceId,
       });
       if (repoContextConflict && repoContextId && existingRepoHash && resolvedRepoContext.repoHash) {
@@ -2765,6 +2852,8 @@ export class LocalEventBuffer {
       if (project) this.projection.tryApplyRawRow(Number(result.lastInsertRowid), new Date(),
         historyImportNoLiveSibling && this.historyImportEpoch !== null &&
         (event.eventType === "usage_rollout" || event.eventType === "usage_transcript"));
+      if (event.source === "codex" && event.metadata.traceId)
+        queueCodexAuthorityProjectionRepairs(this.db, event.id);
       // Otherwise the insert trigger's durable repair receipt remains queued.
       // Capture admission never depends on finishing all derived aggregates.
       // Runtime learning facts (#156) promote from the same durable moment.
@@ -2814,82 +2903,48 @@ export class LocalEventBuffer {
   }
 
   /**
-   * Token accounting is first-writer-authoritative for an entire session, not
-   * merely for one maintenance slice. Without this durable claim, a chunked
-   * rollout could commit early deltas, then allow a later OTLP event to make
-   * the tailer skip the remainder of that same cumulative stream.
+   * Claude retains its original first-writer session authority. Codex
+   * deduplicates individual responses after admission, under this writer.
    */
-  private claimSessionUsageAuthority(event: AiInteractionEvent, claimedAt: string) {
-    if (
-      !event.sessionId ||
-      (event.inputTokens === undefined && event.outputTokens === undefined) ||
-      (event.source !== "codex" && event.source !== "claude_code")
-    ) {
-      return true;
-    }
-    const tailerEvent =
-      event.eventType === "usage_rollout" || event.eventType === "usage_transcript";
-    const desired = tailerEvent ? "tailer" : "live";
-    const existing = this.db
-      .prepare(
-        `select authority from session_usage_authority
-         where source = ? and session_id = ?`,
-      )
-      .get(event.source, event.sessionId) as { authority: "tailer" | "live" } | undefined;
-    if (existing) return existing.authority === desired;
-
-    // Upgrade old ledgers deterministically before admitting new work. Live
-    // capture wins an already-mixed legacy session; otherwise the existing
-    // source that actually has token rows becomes authoritative.
-    const legacy = this.db
-      .prepare(
-        `select
-           max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
-           max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
-         from buffered_events
-         where source = ? and session_id = ?
-           and (input_tokens is not null or output_tokens is not null)`,
-      )
-      .get(event.source, event.sessionId) as { tailer: number | null; live: number | null };
-    const authority = legacy.live ? "live" : legacy.tailer ? "tailer" : desired;
-    this.db
-      .prepare(
-        `insert into session_usage_authority (source, session_id, authority, claimed_at)
-         values (?, ?, ?, ?)
-         on conflict(source, session_id) do nothing`,
-      )
-      .run(event.source, event.sessionId, authority, claimedAt);
-    // Another connection can win between the compatibility lookup and the
-    // insert. Always re-read the durable winner; returning our proposed value
-    // would allow both the live receiver and maintenance tailer to append.
-    const winner = this.db
-      .prepare(
-        `select authority from session_usage_authority
-         where source = ? and session_id = ?`,
-      )
-      .get(event.source, event.sessionId) as { authority: "tailer" | "live" } | undefined;
+  private claimSessionUsageAuthority(event: AiInteractionEvent, claimedAt: string, committed = false) {
+    if (event.source === "codex" || !event.sessionId || isCodexResponseSpan(event) ||
+        (event.inputTokens === undefined && event.outputTokens === undefined) ||
+        event.source !== "claude_code") return true;
+    const desired = event.eventType === "usage_rollout" || event.eventType === "usage_transcript" ? "tailer" : "live";
+    const inserted = committed ? this.db.prepare("select rowid from buffered_events where id=?")
+      .get(event.id) as { rowid: number } | undefined : undefined;
+    const existing = this.sessionUsageAuthority(event.source, event.sessionId, inserted ? [inserted.rowid] : []);
+    if (existing) return existing === desired;
+    this.db.prepare(`insert into session_usage_authority (source,session_id,authority,claimed_at)
+      values (?,?,?,?) on conflict(source,session_id) do nothing`)
+      .run(event.source, event.sessionId, desired, claimedAt);
+    const winner = this.db.prepare(`select authority from session_usage_authority
+      where source=? and session_id=?`).get(event.source, event.sessionId) as { authority: string } | undefined;
     return winner?.authority === desired;
   }
 
-  sessionUsageAuthority(source: "codex" | "claude_code" | "grok", sessionId: string) {
-    const row = this.db
-      .prepare(
-        `select authority from session_usage_authority
-         where source = ? and session_id = ?`,
-      )
-      .get(source, sessionId) as { authority: "tailer" | "live" } | undefined;
-    if (row) return row.authority;
-    const legacy = this.db
-      .prepare(
-        `select
-           max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
-           max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
-         from buffered_events
-         where source = ? and session_id = ?
-           and (input_tokens is not null or output_tokens is not null)`,
-      )
-      .get(source, sessionId) as { tailer: number | null; live: number | null };
-    return legacy.live ? "live" : legacy.tailer ? "tailer" : null;
+  sessionUsageAuthority(source: "codex" | "claude_code" | "grok", sessionId: string, excludeRowids: number[] = []) {
+    void excludeRowids;
+    const row = this.db.prepare(`select authority from session_usage_authority
+      where source=? and session_id=?`).get(source, sessionId) as { authority: "tailer" | "live" } | undefined;
+    if (source !== "codex") {
+      if (row) return row.authority;
+      const legacy = this.db.prepare(`select
+        max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
+        max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
+        from buffered_events where source=? and session_id=?
+          and (input_tokens is not null or output_tokens is not null)`)
+        .get(source,sessionId) as {tailer:number|null;live:number|null};
+      return legacy.live ? "live" : legacy.tailer ? "tailer" : null;
+    }
+    return null;
+  }
+
+  /** Kept for old local callers; no finite response attests a whole session.
+   * Response coverage is committed by append, without advancing the hold. */
+  commitCodexSessionCoverage(sessionId: string) {
+    void sessionId;
+    return false;
   }
 
   append(

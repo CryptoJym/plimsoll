@@ -1,0 +1,4 @@
+{
+  "finding": "R10-P0-06",
+  "operations": ["third-turn", "trace-astra", "sse-zero-complement-twin"]
+}

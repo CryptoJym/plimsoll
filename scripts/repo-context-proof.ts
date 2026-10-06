@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -63,6 +64,7 @@ function event(index: number, sessionId = "repo-context-session"): AiInteraction
     eventType: "assistant_response",
     observedAt: new Date(Date.UTC(2026, 6, 20, 10, 0, index % 60)).toISOString(),
     sessionId,
+    ...nativeCodexFixture(`repo-context-${index}`),
     inputTokens: index + 1,
     outputTokens: 1,
     actionClass: "other",
@@ -495,6 +497,7 @@ try {
   const partial = aiInteractionEventSchema.parse({
     ...event(5, "partial-linkage"),
     metadata: {
+      ...nativeCodexFixture(`repo-context-${5}`).metadata,
       git: {
         remoteUrlHash: replayResult.repoHash,
         branchHash: partialBranch,
@@ -527,6 +530,7 @@ try {
   const alreadyComplete = aiInteractionEventSchema.parse({
     ...event(5_001, "already-complete-linkage"),
     metadata: {
+      ...nativeCodexFixture(`repo-context-${5_001}`).metadata,
       git: {
         remoteUrlHash: replayResult.repoHash,
         branchHash: replayResult.branchHash,
@@ -553,7 +557,8 @@ try {
 
   const mismatch = aiInteractionEventSchema.parse({
     ...event(6, "repo-context-row-mismatch"),
-    metadata: { git: { remoteUrlHash: replayResult.repoHash } },
+    metadata: {
+      ...nativeCodexFixture(`repo-context-${6}`).metadata, git: { remoteUrlHash: replayResult.repoHash } },
   });
   attachRepoContextSidecar(mismatch, "repo-context-row-mismatch", cwdB);
   bufferA.append(mismatch);
@@ -1093,7 +1098,8 @@ try {
   const childSession = "child-inflight-shared";
   const childDonor = aiInteractionEventSchema.parse({
     ...event(2_099, childSession),
-    metadata: { git: { remoteUrlHash: remoteLinkageHash("https://example.invalid/donor.git") } },
+    metadata: {
+      ...nativeCodexFixture(`repo-context-${2_099}`).metadata, git: { remoteUrlHash: remoteLinkageHash("https://example.invalid/donor.git") } },
   });
   childOwner.append(childDonor);
   for (let index = 0; index < 10; index += 1) {

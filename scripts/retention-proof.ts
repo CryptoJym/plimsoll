@@ -403,7 +403,7 @@ try {
     assert.equal((db.prepare("select privacy_disposition as disposition from buffered_events where id=?")
       .get(literalId) as { disposition: string | null }).disposition, null);
     assert.equal(db.prepare("select 1 from upload_outbox where delivery_id=?").get(literalId) !== undefined, true);
-    const leaseAt = new Date(now.getTime() + 5_000);
+    const leaseAt = new Date(now.getTime() + 65_000);
     const lease = buffer.delivery.lease({ now: leaseAt });
     assert.deepEqual(lease.items.map((item) => item.deliveryId), [literalId]);
     assert.equal(buffer.delivery.acknowledge(lease.leaseId, [literalId], leaseAt).acknowledged, 1);
@@ -906,13 +906,13 @@ try {
 
     const lease = buffer.delivery.lease({
       leaseId: "retention-proof-lease",
-      now: new Date(),
+      now: new Date(Date.now() + 65_000),
     });
     assert.equal(lease.items.length, 1, JSON.stringify({ locallyDead: lease.locallyDead, blockedBy: lease.blockedBy }));
     const acknowledged = buffer.delivery.acknowledge(
       lease.leaseId,
       [captured.id],
-      new Date(),
+      new Date(Date.now() + 65_000),
     );
     assert.equal(acknowledged.acknowledged, 1);
     assert.equal(acknowledged.markedUploaded, 1);

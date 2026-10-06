@@ -1,0 +1,11 @@
+{
+  "finding": "R8-P1-01",
+  "operations": [
+    "sse-valid",
+    "stateless-build",
+    "restamp",
+    "rollback-048",
+    "restamp"
+  ],
+  "contract": "A stateless frozen native capture seals its matching queue copy and refuses restamp in both head and the actual .48 reader."
+}

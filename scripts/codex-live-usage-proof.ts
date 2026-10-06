@@ -70,7 +70,7 @@ async function fixture() {
   let token = enroll();
   let server = createCollectorServer(config, buffer, { localAuth: ordinary, liveProducerHome: home, perSourceRequestLimit: 10000 });
   let port = 0;
-  const start = async () => { await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); port = (server.address() as AddressInfo).port; };
+  const start = async () => { await new Promise<void>(resolve => server.listen(49794, "127.0.0.1", resolve)); port = (server.address() as AddressInfo).port; };
   await start();
   const headers = (producerId = baseline.producerId, value = token) => ({ "x-plimsoll-producer-id": producerId, "x-plimsoll-token": value });
   const send = (packet: unknown, extra: Record<string, string | string[]> = {}) => {
@@ -128,8 +128,9 @@ async function main() {
 await test("live_usage_does_not_guess_a_historical_account", async f => {
   const rawId = "fixture-live-codex-account";
   fs.writeFileSync(path.join(f.home, "auth.json"), JSON.stringify({ tokens: { account_id: rawId } }));
-  await f.send(baseline);
-  await f.send(positive);
+  assert.equal((await f.send(baseline)).body.disposition, "baseline_only");
+  assert.equal((await f.send(positive)).body.disposition, "stored");
+  assert.equal(f.events().length, 1, "authenticated interval must actually be stored");
   assert.equal(f.events()[0]?.metadata["user.account_id"], undefined);
 });
 await test("live_usage_uses_a_prior_observed_account_window", async f => {

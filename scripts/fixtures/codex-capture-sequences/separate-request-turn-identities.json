@@ -1,0 +1,4 @@
+{
+  "finding": "R10-P0-03",
+  "operations": ["request-only-span", "request-only-partial", "skew-native"]
+}

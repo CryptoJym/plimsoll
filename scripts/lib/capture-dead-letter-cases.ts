@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { nativeCodexFixture } from "./native-codex-fixture";
 import { LocalEventBuffer } from "../../packages/collector-cli/src/buffer";
 import { aiInteractionEventSchema } from "../../packages/shared/src/index";
 
@@ -34,7 +35,7 @@ export function verifyCaptureDeadLetterCases() {
           buffer.append(aiInteractionEventSchema.parse({
             id, source: "codex", dataMode: "metadata", eventType: row.type,
             observedAt: new Date(epoch + 60_000).toISOString(), actionClass: "other",
-            ...row.usage, metadata: {},
+            ...row.usage, ...("inputTokens" in row.usage ? nativeCodexFixture(id) : {metadata:{}}),
           }));
           return id;
         });

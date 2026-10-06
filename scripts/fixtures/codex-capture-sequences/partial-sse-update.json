@@ -1,0 +1,10 @@
+{
+  "finding": "R9-P0-06",
+  "operations": [
+    "sse-partial-twin",
+    "sse-valid",
+    "expire-retry"
+  ],
+  "shrink": "remove rollout-turn from the mixed counterexample; the partial/complete SSE path also duplicates",
+  "intent": "a partial and a complete native report of one response must conserve each financial field"
+}

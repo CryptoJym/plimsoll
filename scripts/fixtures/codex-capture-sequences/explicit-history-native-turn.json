@@ -1,0 +1,7 @@
+{
+  "finding": "R7-P0-03",
+  "operations": [
+    "history-turn",
+    "expire-retry"
+  ]
+}

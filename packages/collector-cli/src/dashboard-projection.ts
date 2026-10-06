@@ -3,6 +3,8 @@ import { performance } from "node:perf_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
+import { historicalRawProjection } from "./historical-raw";
+import { admittedUsageForRow, hasSessionUsageAuthority } from "./usage-authority";
 import { ensureUuidEventId } from "./upload-history";
 import { readLiveUsageEventObservation } from "../../shared/src/live-usage-metadata";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
@@ -18,7 +20,6 @@ import {
   recordFinanceCaptureActivity,
   financeScanTimeIsCurrent,
   type FinanceCoverageSource,
-  type FinanceSourceCoverageRow,
 } from "./history-coverage";
 import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
 import type { LedgerOpenTimingSink } from "./open-timing";
@@ -106,7 +107,6 @@ const SESSION_REPAIR_ROWS = 1_000;
 const SESSION_REPAIR_BUDGET_MS = 50;
 /** Historical snapshots remain readable after expiry, with parity withdrawn. */
 export const SNAPSHOT_MAX_STALENESS_MS = STATUS_MAX_AGE_MS;
-const FINANCE_CAPTURE_FRESHNESS_MS = 86_400_000;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
@@ -268,7 +268,9 @@ const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","
  * once while both raw evidence rows stay untouched. The class definition is
  * keyed to buffer.ts claimSessionUsageAuthority — `('usage_rollout',
  * 'usage_transcript')` as tailer, anything else usage-bearing as live — and
- * repairs ledgers whose mixed rows predate that gate (issue #193).
+ * repairs ledgers whose mixed rows predate that gate (issue #193). Codex
+ * uses response coverage in append and bounded repair; this session rule
+ * applies only to the other sources.
  */
 const USAGE_AUTHORITY_RULE = "live_capture_usage_wins";
 const USAGE_TAILER_EVENT_TYPES = ["usage_rollout", "usage_transcript"] as const;
@@ -276,16 +278,6 @@ const USAGE_TAILER_EVENT_TYPES = ["usage_rollout", "usage_transcript"] as const;
 function isUsageTailerEventType(eventType: string) {
   return (USAGE_TAILER_EVENT_TYPES as readonly string[]).includes(eventType);
 }
-
-/** Live-class sibling carrying any usage field for the same (source, session). */
-const LIVE_USAGE_SIBLING_SQL = `
-  select 1 from buffered_events
-   where source = ? and session_id = ?
-     and event_type not in ('usage_rollout','usage_transcript')
-     and (input_tokens is not null or output_tokens is not null
-       or cache_read_tokens is not null or cache_creation_tokens is not null
-       or cost_usd is not null)
-   limit 1`;
 
 /** A raw row that is live-class and carries usage (the predicate above, unqualified). */
 const LIVE_USAGE_ROW_SQL = `event_type not in ('usage_rollout','usage_transcript')
@@ -560,8 +552,8 @@ function carriesUsage(row: Pick<RawProjectionRow,
  * converge to the same totals (issue #193).
  */
 function backfillUsageSuppressed(db: Database.Database, row: RawProjectionRow) {
-  return isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
-    Boolean(db.prepare(LIVE_USAGE_SIBLING_SQL).get(row.source, row.sessionId));
+  return row.source !== "codex" && isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
+    hasSessionUsageAuthority(db, row.source, row.sessionId, "live") === true;
 }
 
 function safeClassification(value:string|null|undefined,allowed:Set<string>,fallback:string){
@@ -585,7 +577,7 @@ function day(value: string) {
   return value.slice(0, 10);
 }
 
-function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFact {
+function factFromRaw(row: RawProjectionRow, suppressUsage = false, captureGap = false): ProjectionFact {
   let liveUsageJson: string | null = null;
   let liveUsageFactJson: string | null = null;
   let unresolvedInterval = row.eventType === "usage_live";
@@ -615,7 +607,7 @@ function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFa
     observedAt: row.observedAt,
     sessionHash: safeHash(row.sessionId),
     actionClass: safeClassification(row.actionClass,SAFE_ACTIONS,"other"),
-    model: row.eventType === "usage_live" ? null : safeModel(row.model),
+    model: captureGap || row.eventType === "usage_live" ? null : safeModel(row.model),
     inputTokens: suppressUsage ? null : row.inputTokens,
     outputTokens: suppressUsage ? null : row.outputTokens,
     cacheReadTokens: suppressUsage ? null : row.cacheReadTokens,
@@ -706,6 +698,7 @@ export class DashboardProjectionStore {
   private failNextCompactGcAfterRewrite = false;
 
   private readonly captureStatements = new Map<string, Database.Statement>();
+  private readonly reconcileCodexResponse?: (rawId: string) => boolean;
 
   // Reuse the fixed capture SQL; each 128-record request used to compile the
   // same aggregate/trigger statements hundreds of times on the listener.
@@ -723,8 +716,10 @@ export class DashboardProjectionStore {
 
   constructor(
     private readonly db: Database.Database,
-    options: { newLedger?: boolean; now?: Date; onOpenStep?: LedgerOpenTimingSink } = {},
+    options: { newLedger?: boolean; now?: Date; onOpenStep?: LedgerOpenTimingSink;
+      reconcileCodexResponse?: (rawId: string) => boolean } = {},
   ) {
+    this.reconcileCodexResponse=options.reconcileCodexResponse;
     const openStarted = performance.now();
     let stepStarted = openStarted;
     const markOpenStep = (step: string) => {
@@ -1151,6 +1146,14 @@ export class DashboardProjectionStore {
     // Snapshot publication holds the writer. Keep the usage-authority
     // intersection on small covering indexes instead of reading every raw
     // event's payload-bearing table page once per dashboard window.
+    // The index describes raw counter rows, not financial admission. Adding
+    // Codex's JSON provenance predicate made legacy raw-count readers fall
+    // back to every payload page of the session. Keep admission in queries
+    // and rowHasAdmittedUsage, and repair the short-lived restrictive index.
+    const liveCounterIndex = this.db.prepare(`select sql from sqlite_master
+      where type='index' and name='idx_events_usage_authority_live'`).get() as {sql:string} | undefined;
+    if (liveCounterIndex?.sql.includes("json_extract"))
+      this.db.exec("drop index idx_events_usage_authority_live");
     this.db.exec(`
       create index if not exists idx_events_usage_authority_tailer
         on buffered_events (source, session_id, observed_at)
@@ -1242,9 +1245,16 @@ export class DashboardProjectionStore {
     // first scheduled maintenance slice can inspect the historical facts.
     // The scan record and parity refusal commit together, including on a
     // restart after an interrupted open.
+    // Extend the existing bounded fact scan to the authority rule once. This
+    // non-dashboard column leaves the public projection shape unchanged.
+    if (!(this.db.prepare("pragma table_info(codex_duplicate_fact_scan)").all() as Array<{name:string}>)
+        .some(column=>column.name==="authority_version"))
+      this.db.exec("alter table codex_duplicate_fact_scan add column authority_version integer not null default 0");
     this.db.transaction(() => {
       this.db.prepare(`insert or ignore into codex_duplicate_fact_scan
         (singleton, complete) values (1, ?)`).run(newLedger ? 1 : 0);
+      this.db.prepare(`update codex_duplicate_fact_scan set cursor_raw_rowid=0,
+        complete=?,authority_version=2 where singleton=1 and authority_version<2`).run(newLedger ? 1 : 0);
       // Import the still-queued prefix of a round-6 scan once on upgrade.
       if (!hadScanRepairReceipts) this.db.prepare(`insert or ignore into
         codex_duplicate_fact_scan_repairs (raw_rowid)
@@ -1918,7 +1928,7 @@ export class DashboardProjectionStore {
     // Decided before any write, so a deferral leaves nothing to undo.
     const liveUsageBatchRowids = new Map<string, number[]>();
     for (const row of rows) {
-      if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
+      if (row.source !== "codex" && !isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
         const key = `${row.source}\u0000${row.sessionId}`;
         const rowids = liveUsageBatchRowids.get(key);
         if (rowids) rowids.push(row.rawRowid);
@@ -1938,7 +1948,18 @@ export class DashboardProjectionStore {
       if (!earlier) firstLiveUsage.push([source, sessionId]);
     }
     const compactRows: RawProjectionRow[] = [];
-    for (const row of rows) {
+    for (const initial of rows) {
+      // Historical mixed rows use the same response coverage as append and
+      // send. A bounded repair can restore an uncovered old turn without
+      // making its already-accounted twin contribute a second time.
+      let row=initial.source === "codex" && carriesUsage(initial) &&
+        this.reconcileCodexResponse?.(initial.id) ? this.rawRow(initial.rawRowid) ?? initial : initial;
+      const derived = row.source === "codex" ? historicalRawProjection(this.db,row.id) : undefined;
+      if (derived) row = {...row,eventType:derived.event.eventType,payloadJson:JSON.stringify(derived.event),
+        model:derived.event.model ?? null,inputTokens:derived.event.inputTokens ?? null,
+        outputTokens:derived.event.outputTokens ?? null,cacheReadTokens:derived.event.cacheReadTokens ?? null,
+        cacheCreationTokens:derived.event.cacheCreationTokens ?? null,costUsd:derived.event.costUsd ?? null,
+        costKind:derived.event.costKind ?? null};
       // Raw rowids can be reused before a queued prune repair runs. The retained
       // live fact already has independent event identity; release its old slot.
       const formerLive = this.captureStatement(`select projection_id as id from dashboard_event_facts
@@ -1962,7 +1983,7 @@ export class DashboardProjectionStore {
         // writer from winning after this tailer row is admitted.
         const usageSuppressed = historyImportNoLiveSibling && isUsageTailerEventType(row.eventType)
           ? false : backfillUsageSuppressed(this.db, row);
-        this.applyFact(factFromRaw(row, usageSuppressed), now);
+        this.applyFact(this.capturedProjectionFact(row,usageSuppressed), now);
       }
     }
     if (compactRows.length) this.addCompactRows(compactRows);
@@ -1976,6 +1997,21 @@ export class DashboardProjectionStore {
            and exists (select 1 from dashboard_event_facts f where f.raw_rowid = b.rowid)`,
       ).run(now.toISOString(), source, sessionId);
     }
+  }
+
+  private capturedProjectionFact(row: RawProjectionRow, usageSuppressed: boolean) {
+    const captured = row.source === "codex" && carriesUsage(row)
+      ? admittedUsageForRow(this.db, row.id) : undefined;
+    const captureGap = row.source === "codex" && carriesUsage(row) && !captured;
+    // Both projection and its parity oracle consume the admitted capture,
+    // including its native model and derived price, without restamping raw
+    // diagnostics. Runtime intervals keep their unqualified semantics.
+    const admitted = captured && row.eventType !== "usage_live" ? { ...row,
+      model: captured.model ?? null, inputTokens: captured.inputTokens ?? null,
+      outputTokens: captured.outputTokens ?? null, cacheReadTokens: captured.cacheReadTokens ?? null,
+      cacheCreationTokens: captured.cacheCreationTokens ?? null,
+      costUsd: captured.costUsd ?? null, costKind: captured.costKind ?? null } : row;
+    return factFromRaw(admitted,usageSuppressed || captureGap,captureGap);
   }
 
   /**
@@ -1992,33 +2028,7 @@ export class DashboardProjectionStore {
     batchRowids: number[],
     probeRows?: number,
   ): boolean | "undecided" {
-    const batch = JSON.stringify(batchRowids);
-    if (probeRows === undefined) {
-      return Boolean(this.captureStatement(
-        `select 1 from buffered_events
-          where source = ? and session_id = ? and ${LIVE_USAGE_ROW_SQL}
-            and rowid not in (select value from json_each(?))
-          order by observed_at desc limit 1`,
-      ).get(source, sessionId, batch));
-    }
-    const found = this.captureStatement(
-      `select 1 from (
-         select rowid as raw_rowid, event_type, input_tokens, output_tokens,
-           cache_read_tokens, cache_creation_tokens, cost_usd
-         from buffered_events where source = ? and session_id = ?
-         order by observed_at desc limit ?)
-       where ${LIVE_USAGE_ROW_SQL}
-         and raw_rowid not in (select value from json_each(?))
-       limit 1`,
-    ).get(source, sessionId, probeRows, batch);
-    if (found) return true;
-    // The same newest rows the probe just read, plus one: is there anything older?
-    const { n } = this.captureStatement(
-      `select count(*) as n from (
-         select 1 from buffered_events where source = ? and session_id = ?
-         order by observed_at desc limit ?)`,
-    ).get(source, sessionId, probeRows + 1) as { n: number };
-    return n > probeRows ? "undecided" : false;
+    return hasSessionUsageAuthority(this.db, source, sessionId, "live", batchRowids, probeRows);
   }
 
   private compactWindowCutoffs() {
@@ -2182,14 +2192,14 @@ export class DashboardProjectionStore {
   }
 
   private removeStoredFact(previous:ProjectionFact,now:Date){
-    const bounds=this.db.prepare(
+    const bounds=this.captureStatement(
       `select oldest_observed_at as oldest,newest_observed_at as newest from dashboard_lifetime_totals where singleton=1`,
     ).get() as {oldest:string|null;newest:string|null};
-    const sourceLatest=this.db.prepare(
+    const sourceLatest=this.captureStatement(
       `select last_event_at as lastEventAt,last_token_event_at as lastTokenAt
        from dashboard_source_lifetime where source=?`,
     ).get(previous.source) as {lastEventAt:string|null;lastTokenAt:string|null}|undefined;
-    const windows=this.db.prepare(
+    const windows=this.captureStatement(
       `select days,cutoff_at as cutoffAt,target_cutoff_at as targetCutoffAt,
         expiry_cursor_at as expiryCursorAt,expiry_cursor_id as expiryCursorId from dashboard_window_control`,
     ).all() as Array<{days:number;cutoffAt:string;targetCutoffAt:string|null;expiryCursorAt:string|null;expiryCursorId:string|null}>;
@@ -2203,11 +2213,11 @@ export class DashboardProjectionStore {
       ?"dashboard_post_highwater_window":reference.parityCursor>=previous.rawRowid?"dashboard_parity_window":null):null;
     if(table)for(const window of windows)if(DASHBOARD_WINDOWS.includes(window.days as typeof DASHBOARD_WINDOWS[number])&&previous.observedAt>=(window.targetCutoffAt??window.cutoffAt))this.applyReferenceDelta(table,window.days,previous,-1);
     this.applyLifetimeDelta(previous,-1);
-    this.db.prepare(`delete from dashboard_event_facts where projection_id=?`).run(previous.projectionId);
+    this.captureStatement(`delete from dashboard_event_facts where projection_id=?`).run(previous.projectionId);
     if(bounds.oldest===previous.observedAt||bounds.newest===previous.observedAt)this.refreshLifetimeBounds();
     if(sourceLatest&&(sourceLatest.lastEventAt===previous.observedAt||
       (previous.inputTokens!==null&&sourceLatest.lastTokenAt===previous.observedAt)))this.refreshSourceLatest(previous.source);
-    this.db.prepare(`update dashboard_projection_control set dirty=1,
+    this.captureStatement(`update dashboard_projection_control set dirty=1,
       projection_rows_visited=projection_rows_visited+1,projection_rows_written=projection_rows_written+1 where singleton=1`).run();
     markFinancePublicationDirty(this.db, now.toISOString());
   }
@@ -3052,7 +3062,7 @@ export class DashboardProjectionStore {
   private compactBoundary(direction:"oldest"|"newest"){
     const column=direction==="oldest"?"min_observed_at":"max_observed_at";
     const order=direction==="oldest"?"asc":"desc";
-    const row=this.db.prepare(
+    const row=this.captureStatement(
       `select ${column} as boundary from dashboard_compact_day_source
        where event_count>0 order by ${column} ${order},bucket_day ${order},source ${order} limit 1`,
     ).get() as {boundary:string}|undefined;
@@ -3110,7 +3120,7 @@ export class DashboardProjectionStore {
   }
 
   private compactSourceLatest(source:string){
-    const row=this.db.prepare(
+    const row=this.captureStatement(
       `select max_observed_at as boundary from dashboard_compact_day_source
        where source=? and event_count>0 order by max_observed_at desc,bucket_day desc limit 1`,
     ).get(source) as {boundary:string}|undefined;
@@ -3118,23 +3128,23 @@ export class DashboardProjectionStore {
   }
 
   private refreshSourceLatest(source:string){
-    const fact=this.db.prepare(
+    const fact=this.captureStatement(
       `select
         (select observed_at from dashboard_event_facts where source=? order by observed_at desc,projection_id desc limit 1) as lastEventAt,
         (select observed_at from dashboard_event_facts where source=? and input_tokens is not null
          order by observed_at desc,projection_id desc limit 1) as lastTokenAt`,
     ).get(source,source) as {lastEventAt:string|null;lastTokenAt:string|null};
     const latest=[fact.lastEventAt,this.compactSourceLatest(source)].filter((v):v is string=>Boolean(v)).sort().at(-1)??null;
-    if(latest||fact.lastTokenAt)this.db.prepare(
+    if(latest||fact.lastTokenAt)this.captureStatement(
       `insert into dashboard_source_lifetime (source,last_event_at,last_token_event_at) values (?,?,?)
        on conflict(source) do update set last_event_at=excluded.last_event_at,
         last_token_event_at=excluded.last_token_event_at`,
     ).run(source,latest,fact.lastTokenAt);
-    else this.db.prepare(`delete from dashboard_source_lifetime where source=?`).run(source);
+    else this.captureStatement(`delete from dashboard_source_lifetime where source=?`).run(source);
   }
 
   private refreshLifetimeBounds(){
-    const facts=this.db.prepare(
+    const facts=this.captureStatement(
       `select
         (select observed_at from dashboard_event_facts order by observed_at,projection_id limit 1) as oldest,
         (select observed_at from dashboard_event_facts order by observed_at desc,projection_id desc limit 1) as newest`,
@@ -3142,7 +3152,7 @@ export class DashboardProjectionStore {
     const compactOldest=this.compactBoundary("oldest"),compactNewest=this.compactBoundary("newest");
     const oldest=[facts.oldest,compactOldest].filter((v):v is string=>Boolean(v)).sort()[0]??null;
     const newest=[facts.newest,compactNewest].filter((v):v is string=>Boolean(v)).sort().at(-1)??null;
-    this.db.prepare(`update dashboard_lifetime_totals set oldest_observed_at=?,newest_observed_at=? where singleton=1`).run(oldest,newest);
+    this.captureStatement(`update dashboard_lifetime_totals set oldest_observed_at=?,newest_observed_at=? where singleton=1`).run(oldest,newest);
   }
 
   runMaintenance(now = new Date(Date.now()), options: {
@@ -3183,14 +3193,18 @@ export class DashboardProjectionStore {
     const clock = options.clock ?? (() => performance.now());
     const deadline = options.maxActiveMs === undefined ? Infinity :
       clock() + Math.max(1, options.maxActiveMs);
-    const hasActiveTime = () => clock() < deadline;
+    // Injected row cost supplements the production wall deadline. A held
+    // proof clock must not let real SQLite work admit further batches after
+    // the physical allowance has elapsed; production already uses that clock.
+    const wallDeadline = options.clock && options.maxActiveMs !== undefined
+      ? performance.now() + Math.max(1, options.maxActiveMs) : Infinity;
+    const hasActiveTime = () => clock() < deadline && performance.now() < wallDeadline;
     // Migration and expiry can use the whole allowance in bounded batches.
     // Repairs retain their smaller deadline-sensitive admission units.
     const migrationBatchRows = options.maxActiveMs === undefined ?
       BACKFILL_ROWS : TIMED_BACKFILL_BATCH_ROWS;
     const expiryBatchRows = options.maxActiveMs === undefined ?
       REPAIR_ROWS : TIMED_BACKFILL_BATCH_ROWS;
-    const phaseRows = options.maxActiveMs === undefined ? BACKFILL_ROWS : TIMED_REPAIR_BATCH_ROWS;
     let phaseStarted = options.onPhaseForProof ? performance.now() : 0;
     const markPhase = (phase: "scan" | "pre_repair" | "repair" | "finish" | "commit") => {
       if (!options.onPhaseForProof) return;
@@ -3236,30 +3250,38 @@ export class DashboardProjectionStore {
       const duplicateScan = this.db.prepare(`select cursor_raw_rowid as cursor, complete
         from codex_duplicate_fact_scan where singleton=1`).get() as
         { cursor: number; complete: number };
-      // The first scan row is the admitted unit for this transaction. Even if
-      // control-row setup spent the clock, visit one row and yield afterward.
+      // The bounded SELECT page is the first admitted unit. It is already
+      // read before its rows reach JS; persist that page and its cursor
+      // together even when fetching it exhausted the admission allowance.
+      // Later phases still check the same deadline. Splitting this cheap
+      // page at each JS row made GC pauses add scan ticks after the read had
+      // already held the writer, without reducing that hold.
       if (!duplicateScan.complete) {
-        const candidates = this.db.prepare(`select f.raw_rowid as rawRowid,
-            b.usage_duplicate_reason as duplicateReason
+        const candidates = this.captureStatement(`select f.raw_rowid as rawRowid,
+            b.usage_duplicate_reason as duplicateReason,b.source
           from dashboard_event_facts f
           left join buffered_events b on b.rowid=f.raw_rowid
           where f.raw_rowid > ? order by f.raw_rowid limit ?`
         ).all(duplicateScan.cursor, DUPLICATE_FACT_SCAN_ROWS) as
-          Array<{ rawRowid: number; duplicateReason: string | null }>;
-        const queue = this.db.prepare(`insert or ignore into dashboard_projection_repairs
-          (raw_rowid, reason, queued_at) values (?, 'legacy_usage_duplicate', ?)`);
-        const oweRepair = this.db.prepare(`insert or ignore into
-          codex_duplicate_fact_scan_repairs (raw_rowid) values (?)`);
+          Array<{ rawRowid: number; duplicateReason: string | null; source: string | null }>;
+        const owing:number[]=[];
         for (const candidate of candidates) {
-          // The cursor advances over exactly the prefix admitted in this
-          // transaction. A later tick resumes the rest of the fetched page.
-          if (duplicateFactScanRowsVisited > 0 && !hasActiveTime()) break;
-          if (candidate.duplicateReason !== null) {
-            queue.run(candidate.rawRowid, now.toISOString());
-            oweRepair.run(candidate.rawRowid);
+          if (candidate.duplicateReason !== null || candidate.source === "codex") {
+            owing.push(candidate.rawRowid);
           }
           duplicateFactScanRowsVisited += 1;
           options.onWorkRowForProof?.("scan");
+        }
+        // The admitted page is one transaction. Persist its two debt sets
+        // together in SQL instead of crossing JS/SQLite twice for every row.
+        // Progress counts and the 1,000-row scan cap remain exact.
+        if(owing.length) {
+          const debt=JSON.stringify(owing);
+          this.captureStatement(`insert or ignore into dashboard_projection_repairs
+            (raw_rowid,reason,queued_at) select value,'legacy_usage_duplicate',? from json_each(?)`)
+            .run(now.toISOString(),debt);
+          this.captureStatement(`insert or ignore into codex_duplicate_fact_scan_repairs
+            (raw_rowid) select value from json_each(?)`).run(debt);
         }
         duplicateFactScanExhausted = candidates.length < DUPLICATE_FACT_SCAN_ROWS &&
           duplicateFactScanRowsVisited === candidates.length;
@@ -3352,29 +3374,35 @@ export class DashboardProjectionStore {
       // queued_at cannot strand one behind continuously captured repairs.
       // Start from the receipt primary key rather than sorting the whole
       // repair queue on every tick of a duplicate-heavy upgrade.
-      const scanRepairs=hasActiveTime()?this.db.prepare(
+      const fetchScanRepairs=this.db.prepare(
         `select ${repairColumns}
          from codex_duplicate_fact_scan_repairs scan
          join dashboard_projection_repairs r on r.raw_rowid=scan.raw_rowid
          left join buffered_events b on b.rowid=r.raw_rowid
          where ${repairEligible} order by scan.raw_rowid limit ?`,
-      ).all(REPAIR_ROWS) as RepairRow[]:[];
-      const ordinaryRepairs=hasActiveTime()&&scanRepairs.length<REPAIR_ROWS?this.db.prepare(
+      );
+      const fetchOrdinaryRepairs=this.db.prepare(
         `select ${repairColumns}
          from dashboard_projection_repairs r left join buffered_events b on b.rowid=r.raw_rowid
          where ${repairEligible} and not exists (
            select 1 from codex_duplicate_fact_scan_repairs scan where scan.raw_rowid=r.raw_rowid)
          order by r.queued_at,r.raw_rowid limit ?`,
-      ).all(REPAIR_ROWS-scanRepairs.length) as RepairRow[]:[];
-      const repairs=[...scanRepairs,...ordinaryRepairs];
+      );
       const removeRepair=this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`);
       // Apply and acknowledge only complete batches. A timed production pass
       // checks the same active deadline between small batches; an unbudgeted
       // explicit drain retains its original row-count allowance.
       const batchRows = options.maxActiveMs === undefined ? REPAIR_ROWS : TIMED_REPAIR_BATCH_ROWS;
-      for (let offset = 0; offset < repairs.length; offset += batchRows) {
-        if (!hasActiveTime()) break;
-        const batch = repairs.slice(offset, offset + batchRows);
+      // Fetch only the next admitted batch. Reading privacy/provenance for
+      // 250 candidates when a timed pass can commit only 8-16 rows dominated
+      // repair calibration and held the writer on every remaining tick.
+      while (repairRowsVisited < REPAIR_ROWS && hasActiveTime()) {
+        const requested=Math.min(batchRows,REPAIR_ROWS-repairRowsVisited);
+        const scanRepairs=fetchScanRepairs.all(requested) as RepairRow[];
+        const ordinaryRepairs=scanRepairs.length<requested
+          ? fetchOrdinaryRepairs.all(requested-scanRepairs.length) as RepairRow[] : [];
+        const batch=[...scanRepairs,...ordinaryRepairs];
+        if(!batch.length || !hasActiveTime())break;
         const rowsToApply:RawProjectionRow[]=[];
         for (const repair of batch) {
           if(repair.id!==null){
@@ -3571,7 +3599,9 @@ export class DashboardProjectionStore {
         "dashboard_parity_window",
         windows,
         rows.filter((row) => Boolean(row.privacyEligible))
-          .map((row) => factFromRaw(row, backfillUsageSuppressed(this.db, row))),
+          .map((row) => {
+            return this.capturedProjectionFact(row,backfillUsageSuppressed(this.db, row));
+          }),
       );
       for(const _row of rows)onWorkRowForProof?.("parity");
       rowsVisited+=rows.length;
@@ -4195,7 +4225,7 @@ export class DashboardProjectionStore {
    * (`usage_rollout`/`usage_transcript`) inside the reporting window whose
    * live class (any other event type) also recorded usage. The observed_at
    * window binds ONLY the tailer/backfill side (it is the reporting window);
-   * the live side is unbounded, exactly matching LIVE_USAGE_SIBLING_SQL and
+   * the live side is unbounded, exactly matching hasSessionUsageAuthority and
    * backfillUsageSuppressed, which carry no time bound. Derived from raw
    * evidence with the same class definition as the ingest gate, so the count
    * names what it says: backfill sessions actually suppressed (issue #193).
@@ -4212,6 +4242,7 @@ export class DashboardProjectionStore {
          intersect
          select source, session_id from buffered_events indexed by idx_events_usage_authority_live
           where session_id is not null
+            and source <> 'codex'
             and event_type not in ('usage_rollout','usage_transcript')
             and (input_tokens is not null or output_tokens is not null
               or cache_read_tokens is not null or cache_creation_tokens is not null

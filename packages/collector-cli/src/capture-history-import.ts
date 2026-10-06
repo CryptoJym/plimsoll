@@ -16,6 +16,9 @@ import { deterministicEventId } from "./normalizer";
 import { ensureJsonlScanState, jsonlScanStateKey, rememberJsonlScanCursor,
   type JsonlTailRead } from "./jsonl-byte-tailer";
 import { rootCursorKey } from "./capture-root-inventory";
+import { hasUnkeyedLiveUsageOverlap } from "./usage-authority";
+import { codexResponseCoverage, originalCoveredResponse } from "./codex-response-coverage";
+import { recordCodexTurnModel } from "./codex-model-capture";
 
 const UUID_AT_END = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
@@ -31,7 +34,7 @@ const WAL_STALL_MS = 60_000;
 type DB = Database.Database;
 type Amounts = { input: number; cacheRead: number; cacheCreation: number; output: number };
 type CodexState = { sessionId: string; previous: Amounts; index: number; observedBaseline: boolean;
-  reasoningOutput: number; contextOccurrenceIndex: number; model?: string; sessionStartedAt?: string;
+  reasoningOutput: number; contextOccurrenceIndex: number; model?: string; turnId?: string; turnModels?: string[]; sessionStartedAt?: string;
   originator?: string; cliVersion?: string; planType?: string };
 type ClaudeRevision = { sessionId: string; messageId: string; messageKey: string; current: Amounts };
 type RecordBytes = { recordIndex: number; byteOffset: number; digest: string };
@@ -317,7 +320,10 @@ function decodeCodexState(raw: string, sessionId: string): CodexState {
   if (state.sessionId !== sessionId || !Number.isSafeInteger(state.index) || state.index < -1 ||
       !Number.isSafeInteger(state.contextOccurrenceIndex) || state.contextOccurrenceIndex < -1 ||
       typeof state.observedBaseline !== "boolean" || !state.previous ||
-      !Object.values(state.previous).every(value => Number.isSafeInteger(value) && value >= 0))
+      !Object.values(state.previous).every(value => Number.isSafeInteger(value) && value >= 0) ||
+      (state.turnId !== undefined && (typeof state.turnId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(state.turnId))) ||
+      (state.turnModels !== undefined && (!Array.isArray(state.turnModels) || state.turnModels.length > 2 ||
+        state.turnModels.some(model => typeof model !== "string"))))
     refusal("import_counter_state_invalid");
   return state;
 }
@@ -436,6 +442,7 @@ function rememberSessionBytes(db: DB, source: CaptureRoot["source"], sessionId: 
     .run(source, sessionId, length, digest);
 }
 function isLiveSession(db: DB, source: CaptureRoot["source"], sessionId: string) {
+  if (source === "codex") return false;
   return (db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
     .get(source, sessionId) as { authority: string } | undefined)?.authority === "live";
 }
@@ -550,7 +557,15 @@ function* codexEvents(root: CaptureRoot, file: File): Generator<Candidate> {
         if (typeof parsed.payload?.cli_version === "string") state.cliVersion = parsed.payload.cli_version;
       } else if (parsed.type === "turn_context") {
         state.contextOccurrenceIndex += 1;
-        if (typeof parsed.payload?.model === "string") state.model = parsed.payload.model;
+        const turnId = typeof parsed.payload?.turn_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(parsed.payload.turn_id)
+          ? parsed.payload.turn_id : undefined;
+        if (!turnId || turnId !== state.turnId) state.turnModels = [];
+        state.turnId = turnId;
+        // A context that omits its model/turn is unknown; it is never the
+        // neighbouring turn's model. Keep contradictions within one turn.
+        state.model = typeof parsed.payload?.model === "string" && parsed.payload.model ? parsed.payload.model : undefined;
+        if (turnId && state.model)
+          state.turnModels = [...new Set([...(state.turnModels ?? []),state.model])].slice(0,2);
       } else if (parsed.type === "event_msg" && parsed.payload?.type === "token_count") {
         usage = true;
         const reported = parsed.payload?.info?.total_token_usage;
@@ -573,7 +588,9 @@ function* codexEvents(root: CaptureRoot, file: File): Generator<Candidate> {
         if (typeof observedAt !== "string") refusal("codex_timestamp_missing");
         const marginal = firstUnknown ? { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 } : delta;
         yield { sourceId: id, event: event(root, id, sessionId, observedAt, state.model, marginal,
-          { turnIndex: state.index, ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
+          { turnIndex: state.index, ...(state.turnId ? { codexTurnId: state.turnId } : {}),
+            ...((state.turnModels?.length ?? 0) > 1 ? { modelEvidenceConflict: true } : {}),
+            ...(firstUnknown ? { counterLineage: "unknown_nonzero_first",
             sourceCumulativeInput: current.input, sourceCumulativeCachedInput: current.cacheRead,
             sourceCumulativeOutput: current.output } : {}) }, firstUnknown),
           prefixCheckpoint: { ...record, current, codexState: structuredClone(state) } };
@@ -677,7 +694,8 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
         : `select count(*) as n from raw_retention_receipts`).get() as { n: number }).n : 0;
   const prior = db.prepare(`select source,session_id as sessionId,event_type as eventType,
     observed_at as observedAt,model,input_tokens as inputTokens,output_tokens as outputTokens,
-    cache_read_tokens as cacheReadTokens,cache_creation_tokens as cacheCreationTokens
+    cache_read_tokens as cacheReadTokens,cache_creation_tokens as cacheCreationTokens,
+    payload_json as payload,usage_duplicate_reason as duplicate
     from buffered_events where id=? limit 1`);
   const retained = table(db, "raw_retention_receipts")
     ? db.prepare(`select 1 from raw_retention_receipts where event_id=? limit 1`) : null;
@@ -741,8 +759,10 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       sessions.add(session);
       if (!plan.firstObservedAt || e.observedAt < plan.firstObservedAt) plan.firstObservedAt = e.observedAt;
       if (!plan.lastObservedAt || e.observedAt > plan.lastObservedAt) plan.lastObservedAt = e.observedAt;
-      const live = (authority.get(root.source, session) as { authority: string } | undefined)?.authority === "live" ||
-        Boolean(liveRaw.get(root.source, session));
+      const live = root.source === "codex"
+        ? false
+        : (authority.get(root.source, session) as { authority: string } | undefined)?.authority === "live" ||
+          Boolean(liveRaw.get(root.source, session));
       if (live) { skippedLive.add(session); continue; }
       const digest = crypto.createHash("sha256").update(JSON.stringify([
         e.observedAt, e.model, e.inputTokens, e.outputTokens, e.cacheReadTokens, e.cacheCreationTokens,
@@ -757,11 +777,20 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
         refusal("prior_root_observation_conflict");
       if (retained?.get(candidate.sourceId) && sightings.length === 0)
         matchedReceipts.add(candidate.sourceId);
-      const existing = prior.get(candidate.sourceId) as {
+      let existing = prior.get(candidate.sourceId) as {
         source: string; sessionId: string | null; eventType: string; observedAt: string;
         model: string | null; inputTokens: number | null; outputTokens: number | null;
         cacheReadTokens: number | null; cacheCreationTokens: number | null;
+        payload: string; duplicate: string | null;
       } | undefined;
+      if (existing && root.source === "codex") {
+        const original = originalCoveredResponse(db,candidate.sourceId) ??
+          (existing.duplicate ? JSON.parse(existing.payload) as AiInteractionEvent : undefined);
+        if (original) existing = {...existing,source:original.source,sessionId:original.sessionId ?? null,
+          eventType:original.eventType,observedAt:original.observedAt,model:original.model ?? null,
+          inputTokens:original.inputTokens ?? null,outputTokens:original.outputTokens ?? null,
+          cacheReadTokens:original.cacheReadTokens ?? null,cacheCreationTokens:original.cacheCreationTokens ?? null};
+      }
       if (existing && (existing.source !== e.source || existing.sessionId !== session ||
           existing.eventType !== e.eventType || existing.observedAt !== e.observedAt ||
           existing.model !== (e.model ?? null) || (existing.inputTokens ?? 0) !== (e.inputTokens ?? 0) ||
@@ -780,10 +809,12 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
       if (file.importedByteLength !== undefined &&
           candidate.prefixCheckpoint!.byteOffset <= file.importedByteLength) continue;
       plan.missingRows += 1;
-      plan.tokens.input += e.inputTokens ?? 0;
-      plan.tokens.output += e.outputTokens ?? 0;
-      plan.tokens.cacheRead += e.cacheReadTokens ?? 0;
-      plan.tokens.cacheCreation += e.cacheCreationTokens ?? 0;
+      const coverage = root.source === "codex" ? codexResponseCoverage(db,e) : undefined;
+      const uncovered = coverage?.covered ? undefined : coverage?.remaining ?? e;
+      plan.tokens.input += uncovered?.inputTokens ?? 0;
+      plan.tokens.output += uncovered?.outputTokens ?? 0;
+      plan.tokens.cacheRead += uncovered?.cacheReadTokens ?? 0;
+      plan.tokens.cacheCreation += uncovered?.cacheCreationTokens ?? 0;
       if (onMissing) {
         if (resume && candidateIndex <= resume.index) refusal("resume_cursor_evidence_lost");
         verifiedCandidates.push({ candidate, index: candidateIndex,
@@ -810,11 +841,13 @@ async function scan(db: DB, root: CaptureRoot, options: Options,
   // earlier OTLP/hook capture of any still-missing session, so refuse.
   if (plan.missingRows > 0 && receiptCount !== matchedReceipts.size) refusal("unattributed_pruned_rows");
   if (plan.missingRows > 0 && plan.firstObservedAt && plan.lastObservedAt) {
-    const unkeyed = db.prepare(`select 1 from buffered_events where source=? and session_id is null
-      and observed_at between ? and ? and event_type not in ('usage_rollout','usage_transcript')
-      and (input_tokens is not null or output_tokens is not null or cache_read_tokens is not null
-        or cache_creation_tokens is not null or cost_usd is not null) limit 1`)
-      .get(root.source, plan.firstObservedAt, plan.lastObservedAt);
+    const unkeyed = root.source === "codex"
+      ? hasUnkeyedLiveUsageOverlap(db,root.source,plan.firstObservedAt,plan.lastObservedAt)
+      : db.prepare(`select 1 from buffered_events where source=? and session_id is null
+          and observed_at between ? and ? and event_type not in ('usage_rollout','usage_transcript')
+          and (input_tokens is not null or output_tokens is not null or cache_read_tokens is not null
+            or cache_creation_tokens is not null or cost_usd is not null) limit 1`)
+          .get(root.source,plan.firstObservedAt,plan.lastObservedAt);
     if (unkeyed) refusal("unkeyed_live_usage_overlap");
   }
   return { plan, files };
@@ -986,6 +1019,7 @@ function rememberFileCursor(db: DB, root: CaptureRoot, file: File) {
         reasoningOutput: final.reasoningOutput }, tokenCountIndex: final.index,
       contextOccurrenceIndex: final.contextOccurrenceIndex,
       ...(final.model ? { model: final.model } : {}),
+      ...(final.turnId ? { turnId: final.turnId } : {}),
       ...(final.sessionStartedAt ? { sessionStartedAt: final.sessionStartedAt } : {}),
       ...(final.originator ? { originator: final.originator } : {}),
       ...(final.cliVersion ? { cliVersion: final.cliVersion } : {}),
@@ -1225,19 +1259,32 @@ export async function applyCaptureHistory(buffer: LocalEventBuffer, root: Captur
         maintenanceIdle(db);
         const counts: Amounts = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
         let rows = 0;
+        const liveSessions = new Map<string,boolean>();
         for (const item of batch) {
           const rowStarted = performance.now();
           const e = item.candidate.event;
-          // A concurrent live writer may have won the session while files
+          // A concurrent Claude writer may have won the session while files
           // were read; session authority is checked again under the writer.
-          const authority = db.prepare(`select authority from session_usage_authority where source=? and session_id=?`)
-            .get(root.source, e.sessionId) as { authority: string } | undefined;
-          if (authority?.authority !== "live" && appendRootObservation(buffer, e, root, false, true)) {
+          // No live writer can enter this IMMEDIATE transaction. Tailer
+          // appends cannot create live authority, so one check per session
+          // has the same admission result as rechecking every imported row.
+          if (!liveSessions.has(e.sessionId!))
+            liveSessions.set(e.sessionId!,isLiveSession(db,root.source,e.sessionId!));
+          const native = item.candidate.prefixCheckpoint?.codexState;
+          if (!liveSessions.get(e.sessionId!) && native?.turnId)
+            for (const model of native.turnModels ?? []) recordCodexTurnModel(db,native.sessionId,native.turnId,model,
+              typeof e.metadata.captureAccountHash === "string" ? e.metadata.captureAccountHash : undefined);
+          if (!liveSessions.get(e.sessionId!) && appendRootObservation(buffer, e, root, false, true)) {
             rows += 1;
-            counts.input += e.inputTokens ?? 0;
-            counts.output += e.outputTokens ?? 0;
-            counts.cacheRead += e.cacheReadTokens ?? 0;
-            counts.cacheCreation += e.cacheCreationTokens ?? 0;
+            // Append rechecks response coverage under this writer. Receipt
+            // counters use the admitted remainder, including partial twins.
+            const admitted = db.prepare(`select input_tokens as input,output_tokens as output,
+              cache_read_tokens as cacheRead,cache_creation_tokens as cacheCreation
+              from buffered_events where id=?`).get(e.id) as Amounts;
+            counts.input += admitted.input ?? 0;
+            counts.output += admitted.output ?? 0;
+            counts.cacheRead += admitted.cacheRead ?? 0;
+            counts.cacheCreation += admitted.cacheCreation ?? 0;
             if (item.candidate.claudeRevision) rememberClaudeRevision(db, item.candidate.claudeRevision);
             if (item.candidate.prefixCheckpoint)
               rememberPrefixCheckpoint(db, root.source, e.sessionId!, item.candidate.prefixCheckpoint);

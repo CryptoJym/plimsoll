@@ -1,4 +1,6 @@
 import { acceptedFixtureDelivery } from "../lib/delivery-fixture";
+import { nativeCodexFixture } from "../lib/native-codex-fixture";
+import { captureCodexModel, isCaptureGap } from "../../packages/collector-cli/src/codex-model-capture";
 import { hasRequiredMaintenanceChecks, hasRequiredSchemaTables } from "../system-e2e/contract";
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
@@ -1686,11 +1688,13 @@ export async function runPoisonContinuationContract(
   const config = collectorConfigSchema.parse({
     uploadUrl: "http://127.0.0.1:1/fake-ingest",
     installKey: "resource-proof-install",
+    deviceId: "00000000-0000-4000-8000-000000000081",
     delivery: { maxOldestAgeDays: 3650, requestTimeoutSeconds: 1 },
   });
   const buffer = new LocalEventBuffer(path.join(sandbox.plimsollHome, "poison-continuation.sqlite"), {
     // Issue 0089: capture pre-bound to config.tenantId (future-only enrollment).
     workspaceId: config.tenantId,
+    deviceId: config.deviceId,
     delivery: { enabled: true, limits: config.delivery },
   });
   const eventId = (n: number) =>
@@ -1701,13 +1705,14 @@ export async function runPoisonContinuationContract(
       id: eventId(n),
       sessionId: eventId(100 + n),
       source: "codex",
+      model: nativeCodexFixture(eventId(n)).model,
       dataMode: "metadata",
       eventType: "assistant_response",
       observedAt: new Date(Date.now() + n * 1_000).toISOString(),
       actionClass: "other",
       inputTokens: n,
       outputTokens: 1,
-      metadata: { resourceProof: true },
+      metadata: { ...nativeCodexFixture(eventId(n)).metadata, resourceProof: true },
     }),
   );
   try {
@@ -1718,6 +1723,8 @@ export async function runPoisonContinuationContract(
       .all() as Array<{ id: string; payload: string }>;
     let probes = 0;
     const result = await uploadBufferedEvents(config, buffer, {
+      // This proof measures poison isolation after the capture grace period.
+      now: () => new Date(Date.now() + 61_000),
       fetchImpl: async (_input, init) => {
         probes += 1;
         const body = JSON.parse(String(init?.body ?? "{}")) as {
@@ -2926,7 +2933,9 @@ export function runBoundedCodexReconciliationContract(
   const started = performance.now();
   const counters = emptyWorkCounters();
   const ledger = path.join(sandbox.plimsollHome, "codex-reconciliation-proof.sqlite");
-  const buffer = new LocalEventBuffer(ledger);
+  const buffer = new LocalEventBuffer(ledger, {
+    deviceId: "00000000-0000-4000-8000-000000000091",
+  });
   try {
     const sessionId = "019e9100-0000-7000-8000-000000000091";
     for (let index = 0; index < 4; index += 1) {
@@ -2990,14 +2999,25 @@ export function runBoundedCodexReconciliationContract(
     }
     const rows = buffer.database
       .prepare(
-        `select session_id as sessionId, model, cost_usd as costUsd
-         from buffered_events where id like 'resource-reconciliation-candidate-%'`,
+        `select id,payload_json as payload,session_id as sessionId, model, cost_usd as costUsd,
+          input_tokens as inputTokens,output_tokens as outputTokens
+         from buffered_events where id like 'resource-reconciliation-candidate-%' order by id`,
       )
       .all() as Array<{
       sessionId: string | null;
       model: string | null;
       costUsd: number | null;
+      id:string;payload:string;inputTokens:number;outputTokens:number;
     }>;
+    // Bounded reconciliation may repair a session label. A nearby bare
+    // normalized model is not native model evidence and cannot price usage.
+    const diagnosticGaps = rows.every((row,index) => {
+      const gap=captureCodexModel(buffer.database,JSON.parse(row.payload),row.id,false,false);
+      return isCaptureGap(gap) && gap.model===undefined && gap.costUsd===undefined &&
+        gap.inputTokens===undefined && gap.outputTokens===undefined &&
+        gap.metadata.modelGapInputTokens===100+index &&
+        gap.metadata.modelGapOutputTokens===10;
+    });
     const idle = runCodexReconciliationMaintenance(buffer.database, { timeLimitMs: 1_000 });
     counters.reconciliationRowsVisited += idle.rowsVisited;
     counters.rawEventRewrites += idle.rowsChanged;
@@ -3008,8 +3028,10 @@ export function runBoundedCodexReconciliationContract(
     const passed =
       rows.length === 4 &&
       rows.every(
-        (row) => row.sessionId === sessionId && row.model === "gpt-5.5" && row.costUsd !== null,
+        (row,index) => row.sessionId === sessionId && row.model === null && row.costUsd === null &&
+          row.inputTokens===100+index && row.outputTokens===10,
       ) &&
+      diagnosticGaps &&
       bounded &&
       idle.rowsVisited === 0 &&
       idle.rowsChanged === 0 &&
@@ -3027,6 +3049,7 @@ export function runBoundedCodexReconciliationContract(
       counters,
       measurements: {
         candidateRows: rows.length,
+        tokenlessGapsWithOriginalDiagnostics: diagnosticGaps,
         maintenanceSlices: slices.length,
         maxContextRowsVisited: Math.max(0, ...slices.map((result) => result.contextRowsVisited)),
         maxCandidateRowsVisited: Math.max(

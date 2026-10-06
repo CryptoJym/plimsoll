@@ -1,0 +1,11 @@
+{
+  "finding": "R8-P0-09",
+  "seed": 11,
+  "operations": [
+    "trace-sol",
+    "span",
+    "gap-seal",
+    "upgrade-048"
+  ],
+  "contract": "A stateless frozen span keeps ownership across both rollout pairing and a later exact SSE twin."
+}

@@ -1,4 +1,6 @@
+import { createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -19,6 +21,9 @@ import { readBoundedRegularFile, type BoundedRegularFileRead } from "./safe-file
  */
 
 const cache = new Map<string, { at: number; context: GitLinkageContext | undefined }>();
+// Process-local, opaque cache identities only. Neither raw paths nor a stable
+// working-directory digest are retained, persisted or sent to a reader.
+const cacheKeySalt = randomBytes(32);
 const CACHE_TTL_MS = 30_000;
 const POINTER_LIMIT_BYTES = 4 * 1024;
 const HEAD_LIMIT_BYTES = 4 * 1024;
@@ -27,6 +32,7 @@ const CONFIG_LIMIT_BYTES = 256 * 1024;
 const PACKED_REFS_LIMIT_BYTES = 1024 * 1024;
 
 type LocatedGitDir = { gitDir: string; commonDir: string; isWorktree: boolean };
+type HomeBoundary = { directory: string; device: bigint; inode: bigint };
 type GitLookup<T> = { kind: "ok"; value: T } | { kind: "missing" } | { kind: "unsafe" };
 
 function readText(filePath: string, limitBytes: number): BoundedRegularFileRead {
@@ -45,9 +51,91 @@ function containedGitPath(root: string, relative: string) {
   return resolved.startsWith(`${resolvedRoot}${path.sep}`) ? resolved : undefined;
 }
 
-function findGitDir(startDir: string): GitLookup<LocatedGitDir> {
-  let dir = path.resolve(startDir);
+function resolvedUserHome(): HomeBoundary | undefined {
+  try {
+    const home = os.homedir();
+    if (!home || !path.isAbsolute(home)) return undefined;
+    const resolved = fs.realpathSync(home);
+    const stat = fs.statSync(resolved, { bigint: true });
+    return stat.isDirectory()
+      ? { directory: resolved, device: stat.dev, inode: stat.ino }
+      : undefined;
+  } catch {
+    // Without a verified home boundary, no filesystem-derived linkage is safe.
+    return undefined;
+  }
+}
+
+function pointedGitDirs(dotGit: string, directory: string): GitLookup<LocatedGitDir> {
+  const pointerRead = readText(dotGit, POINTER_LIMIT_BYTES);
+  if (pointerRead.kind !== "ok") return { kind: "unsafe" };
+  const pointer = singleLine(pointerRead.value)?.match(/^gitdir:[ \t]*(.+?)[ \t]*$/)?.[1];
+  if (!pointer) return { kind: "unsafe" };
+  const gitDir = path.resolve(directory, pointer);
+  return commonGitDirs(gitDir, true);
+}
+
+/** Both directory-form and pointer-form git dirs can name a common dir. */
+function commonGitDirs(gitDir: string, isWorktree: boolean): GitLookup<LocatedGitDir> {
+  const commonRead = readText(path.join(gitDir, "commondir"), POINTER_LIMIT_BYTES);
+  if (commonRead.kind === "unsafe") return { kind: "unsafe" };
+  const commonPointer = commonRead.kind === "ok" ? singleLine(commonRead.value)?.trim() : undefined;
+  if (commonRead.kind === "ok" && !commonPointer) return { kind: "unsafe" };
+  return { kind: "ok", value: {
+    gitDir, commonDir: commonPointer ? path.resolve(gitDir, commonPointer) : gitDir,
+    isWorktree: isWorktree || Boolean(commonPointer),
+  } };
+}
+
+function directoryIdentity(directory: string): HomeBoundary {
+  const resolved = fs.realpathSync(directory);
+  const stat = fs.statSync(resolved, { bigint: true });
+  if (!stat.isDirectory()) throw new Error("git_directory_unavailable");
+  return { directory: resolved, device: stat.dev, inode: stat.ino };
+}
+
+function sameDirectory(left: HomeBoundary, right: HomeBoundary) {
+  return left.directory === right.directory || left.device === right.device && left.inode === right.inode;
+}
+
+/** Identify the repository owned by home or the system root, including a
+ * .git file. Only pointer metadata is read here, never its HEAD or config. */
+function boundaryRepository(directory: string): GitLookup<HomeBoundary> {
+  const dotGit = path.join(directory, ".git");
+  let stat: fs.Stats;
+  try { stat = fs.statSync(dotGit); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return { kind: code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unsafe" };
+  }
+  if (!stat.isDirectory() && !stat.isFile()) return { kind: "unsafe" };
+  const located = stat.isDirectory() ? commonGitDirs(dotGit, false) : pointedGitDirs(dotGit, directory);
+  return located.kind === "ok"
+    ? { kind: "ok", value: directoryIdentity(located.value.commonDir) } : located;
+}
+
+function allowedRepository(located: LocatedGitDir, home: HomeBoundary): boolean {
+  const common = directoryIdentity(located.commonDir);
+  for (const directory of [home.directory, path.parse(home.directory).root]) {
+    const owner = boundaryRepository(directory);
+    if (owner.kind === "unsafe" || owner.kind === "ok" && sameDirectory(common, owner.value)) return false;
+  }
+  return true;
+}
+
+function findGitDir(startDir: string, home: HomeBoundary): GitLookup<LocatedGitDir> {
+  let dir = fs.realpathSync(path.resolve(startDir));
   for (let depth = 0; depth < 24; depth += 1) {
+    // Test the boundary BEFORE inspecting .git, including when cwd is the
+    // boundary itself. Never discover a repository above the user's home.
+    if (dir === home.directory || dir === path.parse(dir).root) return { kind: "missing" };
+    // realpath can preserve spelling on case-insensitive volumes. Directory
+    // identity also catches case/Unicode aliases of the same home folder.
+    const directoryStat = fs.statSync(dir, { bigint: true });
+    if (!directoryStat.isDirectory()) return { kind: "unsafe" };
+    if (directoryStat.dev === home.device && directoryStat.ino === home.inode) {
+      return { kind: "missing" };
+    }
     const dotGit = path.join(dir, ".git");
     let stat: fs.BigIntStats | undefined;
     try {
@@ -59,21 +147,11 @@ function findGitDir(startDir: string): GitLookup<LocatedGitDir> {
     }
 
     if (stat?.isDirectory()) {
-      return { kind: "ok", value: { gitDir: dotGit, commonDir: dotGit, isWorktree: false } };
+      return commonGitDirs(dotGit, false);
     }
 
     if (stat?.isFile()) {
-      const pointerRead = readText(dotGit, POINTER_LIMIT_BYTES);
-      if (pointerRead.kind !== "ok") return { kind: "unsafe" };
-      const pointer = singleLine(pointerRead.value)?.match(/^gitdir:[ \t]*(.+?)[ \t]*$/)?.[1];
-      if (!pointer) return { kind: "unsafe" };
-      const gitDir = path.resolve(dir, pointer);
-      const commonRead = readText(path.join(gitDir, "commondir"), POINTER_LIMIT_BYTES);
-      if (commonRead.kind === "unsafe") return { kind: "unsafe" };
-      const commonPointer = commonRead.kind === "ok" ? singleLine(commonRead.value)?.trim() : undefined;
-      if (commonRead.kind === "ok" && !commonPointer) return { kind: "unsafe" };
-      const commonDir = commonPointer ? path.resolve(gitDir, commonPointer) : gitDir;
-      return { kind: "ok", value: { gitDir, commonDir, isWorktree: true } };
+      return pointedGitDirs(dotGit, dir);
     }
 
     if (stat) return { kind: "unsafe" };
@@ -160,11 +238,21 @@ function resolveRemoteUrl(commonDir: string): GitLookup<string | undefined> {
   return { kind: "ok", value: firstRemoteUrl };
 }
 
-function resolveGitContextCore(cwd: string): GitLinkageContext | undefined {
+function resolveGitContextCore(cwd: string, home: HomeBoundary): GitLinkageContext | undefined {
   let context: GitLinkageContext | undefined;
   try {
-    const located = findGitDir(cwd);
+    const located = findGitDir(cwd, home);
     if (located.kind === "ok") {
+      // Git's explicit process environment overrides commondir. Interpret
+      // relative values from this event's cwd, then check ownership before
+      // HEAD/config. Boundary repositories keep their on-disk identity.
+      const environmentCommon = process.env.GIT_COMMON_DIR;
+      if (environmentCommon !== undefined) {
+        if (!environmentCommon || Buffer.byteLength(environmentCommon) > POINTER_LIMIT_BYTES ||
+            /[\0\r\n]/.test(environmentCommon)) return undefined;
+        located.value.commonDir = path.resolve(cwd, environmentCommon);
+      }
+      if (!allowedRepository(located.value, home)) return undefined;
       const { gitDir, commonDir, isWorktree } = located.value;
       const head = resolveHead(gitDir, commonDir);
       const remote = resolveRemoteUrl(commonDir);
@@ -198,24 +286,37 @@ function resolveGitContextCore(cwd: string): GitLinkageContext | undefined {
  */
 export function resolveGitContextUncached(cwd: string | undefined): GitLinkageContext | undefined {
   if (!cwd || typeof cwd !== "string") return undefined;
-  return resolveGitContextCore(cwd);
+  const home = resolvedUserHome();
+  return home ? resolveGitContextCore(cwd, home) : undefined;
 }
 
 export function resolveGitContext(cwd: string | undefined): GitLinkageContext | undefined {
   if (!cwd || typeof cwd !== "string") return undefined;
 
-  const cached = cache.get(cwd);
+  const home = resolvedUserHome();
+  if (!home) return undefined;
+  const key = createHmac("sha256", cacheKeySalt)
+    .update(JSON.stringify([home.directory, home.device.toString(), home.inode.toString(), cwd, process.env.GIT_COMMON_DIR]))
+    .digest("hex");
+  const cached = cache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
     return cached.context;
   }
 
-  const context = resolveGitContextCore(cwd);
+  const context = resolveGitContextCore(cwd, home);
 
-  cache.set(cwd, { at: Date.now(), context });
+  cache.set(key, { at: Date.now(), context });
   return context;
 }
 
 /** Numeric-only proof seam. Raw cache keys and values remain inaccessible. */
 export function gitContextCacheSizeForProof() {
   return cache.size;
+}
+
+/** Numeric-only privacy seam; it never exposes a cache key or raw path. */
+export function gitContextCacheNonDigestKeyCountForProof() {
+  let count = 0;
+  for (const key of cache.keys()) if (!/^[0-9a-f]{64}$/.test(key)) count += 1;
+  return count;
 }

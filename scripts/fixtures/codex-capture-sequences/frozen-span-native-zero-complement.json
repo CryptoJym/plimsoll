@@ -1,0 +1,11 @@
+{
+  "finding": "R9-P1-07",
+  "operations": [
+    "span",
+    "trace-sol",
+    "expire-retry",
+    "ack",
+    "rollout-turn"
+  ],
+  "intent": "preserve newly reported zero fields without rebilling or rewriting a frozen named span"
+}

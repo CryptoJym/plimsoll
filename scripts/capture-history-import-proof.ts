@@ -4,7 +4,9 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { CODEX_MODEL_WAIT_MS } from "../packages/collector-cli/src/codex-model-capture";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { estimateCostUsd } from "../packages/shared/src/index";
 import { beginAutomaticCaptureBaseline, completeAutomaticCaptureBaseline,
   sealCaptureBaselineGenerations } from "../packages/collector-cli/src/capture-baseline";
 import { captureFrontier, ensureCaptureFrontierSchema, CAPTURE_FRONTIER_SOURCES } from "../packages/collector-cli/src/capture-frontier";
@@ -31,6 +33,7 @@ function codexFile(directory: string, id: string, amounts: Array<[number, number
   fs.mkdirSync(day, { recursive: true, mode: 0o700 });
   const file = path.join(day, `rollout-2026-01-02T00-00-00-${id}.jsonl`);
   const lines = [JSON.stringify({ type: "session_meta", timestamp: "2026-01-02T00:00:00.000Z", payload: { id } }),
+    JSON.stringify({ type: "turn_context", timestamp: "2026-01-02T00:00:00.500Z", payload: { turn_id: "turn-a", model: "gpt-6-sol" } }),
     JSON.stringify({ type: "event_msg", timestamp: "2026-01-02T00:00:01.000Z", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 0, output_tokens: 0 } } } }),
     ...amounts.map(([input, output], index) => JSON.stringify({
       type: "event_msg", timestamp: `2026-01-02T00:00:${String(index + 2).padStart(2, "0")}.000Z`,
@@ -80,15 +83,17 @@ function priorTailerRow(buffer: LocalEventBuffer, session: string) {
   const id = deterministicEventId(["codex-rollout", session, "1"]);
   buffer.database.prepare(`insert into buffered_events
     (id, source, event_type, data_mode, observed_at, payload_json,
-     suppressed_fields_json, created_at, session_id, input_tokens, output_tokens, uploaded_at)
+     suppressed_fields_json, created_at, session_id, model, input_tokens, output_tokens, uploaded_at)
     values (?, 'codex', 'usage_rollout', 'metadata', '2026-01-02T00:00:02.000Z', '{}', '[]',
-      '2026-01-02T00:00:03.000Z', ?, 100, 10, '2026-01-02T00:00:04.000Z')`).run(id, session);
+      '2026-01-02T00:00:03.000Z', ?, 'gpt-6-sol', 100, 10, '2026-01-02T00:00:04.000Z')`).run(id, session);
   buffer.database.prepare(`insert into session_usage_authority values ('codex', ?, 'tailer', '2026-01-02T00:00:03.000Z')`).run(session);
 }
 function codexSightingDigest(session: string, id: string) {
   return captureRootObservationPayloadDigest({ source: "codex", id, sessionId: session,
     observedAt: "2026-01-02T00:00:02.000Z", inputTokens: 100, outputTokens: 10,
-    cacheReadTokens: 0 });
+    model: "gpt-6-sol", cacheReadTokens: 0,
+    costUsd: estimateCostUsd({ model: "gpt-6-sol", inputTokens: 100, outputTokens: 10,
+      cacheReadTokens: 0 })?.costUsd });
 }
 async function main() {
   const home = path.join(root, "home");
@@ -108,24 +113,25 @@ async function main() {
       source: "codex", directory, installationEpochId: epoch };
     seal(buffer, "codex", files);
     priorTailerRow(buffer, partial);
-    // A live session remains a live claim even when its raw OTLP row has been pruned.
+    // A legacy whole-session live marker cannot cover new native responses.
     buffer.database.prepare(`insert into session_usage_authority values ('codex', ?, 'live', '2026-01-02T00:00:03.000Z')`).run(live);
     const before = Number((buffer.database.prepare(`select count(*) as n from buffered_events`).get() as { n: number }).n);
     const preview = await planCaptureHistory(buffer.database, captureRoot);
     check("dry_run_is_value_blind", !JSON.stringify(preview).includes(directory) &&
       !JSON.stringify(preview).includes(partial) && !JSON.stringify(preview).includes(missing));
-    check("dry_run_counts_only_missing_rows", preview.missingRows === 3 && preview.skippedLiveSessions === 1);
+    check("dry_run_counts_only_missing_rows", preview.missingRows === 5 && preview.skippedLiveSessions === 0);
     check("dry_run_writes_nothing", Number((buffer.database.prepare(`select count(*) as n from buffered_events`).get() as { n: number }).n) === before &&
       !buffer.database.prepare(`select 1 from sqlite_master where name='capture_history_import_runs'`).get());
     const applied = await applyCaptureHistory(buffer, captureRoot);
     const sessionTotals = (session: string) => buffer.database.prepare(`select sum(input_tokens) as input,
       sum(output_tokens) as output from buffered_events where session_id=?`).get(session) as
         { input: number; output: number };
-    check("partial_tailer_session_imports_only_missing_usage", applied.importedRows === 3 &&
+    check("partial_tailer_session_imports_only_missing_usage", applied.importedRows === 5 &&
       sessionTotals(partial).input === 150 && sessionTotals(partial).output === 15);
     check("never_captured_session_imports_once", sessionTotals(missing).input === 150 &&
       sessionTotals(missing).output === 15);
-    check("otlp_only_session_is_skipped", !buffer.database.prepare(`select 1 from buffered_events where session_id=?`).get(live));
+    check("legacy_live_marker_does_not_erase_native_responses",
+      sessionTotals(live).input === 150 && sessionTotals(live).output === 15);
     const rerun = await applyCaptureHistory(buffer, captureRoot);
     check("rerun_imports_zero", rerun.importedRows === 0);
     fs.appendFileSync(files[1]!, `${JSON.stringify({ type: "event_msg",
@@ -198,8 +204,12 @@ async function main() {
         '2026-01-02T00:00:02.000Z', '{}', '[]', '2026-01-02T00:00:03.000Z', ?, 150, 15)`)
       .run(hookOnly);
     const hookPlan = await planCaptureHistory(buffer.database, captureRoot);
-    check("keyed_hook_only_session_is_skipped", hookPlan.missingRows === 0 &&
-      hookPlan.skippedLiveSessions === 2);
+    check("unqualified_keyed_hook_cannot_cover_native_responses", hookPlan.missingRows === 2 &&
+      hookPlan.skippedLiveSessions === 0);
+    const hookImport = await applyCaptureHistory(buffer, captureRoot);
+    assert.equal(hookImport.importedRows, 2);
+    assert.equal((buffer.database.prepare(`select sum(input_tokens) as n from buffered_events
+      where session_id=? and event_type='usage_rollout'`).get(hookOnly) as { n: number | null } | undefined)?.n, 150);
 
     const pruned = "019d0000-0000-7000-8000-000000000004";
     const prunedFile = codexFile(directory, pruned, [[100, 10], [150, 15]]);
@@ -242,7 +252,8 @@ async function main() {
     let unkeyedRefused = false;
     try { await planCaptureHistory(buffer.database, captureRoot); }
     catch (error) { unkeyedRefused = String(error).includes("unkeyed_live_usage_overlap"); }
-    check("unkeyed_hook_usage_refuses_root", unkeyedRefused);
+    check("unqualified_unkeyed_hook_cannot_erase_native_responses", !unkeyedRefused &&
+      (await planCaptureHistory(buffer.database, captureRoot)).missingRows === 2);
     buffer.database.prepare(`delete from buffered_events where id='opaque-unkeyed-hook'`).run();
 
     const observedOnly = "019d0000-0000-7000-8000-000000000007";
@@ -412,15 +423,18 @@ async function main() {
       return new Response(JSON.stringify({ accepted: body.events?.length ?? 0 }),
         { status: 200, headers: { "content-type": "application/json" } });
     });
+    // Native history still observes the durable model-evidence hold. Move
+    // the fixture clock past it; observedAt and every accounting assertion stay fixed.
+    const flushAt = new Date(Date.now() + CODEX_MODEL_WAIT_MS + 1);
     for (let cycle = 0; cycle < 10; cycle += 1) {
-      const sent = await uploadBufferedEvents(cfg, buffer, { fetchImpl });
+      const sent = await uploadBufferedEvents(cfg, buffer, { fetchImpl, now: () => flushAt });
       if (sent.remainingDelivery === 0) break;
     }
     const importedDeliveryId = deterministicEventId(["codex-rollout", missing, "2"]);
     const uploadedOnce = deliveries.get(importedDeliveryId);
     check("imported_row_uploads_with_original_time", uploadedOnce === "2026-01-02T00:00:03.000Z");
     const sentCount = [...deliveryCounts.values()].reduce((sum, count) => sum + count, 0);
-    await uploadBufferedEvents(cfg, buffer, { fetchImpl });
+    await uploadBufferedEvents(cfg, buffer, { fetchImpl, now: () => flushAt });
     check("imported_row_uploads_once", deliveryCounts.get(importedDeliveryId) === 1 &&
       [...deliveryCounts.values()].reduce((sum, count) => sum + count, 0) === sentCount);
 

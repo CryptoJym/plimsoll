@@ -788,6 +788,103 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-bind-linkability
 
+      - name: Prove model evidence or a capture gap on every Codex upload
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-model-capture
+      - name: Prove historical raw immutability and default migration and recovery holds
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-historical-immutability
+      - name: Prove new usage drains above held history with durable bounded progress
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-post-upgrade-migration
+      - name: Prove gap-decided Codex rows cannot claim authority or erase native conflicts
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-authority
+      - name: Prove native capture finality and explicit history turns
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-finality
+      - name: Prove held native coverage survives an abrupt fixture crash
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-hold-crash
+      - name: Prove seeded Codex accounting operation sequences
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-sequences --seeds=200
+      - name: Compare every response identity shape with released 0.7.50
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-response-identity-class
+      - name: Prove identity regressions, minimal counterexamples and bounded-hold measurements
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-response-identity-directed
+      - name: Prove per-response native coverage and partial cumulative accounting
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-response-coverage
+      - name: Preserve process identity refusals with proof scheduling allowance
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-history-process-identity
+      - name: Preserve paid fields when a late twin adds cache or cost
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-acked-pairing-fields
+      - name: Preserve actual released ACKed partial fields through upgrade
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-legacy-acked-fields
+      - name: Prove bounded automatic capture preserves response accounting
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-bounded-response-accounting
+      - name: Prove Codex response spans and rollout marginals count once
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-span-rollout-pairing
+      - name: Prove all Codex capture invariants across evidence, state and path
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-invariants-matrix
+      - name: Prove native trace and local-turn usage survives retry
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-good-retry
+      - name: Prove a guessed SSE peer cannot supply a model
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-legacy-sse-peer
+      - name: Prove an older sealed capture gap survives replay
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-upgrade-gap-replay
+      - name: Prove late evidence cannot resurrect a tokenless capture gap
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-retry
+      - name: Prove legacy proximity models become tokenless gaps
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-legacy-model-evidence
+      - name: Prove every round-three capture and replay path keeps a durable gap
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-review-r4
+      - name: Prove round-five contradictory peers and replay restamping remain closed
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-review-r5-directed
+      - name: Prove terminal replay preserves frozen named delivery bytes
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-replay-restamp
+      - name: Retain the 0.7.48 replay-restamp defect control
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-replay-restamp-base-origin
+      - name: Prove complete native contradictions veto every fresh promotion
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-veto
+      - name: Prove growing Codex rollout capture survives released reader downgrade
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-rollout-downgrade
+      - name: Prove known disjoint Codex accounts retain separate response usage
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-account-boundary
+      - name: Prove legacy metadata fails closed and unrelated native traces do not lose usage
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-capture-legacy-density
+      - name: Prove admitted native prices and priced rollout twins survive every frozen delivery state
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-admitted-projection
+      - name: Prove the bound A03 plan window keeps valid usage billable
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-a03-directed
+      - name: Prove named usage survives released 0.7.49 and 0.7.48 readers and the legacy scanner rollback
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:collector-named-usage-rollback
+
       - name: Prove bound Codex dispatch survives response pairing (eco-6hoxj.163.99)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dispatch-pairing-integration
@@ -838,6 +935,17 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:git-context
 
+      - name: Prove new home capture and sealed delivery exclusions (PR 464)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:home-capture-downgrade
+          pnpm proof:home-context-upgrade
+          pnpm proof:home-claude-context-upgrade
+          pnpm proof:home-grok-context-upgrade
+          pnpm proof:home-context-delivery
+          pnpm proof:home-worktree-boundary
+          pnpm proof:mounted-root-git
+
       - name: Prove deferred repository context transaction and privacy bounds
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:repo-context
@@ -871,7 +979,6 @@ jobs:
         run: |
           pnpm proof:codex-scan-backlog
           pnpm proof:codex-scan-discovery
-          pnpm proof:collector-named-usage-rollback
 
       - name: Prove Grok usage capture from Grok's own usage files (eco-6hoxj.163.20)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -1234,6 +1341,9 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:privacy-mode --receipt evidence/privacy-mode-proof.json
 
+      - name: Prove fixture join ports refuse invalid defaults before staging
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:join-fixture-port
       - name: Prove transactional join and workspace isolation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-isolation

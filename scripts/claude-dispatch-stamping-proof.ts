@@ -95,7 +95,7 @@ async function main() {
   const codex = path.join(home, ".codex", "sessions");
   for (const directory of [claudeA, claudeB, claudeC, codex, plimsoll]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const base = collectorConfigSchema.parse({ deviceId: "dev_claude-dispatch-fixture",
-    port: 49873, uploadUrl: "http://127.0.0.1:1/unused" });
+    port: 49773, uploadUrl: "http://127.0.0.1:1/unused" });
   const buffer = new LocalEventBuffer(path.join(plimsoll, "work-ledger.sqlite"), {
     workspaceId: base.tenantId, deviceId: base.deviceId,
     enrollmentNow: () => new Date(atMs - 3_600_000), delivery: { enabled: true },
@@ -162,10 +162,17 @@ async function main() {
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(49873, "127.0.0.1", resolve);
+      server.listen(0, "127.0.0.1", resolve);
     });
+    const address=server.address();assert.ok(address && typeof address !== "string");
+    const port=address.port;
+    // The status CLI reads the authoritative private profile; all fixture
+    // clients must use the actual disposable listener, not a hard-coded port.
+    const listeningProfile=collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath,"utf8")));
+    listeningProfile.port=port;
+    fs.writeFileSync(configPath,JSON.stringify(listeningProfile)+"\n",{mode:0o600});
     const post = async (route: string, payload: unknown, source = "claude_code") => {
-      const response = await fetch(`http://127.0.0.1:49873${route}`, { method: "POST",
+      const response = await fetch(`http://127.0.0.1:${port}${route}`, { method: "POST",
         headers: { "content-type": "application/json", "x-plimsoll-source": source,
           "x-plimsoll-token": source === "codex" ? auth.codexProducer : auth.claudeCodeProducer },
         body: JSON.stringify(payload) });
@@ -256,7 +263,7 @@ async function main() {
     const otherRootOtlpIds = ids(buffer, "claude_code", sessionId).slice(priorOtherRootOtlp);
     assert.equal(otherRootOtlpIds.length, 2);
     for (const id of otherRootOtlpIds) unstamped(buffer, id);
-    const statusResponse = await fetch("http://127.0.0.1:49873/status", {
+    const statusResponse = await fetch(`http://127.0.0.1:${port}/status`, {
       headers: { "x-plimsoll-token": auth.managementRead },
     });
     assert.equal(statusResponse.status, 200);
@@ -315,7 +322,7 @@ async function main() {
     const conflictUsage = ids(buffer, "claude_code", conflictTranscriptSession, "usage_transcript");
     assert.equal(conflictUsage.length, 1);
     unstamped(buffer, conflictUsage[0]);
-    const conflictStatusResponse = await fetch("http://127.0.0.1:49873/status", {
+    const conflictStatusResponse = await fetch(`http://127.0.0.1:${port}/status`, {
       headers: { "x-plimsoll-token": auth.managementRead },
     });
     assert.equal(conflictStatusResponse.status, 200);
@@ -352,8 +359,9 @@ async function main() {
     unstamped(buffer,lateUsage[0]);
     proof.check("restamp_corrects_only_known_root_claude_rows_and_outbox");
   } finally {
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    buffer.close();
+    try {
+      if(server.listening)await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    } finally {buffer.close();}
   }
   proof.complete();
 }

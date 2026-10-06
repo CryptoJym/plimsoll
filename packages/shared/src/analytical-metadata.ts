@@ -4,6 +4,32 @@ import {
 } from "./schemas";
 import { linkageHash } from "./linkage";
 
+/** Producer identities have separate namespaces. Co-present values are links,
+ * including a call shared by observations with different request IDs. The
+ * collector scopes any union to workspace/device/install/session/account. */
+export function codexResponseIdentities(metadata: Record<string, unknown>) {
+  const nodes: Array<{ kind: "request" | "call" | "turn"; value: string }> = [];
+  for (const [kind, aliases] of [
+    ["request", ["request_id"]], ["call", ["call_id"]],
+    ["turn", ["codexTurnId", "turn.id", "turn_id"]],
+  ] as const) for (const alias of aliases) {
+    const value = metadata[alias];
+    if (typeof value === "string" && value.trim() &&
+        !nodes.some(node => node.kind === kind && node.value === value)) nodes.push({ kind, value });
+  }
+  return nodes;
+}
+export function codexResponseIdentityOverlap(a: Record<string, unknown>, b: Record<string, unknown>) {
+  const right = codexResponseIdentities(b);
+  return codexResponseIdentities(a).some(left => right.some(node =>
+    left.kind === node.kind && left.value === node.value));
+}
+export function codexResponseIdentityConflict(a: Record<string, unknown>, b: Record<string, unknown>) {
+  if (codexResponseIdentityOverlap(a, b)) return false;
+  const right = codexResponseIdentities(b);
+  return codexResponseIdentities(a).some(left => right.some(node => left.kind === node.kind));
+}
+
 const SESSION_ID_KEYS = [
   "sessionId",
   "session_id",
@@ -281,6 +307,16 @@ const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
   ["otelStatusCode", "status_code"],
   ["turnIndex", "token_count"],
   ["costEstimated", "boolean"],
+  ["captureGap", "boolean"],
+  ["modelEvidenceConflict", "boolean"],
+  ["modelCaptureInputTokens", "token_count"],
+  ["modelCaptureOutputTokens", "token_count"],
+  ["modelCaptureCacheReadTokens", "token_count"],
+  ["modelCaptureCacheCreationTokens", "token_count"],
+  ["modelGapInputTokens", "token_count"],
+  ["modelGapOutputTokens", "token_count"],
+  ["modelGapCacheReadTokens", "token_count"],
+  ["modelGapCacheCreationTokens", "token_count"],
   ["otelExplicitAction", "boolean"],
   ["otelHasError", "boolean"],
   ["otelHasException", "boolean"],
@@ -359,6 +395,8 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["parentAttemptId", "identifier"],
   ["acceptedOutcomeId", "identifier"],
   ["captureAccountHash", "linkage"],
+  ["turn.id", "identifier"],
+  ["turn_id", "identifier"],
   ["accountEvidenceRef", "identifier"],
   ["costKind", "classification"],
   ["rateVersion", "version"],
@@ -420,6 +458,12 @@ const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["planType", "classification"],
   ["stitched", "classification"],
   ["usageSource", "classification"],
+  ["usageDuplicateReason", "classification"],
+  ["modelCaptureSource", "classification"],
+  ["modelGapReason", "classification"],
+  ["accountIdentityState", "classification"],
+  ["codexTurnId", "identifier"],
+  ["sessionLinkBasis", "classification"],
   ["historyImport", "classification"],
   ["role", "classification"],
   ["workClass", "classification"],

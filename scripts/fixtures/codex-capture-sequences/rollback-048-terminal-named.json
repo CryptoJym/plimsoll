@@ -1,0 +1,11 @@
+{
+  "finding": "R8-P0-04",
+  "seed": 3,
+  "operations": [
+    "rollout-turn",
+    "rollback-048",
+    "remote-terminal",
+    "replay"
+  ],
+  "contract": "A released reader terminal replay preserves the head-frozen named ID and bytes."
+}

@@ -103,10 +103,7 @@ function seedLegacyRow(statements: LegacySeedStatements, row: LegacyRow, now: st
   statements.enqueueCandidate.run(row.id, now, 1);
 }
 
-function nearestValue(
-  row: CandidateRow,
-  statements: NearestStatements,
-) {
+function nearestSessionValue(row: CandidateRow, statements: NearestStatements) {
   const observedMs = validObservedAt(row.observedAt);
   if (observedMs === null) return null;
   const base = {
@@ -128,11 +125,9 @@ function nearestValue(
   return nearest?.value ?? null;
 }
 
-function nearestStatements(
-  database: Database.Database,
-  column: "session_id" | "model",
-): NearestStatements {
-  const predicate = column === "session_id" ? "session_id is not null" : "model is not null";
+function nearestSessionStatements(database: Database.Database): NearestStatements {
+  const column = "session_id";
+  const predicate = "session_id is not null";
   return {
     before: database.prepare(
       `select id as eventId, observed_at as observedAt, ${column} as value
@@ -592,8 +587,9 @@ export function runCodexReconciliationMaintenance(
            payload_json = @payloadJson
          where id = @id`,
       );
-      const sessionContext = nearestStatements(database, "session_id");
-      const modelContext = nearestStatements(database, "model");
+      const sessionContext = nearestSessionStatements(database);
+      // Capture resolves models from exact pairs, traces or native turns at sealing.
+      // A nearby model from another conversation is never evidence.
       const selectFreshCandidates = database.prepare(
         `select e.rowid, e.id, e.source, e.event_type as eventType,
            e.observed_at as observedAt, e.session_id as sessionId, e.model,
@@ -635,8 +631,8 @@ export function runCodexReconciliationMaintenance(
             removeCandidate.run(row.id);
             continue;
           }
-          const sessionId = row.sessionId ?? nearestValue(row, sessionContext);
-          const model = row.model ?? nearestValue(row, modelContext);
+          const sessionId = row.sessionId ?? nearestSessionValue(row, sessionContext);
+          const model = row.model;
           let costUsd = row.costUsd;
           if (costUsd === null && model) {
             costUsd =

@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -29,10 +30,10 @@ function event() {
     id: `00000000-0000-4000-8000-${String(++nextId).padStart(12, "0")}`,
     source: "codex", dataMode: "metadata", eventType: "assistant_response",
     observedAt: new Date(now - 1_000).toISOString(), inputTokens: 1,
-    outputTokens: 1, sessionId: "reliability-session", actionClass: "other",
+    outputTokens: 1, ...nativeCodexFixture(`reliability-${nextId}`), sessionId: "reliability-session", actionClass: "other",
   });
 }
-function fixture(name: string) { return new LocalEventBuffer(path.join(root, `${name}.sqlite`)); }
+function fixture(name: string) { return new LocalEventBuffer(path.join(root, `${name}.sqlite`), {workspaceId: "00000000-0000-4000-8000-000000000001"}); }
 function settle(buffer: LocalEventBuffer) {
   for (let i = 0; i < 100; i++) {
     buffer.projection.runMaintenance(new Date(now));
@@ -133,7 +134,7 @@ async function main() {
   });
   await check("partial_ingest_retries_in_process_and_conserves_exact_totals", async () => {
     const ledgerPath = path.join(root, "partial-ingest.sqlite");
-    const buffer = new LocalEventBuffer(ledgerPath, { databaseBusyTimeoutMs: 0 });
+    const buffer = new LocalEventBuffer(ledgerPath, { databaseBusyTimeoutMs: 0, workspaceId: "00000000-0000-4000-8000-000000000001" });
     settle(buffer);
     const maintenance = new Database(ledgerPath, { timeout: 0 });
     maintenance.pragma("journal_mode = WAL");
@@ -159,9 +160,11 @@ async function main() {
     };
     const body = JSON.stringify({resourceLogs: [{scopeLogs: [{logRecords: Array.from({length: 40}, (_, index) => ({
       timeUnixNano: String(BigInt(now - 1_000) * 1_000_000n + BigInt(index)),
+      traceId: nativeCodexFixture(`partial-${index}`).metadata.traceId,
       attributes: [
         {key: "gen_ai.usage.input_tokens", value: {intValue: "1"}},
         {key: "gen_ai.usage.output_tokens", value: {intValue: "2"}},
+        {key: "gen_ai.request.model", value: {stringValue: "gpt-6-sol"}},
         ...(index === 16 ? [{key: "cwd", value: {stringValue: root}}] : []),
       ],
     }))}]}]});

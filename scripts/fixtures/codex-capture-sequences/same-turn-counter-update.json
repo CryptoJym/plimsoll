@@ -1,0 +1,4 @@
+{
+  "finding": "R10-P0-02",
+  "operations": ["skew-complete-request", "skew-native-update"]
+}

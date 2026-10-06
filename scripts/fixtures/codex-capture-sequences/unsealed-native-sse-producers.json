@@ -1,0 +1,7 @@
+{
+  "finding": "R9-P0-04",
+  "seed": 23,
+  "shrinkAttempts": 20,
+  "operations": ["rollout-turn", "sse-partial", "upgrade-047", "sse-partial-twin"],
+  "intent": "several unsealed old/new producers of the same response reconcile to one retained accounting root before leasing"
+}

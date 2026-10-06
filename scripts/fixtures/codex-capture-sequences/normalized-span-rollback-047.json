@@ -1,0 +1,11 @@
+{
+  "finding": "R8-P0-05",
+  "seed": 33,
+  "operations": [
+    "history-no-turn",
+    "trace-sol",
+    "span",
+    "rollback-047"
+  ],
+  "contract": "Native normalized capture metadata stays local so .47 preserves frozen bytes and ID."
+}

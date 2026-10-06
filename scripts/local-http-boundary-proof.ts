@@ -24,6 +24,7 @@ import {
 } from "../packages/collector-cli/src/http-boundary";
 import { OTLP_COMMIT_CHUNK_SIZE, OtlpIntakeSpool } from "../packages/collector-cli/src/otlp-spool";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
+import { peekRepoContextSidecar, REPO_CONTEXT_CAPTURE_POLICY_GENERATION } from "../packages/collector-cli/src/repo-context";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 
 type Receipt = { error?: unknown; reason?: unknown; [key: string]: unknown };
@@ -584,10 +585,16 @@ async function isolatedOtlpRun(
     const exactPayloadRows = persistedRows.length === sortedExpected.length &&
       persistedRows.every((row, index) => {
         const expected = sortedExpected[index]?.event;
+        // A context-bound append adds the local receipt after normalization.
+        // Compare the entire captured payload, including that receipt.
+        const capturedExpected = expected && peekRepoContextSidecar(expected)
+          ? { ...expected, metadata: { ...expected.metadata,
+            repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION } }
+          : expected;
         return expected !== undefined && row.id === expected.id &&
           row.source === expected.source && row.eventType === expected.eventType &&
           row.observedAt === expected.observedAt &&
-          JSON.stringify(row.payload) === JSON.stringify(expected);
+          JSON.stringify(row.payload) === JSON.stringify(capturedExpected);
       });
     const observedAt = (buffer.database.prepare(
       "select observed_at as observedAt from buffered_events order by observed_at",

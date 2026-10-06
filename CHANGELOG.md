@@ -1,6 +1,129 @@
 # Changelog
 
-## 0.7.51 — 2026-10-05 (unpublished)
+## 0.7.52 (unreleased)
+
+- Stop filesystem git linkage at the running user's resolved home folder and
+  system root, including their backed worktrees. Migrate only resumed capture
+  bindings and keep new excluded cwd events out of session inheritance. Real
+  repositories and mounted-volume roots remain attributable. Existing usage
+  and saved results stay unchanged. Policy receipts keep released capture
+  checkpoints readable after downgrade, every upload route honours excluded
+  contexts, and directory-form worktrees check their common directory. New
+  generation-3 bindings cannot reuse generation-2 results from older capture.
+  Lookup cache keys retain no raw paths
+  (`eco-6hoxj.165.213.1`).
+
+- Response aliases remain linked through covered SSE diagnostics, including
+  every co-present request, call and turn identity, transitive chains and
+  restarts. Cumulative fields retain their maximum across these aliases;
+  anonymous exact twins retain complementary paid branches. Qualified native fields ACKed
+  by released collectors remain paid owners across upgrade; reconciliation
+  preserves ACKed finance without inventing missing historical wire bytes.
+- Known limit (R11-P0-02, #450): when two complete reports of one response
+  use different IDs and both are accepted before any record links them, both
+  stay counted. The collector cannot correct an accepted record; the
+  cloud-side identity-link fix is eco-6hoxj.165.184.14. This also affects SSE
+  reports with overlapping fields and disjoint native identities, including
+  partial reports. Local frozen delivery bytes remain unchanged.
+- Observable exposure in the last 30 days: 0 records and 0 tokens among checkable records. 503,965 complete SSE records lacked device or installation scope and could not be checked, so actual exposure is unknown; the identity-link fix eco-6hoxj.165.184.14 removes the need for this inference.
+- The measured zero is a lower bound: a bridge the collector fully covers
+  locally never reaches the cloud, and bridges more than two days late were
+  not read.
+- The exposure query is not a general token measure (R12-P1-01): bridged
+  rows carry residual amounts, so it can overstate excess tokens when a group
+  is found. Do not reuse it as a token lower bound until
+  eco-6hoxj.165.184.14 keeps the original amounts.
+
+- Codex token-bearing captures now name their model from an exact paired SSE
+  log, one unambiguous native trace, or the same local conversation turn. Any
+  ambiguity becomes a tokenless capture gap while the original counters stay
+  in local diagnostics. Paired spans no longer overwrite an existing account
+  identity, and nested OTel model aliases participate in conflict checks.
+- Invalid or durably gap-decided Codex rows cannot own live session authority
+  or suppress known native rollout usage in projections. Native trace models
+  and identities remain contradiction evidence after a gap is ACKed; only
+  eligible native evidence may promote a model. Genuine Claude authority is
+  unchanged.
+- Capture diagnostics stay out of the sealed envelope so 0.7.48 and 0.7.47
+  readers can replay 0.7.49 usage byte-for-byte during rollback. Plan-limit
+  windows are bounded to 525,600 minutes before emission or sealing, while
+  keyless legacy readings remain compatible.
+- A queued tokenless capture-gap replacement never rereads late raw counters,
+  so a lost acknowledgement cannot make the same usage billable under a new
+  delivery ID. Legacy 0.7.48 proximity-assigned models without a native pair,
+  trace or turn now become tokenless gaps instead of billable usage.
+- The same native-provenance and durable-gap checks now cover SSE rows, sealed
+  retries, history upload, migration, pairing refresh and remote dead-letter
+  replay. A recorded gap cannot regain counters after a receipt is replaced;
+  unsafe legacy guesses retire to a distinct tokenless replacement.
+- A model-less `handle_responses` span with usage counts pairs with one mutually
+  unique, model-bearing rollout marginal only when its workspace, install,
+  device, session, turn, account, model and exact counters agree. The rollout
+  owns the one counted observation unless a named span was already frozen;
+  that span keeps its identity and bytes. Durable gaps cannot pair or regain
+  counters, and ambiguous or cross-boundary twins remain separate and tokenless
+  where required.
+- The capture contract proof executes and asserts all 147 combinations of seven
+  evidence tiers, three outbox states and seven delivery paths, including the
+  span-plus-rollout one-owner shape, live lease refusals, aggregate billing
+  counts, 0.7.48 reader compatibility, replay-then-restamp, and late
+  contradictory native evidence. Native retries and terminal replays keep their
+  frozen ID and bytes; sealed gaps remain tokenless and cannot be restamped or
+  regain counters. The three twin upgrade cells compose the pairing helper
+  with synthetic stable-turn evidence; opening or leasing a historical ledger
+  does not automatically pair its existing twins. A real 0.7.47 tailer fixture
+  separately proves one named span plus one tokenless rollout gap on upgrade.
+
+- Valid native named captures now retain a lineage-bound accounting witness.
+  Retry, ACK, remote replay and rollback preserve their frozen IDs and bytes
+  after new contradictory evidence; those facts still gate new captures.
+  Native readers freeze qualified live coverage before consuming cumulative
+  counters, while transport retains its 60-second hold across an abrupt crash.
+  Codex coverage is per native response and financial field: an exact twin
+  consumes only retained accounting, preserves the first delivery's bytes,
+  and leaves later cumulative turn deltas billable on tailing and history.
+  Within one conversation and workspace/device/install/account boundary,
+  shared explicit request or turn identity joins observations before time or
+  residual-counter filters. Native counter marginals sum within that response
+  before competing with SSE/span observations. Each financial field accounts
+  for its largest reported response amount, preserving absence versus zero;
+  only distinct responses add. Late, earlier-timestamped partial/complete or
+  smaller/larger updates emit only the unpaid fields across all frozen owners.
+  Newly reported zeros remain known beside an owner whose field was absent.
+  Known but unshared request/turn identities cannot acquire a twin through
+  equal counts. Anonymous established twins retain the exact-completion and
+  directional counter checks. A model-less span remains contradiction evidence
+  without vetoing an explicit native SSE's complementary cache/cost fields.
+  Late SSE and rollout twins preserve an already-frozen named span as the
+  counted owner, including an actual 0.7.48 writer running during rollback.
+  Stateless and history snapshots also freeze their matching queue copy so
+  those captures cannot become restampable before their first outbox lease.
+  Native source prefixes retain their accounting custody even when the next
+  marginal needs no reduction; a smaller SSE cannot hide an unsealed prefix.
+  With the outbox disabled, stateless accounting freezes a validated local
+  envelope instead of throwing away a native append for a missing queue entry.
+- History import carries explicit native turn IDs and same-turn model conflicts
+  through parsing, byte checkpoints and tailer handoff. Known native turns stay
+  billable when uncovered by that response's retained accounting; missing
+  turns and conflicting models still produce tokenless gaps.
+  Turnless history fails capture admission before peer scans, and writer slices
+  reuse Claude session admission within their transaction. Codex projection
+  and summary readers no longer suppress whole sessions after one SSE.
+- A seeded operation proof drives 200 worlds with multiple responses and
+  cumulative counters through production
+  ingest, pairing, native tailing, history, retries, ACK, replay, restamp and the
+  actual 0.7.47/0.7.48 readers. It checks accounting after every operation and
+  retains directed counterexamples. Its independent producer oracle checks
+  every financial field, including diagnostic, zero, partial and cache/cost
+  signals, request-only/turn-only/mixed identities, timestamp drift, repeated
+  counters within a native turn and late arrivals with earlier timestamps.
+  Eight three-observation groups check all arrival permutations with an ACK
+  after each observation; a long update case crosses the legacy ancestry bound.
+  Public tailer/history, snapshot, projection and summary fixtures also cover
+  skewed partial/complete and growing reports. This finite coverage complements the matrix;
+  it does not claim every possible producer shape or operation sequence.
+
+## 0.7.51 — 2026-10-05
 
 - #453 adds the dispatch binding index, bounded dispatch history and explicit
   adoption qualification as a rollback bridge. Adoption remains off and is
@@ -8,7 +131,7 @@
   reviewed build and qualification of the actual installed pair.
 - #453 adds test-only join-proof diagnostics without changing proof limits.
 
-## 0.7.50 — 2026-10-05 (unpublished)
+## 0.7.50 — 2026-10-05
 
 - #458 keeps source-recorded Codex processing-tier metadata readable before
   enabling any tier writer, and preserves reported cached-input counts,

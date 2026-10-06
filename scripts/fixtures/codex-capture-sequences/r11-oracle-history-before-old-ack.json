@@ -1,0 +1,13 @@
+{
+  "finding": "R11 harness: require actual legacy producer admission and named ACK after another session history import",
+  "operations": [
+    "history-multiple",
+    "old-acked-pair-047",
+    "old-acked-pair-048",
+    "old-acked-047-input-output",
+    "old-acked-048-output-input",
+    "expire-retry",
+    "ack",
+    "reopen"
+  ]
+}

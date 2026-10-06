@@ -83,9 +83,15 @@ async function main() {
       sum(output_tokens) as output from buffered_events where session_id=?`).get(session) as
       { rows: number; input: number; output: number };
     assert.deepEqual(totals, { rows: 512, input: 512, output: 512 });
-    const projected = buffer.database.prepare(`select count(*) as rows,sum(input_tokens) as input
-      from dashboard_event_facts where event_type='usage_rollout'`).get() as { rows: number; input: number };
-    assert.deepEqual(projected, { rows: 512, input: 512 });
+    const projected = buffer.database.prepare(`select count(*) as rows,sum(input_tokens) as input,
+      count(input_tokens) as countedRows,min(model) as firstModel,max(model) as lastModel
+      from dashboard_event_facts where event_type='usage_rollout'`).get() as
+      { rows: number; input: number | null; countedRows: number; firstModel: string | null; lastModel: string | null };
+    // This fixture has counters but no native model/turn evidence. The raw
+    // totals above still prove conservation; projected financial usage must
+    // stay unknown. The main-reader run retains its own former expectation.
+    assert.deepEqual(projected, { rows: 512, input: null,
+      countedRows: 0, firstModel: null, lastModel: null });
     assert.equal((buffer.database.prepare(`select count(*) as rows from dashboard_projection_repairs`)
       .get() as { rows: number }).rows, 0);
     const rerun = await applyCaptureHistory(buffer, captureRoot);
@@ -93,7 +99,8 @@ async function main() {
     console.log(JSON.stringify({ checks: 13, cursor: cursor.position,
       maxWriterSliceMs: receipt.maxWriterSliceMs, timeBudgetStops: receipt.timeBudgetStops,
       writerSliceHistogram: receipt.writerSliceHistogram, rows: totals.rows,
-      projectedRows: projected.rows }));
+      projectedRows: projected.rows, projectedInput: projected.input,
+      projectedCountedRows: projected.countedRows }));
   } finally {
     buffer.close();
     fixture.restore();

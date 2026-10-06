@@ -1,3 +1,8 @@
+import { captureCodexModel, codexHasUsage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { frozenCodexCapture, rememberFrozenCodexCapture } from "./codex-named-capture";
+import { isCodexResponseSpan, rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
+import { DeliveryOutbox } from "./outbox";
+import { codexResponseCoverage } from "./codex-response-coverage";
 import { openLedgerDatabase } from "./ledger-connection";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -14,7 +19,7 @@ import {
 } from "./config";
 import { deterministicEventId, ensureUuidEventId } from "./delivery-id";
 export { ensureUuidEventId, POSTGRES_UUID_RE } from "./delivery-id";
-import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
+import { applyProjectAttribution, captureRepoContextExcluded, SessionAttributionBatch } from "./session-attribution";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
@@ -36,9 +41,11 @@ import {
  * the local archive backfill.
  *
  * Invariants:
- * - The ledger is opened strictly READ-ONLY. The live daemon keeps writing it
- *   (WAL) and keeps draining its own 5-minute sync; nothing here marks rows
- *   uploaded or touches collector.config.json.
+ * - Raw history rows are opened strictly READ-ONLY. The live daemon keeps
+ *   writing them (WAL) and keeps draining its own 5-minute sync; this path
+ *   never marks rows uploaded or touches collector.config.json. Codex capture
+ *   gaps may add only their durable decision/census metadata in a separate
+ *   bounded writer connection.
  * - Idempotency comes from event ids, not from local state: the cloud dedupes
  *   by id (bulk createMany(skipDuplicates) since cloud PR #19; per-event
  *   upserts before that), so re-sending the same history can never create new
@@ -99,6 +106,7 @@ export type HistorySkipReason =
   | "schema_invalid"
   | "forbidden_content"
   | "local_privacy_terminal"
+  | "usage_duplicate"
   | "local_evidence_quarantine_migration_required";
 
 export type HistoryEnvelope = {
@@ -219,7 +227,8 @@ export function sealHistoryEvent(
 ): NormalizedHistoryEvent {
   const { candidate, idDerived } = prepared;
   if (prepared.event) {
-    const linkage = { repoHash: row.repoHash, branchHash: row.branchHash };
+    const linkage = { repoHash: row.repoHash, branchHash: row.branchHash,
+      repoContextExcluded: captureRepoContextExcluded(prepared.event.metadata?.repoContextPolicyGeneration, row.repoHash) };
     const attributed = row.attribution
       ? row.attribution.attribute(prepared.event, linkage)
       : applyProjectAttribution(prepared.event, linkage);
@@ -715,6 +724,21 @@ export async function runWorkspaceHistoryUpload(
       `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — nothing to backfill.`,
     );
   }
+  // History walks keep their source connection read-only. Capture gaps still
+  // need a durable lineage decision, so open one bounded writable connection
+  // for capture decisions and response reconciliation before an actual send.
+  // Dry runs never consume response coverage or change the raw ledger.
+  let captureLedger: Database.Database | null = null;
+  let captureOutbox: DeliveryOutbox | undefined;
+  const captureDatabase = () => {
+    if (!captureLedger) captureLedger = openLedgerDatabase(ledgerPath, { fileMustExist: true });
+    return captureLedger;
+  };
+  const closeCaptureDatabase = () => {
+    captureLedger?.close();
+    captureLedger = null;
+    captureOutbox = undefined;
+  };
 
   const startedAt = now();
   const batchSize = Math.max(1, Math.min(options.batchSize ?? HISTORY_MAX_BATCH_EVENTS, HISTORY_MAX_BATCH_EVENTS));
@@ -735,6 +759,7 @@ export async function runWorkspaceHistoryUpload(
       .prepare(`select id from buffered_events where rowid = ?`)
       .get(state.watermark.rowid) as { id: string } | undefined;
     if (atRowid && atRowid.id !== state.watermark.id) {
+      closeCaptureDatabase();
       ledger.close();
       throw new Error(
         `Resume watermark mismatch (rowid ${state.watermark.rowid} no longer holds event ${state.watermark.id}). ` +
@@ -745,6 +770,7 @@ export async function runWorkspaceHistoryUpload(
   }
 
   if (options.until && Number.isNaN(Date.parse(options.until))) {
+    closeCaptureDatabase();
     ledger.close();
     throw new Error(`--until must be an ISO timestamp, got: ${options.until}`);
   }
@@ -958,6 +984,47 @@ export async function runWorkspaceHistoryUpload(
         });
         continue;
       }
+      if (preparedRow.ok && preparedRow.event) {
+        if (preparedRow.event.source === "codex") {
+          if (options.dryRun) {
+            const coverage=codexResponseCoverage(ledger,preparedRow.event);
+            if(coverage?.covered){skipQueue.push({rowid:row.rowid,reason:"usage_duplicate"});continue;}
+            if(coverage)preparedRow.event=coverage.remaining;
+          } else if ((ledger.pragma("table_info(buffered_events)") as Array<{name:string}>)
+              .some(c=>c.name==="installation_epoch_id")) {
+            captureOutbox ??= new DeliveryOutbox(captureDatabase());
+            captureOutbox.reconcileCodexResponse(row.id);
+            const current=captureDatabase().prepare(`select payload_json as payload,usage_duplicate_reason as duplicate
+              from buffered_events where rowid=? and id=? and created_at=?`)
+              .get(row.rowid,row.id,row.createdAt) as {payload:string;duplicate:string|null}|undefined;
+            if(current?.duplicate){skipQueue.push({rowid:row.rowid,reason:"usage_duplicate"});continue;}
+            if(current) {
+              // Reconciliation may reduce counters, but the refreshed raw
+              // payload still needs history's null-field/legacy-ID repairs.
+              // Parsing it directly discarded those repairs and wedged the
+              // oldest page on .48's null session/model fields.
+              const refreshed = prepareHistoryEvent({ ...row, payloadJson: current.payload });
+              if (!refreshed.ok || !refreshed.event) {
+                skipQueue.push({ rowid: row.rowid, reason: refreshed.ok ? "schema_invalid" : refreshed.reason });
+                continue;
+              }
+              Object.assign(preparedRow, refreshed);
+            }
+          }
+        }
+        if (unresolvedCapture(preparedRow.event)) {
+          const age = now().getTime() - Date.parse(row.createdAt);
+          const waitMs = Math.max(0, Math.min(CODEX_MODEL_WAIT_MS, CODEX_MODEL_WAIT_MS - age));
+          if (Number.isFinite(waitMs) && waitMs > 0) await sleep(waitMs);
+        }
+        preparedRow.event = captureCodexModel(
+          codexHasUsage(preparedRow.event) && !options.dryRun ? captureDatabase() : ledger,
+          preparedRow.event,
+          row.id,
+          !options.dryRun,
+          !options.dryRun,
+        );
+      }
       const normalized = preparedRow.ok
         ? sealHistoryEvent(preparedRow, { ...row, attribution })
         : preparedRow;
@@ -965,7 +1032,21 @@ export async function runWorkspaceHistoryUpload(
         skipQueue.push({ rowid: row.rowid, reason: normalized.reason });
         continue;
       }
+      if (preparedRow.ok && preparedRow.event && codexHasUsage(preparedRow.event)) {
+        const capturedDb = captureDatabase();
+        const frozen = frozenCodexCapture(capturedDb,row.id);
+        if (frozen) {
+          normalized.envelope = JSON.parse(frozen.envelopeJson);
+          normalized.bytes = Buffer.byteLength(frozen.envelopeJson);
+          normalized.idDerived = normalized.envelope.event.id !== row.id;
+        }
+        if (!options.dryRun) rememberFrozenCodexCapture(capturedDb,row.id,normalized.envelope.event.id,
+          JSON.stringify(normalized.envelope),preparedRow.event);
+      }
       eligibleEvents += 1;
+      if (!options.dryRun && isCodexResponseSpan(normalized.envelope.event)) {
+        rememberCodexSpanEmission(captureDatabase(), row.id, normalized.envelope.event);
+      }
       carry.push({
         envelope: normalized.envelope,
         bytes: normalized.bytes,
@@ -1042,6 +1123,7 @@ export async function runWorkspaceHistoryUpload(
   }
 
   await Promise.allSettled([...inFlight]);
+  closeCaptureDatabase();
   ledger.close();
 
   const drainedEverything = abortReason === null && !limitReached;

@@ -228,6 +228,10 @@ export function restampDispatch(args: string[],buffer: LocalEventBuffer,roots: r
           else 0 end
         and raw.rowid>?
         and raw.uploaded_at is null and raw.privacy_disposition is null
+        and not exists (select 1 from upload_replays as replay
+          where replay.delivery_id=raw.id
+             or (replay.raw_id=raw.id and replay.raw_created_at=raw.created_at
+                 and replay.raw_generation is raw.privacy_generation))
         and not exists (select 1 from upload_outbox as queued where queued.raw_rowid=raw.rowid
           and queued.raw_id=raw.id and queued.raw_created_at=raw.created_at
           and queued.raw_generation is raw.privacy_generation

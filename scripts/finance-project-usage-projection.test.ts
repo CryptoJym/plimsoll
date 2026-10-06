@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import { ensureUuidEventId } from "../packages/collector-cli/src/upload-history";
 
 import {
@@ -64,20 +65,24 @@ function event(
   observedAt: string,
   options: Partial<AiInteractionEvent> = {},
 ): AiInteractionEvent {
+  const id=eventId();
+  const native=(options.source ?? "codex") === "codex"
+    ? nativeCodexFixture(id,options.model ?? "gpt-6-sol") : undefined;
   return {
-    id: eventId(),
+    id,
+    ...native,
     tenantId: refs.tenant,
     source: "codex",
     dataMode: "metadata",
     eventType: "assistant_response",
     observedAt,
     actionClass: "other",
-    metadata: { costUsd: 0.001, ...(options.metadata ?? {}) },
     inputTokens: 10,
     outputTokens: 20,
     costUsd: 0.001,
     projectKey: repoKey,
     ...options,
+    metadata: { ...native?.metadata, costUsd: 0.001, ...(options.metadata ?? {}) },
     intent: options.intent ?? "unknown",
   };
 }
@@ -412,6 +417,7 @@ test("blocks pending and conflicting repo context and never emits stored sentine
   });
   const conflictingEvent = event("2026-08-31T13:00:00.000Z", {
     projectKey: secondRepoKey,
+    model: "PRIVATE_MODEL_SENTINEL",
     metadata: {
       costUsd: 0.001,
       model: "PRIVATE_MODEL_SENTINEL",

@@ -56,7 +56,7 @@ const eligibilitySqlCache = new WeakMap<Database.Database, {
 export function terminalPrivacyEligibilitySql(
   db: Database.Database,
   rawAlias = "buffered_events",
-  options: { includeUnboundLegacyReceipts?: boolean } = {},
+  options: { includeUnboundLegacyReceipts?: boolean; includeUsageDuplicates?: boolean } = {},
 ) {
   const alias = safeAlias(rawAlias);
   const includeUnbound = options.includeUnboundLegacyReceipts !== false;
@@ -68,7 +68,7 @@ export function terminalPrivacyEligibilitySql(
     cache = { schemaVersion, predicates: new Map() };
     eligibilitySqlCache.set(db, cache);
   }
-  const cacheKey = `${alias}:${includeUnbound ? 1 : 0}`;
+  const cacheKey = `${alias}:${includeUnbound ? 1 : 0}:${options.includeUsageDuplicates ? 1 : 0}`;
   const cached = cache.predicates.get(cacheKey);
   if (cached) return cached;
   const rawColumns = columns(db, "buffered_events");
@@ -79,8 +79,10 @@ export function terminalPrivacyEligibilitySql(
   }
   // A Codex response span retained as evidence for an SSE usage event is not
   // a second accounting event. This one predicate feeds projections, session
-  // summaries, local lists, and the legacy upload path.
-  if (rawColumns.has("usage_duplicate_reason")) {
+  // summaries, local lists, and the legacy upload path. Native contradiction
+  // checks explicitly retain duplicates as facts; that never admits them to
+  // a second financial delivery.
+  if (!options.includeUsageDuplicates && rawColumns.has("usage_duplicate_reason")) {
     terms.push(`${alias}.usage_duplicate_reason is null`);
   }
   if (rawColumns.has("privacy_generation")) {

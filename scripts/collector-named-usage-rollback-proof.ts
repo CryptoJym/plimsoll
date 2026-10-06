@@ -7,10 +7,16 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createProofCompletion } from "./lib/proof-completion";
+import { runCaptureDowngradeFixtures } from "./lib/capture-downgrade-fixture";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 
-const completion = createProofCompletion("collector-named-usage-rollback", 14);
+import { LocalEventBuffer as HeadBuffer } from "../packages/collector-cli/src/buffer";
+import { captureCodexModel as headCapture } from "../packages/collector-cli/src/codex-model-capture";
+
+// Keep the fourteen shared checks, eight additional #450 head-writer checks,
+// and #464's .51 writer retry plus four growing Codex/Claude reader checks.
+const completion = createProofCompletion("collector-named-usage-rollback", 27);
 // Commit A is a reader-only tier release. Commit B enables tier capture and
 // changes this proof's previous reader to the exact commit A, not stock 0.7.49.
 const recordedTierWriter = false;
@@ -24,6 +30,7 @@ const currentVersion: string = JSON.parse(fs.readFileSync(
 )).version;
 const writerCommit = "9f75bdcdf6d19fd477caed838482bb0fe16c8d31";
 const released050Commit = "121b55437555c3a3c34bafe5889f4d6d8870509f";
+const released051Commit = "71d6ff27f0d39aa31d188c9bcc31d37bf188c384";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-named-rollback-"));
 const ledgerPath = path.join(root, "rollback.sqlite");
 const workspaceId = "00000000-0000-4000-8000-000000000001";
@@ -55,7 +62,7 @@ async function leaseWithReader(
 ) {
   const reader = await import(pathToFileURL(
     path.join(worktree, "packages/collector-cli/src/buffer.ts"),
-  ).href);
+  ).href) as typeof import("../packages/collector-cli/src/buffer");
   const now = new Date(nowMs);
   const buffer = new reader.LocalEventBuffer(fixtureLedgerPath, {
     workspaceId,
@@ -71,8 +78,8 @@ async function leaseWithReader(
     const lease = buffer.delivery.lease({ now });
     assert.equal(lease.locallyDead, 0, `${expectedVersion} did not retire usage`);
     assert.equal(lease.items.length, 2, `${expectedVersion} read both sealed deliveries`);
-    const named = lease.items.find((item: any) => item.deliveryId === namedId)?.envelope.event;
-    const gap = lease.items.find((item: any) => item.deliveryId === gapId)?.envelope.event;
+    const named = lease.items.find((item) => item.deliveryId === namedId)?.envelope.event;
+    const gap = lease.items.find((item) => item.deliveryId === gapId)?.envelope.event;
     assert.equal(named?.model, "gpt-6.1-sol");
     assert.equal(named?.inputTokens, 19);
     assert.equal(named?.outputTokens, 2);
@@ -83,7 +90,7 @@ async function leaseWithReader(
     if (acknowledge) {
       const acknowledged = buffer.delivery.acknowledge(
         lease.leaseId,
-        lease.items.map((item: any) => item.deliveryId),
+        lease.items.map((item) => item.deliveryId),
         now,
       );
       assert.equal(acknowledged.locallyDead, 0);
@@ -91,7 +98,7 @@ async function leaseWithReader(
     }
     return {
       leaseId: lease.leaseId,
-      itemIds: lease.items.map((item: any) => item.deliveryId),
+      itemIds: lease.items.map((item) => item.deliveryId),
       namedModel: named?.model,
       namedInput: named?.inputTokens,
       gapInput: gap?.inputTokens,
@@ -116,6 +123,10 @@ async function branchWriterStockReader(stockTree: string) {
       actorId: accountId, source: "codex", dataMode: "metadata",
       eventType: "assistant_response", observedAt: now.toISOString(),
       model: "gpt-6.1-sol", inputTokens: 19, outputTokens: 2,
+      // Preserve main's generic-response shape and its one-second lease.
+      // Native request attributes on this exact trace attest the named model.
+      metadata: { "gen_ai.request.model": "gpt-6.1-sol",
+        traceId: "e".repeat(32), "user.account_id": accountId },
     })), true);
     assert.equal(buffer.append(aiInteractionEventSchema.parse({
       id: gapId, sessionId: "00000000-0000-4000-8000-000000000912",
@@ -150,8 +161,152 @@ async function branchWriterStockReader(stockTree: string) {
     preservedDeliveries: stockLease.itemIds.length, dead: 0 }));
 }
 
+async function rollbackFixture(
+  name: string,
+  writer: { LocalEventBuffer: typeof HeadBuffer; captureCodexModel: typeof headCapture },
+  writerCommit: string,
+  readers: Array<{ tree: string; version: string }>,
+) {
+  const ledgerPath = path.join(root, `${name}.sqlite`);
+  const fixtureStart = baseMs + 3_000_000; // after main's final 2,122,000 ms lease
+  const check = (label: string) => completion.check(`${name}:${label}`);
+  {
+    let now = new Date(fixtureStart);
+    const buffer = new writer.LocalEventBuffer(ledgerPath, {
+      workspaceId,
+      deviceId,
+      enrollmentNow: () => new Date(fixtureStart),
+      delivery: { enabled: true, now: () => now },
+    });
+    let claim: unknown;
+    let sealedBefore: Array<{ id: string; sealed: string | null }>;
+    try {
+      const traceId = "c".repeat(32);
+      const evidence = aiInteractionEventSchema.parse({
+        id: "00000000-0000-4000-8000-000000000903",
+        sessionId: "00000000-0000-4000-8000-000000000911",
+        actorId: accountId,
+        source: "codex", dataMode: "metadata", eventType: "otel_span",
+        observedAt: new Date(fixtureStart).toISOString(), model: "gpt-6.1-sol",
+        metadata: {
+          otelEventName: "codex.sse_event", traceId, "user.account_id": accountId,
+          "gen_ai.request.model": "gpt-6.1-sol",
+        },
+      });
+      assert.equal(buffer.append(evidence), true);
+      const evidenceLease = buffer.delivery.lease({ now });
+      assert.equal(evidenceLease.items.length, 1);
+      buffer.delivery.acknowledge(evidenceLease.leaseId, [evidence.id], now);
+      const named = aiInteractionEventSchema.parse({
+        id: namedId,
+        sessionId: "00000000-0000-4000-8000-000000000911",
+        actorId: accountId,
+        source: "codex",
+        dataMode: "metadata",
+        eventType: "assistant_response",
+        observedAt: new Date(fixtureStart).toISOString(),
+        inputTokens: 19,
+        outputTokens: 2,
+        metadata: { traceId, "user.account_id": accountId },
+      });
+      const gap = aiInteractionEventSchema.parse({
+        id: gapId,
+        sessionId: "00000000-0000-4000-8000-000000000912",
+        source: "codex",
+        dataMode: "metadata",
+        eventType: "assistant_response",
+        observedAt: new Date(fixtureStart + 1_000).toISOString(),
+        inputTokens: 7,
+        outputTokens: 1,
+        metadata: { otelEventName: "handle_responses" },
+      });
+      assert.equal(buffer.append(named), true);
+      assert.equal(buffer.append(gap), true);
+
+      now = new Date(fixtureStart + 61_000);
+      const localCapture = writer.captureCodexModel(buffer.database, named);
+      assert.equal(localCapture.metadata.modelCaptureSource, "unique_trace_sse_event");
+      const lease = buffer.delivery.lease({ now });
+      assert.equal(lease.locallyDead, 0);
+      assert.equal(lease.items.length, 2);
+      const namedWire = lease.items.find((item) => item.deliveryId === namedId)?.envelope.event;
+      const gapWire = lease.items.find((item) => item.deliveryId === gapId)?.envelope.event;
+      assert.equal(namedWire?.model, "gpt-6.1-sol");
+      assert.equal(namedWire?.inputTokens, 19);
+      assert.equal(namedWire?.metadata.modelCaptureSource, undefined);
+      assert.equal(gapWire?.metadata.usageSource, "capture_gap");
+      assert.equal(gapWire?.inputTokens, undefined);
+      check("new-reader-seals-named-usage-and-tokenless-gap");
+
+      claim = buffer.delivery.captureClaim(
+        lease.items.map((item) => item.deliveryId),
+        { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false },
+        now,
+      );
+      assert.ok(claim);
+      assert.ok((claim as { gaps: unknown[] }).gaps.length >= 1,
+        "the model-capture gap is present in the capture claim");
+      check("new-reader-seals-gap-census-claim");
+      sealedBefore = readSealed(buffer.database);
+    } finally {
+      buffer.close();
+    }
+
+    const current = await leaseWithReader(path.resolve("."), currentVersion,
+      fixtureStart + 182_000, false, ledgerPath);
+    assert.deepEqual(current.itemIds.sort(), [gapId, namedId].sort());
+    const afterCurrent = new Database(ledgerPath, { readonly: true });
+    try { assert.deepEqual(readSealed(afterCurrent), sealedBefore); } finally { afterCurrent.close(); }
+    check("scanner-head-reader-preserves-exact-sealed-usage-and-gap");
+
+    let previousLeaseId = current.leaseId;
+    for (const [index, reader] of readers.entries()) {
+      const nowMs = fixtureStart + 303_000 + index * 121_000;
+      const lease = await leaseWithReader(reader.tree, reader.version, nowMs,
+        index === readers.length - 1, ledgerPath);
+      assert.notEqual(lease.leaseId, previousLeaseId, `${reader.version} waits for lease expiry`);
+      previousLeaseId = lease.leaseId;
+      assert.deepEqual(lease.itemIds.sort(), [gapId, namedId].sort());
+      const db = new Database(ledgerPath, { readonly: true });
+      try {
+        if (index < readers.length - 1) assert.deepEqual(readSealed(db), sealedBefore);
+      } finally { db.close(); }
+      check(`rollback-reader-${reader.version}-preserves-usage-after-lease-expiry`);
+    }
+
+    const finalDb = new Database(ledgerPath, { readonly: true });
+    try {
+      const counts = finalDb.prepare(`select
+        (select count(*) from upload_outbox) as outbox,
+        (select count(*) from upload_receipts where terminal_state='dead') as dead,
+        (select count(*) from upload_receipts where reason='local_model_capture_gap') as captureGapDead,
+        (select count(*) from buffered_events where uploaded_at is not null and id in (?,?)) as uploaded`).get(
+        namedId, gapId,
+      ) as { outbox: number; dead: number; captureGapDead: number; uploaded: number };
+      assert.deepEqual(counts, { outbox: 0, dead: 0, captureGapDead: 0, uploaded: 2 });
+      const raw = finalDb.prepare(
+        "select id, input_tokens as input from buffered_events where id in (?,?) order by id",
+      ).all(namedId, gapId) as Array<{ id: string; input: number | null }>;
+      assert.deepEqual(raw, [{ id: namedId, input: 19 }, { id: gapId, input: 7 }]);
+    } finally { finalDb.close(); }
+    check("rollback-outbox-receipt-state-is-consistent");
+    console.log(JSON.stringify({
+      proof: "collector-named-usage-rollback",
+      fixture: name,
+      writerCommit,
+      readers: [`scanner-head-${currentVersion}`, ...readers.map((reader) => reader.version)],
+      leaseOffsets: [fixtureStart - baseMs + 61_000, fixtureStart - baseMs + 182_000,
+        ...readers.map((_, index) => fixtureStart - baseMs + 303_000 + index * 121_000)],
+      released051Commit,
+      claim,
+      frozenEnvelopes: sealedBefore.length,
+    }));
+  }
+}
+
 async function main() {
   let writerTree: string | undefined;
+  let old051: string | undefined;
   let old050: string | undefined;
   let old049: string | undefined;
   let old048: string | undefined;
@@ -167,7 +322,7 @@ async function main() {
     fs.symlinkSync(path.resolve("node_modules"), path.join(writerTree, "node_modules"), "dir");
     const { LocalEventBuffer } = await import(pathToFileURL(
       path.join(writerTree, "packages/collector-cli/src/buffer.ts"),
-    ).href);
+    ).href) as typeof import("../packages/collector-cli/src/buffer");
     const { captureCodexModel } = await import(pathToFileURL(
       path.join(writerTree, "packages/collector-cli/src/codex-model-capture.ts"),
     ).href);
@@ -229,8 +384,8 @@ async function main() {
       const lease = buffer.delivery.lease({ now });
       assert.equal(lease.locallyDead, 0);
       assert.equal(lease.items.length, 2);
-      const namedWire = lease.items.find((item: any) => item.deliveryId === namedId)?.envelope.event;
-      const gapWire = lease.items.find((item: any) => item.deliveryId === gapId)?.envelope.event;
+      const namedWire = lease.items.find((item) => item.deliveryId === namedId)?.envelope.event;
+      const gapWire = lease.items.find((item) => item.deliveryId === gapId)?.envelope.event;
       assert.equal(namedWire?.model, "gpt-6.1-sol");
       assert.equal(namedWire?.inputTokens, 19);
       assert.equal(namedWire?.metadata.modelCaptureSource, undefined);
@@ -239,7 +394,7 @@ async function main() {
       completion.check("new-reader-seals-named-usage-and-tokenless-gap");
 
       claim = buffer.delivery.captureClaim(
-        lease.items.map((item: any) => item.deliveryId),
+        lease.items.map((item) => item.deliveryId),
         { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false },
         now,
       );
@@ -254,10 +409,13 @@ async function main() {
 
     const oldRoot = path.join(root, "readers");
     fs.mkdirSync(oldRoot, { recursive: true });
+    old051 = path.join(oldRoot, "collector-0.7.51");
     old050 = path.join(oldRoot, "collector-0.7.50");
     old049 = path.join(oldRoot, "collector-0.7.49");
     old048 = path.join(oldRoot, "collector-0.7.48");
     old047 = path.join(oldRoot, "collector-0.7.47");
+    execFileSync("git", ["worktree", "add", "--detach", "--quiet", old051,
+      released051Commit]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old050,
       released050Commit]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old049,
@@ -266,7 +424,7 @@ async function main() {
       "34d58bcd90865679e09fcbd1ee1703de5effda97"]);
     execFileSync("git", ["worktree", "add", "--detach", "--quiet", old047,
       "a60590559403cace3db7cbbda49812c9e3dbfe62"]);
-    for (const worktree of [old050, old049, old048, old047])
+    for (const worktree of [old051, old050, old049, old048, old047])
       fs.symlinkSync(path.resolve("node_modules"), path.join(worktree, "node_modules"), "dir");
 
     const current = await leaseWithReader(path.resolve("."), currentVersion, baseMs + 182_000, false);
@@ -290,15 +448,22 @@ async function main() {
     try { assert.deepEqual(readSealed(after049), sealedBefore); } finally { after049.close(); }
     completion.check("rollback-reader-0.7.49-preserves-usage-after-lease-expiry");
 
-    const first = await leaseWithReader(old048, "0.7.48", baseMs + 545_000, false);
-    assert.notEqual(first.leaseId, stock.leaseId);
+    const released051 = await leaseWithReader(old051, "0.7.51", baseMs + 545_000, false);
+    assert.notEqual(released051.leaseId, stock.leaseId);
+    assert.deepEqual(released051.itemIds.sort(), [gapId, namedId].sort());
+    const after051 = new Database(ledgerPath, { readonly: true });
+    try { assert.deepEqual(readSealed(after051), sealedBefore); } finally { after051.close(); }
+    completion.check("rollback-reader-0.7.51-preserves-usage-after-lease-expiry");
+
+    const first = await leaseWithReader(old048, "0.7.48", baseMs + 666_000, false);
+    assert.notEqual(first.leaseId, released051.leaseId);
     assert.deepEqual(first.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.48-preserves-usage");
 
     const after048 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after048), sealedBefore); } finally { after048.close(); }
 
-    const second = await leaseWithReader(old047, "0.7.47", baseMs + 666_000, true);
+    const second = await leaseWithReader(old047, "0.7.47", baseMs + 787_000, true);
     assert.notEqual(second.leaseId, first.leaseId);
     assert.deepEqual(second.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.47-preserves-usage");
@@ -323,7 +488,7 @@ async function main() {
     // Retain every legacy PR #450 assertion, then use this branch's actual
     // OTLP writer. A -> stock and B -> A are distinct staged rollback gates.
     assert.equal(JSON.parse(fs.readFileSync(path.join(old049, "packages/collector-cli/package.json"), "utf8")).version, "0.7.49");
-    const currentReader = await import(pathToFileURL(path.resolve("packages/collector-cli/src/buffer.ts")).href);
+    const currentReader = await import(pathToFileURL(path.resolve("packages/collector-cli/src/buffer.ts")).href) as typeof import("../packages/collector-cli/src/buffer");
     const tierIds = ["00000000-0000-4000-8000-000000000921", "00000000-0000-4000-8000-000000000922",
       "00000000-0000-4000-8000-000000000923"];
     const tierStart = baseMs + 1_000_000;
@@ -355,26 +520,28 @@ async function main() {
       tierNow = new Date(tierStart + 61_000);
       const lease = tierWriter.delivery.lease({ now: tierNow });
       assert.equal(lease.locallyDead, 0);
-      assert.deepEqual(lease.items.map((item: any) => item.deliveryId).sort(), tierIds);
-      assert.equal(lease.items.find((item: any) => item.deliveryId === tierIds[0]).envelope.event.metadata.serviceTier,
+      assert.deepEqual(lease.items.map((item) => item.deliveryId).sort(), tierIds);
+      assert.equal(lease.items.find((item) => item.deliveryId === tierIds[0])!.envelope.event.metadata.serviceTier,
         recordedTierWriter ? "priority" : undefined);
       completion.check(recordedTierWriter ? "branch-writer-seals-zero-and-recorded-processing-tier" : "reader-first-writer-seals-zero-with-no-tier-key");
-      tierClaim = tierWriter.delivery.captureClaim(tierIds, { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      const tierCaptureClaim = tierWriter.delivery.captureClaim(tierIds, { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      assert.ok(tierCaptureClaim);
+      tierClaim = tierCaptureClaim;
       assert.ok(tierClaim);
       assert.equal(tierClaim.dead, 0);
       tierSealed = readSealed(tierWriter.database);
       completion.check("branch-writer-seals-capture-claim-with-no-dead-usage");
     } finally { tierWriter.close(); }
-    const previous = await import(pathToFileURL(path.join(old049, "packages/collector-cli/src/buffer.ts")).href);
+    const previous = await import(pathToFileURL(path.join(old049, "packages/collector-cli/src/buffer.ts")).href) as typeof import("../packages/collector-cli/src/buffer");
     tierNow = new Date(tierStart + 182_000); // the branch writer's lease has expired
     const previousReader = new previous.LocalEventBuffer(ledgerPath, { workspaceId, deviceId,
       enrollmentNow: () => new Date(baseMs), delivery: { enabled: true, now: () => tierNow } });
     try {
       const lease = previousReader.delivery.lease({ now: tierNow });
       assert.equal(lease.locallyDead, 0);
-      assert.deepEqual(lease.items.map((item: any) => item.deliveryId).sort(), tierIds);
+      assert.deepEqual(lease.items.map((item) => item.deliveryId).sort(), tierIds);
       for (const [i, id] of tierIds.entries()) {
-        const event = lease.items.find((item: any) => item.deliveryId === id).envelope.event;
+        const event = lease.items.find((item) => item.deliveryId === id)!.envelope.event;
         assert.equal(event.model, "gpt-6.1-sol");
         assert.equal(event.inputTokens, 19);
         assert.equal(event.outputTokens, 2);
@@ -386,6 +553,7 @@ async function main() {
       assert.deepEqual(readSealed(previousReader.database), tierSealed);
       const oldClaim = previousReader.delivery.captureClaim(tierIds,
         { pendingFiles: 0, oldestPendingMs: null, losses: [], unreadable: false }, tierNow);
+      assert.ok(oldClaim);
       assert.equal(oldClaim.dead, 0);
       assert.ok(oldClaim.cursor > tierClaim.cursor);
       completion.check(`${previousReaderLabel}-keeps-frozen-envelopes-and-continues-claims`);
@@ -397,12 +565,18 @@ async function main() {
       completion.check(`${previousReaderLabel}-delivers-all-new-usage-with-zero-retirements`);
     } finally { previousReader.close(); }
     await branchWriterStockReader(old049);
+    const continuedCapture = await runCaptureDowngradeFixtures();
+    assert.equal(continuedCapture.length, 4);
+    for (const fixture of continuedCapture) completion.check(
+      `continued-${fixture.kind}-capture-after-downgrade-${fixture.releasedVersion}`);
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
-      readers: [`scanner-head-${currentVersion}`, "released-0.7.50", "stock-0.7.49", "main-0.7.48", "0.7.47"],
-      readerLeaseOffsetsMs: [182_000, 303_000, 424_000, 545_000, 666_000],
+      readers: [`scanner-head-${currentVersion}`, "released-0.7.50", "stock-0.7.49", "released-0.7.51", "main-0.7.48", "0.7.47"],
+      readerLeaseOffsetsMs: [182_000, 303_000, 424_000, 545_000, 666_000, 787_000],
       released050Commit,
+      released051Commit,
+      continuedCapture,
       stagedRollback: { writerCommit: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
         previousReaderCommit, previousReaderLabel, recordedTierWriter, sameLedger: true, leaseExpired: true,
         locallyDead: 0, acknowledged: 3 },
@@ -410,8 +584,16 @@ async function main() {
       tierClaim,
       frozenEnvelopes: sealedBefore.length,
     }));
+    await rollbackFixture("head-writer-released-readers", {
+      LocalEventBuffer: HeadBuffer, captureCodexModel: headCapture,
+    }, execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(), [
+      { tree: old051, version: "0.7.51" },
+      { tree: old050, version: "0.7.50" }, { tree: old049, version: "0.7.49" },
+      { tree: old048, version: "0.7.48" },
+    ]);
     completion.complete();
   } finally {
+    if (old051) closeQuietly(old051);
     if (writerTree) closeQuietly(writerTree);
     if (old050) closeQuietly(old050);
     if (old049) closeQuietly(old049);

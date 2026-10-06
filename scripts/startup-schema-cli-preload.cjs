@@ -25,7 +25,7 @@ Database.prototype.pragma = function (sql, ...args) {
   return Reflect.apply(originalPragma, this, [sql, ...args]);
 };
 
-// The proof may only listen on its fixture's Unix sockets and ports 49100-49199.
+// The proof may only listen on its fixture's Unix sockets and ports 49750-49799.
 const leases = path.join(process.env.TMPDIR, "startup-schema-port-leases");
 fs.mkdirSync(leases, { recursive: true });
 const originalListen = net.Server.prototype.listen;
@@ -43,14 +43,14 @@ net.Server.prototype.listen = function (...args) {
   let lease;
   if (requested === 0) {
     for (let i = 0; i < 50; i++) {
-      chosen = 49150 + ((process.pid + i) % 50);
+      chosen = 49750 + ((process.pid + i) % 50);
       const file = path.join(leases, String(chosen));
       try { fs.writeFileSync(file, String(process.pid), { flag: "wx" }); lease = file; break; }
       catch (error) { if (error.code !== "EEXIST") throw error; }
     }
     if (!lease) throw new Error("startup_schema_fixture_ports_exhausted");
   }
-  if (chosen < 49100 || chosen > 49199) throw new Error(`startup_schema_refuses_port_${chosen}`);
+  if (chosen < 49750 || chosen > 49799) throw new Error(`startup_schema_refuses_port_${chosen}`);
   if (options) args[0] = { ...options, port: chosen, host: options.host || "127.0.0.1" };
   else args[0] = chosen;
   const cleanup = () => { if (lease) { try { fs.unlinkSync(lease); } catch {} lease = undefined; } };

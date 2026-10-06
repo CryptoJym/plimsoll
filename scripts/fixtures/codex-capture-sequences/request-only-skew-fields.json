@@ -1,0 +1,9 @@
+{
+  "finding": "B-P0-04",
+  "operations": [
+    "request-only-partial",
+    "request-only-span",
+    "request-only-complete"
+  ],
+  "intent": "request identity alone joins timestamp-drifted observations and retains complementary cache and cost fields"
+}

@@ -1,6 +1,11 @@
 import type { LocalEventBuffer } from "./buffer";
 import { deterministicEventId } from "./normalizer";
-import { aiInteractionEventSchema, type AiInteractionEvent } from "../../shared/src/index";
+import {
+  aiInteractionEventSchema,
+  isPlanLimitWindowWithinBound,
+  MAX_PLAN_LIMIT_WINDOW_MINUTES,
+  type AiInteractionEvent,
+} from "../../shared/src/index";
 
 export type PlanLimitWindow = {
   window: string;
@@ -33,7 +38,8 @@ export function codexPlanLimitWindows(rateLimits: unknown): PlanLimitWindow[] {
     const limit = record(limits[slot]);
     const minutes = limit.window_minutes;
     const resetsAt = resetInstant(limit.resets_at);
-    if (!percentage(limit.used_percent) || !Number.isSafeInteger(minutes) || (minutes as number) <= 0 || !resetsAt) continue;
+    if (!percentage(limit.used_percent) || !Number.isSafeInteger(minutes) ||
+      (minutes as number) <= 0 || (minutes as number) > MAX_PLAN_LIMIT_WINDOW_MINUTES || !resetsAt) continue;
     windows.push({
       window: minutes === 300 ? "five_hour" : minutes === 10080 ? "weekly" : `window_${minutes}m`,
       minutes: minutes as number,
@@ -93,7 +99,10 @@ export class PlanLimitEmitter {
 
   observe(input: Observation): boolean {
     const { source, accountKey, window, observedAt } = input;
-    if (!accountKey || !/^sha256:[a-f0-9]{16}$/.test(accountKey) ||
+    if (!isPlanLimitWindowWithinBound({
+      planLimitWindow: window.window,
+      ...(window.minutes === undefined ? {} : { planLimitWindowMinutes: window.minutes }),
+    }) || !accountKey || !/^sha256:[a-f0-9]{16}$/.test(accountKey) ||
       !Number.isFinite(Date.parse(observedAt))) return false;
     this.ensureSchema();
     const stateKey = accountKey;

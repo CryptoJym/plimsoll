@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 /**
  * eco-6hoxj.163.9 r2: session attribution on the upload path costs a bounded
  * amount independent of session size, and its results equal the per-event
@@ -242,8 +243,11 @@ function tokenEvent(
     actionClass: "other",
     inputTokens: 1_000,
     outputTokens: 50,
-    metadata: {},
+    // These are native requests for attribution, with an intentionally
+    // unpriced model so the independent byte oracle keeps its original cost.
+    ...nativeCodexFixture(id, "attribution-proof-unpriced"),
     ...extra,
+    metadata: { ...nativeCodexFixture(id, "attribution-proof-unpriced").metadata, ...extra.metadata },
   };
 }
 
@@ -451,14 +455,15 @@ async function largeSessionBudget(dir: string) {
     `insert into buffered_events
        (id, source, event_type, data_mode, observed_at, payload_json,
         suppressed_fields_json, created_at, session_id, input_tokens,
-        output_tokens, workspace_id, device_id, privacy_generation)
+        output_tokens, workspace_id, device_id, installation_epoch_id, privacy_generation)
      values (@id, @source, @eventType, @dataMode, @observedAt, @payload, '[]',
-       @observedAt, @sessionId, @inputTokens, @outputTokens, @workspace, @device,
+       @observedAt, @sessionId, @inputTokens, @outputTokens, @workspace, @device, @epoch,
        'fixture-generation')`,
   );
   busy.database.transaction(() => {
     for (const event of uploadEvents) {
-      insertRaw.run({ ...event, payload: JSON.stringify(event), workspace: WORKSPACE, device: DEVICE });
+      insertRaw.run({ ...event, payload: JSON.stringify(event), workspace: WORKSPACE, device: DEVICE,
+        epoch: (busy.database.prepare("select current_installation_epoch_id as id from collector_workspace_binding where singleton=1").get() as {id:string}).id });
     }
   })();
 

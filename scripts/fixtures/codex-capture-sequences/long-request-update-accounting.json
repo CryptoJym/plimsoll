@@ -1,0 +1,4 @@
+{
+  "finding": "R10-B-P0-04-bound-control",
+  "operations": ["skew-native", "skew-series"]
+}

@@ -1037,7 +1037,13 @@ async function stagePrivacy() {
       (fixture.buffer.database.prepare("select id, attrs_json as attrsJson from metric_samples").all() as Array<{ id: string; attrsJson: string }>)
         .map((row) => [row.id, row.attrsJson]),
     );
-    const eventMismatches = spooledEvents.filter((event) => stored.get(event.id) !== JSON.stringify(event)).length;
+    // Append binds every observation to the local installation epoch. The
+    // producer bytes must otherwise survive spool replay without any edits.
+    const epoch = fixture.buffer.workspaceBinding()?.currentInstallationEpochId;
+    const eventMismatches = spooledEvents.filter((event) => stored.get(event.id) !==
+      JSON.stringify((event as {source?: string}).source === "codex"
+        ? { ...event, metadata: { ...(event as {metadata?: Record<string, unknown>}).metadata, installationEpochId: epoch } }
+        : event)).length;
     const sampleMismatches = spooledSamples.filter((sample) => storedAttrs.get(sample.id) !== JSON.stringify(sample.attrs)).length;
     check(
       "g_each_spooled_row_is_exactly_the_row_the_ledger_stores",

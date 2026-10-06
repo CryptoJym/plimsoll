@@ -1,0 +1,4 @@
+{
+  "finding": "R10-P0-07",
+  "operations": ["upgrade-047", "sse-zero-complement-twin", "skew-native-update"]
+}

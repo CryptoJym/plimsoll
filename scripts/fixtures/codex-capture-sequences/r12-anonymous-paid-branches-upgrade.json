@@ -1,0 +1,8 @@
+{
+  "operations": [
+    "sse-partial-twin",
+    "span",
+    "history-turn",
+    "upgrade-047"
+  ]
+}

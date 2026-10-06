@@ -108,7 +108,7 @@ async function realDaemonTrial(trial: number, loader: string) {
   const home = path.join(fixture, "home");
   for (const folder of [".plimsoll", ".codex", ".claude", ".grok", "tmp", ".config", ".cache", ".state"])
     fs.mkdirSync(path.join(home, folder), { recursive: true, mode: 0o700 });
-  const config = { port: 49100 + trial, tenantId: workspaceId,
+  const config = { port: 49750 + trial, tenantId: workspaceId,
     deviceId: "dev_startup_schema_fixture", managedConfig: { reconcile: { enabled: false } } };
   fs.writeFileSync(path.join(home, ".plimsoll/collector.config.json"), JSON.stringify(config), { mode: 0o600 });
   const env = { ...process.env, HOME: home, USERPROFILE: home,
@@ -165,6 +165,9 @@ async function realDaemonTrial(trial: number, loader: string) {
     console.log(JSON.stringify({ trial, realCli: true, listened,
       results: settled.map(({ role, code, stderr }) => ({ role, code, stderr })) }));
     assert.ok(listened, "the real daemon must reach its listener");
+    const listener = JSON.parse(fs.readFileSync(listening, "utf8"));
+    assert.equal(listener.port, config.port, "the daemon listens on its configured fixture port");
+    assert.equal(listener.address, "127.0.0.1", "the fixture listener stays on loopback");
     assert.deepEqual(settled.map(({ code }) => code), [0, 0, 0],
       "daemon, hook and status must all exit zero");
   } finally {

@@ -1,0 +1,9 @@
+{
+  "finding": "R8-P0-06",
+  "operations": [
+    "sse-valid",
+    "rollout-turn",
+    "trace-astra"
+  ],
+  "contract": "A native cursor never consumes known usage against a withdrawable pending live witness; transport still waits 60 seconds."
+}

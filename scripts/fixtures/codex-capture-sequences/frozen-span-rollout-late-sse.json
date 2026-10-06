@@ -1,0 +1,11 @@
+{
+  "finding": "positive-three-producer-control",
+  "operations": [
+    "trace-sol",
+    "span",
+    "expire-retry",
+    "rollout-turn",
+    "sse-valid"
+  ],
+  "contract": "A frozen span remains the only owner when both its rollout and SSE twins arrive."
+}

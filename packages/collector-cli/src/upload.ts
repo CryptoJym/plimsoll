@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { captureCodexModel, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { frozenCodexCapture, rememberFrozenCodexCapture } from "./codex-named-capture";
 
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
 import {
@@ -23,6 +25,7 @@ import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
 import {
   applyProjectAttribution,
+  captureRepoContextExcluded,
   SessionAttributionBatch,
 } from "./session-attribution";
 
@@ -46,7 +49,7 @@ export function attachRepoLinkage(
 export function buildIngestBatch(
   config: CollectorConfig,
   buffer: LocalEventBuffer,
-  options: { limit?: number; maxBytes?: number; appVersion?: string } = {},
+  options: { limit?: number; maxBytes?: number; appVersion?: string; now?: () => Date } = {},
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
   buffer.useWorkspace(config.tenantId, config.deviceId);
   const candidateRows = buffer.listUnuploaded({
@@ -61,7 +64,17 @@ export function buildIngestBatch(
     candidateRows.map((row) => ({ event: row.payload, repoHash: row.repoHash })),
   );
   for (const row of candidateRows) {
-    const attributed = attribution.attribute(row.payload, {
+    if (row.payload.source === "codex" && buffer.delivery.reconcileCodexResponse(row.id)) {
+      const current = buffer.database.prepare(`select payload_json as payload,usage_duplicate_reason as duplicate
+        from buffered_events where id=?`).get(row.id) as {payload:string;duplicate:string}|undefined;
+      if (!current || current.duplicate) continue;
+      row.payload=JSON.parse(current.payload);
+    }
+    if (unresolvedCapture(row.payload) &&
+        (options.now?.() ?? new Date()).getTime() < Date.parse(row.createdAt) + CODEX_MODEL_WAIT_MS) continue;
+    const captured = captureCodexModel(buffer.database,row.payload,row.id,true);
+    const attributed = attribution.attribute(captured, {
+      repoContextExcluded: captureRepoContextExcluded(captured.metadata?.repoContextPolicyGeneration, row.repoHash),
       repoHash: row.repoHash,
       branchHash: row.branchHash,
     });
@@ -70,8 +83,11 @@ export function buildIngestBatch(
       suppressedFields: row.suppressedFields,
     });
     if (!sealed.ok) continue;
+    const frozen = frozenCodexCapture(buffer.database,row.id);
+    const envelope = frozen ? JSON.parse(frozen.envelopeJson) : sealed.envelope;
+    rememberFrozenCodexCapture(buffer.database,row.id,envelope.event.id,JSON.stringify(envelope),captured);
     rows.push(row);
-    events.push(sealed.envelope);
+    events.push(envelope);
   }
   if (rows.length === 0) return { batch: null, rows };
   const batch = aiWorkIngestBatchSchema.parse({
@@ -378,7 +394,10 @@ let captureClaimFailureLogged = false;
  * synchronous turn, 200-270 ms on the Studio0 ledger; the daemon claims the
  * same batch in slices under one lease id and yields between them.
  */
-export const LEASE_SLICE_ROWS = 125;
+// Native model capture adds work to each sealed item. Keep the wire batch at
+// 500 while yielding more often inside leasing and acknowledgment; the 125-row
+// ceiling and 250 ms responsiveness gate remain unchanged.
+export const LEASE_SLICE_ROWS = 64;
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 

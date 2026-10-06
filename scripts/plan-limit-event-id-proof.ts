@@ -3,8 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { PlanLimitEmitter } from "../packages/collector-cli/src/plan-limit-observation";
-import { providerAccountKey } from "../packages/shared/src/policy";
+import { codexPlanLimitWindows, PlanLimitEmitter } from "../packages/collector-cli/src/plan-limit-observation";
+import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
+import { MAX_PLAN_LIMIT_WINDOW_MINUTES, providerAccountKey } from "../packages/shared/src/index";
 
 const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "plimsoll-plan-limit-id-"));
 const buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
@@ -39,7 +40,46 @@ try {
   buffer.database.prepare("delete from plan_limit_emission_state").run();
   assert.equal(observe(new PlanLimitEmitter(buffer), "2026-09-29T09:15:02.000Z"), false);
   assert.equal(readings().length, 2, "a same-bucket replay deduplicates independently of throttle state");
-  console.log(JSON.stringify({ proof: "plan-limit-event-id", checks: 9, passed: 9, failed: 0 }));
+
+  const invalidRateLimit = {
+    primary: {
+      used_percent: 42,
+      window_minutes: MAX_PLAN_LIMIT_WINDOW_MINUTES + 1,
+      resets_at: "2026-09-29T14:00:00.000Z",
+    },
+  };
+  assert.deepEqual(codexPlanLimitWindows(invalidRateLimit), [],
+    "an over-bound provider window is not admitted by the normalizer");
+  assert.equal(emitter.observe({
+    source: "codex", accountKey, observedAt: "2026-09-29T09:30:01.000Z",
+    window: {
+      window: `window_${MAX_PLAN_LIMIT_WINDOW_MINUTES + 1}m`,
+      minutes: MAX_PLAN_LIMIT_WINDOW_MINUTES + 1,
+      usedPercent: 42,
+      resetsAt: "2026-09-29T14:00:00.000Z",
+    },
+    planLimitSource: "codex_rollout",
+  }), false,
+    "the emitter refuses an explicitly over-bound window");
+  const invalidEnvelope = sealOutboundEnvelope({
+    event: {
+      id: "00000000-0000-4000-8000-000000000901",
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "plan_limit_observation",
+      observedAt: "2026-09-29T09:30:01.000Z",
+      metadata: {
+        planLimitWindow: `window_${MAX_PLAN_LIMIT_WINDOW_MINUTES + 1}m`,
+        planLimitWindowMinutes: MAX_PLAN_LIMIT_WINDOW_MINUTES + 1,
+      },
+    },
+    suppressedFields: [],
+  });
+  assert.equal(invalidEnvelope.ok, false,
+    "the outbound boundary refuses an over-bound plan reading");
+  assert.equal(readings().length, 2,
+    "refused plan readings cannot join a usage batch through the ledger");
+  console.log(JSON.stringify({ proof: "plan-limit-event-id", checks: 12, passed: 12, failed: 0 }));
 } finally {
   buffer.close();
   fs.rmSync(root, { recursive: true, force: true });

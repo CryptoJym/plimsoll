@@ -60,11 +60,11 @@ function insertFact(
 ) {
   insert.run(
     id,
-    "codex",
+    "claude_code",
     "assistant_response",
     "metadata",
     observedAt,
-    JSON.stringify({ id, source: "codex", eventType: "assistant_response", observedAt, sessionId }),
+    JSON.stringify({ id, source: "claude_code", eventType: "assistant_response", observedAt, sessionId }),
     "[]",
     NOW.toISOString(),
     sessionId,

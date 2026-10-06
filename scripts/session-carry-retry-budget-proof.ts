@@ -1,3 +1,4 @@
+import { nativeCodexFixture } from "./lib/native-codex-fixture";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -75,6 +76,7 @@ async function main() {
       actionClass: "other",
       inputTokens: 1,
       outputTokens: 1,
+      ...nativeCodexFixture("session-carry-119"),
     });
     const admission = buffer.append(event, undefined, { integrityReceipt: true });
     assert.equal(admission.appended, true, JSON.stringify(admission));

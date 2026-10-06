@@ -341,9 +341,8 @@ function buildLogEvent(
   if (resolvedGit?.remoteUrlHash && resolvedGit.remoteLabel) {
     context.onRepoLabel?.(resolvedGit.remoteUrlHash, resolvedGit.remoteLabel);
   }
-  const gitContext = resolvedGit
-    ? (({ remoteLabel: _label, ...linkage }) => linkage)(resolvedGit)
-    : undefined;
+  const gitContext = resolvedGit ? { ...resolvedGit } : undefined;
+  if (gitContext) delete gitContext.remoteLabel;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
   const rawAttrs = flattenOtelAttributes(safeRecord.attributes);
@@ -460,7 +459,9 @@ function buildLogEvent(
       ...(costEstimated ? { costEstimated: true } : {}),
     },
   });
-  if (!context.resolveGit && repoContextCwd) {
+  // An inline null lookup still owns this cwd; keep its exclusion through
+  // deferred capture and sealing rather than falling back to old session git.
+  if ((!context.resolveGit || !resolvedGit) && repoContextCwd) {
     attachRepoContextSidecar(event, event.id, repoContextCwd);
   }
 
@@ -852,9 +853,18 @@ export function explodeOtlpPayload(
     }
   }
 
+  // Conflicting native aliases never choose the first model in a key list.
+  for (const { event } of result.events) {
+    if (event.source !== "codex") continue;
+    const models = new Set(usageFieldKeys.model.map(key => event.metadata[key])
+      .filter(value => typeof value === "string" && value.trim()));
+    if (models.size > 1) { delete event.model; delete event.costUsd; delete event.costKind;
+      event.metadata.modelEvidenceConflict = true; }
+  }
   // A response span can carry a session only when a sanitized peer in this
   // same OTLP trace has exactly one session. The span's token counts and model
-  // remain its own facts; trace proximity never supplies a model or account.
+  // remain its own facts here. At outbound sealing a codex.sse_event in the
+  // same trace may supply a model only when exactly one model is present.
   const sessionsByTrace = new Map<string, Set<string>>();
   for (const { event } of result.events) {
     const traceId = event.metadata.traceId;

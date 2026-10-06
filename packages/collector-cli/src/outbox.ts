@@ -1,8 +1,15 @@
+import type { AiInteractionEvent } from "../../shared/src/index";
+import { captureCodexModel, codexModelGap, codexHasUsage, codexMisfiledUnderClaude, hasCaptureGapDecision, isCaptureGap, legacyFrozenNativeCapture, rememberCaptureGap, rememberCaptureGapForLineage, unresolvedCapture, CODEX_MODEL_WAIT_MS } from "./codex-model-capture";
+import { frozenCodexCapture, frozenCodexDelivery, installCodexFrozenCompatibility, rememberFrozenCodexCapture } from "./codex-named-capture";
+import { rememberCodexSpanEmission } from "./codex-span-rollout-pairing";
+import { applyCodexResponseCoverage } from "./codex-response-coverage";
+import { ensureHistoricalMutationBoundary, historicalRawHighWater, historicalRawProjection, historicalRepairHold, isHistoricalRaw, type HistoricalRepairHold } from "./historical-raw";
 import crypto from "node:crypto";
 
 import type Database from "better-sqlite3";
 
 import {
+  aiInteractionEventSchema,
   aiWorkIngestEventSchema,
   type AiWorkIngestEvent,
 } from "../../shared/src/index";
@@ -15,7 +22,7 @@ import {
 import { collisionSafeDeliveryId, ensureUuidEventId, incarnationDeliveryId,
   isCollisionSafeDeliveryId,
   normalizeHistoryEvent } from "./upload-history";
-import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
+import { applyProjectAttribution, captureRepoContextExcluded, SessionAttributionBatch } from "./session-attribution";
 import {
   CAPTURE_WRITE_LAG_MS,
   captureFrontier,
@@ -67,6 +74,7 @@ export type DeliveryReceiptReason =
   | "local_privacy_violation"
   | "local_item_oversize"
   | "local_usage_duplicate"
+  | "local_model_capture_gap"
   | "remote_rejected_exhausted"
   | "remote_validation_rejected";
 
@@ -95,6 +103,8 @@ export type DeliveryReplaySummary = {
     alreadyAcknowledged: number;
     missingRaw: number;
     privacyDisposed: number;
+    /** Present only when an archived incarnation requires reviewed opt-in. */
+    historicalHeld?: number;
   };
   dryRun: boolean;
   /** Set only when a full `--limit` of candidates re-queued nothing, so an
@@ -127,6 +137,7 @@ export type DeliveryStatus = {
     | "remote_rejected"
     | "auth_circuit"
     | "contract_circuit"
+    | "historical_repair_hold"
   >;
   remainingDelivery: number;
   active: {
@@ -151,7 +162,7 @@ export type DeliveryStatus = {
   migration: {
     cursorRowid: number;
     complete: boolean;
-    pausedReason: "pressure" | "slice_budget_too_small" | "receipt_lineage_pending" | null;
+    pausedReason: "pressure" | "slice_budget_too_small" | "receipt_lineage_pending" | HistoricalRepairHold | null;
     progressMode: "bounded_rowid_watermark_no_exact_remaining";
     sliceBudget: { rows: number; bytes: number; uploadBatchesPerCycle: number };
     lastSlice: {
@@ -288,11 +299,13 @@ type ActiveDeliveryRow = {
   rawCreatedAt: string | null;
   rawGeneration: string | null;
   baseEnvelopeJson: string;
+  rawPayloadJson: string | null;
   sealedEnvelopeJson: string | null;
   repoHash: string | null;
   branchHash: string | null;
   attemptCount: number;
   deviceId: string | null;
+  captureRepoContextPolicyGeneration?: number | null;
 };
 
 type RawPrivacyRow = {
@@ -309,6 +322,13 @@ type RawLineageSnapshot = Pick<
   ActiveDeliveryRow,
   "deliveryId" | "rawRowid" | "rawId" | "rawCreatedAt" | "rawGeneration" | "deviceId"
 >;
+
+function rememberDeliveryCaptureGap(db: Database.Database, row: Pick<ActiveDeliveryRow,
+  "rawRowid" | "rawId" | "rawCreatedAt" | "rawGeneration">, reason: string) {
+  if(row.rawRowid===null || row.rawId===null || row.rawCreatedAt===null)return false;
+  return rememberCaptureGapForLineage(db,{rawRowid:row.rawRowid,rawId:row.rawId,
+    rawCreatedAt:row.rawCreatedAt,rawGeneration:row.rawGeneration},reason);
+}
 
 type PrivacyDecision = DeliveryReceiptReason | "lineage_unresolved" | null;
 
@@ -331,6 +351,8 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number, resolvedId?:
   const normalized = normalizeHistoryEvent({
     payloadJson: row.payloadJson,
     suppressedFieldsJson: row.suppressedFieldsJson,
+    repoHash: row.repoHash,
+    branchHash: row.branchHash,
   });
   if (normalized.ok === false) {
     const reason =
@@ -376,6 +398,37 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number, resolvedId?:
   };
 }
 
+function persistedGapPayload(db: Database.Database, row: RawDeliveryRow) {
+  let event: AiInteractionEvent;
+  try { event = aiInteractionEventSchema.parse(JSON.parse(row.payloadJson)); }
+  catch { return row.payloadJson; }
+  const lineage = {
+    rawRowid: row.rawRowid, rawId: row.rawId, rawCreatedAt: row.createdAt,
+    rawGeneration: row.privacyGeneration,
+  };
+  if (isCaptureGap(event)) {
+    const reason = typeof event.metadata.modelGapReason === "string"
+      ? event.metadata.modelGapReason : "legacy_capture_gap";
+    rememberCaptureGap(db, row.rawId, reason);
+    return row.payloadJson;
+  }
+  if (!codexHasUsage(event) || !hasCaptureGapDecision(db, lineage)) return row.payloadJson;
+  return JSON.stringify(codexModelGap(db, event, "persisted_capture_gap"));
+}
+
+function captureGapReason(envelopeJson: string | null | undefined): string | undefined {
+  if (!envelopeJson) return undefined;
+  try {
+    const envelope = aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
+    if (!isCaptureGap(envelope.event)) return undefined;
+    return typeof envelope.event.metadata.modelGapReason === "string"
+      ? envelope.event.metadata.modelGapReason
+      : "sealed_capture_gap";
+  } catch {
+    return undefined;
+  }
+}
+
 /** Refresh only a never-attempted envelope after pairing adds cached tokens. */
 export function refreshUnsentRawDelivery(
   db: Database.Database,
@@ -395,11 +448,27 @@ export function refreshUnsentRawDelivery(
      from buffered_events where id = ?`,
   ).get(rawId) as RawDeliveryRow | undefined;
   if (!raw || raw.uploadedAt || raw.usageDuplicateReason) return false;
-  const linked = db.prepare(`select delivery_id as id from upload_outbox
+  const derived = historicalRawProjection(db,rawId);
+  if (derived?.duplicate) return false;
+  if (derived) raw.payloadJson = JSON.stringify(derived.event);
+  const linked = db.prepare(`select delivery_id as id,base_envelope_json as baseEnvelopeJson from upload_outbox
     where raw_rowid=? and raw_id=? and raw_created_at=?
       and raw_generation is ? limit 1`).get(raw.rawRowid, raw.rawId,
-    raw.createdAt, raw.privacyGeneration) as { id: string } | undefined;
+    raw.createdAt, raw.privacyGeneration) as { id: string; baseEnvelopeJson: string } | undefined;
   if (!linked) return false;
+  if (hasCaptureGapDecision(db, {
+    rawRowid: raw.rawRowid, rawId: raw.rawId, rawCreatedAt: raw.createdAt,
+    rawGeneration: raw.privacyGeneration,
+  })) return false;
+  try {
+    const base = aiWorkIngestEventSchema.parse(JSON.parse(linked.baseEnvelopeJson));
+    if (isCaptureGap(base.event)) return false;
+  } catch {
+    // A malformed base cannot prove that this delivery is safe to refresh.
+    // Leave it for the ordinary lease/schema path instead of deriving a new
+    // billable envelope from the raw row.
+    return false;
+  }
   const prepared = prepareDelivery(raw, maxItemBytes, linked.id);
   if (!prepared.ok) return false;
   return db.prepare(
@@ -407,7 +476,7 @@ export function refreshUnsentRawDelivery(
        base_bytes = @baseBytes, sealed_envelope_json = null, sealed_bytes = null,
        updated_at = @now
      where delivery_id = @deliveryId and state in ('pending','retry')
-       and attempt_count = 0`,
+       and sealed_envelope_json is null and attempt_count = 0`,
   ).run({ ...prepared, now: new Date().toISOString() }).changes > 0;
   };
   return db.inTransaction ? refresh() : db.transaction(refresh).immediate();
@@ -416,7 +485,7 @@ export function refreshUnsentRawDelivery(
 /** A paired span stays in the raw ledger but must not enter a new upload. */
 export function retirePairedSpanDelivery(db: Database.Database, spanId: string) {
   return db.prepare(
-    `delete from upload_outbox where delivery_id = ? and state in ('pending','retry')`,
+    `delete from upload_outbox where delivery_id = ? and sealed_envelope_json is null and state in ('pending','retry')`,
   ).run(ensureUuidEventId(spanId).id).changes;
 }
 
@@ -426,8 +495,10 @@ function attachFillOnlyLinkage(
   branchHash: string | null,
   attribution: SessionAttributionBatch,
   disposedRawRowids: ReadonlySet<number>,
+  captureRepoContextPolicyGeneration: number | null | undefined,
 ): AiWorkIngestEvent {
   const attributed = attribution.attribute(envelope.event, {
+    repoContextExcluded: captureRepoContextExcluded(captureRepoContextPolicyGeneration, repoHash),
     repoHash,
     branchHash,
     excludedRowids: disposedRawRowids,
@@ -450,6 +521,19 @@ function asLimits(input: Partial<DeliveryLimits> | undefined): DeliveryLimits {
 }
 
 export class DeliveryOutbox {
+  private leaseStatements: Map<string, Database.Statement> | undefined;
+  private leaseStatement(sql: string) {
+    const cache = this.leaseStatements;
+    if (!cache) return this.db.prepare(sql);
+    const existing = cache.get(sql);
+    if (existing) return existing;
+    // Only compiled SQL lives for this writer pass. Every get/run rereads
+    // current state with its current bindings and the original ledger guards.
+    // Excess query shapes fall back to ordinary preparation, never less work.
+    const statement = this.db.prepare(sql);
+    if (cache.size < 64) cache.set(sql, statement);
+    return statement;
+  }
   private enabled: boolean;
   private limits: DeliveryLimits;
   private workspaceId: string | null;
@@ -479,6 +563,7 @@ export class DeliveryOutbox {
     this.onHoldChange = options.onHoldChange;
     this.workspaceId = options.workspaceId?.trim() || null;
     this.deviceId = options.deviceId?.trim() || null;
+    ensureHistoricalMutationBoundary(this.db);
     this.initializeSchema();
     if (this.enabled) this.reopenMigrationPastWatermark();
   }
@@ -829,7 +914,14 @@ export class DeliveryOutbox {
         reason text not null,
         original_terminal_at text not null,
         replayed_at text not null,
-        replay_count integer not null default 1
+        replay_count integer not null default 1,
+        raw_rowid integer,
+        raw_id text,
+        raw_created_at text,
+        raw_generation text,
+        frozen_envelope_json text,
+        frozen_bytes integer,
+        frozen_attempt_count integer
       );
       create table if not exists upload_control (
         singleton integer primary key check (singleton = 1),
@@ -942,6 +1034,22 @@ export class DeliveryOutbox {
         where singleton = 1;
       end;
     `);
+    const replayColumns = this.db
+      .prepare(`pragma table_info(upload_replays)`)
+      .all() as Array<{ name: string }>;
+    const replayAdditions: Array<[string, string]> = [
+      ["raw_rowid", "integer"],
+      ["raw_id", "text"],
+      ["raw_created_at", "text"],
+      ["raw_generation", "text"],
+      ["frozen_envelope_json", "text"],
+      ["frozen_bytes", "integer"],
+      ["frozen_attempt_count", "integer"],
+    ];
+    for (const [name, type] of replayAdditions) {
+      if (!replayColumns.some((column) => column.name === name))
+        this.db.exec(`alter table upload_replays add column ${name} ${type}`);
+    }
     const controlColumns = this.db
       .prepare(`pragma table_info(upload_control)`)
       .all() as Array<{ name: string }>;
@@ -1121,6 +1229,30 @@ export class DeliveryOutbox {
          privacy_migration_version = 1, updated_at = @now
        where singleton = 1 and privacy_migration_version < 1`,
      ).run({ now: this.clock().toISOString() });
+    installCodexFrozenCompatibility(this.db);
+    // A held historical cursor cannot cover new captures made while delivery
+    // was disabled. This independent cursor starts at the immutable boundary;
+    // rollback readers ignore it and still use their original migration path.
+    this.db.exec(`create table if not exists upload_new_row_migration (
+      singleton integer primary key check(singleton=1),
+      boundary_rowid integer not null check(boundary_rowid>=0),
+      cursor_rowid integer not null check(cursor_rowid>=boundary_rowid),
+      paused_reason text,
+      last_visited integer not null default 0,
+      last_bytes integer not null default 0,
+      last_enqueued integer not null default 0,
+      last_dead integer not null default 0,
+      last_skipped_uploaded integer not null default 0,
+      updated_at text not null
+    );
+    create trigger if not exists trg_new_row_migration_boundary
+      before update on upload_new_row_migration
+      when new.boundary_rowid is not old.boundary_rowid or new.cursor_rowid<old.cursor_rowid
+      begin select raise(abort,'new_row_migration_boundary_is_immutable'); end;`);
+    const boundary = historicalRawHighWater(this.db);
+    this.db.prepare(`insert or ignore into upload_new_row_migration
+      (singleton,boundary_rowid,cursor_rowid,updated_at) values (1,?,?,?)`)
+      .run(boundary,boundary,this.clock().toISOString());
    }
 
   /** Only dead NULL-lineage receipts ahead of the durable cursor block attestation. */
@@ -1146,6 +1278,9 @@ export class DeliveryOutbox {
    * unresolved; it cannot extend a writer slice or claim false uniqueness.
    */
   backfillLegacyReceiptLineage(options: { maxRows?: number; maxWriterMs?: number } = {}) {
+    const held = historicalRepairHold(this.db);
+    if (held === "historical_receipt_recovery_requires_opt_in")
+      return {visited:0,bound:0,complete:false,held};
     const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? 256), 5_000));
     const maxWriterMs = Math.max(1, Math.min(Math.trunc(options.maxWriterMs ?? 100), 500));
     const deadline = performance.now() + maxWriterMs;
@@ -1392,6 +1527,7 @@ export class DeliveryOutbox {
   }
 
   enqueueRaw(row: RawDeliveryRow) {
+    if (isHistoricalRaw(this.db,row.rawRowid)) return {enqueued:0,dead:0,held:"historical_repair_requires_opt_in" as const};
     if (!this.enabled || row.uploadedAt) return { enqueued: 0, dead: 0 };
     if (row.privacyDisposition) return { enqueued: 0, dead: 0 };
     if (row.usageDuplicateReason) return { enqueued: 0, dead: 0 };
@@ -1427,7 +1563,7 @@ export class DeliveryOutbox {
         dead: this.retireLinkedPrivacyDeliveries(row.rawRowid, row.rawId,
           row.createdAt, row.privacyGeneration, existingReceipt.reason, terminalAt) };
     }
-    const prepared = prepareDelivery(row, this.limits.maxItemBytes,
+    const prepared = prepareDelivery({ ...row, payloadJson: persistedGapPayload(this.db, row) }, this.limits.maxItemBytes,
       deliveryId === ensureUuidEventId(row.rawId).id ? undefined : deliveryId);
     if (prepared.ok === false) {
       const terminalAt = this.clock().toISOString();
@@ -1477,11 +1613,16 @@ export class DeliveryOutbox {
     let nextAttemptAt = now;
     try {
       const event = (JSON.parse(row.payloadJson) as { source?: string; eventType?: string;
-        metadata?: { otelEventName?: string } });
-      if (event.source === "codex" && event.eventType === "assistant_response" &&
-          (event.metadata?.otelEventName === "codex.sse_event" ||
-           event.metadata?.otelEventName === "handle_responses")) {
-        nextAttemptAt = new Date(nowDate.getTime() + 60_000).toISOString();
+        model?: string; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number; metadata?: { otelEventName?: string } });
+      if ((event.source === "codex" || event.source === "claude_code") && (
+          event.source === "codex" && event.eventType === "assistant_response" && (event.metadata?.otelEventName === "codex.sse_event" ||
+            event.metadata?.otelEventName === "handle_responses") ||
+          unresolvedCapture(event as AiInteractionEvent))) {
+        // Repaired/re-enqueued history already waited at capture. Preserve
+        // that elapsed wait, while an injected clock bounds a future stamp.
+        const capturedAt = Math.min(Date.parse(row.createdAt), nowDate.getTime());
+        nextAttemptAt = new Date(Math.max(nowDate.getTime(),
+          (Number.isFinite(capturedAt) ? capturedAt : nowDate.getTime()) + CODEX_MODEL_WAIT_MS)).toISOString();
       }
     } catch {
       // prepareDelivery already validates the payload; this is only a grace
@@ -1542,7 +1683,12 @@ export class DeliveryOutbox {
         suppressed_fields_json as suppressedFieldsJson,repo_hash as repoHash,branch_hash as branchHash,
         workspace_id as workspaceId,device_id as deviceId,privacy_generation as privacyGeneration,
         privacy_disposition as privacyDisposition from buffered_events where id=?`).get(rawId) as RawDeliveryRow|undefined;
-      if (!row || row.uploadedAt || row.privacyDisposition) return false;
+      if (!row || isHistoricalRaw(this.db, row.rawRowid) || row.uploadedAt ||
+          row.privacyDisposition || frozenCodexCapture(this.db,rawId)) return false;
+      if (hasCaptureGapDecision(this.db, {
+        rawRowid: row.rawRowid, rawId: row.rawId, rawCreatedAt: row.createdAt,
+        rawGeneration: row.privacyGeneration,
+      })) return false;
       const outbox = this.db.prepare(`select delivery_id as deliveryId,state,attempt_count as attemptCount,
         sealed_envelope_json as sealedEnvelopeJson from upload_outbox
         where raw_rowid=? and raw_id=? and raw_created_at=?
@@ -1550,6 +1696,17 @@ export class DeliveryOutbox {
         row.rawRowid, row.rawId, row.createdAt, row.privacyGeneration,
       ) as
         { deliveryId: string;state: string;attemptCount: number;sealedEnvelopeJson: string|null }|undefined;
+      if (outbox?.sealedEnvelopeJson) {
+        const reason = captureGapReason(outbox.sealedEnvelopeJson);
+        if (reason) rememberCaptureGap(this.db, rawId, reason);
+      }
+      // A remote terminal replay must not erase the fact that this delivery
+      // was already frozen. Keep restamp conservative even if an old replay
+      // reader rebuilt a pending attempt-zero row.
+      if (this.db.prepare(`select 1 from upload_replays
+        where (delivery_id=? or (raw_id=? and raw_created_at=? and raw_generation is ?))
+        limit 1`).get(outbox?.deliveryId ?? ensureUuidEventId(rawId).id,
+          row.rawId, row.createdAt, row.privacyGeneration)) return false;
       if (outbox && (outbox.attemptCount !== 0 || outbox.sealedEnvelopeJson !== null || outbox.state !== "pending"))
         return false;
       if (this.db.prepare("select 1 from upload_receipts where delivery_id=?").get(ensureUuidEventId(rawId).id))
@@ -1771,6 +1928,12 @@ export class DeliveryOutbox {
             summary.skipped.alreadyAcknowledged += 1;
             continue;
           }
+          // Refuse before superseding terminal custody or predicting a
+          // requeue that enqueueRaw's historical guard cannot perform.
+          if (isHistoricalRaw(this.db, raw.rawRowid)) {
+            summary.skipped.historicalHeld = (summary.skipped.historicalHeld ?? 0) + 1;
+            continue;
+          }
           bytes += raw.rowBytes;
           if (dryRun) {
             summary.requeued += 1;
@@ -1778,6 +1941,22 @@ export class DeliveryOutbox {
           }
           this.supersedeDeadReceipt(candidate.deliveryId, reason, candidate.diedAt, nowIso);
           const outcome = this.enqueueRaw(raw);
+          if (outcome.enqueued > 0) {
+            const lineage = this.db.prepare(`select frozen_envelope_json as frozenEnvelopeJson,
+                frozen_bytes as frozenBytes, frozen_attempt_count as frozenAttemptCount
+              from upload_replays where delivery_id=?`).get(candidate.deliveryId) as {
+                frozenEnvelopeJson: string | null; frozenBytes: number | null;
+                frozenAttemptCount: number | null;
+              } | undefined;
+            const frozenEnvelopeJson = lineage?.frozenEnvelopeJson;
+            if (frozenEnvelopeJson) {
+              const restored = this.restoreReplayEnvelope(candidate.deliveryId, {
+                ...lineage,
+                frozenEnvelopeJson,
+              }, nowIso);
+              if (!restored) throw new Error("replay_frozen_lineage_missing");
+            }
+          }
           if (outcome.enqueued > 0) summary.requeued += 1;
           else if (outcome.dead > 0) summary.skipped.privacyDisposed += 1;
           else summary.skipped.missingRaw += 1;
@@ -1809,6 +1988,10 @@ export class DeliveryOutbox {
         `selected ${candidatesSelected} actionable candidates and re-queued none at ` +
         `--limit ${limit}: narrow the window with --since <ISO-8601> or raise --limit. ` +
         "Already-replayed deliveries are reported as skipped but never consume the limit.";
+    }
+    if (summary.skipped.historicalHeld) {
+      summary.hint = "Historical replay requires separately reviewed opt-in; " +
+        "held historical candidates retain their terminal receipts.";
     }
     return summary;
   }
@@ -1844,6 +2027,51 @@ export class DeliveryOutbox {
       .run({ deliveryId, reason, diedAt, now: nowIso });
   }
 
+  private rememberReplayLineage(input: {
+    deliveryId: string;
+    rawRowid: number | null;
+    rawId: string | null;
+    rawCreatedAt: string | null;
+    rawGeneration: string | null;
+    frozenEnvelopeJson: string;
+    frozenAttemptCount: number;
+    terminalAt: string;
+  }) {
+    const frozenBytes = Buffer.byteLength(input.frozenEnvelopeJson);
+    this.db.prepare(`insert into upload_replays
+      (delivery_id,reason,original_terminal_at,replayed_at,replay_count,
+       raw_rowid,raw_id,raw_created_at,raw_generation,frozen_envelope_json,
+       frozen_bytes,frozen_attempt_count)
+      values (?, 'remote_validation_rejected', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(delivery_id) do update set
+        raw_rowid=coalesce(upload_replays.raw_rowid,excluded.raw_rowid),
+        raw_id=coalesce(upload_replays.raw_id,excluded.raw_id),
+        raw_created_at=coalesce(upload_replays.raw_created_at,excluded.raw_created_at),
+        raw_generation=coalesce(upload_replays.raw_generation,excluded.raw_generation),
+        frozen_envelope_json=coalesce(upload_replays.frozen_envelope_json,excluded.frozen_envelope_json),
+        frozen_bytes=coalesce(upload_replays.frozen_bytes,excluded.frozen_bytes),
+        frozen_attempt_count=coalesce(upload_replays.frozen_attempt_count,excluded.frozen_attempt_count)`).run(
+      input.deliveryId, input.terminalAt, input.terminalAt, input.rawRowid, input.rawId,
+      input.rawCreatedAt, input.rawGeneration, input.frozenEnvelopeJson, frozenBytes,
+      input.frozenAttemptCount,
+    );
+  }
+
+  private restoreReplayEnvelope(
+    deliveryId: string,
+    lineage: { frozenEnvelopeJson: string; frozenBytes: number | null; frozenAttemptCount: number | null },
+    nowIso: string,
+  ) {
+    const bytes = lineage.frozenBytes ?? Buffer.byteLength(lineage.frozenEnvelopeJson);
+    return this.db.prepare(`update upload_outbox set
+      base_envelope_json=?, base_bytes=?, sealed_envelope_json=?, sealed_bytes=?,
+      attempt_count=max(attempt_count,?), state='pending', lease_id=null,
+      lease_expires_at=null, next_attempt_at=?, updated_at=? where delivery_id=?`).run(
+      lineage.frozenEnvelopeJson, bytes, lineage.frozenEnvelopeJson, bytes,
+      lineage.frozenAttemptCount ?? 1, nowIso, nowIso, deliveryId,
+    ).changes === 1;
+  }
+
   fillLinkageForRawRow(rawRowid: number, repoHash: string | null, branchHash: string | null) {
     if (!this.enabled) return 0;
     const fill = () => {
@@ -1876,22 +2104,37 @@ export class DeliveryOutbox {
     return this.db.inTransaction ? fill() : this.db.transaction(fill).immediate();
   }
 
-  migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}) {
-    const receiptBackfill = this.backfillLegacyReceiptLineage({
+  migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}): {
+    visited:number; bytes?:number; enqueued:number; dead:number; skippedUploaded:number;
+    quarantinedEvidence:number; complete:boolean;
+    paused:"pressure" | "slice_budget_too_small" | "receipt_lineage_pending" | HistoricalRepairHold | null;
+    newRows?:{cursorRowid:number;boundaryRowid:number;complete:boolean;
+      paused:"slice_budget_too_small" | "receipt_lineage_pending" | null};
+  } {
+    const held = historicalRepairHold(this.db);
+    // A hold protects history, not post-boundary backlog. Reuse the same
+    // candidate/queue/sealing rules with an independent durable watermark.
+    // Constructor receipt recovery remains held; this path never repairs it.
+    const newRowsOnly = held !== null;
+    const receiptBackfill = newRowsOnly ? {complete:false} : this.backfillLegacyReceiptLineage({
       maxRows: Math.min(options.maxRows ?? 256, 256),
       maxWriterMs: Math.min(options.maxWriterMs ?? 100, 100),
     });
-    if (!this.enabled) return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: null };
+    if (!this.enabled) {
+      if (held) this.db.prepare(`update upload_control set migration_paused_reason=? where singleton=1`).run(held);
+      return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: held };
+    }
     const now = options.now ?? new Date();
     const nowIso = now.toISOString();
     const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? this.limits.migrationBatchRows), 5_000));
     // The daemon bounds each writer turn below the OTLP 750 ms retry window.
     // Start the migration turn's clock after the candidate read: a cold large
     // ledger must not spend the whole writer budget on read-only work.
-    const writerBudgetMs = options.maxWriterMs === undefined
+    const requestedWriterMs = options.maxWriterMs ?? (newRowsOnly ? 100 : undefined);
+    const writerBudgetMs = requestedWriterMs === undefined
       ? undefined
-      : Math.max(1, Math.min(Math.trunc(options.maxWriterMs), 1_000));
-    const lineageDead = this.db.transaction(() =>
+      : Math.max(1, Math.min(Math.trunc(requestedWriterMs), 1_000));
+    const lineageDead = newRowsOnly ? 0 : this.db.transaction(() =>
       this.quarantineUnprovenLineage(Math.min(maxRows, 500), nowIso,
         writerBudgetMs === undefined ? undefined : performance.now() + writerBudgetMs),
     )();
@@ -1906,12 +2149,19 @@ export class DeliveryOutbox {
       return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: "pressure" as const };
     }
 
-    const control = this.db
+    const control: {cursorRowid:number;complete:number;boundaryRowid?:number} = newRowsOnly ? this.db.prepare(`select cursor_rowid as cursorRowid,0 as complete,
+      boundary_rowid as boundaryRowid from upload_new_row_migration where singleton=1`).get() as
+      { cursorRowid: number; complete: number; boundaryRowid: number } : this.db
       .prepare(
         `select migration_cursor_rowid as cursorRowid, migration_complete as complete
          from upload_control where singleton = 1`,
       )
       .get() as { cursorRowid: number; complete: number };
+    if (newRowsOnly && (!Number.isSafeInteger(control.cursorRowid) ||
+        control.cursorRowid < historicalRawHighWater(this.db) ||
+        control.boundaryRowid !== historicalRawHighWater(this.db))) {
+      throw new Error("new_row_migration_boundary_invalid");
+    }
     if (control.complete) {
       return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0,
         quarantinedEvidence: 0, complete: this.receiptLineageComplete(),
@@ -2060,7 +2310,15 @@ export class DeliveryOutbox {
         paused = "receipt_lineage_pending";
       }
       const complete = !writerBudgetExhausted && paused === null &&
-        this.receiptLineageComplete() && rows.length < maxRows && visited === rows.length;
+        (newRowsOnly || this.receiptLineageComplete()) && rows.length < maxRows && visited === rows.length;
+      if (newRowsOnly) {
+        this.db.prepare(`update upload_new_row_migration set cursor_rowid=@cursor,
+          paused_reason=@paused,last_visited=@visited,last_bytes=@bytes,last_enqueued=@enqueued,
+          last_dead=@dead,last_skipped_uploaded=@skippedUploaded,updated_at=@now where singleton=1`)
+          .run({cursor,paused,visited,bytes,enqueued,dead,skippedUploaded,now:nowIso});
+        this.db.prepare(`update upload_control set migration_paused_reason=? where singleton=1`).run(held);
+        return complete;
+      }
       this.db
         .prepare(
           `update upload_control set
@@ -2090,15 +2348,84 @@ export class DeliveryOutbox {
       return complete;
     });
     const complete = run();
+    if (newRowsOnly) return { visited, bytes, enqueued, dead, skippedUploaded, quarantinedEvidence,
+      complete:false,paused:held,
+      newRows:{cursorRowid:cursor,boundaryRowid:historicalRawHighWater(this.db),complete,paused} };
     return { visited, bytes, enqueued, dead, skippedUploaded, quarantinedEvidence, complete, paused };
+  }
+
+  /** Pin the admitted live result before a native reader consumes its
+   * cumulative counters as covered. This neither leases nor uploads, and
+   * leaves next_attempt_at (the 60-second transport hold) unchanged. */
+  freezeSessionCoverage(rawId: string): boolean {
+    const freeze = () => {
+      if (frozenCodexCapture(this.db,rawId)) return true;
+      const raw=this.db.prepare(`select payload_json as payload,uploaded_at as uploadedAt,
+        suppressed_fields_json as suppressed,repo_hash as repo,branch_hash as branch,
+        case when json_valid(payload_json) then json_extract(payload_json, '$.metadata.repoContextPolicyGeneration') end
+          as captureRepoContextPolicyGeneration from buffered_events where id=?`)
+        .get(rawId) as {payload:string;uploadedAt:string|null;suppressed:string;repo:string|null;branch:string|null;
+          captureRepoContextPolicyGeneration:number|null}|undefined;
+      if(!raw)return false;
+      const captured=captureCodexModel(this.db,aiInteractionEventSchema.parse(JSON.parse(raw.payload)),rawId,false,false);
+      if(!codexHasUsage(captured)||isCaptureGap(captured))return false;
+      // Coverage retains qualified old ACK fields directly. Their released
+      // readers discarded the envelope: acknowledge custody, without making
+      // up bytes or a new named witness from the raw diagnostic payload.
+      if(raw.uploadedAt)return captured.metadata.modelCaptureSource==="legacy_native_acknowledged";
+      const row=this.db.prepare(`select delivery_id as deliveryId,base_envelope_json as base,
+        sealed_envelope_json as sealed,repo_hash as repo,branch_hash as branch from upload_outbox
+        where raw_id=? and raw_rowid=(select rowid from buffered_events where id=?)
+          and raw_created_at=(select created_at from buffered_events where id=?)
+          and raw_generation=(select privacy_generation from buffered_events where id=?) limit 1`)
+        .get(rawId,rawId,rawId,rawId) as {deliveryId:string;base:string;sealed:string|null;repo:string|null;branch:string|null}|undefined;
+      if(!row) {
+        // Stateless capture can retain accounting before an outbox exists.
+        // Freeze the same native/privacy-validated envelope its snapshot would
+        // send. An enabled but pending queue, or an older terminal delivery,
+        // cannot acquire fabricated replacement bytes through this fallback.
+        if(this.enabled||this.db.prepare(`select 1 from upload_receipts where raw_id=? or delivery_id=? limit 1`)
+          .get(rawId,rawId))return false;
+        const attribution=new SessionAttributionBatch(this.db,[{event:captured,repoHash:canonicalLinkage(raw.repo)}]);
+        const sealed=sealOutboundEnvelope(attachFillOnlyLinkage({event:captured,suppressedFields:JSON.parse(raw.suppressed)},
+          canonicalLinkage(raw.repo),canonicalLinkage(raw.branch),attribution,new Set(),raw.captureRepoContextPolicyGeneration));
+        if(!sealed.ok)throw new Error("codex_usage_coverage_seal_refused");
+        const bytes=JSON.stringify(sealed.envelope);
+        if(Buffer.byteLength(bytes)>this.limits.maxItemBytes)throw new Error("codex_usage_coverage_item_oversize");
+        rememberFrozenCodexCapture(this.db,rawId,sealed.envelope.event.id,bytes,captured);
+        return true;
+      }
+      if(row.sealed) {
+        const prior=aiWorkIngestEventSchema.parse(JSON.parse(row.sealed));
+        if(isCaptureGap(prior.event))return false;
+        rememberFrozenCodexCapture(this.db,rawId,row.deliveryId,row.sealed,captured);
+        return true;
+      }
+      const base=aiWorkIngestEventSchema.parse(JSON.parse(row.base));
+      const attribution=new SessionAttributionBatch(this.db,[{event:captured,repoHash:canonicalLinkage(row.repo)}]);
+      const sealed=sealOutboundEnvelope(attachFillOnlyLinkage({...base,event:{...captured,id:base.event.id}},
+        canonicalLinkage(row.repo),canonicalLinkage(row.branch),attribution,new Set(),raw.captureRepoContextPolicyGeneration));
+      if(!sealed.ok)throw new Error("codex_usage_coverage_seal_refused");
+      const bytes=JSON.stringify(sealed.envelope);
+      if(Buffer.byteLength(bytes)>this.limits.maxItemBytes)throw new Error("codex_usage_coverage_item_oversize");
+      this.db.prepare(`update upload_outbox set sealed_envelope_json=?,sealed_bytes=?
+        where delivery_id=? and sealed_envelope_json is null`).run(bytes,Buffer.byteLength(bytes),row.deliveryId);
+      rememberFrozenCodexCapture(this.db,rawId,row.deliveryId,bytes,captured);
+      return true;
+    };
+    return this.db.inTransaction?freeze():this.db.transaction(freeze).immediate();
+  }
+
+  reconcileCodexResponse(rawId: string) {
+    const reconcile = () => applyCodexResponseCoverage(this.db,rawId,id => this.freezeSessionCoverage(id));
+    return this.db.inTransaction ? reconcile() : this.db.transaction(reconcile).immediate();
   }
 
   lease(options: { maxRows?: number; maxBytes?: number; now?: Date; leaseId?: string } = {}): DeliveryLease {
     if (!this.enabled) return { leaseId: "", items: [], locallyDead: 0, blockedBy: "none" };
     const now = options.now ?? new Date();
     const nowIso = now.toISOString();
-    const control = this.db
-      .prepare(
+    const control = this.leaseStatement(
         `select circuit_kind as kind, circuit_until as until
          from upload_control where singleton = 1`,
       )
@@ -2117,23 +2444,31 @@ export class DeliveryOutbox {
     let selectedBytes = 0;
 
     const run = this.db.transaction(() => {
-      this.db
-        .prepare(
+      this.leaseStatement(
           `update upload_outbox set state = 'retry', next_attempt_at = @now,
              lease_id = null, lease_expires_at = null, updated_at = @now
            where state = 'in_flight' and lease_expires_at <= @now`,
         )
         .run({ now: nowIso });
-      const candidates = this.db
-        .prepare(
+      const candidates = this.leaseStatement(
           `select delivery_id as deliveryId, raw_rowid as rawRowid,
              raw_id as rawId, raw_created_at as rawCreatedAt,
              raw_generation as rawGeneration,
              base_envelope_json as baseEnvelopeJson,
+             (select payload_json from buffered_events raw
+               where raw.rowid = upload_outbox.raw_rowid and raw.id is upload_outbox.raw_id
+                 and raw.created_at is upload_outbox.raw_created_at
+                 and raw.privacy_generation is upload_outbox.raw_generation) as rawPayloadJson,
              sealed_envelope_json as sealedEnvelopeJson,
              repo_hash as repoHash, branch_hash as branchHash,
              device_id as deviceId,
-             attempt_count as attemptCount
+             attempt_count as attemptCount,
+             (select case when json_valid(e.payload_json) then
+                json_extract(e.payload_json, '$.metadata.repoContextPolicyGeneration') end
+              from buffered_events e where e.rowid = upload_outbox.raw_rowid
+                and e.id is upload_outbox.raw_id and e.created_at is upload_outbox.raw_created_at
+                and e.privacy_generation is upload_outbox.raw_generation)
+               as captureRepoContextPolicyGeneration
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= @now
              and not exists (select 1 from claude_replay_hooks held
@@ -2158,9 +2493,20 @@ export class DeliveryOutbox {
       // Session inheritance is applied here, where envelopes are sealed. Parse
       // every unsealed envelope first so the batch plans one bounded lookup
       // per session instead of one ledger scan per token row.
+      const capturePrepare = (sql: string) => this.leaseStatement(sql);
       const unsealed = new Map<string, AiWorkIngestEvent | null>();
       for (const row of candidates) {
         if (row.sealedEnvelopeJson) continue;
+        if (row.rawId && row.rawPayloadJson && this.reconcileCodexResponse(row.rawId)) {
+          const current = this.leaseStatement(`select base_envelope_json as base,sealed_envelope_json as sealed,
+            (select payload_json from buffered_events raw where raw.rowid=upload_outbox.raw_rowid
+              and raw.id is upload_outbox.raw_id and raw.created_at is upload_outbox.raw_created_at
+              and raw.privacy_generation is upload_outbox.raw_generation) as raw
+              from upload_outbox where delivery_id=?`)
+            .get(row.deliveryId) as {base:string;sealed:string|null;raw:string|null}|undefined;
+          if (!current) continue;
+          row.baseEnvelopeJson=current.base;row.rawPayloadJson=current.raw;row.sealedEnvelopeJson=current.sealed;
+        }
         try {
           unsealed.set(row.deliveryId, aiWorkIngestEventSchema.parse(JSON.parse(row.baseEnvelopeJson)));
         } catch {
@@ -2181,13 +2527,24 @@ export class DeliveryOutbox {
       const disposedRawRowids = new Set<number>();
 
       for (const row of candidates) {
+        if (!this.leaseStatement("select 1 from upload_outbox where delivery_id=?").get(row.deliveryId)) continue;
         const authoritativeReason = this.authoritativePrivacyReason(row);
         if (authoritativeReason === "lineage_unresolved") continue;
         if (authoritativeReason) {
           locallyDead += this.deadActive(row.deliveryId, authoritativeReason, nowIso, disposedRawRowids);
           continue;
         }
-        let envelopeJson = row.sealedEnvelopeJson;
+        const namedWitness = frozenCodexDelivery(this.db,row);
+        let envelopeJson = row.sealedEnvelopeJson ??
+          namedWitness?.envelopeJson;
+        // Only this iteration's freshly validated native Codex result can
+        // reuse its canonical object. Frozen/retry bytes still pass the full
+        // parse and byte-for-byte privacy gate below. No metadata flag can
+        // create this local validation result.
+        let freshNativeEnvelope: AiWorkIngestEvent | undefined;
+        if (!row.sealedEnvelopeJson && envelopeJson) this.leaseStatement(`update upload_outbox set
+          sealed_envelope_json=?,sealed_bytes=?,updated_at=? where delivery_id=? and sealed_envelope_json is null`)
+          .run(envelopeJson,Buffer.byteLength(envelopeJson),nowIso,row.deliveryId);
         if (!envelopeJson) {
           const parsed = unsealed.get(row.deliveryId);
           if (!parsed) {
@@ -2203,6 +2560,31 @@ export class DeliveryOutbox {
             );
             continue;
           }
+          // Sealed base envelopes intentionally omit local capture diagnostics
+          // for rollback readers. Re-read the immutable raw payload here so
+          // turn IDs and nested evidence still participate in capture; only
+          // the resulting outbound event is sealed below.
+          let captureInput = parsed.event;
+          // A retired uncertain delivery is replaced by an explicit gap. Its
+          // raw lineage is retained for diagnostics, but rereading it here
+          // would resurrect the counters under the replacement ID.
+          if (!isCaptureGap(parsed.event) && row.rawPayloadJson) {
+            try {
+              captureInput = aiInteractionEventSchema.parse(JSON.parse(row.rawPayloadJson));
+            } catch {
+              captureInput = parsed.event;
+            }
+          }
+          const captured = isCaptureGap(parsed.event)
+            ? parsed.event
+            : codexHasUsage(captureInput) && !row.rawPayloadJson
+            ? codexModelGap(this.db,captureInput,"capture_row_missing")
+            : captureCodexModel(this.db, captureInput, row.rawId ?? parsed.event.id, true, true, capturePrepare);
+          if (isCaptureGap(parsed.event) && row.rawId) {
+            rememberDeliveryCaptureGap(this.db, row,
+              String(parsed.event.metadata.modelGapReason ?? "legacy_capture_gap"));
+          }
+          parsed.event = { ...captured, id: parsed.event.id };
           const sealed = sealOutboundEnvelope(
             attachFillOnlyLinkage(
               parsed,
@@ -2210,6 +2592,7 @@ export class DeliveryOutbox {
               canonicalLinkage(row.branchHash),
               attribution,
               disposedRawRowids,
+              row.captureRepoContextPolicyGeneration,
             ),
           );
           if (!sealed.ok) {
@@ -2227,22 +2610,31 @@ export class DeliveryOutbox {
             locallyDead += this.deadActive(row.deliveryId, "local_item_oversize", nowIso, disposedRawRowids);
             continue;
           }
-          this.db
-            .prepare(
+          this.leaseStatement(
               `update upload_outbox set sealed_envelope_json = @envelopeJson,
                  sealed_bytes = @envelopeBytes, updated_at = @now
                where delivery_id = @deliveryId and sealed_envelope_json is null`,
             )
             .run({ deliveryId: row.deliveryId, envelopeJson, envelopeBytes, now: nowIso });
+          rememberFrozenCodexCapture(this.db,row.rawId ?? parsed.event.id,row.deliveryId,envelopeJson,captured);
+          if (captured.source === "codex" && captured.model && captured.metadata.modelCaptureSource &&
+              !isCaptureGap(captured) && codexHasUsage(captured)) freshNativeEnvelope = sealed.envelope;
         }
         // Older builds may already have sealed an evidence-marked item. The
         // sealed copy is not trusted merely because it predates this gate.
         let outboundEnvelope: AiWorkIngestEvent;
         try {
-          outboundEnvelope = aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
+          outboundEnvelope = freshNativeEnvelope ?? aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
         } catch {
           locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso, disposedRawRowids);
           continue;
+        }
+        // A gap sealed by an older binary has no r4 decision-table row yet.
+        // Import the accounting decision from the frozen envelope before any
+        // terminal deletion or replay can remove that envelope.
+        if (row.rawId) {
+          const reason = captureGapReason(envelopeJson);
+          if (reason) rememberDeliveryCaptureGap(this.db, row, reason);
         }
         if (outboundEnvelope.event.dataMode === "evidence") {
           locallyDead += this.deadActive(
@@ -2253,9 +2645,91 @@ export class DeliveryOutbox {
           );
           continue;
         }
-        const revalidated = sealOutboundEnvelope(outboundEnvelope);
-        if (!revalidated.ok || JSON.stringify(revalidated.envelope) !== envelopeJson) {
-          locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
+        if (!freshNativeEnvelope) {
+          const revalidated = sealOutboundEnvelope(outboundEnvelope);
+          if (!revalidated.ok || JSON.stringify(revalidated.envelope) !== envelopeJson) {
+            locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
+            continue;
+          }
+        }
+        let sealedOriginGap = false;
+        if (row.sealedEnvelopeJson && codexHasUsage(outboundEnvelope.event)) {
+          if (namedWitness?.envelopeJson === envelopeJson) {
+            // Complete lineage and frozen bytes identify the admitted result,
+            // even if raw retention has since removed its diagnostic row.
+          } else if (!row.rawId || !row.rawPayloadJson) {
+            sealedOriginGap = true;
+          } else {
+            try {
+              const rawLineage = aiInteractionEventSchema.parse(JSON.parse(row.rawPayloadJson));
+              const frozen = frozenCodexCapture(this.db,row.rawId);
+              if (frozen?.deliveryId === row.deliveryId && frozen.envelopeJson === envelopeJson) {
+                // This exact native result was validated when these bytes
+                // froze. Later evidence governs new captures, not this ID.
+              } else if (!hasCaptureGapDecision(this.db, {
+                rawRowid: row.rawRowid!,rawId: row.rawId,
+                rawCreatedAt: row.rawCreatedAt!,rawGeneration: row.rawGeneration,
+              }) && legacyFrozenNativeCapture(rawLineage,outboundEnvelope.event)) {
+                rememberFrozenCodexCapture(this.db,row.rawId,row.deliveryId,envelopeJson,
+                  {...outboundEnvelope.event,metadata:{...outboundEnvelope.event.metadata,modelCaptureSource:"legacy_native_frozen"}});
+              } else if (isCaptureGap(rawLineage)) {
+                rememberCaptureGap(this.db, row.rawId,
+                  String(rawLineage.metadata.modelGapReason ?? "legacy_capture_gap"));
+                sealedOriginGap = true;
+              } else if (codexHasUsage(rawLineage)) {
+                const validated = captureCodexModel(this.db, rawLineage, row.rawId, true, true, capturePrepare);
+                sealedOriginGap = isCaptureGap(validated) ||
+                  typeof validated.model !== "string" || !validated.model.trim() ||
+                  validated.model !== outboundEnvelope.event.model;
+                if (!sealedOriginGap) rememberFrozenCodexCapture(this.db,row.rawId,row.deliveryId,envelopeJson,validated);
+              } else {
+                sealedOriginGap = true;
+              }
+            } catch {
+              sealedOriginGap = true;
+            }
+          }
+        }
+        if (row.sealedEnvelopeJson && sealedOriginGap) {
+          // An old, once-attempted request may already have committed remotely.
+          // Never rewrite its frozen bytes or retry unknown billable usage.
+          // Retire it and send a distinct tokenless gap with the same raw lineage.
+          const owner = this.leaseStatement(`select installation_epoch_id as epoch from buffered_events where
+            rowid=? and id is ? and created_at is ? and privacy_generation is ?`).get(
+              row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration) as {epoch:string|null}|undefined;
+          const prior = {...outboundEnvelope.event,metadata:{...outboundEnvelope.event.metadata,
+            ...(owner?.epoch ? {installationEpochId:owner.epoch} : {})}};
+          let gapId: string | undefined;
+          if (row.rawId && row.rawCreatedAt && row.rawGeneration) for (let attempt=0;attempt<32;attempt++) {
+            const id=incarnationDeliveryId(row.rawId,row.rawCreatedAt,row.rawGeneration,attempt);
+            if (!this.leaseStatement(`select 1 from buffered_events where id=? union all
+              select 1 from upload_outbox where delivery_id=? union all
+              select 1 from upload_receipts where delivery_id=? union all
+              select 1 from upload_replays where delivery_id=? union all
+              select 1 from upload_validation_candidates where delivery_id=? limit 1`).get(id,id,id,id,id)) {gapId=id;break;}
+          }
+          if (!gapId) {
+            locallyDead += this.deadActive(row.deliveryId,"local_model_capture_gap",nowIso,disposedRawRowids);
+            codexModelGap(this.db,prior,"legacy_gap_identity_unavailable");
+            continue;
+          }
+          const gap = sealOutboundEnvelope({...outboundEnvelope,event:{
+            ...codexModelGap(this.db,prior,codexMisfiledUnderClaude(prior) ? "legacy_sealed_source_mismatch" :
+              prior.model ? "legacy_sealed_model_evidence_conflict" : "legacy_sealed_model_missing"),id:gapId}});
+          if (!gap.ok) {
+            locallyDead += this.deadActive(row.deliveryId,"local_schema_invalid",nowIso,disposedRawRowids);
+            continue;
+          }
+          const gapJson=JSON.stringify(gap.envelope),gapBytes=Buffer.byteLength(gapJson);
+          locallyDead += this.deadActive(row.deliveryId,"local_model_capture_gap",nowIso,disposedRawRowids);
+          if (gapBytes <= this.limits.maxItemBytes) this.leaseStatement(`insert or ignore into upload_outbox
+            (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,workspace_id,device_id,
+             base_envelope_json,base_bytes,repo_hash,branch_hash,state,attempt_count,next_attempt_at,
+             last_failure_class,created_at,updated_at)
+            select ?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,'none',?,?
+            where not exists(select 1 from upload_receipts where delivery_id=?)`).run(
+              gapId,row.rawRowid,row.rawId,row.rawCreatedAt,row.rawGeneration,this.workspaceId,row.deviceId,
+              gapJson,gapBytes,row.repoHash,row.branchHash,nowIso,row.rawCreatedAt??nowIso,nowIso,gapId);
           continue;
         }
         const envelopeBytes = Buffer.byteLength(envelopeJson);
@@ -2263,8 +2737,8 @@ export class DeliveryOutbox {
         if (items.length > 0 && selectedBytes + addedBytes > maxBytes) break;
         selectedBytes += addedBytes;
         const attemptCount = row.attemptCount + 1;
-        this.db
-          .prepare(
+        if (row.rawId) rememberCodexSpanEmission(this.db, row.rawId, outboundEnvelope.event);
+        this.leaseStatement(
             `update upload_outbox set state = 'in_flight', attempt_count = @attemptCount,
                lease_id = @leaseId, lease_expires_at = @leaseExpiresAt,
                updated_at = @now
@@ -2290,7 +2764,9 @@ export class DeliveryOutbox {
         });
       }
     });
-    run();
+    const previousStatements = this.leaseStatements;
+    this.leaseStatements = new Map();
+    try { run(); } finally { this.leaseStatements = previousStatements; }
     return { leaseId, items, locallyDead, blockedBy: "none" };
   }
 
@@ -2438,10 +2914,15 @@ export class DeliveryOutbox {
           workspaceId: this.workspaceId,
           deviceId: this.deviceId,
         };
-        const marked = authoritativeReason === "local_usage_duplicate"
+        const historical = isHistoricalRaw(this.db,row.rawRowid);
+        const historicalEligible = historical && this.db.prepare(`select 1 from buffered_events
+          where rowid=@rawRowid and id=@rawId and created_at=@rawCreatedAt
+            and privacy_generation is @rawGeneration and workspace_id is @workspaceId
+            and device_id is @deviceId and ${privacyEligible}`).get(markParams);
+        const marked = historical ? 0 : authoritativeReason === "local_usage_duplicate"
           ? markAcceptedPairedSpan.run(markParams).changes
           : markRaw.run(markParams).changes;
-        if (marked !== 1 && !this.rawRetentionExpired(row)) {
+        if (marked !== 1 && !historicalEligible && !this.rawRetentionExpired(row)) {
           locallyDead += this.deadActive(id, authoritativeReason ?? "local_privacy_violation", terminalAt);
           continue;
         }
@@ -2598,15 +3079,36 @@ export class DeliveryOutbox {
   deadLetterRemote(leaseId: string, ids: string[], at = new Date()) {
     const terminalAt = at.toISOString();
     const get = this.db.prepare(
-      `select attempt_count as attemptCount, created_at as createdAt
+      `select attempt_count as attemptCount, created_at as createdAt,
+              raw_rowid as rawRowid, raw_created_at as rawCreatedAt,
+              raw_generation as rawGeneration,
+              raw_id as rawId, sealed_envelope_json as sealedEnvelopeJson,
+              base_envelope_json as baseEnvelopeJson
        from upload_outbox where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
     );
     const remove = this.db.prepare(`delete from upload_outbox where delivery_id = ? and lease_id = ?`);
     const run = this.db.transaction(() => {
       let dead = 0;
       for (const id of ids) {
-        const row = get.get(id, leaseId) as { attemptCount: number; createdAt: string } | undefined;
+        const row = get.get(id, leaseId) as {
+          attemptCount: number; createdAt: string; rawRowid: number | null;
+          rawCreatedAt: string | null; rawGeneration: string | null; rawId: string | null;
+          sealedEnvelopeJson: string | null; baseEnvelopeJson: string;
+        } | undefined;
         if (!row) continue;
+        const reason = captureGapReason(row.sealedEnvelopeJson) ??
+          captureGapReason(row.baseEnvelopeJson);
+        if (row.rawId && reason) rememberDeliveryCaptureGap(this.db, row, reason);
+        this.rememberReplayLineage({
+          deliveryId: id,
+          rawRowid: row.rawRowid,
+          rawId: row.rawId,
+          rawCreatedAt: row.rawCreatedAt,
+          rawGeneration: row.rawGeneration,
+          frozenEnvelopeJson: row.sealedEnvelopeJson ?? row.baseEnvelopeJson,
+          frozenAttemptCount: row.attemptCount,
+          terminalAt,
+        });
         dead += this.writeReceipt({
           deliveryId: id,
           state: "dead",
@@ -2803,6 +3305,8 @@ export class DeliveryOutbox {
     if (control.pausedReason === "slice_budget_too_small") {
       degradedReasons.push("migration_slice_budget");
     }
+    const historicalHold = historicalRepairHold(this.db);
+    if (historicalHold) degradedReasons.push("historical_repair_hold");
     return {
       enabled: this.enabled,
       degraded: degradedReasons.length > 0,
@@ -2827,7 +3331,7 @@ export class DeliveryOutbox {
       migration: {
         cursorRowid: control.cursorRowid,
         complete: Boolean(control.complete) && receiptLineageComplete,
-        pausedReason: receiptLineageComplete ? control.pausedReason : "receipt_lineage_pending",
+        pausedReason: historicalHold ?? (receiptLineageComplete ? control.pausedReason : "receipt_lineage_pending"),
         progressMode: "bounded_rowid_watermark_no_exact_remaining",
         sliceBudget: {
           rows: this.limits.migrationBatchRows,
@@ -2964,15 +3468,33 @@ export class DeliveryOutbox {
       .prepare(
         `select raw_rowid as rawRowid,raw_id as rawId,
            raw_created_at as rawCreatedAt,raw_generation as rawGeneration,
-           attempt_count as attemptCount,created_at as createdAt
+           attempt_count as attemptCount,created_at as createdAt,
+           base_envelope_json as baseEnvelopeJson,
+           sealed_envelope_json as sealedEnvelopeJson
          from upload_outbox where delivery_id = ?`,
       )
       .get(deliveryId) as
         | { rawRowid: number | null; rawId: string | null;
             rawCreatedAt: string | null; rawGeneration: string | null;
-            attemptCount: number; createdAt: string }
+            attemptCount: number; createdAt: string;
+            baseEnvelopeJson: string; sealedEnvelopeJson: string | null }
         | undefined;
     if (!row) return 0;
+    if (isReplayableReceiptReason(reason)) {
+      this.rememberReplayLineage({
+        deliveryId,
+        rawRowid: row.rawRowid,
+        rawId: row.rawId,
+        rawCreatedAt: row.rawCreatedAt,
+        rawGeneration: row.rawGeneration,
+        frozenEnvelopeJson: row.sealedEnvelopeJson ?? row.baseEnvelopeJson,
+        frozenAttemptCount: row.attemptCount,
+        terminalAt,
+      });
+    }
+    const gapReason = captureGapReason(row.sealedEnvelopeJson) ??
+      captureGapReason(row.baseEnvelopeJson);
+    if (row.rawId && gapReason) rememberDeliveryCaptureGap(this.db, row, gapReason);
     let siblingReceipts = 0;
     if (row.rawRowid !== null && isTerminalPrivacyReason(reason)) {
       const owner = this.db.prepare(`select id from buffered_events
@@ -3006,7 +3528,7 @@ export class DeliveryOutbox {
   private relocateConflictingPrivacyReceipt(lineage: RawLineageSnapshot) {
     if (lineage.rawId === null || lineage.rawCreatedAt === null) return false;
     const run = () => {
-      const receipt = this.db.prepare(`select raw_rowid as rawRowid,
+      const receipt = this.leaseStatement(`select raw_rowid as rawRowid,
         raw_id as rawId,raw_created_at as rawCreatedAt,
         raw_generation as rawGeneration,created_at as createdAt,
         terminal_state as state,reason
@@ -3028,13 +3550,13 @@ export class DeliveryOutbox {
       } else if (receipt.rawRowid === null && receipt.rawId === null &&
           receipt.rawCreatedAt === null && receipt.rawGeneration === null &&
           receipt.createdAt !== lineage.rawCreatedAt) {
-        const current = this.db.prepare(`select rowid as rawRowid,id as rawId,
+        const current = this.leaseStatement(`select rowid as rawRowid,id as rawId,
           created_at as rawCreatedAt,privacy_generation as rawGeneration
           from buffered_events where id=? and created_at=?
             and privacy_disposition=?`).get(
           lineage.rawId, receipt.createdAt, receipt.reason,
         ) as typeof owner;
-        const expired = this.db.prepare(`select raw_rowid as rawRowid,
+        const expired = this.leaseStatement(`select raw_rowid as rawRowid,
           event_id as rawId,raw_created_at as rawCreatedAt,
           raw_generation as rawGeneration from raw_retention_receipts
           where event_id=? and raw_created_at=? limit 2`).all(
@@ -3050,7 +3572,7 @@ export class DeliveryOutbox {
       if (!owner || (owner.rawId === lineage.rawId &&
           owner.rawCreatedAt === lineage.rawCreatedAt &&
           owner.rawGeneration === lineage.rawGeneration)) return false;
-      const occupied = this.db.prepare(`select 1 from buffered_events where id=?
+      const occupied = this.leaseStatement(`select 1 from buffered_events where id=?
         union all select 1 from upload_outbox where delivery_id=?
         union all select 1 from upload_receipts where delivery_id=?
         union all select 1 from upload_replays where delivery_id=?
@@ -3061,7 +3583,7 @@ export class DeliveryOutbox {
           owner.rawCreatedAt, owner.rawGeneration, attempt);
         if (occupied.get(replacement, replacement, replacement, replacement,
           replacement)) continue;
-        return this.db.prepare(`update upload_receipts set delivery_id=?,
+        return this.leaseStatement(`update upload_receipts set delivery_id=?,
           raw_rowid=?,raw_id=?,raw_created_at=?,raw_generation=?
           where delivery_id=? and terminal_state='dead'`).run(
           replacement, owner.rawRowid, owner.rawId, owner.rawCreatedAt,
@@ -3077,7 +3599,7 @@ export class DeliveryOutbox {
     lineage: RawLineageSnapshot,
   ): PrivacyDecision {
     this.relocateConflictingPrivacyReceipt(lineage);
-    const receipt = this.db.prepare(`select terminal_state as state,reason,raw_id as rawId,
+    const receipt = this.leaseStatement(`select terminal_state as state,reason,raw_id as rawId,
       raw_created_at as rawCreatedAt,raw_generation as rawGeneration
       from upload_receipts where delivery_id = ?`).get(lineage.deliveryId) as {
         state: string; reason: DeliveryReceiptReason;
@@ -3096,8 +3618,7 @@ export class DeliveryOutbox {
       return receipt.state === "acknowledged" ? "remote_acknowledged" : receipt.reason;
     }
     if (lineage.rawRowid === null) return "lineage_unresolved";
-    const raw = this.db
-      .prepare(
+    const raw = this.leaseStatement(
         `select id as rawId, created_at as createdAt,
            privacy_generation as privacyGeneration,
            privacy_disposition as privacyDisposition,

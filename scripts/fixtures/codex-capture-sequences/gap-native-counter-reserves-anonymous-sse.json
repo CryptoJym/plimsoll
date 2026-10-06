@@ -1,0 +1,4 @@
+{
+  "finding": "R10-P0-08",
+  "operations": ["rollout-no-turn", "sse-zero-complement-twin", "skew-native-update"]
+}

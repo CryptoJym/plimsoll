@@ -1,4 +1,5 @@
-import { ensureJsonlContinuationStore, readJsonlContinuation, ContinuationAdmission, retireJsonlContinuations } from "./jsonl-continuation";
+import { recordCodexTurnModel } from "./codex-model-capture";
+import { ensureJsonlContinuationStore, readJsonlContinuation, ContinuationAdmission, retireJsonlContinuations, jsonlCursorDigest } from "./jsonl-continuation";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,7 @@ import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
+  REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
   validRepoContextId,
   type RepoContextRequest,
 } from "./repo-context";
@@ -206,6 +208,7 @@ type RolloutParserState = {
   originator?: string;
   cliVersion?: string;
   model?: string;
+  turnId?: string;
   planType?: string;
   previous: TokenTotals;
   tokenCountIndex: number;
@@ -280,12 +283,14 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
       "originator",
       "cliVersion",
       "model",
+      "turnId",
       "planType",
       "previous",
       "tokenCountIndex",
       "counterUncertain",
       "contextOccurrenceIndex",
       "activeRepoContextId",
+      "repoContextPolicyGeneration", // Unreleased r2 input only; stripped on write.
       // Accepted only to migrate old checkpoints without rebuilding or
       // carrying their parser-wide attribution forward.
       "git",
@@ -321,12 +326,19 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
   const cliVersion = optionalString(value.cliVersion);
   const model = optionalString(value.model);
   const planType = optionalString(value.planType);
-  if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType].includes(null)) {
+  const turnId = optionalString(value.turnId);
+  if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType, turnId].includes(null)) {
     return undefined;
   }
+  if (turnId && !/^[A-Za-z0-9._:-]{1,128}$/.test(turnId)) return undefined;
   if (conversationId && !isCodexUuid(conversationId)) return undefined;
   if (value.git !== undefined && !validLegacyPersistedGit(value.git)) return undefined;
   if (value.activeRepoContextId !== undefined && !validRepoContextId(value.activeRepoContextId)) {
+    return undefined;
+  }
+  if (value.repoContextPolicyGeneration !== undefined &&
+      (!Number.isSafeInteger(value.repoContextPolicyGeneration) ||
+        typeof value.repoContextPolicyGeneration !== "number" || value.repoContextPolicyGeneration < 1)) {
     return undefined;
   }
 
@@ -342,6 +354,7 @@ export function validateRolloutParserState(value: unknown): RolloutParserState |
     ...(originator ? { originator } : {}),
     ...(cliVersion ? { cliVersion } : {}),
     ...(model ? { model } : {}),
+    ...(turnId ? { turnId } : {}),
     ...(planType ? { planType } : {}),
     ...(typeof value.activeRepoContextId === "string"
       ? { activeRepoContextId: value.activeRepoContextId }
@@ -381,6 +394,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]) {
   const names = new Set(allowed);
   return Object.keys(value).every((key) => names.has(key));
+}
+
+// turnId is transient parser context (and a read-only migration key for old
+// PR checkpoints). Released 0.7.50/0.7.51 validators reject it on disk.
+function releasedCompatibleParserState(state: RolloutParserState) {
+  const releasedState = { ...state };
+  delete releasedState.turnId;
+  return releasedState;
 }
 
 function baselineObservation(
@@ -1286,6 +1307,8 @@ export class RolloutTailer {
             const initialState = read.reset || !cursor?.parserState
               ? this.initialParserState(candidate.file)
               : structuredClone(cursor.parserState);
+            if (!read.reset && cursor?.parserState)
+              initialState.turnId = this.loadTurnContinuation(candidate.file, initialState.turnId);
             // Git work is deferred until after capture. Validate the open
             // generation immediately before the event/cursor transaction so a
             // changed source never advances durable truth.
@@ -1327,8 +1350,9 @@ export class RolloutTailer {
                   PARSER_KIND,
                   CHECKPOINT_VERSION,
                   read,
-                  initialState,
+                  releasedCompatibleParserState(initialState),
                 );
+                this.rememberTurnContinuation(candidate.file, initialState);
                 return;
               }
               const parseErrorsBefore = result.parseErrors;
@@ -1358,8 +1382,9 @@ export class RolloutTailer {
                 PARSER_KIND,
                 CHECKPOINT_VERSION,
                 read,
-                parserState,
+                releasedCompatibleParserState(parserState),
               );
+              this.rememberTurnContinuation(candidate.file, parserState);
             });
             committed = true;
             if (read.skippedRecord) {
@@ -1764,8 +1789,43 @@ export class RolloutTailer {
     return { files: files.sort(), truncated, errors, discoveryEntries: entriesVisited };
   }
 
-  private sessionHasNonRolloutTokens(sessionId: string) {
-    return this.buffer.sessionUsageAuthority("codex", sessionId) === "live";
+
+  private turnContinuationBinding() {
+    const b = this.buffer.workspaceBinding();
+    return JSON.stringify([b?.currentWorkspaceId ?? null, b?.currentDeviceId ?? null,
+      b?.currentInstallationEpochId ?? null]);
+  }
+
+  private turnContinuationKey(file: string) {
+    return `codex_rollout_turn_v1:${jsonlScanStateKey(this.cursorKey(file))}`;
+  }
+
+  private loadTurnContinuation(file: string, legacyTurnId?: string): string | undefined {
+    // A validated legacy PR checkpoint supplies its own exact turn until the
+    // next cursor commit migrates it. Never infer a turn from a model/time.
+    if (legacyTurnId) return legacyTurnId;
+    const row = this.buffer.database.prepare("select value from maintenance_state where key=?")
+      .get(this.turnContinuationKey(file)) as { value: string } | undefined;
+    if (!row || Buffer.byteLength(row.value) > 1024) return undefined;
+    let value: unknown;
+    try { value = JSON.parse(row.value); } catch { return undefined; }
+    if (!isRecord(value) || !hasOnlyKeys(value,["version","binding","cursor","turnId"]) ||
+        value.version !== 1 || value.binding !== this.turnContinuationBinding() ||
+        value.cursor !== jsonlCursorDigest(this.buffer.database,this.cursorKey(file)) ||
+        !(value.turnId === null || typeof value.turnId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(value.turnId)))
+      return undefined;
+    return value.turnId ?? undefined;
+  }
+
+  private rememberTurnContinuation(file: string, state: RolloutParserState) {
+    // This tolerant, existing key/value store is ignored by released readers.
+    // A released reader's next cursor commit invalidates the exact digest, so
+    // a later upgrade cannot resurrect that reader's unknown active turn.
+    const value = JSON.stringify({version:1,binding:this.turnContinuationBinding(),
+      cursor:jsonlCursorDigest(this.buffer.database,this.cursorKey(file)),turnId:state.turnId ?? null});
+    this.buffer.database.prepare(`insert into maintenance_state(key,value,updated_at) values(?,?,?)
+      on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at`)
+      .run(this.turnContinuationKey(file),value,new Date(this.receivedAtMs).toISOString());
   }
 
   private initialParserState(file: string): RolloutParserState {
@@ -1814,11 +1874,24 @@ export class RolloutTailer {
       observedAt: string | undefined;
       delta: TokenTotals;
       model: string | undefined;
+      turnId: string | undefined;
       repoContext: ActiveContext;
       lineageFirstUnknown?: TokenTotals;
     }> = [];
     const accountHome = this.activeCaptureRoot?.directory ?? this.sessionsDir;
     const planReadings: Array<{ observedAt?: string; window: PlanLimitWindow; planType?: string; limitId?: string }> = [];
+    const capturedEventId = state.conversationId
+      ? deterministicEventId(["codex-rollout", state.conversationId, String(state.tokenCountIndex)]) : undefined;
+    if (!state.activeRepoContextId || !this.buffer.repoContextHasCurrentCapturePolicy(
+      state.activeRepoContextId, capturedEventId ? [capturedEventId] : [],
+    )) {
+      // Preserve the cursor, counters, model and event indices. Only the old
+      // context binding migrates; the saved result and its earlier rows stay.
+      state.activeRepoContextId = this.buffer.repoContextUnknownId("codex", [
+        fileIdentity, "capture-policy", REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
+        state.activeRepoContextId ?? "unknown", state.contextOccurrenceIndex,
+      ].join(":"));
+    }
     let activeRepoContext: ActiveContext = state.activeRepoContextId
       ? { kind: "persisted", contextId: state.activeRepoContextId }
       : undefined;
@@ -1829,7 +1902,6 @@ export class RolloutTailer {
     ): ActiveContext => {
       state.contextOccurrenceIndex += 1;
       state.activeRepoContextId = undefined;
-      if (typeof cwd !== "string") return undefined;
       const occurrence = [
         "codex-rollout",
         fileIdentity,
@@ -1837,8 +1909,10 @@ export class RolloutTailer {
         type,
         String(state.contextOccurrenceIndex),
       ].join(":");
-      const request = this.buffer.repoContextOccurrenceRequest("codex", occurrence, cwd);
-      return request ? { kind: "request", request } : undefined;
+      const request = typeof cwd === "string"
+        ? this.buffer.repoContextOccurrenceRequest("codex", occurrence, cwd) : null;
+      return request ? { kind: "request", request }
+        : { kind: "persisted", contextId: this.buffer.repoContextUnknownId("codex", occurrence) };
     };
 
     for (const line of lines) {
@@ -1865,10 +1939,17 @@ export class RolloutTailer {
         if (typeof payload.originator === "string") state.originator = payload.originator;
         if (typeof payload.cli_version === "string") state.cliVersion = payload.cli_version;
       } else if (type === "turn_context") {
+        // A native turn ID is required to reuse this model for another signal.
+        // A session may switch models; an absent turn never means the prior turn.
+        state.turnId = typeof payload.turn_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(payload.turn_id)
+          ? payload.turn_id : undefined;
+        state.model = undefined;
         if (typeof payload.model === "string" && payload.model) {
           state.model = payload.model;
+          if (state.conversationId && state.turnId) recordCodexTurnModel(this.buffer.database,state.conversationId,state.turnId,state.model,
+            this.accountBindings.keyAt(accountHome,typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,this.accountObservedAtMs) ?? undefined);
           // Codex can report its first token count before turn_context.
-          for (const entry of pending) entry.model ??= state.model;
+          for (const entry of pending) if (entry.turnId && entry.turnId === state.turnId) entry.model ??= state.model;
         }
         activeRepoContext = observeContext("turn_context", payload.cwd);
       } else if (type === "event_msg" && payload.type === "token_count") {
@@ -1897,12 +1978,13 @@ export class RolloutTailer {
         const delta = diff(totals, state.previous);
         state.previous = totals;
         state.counterUncertain = false;
-        if (delta.input === 0 && delta.output === 0) continue; // periodic no-op emission
+        if (delta.input === 0 && delta.output === 0 && delta.cachedInput === 0) continue; // periodic no-op emission
         pending.push({
           index: state.tokenCountIndex,
           observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
           delta,
           model: state.model,
+          turnId: state.turnId,
           repoContext: activeRepoContext,
           ...(lineageFirstUnknown ? { lineageFirstUnknown } : {}),
         });
@@ -1921,15 +2003,6 @@ export class RolloutTailer {
       if (this.planLimits.observe({ source: "codex", accountKey, observedAt,
         window: reading.window, planLimitSource: "codex_rollout", planType: reading.planType,
         planLimitId: reading.limitId, sessionId: state.conversationId })) result.eventsAppended += 1;
-    }
-
-    const sessionCovered = state.conversationId
-      ? this.sessionHasNonRolloutTokens(state.conversationId)
-      : false;
-    if (sessionCovered) {
-      if (pending.length > 0) result.sessionsSkippedOtlpCovered += 1;
-      if (activeRepoContext?.kind === "request") state.activeRepoContextId = undefined;
-      return state;
     }
 
     // Only contexts that can affect a token or the next slice consume bounded
@@ -2005,6 +2078,7 @@ export class RolloutTailer {
           this.accountAttributionEnabled()),
         usageSource: "rollout",
         turnIndex: entry.index,
+        ...(entry.turnId ? { codexTurnId: entry.turnId } : {}),
         ...(accountKey ? { "user.account_id": accountKey } : {}),
       };
       if (state.originator) metadata.originator = state.originator;

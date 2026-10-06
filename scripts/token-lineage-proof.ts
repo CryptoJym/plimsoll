@@ -23,6 +23,7 @@ import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
+import { REPO_CONTEXT_CAPTURE_POLICY_GENERATION } from "../packages/collector-cli/src/repo-context";
 import { sealOutboundEvent } from "../packages/collector-cli/src/outbound-envelope";
 import { admittedMetadataAttributes, aiInteractionEventSchema } from "../packages/shared/src/index";
 
@@ -133,7 +134,7 @@ async function main() {
     const [first, second, third] = rows;
     // Raw observation preserved; validated columns zero; never priced even if
     // the model had been known (here it is unknown, matching the incident).
-    assert.deepEqual(metadata(first), {
+    const expectedObservedMetadata = {
       usageSource: "rollout",
       turnIndex: 0,
       planType: "pro",
@@ -142,7 +143,19 @@ async function main() {
       sourceCumulativeCachedInput: 953284608,
       sourceCumulativeOutput: 2008151,
       sourceCumulativeReasoningOutput: 1500000,
+    };
+    assert.deepEqual(metadata(first), { ...expectedObservedMetadata,
+      repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION });
+    // The local receipt changes neither sealed contents nor omission receipts.
+    const capturedFirst = aiInteractionEventSchema.parse(JSON.parse(first!.payloadJson));
+    const sealedFirst = sealOutboundEvent(capturedFirst);
+    assert.ok(sealedFirst.ok);
+    assert.deepEqual(sealedFirst.event.metadata, {
+      usageSource: "rollout", turnIndex: 0, planType: "pro",
     });
+    assert.equal(JSON.stringify(sealedFirst), JSON.stringify(sealOutboundEvent({
+      ...capturedFirst, metadata: expectedObservedMetadata,
+    })));
     assert.deepEqual(
       {
         inputTokens: first!.inputTokens,
