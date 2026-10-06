@@ -860,6 +860,9 @@ jobs:
       - name: Prove complete native contradictions veto every fresh promotion
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-veto
+      - name: Prove growing Codex rollout capture survives released reader downgrade
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-rollout-downgrade
       - name: Prove legacy metadata fails closed and unrelated native traces do not lose usage
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-capture-legacy-density

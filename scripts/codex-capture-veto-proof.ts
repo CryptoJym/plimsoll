@@ -7,7 +7,7 @@ import {captureCodexModel,isCaptureGap,recordCodexTurnModel} from '../packages/c
 import {aiInteractionEventSchema,type AiInteractionEvent} from '../packages/shared/src/index';
 import {createProofCompletion} from './lib/proof-completion';
 
-const completion=createProofCompletion('codex-capture-veto',171);
+const completion=createProofCompletion('codex-capture-veto',225);
 const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'codex-capture-veto-')));
 const AT=Date.now()-300_000, A='sha256:0123456789abcdef',B='sha256:fedcba9876543210';
 const MODEL='gpt-6-sol',OTHER='gpt-5.5',SESSION='22222222-2222-4222-8222-222222222222';
@@ -122,6 +122,58 @@ try{
     f.append(make(2,{[key]:'source',model:MODEL,otelEventName:'codex.sse_event'},{model:MODEL}));
     f.deliver(f.append(make(1,{})),true);
    });
+ // The independent r15 review's exact 24-cell shape: a selected SSE has a
+ // typed identity which the trace-free target lacks. The hour-old, counterless
+ // contradiction is outside its trace. Trace and typed links must BOTH veto.
+ for(const traced of [false,true])for(const identity of ['request_id','call_id','codexTurnId'] as const)
+  for(const conflict of ['model','account'] as const)for(const noise of [0,129])
+   cell(`source-${traced?'traced':'trace-free'}/${identity}/${conflict}/${noise}`,noise,f=>{
+    const model=conflict==='model'?OTHER:MODEL;
+    f.append(make(3,{[identity]:'physical-source',model},{model,eventType:'tool_result',
+     actorId:conflict==='account'?B:A,inputTokens:undefined,outputTokens:undefined,
+     observedAt:new Date(AT-3_600_000).toISOString()}));
+    f.append(make(2,{[identity]:'physical-source',model:MODEL,otelEventName:'codex.sse_event',
+     ...(traced?{traceId:f.trace}:{})},{model:MODEL}));
+    f.deliver(f.append(make(1,{})),true);
+   });
+ // Apply the same cumulative rule when the traced SSE is the target itself.
+ for(const identity of ['request_id','call_id','codexTurnId'] as const)
+  for(const conflict of ['model','account'] as const)for(const noise of [0,129])
+   cell(`traced-native-target/${identity}/${conflict}/${noise}`,noise,f=>{
+    const model=conflict==='model'?OTHER:MODEL;
+    f.append(make(3,{[identity]:'physical-target',model},{model,eventType:'tool_result',
+     actorId:conflict==='account'?B:A,inputTokens:undefined,outputTokens:undefined,
+     observedAt:new Date(AT-3_600_000).toISOString()}));
+    f.deliver(f.append(make(1,{traceId:f.trace,[identity]:'physical-target',model:MODEL,
+     otelEventName:'codex.sse_event'},{model:MODEL})),true);
+   });
+ for(const identity of ['request_id','call_id','codexTurnId'] as const)for(const noise of [0,129])
+  cell(`traced-native-target-clean/${identity}/${noise}`,noise,f=>{
+   f.append(make(3,{[identity]:'physical-target',model:MODEL},{model:MODEL,eventType:'tool_result',
+    inputTokens:undefined,outputTokens:undefined,observedAt:new Date(AT-3_600_000).toISOString()}));
+   f.deliver(f.append(make(1,{traceId:f.trace,[identity]:'physical-target',model:MODEL,
+    otelEventName:'codex.sse_event'},{model:MODEL})),false);
+  });
+ // A saved span's request/call and native-turn context remain provenance
+ // dependencies even when its mutable rollout owner lacks those aliases.
+ for(const identity of ['request_id','call_id'] as const)for(const conflict of ['model','account'] as const)
+  for(const noise of [0,129])cell(`saved-span-linked/${identity}/${conflict}/${noise}`,noise,f=>{
+   recordCodexTurnModel(f.b.database,SESSION,'T',MODEL,A);
+   const span=f.append(make(1,{traceId:f.trace,codexTurnId:'T',[identity]:'saved-source',otelEventName:'handle_responses'}));
+   const rollout=f.append(make(2,{usageSource:'rollout',codexTurnId:'T'},{eventType:'usage_rollout',model:MODEL}));
+   assert.ok(f.b.database.prepare('select 1 from codex_span_rollout_pairs where span_id=?').get(span.id));
+   const model=conflict==='model'?OTHER:MODEL;
+   f.append(make(3,{[identity]:'saved-source',model},{model,eventType:'tool_result',actorId:conflict==='account'?B:A,
+    inputTokens:undefined,outputTokens:undefined,observedAt:new Date(AT-3_600_000).toISOString()}));
+   const captured=f.capture(span);assert.equal(isCaptureGap(captured),true);assert.equal(captured.model,undefined);
+   f.deliver(rollout,true);
+  });
+ for(const noise of [0,129])for(const conflict of ['model','account'] as const)
+  cell(`traced-source-native-turn-table/${conflict}/${noise}`,noise,f=>{
+   recordCodexTurnModel(f.b.database,SESSION,'source',conflict==='model'?OTHER:MODEL,conflict==='account'?B:A);
+   f.append(make(2,{traceId:f.trace,codexTurnId:'source',model:MODEL,otelEventName:'codex.sse_event'},{model:MODEL}));
+   f.deliver(f.append(make(1,{})),true);
+  });
  // The exact persisted-legacy A/B/A counterexample: real lineage first, original
  // producer bytes restored together, no paid capture/coverage witness injected.
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
@@ -198,6 +250,6 @@ try{
   f.append(make(3,{traceId:f.trace,model:OTHER},{eventType:'tool_result',model:OTHER,inputTokens:undefined,outputTokens:undefined}));
   const c=f.capture(target);assert.equal(c.model,MODEL);assert.equal(c.inputTokens,19);assert.equal(c.outputTokens,2);f.frozenUnchanged(frozen);
  });
- assert.equal(executed,171,'every declared matrix cell executes');
+ assert.equal(executed,225,'every declared matrix cell executes');
  console.log(JSON.stringify({executed,failed:failures.length,failures}));completion.complete();
 }finally{fs.rmSync(root,{recursive:true,force:true});}

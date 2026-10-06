@@ -663,6 +663,7 @@ export function captureCodexModel(
     and e.device_id is ? and e.installation_epoch_id is ? and ${eligible}`;
   const nativeScopeArgs = [rawId,row.workspace,row.device,row.epoch];
   const vetoTraces = new Set<string>(traceId ? [traceId] : []);
+  let pairedSpan: Peer | undefined;
   // A mutable saved rollout owner also depends on its exact span's trace.
   // Follow only the saved span incarnation, never a reused ID or another
   // workspace/device/install. That trace remains a veto after pairing.
@@ -674,6 +675,7 @@ export function captureCodexModel(
     if (spanRow) {
       const span = decodePeers([spanRow])[0];
       if (span) {
+        pairedSpan = span;
         const reason = veto(span,"trace");
         if (reason) return gap(reason);
         const spanTrace = text(span.event.metadata.traceId);
@@ -699,8 +701,8 @@ export function captureCodexModel(
   // Request and call namespaces stay distinct. A native turn is local to
   // its conversation. Co-present aliases expand the exact linked component;
   // a counterless/gap/ACK row remains a fact, never a promotable witness.
-  // Trace-bearing requests use their complete trace, plus their own native
-  // turn context; an unrelated trace-free account cannot rename that trace.
+  // Trace, typed links and native turn context are cumulative veto sources.
+  // A trace never makes an otherwise linked native contradiction irrelevant.
   const checkLinkedFacts = (seed: AiInteractionEvent): string | undefined => {
     const seedSession = trustedSession(seed);
     const pending: ReturnType<typeof codexResponseIdentities> = [];
@@ -737,8 +739,12 @@ export function captureCodexModel(
     }
     return reasonFound;
   };
-  if (!traceId) vetoReason = checkLinkedFacts(event);
+  vetoReason = checkLinkedFacts(event);
   if (vetoReason) return gap(vetoReason);
+  if (pairedSpan) {
+    vetoReason = checkLinkedFacts(pairedSpan.event);
+    if (vetoReason) return gap(vetoReason);
+  }
   const nativeSession = trustedSession(event);
   type TurnName = { model: string; account: string | null; accounts: number };
   const boundary = row;
@@ -780,6 +786,10 @@ export function captureCodexModel(
   };
   const targetLocalFacts = checkLocalFacts(event);
   if (targetLocalFacts.reason) return gap(targetLocalFacts.reason);
+  if (pairedSpan) {
+    const spanLocalFacts = checkLocalFacts(pairedSpan.event);
+    if (spanLocalFacts.reason) return gap(spanLocalFacts.reason);
+  }
   const nativeTurnNames = targetLocalFacts.names;
   if (responsePair && vetoModel && responsePair.model !== vetoModel)
     return gap("conflicting_pair_target_model");
@@ -903,8 +913,10 @@ export function captureCodexModel(
         if (reason) break;
       }
       vetoTraces.add(sourceTrace);
-    } else if (!sourceTrace) reason = checkLinkedFacts(source.event);
+    }
     if (reason) return gap(reason); // every SQLite iterator has closed.
+    reason = checkLinkedFacts(source.event);
+    if (reason) return gap(reason);
     const local = checkLocalFacts(source.event);
     if (local.reason) return gap(local.reason);
   }
