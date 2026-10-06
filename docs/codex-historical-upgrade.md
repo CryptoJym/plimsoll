@@ -21,6 +21,8 @@ Delivery status exposes `historical_receipt_recovery_requires_opt_in` or
 `historical_migration_requires_opt_in`, with `historical_repair_hold` degradation.
 Existing queue work and new captures can continue; a repeated historical raw ID
 does not authorize new delivery repair.
+Explicit replay also holds archived candidates before changing terminal receipts.
+Its dry run reports historicalHeld instead of promising a forbidden requeue.
 
 There is no automatic or environment-variable override. A historical repair
 apply command requires separate review, an explicit opt-in and a dry run that

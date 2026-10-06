@@ -14,9 +14,10 @@ import { createProofCompletion } from "./lib/proof-completion";
 
 const redAdditions = process.argv.includes("--red-additions");
 const redRestamp = process.argv.includes("--red-restamp");
+const redReplay = process.argv.includes("--red-replay");
 const selected = new Set(["reviewer-native-old-observation-and-ACK-owner", "historical-pending-native-ACK-does-not-restamp-raw",
   "late-new-SSE-preserves-historical-span", "released-0747-boundary-holds-through-restart"]);
-const completion = createProofCompletion("codex-historical-immutability", redRestamp ? 1 : redAdditions ? 4 : 9);
+const completion = createProofCompletion("codex-historical-immutability", redReplay ? 1 : redRestamp ? 1 : redAdditions ? 4 : 10);
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "historical-immutability-"));
 const AT = Date.now() - 600_000;
 const NOW = Date.now() + 121_001;
@@ -77,6 +78,7 @@ async function main() {
   const outcomes: Array<{ name: string; passed: boolean; error?: string }> = [];
   try {
     async function check(name: string, body: (file: string) => Promise<void>) {
+        if (redReplay && name !== "historical-replay-preserves-terminal-custody") return;
         if (redRestamp && name !== "historical-restamp-preserves-raw-and-envelope") return;
         if (redAdditions && !selected.has(name)) return;
         try { await body(path.join(root, name + ".sqlite")); outcomes.push({ name, passed: true }); }
@@ -183,6 +185,39 @@ async function main() {
           const lease = b.delivery.lease({ now: new Date(NOW + 121_001) }); assert.equal(lease.items.length, 1);
           assert.equal(lease.items[0].envelope.event.model, "gpt-6.1-sol"); assert.equal(lease.items[0].envelope.event.inputTokens, 19);
         } finally { b.close(); }
+      });
+      await check("historical-replay-preserves-terminal-custody", async file => {
+        const terminal = (b:any,id:string) => {
+          b.database.prepare(`delete from upload_outbox where delivery_id=?`).run(id);
+          b.database.prepare(`insert into upload_receipts(delivery_id,terminal_state,reason,status_class,
+            attempt_count,created_at,terminal_at,raw_rowid,raw_id,raw_created_at,raw_generation)
+            select id,'dead','remote_validation_rejected','remote_validation',1,created_at,created_at,
+              rowid,id,created_at,privacy_generation from buffered_events where id=?`).run(id);
+        };
+        let b:any=new old.Buffer(file,{...seedOptions,delivery:{...seedOptions.delivery,enabled:true}});
+        let before:string,receipts:string,replays:string;
+        try{assert.equal(b.append(sse(1,19,2)),true);terminal(b,uuid(1));completeMigration(b);
+          before=snapshot(b);receipts=JSON.stringify(b.database.prepare("select * from upload_receipts").all());
+          replays=JSON.stringify(b.database.prepare("select * from upload_replays").all());}
+        finally{b.close();}
+        b=open(file);try{
+          for(const dryRun of [true,false]){
+            const replay=b.delivery.replayDeadLetters({reason:"remote_validation_rejected",dryRun});
+            assert.equal(replay.requeued,0,"a historical dry run cannot promise a forbidden repair");
+            assert.equal(replay.skipped.historicalHeld,1);
+            assert.equal(snapshot(b),before!);assert.equal(count(b,"upload_outbox"),0);
+            assert.equal(JSON.stringify(b.database.prepare("select * from upload_receipts").all()),receipts!);
+            assert.equal(JSON.stringify(b.database.prepare("select * from upload_replays").all()),replays!);
+          }
+          // An old held candidate must not change a genuinely new replay's model/counters.
+          assert.equal(b.append(sse(100,23,3,"new-replay-response")),true);terminal(b,uuid(100));
+          const fresh=b.delivery.replayDeadLetters({reason:"remote_validation_rejected"});
+          assert.equal(fresh.requeued,1);assert.equal(fresh.skipped.historicalHeld,1);
+          const lease=b.delivery.lease({now:new Date(NOW+121_001)});assert.equal(lease.items.length,1);
+          assert.equal(lease.items[0].envelope.event.model,"gpt-6.1-sol");
+          assert.equal(lease.items[0].envelope.event.inputTokens,23);assert.equal(lease.items[0].envelope.event.outputTokens,3);
+          assert.equal(JSON.stringify(b.database.prepare("select rowid as raw_rowid,* from buffered_events where id=?").all(uuid(1))),before!);
+        }finally{b.close();}
       });
       await check("historical-restamp-preserves-raw-and-envelope", async file => {
         let b:any=new old.Buffer(file,{...seedOptions,delivery:{...seedOptions.delivery,enabled:true}});let before:string,queue:string;

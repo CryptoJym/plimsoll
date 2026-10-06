@@ -103,6 +103,8 @@ export type DeliveryReplaySummary = {
     alreadyAcknowledged: number;
     missingRaw: number;
     privacyDisposed: number;
+    /** Present only when an archived incarnation requires reviewed opt-in. */
+    historicalHeld?: number;
   };
   dryRun: boolean;
   /** Set only when a full `--limit` of candidates re-queued nothing, so an
@@ -1903,6 +1905,12 @@ export class DeliveryOutbox {
             summary.skipped.alreadyAcknowledged += 1;
             continue;
           }
+          // Refuse before superseding terminal custody or predicting a
+          // requeue that enqueueRaw's historical guard cannot perform.
+          if (isHistoricalRaw(this.db, raw.rawRowid)) {
+            summary.skipped.historicalHeld = (summary.skipped.historicalHeld ?? 0) + 1;
+            continue;
+          }
           bytes += raw.rowBytes;
           if (dryRun) {
             summary.requeued += 1;
@@ -1957,6 +1965,10 @@ export class DeliveryOutbox {
         `selected ${candidatesSelected} actionable candidates and re-queued none at ` +
         `--limit ${limit}: narrow the window with --since <ISO-8601> or raise --limit. ` +
         "Already-replayed deliveries are reported as skipped but never consume the limit.";
+    }
+    if (summary.skipped.historicalHeld) {
+      summary.hint = "Historical replay requires separately reviewed opt-in; " +
+        "held historical candidates retain their terminal receipts.";
     }
     return summary;
   }
