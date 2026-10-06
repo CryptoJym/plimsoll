@@ -706,7 +706,7 @@ async function main() {
         return span();
       },
       null,
-      "ambiguous_trace_model",
+      "conflicting_pair_target_model",
     );
     await run(
       "two-model-pair",

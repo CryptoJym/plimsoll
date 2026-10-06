@@ -879,6 +879,11 @@ export function captureCodexModel(
   // before selecting promotable witnesses, just as the trace tier does.
   if (pairFacts.some((p) => nativeModel(p.event) === undefined || conflicts(p)))
     return gap("conflicting_pair_model_evidence");
+  const pair = pairFacts.filter(mayPromote);
+  const pairModels = unique(pair, (e) => nativeModel(e));
+  if (pairModels.length > 1) return gap("ambiguous_pair_model");
+  if (vetoModel && pairModels.length === 1 && pairModels[0] !== vetoModel)
+    return gap("conflicting_pair_target_model");
   // A trace-free target can select a traced SSE, or one with request/turn
   // identities absent from the target. Those identities must not conceal a
   // contradiction that would refuse the witness's own fresh capture. Read
@@ -903,11 +908,6 @@ export function captureCodexModel(
     const local = checkLocalFacts(source.event);
     if (local.reason) return gap(local.reason);
   }
-  const pair = pairFacts.filter(mayPromote);
-  const pairModels = unique(pair, (e) => nativeModel(e));
-  if (pairModels.length > 1) return gap("ambiguous_pair_model");
-  if (vetoModel && pairModels.length === 1 && pairModels[0] !== vetoModel)
-    return gap("conflicting_pair_target_model");
   const competingSpans = peers.filter(
     (p) =>
       p.event.metadata.otelEventName === "handle_responses" &&
