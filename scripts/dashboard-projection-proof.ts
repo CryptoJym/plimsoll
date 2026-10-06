@@ -1655,7 +1655,7 @@ async function main() {
         liveIntervalStart:new Date(Date.parse(liveEnd)-1000).toISOString(),liveIntervalEnd:liveEnd,
         liveTotalTokens:48,liveReasoningOutputTokens:0,sourceEventId:"projection-runtime-1",
         logicalSourceEventId:"projection-runtime-1",captureRootId:"projection-runtime",captureProfileId:"projection-profile",
-        installationEpochId:buffer.workspaceBinding().currentInstallationEpochId!,sourcePayloadDigest:"a".repeat(64)}});
+        installationEpochId:buffer.workspaceBinding()!.currentInstallationEpochId!,sourcePayloadDigest:"a".repeat(64)}});
     check("live_observer_fixture_is_a_valid_native_interval",readLiveUsageEventObservation(liveObserver)!==null);
     check("live_observer_fixture_does_not_invent_request_model",liveObserver.model===undefined &&
       liveObserver.metadata.model===undefined && liveObserver.metadata.traceId===undefined);

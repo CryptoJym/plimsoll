@@ -67,7 +67,7 @@ try{
  // All twelve reviewer wire cells, expanded to session and retained-state contradictions.
  for(const noise of [0,129])for(const kind of ['generic','span'] as const)
   for(const conflict of ['model','account','session','none'] as const)
-   for(const state of (conflict==='none'?['counterless']:['counterless','distant','gap','acked']) as const){
+   for(const state of (conflict==='none'?['counterless'] as const:['counterless','distant','gap','acked'] as const)){
     cell(`wire/${kind}/${conflict}/${state}/${noise}`,noise,f=>{
      let frozen:ReturnType<Fixture['freezeFact']>|undefined;
      if(conflict!=='none'){
@@ -127,7 +127,7 @@ try{
  for(const noise of [0,129])cell(`linked-legacy-request-A-B-A/${noise}`,noise,f=>{
   const events=[MODEL,OTHER,MODEL].map((model,n)=>make(n+1,{otelEventName:'codex.sse_event',model,request_id:'one-physical-request'},{model}));
   for(const e of events){f.append(make(Number(e.id.slice(-12)),{}, {eventType:e.eventType,inputTokens:undefined,outputTokens:undefined}));
-   const raw={...e,metadata:{...e.metadata,installationEpochId:f.b.workspaceBinding().currentInstallationEpochId}};
+   const raw={...e,metadata:{...e.metadata,installationEpochId:f.b.workspaceBinding()!.currentInstallationEpochId}};
    f.b.database.prepare('update buffered_events set payload_json=?,model=?,input_tokens=?,output_tokens=? where id=?')
     .run(JSON.stringify(raw),e.model,19,2,e.id);}
   f.deliver(events[0]!,true);
