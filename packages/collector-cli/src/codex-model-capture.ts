@@ -681,17 +681,20 @@ export function captureCodexModel(
       }
     }
   }
-  for (const vetoTrace of vetoTraces) for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
+  let vetoReason: string | undefined;
+  traceVeto: for (const vetoTrace of vetoTraces) for (const candidate of prepare(`${selectEvidence} where ${nativeScope}
     and case when json_valid(e.payload_json) then json_extract(e.payload_json,'$.metadata.traceId') end=?`)
     .iterate(...nativeScopeArgs,vetoTrace) as Iterable<EvidenceRow>) {
     const p = decodePeers([candidate])[0];
     if (!p) continue;
     const reason = veto(p,"trace");
-    if (reason) return gap(reason);
+    if (reason) { vetoReason = reason; break traceVeto; }
     if (vetoTrace !== traceId) continue; // veto-only partner facts never promote.
     if (tracePeers.length < MAX_EVIDENCE_ROWS + 1) tracePeers.push(p);
     else traceOverflow = true;
   }
+  // Close the SQLite iterator before persisting a capture-gap decision.
+  if (vetoReason) return gap(vetoReason);
   if (tracePeers.length > MAX_EVIDENCE_ROWS) traceOverflow = true;
   // Request and call namespaces stay distinct. A native turn is local to
   // its conversation. Co-present aliases expand the exact linked component;
@@ -712,7 +715,7 @@ export function captureCodexModel(
       return true;
     };
     if (!enqueue(event)) return gap("linked_identity_overflow");
-    for (let index = 0; index < pending.length; index++) {
+    linkedVeto: for (let index = 0; index < pending.length; index++) {
       const node = pending[index]!;
       const aliases = node.kind === "request" ? ["request_id"] : node.kind === "call" ? ["call_id"] :
         ["codexTurnId","turn.id","turn_id"];
@@ -726,11 +729,12 @@ export function captureCodexModel(
         const p = decodePeers([candidate])[0];
         if (!p) continue;
         const reason = veto(p,"linked");
-        if (reason) return gap(reason);
-        if (!enqueue(p.event)) return gap("linked_identity_overflow");
+        if (reason) { vetoReason = reason; break linkedVeto; }
+        if (!enqueue(p.event)) { vetoReason = "linked_identity_overflow"; break linkedVeto; }
       }
     }
   }
+  if (vetoReason) return gap(vetoReason);
   const nativeSession = trustedSession(event);
   if (nativeSession && turn) {
     for (const candidate of prepare(`${selectEvidence} where ${nativeScope} and e.session_id=?
@@ -743,9 +747,10 @@ export function captureCodexModel(
       const p = decodePeers([candidate])[0];
       if (!p) continue;
       const reason = veto(p,"local");
-      if (reason) return gap(reason);
+      if (reason) { vetoReason = reason; break; }
     }
   }
+  if (vetoReason) return gap(vetoReason);
   let nativeTurnNames: Array<{ model: string; account: string | null; accounts: number }> = [];
   if (nativeSession && turn && prepare(
     "select 1 from sqlite_master where type='table' and name='codex_turn_model_evidence'",
