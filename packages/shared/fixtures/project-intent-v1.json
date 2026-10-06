@@ -5,22 +5,22 @@
     "receiptId": "24000000-0000-4000-8000-000000000001",
     "installId": "24000000-0000-4000-8000-000000000002",
     "source": "codex",
-    "sourceRootKey": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-    "accountKey": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "sourceRootKey": "sha256:8c46a54821f957c60b472658ee0de09b286556293c76150210dc36ce6c971aaa",
+    "accountKey": "sha256:0f2a83d7322bce30f199a5852f6bae85303fa593b1ab0a19be028d7f8ffc9727",
     "sessionId": "24000000-0000-4000-8000-000000000003",
-    "nativeSessionKey": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-    "sessionEpochKey": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "nativeSessionKey": "sha256:864cfc49b31ee0de16068def156dd810d454e47860ebeee7afba34ea631b1614",
+    "sessionEpochKey": "sha256:e9d1c39a2c629156d42e1ff4e96d6f0f505250168eaf107fe88e625ffe58cd32",
     "rootAttemptId": "24000000-0000-4000-8000-000000000004",
     "attemptId": "24000000-0000-4000-8000-000000000004",
     "parentAttemptId": null,
-    "workItemKey": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
-    "projectKey": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "workItemKey": "sha256:01ecdfe26b61389d19089f66be79b84d7f9ce1a533f3923a931af5e08da75adb",
+    "projectKey": "sha256:3e867b783a8b606a0725d6879a683ce851c2ffb3f4bdde1c0e795a7c0fc74c4a",
     "projectRegistryRevision": 1,
-    "observedRepoKey": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "observedRepoKey": "sha256:9a421f8aa3ad32da7bb79bcb71208922932035b00400202cf95d44bbaaf6a508",
     "effectiveFrom": "2026-10-06T18:00:00.000Z",
     "effectiveUntil": null,
     "basis": "routed_launch",
-    "evidenceRef": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "evidenceRef": "sha256:e4d8f66dd84dd892f10ce0079bfb2a552d77c931f1cd8b2916b3cbae85ffaf0f",
     "adapterId": "routed-launch",
     "adapterVersion": "1.0.0"
   },
@@ -29,7 +29,8 @@
       "name": "resume",
       "patch": {
         "receiptId": "24000000-0000-4000-8000-000000000005",
-        "effectiveFrom": "2026-10-06T19:00:00.000Z"
+        "effectiveFrom": "2026-10-06T19:00:00.000Z",
+        "evidenceRef": "sha256:44b97d1efe0eea32181b7c1a82b5b9915a651f4cb94c335e2784b2afedf29dc1"
       },
       "expected": "accepted"
     },
@@ -40,8 +41,9 @@
         "effectiveFrom": "2026-10-06T19:00:00.000Z",
         "attemptId": "24000000-0000-4000-8000-000000000007",
         "parentAttemptId": "24000000-0000-4000-8000-000000000004",
-        "accountKey": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
-        "sourceRootKey": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+        "accountKey": "sha256:444c2bb7121339a73656dfad4cb55c2549a3cda5ae59f5a0d23c6ba571794e23",
+        "sourceRootKey": "sha256:9f278a36c917fe040a0e432851de83d3332f7dfea93dba82ad18477df8fe0c0e",
+        "evidenceRef": "sha256:c1a1a73b42e6a88f97519351aa1616eed72e92d8817b6267fab959e49d2c325d"
       },
       "expected": "accepted"
     },
@@ -49,8 +51,9 @@
       "name": "reused_native_id",
       "patch": {
         "receiptId": "24000000-0000-4000-8000-000000000008",
-        "sessionEpochKey": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
-        "effectiveFrom": "2026-10-06T19:00:00.000Z"
+        "sessionEpochKey": "sha256:223d61b2dcbcaa747a24e34757350be5cc1ec7202b1e93be1ca280ef60f318db",
+        "effectiveFrom": "2026-10-06T19:00:00.000Z",
+        "evidenceRef": "sha256:129144f9adc2aef71ef0c3e795ae2554f00ca068c23221affbbb416eee5b23f5"
       },
       "expected": "session_identity_conflict"
     },
@@ -59,7 +62,8 @@
       "patch": {
         "receiptId": "24000000-0000-4000-8000-000000000009",
         "projectKey": null,
-        "projectRegistryRevision": null
+        "projectRegistryRevision": null,
+        "evidenceRef": "sha256:80194e28d286dda2f992c51afc1d0b54abda633504183bd98e93484dd647d0a3"
       },
       "expected": "unknown"
     },
@@ -72,16 +76,104 @@
         "projectKey": null,
         "projectRegistryRevision": null,
         "effectiveFrom": "2026-10-06T19:00:00.000Z",
-        "observedRepoKey": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        "observedRepoKey": "sha256:54964f347fe610e90b3fad8c242cef238a60bd5d03e7ff5b0df528d2036c94fd",
+        "evidenceRef": "sha256:5ec4dd89a0a4605be4b70aca5922d495e95ba38a9eb291d662d272518a132725"
       },
       "expected": "preserve_explicit_intent"
     },
     {
       "name": "unsupported_adapter",
       "patch": {
-        "adapterVersion": "99.0.0"
+        "adapterVersion": "99.0.0",
+        "evidenceRef": "sha256:d7d81de5d15951e34f3f67af0754a38f461dcb63760489aee113866217e2bb54"
       },
       "expected": "unsupported_adapter"
     }
-  ]
+  ],
+  "registeredProjects": [
+    {
+      "projectKey": "sha256:3e867b783a8b606a0725d6879a683ce851c2ffb3f4bdde1c0e795a7c0fc74c4a",
+      "company": "Client company",
+      "projectLabel": "Client work"
+    },
+    {
+      "projectKey": "sha256:7f4f15bed0d092bbd2902d46a57771528306f44cc5644a8b2eb9e970b8872fd9",
+      "company": "Served company",
+      "projectLabel": "Company overhead"
+    }
+  ],
+  "derivationVectors": {
+    "sourceRootKey": {
+      "kind": "source-root",
+      "normalizedParts": [
+        "24000000-0000-4000-8000-000000000002",
+        "codex",
+        "/Users/fixture/.codex"
+      ],
+      "expected": "sha256:8c46a54821f957c60b472658ee0de09b286556293c76150210dc36ce6c971aaa"
+    },
+    "accountKey": {
+      "kind": "account",
+      "normalizedParts": [
+        "codex",
+        "openai",
+        "acct_p02_demo"
+      ],
+      "expected": "sha256:0f2a83d7322bce30f199a5852f6bae85303fa593b1ab0a19be028d7f8ffc9727"
+    },
+    "nativeSessionKey": {
+      "kind": "native-session",
+      "normalizedParts": [
+        "24000000-0000-4000-8000-000000000002",
+        "codex",
+        "24000000-0000-4000-8000-000000000003"
+      ],
+      "expected": "sha256:864cfc49b31ee0de16068def156dd810d454e47860ebeee7afba34ea631b1614"
+    },
+    "sessionEpochKey": {
+      "kind": "session-epoch",
+      "normalizedParts": [
+        "24000000-0000-4000-8000-000000000002",
+        "codex",
+        "sha256:864cfc49b31ee0de16068def156dd810d454e47860ebeee7afba34ea631b1614",
+        "24000000-0000-4000-8000-000000000020"
+      ],
+      "expected": "sha256:e9d1c39a2c629156d42e1ff4e96d6f0f505250168eaf107fe88e625ffe58cd32"
+    },
+    "workItemKey": {
+      "kind": "work-item",
+      "normalizedParts": [
+        "beads",
+        "eco-6hoxj",
+        "eco-6hoxj.165.240"
+      ],
+      "expected": "sha256:01ecdfe26b61389d19089f66be79b84d7f9ce1a533f3923a931af5e08da75adb"
+    },
+    "evidenceRef": {
+      "kind": "evidence",
+      "normalizedParts": [
+        "24000000-0000-4000-8000-000000000001",
+        "24000000-0000-4000-8000-000000000002",
+        "codex",
+        "sha256:8c46a54821f957c60b472658ee0de09b286556293c76150210dc36ce6c971aaa",
+        "sha256:0f2a83d7322bce30f199a5852f6bae85303fa593b1ab0a19be028d7f8ffc9727",
+        "24000000-0000-4000-8000-000000000003",
+        "sha256:864cfc49b31ee0de16068def156dd810d454e47860ebeee7afba34ea631b1614",
+        "sha256:e9d1c39a2c629156d42e1ff4e96d6f0f505250168eaf107fe88e625ffe58cd32",
+        "24000000-0000-4000-8000-000000000004",
+        "24000000-0000-4000-8000-000000000004",
+        null,
+        "sha256:01ecdfe26b61389d19089f66be79b84d7f9ce1a533f3923a931af5e08da75adb",
+        "sha256:3e867b783a8b606a0725d6879a683ce851c2ffb3f4bdde1c0e795a7c0fc74c4a",
+        1,
+        "sha256:9a421f8aa3ad32da7bb79bcb71208922932035b00400202cf95d44bbaaf6a508",
+        "2026-10-06T18:00:00.000Z",
+        null,
+        "routed_launch",
+        "routed-launch",
+        "1.0.0"
+      ],
+      "expected": "sha256:e4d8f66dd84dd892f10ce0079bfb2a552d77c931f1cd8b2916b3cbae85ffaf0f"
+    }
+  }
 }

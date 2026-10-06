@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
@@ -9,6 +10,25 @@ const fixture = JSON.parse(readFileSync(new URL("../../packages/shared/fixtures/
 const base = projectIntentReceiptSchema.parse(fixture.baseReceipt);
 const receipt = (name: string) => projectIntentReceiptSchema.parse({
   ...fixture.baseReceipt, ...fixture.cases.find((item: { name: string }) => item.name === name).patch,
+});
+
+test("v1 identity derivation domains and evidence digests match every golden receipt", () => {
+  const digest = (kind: string, parts: unknown[]) =>
+    `sha256:${createHash("sha256").update(`plimsoll:project-intent:v1:${kind}\0${JSON.stringify(parts)}`, "utf8").digest("hex")}`;
+  const vectors = fixture.derivationVectors as Record<string, { kind: string; normalizedParts: unknown[]; expected: string }>;
+  assert.deepEqual(Object.keys(vectors), ["sourceRootKey", "accountKey", "nativeSessionKey", "sessionEpochKey", "workItemKey", "evidenceRef"]);
+  for (const [field, vector] of Object.entries(vectors)) {
+    assert.equal(digest(vector.kind, vector.normalizedParts), vector.expected, field);
+    assert.equal(fixture.baseReceipt[field], vector.expected, field);
+    assert.notEqual(digest("different-domain", vector.normalizedParts), vector.expected, field);
+  }
+  const evidenceFields = ["receiptId", "installId", "source", "sourceRootKey", "accountKey", "sessionId",
+    "nativeSessionKey", "sessionEpochKey", "rootAttemptId", "attemptId", "parentAttemptId", "workItemKey",
+    "projectKey", "projectRegistryRevision", "observedRepoKey", "effectiveFrom", "effectiveUntil",
+    "basis", "adapterId", "adapterVersion"] as const;
+  const rows = [base, ...fixture.cases.map((item: { name: string }) => receipt(item.name))];
+  for (const row of rows)
+    assert.equal(row.evidenceRef, digest("evidence", evidenceFields.map(field => row[field])), row.receiptId);
 });
 
 test("v1 golden receipts preserve resume and explicit attempt lineage across account rotation", () => {
