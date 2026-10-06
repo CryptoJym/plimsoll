@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.52 — 2026-10-06 (unpublished)
 
 - Stop filesystem git linkage at the running user's resolved home folder and
   system root, including their backed worktrees. Migrate only resumed capture

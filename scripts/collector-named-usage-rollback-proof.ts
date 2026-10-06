@@ -282,29 +282,29 @@ async function main() {
     completion.check("scanner-head-reader-preserves-exact-sealed-usage-and-gap");
 
     // Each reader waits 121 seconds: the preceding 120-second lease is expired.
-    const released050 = await leaseWithReader(old050, "0.7.50", baseMs + 303_000, false);
-    assert.notEqual(released050.leaseId, current.leaseId);
+    const released051 = await leaseWithReader(old051, "0.7.51", baseMs + 303_000, false);
+    assert.notEqual(released051.leaseId, current.leaseId);
+    assert.deepEqual(released051.itemIds.sort(), [gapId, namedId].sort());
+    const after051 = new Database(ledgerPath, { readonly: true });
+    try { assert.deepEqual(readSealed(after051), sealedBefore); } finally { after051.close(); }
+    completion.check("rollback-reader-0.7.51-preserves-usage-after-lease-expiry");
+
+    const released050 = await leaseWithReader(old050, "0.7.50", baseMs + 424_000, false);
+    assert.notEqual(released050.leaseId, released051.leaseId);
     assert.deepEqual(released050.itemIds.sort(), [gapId, namedId].sort());
     const after050 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after050), sealedBefore); } finally { after050.close(); }
     completion.check("rollback-reader-0.7.50-preserves-usage-after-lease-expiry");
 
-    const stock = await leaseWithReader(old049, "0.7.49", baseMs + 424_000, false);
+    const stock = await leaseWithReader(old049, "0.7.49", baseMs + 545_000, false);
     assert.notEqual(stock.leaseId, released050.leaseId);
     assert.deepEqual(stock.itemIds.sort(), [gapId, namedId].sort());
     const after049 = new Database(ledgerPath, { readonly: true });
     try { assert.deepEqual(readSealed(after049), sealedBefore); } finally { after049.close(); }
     completion.check("rollback-reader-0.7.49-preserves-usage-after-lease-expiry");
 
-    const released051 = await leaseWithReader(old051, "0.7.51", baseMs + 545_000, false);
-    assert.notEqual(released051.leaseId, stock.leaseId);
-    assert.deepEqual(released051.itemIds.sort(), [gapId, namedId].sort());
-    const after051 = new Database(ledgerPath, { readonly: true });
-    try { assert.deepEqual(readSealed(after051), sealedBefore); } finally { after051.close(); }
-    completion.check("rollback-reader-0.7.51-preserves-usage-after-lease-expiry");
-
     const first = await leaseWithReader(old048, "0.7.48", baseMs + 666_000, false);
-    assert.notEqual(first.leaseId, released051.leaseId);
+    assert.notEqual(first.leaseId, stock.leaseId);
     assert.deepEqual(first.itemIds.sort(), [gapId, namedId].sort());
     completion.check("rollback-reader-0.7.48-preserves-usage");
 
@@ -420,7 +420,7 @@ async function main() {
     console.log(JSON.stringify({
       proof: "collector-named-usage-rollback",
       writerCommit,
-      readers: [`scanner-head-${currentVersion}`, "released-0.7.50", "stock-0.7.49", "released-0.7.51", "main-0.7.48", "0.7.47"],
+      readers: [`scanner-head-${currentVersion}`, "released-0.7.51", "released-0.7.50", "stock-0.7.49", "main-0.7.48", "0.7.47"],
       readerLeaseOffsetsMs: [182_000, 303_000, 424_000, 545_000, 666_000, 787_000],
       released050Commit,
       released051Commit,
