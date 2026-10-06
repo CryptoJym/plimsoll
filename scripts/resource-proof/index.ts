@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertDashboardRss, runOwnedDashboardScenario } from "./dashboard-resources";
+import { SYSTEM_E2E_BUDGETS } from "../system-e2e/contract";
 
 import {
   createResourceSandbox,
@@ -21,7 +23,6 @@ import {
   runPortReservationContract,
   runDuplicateStartSingleOwnerContract,
   runPoisonContinuationContract,
-  runDashboardProjectionBudgetContract,
   runIntegratedCaptureProjectionOutboxContract,
   runMaintenanceRegressionContract,
   runMetadataPrivacySentinelsContract,
@@ -53,6 +54,8 @@ Usage:
 
 Options:
   --receipt <path>       Write the JSON receipt to a caller-selected path.
+  --dashboard-rss-receipt <path> Write owned dashboard RSS measurements separately.
+  --dashboard-resources-only Run only the owned dashboard measurement.
   --run-existing-proof   Run scripts/signal-fidelity-proof.ts in the isolated environment.
   --require-integrated   Exit non-zero while any required scenario is fail/not_wired/skipped.
   --help                 Show this help.
@@ -711,13 +714,17 @@ async function main() {
     return;
   }
   const receiptPath = optionValue("--receipt");
+  const dashboardRssReceiptPath = optionValue("--dashboard-rss-receipt");
   if (process.argv.includes("--receipt") && !receiptPath) {
     throw new Error("--receipt requires a path");
+  }
+  if (process.argv.includes("--dashboard-rss-receipt") && !dashboardRssReceiptPath) {
+    throw new Error("--dashboard-rss-receipt requires a path");
   }
   const requireIntegrated = process.argv.includes("--require-integrated");
   const runExistingProof = process.argv.includes("--run-existing-proof");
   const operatorHome = os.homedir();
-  if (receiptPath) {
+  for (const selectedPath of [receiptPath, dashboardRssReceiptPath].filter((value): value is string => Boolean(value))) {
     const liveCollectorHome = path.join(
       operatorHome,
       "Library",
@@ -725,10 +732,10 @@ async function main() {
       "Plimsoll",
     );
     if (
-      within(liveCollectorHome, receiptPath) ||
+      within(liveCollectorHome, selectedPath) ||
       within(
         normalizeStableTemporaryRoot(liveCollectorHome),
-        normalizeStableTemporaryRoot(receiptPath),
+        normalizeStableTemporaryRoot(selectedPath),
       )
     ) {
       throw new Error("--receipt must not point inside the operator's live Plimsoll directory");
@@ -736,8 +743,21 @@ async function main() {
   }
   const sandbox = await createResourceSandbox();
   const scenarios: ScenarioReceipt[] = [];
+  const dashboard = async () => {
+    const result = await runOwnedDashboardScenario(sandbox, process.argv.includes("--negative-control-rss"));
+    if (dashboardRssReceiptPath) writeResourceReceiptAtomically(dashboardRssReceiptPath, `${JSON.stringify(result.resources, null, 2)}\n`);
+    console.error(JSON.stringify({ phase: "idle_dashboard_resources", budgetBytes: SYSTEM_E2E_BUDGETS.maxRssBytes, ...result.resources }));
+    assertDashboardRss(result.resources);
+    return result;
+  };
 
   try {
+    if (process.argv.includes("--dashboard-resources-only")) {
+      const result = await dashboard();
+      if (result.scenario.status !== "pass") throw new Error(result.scenario.detail);
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
     scenarios.push(runIsolationContract(sandbox, operatorHome));
     const portScenario = await runPortReservationContract(sandbox);
     scenarios.push(portScenario);
@@ -752,7 +772,7 @@ async function main() {
     scenarios.push(runBoundedCodexReconciliationContract(sandbox));
     scenarios.push(await runDuplicateStartSingleOwnerContract(sandbox));
     scenarios.push(await runPoisonContinuationContract(sandbox));
-    scenarios.push(await runDashboardProjectionBudgetContract(sandbox));
+    scenarios.push((await dashboard()).scenario);
     scenarios.push(runIntegratedCaptureProjectionOutboxContract(sandbox, operatorHome));
     scenarios.push(runMetadataPrivacySentinelsContract(sandbox, operatorHome));
     scenarios.push(runLearningFactPrivacyAndResourceContract(sandbox, operatorHome));

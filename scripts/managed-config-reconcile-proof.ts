@@ -1378,6 +1378,49 @@ function pruneChecks(fixtureRoot: string) {
  * ~0.6 s on a full-churn run. The daemon's tick now yields between targets, so
  * the longest chunk it can owe the loop is one target.
  */
+/** CPU spent between check-phase turns, excluding scheduler and disk wait. */
+async function measureReconcileChunks<T>(run: () => T | Promise<T>) {
+  const chunks: Array<{ cpuMs: number; wallMs: number }> = [];
+  let previousCpu = process.cpuUsage();
+  let previousTime = process.hrtime.bigint();
+  let yields = 0;
+  const sample = () => {
+    const usage = process.cpuUsage(previousCpu);
+    const now = process.hrtime.bigint();
+    chunks.push({ cpuMs: (usage.user + usage.system) / 1_000, wallMs: Number(now - previousTime) / 1e6 });
+    previousCpu = process.cpuUsage();
+    previousTime = now;
+  };
+  let sampler = setImmediate(function turn() {
+    sample();
+    yields += 1;
+    sampler = setImmediate(turn);
+  });
+  try {
+    const result = await run();
+    sample(); // Include synchronous setup and the final receipt/prune chunk.
+    return {
+      result,
+      yields,
+      longestChunkCpuMs: Math.max(...chunks.map((chunk) => chunk.cpuMs)),
+      longestChunkMs: Math.max(...chunks.map((chunk) => chunk.wallMs)),
+    };
+  } finally {
+    clearImmediate(sampler);
+  }
+}
+
+const LONGEST_CHUNK_BUDGET_MS = 100;
+function withinReconcileChunkBudget(
+  measured: { yields: number; longestChunkCpuMs: number },
+  targetCount: number,
+  synchronousCpuMs: number,
+) {
+  return measured.yields >= targetCount + 1 && synchronousCpuMs > 0 &&
+    measured.longestChunkCpuMs < LONGEST_CHUNK_BUDGET_MS &&
+    measured.longestChunkCpuMs < synchronousCpuMs / 2;
+}
+
 async function eventLoopBoundChecks(fixtureRoot: string) {
   const home = path.join(fixtureRoot, "scale-home");
   const collectorHome = path.join(fixtureRoot, "scale-plimsoll-home");
@@ -1429,6 +1472,7 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
   // The synchronous full-churn run: what the daemon used to do in one chunk.
   seed();
   const syncStart = process.hrtime.bigint();
+  const syncCpuStart = process.cpuUsage();
   const syncRun = runManagedConfigReconcile({
     collectorHome,
     targets: targets(),
@@ -1436,36 +1480,26 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
     prune: { minBackupAgeMs: 0 },
   });
   const syncMs = Number(process.hrtime.bigint() - syncStart) / 1e6;
+  const syncCpu = process.cpuUsage(syncCpuStart);
+  const syncCpuMs = (syncCpu.user + syncCpu.system) / 1_000;
 
-  // The same work through the daemon's async entrypoint, with a loop-lag
-  // sampler measuring the longest stretch the event loop was actually held.
+  // A delayed timer counts time when this process was descheduled or waiting
+  // on disk as an event-loop hold. CPU between setImmediate turns measures
+  // this tick's own work, and the same-run synchronous tick calibrates it.
   seed();
-  let longestChunkMs = 0;
-  let samples = 0;
-  const SAMPLE_MS = 4;
-  let previous = process.hrtime.bigint();
-  const sampler = setInterval(() => {
-    const nowNs = process.hrtime.bigint();
-    const heldMs = Number(nowNs - previous) / 1e6 - SAMPLE_MS;
-    previous = nowNs;
-    samples += 1;
-    if (heldMs > longestChunkMs) longestChunkMs = heldMs;
-  }, SAMPLE_MS);
   const asyncStart = process.hrtime.bigint();
-  const asyncRun = await runManagedConfigReconcileAsync({
+  const runOptions = {
     collectorHome,
     targets: targets(),
     toolOptions,
     prune: { minBackupAgeMs: 0 },
-  });
+  };
+  const measured = await measureReconcileChunks(() =>
+    process.argv.includes("--negative-control-event-loop")
+      ? runManagedConfigReconcile(runOptions)
+      : runManagedConfigReconcileAsync(runOptions));
+  const asyncRun = measured.result;
   const asyncMs = Number(process.hrtime.bigint() - asyncStart) / 1e6;
-  clearInterval(sampler);
-
-  // review r3, N1: a 4 ms setInterval sampler on a cold CI runner measured
-  // 51.9 ms once against a 50 ms max. The product invariant is per-target
-  // yield, not a 50 ms wall-clock ceiling; 100 ms still fails a tick that
-  // stopped yielding (fleet-scale sync is several hundred ms).
-  const LONGEST_CHUNK_BUDGET_MS = 100;
   check(
     "the_fleet_scale_fixture_is_the_reviewers_twenty_eight_targets",
     targetCount === SEATS + PROFILES + 2 && readback.targets.length === targetCount,
@@ -1474,19 +1508,28 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
   check(
     "the_async_tick_never_holds_the_event_loop_for_more_than_the_chunk_budget_on_a_full_churn_run",
     asyncRun.applied === targetCount &&
-      samples > 0 &&
-      longestChunkMs < LONGEST_CHUNK_BUDGET_MS,
+      withinReconcileChunkBudget(measured, targetCount, syncCpuMs),
     {
       targets: targetCount,
       applied: asyncRun.applied,
-      longestChunkMs: Number(longestChunkMs.toFixed(1)),
+      longestChunkMs: Number(measured.longestChunkMs.toFixed(1)),
+      longestChunkCpuMs: Number(measured.longestChunkCpuMs.toFixed(1)),
       budgetMs: LONGEST_CHUNK_BUDGET_MS,
-      samples,
+      synchronousCpuMs: Number(syncCpuMs.toFixed(1)),
+      samples: measured.yields,
       syncRunMs: Number(syncMs.toFixed(1)),
       asyncRunMs: Number(asyncMs.toFixed(1)),
       driftReadbackMs: Number(readbackMs.toFixed(1)),
     },
   );
+  seed();
+  const nonYielding = await measureReconcileChunks(() => runManagedConfigReconcile({
+    ...runOptions, targets: targets(),
+  }));
+  check("the_chunk_measurement_rejects_a_deliberately_non_yielding_full_churn_tick",
+    nonYielding.result.applied === targetCount &&
+      !withinReconcileChunkBudget(nonYielding, targetCount, syncCpuMs),
+    { yields: nonYielding.yields, longestChunkCpuMs: nonYielding.longestChunkCpuMs, synchronousCpuMs: syncCpuMs });
   check(
     "the_async_tick_reconciles_exactly_what_the_synchronous_run_reconciles",
     syncRun.applied === asyncRun.applied &&
@@ -1501,7 +1544,9 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
     driftReadbackMs: Number(readbackMs.toFixed(1)),
     syncRunMs: Number(syncMs.toFixed(1)),
     asyncRunMs: Number(asyncMs.toFixed(1)),
-    longestChunkMs: Number(longestChunkMs.toFixed(1)),
+    longestChunkMs: Number(measured.longestChunkMs.toFixed(1)),
+    longestChunkCpuMs: Number(measured.longestChunkCpuMs.toFixed(1)),
+    synchronousCpuMs: Number(syncCpuMs.toFixed(1)),
   };
 }
 
@@ -1591,6 +1636,11 @@ async function main() {
     home: path.join(fixtureRoot, "must-remain-absent-operator-home"),
   });
   try {
+    if (process.argv.includes("--event-loop-only")) {
+      const scale = await eventLoopBoundChecks(fixture.root);
+      console.log(JSON.stringify({ ok: true, scale, checks }, null, 2));
+      return;
+    }
     commandChecks(fixture.root);
     concurrentWriterChecks(fixture.root);
     applyRaceChecks(fixture.root);

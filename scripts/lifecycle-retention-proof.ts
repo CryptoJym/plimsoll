@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-retention", 74);
+const completion = createProofCompletion("lifecycle-retention", 75);
 /**
  * eco-6hoxj.163.30: lifecycle update snapshots are bounded and cheap.
  *
@@ -73,7 +73,40 @@ const LEDGER_SENTINEL = `ledger-content-sentinel-${randomBytes(6).toString("hex"
 const CONFIG_SENTINEL = `config-secret-sentinel-${randomBytes(6).toString("hex")}`;
 const FIXTURE_PARENT = process.env.TMPDIR || "/private/var/tmp";
 fs.mkdirSync(FIXTURE_PARENT, { recursive: true });
-const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(FIXTURE_PARENT, "plimsoll-retention-")));
+const IMAGE_ROOT = fs.realpathSync(fs.mkdtempSync(path.join(FIXTURE_PARENT, "plimsoll-retention-")));
+const ROOT = path.join(IMAGE_ROOT, "volume");
+fs.mkdirSync(ROOT, { mode: 0o700 });
+
+/** Only this proof writes the APFS container whose free blocks we measure. */
+function attachPrivateProofVolume() {
+  if (process.platform !== "darwin") throw new Error("clone consumption proof requires APFS on macOS");
+  const image = path.join(IMAGE_ROOT, "fixture.sparseimage");
+  for (const args of [
+    ["create", "-size", "8g", "-type", "SPARSE", "-fs", "APFS", "-volname", "PlimsollProof", "-nospotlight", "-quiet", image],
+    ["attach", "-nobrowse", "-noautoopen", "-owners", "on", "-mountpoint", ROOT, "-quiet", image],
+  ]) {
+    const result = spawnSync("/usr/bin/hdiutil", args, { encoding: "utf8", timeout: 60_000 });
+    if (result.status !== 0 || result.error) {
+      throw new Error(`private APFS proof volume ${args[0]} failed: ${result.error?.message ?? result.stderr}`);
+    }
+  }
+  if (fs.statSync(ROOT).dev === fs.statSync(IMAGE_ROOT).dev) {
+    throw new Error("clone measurement is not on its private mounted volume");
+  }
+}
+
+function detachPrivateProofVolume() {
+  if (fs.statSync(ROOT).dev !== fs.statSync(IMAGE_ROOT).dev) {
+    const result = spawnSync("/usr/bin/hdiutil", ["detach", ROOT, "-quiet"], {
+      encoding: "utf8", timeout: 60_000,
+    });
+    if (result.status !== 0 || result.error) {
+      // Retain the backing image if detach fails; never unlink a mounted image.
+      throw new Error(`private APFS proof volume detach failed: ${result.error?.message ?? result.stderr}`);
+    }
+  }
+  fs.rmSync(IMAGE_ROOT, { recursive: true, force: true });
+}
 
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const freeBytes = (directory: string) => {
@@ -343,7 +376,7 @@ function probeFromOtherProcess(ledger: string) {
   return result.stdout.trim();
 }
 
-/** Measures the volume's free bytes consumed by each snapshot the inner adapter takes. */
+/** Measures free blocks on the proof's dedicated APFS container, never the host volume. */
 function measuring(inner: LifecycleDatabaseAdapter, samples: Array<{ method: string | null; consumed: number }>): LifecycleDatabaseAdapter {
   return {
     async snapshot(input) {
@@ -424,6 +457,7 @@ function valueBlind(text: string) {
 
 async function main() {
   try {
+    attachPrivateProofVolume();
     // ---- N+3 sequential updates through the production composition --------
     const primary = createHome("primary", 288);
     const ledgerBytes = primary.ledgerBytes();
@@ -502,6 +536,17 @@ async function main() {
     const cloneWithProbe = (source: string, destination: string) => {
       lockSamples.push(probeFromOtherProcess(source));
       const cloned = cloneFileOrFail(source, destination);
+      if (cloned !== false && process.argv.includes("--negative-control-clone")) {
+        // Deliberately replace a real clone with an independent byte copy,
+        // retaining its method evidence so the consumption guard must catch it.
+        fs.rmSync(destination);
+        // Copy in another process: closing another source descriptor in this
+        // process would release SQLite's POSIX locks before the lock probe.
+        const copied = spawnSync(process.execPath, ["-e",
+          "require('node:fs').copyFileSync(process.argv[1],process.argv[2])", source, destination],
+        { encoding: "utf8", timeout: 60_000 });
+        if (copied.status !== 0 || copied.error) throw new Error("full-copy negative control failed to create its fixture");
+      }
       lockSamples.push(probeFromOtherProcess(source));
       if (cloned !== false) {
         const physical = physicalCloneOffsets(source, destination);
@@ -521,6 +566,18 @@ async function main() {
     check("measured_clone_snapshot_consumes_under_a_quarter_of_the_ledger",
       probedSamples.length === 1 && probedSamples[0]!.method === "clone" && probedSamples[0]!.consumed < ledgerBytes * 0.25,
       { probedSamples, ledgerBytes });
+    const controlCopy = path.join(ROOT, "full-copy-negative-control");
+    const beforeCopy = freeBytes(ROOT);
+    let fullCopyConsumed: number;
+    try {
+      // No COPYFILE_FICLONE flag: copy every byte into independent blocks.
+      fs.copyFileSync(primary.ledger, controlCopy);
+      fullCopyConsumed = beforeCopy - freeBytes(ROOT);
+      check("clone_consumption_measurement_rejects_a_full_copy",
+        !(fullCopyConsumed < ledgerBytes * 0.25), { fullCopyConsumed, ledgerBytes });
+    } finally {
+      fs.rmSync(controlCopy, { force: true });
+    }
     check("clone_snapshot_shares_physical_extents_with_its_source",
       u6.snapshot?.method === "clone" && physicalSamples.length === 1 && physicalSamples[0]!.shared === true,
       { physicalSamples });
@@ -1064,6 +1121,8 @@ syncBuiltinESMExports();
       passed: checks.filter((row) => row.passed).length,
       failed: checks.filter((row) => !row.passed).map((row) => row.name),
       measurements: {
+        consumptionVolume: "private-apfs-sparse-image",
+        fullCopyNegativeControlBytes: fullCopyConsumed,
         ledgerBytes,
         freeBytesConsumedByCloneUpdates: freeConsumedByUpdate,
         freeBytesConsumedByMeasuredCloneSnapshot: probedSamples[0]!.consumed,
@@ -1073,7 +1132,7 @@ syncBuiltinESMExports();
       liveStateTouched: false,
     }));
   } finally {
-    fs.rmSync(ROOT, { recursive: true, force: true });
+    detachPrivateProofVolume();
   }
   completion.complete();
 }
