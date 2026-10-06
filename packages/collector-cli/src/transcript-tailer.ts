@@ -11,6 +11,7 @@ import { historyGrowthNeedsHandoff } from "./capture-history-handoff";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
+  REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
   validRepoContextId,
   type RepoContextRequest,
 } from "./repo-context";
@@ -168,6 +169,7 @@ type TranscriptParserState = {
   sessionId?: string;
   pending?: TranscriptPendingUsage;
   usageRevisions?: TranscriptUsageRevision[];
+  repoContextPolicyGeneration?: number;
 };
 
 type TranscriptUsageRevision = Pick<
@@ -179,6 +181,7 @@ type TranscriptUsageRevision = Pick<
   | "output"
   | "repoContextId"
   | "contextConflict"
+  | "repoContextPolicyGeneration"
 >;
 
 type TranscriptPendingUsage = {
@@ -191,6 +194,7 @@ type TranscriptPendingUsage = {
   output: number;
   repoContextId?: string;
   contextConflict?: boolean;
+  repoContextPolicyGeneration?: number;
 };
 
 const PARSER_KIND = "claude-transcript-v3";
@@ -215,7 +219,7 @@ export type TranscriptScanOptions = {
 
 export function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
   if (!isRecord(value)) return undefined;
-  if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git", "pending", "usageRevisions"])) {
+  if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git", "pending", "usageRevisions", "repoContextPolicyGeneration"])) {
     return undefined;
   }
   if (value.parserKind !== PARSER_KIND || value.checkpointVersion !== CHECKPOINT_VERSION) {
@@ -225,6 +229,8 @@ export function validateTranscriptParserState(value: unknown): TranscriptParserS
     if (typeof value.sessionId !== "string" || !UUID_EXACT_RE.test(value.sessionId)) return undefined;
   }
   if (value.git !== undefined && !validLegacyPersistedGit(value.git)) return undefined;
+  if (value.repoContextPolicyGeneration !== undefined &&
+      (!Number.isSafeInteger(value.repoContextPolicyGeneration) || Number(value.repoContextPolicyGeneration) < 1)) return undefined;
   const pending = validatePendingUsage(value.pending);
   if (value.pending !== undefined && !pending) return undefined;
   const usageRevisions = validateUsageRevisions(value.usageRevisions);
@@ -235,6 +241,8 @@ export function validateTranscriptParserState(value: unknown): TranscriptParserS
     ...(value.sessionId ? { sessionId: value.sessionId.toLowerCase() } : {}),
     ...(pending ? { pending } : {}),
     ...(usageRevisions?.length ? { usageRevisions } : {}),
+    ...(typeof value.repoContextPolicyGeneration === "number"
+      ? { repoContextPolicyGeneration: value.repoContextPolicyGeneration } : {}),
   };
 }
 
@@ -255,6 +263,7 @@ function validateUsageRevisions(value: unknown): TranscriptUsageRevision[] | und
       output: normalized.output,
       ...(normalized.repoContextId ? { repoContextId: normalized.repoContextId } : {}),
       ...(normalized.contextConflict ? { contextConflict: true } : {}),
+      ...(normalized.repoContextPolicyGeneration ? { repoContextPolicyGeneration: normalized.repoContextPolicyGeneration } : {}),
     });
   }
   return revisions;
@@ -273,6 +282,7 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
       "output",
       "repoContextId",
       "contextConflict",
+      "repoContextPolicyGeneration",
     ]) ||
     typeof value.messageId !== "string" ||
     value.messageId.length === 0 ||
@@ -287,6 +297,8 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
   if (value.model !== undefined && typeof value.model !== "string") return undefined;
   if (value.repoContextId !== undefined && !validRepoContextId(value.repoContextId)) return undefined;
   if (value.contextConflict !== undefined && typeof value.contextConflict !== "boolean") return undefined;
+  if (value.repoContextPolicyGeneration !== undefined &&
+      (!Number.isSafeInteger(value.repoContextPolicyGeneration) || Number(value.repoContextPolicyGeneration) < 1)) return undefined;
   return {
     messageId: value.messageId,
     ...(typeof value.observedAt === "string" ? { observedAt: value.observedAt } : {}),
@@ -297,6 +309,8 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
     output: Number(value.output),
     ...(typeof value.repoContextId === "string" ? { repoContextId: value.repoContextId } : {}),
     ...(value.contextConflict === true ? { contextConflict: true } : {}),
+    ...(typeof value.repoContextPolicyGeneration === "number"
+      ? { repoContextPolicyGeneration: value.repoContextPolicyGeneration } : {}),
   };
 }
 
@@ -1408,6 +1422,7 @@ export class TranscriptTailer {
   }
 
   private recentDiscovery(limit?: number, _options?: TranscriptScanOptions) {
+    void _options;
     const resume = loadCaptureSweepResume(this.buffer.database, "claude_code");
     return new IncrementalJsonlDiscovery(this.directories, {
       recursive: true,
@@ -1583,6 +1598,18 @@ export class TranscriptTailer {
     flushAtStableEof: boolean,
     fallbackObservedAt: { observedAt: string; clamped: boolean },
   ) {
+    if (state.repoContextPolicyGeneration !== REPO_CONTEXT_CAPTURE_POLICY_GENERATION) {
+      const migrate = (usage: TranscriptPendingUsage) => {
+        const next = { ...usage, repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
+          repoContextId: this.buffer.repoContextUnknownId("claude_code", ["transcript-capture-policy",
+            state.sessionId ?? "unknown", this.messageKey(usage.messageId)].join(":")) };
+        delete next.contextConflict;
+        return next;
+      };
+      if (state.pending) state.pending = migrate(state.pending);
+      state.usageRevisions = state.usageRevisions?.map(migrate);
+      state.repoContextPolicyGeneration = REPO_CONTEXT_CAPTURE_POLICY_GENERATION;
+    }
     // Upgrade an old v3 pending snapshot into the durable revision model
     // before processing new bytes. This keeps existing cursors compatible.
     if (state.pending) {
@@ -1700,15 +1727,23 @@ export class TranscriptTailer {
       cacheCreation: entry.cacheCreation - (previous?.cacheCreation ?? 0),
       output: entry.output - (previous?.output ?? 0),
     };
-    const priorContextId = previous?.repoContextId;
+    const storedContextId = previous?.repoContextId;
+    const currentBinding = Boolean(storedContextId && (
+      this.buffer.repoContextHasCurrentCapturePolicy(storedContextId) ||
+      (statePrevious?.repoContextPolicyGeneration === REPO_CONTEXT_CAPTURE_POLICY_GENERATION &&
+        statePrevious.repoContextId === storedContextId &&
+        (previous?.contextConflict || this.buffer.canBindRepoContextId(storedContextId)))
+    ));
+    const priorContextId = currentBinding ? storedContextId : undefined;
     const candidateContextId = repoContextRequest?.contextId;
     const contextConflict = Boolean(
-      previous?.contextConflict ||
+      (currentBinding && previous?.contextConflict) ||
       forceContextConflict ||
       (priorContextId && candidateContextId && priorContextId !== candidateContextId),
     );
-    const repoContextId = priorContextId ?? candidateContextId;
-    if (contextConflict && !previous?.contextConflict && repoContextId) {
+    const repoContextId = priorContextId ?? candidateContextId ?? this.buffer.repoContextUnknownId("claude_code",
+      ["transcript-capture-policy", state.sessionId ?? "unknown", this.messageKey(entry.messageId)].join(":"));
+    if (contextConflict && !(currentBinding && previous?.contextConflict) && repoContextId) {
       this.buffer.suppressRepoContextId(repoContextId);
     }
     if (!contextConflict && repoContextRequest) {
@@ -1724,6 +1759,7 @@ export class TranscriptTailer {
         output: entry.output,
         ...(repoContextId ? { repoContextId } : {}),
         ...(contextConflict ? { contextConflict: true } : {}),
+        repoContextPolicyGeneration: REPO_CONTEXT_CAPTURE_POLICY_GENERATION,
       },
     ].slice(-64);
     this.buffer.database.prepare(

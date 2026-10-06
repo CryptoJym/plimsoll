@@ -21,7 +21,6 @@ import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import {
   attachRepoContextId,
   attachRepoContextSidecar,
-  REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
 } from "../packages/collector-cli/src/repo-context";
 import { readBoundedRegularFile } from "../packages/collector-cli/src/safe-file-read";
@@ -32,6 +31,8 @@ import {
   remoteLinkageHash,
   type GitLinkageContext,
 } from "../packages/shared/src/index";
+
+const patchableFs = fs as { statSync: typeof fs.statSync; lstatSync: typeof fs.lstatSync };
 
 const HEAD_SHA = "918424fd85571dc1368400ab06ca7540f44127e1";
 const WORKTREE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -76,7 +77,7 @@ function withHome<T>(home: string, run: () => T): T {
 }
 
 function fullLinkage(context: GitLinkageContext | undefined, branch = "main", sha = HEAD_SHA, remote = REMOTE) {
-  return context?.remoteUrlHash === remoteLinkageHash(remote) &&
+  return context !== undefined && context.remoteUrlHash === remoteLinkageHash(remote) &&
     context.branchHash === branchLinkageHash(branch) && context.headSha === sha;
 }
 
@@ -151,7 +152,7 @@ function proveHomeBoundaries(root: string) {
     fs.renameSync(home.git, path.join(home.repo, "saved-git"));
     const originalLstat = fs.lstatSync;
     let forbiddenReads = 0;
-    fs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) => {
+    patchableFs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) => {
       if (String(file) === home.git || String(file) === parent.git) forbiddenReads += 1;
       return originalLstat(file, options);
     }) as typeof fs.lstatSync;
@@ -159,7 +160,7 @@ function proveHomeBoundaries(root: string) {
       check("walk_stops_before_home_metadata_and_never_reaches_parent_repository",
         resolveGitContextUncached(path.join(home.repo, "chat-0")) === undefined && forbiddenReads === 0,
         { forbiddenMetadataReads: forbiddenReads });
-    } finally { fs.lstatSync = originalLstat; }
+    } finally { patchableFs.lstatSync = originalLstat; }
     write(home.git, `gitdir: ${parent.git}\n`);
     check("home_git_file_pointer_is_excluded_before_following_it",
       resolveGitContextUncached(home.repo) === undefined &&
@@ -199,7 +200,7 @@ function proveDiskRootAndOtherVolume(root: string) {
   const diskRoot = path.parse(fs.realpathSync(root)).root;
   const originalLstat = fs.lstatSync;
   let rootGitReads = 0;
-  fs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) => {
+  patchableFs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) => {
     if (String(file) === path.join(diskRoot, ".git")) {
       rootGitReads += 1;
       return originalLstat(fakeGit.git, options);
@@ -211,12 +212,12 @@ function proveDiskRootAndOtherVolume(root: string) {
   }) as typeof fs.lstatSync;
   try {
     withHome(fakeGit.repo, () => {
-      check("disk_root_git_is_never_read_at_root_or_from_descendants",
+      check("system_root_git_is_never_read_at_root_or_from_descendants",
         resolveGitContextUncached(diskRoot) === undefined &&
         resolveGitContextUncached(child) === undefined && rootGitReads === 0,
         { rootAndDescendant: true, syntheticRootGit: true, rootGitReads });
     });
-  } finally { fs.lstatSync = originalLstat; }
+  } finally { patchableFs.lstatSync = originalLstat; }
 
   // A mounted-volume namespace is injected onto real fixture metadata; no
   // file is created outside the disposable proof root.
@@ -231,11 +232,11 @@ function proveDiskRootAndOtherVolume(root: string) {
       ? path.join(volumeRepo.repo, path.relative(mountedCwd, value)) : file;
   };
   fs.realpathSync = Object.assign(((file: fs.PathLike) =>
-    String(file) === mountedCwd ? mountedCwd : originalRealpath(file)) as typeof fs.realpathSync,
+    String(file) === mountedCwd ? mountedCwd : originalRealpath(translate(file))) as typeof fs.realpathSync,
   { native: originalRealpath.native });
-  fs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) =>
+  patchableFs.lstatSync = ((file: fs.PathLike, options?: fs.StatOptions) =>
     originalLstat(translate(file), options)) as typeof fs.lstatSync;
-  fs.statSync = ((file: fs.PathLike, options?: fs.StatOptions) =>
+  patchableFs.statSync = ((file: fs.PathLike, options?: fs.StatOptions) =>
     originalStat(translate(file), options)) as typeof fs.statSync;
   fs.openSync = ((file: fs.PathLike, flags: string | number, mode?: fs.Mode) =>
     originalOpen(translate(file), flags, mode)) as typeof fs.openSync;
@@ -245,8 +246,8 @@ function proveDiskRootAndOtherVolume(root: string) {
       { simulatedMountedVolume: true, realBoundedMetadataReads: true });
   } finally {
     fs.realpathSync = originalRealpath;
-    fs.lstatSync = originalLstat;
-    fs.statSync = originalStat;
+    patchableFs.lstatSync = originalLstat;
+    patchableFs.statSync = originalStat;
     fs.openSync = originalOpen;
   }
 }
@@ -321,7 +322,7 @@ async function proveUpgradeSpanningCapture(root: string) {
     };
     const previousContexts = await import(pathToFileURL(
       path.join(legacyTree, "packages/collector-cli/src/repo-context.ts"),
-    ).href) as { attachRepoContextSidecar: typeof attachRepoContextSidecar };
+    ).href) as { attachRepoContextSidecar: typeof attachRepoContextSidecar; REPO_CONTEXT_RESOLVER_VERSION: string };
     const home = normalRepo(root, "studio0-upgrade-home");
     const chat = path.join(home.repo, "Documents", "Codex", "2026-10-05", "chat");
     fs.mkdirSync(chat, { recursive: true, mode: 0o700 });
@@ -367,7 +368,7 @@ async function proveUpgradeSpanningCapture(root: string) {
       assert.equal(buffer.applyRepoContextResults([{
         contextId: savedContextId, repoHash: oldContext.remoteUrlHash!,
         branchHash: oldContext.branchHash!, headSha: oldContext.headSha!,
-        resolvedAt: now.toISOString(), resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+        resolvedAt: now.toISOString(), resolverVersion: previousContexts.REPO_CONTEXT_RESOLVER_VERSION,
       }]).resultsInserted, 1);
       const sealed = event(2, oldContext);
       assert.equal(buffer.append(sealed), true);
@@ -434,11 +435,10 @@ async function proveUpgradeSpanningCapture(root: string) {
         JSON.stringify(read.get(fresh.id)) === JSON.stringify(noLinkage) &&
         JSON.stringify(read.get(newOccurrence.id)) === JSON.stringify(noLinkage),
         { freshLookups: 2, inputTokensEach: 19, outputTokensEach: 2 });
-      check("upgrade_later_event_reusing_saved_context_keeps_old_linkage_until_new_occurrence",
-        JSON.stringify(read.get(reused.id)) === JSON.stringify({
-          repo: oldContext.remoteUrlHash, branch: oldContext.branchHash, head: oldContext.headSha, input: 19, output: 2,
-        }) && JSON.stringify(read.get(newOccurrence.id)) === JSON.stringify(noLinkage),
-        { reusedContextStillLinked: true, freshContextNotLinked: true });
+      check("upgrade_later_event_reusing_legacy_context_keeps_usage_without_old_linkage",
+        JSON.stringify(read.get(reused.id)) === JSON.stringify(noLinkage) &&
+        JSON.stringify(read.get(newOccurrence.id)) === JSON.stringify(noLinkage),
+        { reusedLegacyContextNotLinked: true, freshContextNotLinked: true });
       const retained = JSON.stringify({
         payloads: buffer.database.prepare("select payload_json from buffered_events").all(),
         results, receipt: applied, queue: buffer.repoContextQueueStatus(),

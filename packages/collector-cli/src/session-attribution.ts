@@ -63,6 +63,8 @@ export type SessionRepoContextScan = {
 };
 
 export type ProjectAttributionOptions = {
+  /** A new capture explicitly owns its cwd; null cannot inherit older work. */
+  repoContextExcluded?: boolean;
   repoHash?: string | null;
   branchHash?: string | null;
   sessionContexts?: readonly SessionRepoContext[];
@@ -128,7 +130,8 @@ function withBasis(
   if (projectKey !== undefined) {
     return { ...event, projectKey, metadata };
   }
-  const { projectKey: _projectKey, ...withoutProject } = event;
+  const withoutProject = { ...event };
+  delete withoutProject.projectKey;
   return { ...withoutProject, metadata } as AiInteractionEvent;
 }
 
@@ -483,13 +486,16 @@ export class SessionAttributionBatch {
   attribute(
     event: AiInteractionEvent,
     options: {
+      repoContextExcluded?: boolean;
       repoHash?: string | null;
       branchHash?: string | null;
       excludedRowids?: ReadonlySet<number>;
     } = {},
   ): ProjectAttributionResult {
-    const scan = this.sessionContexts(event, options.repoHash, options.excludedRowids);
+    const scan = options.repoContextExcluded ? { rows: [], truncated: false }
+      : this.sessionContexts(event, options.repoHash, options.excludedRowids);
     return applyProjectAttribution(event, {
+      repoContextExcluded: options.repoContextExcluded,
       repoHash: options.repoHash,
       branchHash: options.branchHash,
       sessionContexts: scan.rows,
@@ -547,6 +553,13 @@ export function applyProjectAttribution(
   // markers is explicit. Return before touching any supplied session slice.
   if (event.projectKey && !replaceable) {
     return { event: withBasis(event, "explicit", event.projectKey), basis: "explicit" };
+  }
+  if (options.repoContextExcluded) {
+    const metadata = { ...event.metadata };
+    delete metadata.git;
+    delete metadata.branchHash;
+    delete metadata.headSha;
+    return { event: withBasis({ ...event, metadata }, "unallocated"), basis: "unallocated" };
   }
   // A generated project from a prior attribution pass is no stronger than the
   // session evidence that produced it. If this lookup is incomplete, clear

@@ -74,6 +74,9 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
   };
 
   for (const [key, value] of Object.entries(input)) {
+    // Collector-owned, path-free capture receipt. It is consumed from the
+    // exact raw lineage at lease time, never an outbound/suppression field.
+    if (key === "repoContextPolicyGeneration" && value === 2) continue;
     if (OMIT_LOCAL_ONLY_KEYS.has(key) || isForbiddenRawContentFieldName(key)) {
       recordOmission(key);
       continue;

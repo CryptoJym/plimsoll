@@ -16,6 +16,7 @@ import { collisionSafeDeliveryId, ensureUuidEventId, incarnationDeliveryId,
   isCollisionSafeDeliveryId,
   normalizeHistoryEvent } from "./upload-history";
 import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
+import { REPO_CONTEXT_CAPTURE_POLICY_GENERATION } from "./repo-context";
 import {
   CAPTURE_WRITE_LAG_MS,
   captureFrontier,
@@ -293,6 +294,7 @@ type ActiveDeliveryRow = {
   branchHash: string | null;
   attemptCount: number;
   deviceId: string | null;
+  captureRepoContextPolicyGeneration?: number | null;
 };
 
 type RawPrivacyRow = {
@@ -426,8 +428,10 @@ function attachFillOnlyLinkage(
   branchHash: string | null,
   attribution: SessionAttributionBatch,
   disposedRawRowids: ReadonlySet<number>,
+  captureRepoContextPolicyGeneration: number | null | undefined,
 ): AiWorkIngestEvent {
   const attributed = attribution.attribute(envelope.event, {
+    repoContextExcluded: captureRepoContextPolicyGeneration === REPO_CONTEXT_CAPTURE_POLICY_GENERATION && !repoHash,
     repoHash,
     branchHash,
     excludedRowids: disposedRawRowids,
@@ -2133,7 +2137,13 @@ export class DeliveryOutbox {
              sealed_envelope_json as sealedEnvelopeJson,
              repo_hash as repoHash, branch_hash as branchHash,
              device_id as deviceId,
-             attempt_count as attemptCount
+             attempt_count as attemptCount,
+             (select case when json_valid(e.payload_json) then
+                json_extract(e.payload_json, '$.metadata.repoContextPolicyGeneration') end
+              from buffered_events e where e.rowid = upload_outbox.raw_rowid
+                and e.id is upload_outbox.raw_id and e.created_at is upload_outbox.raw_created_at
+                and e.privacy_generation is upload_outbox.raw_generation)
+               as captureRepoContextPolicyGeneration
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= @now
              and not exists (select 1 from claude_replay_hooks held
@@ -2210,6 +2220,7 @@ export class DeliveryOutbox {
               canonicalLinkage(row.branchHash),
               attribution,
               disposedRawRowids,
+              row.captureRepoContextPolicyGeneration,
             ),
           );
           if (!sealed.ok) {

@@ -66,6 +66,58 @@ function resolvedUserHome(): HomeBoundary | undefined {
   }
 }
 
+function pointedGitDirs(dotGit: string, directory: string): GitLookup<LocatedGitDir> {
+  const pointerRead = readText(dotGit, POINTER_LIMIT_BYTES);
+  if (pointerRead.kind !== "ok") return { kind: "unsafe" };
+  const pointer = singleLine(pointerRead.value)?.match(/^gitdir:[ \t]*(.+?)[ \t]*$/)?.[1];
+  if (!pointer) return { kind: "unsafe" };
+  const gitDir = path.resolve(directory, pointer);
+  const commonRead = readText(path.join(gitDir, "commondir"), POINTER_LIMIT_BYTES);
+  if (commonRead.kind === "unsafe") return { kind: "unsafe" };
+  const commonPointer = commonRead.kind === "ok" ? singleLine(commonRead.value)?.trim() : undefined;
+  if (commonRead.kind === "ok" && !commonPointer) return { kind: "unsafe" };
+  return { kind: "ok", value: {
+    gitDir, commonDir: commonPointer ? path.resolve(gitDir, commonPointer) : gitDir, isWorktree: true,
+  } };
+}
+
+function directoryIdentity(directory: string): HomeBoundary {
+  const resolved = fs.realpathSync(directory);
+  const stat = fs.statSync(resolved, { bigint: true });
+  if (!stat.isDirectory()) throw new Error("git_directory_unavailable");
+  return { directory: resolved, device: stat.dev, inode: stat.ino };
+}
+
+function sameDirectory(left: HomeBoundary, right: HomeBoundary) {
+  return left.directory === right.directory || left.device === right.device && left.inode === right.inode;
+}
+
+/** Identify the repository owned by home or the system root, including a
+ * .git file. Only pointer metadata is read here, never its HEAD or config. */
+function boundaryRepository(directory: string): GitLookup<HomeBoundary> {
+  const dotGit = path.join(directory, ".git");
+  let stat: fs.Stats;
+  try { stat = fs.statSync(dotGit); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return { kind: code === "ENOENT" || code === "ENOTDIR" ? "missing" : "unsafe" };
+  }
+  if (stat.isDirectory()) return { kind: "ok", value: directoryIdentity(dotGit) };
+  if (!stat.isFile()) return { kind: "unsafe" };
+  const located = pointedGitDirs(dotGit, directory);
+  return located.kind === "ok"
+    ? { kind: "ok", value: directoryIdentity(located.value.commonDir) } : located;
+}
+
+function allowedRepository(located: LocatedGitDir, home: HomeBoundary): boolean {
+  const common = directoryIdentity(located.commonDir);
+  for (const directory of [home.directory, path.parse(home.directory).root]) {
+    const owner = boundaryRepository(directory);
+    if (owner.kind === "unsafe" || owner.kind === "ok" && sameDirectory(common, owner.value)) return false;
+  }
+  return true;
+}
+
 function findGitDir(startDir: string, home: HomeBoundary): GitLookup<LocatedGitDir> {
   let dir = fs.realpathSync(path.resolve(startDir));
   for (let depth = 0; depth < 24; depth += 1) {
@@ -94,17 +146,7 @@ function findGitDir(startDir: string, home: HomeBoundary): GitLookup<LocatedGitD
     }
 
     if (stat?.isFile()) {
-      const pointerRead = readText(dotGit, POINTER_LIMIT_BYTES);
-      if (pointerRead.kind !== "ok") return { kind: "unsafe" };
-      const pointer = singleLine(pointerRead.value)?.match(/^gitdir:[ \t]*(.+?)[ \t]*$/)?.[1];
-      if (!pointer) return { kind: "unsafe" };
-      const gitDir = path.resolve(dir, pointer);
-      const commonRead = readText(path.join(gitDir, "commondir"), POINTER_LIMIT_BYTES);
-      if (commonRead.kind === "unsafe") return { kind: "unsafe" };
-      const commonPointer = commonRead.kind === "ok" ? singleLine(commonRead.value)?.trim() : undefined;
-      if (commonRead.kind === "ok" && !commonPointer) return { kind: "unsafe" };
-      const commonDir = commonPointer ? path.resolve(gitDir, commonPointer) : gitDir;
-      return { kind: "ok", value: { gitDir, commonDir, isWorktree: true } };
+      return pointedGitDirs(dotGit, dir);
     }
 
     if (stat) return { kind: "unsafe" };
@@ -196,6 +238,7 @@ function resolveGitContextCore(cwd: string, home: HomeBoundary): GitLinkageConte
   try {
     const located = findGitDir(cwd, home);
     if (located.kind === "ok") {
+      if (!allowedRepository(located.value, home)) return undefined;
       const { gitDir, commonDir, isWorktree } = located.value;
       const head = resolveHead(gitDir, commonDir);
       const remote = resolveRemoteUrl(commonDir);

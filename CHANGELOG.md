@@ -3,8 +3,10 @@
 ## Unreleased
 
 - Stop filesystem git linkage at the running user's resolved home folder and
-  disk root, keeping real repositories below them attributable. Existing usage
-  and saved linkage stay unchanged; lookup cache keys retain no raw paths
+  system root, including their backed worktrees. Migrate only resumed capture
+  bindings and keep new excluded cwd events out of session inheritance. Real
+  repositories and mounted-volume roots remain attributable. Existing usage
+  and saved results stay unchanged; lookup cache keys retain no raw paths
   (`eco-6hoxj.165.213.1`).
 
 ## 0.7.51 — 2026-10-05 (unpublished)
