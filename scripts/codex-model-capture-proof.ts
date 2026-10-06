@@ -936,7 +936,7 @@ async function main() {
         ]);
       },
       null,
-      "local_turn_identity_conflict",
+      "ambiguous_local_turn_identity",
     );
     await run(
       "conflicting-model-peer",
