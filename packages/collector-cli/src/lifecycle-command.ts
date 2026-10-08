@@ -123,6 +123,30 @@ export async function runLifecycleSnapshotCommand(input: {
   if (input.argv[0] !== "snapshots") {
     throw new Error("Expected lifecycle update --preflight or lifecycle snapshots list|prune|reconcile");
   }
+  if (input.argv[1] === "remove") {
+    const values = new Map<string, string>();
+    const flags = new Set<string>();
+    for (let i = 2; i < input.argv.length; i++) {
+      const arg = input.argv[i]!;
+      if (["--id", "--operation-id", "--confirm-exact"].includes(arg)) {
+        const value = input.argv[++i];
+        if (!value || value.startsWith("--") || values.has(arg)) throw new Error("snapshot removal requires distinct options with values");
+        values.set(arg, value);
+      } else if (["--apply", "--json"].includes(arg) && !flags.has(arg)) {
+        flags.add(arg);
+      } else {
+        throw new Error("unknown or repeated snapshot removal option");
+      }
+    }
+    const snapshotId = values.get("--id");
+    if (!snapshotId) throw new Error("snapshot removal requires --id");
+    if (values.has("--confirm-exact") && !flags.has("--apply")) throw new Error("--confirm-exact requires --apply");
+    const result = await manager.removeSnapshot({
+      operationId: values.get("--operation-id") ?? `snapshots-remove-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
+      snapshotId, apply: flags.has("--apply"), confirmation: values.get("--confirm-exact"),
+    });
+    return { kind: "remove" as const, ...result, boundary };
+  }
   const keep = keepOption(input.argv);
   if (input.argv[1] === "list") {
     return { kind: "list" as const, snapshots: await manager.listSnapshots({ ...(keep !== undefined ? { keep } : {}) }), boundary };
@@ -147,7 +171,7 @@ export async function runLifecycleSnapshotCommand(input: {
     });
     return { kind: "reconcile" as const, ...result, boundary };
   }
-  throw new Error("Expected lifecycle snapshots list|prune|reconcile");
+  throw new Error("Expected lifecycle snapshots list|prune|reconcile|remove");
 }
 
 function formatBytes(bytes: number) {
