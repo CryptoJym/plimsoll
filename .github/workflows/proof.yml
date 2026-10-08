@@ -823,6 +823,7 @@ jobs:
         run: |
           pnpm test:lifecycle-snapshot-remove
           pnpm proof:lifecycle-snapshot-remove
+          pnpm proof:ledger-retention-prototype
 
       - name: Prove bounded lifecycle snapshot retention and space-free snapshots (eco-6hoxj.163.30)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

@@ -43,6 +43,7 @@
     "proof:lifecycle-manifest-rollback": "tsx scripts/run-proof.ts scripts/lifecycle-manifest-rollback-proof.ts",
     "test:lifecycle-snapshot-remove": "node --import tsx scripts/lifecycle-snapshot-remove.test.ts",
     "proof:lifecycle-snapshot-remove": "tsx scripts/run-proof.ts scripts/lifecycle-snapshot-remove-proof.ts",
+    "proof:ledger-retention-prototype": "tsx scripts/run-proof.ts scripts/ledger-retention-prototype-proof.ts",
     "proof:lifecycle-retention": "tsx scripts/run-proof.ts scripts/lifecycle-retention-proof.ts",
     "proof:lifecycle-data-safety": "tsx scripts/run-proof.ts scripts/lifecycle-data-safety-proof.ts",
     "proof:lifecycle-cross-version": "tsx scripts/run-proof.ts scripts/lifecycle-cross-version-proof.ts",
