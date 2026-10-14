@@ -136,7 +136,12 @@
     "proof:provider-usage": "tsx scripts/provider-usage-proof.ts",
     "proof:native-subscription": "tsx scripts/native-subscription-proof.ts",
     "telemetry:refresh": "tsx scripts/subscription-native-refresh.ts",
-    "telemetry:install": "tsx scripts/install-subscription-native-refresh.ts --install"
+    "telemetry:install": "tsx scripts/install-subscription-native-refresh.ts --install",
+    "proof:native-account-links": "tsx scripts/native-account-links-proof.ts",
+    "proof:subscription-reconciliation": "tsx scripts/subscription-reconciliation-proof.ts",
+    "proof:subscription-reconciliation-file": "tsx scripts/subscription-reconciliation-file-proof.ts",
+    "proof:subscription-export-links": "tsx scripts/subscription-export-links-proof.ts",
+    "proof:subscription-bank-source": "python3 -B scripts/subscription-bank-source-refresh-proof.py --engine"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

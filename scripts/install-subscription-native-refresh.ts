@@ -35,18 +35,25 @@ if (!process.argv.includes("--install")) {
   console.log(JSON.stringify({status:"prepared",label,intervalSeconds:60,bundleSha256:digest,scope:"local subscription feed, bounded ledger reads, verified CSV inbox; no provider model calls"},null,2));
 } else {
   if (fs.existsSync(plist) && fs.readFileSync(plist,"utf8")!==body) throw new Error("subscription_refresh_existing_service_requires_inspection");
+  const bankHelperSource=path.join(repo,"scripts/subscription-bank-source-refresh.py");
+  const bankHelper=fs.readFileSync(bankHelperSource);
+  const bankHelperSha256=`sha256:${crypto.createHash("sha256").update(bankHelper).digest("hex")}`;
+  fs.mkdirSync(home,{recursive:true,mode:0o700});
+  fs.writeFileSync(path.join(home,"subscription-bank-source-refresh.py"),bankHelper,{mode:0o600});
+  fs.chmodSync(path.join(home,"subscription-bank-source-refresh.py"),0o600);
+  fs.writeFileSync(path.join(home,"subscription-bank-source-refresh-receipt.json"),JSON.stringify({sha256:bankHelperSha256,installedAt:new Date().toISOString(),scope:"read-only stored company tracker; no Plaid calls"},null,2)+"\n",{mode:0o600});
   fs.mkdirSync(path.join(release,"node_modules"),{recursive:true,mode:0o700});
   fs.writeFileSync(entry,contents,{mode:0o600});
   const require=createRequire(path.join(repo,"package.json"));
   const driver=fs.realpathSync(path.dirname(require.resolve("better-sqlite3/package.json")));
   const driverLink=path.join(release,"node_modules/better-sqlite3");
   if (!fs.existsSync(driverLink)) fs.symlinkSync(driver,driverLink,"dir");
-  const smoke=spawnSync(process.execPath,[entry],{encoding:"utf8",timeout:20_000,maxBuffer:64*1024});
+  const smoke=spawnSync(process.execPath,[entry],{encoding:"utf8",timeout:45_000,maxBuffer:64*1024});
   if (smoke.status!==0 || !smoke.stdout.includes('"status":"subscription_telemetry_refreshed"')) throw new Error("subscription_refresh_runtime_check_failed");
   fs.mkdirSync(path.dirname(plist),{recursive:true,mode:0o700});
   const alreadyConfigured=fs.existsSync(plist);
   fs.writeFileSync(plist,body,{mode:0o600});
-  fs.writeFileSync(path.join(release,"receipt.json"),JSON.stringify({label,intervalSeconds:60,bundleSha256:digest,createdAt:new Date().toISOString(),node:process.version},null,2)+"\n",{mode:0o600});
+  fs.writeFileSync(path.join(release,"receipt.json"),JSON.stringify({label,intervalSeconds:60,bundleSha256:digest,bankHelperSha256,bankRefreshIntervalSeconds:3600,createdAt:new Date().toISOString(),node:process.version},null,2)+"\n",{mode:0o600});
   if (!alreadyConfigured) {
     const bootstrap=spawnSync("/bin/launchctl",["bootstrap",`gui/${process.getuid!()}`,plist],{encoding:"utf8",timeout:10_000,maxBuffer:16*1024});
     if (bootstrap.status!==0) throw new Error("subscription_refresh_launchd_bootstrap_failed");

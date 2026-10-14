@@ -6,6 +6,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { resolveCollectorHome, resolveGrokHome } from "./collector-home";
 import { readNativeLedger, type NativeLedgerReading } from "./native-ledger";
+import { nativeAccountLinkEvidence, nativeProviderAccountLinkEvidence, readExistingNativeAccountSalt, type NativeAccountLinkEvidence, type NativeIdentityProvenance } from "./native-account-links";
 
 export const NATIVE_SUBSCRIPTION_SCHEMA = "plimsoll.native-subscription.v1" as const;
 
@@ -26,6 +27,7 @@ export type NativeSubscriptionPaths = {
   nativeUsageFile: string;
   codexAuthFile: string;
   claudeConfigFile: string;
+  claudeSeatsRoot?: string;
   cursorCliConfigFile: string;
   cursorTrackingDb: string;
   grokConfigFile: string;
@@ -95,6 +97,8 @@ export type NativeAccountObservation = {
   freshness: NativeFreshness;
   subscriptionState: NativeEvidenceState;
   errorCodes: string[];
+  accountLink?: NativeAccountLinkEvidence | null;
+  accountLinks?: NativeAccountLinkEvidence[];
 };
 
 export type NativeProviderSurface = {
@@ -268,9 +272,89 @@ function accountRef(value: unknown): string | null {
   return raw ? `native:${crypto.createHash("sha256").update(raw).digest("hex").slice(0, 32)}` : null;
 }
 
+/** Only the explicitly named configuration is read. Reject writable or
+ * redirected files and ancestors, and bound the read without opening secrets. */
+function readClaudeConfig(file: string): JsonRecord | null {
+  let fd: number | undefined;
+  try {
+    if (!path.isAbsolute(file) || /(?:credentials|auth\.json)/i.test(path.basename(file))) return null;
+    const uid = process.getuid?.();
+    const checkAncestors = () => {
+      let directory = path.dirname(file);
+      for (let depth = 0; depth < 64; depth += 1) {
+        let stat = fs.lstatSync(directory);
+        if (stat.isSymbolicLink()) {
+          // Only macOS's root-owned /var and /tmp aliases are followed.
+          // Every user/profile symlink fails, including for a root agent.
+          if (process.platform !== "darwin" || !["/var","/tmp"].includes(directory) || stat.uid !== 0) return false;
+          const parent = fs.lstatSync(path.dirname(directory));
+          const target = fs.statSync(directory);
+          if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== 0 || (parent.mode & 0o022) !== 0 ||
+            !target.isDirectory() || target.uid !== 0) return false;
+          directory = fs.realpathSync(directory);
+          stat = fs.lstatSync(directory);
+        }
+        const trustedSticky = stat.uid === 0 && (stat.mode & 0o1000) !== 0;
+        if (!stat.isDirectory() || stat.isSymbolicLink() ||
+          uid !== undefined && stat.uid !== uid && stat.uid !== 0 ||
+          (stat.mode & 0o022) !== 0 && !trustedSticky) return false;
+        const parent = path.dirname(directory);
+        if (parent === directory) return true;
+        directory = parent;
+      }
+      return false;
+    };
+    if (!checkAncestors()) return null;
+    const before = fs.lstatSync(file);
+    if (!before.isFile() || before.isSymbolicLink() || (before.mode & 0o022) !== 0 ||
+      uid !== undefined && before.uid !== uid || before.size > 1024 * 1024) return null;
+    fd = fs.openSync(file,fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(fd);
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size > 1024 * 1024) return null;
+    const bytes = Buffer.alloc(opened.size);
+    let length = 0;
+    while (length < bytes.length) {
+      const read = fs.readSync(fd,bytes,length,bytes.length - length,length);
+      if (!read) return null;
+      length += read;
+    }
+    const after = fs.lstatSync(file);
+    if (!checkAncestors() || after.dev !== opened.dev || after.ino !== opened.ino ||
+      after.size !== opened.size || (after.mode & 0o022) !== 0 || uid !== undefined && after.uid !== uid) return null;
+    return object(JSON.parse(bytes.toString("utf8")));
+  } catch { return null; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function claudeAccountIdentity(identity: JsonRecord, source: JsonRecord, paths: NativeSubscriptionPaths,
+  localConfig: JsonRecord | null): { value: unknown; reason: string | null; provenance: NativeIdentityProvenance | null } {
+  const hasProfile = source.profile !== undefined && source.profile !== null;
+  if (hasProfile && (typeof source.profile !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(source.profile))) {
+    return { value: null, reason: "invalid_claude_profile", provenance: null };
+  }
+  const config = hasProfile ? readClaudeConfig(path.join(paths.claudeSeatsRoot!,source.profile as string,".claude.json")) : localConfig;
+  if (!config) return { value: null, reason: "missing_or_unsafe_claude_profile", provenance: null };
+  const oauth = object(config.oauthAccount);
+  // Exact scalar equality: neither an email-only match nor a tenant UUID is
+  // evidence of the personal account UUID. Missing feed metadata cannot prove it.
+  const valid = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
+    value.length <= 512 && value === value.trim() && !/[\u0000-\u001f]/.test(value);
+  if (!valid(identity.email) || !valid(identity.organizationId) || !valid(oauth.emailAddress) || !valid(oauth.organizationUuid)) {
+    return { value: null, reason: "missing_claude_identity_metadata", provenance: null };
+  }
+  if (identity.email !== oauth.emailAddress || identity.organizationId !== oauth.organizationUuid) {
+    return { value: null, reason: "mismatched_claude_profile_identity", provenance: null };
+  }
+  return { value: oauth.accountUuid, reason: null,
+    provenance: hasProfile ? "registered_claude_profile_account_uuid" : "matching_local_claude_account_uuid" };
+}
+
 function parseNativeUsageFile(
   payload: JsonRecord | null,
   now: string,
+  salt: Buffer | null,
+  paths: NativeSubscriptionPaths,
+  localClaudeConfig: JsonRecord | null,
 ): { snapshots: NativeQuotaSnapshot[]; accounts: NativeAccountObservation[] } {
   const snapshots: NativeQuotaSnapshot[] = [];
   const accounts: NativeAccountObservation[] = [];
@@ -293,7 +377,16 @@ function parseNativeUsageFile(
     const identityValid = authenticated && identity.matchesExpected !== false && Boolean(proof && proof !== "configured_only") && Boolean(ref);
     const subscriptionState: NativeEvidenceState = identityValid && planType && planType.toLowerCase() !== "free" && accountFreshness === "fresh" ? "verified" : "unknown";
     const errorCodes = (Array.isArray(raw.errors) ? raw.errors : []).map((value) => stringValue(object(value).code, 128)).filter((value): value is string => Boolean(value && /^[A-Z0-9_]+$/.test(value)));
-    accounts.push({ provider, accountRef: ref, authenticated, planType, proof, state, observedAt: identityObservedAt, freshness: accountFreshness, subscriptionState, errorCodes });
+    const capturedIdentity = provider === "anthropic" ? claudeAccountIdentity(identity,source,paths,localClaudeConfig) :
+      { value: provider === "openai" ? identity.providerAccountId : null, reason: null,
+        provenance: provider === "openai" ? "native_feed_provider_account_id" as const : null };
+    const linkOptions = { provider, accountRef: ref, nativeIdentity: capturedIdentity.value,
+      identityReason: capturedIdentity.reason, identityProvenance: capturedIdentity.provenance,
+      authenticated, matchesExpected: identity.matchesExpected, proof, observedAt: identityObservedAt, now };
+    const accountLink = nativeAccountLinkEvidence(linkOptions, salt);
+    const protectedAccountLink = nativeProviderAccountLinkEvidence(linkOptions);
+    const accountLinks = [accountLink,protectedAccountLink].filter((item): item is NativeAccountLinkEvidence => item !== null);
+    accounts.push({ provider, accountRef: ref, authenticated, planType, proof, state, observedAt: identityObservedAt, freshness: accountFreshness, subscriptionState, errorCodes, accountLink, accountLinks });
 
     const evidenceState: NativeEvidenceState = identityValid && source.state === "OK" && state === "OK" && planType ? "verified" : "unknown";
     const buckets = Array.isArray(raw.quotaBuckets) ? raw.quotaBuckets : [];
@@ -361,46 +454,6 @@ function parseNativeUsageFile(
     }
   });
   return { snapshots, accounts };
-}
-
-function findClaim(value: unknown, claim: string, depth = 0): string | null {
-  if (depth > 6 || value === null || value === undefined) return null;
-  if (typeof value === "object" && !Array.isArray(value)) {
-    const record = value as JsonRecord;
-    const separator = claim.lastIndexOf(".");
-    if (separator > 0) {
-      const namespace = claim.slice(0, separator);
-      const childKey = claim.slice(separator + 1);
-      const child = object(record[namespace])[childKey];
-      if (typeof child === "string") return stringValue(child, 128);
-    }
-  }
-  if (typeof value === "string" && value.split(".").length === 3 && value.length < 32_000) {
-    try {
-      const payload = value.split(".")[1];
-      const decoded = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as unknown;
-      const result = findClaim(decoded, claim, depth + 1);
-      if (result) return result;
-    } catch {
-      return null;
-    }
-  }
-  if (Array.isArray(value)) {
-    for (const item of value.slice(0, 32)) {
-      const result = findClaim(item, claim, depth + 1);
-      if (result) return result;
-    }
-    return null;
-  }
-  if (typeof value !== "object") return null;
-  for (const [key, child] of Object.entries(value as JsonRecord)) {
-    if (key === claim && typeof child === "string") return stringValue(child, 128);
-    if (key.toLowerCase().includes("token") || key === claim || claim.startsWith(`${key}.`)) {
-      const result = findClaim(child, claim, depth + 1);
-      if (result) return result;
-    }
-  }
-  return null;
 }
 
 function readGrokFlags(file: string): { telemetryEnabled: boolean; externalOtelEnabled: boolean } {
@@ -595,6 +648,7 @@ export function defaultNativeSubscriptionPaths(home = os.homedir()): NativeSubsc
     nativeUsageFile: path.join(home, "Library/Memory/ops/data/native-account-usage.json"),
     codexAuthFile: path.join(home, ".codex/auth.json"),
     claudeConfigFile: path.join(home, ".claude.json"),
+    claudeSeatsRoot: path.join(home, ".claude-seats"),
     cursorCliConfigFile: path.join(home, ".cursor/cli-config.json"),
     cursorTrackingDb: path.join(home, ".cursor/ai-tracking/ai-code-tracking.db"),
     grokConfigFile: path.join(resolveGrokHome({ homeDir: home }).home, "config.toml"),
@@ -605,21 +659,26 @@ export function defaultNativeSubscriptionPaths(home = os.homedir()): NativeSubsc
 }
 
 export function inspectNativeSubscriptionSurfaces(
-  options: { paths?: Partial<NativeSubscriptionPaths>; now?: string; ledgerReading?: NativeLedgerReading } = {},
+  options: { paths?: Partial<NativeSubscriptionPaths>; now?: string; ledgerReading?: NativeLedgerReading; identityEvidenceOnly?: boolean } = {},
 ): NativeSubscriptionInspection {
   const paths = { ...defaultNativeSubscriptionPaths(), ...options.paths };
   const observedAt = iso(options.now) ?? new Date().toISOString();
   const rawNativePayload = readJson(paths.nativeUsageFile);
   const nativePayload = rawNativePayload && Array.isArray(rawNativePayload.accounts) && iso(rawNativePayload.generatedAt) ? rawNativePayload : null;
-  const parsed = parseNativeUsageFile(nativePayload, observedAt);
-  const cursorTracking = readCursorTracking(paths.cursorTrackingDb, observedAt);
+  const claudeConfig = readClaudeConfig(paths.claudeConfigFile);
+  const salt = nativePayload ? readExistingNativeAccountSalt(path.dirname(paths.collectorDb)) : null;
+  let parsed: ReturnType<typeof parseNativeUsageFile>;
+  try { parsed = parseNativeUsageFile(nativePayload, observedAt, salt, paths, claudeConfig); }
+  finally { salt?.fill(0); }
+  const cursorTracking: ReturnType<typeof readCursorTracking> = options.identityEvidenceOnly ? {
+    available: false, conversationCount: 0, observationCount: 0, modelCount: 0,
+    firstSeenAt: null, lastSeenAt: null, tokenState: "unknown", freshness: "unknown", observations: [],
+  } : readCursorTracking(paths.cursorTrackingDb, observedAt);
   const ledgerReading = options.ledgerReading ?? readNativeLedger(paths.collectorDb);
   const localThreadTelemetry = summarizeLocalThreadTelemetry(ledgerReading);
-  const codexAuth = readJson(paths.codexAuthFile);
-  const claudeConfig = readJson(paths.claudeConfigFile);
   const claudeOauth = object(claudeConfig?.oauthAccount);
-  const cursorConfig = readJson(paths.cursorCliConfigFile);
-  const grokFlags = readGrokFlags(paths.grokConfigFile);
+  const cursorConfig = options.identityEvidenceOnly ? null : readJson(paths.cursorCliConfigFile);
+  const grokFlags = options.identityEvidenceOnly ? {telemetryEnabled:false,externalOtelEnabled:false} : readGrokFlags(paths.grokConfigFile);
   const providerTelemetry = (provider: NativeProvider): NativeThreadTelemetry => {
     const source = provider === "openai" ? "codex" : provider === "anthropic" ? "claude_code" : provider === "xai" ? "grok" : "cursor";
     if (provider === "cursor") {
@@ -652,7 +711,7 @@ export function inspectNativeSubscriptionSurfaces(
   ]);
   const providers = (["openai", "anthropic", "cursor", "xai"] as NativeProvider[]).map((provider) =>
     accountSummary(provider, parsed.accounts, parsed.snapshots, telemetryByProvider.get(provider)!));
-  const dashboardEvidence = object(readJson(paths.dashboardEvidenceFile)?.providers);
+  const dashboardEvidence = object(options.identityEvidenceOnly ? null : readJson(paths.dashboardEvidenceFile)?.providers);
   for (const provider of providers) {
     const dashboard = object(dashboardEvidence[provider.provider]);
     const matchedAccount = parsed.accounts.find((account) => account.provider === provider.provider && account.accountRef === dashboard.accountRef);
@@ -690,7 +749,10 @@ export function inspectNativeSubscriptionSurfaces(
       freshness: freshness(collectorGeneratedAt, observedAt),
     },
     metadata: {
-      codexPlanType: findClaim(codexAuth, "https://api.openai.com/auth.chatgpt_plan_type") ?? null,
+      codexPlanType: (() => {
+        const plans = [...new Set(parsed.accounts.filter(account => account.provider === "openai").map(account => account.planType).filter(Boolean))];
+        return plans.length === 1 ? plans[0] : null;
+      })(),
       claudePlanType: stringValue(claudeOauth.organizationType),
       claudeBillingType: stringValue(claudeOauth.billingType),
       claudeOrganizationType: stringValue(claudeOauth.organizationType),

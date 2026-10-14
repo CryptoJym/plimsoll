@@ -1,0 +1,267 @@
+{
+  "schema": "plimsoll.subscription-attribution-verification.v1",
+  "verifiedAt": "2026-10-14T20:18:16.902057+00:00",
+  "sourceObservedAt": "2026-10-14T20:17:52.375Z",
+  "workId": "eco-4jicdb",
+  "scope": "personal subscription native evidence and captured local ledger; no team/API-console accounting",
+  "doneChecks": {
+    "capturedIdentityAccountLinks": "PASSED",
+    "projectEvidenceAndConflicts": "PASSED",
+    "invoiceBankAdjudicationWithUnknownHolds": "PASSED",
+    "recurringOutputAndFocusedChecks": "PASSED"
+  },
+  "accountLinkCoverage": {
+    "totalEvents": 13583,
+    "capturedHashEvents": 5123,
+    "linkedEvents": 2469,
+    "unknownEvents": 11114,
+    "linkedEventFraction": 0.18177133181182362,
+    "state": "partial",
+    "scope": "captured_sidecar_events",
+    "completeness": "UNKNOWN",
+    "unknownReasons": {
+      "missing_captured_identity": 8460,
+      "missing_captured_account_evidence": 2654
+    }
+  },
+  "threads": {
+    "reported": 200,
+    "fullyAccountLinked": 59,
+    "partiallyAccountLinked": 54,
+    "spansAccounts": 9,
+    "projectStates": {
+      "UNKNOWN": 141,
+      "inferred": 59
+    },
+    "distinctInferredRepositories": 3,
+    "reportedLimit": 200,
+    "threadInventoryCompleteness": "UNKNOWN"
+  },
+  "cursorExportChatLinks": 8,
+  "projectMetadataRefresh": {
+    "threadGroupsSelected": 202,
+    "projectRootsChecked": 11,
+    "rootRotationOffset": 2,
+    "remainingRootCoverage": "bounded_observation",
+    "historyCompleteness": "UNKNOWN"
+  },
+  "replay": {
+    "receipt": {
+      "schema": "plimsoll.native-subscription.v1",
+      "quotaRecords": 0,
+      "quotaInserted": 0,
+      "quotaReplayed": 0,
+      "quotaRevised": 0,
+      "threadRecords": 0,
+      "threadInserted": 0,
+      "threadReplayed": 0,
+      "threadRevised": 0,
+      "ledgerInserted": 0,
+      "ledgerReplayed": 2132,
+      "ledgerSkippedUnstored": 47868,
+      "ledgerReadState": "observed",
+      "ledgerCoverage": "recent_window",
+      "hasMore": false,
+      "earlierHistory": "UNKNOWN",
+      "mode": "identity_project_evidence_replay",
+      "rawRowsSelected": 50000,
+      "maximumRowid": 32499451,
+      "throughRowid": 32499451,
+      "cursorUpdated": false,
+      "tokenCountersUpdated": false
+    },
+    "repeatIdempotent": true,
+    "originalTokenTotalsAndCursorsPreserved": true,
+    "originalNonNullActorBytesPreserved": true,
+    "capturedActorNullsEnriched": 1427,
+    "coverage": {
+      "totalEvents": 13005,
+      "capturedHashEvents": 4745,
+      "linkedEvents": 2091,
+      "unknownEvents": 10914,
+      "linkedEventFraction": 0.1607843137254902,
+      "state": "partial",
+      "scope": "captured_sidecar_events",
+      "completeness": "UNKNOWN",
+      "unknownReasons": {
+        "missing_captured_identity": 8260,
+        "missing_captured_account_evidence": 2654
+      }
+    },
+    "verifiedAt": "2026-10-14T20:05:42.680Z"
+  },
+  "bankSourceReadback": {
+    "sourceHashVerified": true,
+    "invoiceRows": 31,
+    "invoiceRowsAndClocksPreserved": true,
+    "bankRows": 66,
+    "bankStates": {
+      "POSTED": 41,
+      "PENDING": 2,
+      "REMOVED": 23
+    },
+    "bankSourceReadAt": "2026-10-14T19:51:02.039Z",
+    "bankSourceLastSyncedAt": "2026-10-14T09:15:04.098Z",
+    "sourceCardIdentity": "UNKNOWN",
+    "bankCoverage": {
+      "periodEnd": "2026-10-15",
+      "periodStart": "2026-09-01",
+      "state": "PARTIAL"
+    },
+    "rowsExcluded": 0
+  },
+  "financial": {
+    "invoiceRecords": 31,
+    "invoiceAccountIdentitiesVerified": 30,
+    "bankRecords": 66,
+    "matchState": "UNKNOWN",
+    "verifiedMatches": 0,
+    "currentCertifiedSettledTotals": null,
+    "cashAllocation": "UNKNOWN",
+    "observedPostedDebitGroups": 4,
+    "supplemental": {
+      "state": "UNKNOWN",
+      "hostedBankRows": 68,
+      "unknownReceiptCount": 1
+    },
+    "sourceFreshness": [
+      {
+        "sourceRef": "owner-invoices-20261014",
+        "asOf": "2026-10-14T18:54:25.873Z",
+        "state": "fresh"
+      },
+      {
+        "sourceRef": "company-tracker-chase-20261014",
+        "asOf": "2026-10-14T09:15:04.098Z",
+        "state": "fresh"
+      },
+      {
+        "sourceRef": "openai-personal-billing-20261014",
+        "asOf": "2026-10-14T19:39:03.098Z",
+        "state": "fresh"
+      }
+    ],
+    "correction": "The earlier USD214.90 candidate was withdrawn because tracker card digits derive from Plaid account masks; no independent payment-instrument proof was found."
+  },
+  "checks": {
+    "nativeAccountLinkFixtures": 57,
+    "nativeSubscriptionFixtures": 16,
+    "subscriptionReconciliationFixtures": 51,
+    "privateFileAndFreshnessChecks": 8,
+    "cursorExportThreadChecks": 3,
+    "storedBankSourceChecksPython39": 20,
+    "typecheck": "PASSED",
+    "diffWhitespace": "PASSED",
+    "privateJsonContainsNoEmails": "PASSED",
+    "frozenRuntimeHash": "PASSED",
+    "bankHelperHash": "PASSED",
+    "mainCollectorStillRunning": "PASSED"
+  },
+  "deployment": {
+    "label": "com.utlyze.plimsoll-subscription-telemetry",
+    "bundleSha256": "ded2e507b147570fceae5a9e283eeef6d6805b26ae0bc8482052d19854193fc1",
+    "bankHelperSha256": "sha256:6c4b084b67ebbe082f54197ec67c4cc22f464d769f54649ed00330a9dbfb9223",
+    "configuredNativeIntervalSeconds": 60,
+    "configuredBankIntervalSeconds": 3600,
+    "createdAt": "2026-10-14T20:15:34.204Z",
+    "lastExitStatus": 0,
+    "automaticRunsObserved": 3,
+    "automaticRunTimes": [
+      "2026-10-14T20:15:42.957Z",
+      "2026-10-14T20:16:47.877Z",
+      "2026-10-14T20:17:52.375Z"
+    ],
+    "hourlyBankDueExecution": "NOT_CHECKED_FIRST_RUN_NOT_DUE",
+    "manualStoredBankRead": "PASSED",
+    "bankRefresh": {
+      "state": "configured",
+      "attempted": false,
+      "reason": "NOT_DUE",
+      "intervalSeconds": 3600
+    },
+    "artifactModes": {
+      "native-subscription.sqlite": "0o600",
+      "subscription-telemetry-status.json": "0o600",
+      "subscription-telemetry.html": "0o600",
+      "subscription-bank-source-refresh.py": "0o600"
+    }
+  },
+  "unknown": [
+    "earlier token history and fleet completeness",
+    "subscription-wide exact token totals where the provider supplies no export",
+    "remaining captured-event account identities",
+    "hosted project record acceptance and unproved project relationships",
+    "invoice-to-bank payment instrument/reference joins",
+    "Amex bank source coverage and rendered bank observations without stable IDs",
+    "unavailable receipt currency",
+    "cash allocation to chats or projects",
+    "personal compliance-export entitlement",
+    "automatic acquisition of new provider dashboard exports"
+  ],
+  "coordination": {
+    "ownInbox": "recovered_ready",
+    "policySha256": "7b78332f0dae7081bba57a422ad0bd2bfe76828c57147a8377a24de28478e655",
+    "delegation": "conductor-delegate; all execution receipts completed; no native local worker fallback",
+    "ownersAndHoldsPreserved": true,
+    "adoption": {
+      "nativeSession": "01a13aba-d80b-7743-a8e9-d18db95147af",
+      "owner": "session-ee30ac97bd3dd075b213e17b665b845e",
+      "workId": "eco-4jicdb",
+      "localNativeWorkers": "NONE",
+      "transientLocalHelpersRemaining": "NONE",
+      "durableLocalCredentialBoundProductJobs": [
+        "com.utlyze.plimsoll-subscription-telemetry"
+      ],
+      "safeCheckpoint": "All delegated execution completed, scoped artifacts integrated, frozen runtime installed and automatic native output verified. Only local integration/readback/commit remained.",
+      "remoteWork": [
+        {
+          "workId": "plimsoll-thread-subscription-links-20261014-r1",
+          "host": "jamess-macbook-pro-2",
+          "launchId": "20261014-124755-aea6"
+        },
+        {
+          "workId": "plimsoll-subscription-bank-reconcile-20261014",
+          "host": "studio1",
+          "launchId": "20261014-125228-a47a"
+        },
+        {
+          "workId": "plimsoll-bank-calendar-precision-20261014-r1",
+          "host": "studio3",
+          "launchId": "20261014-131026-efb7"
+        },
+        {
+          "workId": "plimsoll-native-identity-compat-20261014-r1",
+          "host": "jamess-macbook-pro-2",
+          "launchId": "20261014-132845-6f5f"
+        },
+        {
+          "workId": "plimsoll-bank-readonly-refresh-20261014",
+          "host": "studio4",
+          "launchId": "20261014-133141-5e27"
+        }
+      ],
+      "remainingRemoteExecution": "NONE",
+      "localWorkerRetirement": "NOT_APPLICABLE_NONE_LAUNCHED",
+      "preservedMainCollector": "com.plimsoll.collector"
+    }
+  },
+  "changesToProviderOrBankState": {
+    "charges": 0,
+    "resetsRedeemed": 0,
+    "providerPlanChanges": 0,
+    "bankDatabaseWrites": 0,
+    "clientMessagesSent": 0
+  },
+  "cleanup": {
+    "taskCreatedBrowserTabsRemaining": 0,
+    "sharedBrowserPreserved": true,
+    "taskInputStagesRemoved": [
+      "plimsoll-telemetry-input-20261014",
+      "plimsoll-bank-date-input-20261014",
+      "plimsoll-identity-compat-input-20261014",
+      "plimsoll-bank-source-input-20261014"
+    ],
+    "privateShadowCopiesRemoved": 2,
+    "rollbackBackupsRetained": true
+  }
+}

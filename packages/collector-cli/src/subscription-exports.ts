@@ -142,3 +142,23 @@ export function latestSubscriptionExportSummaries(db: Database.Database) {
       note: "Latest export only; overlapping exports are not summed. Included usage is not a cash charge; unreported counters and thread joins remain UNKNOWN." };
   });
 }
+
+/** Cloud-agent IDs are provider-export chat IDs. They do not identify local
+ * Cursor conversations. Keep this control snapshot outside native-event sums. */
+export function latestSubscriptionExportThreadLinks(db: Database.Database) {
+  ensureSubscriptionExportSchema(db);
+  return db.prepare(`select e.provider,e.account_ref as accountRef,e.export_id as exportId,
+    e.source_digest as sourceDigest,e.imported_at as importedAt,d.thread_id as threadId,
+    count(*) as observedRows,count(d.total_tokens) as rowsWithTotalTokens,
+    sum(d.input_tokens) as observedInputTokens,sum(d.output_tokens) as observedOutputTokens,
+    sum(d.cache_read_tokens) as observedCacheReadTokens,sum(d.cache_write_tokens) as observedCacheWriteTokens,
+    sum(d.total_tokens) as observedTotalTokens,max(d.observed_at) as lastObservedAt
+    from subscription_dashboard_exports e join subscription_dashboard_events d on d.export_id=e.export_id
+    where d.thread_id is not null and e.export_id=(select n.export_id from subscription_dashboard_exports n
+      where n.provider=e.provider and n.account_ref=e.account_ref order by n.imported_at desc,n.rowid desc limit 1)
+    group by e.export_id,d.thread_id order by lastObservedAt desc limit 1000`).all() as Array<{
+      provider:string;accountRef:string;exportId:string;sourceDigest:string;importedAt:string;threadId:string;
+      observedRows:number;rowsWithTotalTokens:number;observedInputTokens:number|null;observedOutputTokens:number|null;
+      observedCacheReadTokens:number|null;observedCacheWriteTokens:number|null;observedTotalTokens:number|null;lastObservedAt:string|null;
+    }>;
+}

@@ -17,6 +17,8 @@ export * from "./native-subscription";
 export * from "./native-ledger";
 export * from "./native-telemetry-store";
 export * from "./subscription-exports";
+export { reconcileSubscriptionCharges, parseSubscriptionReconciliationInput } from "./subscription-reconciliation";
+export { readSubscriptionReconciliation } from "./subscription-reconciliation-file";
 export * from "./runtime-facts";
 export * from "./server";
 export * from "./version";

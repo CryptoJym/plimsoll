@@ -59,6 +59,11 @@ four-second deadline and a forced rowid range, so SQLite cannot choose a full
 ledger scan. It preserves the collector's terminal privacy exclusions, native
 duplicate dispositions, and live-versus-tailer authority. Source ledgers are
 opened read-only; a failed read leaves the cursor in place and reports UNKNOWN.
+The same job checks whether an hourly stored-bank refresh is due. Its pinned
+private Python helper reads the existing local tracker, preserves invoice source
+clocks, and replaces only its bank snapshot. It makes no new Plaid/API calls.
+Invoice and provider dashboard acquisition remain separate; the refresh never
+makes cached documents current by changing their timestamps.
 
 The bridge writes only its own small local database and status artifacts:
 
@@ -66,10 +71,81 @@ The bridge writes only its own small local database and status artifacts:
 - `~/Library/Application Support/Plimsoll/subscription-telemetry-status.json`
 - `~/Library/Application Support/Plimsoll/subscription-telemetry.html`
 
-The HTML report refreshes itself when open. It shows current account allowance
-windows, their reset times, provider export timestamps, and recent chats with
-observed or inferred project links. Inferred repository links remain reviewable;
-unknown subscription-account joins and settled spend are not filled in.
+The HTML report refreshes itself when open. It shows account allowance windows,
+captured usage by subscription account, recent chats and project candidates,
+provider export chat IDs, and invoice-to-bank adjudication. Unknown joins remain
+visible. Personal email labels appear only in the private HTML; the JSON and
+sidecar use account references and protected identity evidence.
+
+## Linking chats to subscription accounts and projects
+
+An account join requires identity captured on the event. The native 0.7.47
+collector protects provider account IDs with its boxed SHA-256 derivation;
+tenant-salted assertion hashes use a separate derivation. Generic user/actor
+hashes are preserved separately. In particular, Claude's generic `user.id`
+must not replace its captured `user.account_uuid`.
+
+Codex account IDs come from the authenticated native account feed. Claude
+account UUIDs come from an explicitly registered profile's local metadata,
+checked against both its native email and organization identity. This does not
+assign historical activity from a current login. Missing identities, semantic
+conflicts, collisions and multiple account candidates remain `UNKNOWN`.
+Coverage is reported per chat and per captured event, including chats that span
+accounts. Native allowance freshness remains independent from identity evidence.
+
+Explicit project keys take precedence over repository suggestions. Each
+candidate keeps its source; conflicting suggestions remain reviewable. A Git
+repository link is an inferred project relationship, not evidence that a
+corresponding hosted project was created or accepted.
+The refresh also checks repository metadata for up to 256 stored chat groups
+across the explicitly registered Claude project folders. Starting folders rotate
+under a shared read budget. Repeated directory metadata uses one repository
+lookup per refresh; different repository candidates remain separate.
+
+Cursor cloud-agent IDs supplied by its latest individual export retain the
+export's account scope. They are separate control observations, not extra
+native events. Mapping these IDs to local Cursor conversations or projects is
+`UNKNOWN` without further evidence. Rows without IDs stay unattributed.
+
+## Subscription charges and bank reconciliation
+
+The private `subscription-reconciliation-input.json` binds source clocks and
+SHA-256 evidence to paid invoices and bank transactions. The strict matcher
+requires exact provider, currency and cents, compatible actual payment/posting
+dates, payment-instrument or exact-reference proof, and an unambiguous mapping.
+Amount and date alone never settle a match. Calendar dates keep day precision;
+an invoice's issue date is not substituted for its payment date.
+
+Monthly subscriptions, upgrades/prorations and usage resets remain different
+charge kinds. Pending transactions, removals, refunds and revisions are retained
+outside certified settlement totals. A matching card does not establish the
+subscription login; account identity has its own evidence. Cash allocation to
+chats and projects remains `UNKNOWN` until account usage joins and period
+coverage support it.
+
+The initial bank source is the existing company tracker's stored transactions.
+It is read without DB writes or new Plaid calls. Its importer company label does
+not prove the legal payer. Hosted bank-screen observations lacking stable
+transaction IDs/current posted state remain supplemental `UNKNOWN` evidence and
+are excluded from totals. There is no cross-source summing or guessed card alias.
+The tracker derives `paymentInstrument.lastFour` from a financial account's
+Plaid mask. That field supplies no independent card proof, so bank `cardLast4`
+stays null. Plaid documents that an account's
+[mask can be a displayed account mask and can be non-unique](https://plaid.com/docs/api/accounts/).
+The initial $214.90 candidate was therefore withdrawn from verified settlement
+after this source review. It remains `UNKNOWN` with the other unresolved pairs.
+Positive posted bank debits are displayed separately by source, provider,
+currency and charge kind, within the source's posting window. They do not become
+subscription-account totals. Pending/removed rows, unresolved revisions and
+cross-source summing are excluded; absence of verified matches is `UNKNOWN`,
+not zero dollars spent.
+
+Invoice PDFs, paid-receipt evidence and the reconciliation evidence index stay
+under the private Plimsoll application-support directory. Originals issued with
+an amount due are not relabeled unpaid: paid status comes from the separate
+receipt or native paid-invoice screen. Unavailable documents/currency stay
+`UNKNOWN`. Reprocessing keeps source read/sync times; stale sources mask current
+totals while retaining historical matches as of those sources.
 
 ```sh
 # From the repository root; read-only capability/status inspection.
@@ -132,6 +208,11 @@ is separate from the live-tested individual Cursor adapter.
 pnpm typecheck
 pnpm proof:native-subscription
 pnpm proof:provider-usage
+pnpm proof:native-account-links
+pnpm proof:subscription-reconciliation
+pnpm proof:subscription-reconciliation-file
+pnpm proof:subscription-export-links
+pnpm proof:subscription-bank-source
 ```
 
 The native proof checks freshness and missing-data semantics, privacy exclusions,
