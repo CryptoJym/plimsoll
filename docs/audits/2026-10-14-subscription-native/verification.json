@@ -1,0 +1,298 @@
+{
+  "schema": "plimsoll.subscription-native-verification.v1",
+  "verifiedAt": "2026-10-14T17:34:12.824329+00:00",
+  "snapshotAt": "2026-10-14T17:33:21.089Z",
+  "scope": "Individual subscriptions; API-console accounting remains separate. No bank-charge allocation is certified.",
+  "doneChecks": [
+    {
+      "check": "Native account allowance is collected with per-account freshness and UNKNOWN gaps",
+      "state": "PASSED",
+      "accountRecords": 32,
+      "quotaWindows": 61,
+      "unknownCurrentValuesMasked": true
+    },
+    {
+      "check": "Local thread events are read without scanning or blocking the live ledger",
+      "state": "PASSED",
+      "readState": "observed",
+      "coverage": "incremental",
+      "storedObservedTokenEvents": 4801,
+      "reportThreads": 83,
+      "projectStates": {
+        "inferred": 33,
+        "UNKNOWN": 48,
+        "observed": 2
+      },
+      "hardReadTimeoutMs": 4000,
+      "sourceOpenedReadOnly": true,
+      "earlierHistory": "UNKNOWN",
+      "fleetCompleteness": "UNKNOWN"
+    },
+    {
+      "check": "Subscription dashboard import is scoped and tested; unverified compliance access remains UNKNOWN",
+      "state": "PASSED",
+      "dashboardExports": [
+        {
+          "provider": "cursor",
+          "accountRef": "native:9e5db623e1e293de5017b17740d7486b",
+          "exportId": "fce292e567f72b0f1ed0cc4d97b517fe4bce517894f06e9c40d552825a729a8e",
+          "importedAt": "2026-10-14T17:04:42.870Z",
+          "periodStart": "2026-09-15T00:00:00.000Z",
+          "periodEnd": "2026-10-15T00:00:00.000Z",
+          "scopeState": "declared",
+          "records": 23421,
+          "rowsWithTotalTokens": 22556,
+          "observedTotalTokens": 3198818064,
+          "observedInputTokens": 228682116,
+          "observedOutputTokens": 26118798,
+          "observedCacheReadTokens": 2863647311,
+          "observedCacheWriteTokens": 80369839,
+          "reportedOnDemandUsageUsd": 146.25,
+          "rowsWithThreadId": 14,
+          "firstObservedAt": "2026-09-15T00:26:19.533Z",
+          "lastObservedAt": "2026-10-14T16:49:37.771Z",
+          "completeness": "UNKNOWN",
+          "settledBankChargeUsd": null,
+          "note": "Latest export only; overlapping exports are not summed. Included usage is not a cash charge; unreported counters and thread joins remain UNKNOWN."
+        }
+      ],
+      "controlComparisons": [
+        {
+          "state": "UNKNOWN",
+          "note": "UNKNOWN reconciliation: the Cursor dashboard displayed approximately 1.9B tokens for the selected view, while CSV row totals sum to 3,198,818,064. The scope/counting difference is unverified; 865 CSV rows have no token total."
+        }
+      ],
+      "freshProviderExportAutomation": "UNKNOWN"
+    },
+    {
+      "check": "Recurring installed runtime and newly produced artifacts are verified",
+      "state": "PASSED",
+      "jobLabel": "com.utlyze.plimsoll-subscription-telemetry",
+      "configuredIntervalSeconds": 60,
+      "lastExitStatus": 0,
+      "bundleSha256": "23f54d7aa3cb23a13dcd00fb68d0319a516dad994a98f5e117eebb499ced07b4",
+      "receiptMatchesBundle": true,
+      "installedAt": "2026-10-14T17:30:12.837310+00:00",
+      "successfulRunsAfterInstall": 4,
+      "latestScheduledRun": {
+        "status": "subscription_telemetry_refreshed",
+        "observedAt": "2026-10-14T17:33:21.089Z",
+        "schema": "plimsoll.native-subscription.v1",
+        "quotaRecords": 61,
+        "quotaInserted": 0,
+        "quotaReplayed": 53,
+        "quotaRevised": 8,
+        "threadRecords": 5,
+        "threadInserted": 0,
+        "threadReplayed": 5,
+        "threadRevised": 0,
+        "ledgerInserted": 283,
+        "ledgerReplayed": 0,
+        "ledgerReadState": "observed",
+        "ledgerCoverage": "incremental",
+        "hasMore": false,
+        "earlierHistory": "UNKNOWN",
+        "exportFiles": 1,
+        "exportErrors": 0,
+        "observedTokenEvents": 4801
+      }
+    }
+  ],
+  "providerStates": [
+    {
+      "provider": "openai",
+      "accountCount": 20,
+      "subscription": {
+        "state": "partial",
+        "authority": "native_local",
+        "note": "Authenticated native account metadata and quota windows were observed locally."
+      },
+      "quota": {
+        "state": "partial",
+        "snapshotCount": 26,
+        "freshSnapshotCount": 13,
+        "note": "Quota values are native account readings; missing values are UNKNOWN."
+      },
+      "threadTelemetry": {
+        "state": "partial",
+        "eventCount": 2593,
+        "sources": [
+          "codex"
+        ],
+        "latestObservedAt": "2026-10-14T17:33:19.611Z",
+        "tokenState": "partial",
+        "note": "Bounded local thread events observed; historical and fleet completeness are UNKNOWN. Subscription quota cannot be converted to token totals or cash."
+      },
+      "dashboardExport": {
+        "state": "partial",
+        "access": "unknown",
+        "scope": "individual subscription",
+        "route": "ChatGPT/Codex usage dashboard",
+        "note": "Native dashboard was inspected at 2026-10-14T17:04:05.353Z; token export availability remains UNKNOWN."
+      },
+      "complianceExport": {
+        "state": "unknown",
+        "access": "unknown",
+        "route": "OpenAI Compliance API",
+        "scope": "eligibility/admin-controlled",
+        "note": "The documented surface is separate from the personal subscription; entitlement is UNKNOWN."
+      }
+    },
+    {
+      "provider": "anthropic",
+      "accountCount": 10,
+      "subscription": {
+        "state": "verified",
+        "authority": "native_local",
+        "note": "Authenticated native account metadata and quota windows were observed locally."
+      },
+      "quota": {
+        "state": "verified",
+        "snapshotCount": 30,
+        "freshSnapshotCount": 30,
+        "note": "Quota values are native account readings; missing values are UNKNOWN."
+      },
+      "threadTelemetry": {
+        "state": "partial",
+        "eventCount": 1750,
+        "sources": [
+          "claude_code"
+        ],
+        "latestObservedAt": "2026-10-14T17:33:20.603Z",
+        "tokenState": "partial",
+        "note": "Bounded local thread events observed; historical and fleet completeness are UNKNOWN. Subscription quota cannot be converted to token totals or cash."
+      },
+      "dashboardExport": {
+        "state": "partial",
+        "access": "unknown",
+        "scope": "individual subscription",
+        "route": "Claude usage surface",
+        "note": "Native dashboard was inspected at 2026-10-14T17:04:05.353Z; token export availability remains UNKNOWN."
+      },
+      "complianceExport": {
+        "state": "unknown",
+        "access": "unknown",
+        "route": "Claude Code Analytics/Admin API",
+        "scope": "organization admin",
+        "note": "Individual-account admin access is not proven; subscription usage stays on the local native source."
+      }
+    },
+    {
+      "provider": "cursor",
+      "accountCount": 1,
+      "subscription": {
+        "state": "verified",
+        "authority": "native_local",
+        "note": "Plan was verified in the account-matched native dashboard; this does not certify settled payment."
+      },
+      "quota": {
+        "state": "unknown",
+        "snapshotCount": 3,
+        "freshSnapshotCount": 0,
+        "note": "Quota values are native account readings; missing values are UNKNOWN."
+      },
+      "threadTelemetry": {
+        "state": "partial",
+        "eventCount": 2762,
+        "sources": [
+          "cursor_tracking_db"
+        ],
+        "latestObservedAt": "2026-09-22T00:40:30.583Z",
+        "tokenState": "unknown",
+        "note": "Conversation/model observations are present; the local database has no token counters."
+      },
+      "dashboardExport": {
+        "state": "verified",
+        "access": "connected",
+        "scope": "individual subscription",
+        "route": "Cursor individual usage dashboard/export",
+        "note": "CSV export was verified in the native individual dashboard at 2026-10-14T17:04:05.353Z; import freshness is reported separately."
+      },
+      "complianceExport": {
+        "state": "unknown",
+        "access": "unknown",
+        "route": "Cursor team Analytics/Admin API",
+        "scope": "team admin",
+        "note": "Teams are out of scope here; individual dashboard export remains the relevant route."
+      }
+    },
+    {
+      "provider": "xai",
+      "accountCount": 1,
+      "subscription": {
+        "state": "verified",
+        "authority": "native_local",
+        "note": "Authenticated native account metadata and quota windows were observed locally."
+      },
+      "quota": {
+        "state": "partial",
+        "snapshotCount": 2,
+        "freshSnapshotCount": 1,
+        "note": "Quota values are native account readings; missing values are UNKNOWN."
+      },
+      "threadTelemetry": {
+        "state": "unknown",
+        "eventCount": 0,
+        "sources": [],
+        "latestObservedAt": null,
+        "tokenState": "unknown",
+        "note": "No events for this source in the bounded sample; total usage is UNKNOWN."
+      },
+      "dashboardExport": {
+        "state": "unknown",
+        "access": "unknown",
+        "route": "Grok account usage surface",
+        "scope": "personal subscription",
+        "note": "No dashboard export was imported in this run."
+      },
+      "complianceExport": {
+        "state": "unknown",
+        "access": "unknown",
+        "route": "xAI management/usage API",
+        "scope": "API management",
+        "note": "No documented personal subscription compliance export was verified."
+      }
+    }
+  ],
+  "validation": {
+    "typecheck": "PASSED",
+    "proof:native-subscription": "PASSED",
+    "proof:provider-usage": "PASSED",
+    "git diff --check": "PASSED",
+    "noInventedThreadCashAllocation": true,
+    "taskBrowserTabsClosed": true,
+    "sharedBrowserPreserved": true
+  },
+  "unknowns": [
+    "Earlier token history and fleet completeness",
+    "Exact subscription-wide token totals for OpenAI, Claude and Grok",
+    "Subscription-account joins for local thread events",
+    "Grok per-thread tokens and external OpenTelemetry delivery",
+    "Individual compliance/Admin API entitlement",
+    "Cursor dashboard-chart versus CSV counting/scope difference",
+    "Fresh provider-side export automation",
+    "Settled bank charges and thread/project cash allocation"
+  ],
+  "artifacts": {
+    "html": "/Users/utlyze/Library/Application Support/Plimsoll/subscription-telemetry.html",
+    "status": "/Users/utlyze/Library/Application Support/Plimsoll/subscription-telemetry-status.json",
+    "sidecar": "/Users/utlyze/Library/Application Support/Plimsoll/native-subscription.sqlite",
+    "installReceipt": "/Users/utlyze/Library/Application Support/Plimsoll/subscription-native-install-receipt.json"
+  },
+  "sourceSha256": {
+    "package.json": "dce6638cb88be99a6602169bcdc13f2c9c059186259a74b2426bc8fd7a06dd8a",
+    "packages/collector-cli/src/cli.ts": "978c54ee8f79f8c650416299ff3bf384de06b0f1d8e34273f91610bd5f4b1035",
+    "packages/collector-cli/src/index.ts": "16ae81765bc5d5f17501206401f71a80f01123fe48d0b498158440e1ff4e298c",
+    "packages/collector-cli/src/provider-usage.ts": "99632510d29756b7f5d253b4eaa61194ead216bfa273b0f2a373ff82e87fea01",
+    "packages/collector-cli/src/native-subscription.ts": "279aca6ff7c2267d56af5a97e52f5f20555c708477e9fa2f9865696a1ecfcb3c",
+    "packages/collector-cli/src/native-ledger.ts": "f055167326f15362ec361fae3614640951c400d65b82f0bc8b8b9801e060b026",
+    "packages/collector-cli/src/native-telemetry-store.ts": "9547c4f85dfd540b23283bcabdc69e745fb98e8200fca1a7f6a8974952b72b18",
+    "packages/collector-cli/src/subscription-exports.ts": "704dd285a51a735eba26ffc0c5f409bca7ee98f1a73c2871784c35ebc30bfd29",
+    "packages/collector-cli/src/subscription-refresh.ts": "f1e7126d3e8eb5b603e85db568472f9ab3d98338853522c811ced17dc5c17871",
+    "scripts/native-subscription-proof.ts": "77ab8dee967b323c0c82a36af69c96880ac0eb01ee0d5041a7232ccd0f0d9dc4",
+    "scripts/provider-usage-proof.ts": "c592dfc6feebd42be1c2d95600dcde19942a468b41ab1b39707553ec434a0a91",
+    "scripts/subscription-native-refresh.ts": "c7fdf3c724332397067ac17e5eae0a3a8b838487ce4ab1084ea9281cc8e0eeeb",
+    "scripts/install-subscription-native-refresh.ts": "f43e902df1c336362f143a4adbd436feb04c4770689accbde892c0544a5260e6",
+    "docs/provider-usage-reconciliation.md": "e076780755322545be4366cfdf459aa3cd4aa581fcfef98ca5d2bae35d250a85"
+  }
+}

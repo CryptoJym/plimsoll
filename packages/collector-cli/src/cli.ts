@@ -221,6 +221,23 @@ import {
 } from "./managed-config-reconcile";
 import { runOutcomesSync } from "./outcomes-sync";
 import {
+  adjudicateProviderUsage,
+  ensureProviderUsageSchema,
+  importProviderUsage,
+  normalizeProviderPayload,
+  parseProviderUsageCsv,
+  providerUsageCapabilities,
+  readProviderUsageRows,
+  type ProviderName,
+  type ProviderUsageSource,
+} from "./provider-usage";
+import {
+  defaultNativeSubscriptionPaths,
+  inspectNativeSubscriptionSurfaces,
+} from "./native-subscription";
+import { collectNativeTelemetry, nativeTelemetryReport } from "./native-telemetry-store";
+import { importCursorSubscriptionExport, parseCursorSubscriptionCsv } from "./subscription-exports";
+import {
   GitHubRestOutcomeTimelineAdapter,
   readRequiredCheckPolicy,
   runOutcomeTimelineBackfill,
@@ -308,6 +325,17 @@ Commands:
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
+  usage status           Show provider API and subscription-native capability status
+  usage native-status    Read local Pro/Max quota and thread surfaces (read-only)
+  usage native-import    Import local native quota and thread observations
+                        (use --dry-run to preview)
+  usage native-report    Report captured tokens and reviewable thread/project links
+  usage dashboard-import --provider cursor --file CSV --account-ref LABEL
+                        Import an individual subscription dashboard CSV
+  usage import --provider PROVIDER --file JSON|CSV [--format json|csv] [--dry-run]
+                        Import a documented provider usage/cost or dashboard export locally
+  usage report [--local-source codex|claude_code|grok]
+                        Compare provider snapshots with local thread capture
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   forward-hook-http SOURCE
                         Forward stdin to the authenticated loopback hook boundary without argv secrets
@@ -2162,6 +2190,7 @@ async function main() {
     "unload-launch-agent",
     "uninstall-launch-agent",
     "lifecycle",
+    "usage",
   ]);
   const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
@@ -2176,6 +2205,150 @@ async function main() {
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
+
+  if (command === "usage") {
+    const subcommand = process.argv[3] ?? "status";
+    if (subcommand === "status") {
+      const native = inspectNativeSubscriptionSurfaces();
+      const provider = Object.fromEntries(native.providers.map((item) => [item.provider, {
+        subscription: item.subscription,
+        quota: item.quota,
+        threadTelemetry: item.threadTelemetry,
+        dashboardExport: item.dashboardExport,
+        complianceExport: item.complianceExport,
+      }]));
+      console.log(JSON.stringify({
+        schema: "plimsoll.provider-usage.capabilities.v1",
+        status: "capability_inventory",
+        apiConsoleCapabilities: providerUsageCapabilities(),
+        subscriptionTracking: native.collector.available ? "native_local" : "UNKNOWN",
+        subscriptionCollector: native.collector,
+        subscriptionMetadata: native.metadata,
+        subscriptionSources: provider,
+        note: "configured means an environment variable exists; it does not prove provider authentication or admin scope",
+      }, null, 2));
+      return;
+    }
+    if (subcommand === "native-status") {
+      const native = inspectNativeSubscriptionSurfaces();
+      const { quotaSnapshots, threadObservations, ledgerReading, ...status } = native;
+      console.log(JSON.stringify({
+        ...status,
+        quotaSnapshotCount: quotaSnapshots.length,
+        threadObservationCount: threadObservations.length,
+        note: "Raw account identifiers and event bodies are omitted; account references are hashed. UNKNOWN means no current native proof was read.",
+      }, null, 2));
+      return;
+    }
+    if (subcommand === "native-import") {
+      if (flag("--dry-run")) {
+        const native = inspectNativeSubscriptionSurfaces();
+        const preview = {
+        status: "native_subscription_import_preview",
+        collector: native.collector,
+        providers: native.providers.map((item) => ({
+          provider: item.provider,
+          accountCount: item.accountCount,
+          subscription: item.subscription,
+          quota: item.quota,
+          threadTelemetry: item.threadTelemetry,
+        })),
+        quotaRecords: native.quotaSnapshots.length,
+        threadRecords: native.threadObservations.length,
+        dryRun: flag("--dry-run"),
+        };
+        console.log(JSON.stringify(preview, null, 2));
+        return;
+      }
+      ensureCollectorHome();
+      const database = new Database(defaultNativeSubscriptionPaths().nativeSubscriptionDb, { timeout: 5_000 });
+      try {
+        fs.chmodSync(defaultNativeSubscriptionPaths().nativeSubscriptionDb, 0o600);
+        const { receipt } = collectNativeTelemetry(database);
+        console.log(JSON.stringify({ status: "native_subscription_imported", ...receipt }, null, 2));
+      } finally { database.close(); }
+      return;
+    }
+    if (subcommand === "native-report") {
+      ensureCollectorHome();
+      const database = new Database(defaultNativeSubscriptionPaths().nativeSubscriptionDb, { timeout: 5_000 });
+      try { console.log(JSON.stringify(nativeTelemetryReport(database), null, 2)); }
+      finally { database.close(); }
+      return;
+    }
+    if (subcommand === "dashboard-import") {
+      if (optionValue("--provider") !== "cursor") throw new Error("subscription_dashboard_provider_unverified; only the verified Cursor CSV shape is supported");
+      const file = optionValue("--file"), accountRef = optionValue("--account-ref");
+      if (!file || !accountRef) throw new Error("Usage: plimsoll usage dashboard-import --provider cursor --file CSV --account-ref NON_SECRET_LABEL");
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32 * 1024 * 1024) throw new Error("subscription_dashboard_file_invalid");
+      const csv = fs.readFileSync(file, "utf8");
+      if (flag("--dry-run")) {
+        console.log(JSON.stringify({ status: "subscription_export_preview", provider: "cursor", records: parseCursorSubscriptionCsv(csv).length, dryRun: true }, null, 2));
+        return;
+      }
+      ensureCollectorHome();
+      const database = new Database(defaultNativeSubscriptionPaths().nativeSubscriptionDb, { timeout: 5_000 });
+      try {
+        fs.chmodSync(defaultNativeSubscriptionPaths().nativeSubscriptionDb, 0o600);
+        console.log(JSON.stringify({ status: "subscription_dashboard_imported", ...importCursorSubscriptionExport(database,csv,{
+          accountRef,periodStart: optionValue("--period-start"),periodEnd: optionValue("--period-end"),
+        }) },null,2));
+      } finally { database.close(); }
+      return;
+    }
+    const providerValue = optionValue("--provider") ?? process.argv[4];
+    const providerNames = new Set<ProviderName>(["openai", "anthropic", "xai", "cursor"]);
+    if (subcommand === "import") {
+      if (!providerValue || !providerNames.has(providerValue as ProviderName)) {
+        throw new Error("Usage: plimsoll usage import --provider openai|anthropic|xai|cursor --file RESPONSE.json [--dry-run]");
+      }
+      const file = optionValue("--file");
+      if (!file) throw new Error("usage import requires --file RESPONSE.json");
+      const stat = fs.statSync(file);
+      if (!stat.isFile() || stat.size > 16 * 1024 * 1024) throw new Error("usage import file is missing or exceeds 16 MiB");
+      const format = (optionValue("--format") ?? (path.extname(file).replace(/^\./, "") || "json")).toLowerCase();
+      const payload = format === "csv"
+        ? parseProviderUsageCsv(fs.readFileSync(file, "utf8"))
+        : JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+      const source = optionValue("--source") as ProviderUsageSource | undefined;
+      const records = normalizeProviderPayload(providerValue as ProviderName, payload, {
+        accountRef: optionValue("--account-ref") ?? null,
+        observedAt: optionValue("--observed-at"),
+        periodStart: optionValue("--period-start"),
+        periodEnd: optionValue("--period-end"),
+        source,
+      });
+      if (flag("--dry-run")) {
+        console.log(JSON.stringify({ status: "provider_usage_import_preview", provider: providerValue, format, records: records.length, dryRun: true }, null, 2));
+        return;
+      }
+      ensureCollectorHome();
+      const database = new Database(collectorBufferPath(), { timeout: 5_000 });
+      try {
+        const receipt = importProviderUsage(database, records);
+        console.log(JSON.stringify({ status: "provider_usage_imported", ...receipt }, null, 2));
+      } finally { database.close(); }
+      return;
+    }
+    if (subcommand === "report") {
+      ensureCollectorHome();
+      const database = new Database(collectorBufferPath(), { timeout: 5_000 });
+      try {
+        ensureProviderUsageSchema(database);
+        const adjudications = adjudicateProviderUsage(database, { localSource: optionValue("--local-source") ?? null });
+        const rows = readProviderUsageRows(database);
+        console.log(JSON.stringify({
+          schema: "plimsoll.provider-usage.adjudication.v1",
+          status: "provider_usage_adjudicated",
+          snapshots: rows.length,
+          adjudications,
+        }, null, 2));
+      } finally { database.close(); }
+      return;
+    }
+    throw new Error("Usage: plimsoll usage status | usage native-status | usage native-import [--dry-run] | usage import --provider PROVIDER --file RESPONSE.json|CSV [--format json|csv] | usage report [--local-source SOURCE]");
+  }
 
   if (command === "enroll-codex-live-producer") {
     const optionNames = new Set(["--producer-id", "--credential-id", "--capture-root-id"]);
