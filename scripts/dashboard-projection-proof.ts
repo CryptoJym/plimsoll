@@ -2706,7 +2706,9 @@ async function main() {
 
     let legacy = new LocalEventBuffer(legacyPath);
     legacy.database.prepare(`update buffered_events set created_at='2000-01-01T00:00:00.000Z',uploaded_at=? where rowid=1`).run(NOW.toISOString());
-    const migrationPrune=legacy.prune(90);
+    // Retention runs on the fixture clock like every other step here: on the
+    // wall clock, the rows stamped NOW passed the 90-day window on 2026-10-13.
+    const migrationPrune=legacy.prune(90,{now:NOW});
     check("legacy_constructor_does_not_scan_or_materialize_history",
       (legacy.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n === 0 &&
       legacy.projection.status().backfill.highWater === null&&

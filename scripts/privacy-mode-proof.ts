@@ -58,6 +58,12 @@ type SentinelFixture = {
 };
 
 const startedAt = Date.now();
+const DAY_MS = 24 * 60 * 60 * 1_000;
+// Fixture rows are stamped on the previous UTC day. Delivery measures the
+// oldest pending row against the wall clock (a 90-day budget), so rows with
+// fixed 2026-07-17 stamps paused legacy migration from 2026-10-15 on.
+const FIXTURE_DAY = new Date(startedAt - DAY_MS).toISOString().slice(0, 10);
+const FIXTURE_NEXT_YEAR_DAY = new Date(startedAt + 364 * DAY_MS).toISOString().slice(0, 10);
 const repoRoot = process.cwd();
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-privacy-mode-proof-"));
 // runCli inherits process.env, and `setup` derives its Gemini and Grok targets
@@ -555,7 +561,7 @@ async function main() {
     source: "codex",
     dataMode: "evidence",
     eventType: "user_prompt_submit",
-    observedAt: "2026-07-17T12:00:00.000Z",
+    observedAt: `${FIXTURE_DAY}T12:00:00.000Z`,
     actionClass: "other",
     metadata: { prompt: fixture.sentinels.prompt },
   };
@@ -581,7 +587,7 @@ async function main() {
     source: "codex",
     dataMode: "metadata",
     eventType: "assistant_response",
-    observedAt: "2026-07-17T12:00:01.000Z",
+    observedAt: `${FIXTURE_DAY}T12:00:01.000Z`,
     actionClass: "other",
     inputTokens: 1,
     outputTokens: 1,
@@ -612,24 +618,24 @@ async function main() {
     "11711711-1111-4111-8111-111111111121",
   ];
   for (const [index, id] of staleEnvelopeIds.entries()) {
-    const envelope = canonicalMetadataEnvelope(id, `2026-07-17T12:00:0${index + 2}.000Z`);
+    const envelope = canonicalMetadataEnvelope(id, `${FIXTURE_DAY}T12:00:0${index + 2}.000Z`);
     outboxInsert.run({
       id,
       rawRowid: evidenceRawRowid,
       envelope,
       bytes: Buffer.byteLength(envelope),
-      at: `2026-07-17T12:00:00.${index + 5}00Z`,
+      at: `${FIXTURE_DAY}T12:00:00.${index + 5}00Z`,
     });
   }
 
   const nullRawId = "11711711-1111-4111-8111-111111111122";
-  const nullRawEnvelope = canonicalMetadataEnvelope(nullRawId, "2026-07-17T12:00:04.000Z");
+  const nullRawEnvelope = canonicalMetadataEnvelope(nullRawId, `${FIXTURE_DAY}T12:00:04.000Z`);
   outboxInsert.run({
     id: nullRawId,
     rawRowid: null,
     envelope: nullRawEnvelope,
     bytes: Buffer.byteLength(nullRawEnvelope),
-    at: "2026-07-17T12:00:04.000Z",
+    at: `${FIXTURE_DAY}T12:00:04.000Z`,
   });
 
   const deletedRawId = "11711711-1111-4111-8111-111111111123";
@@ -641,16 +647,16 @@ async function main() {
     )
     .run({
       id: deletedRawId,
-      at: "2026-07-17T12:00:05.000Z",
-      payload: canonicalMetadataEnvelope(deletedRawId, "2026-07-17T12:00:05.000Z"),
+      at: `${FIXTURE_DAY}T12:00:05.000Z`,
+      payload: canonicalMetadataEnvelope(deletedRawId, `${FIXTURE_DAY}T12:00:05.000Z`),
     });
-  const deletedRawEnvelope = canonicalMetadataEnvelope(deletedRawId, "2026-07-17T12:00:05.000Z");
+  const deletedRawEnvelope = canonicalMetadataEnvelope(deletedRawId, `${FIXTURE_DAY}T12:00:05.000Z`);
   outboxInsert.run({
     id: deletedRawId,
     rawRowid: Number(deletedRaw.lastInsertRowid),
     envelope: deletedRawEnvelope,
     bytes: Buffer.byteLength(deletedRawEnvelope),
-    at: "2026-07-17T12:00:05.000Z",
+    at: `${FIXTURE_DAY}T12:00:05.000Z`,
   });
   legacyBuffer.database
     .prepare(`delete from buffered_events where rowid = ?`)
@@ -665,16 +671,16 @@ async function main() {
     )
     .run({
       id: terminalRawId,
-      at: "2026-07-17T12:00:06.000Z",
-      payload: JSON.stringify({ ...safeEvent, id: terminalRawId, observedAt: "2026-07-17T12:00:06.000Z" }),
+      at: `${FIXTURE_DAY}T12:00:06.000Z`,
+      payload: JSON.stringify({ ...safeEvent, id: terminalRawId, observedAt: `${FIXTURE_DAY}T12:00:06.000Z` }),
     });
-  const terminalEnvelope = canonicalMetadataEnvelope(terminalRawId, "2026-07-17T12:00:06.000Z");
+  const terminalEnvelope = canonicalMetadataEnvelope(terminalRawId, `${FIXTURE_DAY}T12:00:06.000Z`);
   outboxInsert.run({
     id: terminalRawId,
     rawRowid: Number(terminalRaw.lastInsertRowid),
     envelope: terminalEnvelope,
     bytes: Buffer.byteLength(terminalEnvelope),
-    at: "2026-07-17T12:00:06.000Z",
+    at: `${FIXTURE_DAY}T12:00:06.000Z`,
   });
   legacyBuffer.database
     .prepare(
@@ -682,7 +688,7 @@ async function main() {
        (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
        values (?,'dead','local_evidence_quarantined','local_validation',0,?,?)`,
     )
-    .run(terminalRawId, "2026-07-17T12:00:06.000Z", "2026-07-17T12:00:06.500Z");
+    .run(terminalRawId, `${FIXTURE_DAY}T12:00:06.000Z`, `${FIXTURE_DAY}T12:00:06.500Z`);
   const migration = legacyBuffer.delivery.migrateLegacy();
   const legacyUploadBodies: string[] = [];
   const legacyUpload = await uploadBufferedEvents(metadataConfig, legacyBuffer, {
@@ -839,7 +845,7 @@ async function main() {
     source: "codex",
     dataMode: "metadata",
     eventType: "assistant_response",
-    observedAt: "2026-07-17T12:10:00.000Z",
+    observedAt: `${FIXTURE_DAY}T12:10:00.000Z`,
     sessionId: terminalSessionId,
     actionClass: "other",
     inputTokens: 31,
@@ -860,24 +866,24 @@ async function main() {
     terminalBuffer.database,
     terminalRow.rawRowid,
     "local_privacy_violation",
-    "2026-07-17T12:10:01.000Z",
+    `${FIXTURE_DAY}T12:10:01.000Z`,
   );
   const terminalMarkUploaded = terminalBuffer.markUploaded([terminalEvent.id]);
   const terminalSnapshots = collectSessionSnapshots(terminalBuffer.database, {
-    until: "2027-07-17T12:11:00.000Z",
+    until: `${FIXTURE_NEXT_YEAR_DAY}T12:11:00.000Z`,
   });
   const terminalLinks = collectSessionLinks(terminalBuffer.database, {
-    since: "2026-07-17T12:00:00.000Z",
-    until: "2027-07-17T12:11:00.000Z",
+    since: `${FIXTURE_DAY}T12:00:00.000Z`,
+    until: `${FIXTURE_NEXT_YEAR_DAY}T12:11:00.000Z`,
   });
   const terminalPulls = [{
     number: 117,
     state: "closed",
     merged: true,
-    mergedAt: "2026-07-17T12:10:30.000Z",
+    mergedAt: `${FIXTURE_DAY}T12:10:30.000Z`,
     branchHash: `sha256:${"b".repeat(64)}`,
     headSha: "c".repeat(40),
-    updatedAt: "2026-07-17T12:10:30.000Z",
+    updatedAt: `${FIXTURE_DAY}T12:10:30.000Z`,
     checks: "passed" as const,
     checksFetched: true,
   }];
@@ -896,7 +902,7 @@ async function main() {
     reworkWindowDays: 7,
   });
   for (let pass = 0; pass < 4; pass += 1) {
-    terminalBuffer.projection.runMaintenance(new Date("2026-07-17T12:11:00.000Z"));
+    terminalBuffer.projection.runMaintenance(new Date(`${FIXTURE_DAY}T12:11:00.000Z`));
   }
   const terminalDashboardFacts = (
     terminalBuffer.database
@@ -908,7 +914,7 @@ async function main() {
   const terminalAttributionBodies: string[] = [];
   const terminalAttribution = await runAttributionRepair(metadataConfig, {
     ledgerPath: terminalLedger,
-    until: "2027-07-17T12:11:00.000Z",
+    until: `${FIXTURE_NEXT_YEAR_DAY}T12:11:00.000Z`,
     delayMs: 0,
     sleep: async () => undefined,
     log: () => undefined,
@@ -925,7 +931,7 @@ async function main() {
     full: true,
     ledgerPath: terminalLedger,
     statePath: path.join(terminalHome, "backfill-state.json"),
-    until: "2027-07-17T12:11:00.000Z",
+    until: `${FIXTURE_NEXT_YEAR_DAY}T12:11:00.000Z`,
     delayMs: 0,
     sleep: async () => undefined,
     log: () => undefined,
@@ -1004,7 +1010,7 @@ async function main() {
     delivery: { enabled: true, limits: metadataConfig.delivery },
   });
   const recycledId = "11711711-1111-4111-8111-111111111132";
-  const recycledAt = "2026-07-17T12:12:00.000Z";
+  const recycledAt = `${FIXTURE_DAY}T12:12:00.000Z`;
   const recycledEvidence = {
     ...evidenceEvent,
     id: recycledId,
@@ -1095,7 +1101,7 @@ async function main() {
   const recycledListed = recycledBuffer.list().some((row) => row.id === recycledId);
   rawStates.push(recycledState());
   const recycledSnapshots = collectSessionSnapshots(recycledBuffer.database, {
-    until: "2026-07-17T12:13:00.000Z",
+    until: `${FIXTURE_DAY}T12:13:00.000Z`,
   });
   const recycledBodies: string[] = [];
   const recycledUpload = await uploadBufferedEvents(metadataConfig, recycledBuffer, {
@@ -1109,7 +1115,7 @@ async function main() {
   });
   rawStates.push(recycledState());
   for (let pass = 0; pass < 4; pass += 1) {
-    recycledBuffer.projection.runMaintenance(new Date("2026-07-17T12:13:00.000Z"));
+    recycledBuffer.projection.runMaintenance(new Date(`${FIXTURE_DAY}T12:13:00.000Z`));
   }
   const recycledRaw = recycledBuffer.database
     .prepare(
@@ -1212,7 +1218,7 @@ async function main() {
     delivery: { enabled: true, limits: metadataConfig.delivery },
   });
   const partialId = "11711711-1111-4111-8111-111111111134";
-  const partialAt = "2026-07-17T12:14:00.000Z";
+  const partialAt = `${FIXTURE_DAY}T12:14:00.000Z`;
   const partialEvent = aiInteractionEventSchema.parse({ ...safeEvent,
     id: partialId, observedAt: partialAt,
     sessionId: "11711711-1111-4111-8111-111111111135",
@@ -1303,7 +1309,7 @@ async function main() {
   const beforeRemoteRace = aiInteractionEventSchema.parse({
     ...safeEvent,
     id: "11711711-1111-4111-8111-111111111125",
-    observedAt: "2026-07-17T12:00:07.000Z",
+    observedAt: `${FIXTURE_DAY}T12:00:07.000Z`,
     metadata: { admission: "before-remote-race" },
   });
   raceBuffer.append(beforeRemoteRace);
@@ -1336,7 +1342,7 @@ async function main() {
   const afterRemoteRace = aiInteractionEventSchema.parse({
     ...safeEvent,
     id: "11711711-1111-4111-8111-111111111126",
-    observedAt: "2026-07-17T12:00:08.000Z",
+    observedAt: `${FIXTURE_DAY}T12:00:08.000Z`,
     metadata: { admission: "after-remote-race" },
   });
   raceBuffer.append(afterRemoteRace);
