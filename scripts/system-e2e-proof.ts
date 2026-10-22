@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { assertDashboardRss, type DashboardRssMeasurement } from "./resource-proof/dashboard-resources";
 
 import {
   LEARNING_ANALYSIS_VERSION,
@@ -76,6 +77,9 @@ type PhaseReceipt = {
     blockInputOperations: number;
     blockOutputOperations: number;
     capturedOutputBytes: number;
+    rssSampleWindowMs?: number;
+    rssSampleCount?: number;
+    rssScope?: "owned-dashboard-process-tree";
   };
 };
 
@@ -354,6 +358,7 @@ function runSupportingProof(options: {
   temp: string;
   requiredAssertions: string[];
   receipt?: string;
+  dashboardRssReceipt?: string;
   sourceHeadCommit: string;
   testedTreeCommit: string;
 }): PhaseReceipt {
@@ -392,7 +397,10 @@ function runSupportingProof(options: {
   const cpuMs = Math.round(
     (parseTimeMetric(result.stderr, "user") + parseTimeMetric(result.stderr, "sys")) * 1_000,
   );
-  const maxRssBytes = parseTimeMetric(result.stderr, "maximum resident set size");
+  const dashboardRss = options.dashboardRssReceipt
+    ? JSON.parse(fs.readFileSync(options.dashboardRssReceipt, "utf8")) as DashboardRssMeasurement : undefined;
+  if (dashboardRss) assertDashboardRss(dashboardRss);
+  const maxRssBytes = dashboardRss?.maxRssBytes ?? parseTimeMetric(result.stderr, "maximum resident set size");
   const blockInputOperations = parseTimeMetric(result.stderr, "block input operations");
   const blockOutputOperations = parseTimeMetric(result.stderr, "block output operations");
   const capturedOutputBytes = Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr);
@@ -400,7 +408,9 @@ function runSupportingProof(options: {
     wallMs <= SUPPORTING_PROOF_TIMEOUT_MS,
     `${options.name} exceeded its ${SUPPORTING_PROOF_TIMEOUT_MS / 1_000}s wall budget`,
   );
-  assert.ok(maxRssBytes <= BUDGETS.maxRssBytes, `${options.name} exceeded RSS budget`);
+  assert.ok(maxRssBytes <= BUDGETS.maxRssBytes,
+    `${options.name} exceeded RSS budget: maxRssBytes=${maxRssBytes} budgetBytes=${BUDGETS.maxRssBytes} ` +
+    `sampleWindowMs=${dashboardRss?.sampleWindowMs ?? wallMs}`);
   assert.ok(capturedOutputBytes <= 12 * 1024 * 1024, `${options.name} exceeded output budget`);
   if (options.receipt) {
     assert.ok(fs.existsSync(options.receipt), `${options.name} did not write its selected receipt`);
@@ -458,6 +468,8 @@ function runSupportingProof(options: {
       blockInputOperations,
       blockOutputOperations,
       capturedOutputBytes,
+      ...(dashboardRss ? { rssSampleWindowMs: dashboardRss.sampleWindowMs,
+        rssSampleCount: dashboardRss.samples, rssScope: dashboardRss.scope } : {}),
     },
   };
   const phasePath = path.join(evidenceRoot, "phases", `${options.name}.json`);
@@ -1198,12 +1210,15 @@ async function main() {
     testedTreeCommit,
   });
   const resourceReceiptPath = path.join(evidenceRoot, "resource.json");
+  const dashboardRssReceiptPath = path.join(evidenceRoot, "dashboard-rss.json");
   const resource = runSupportingProof({
     name: "idle_dashboard_resources",
     kind: "json_receipt",
     script: "scripts/resource-proof/index.ts",
-    args: ["--require-integrated", "--receipt", resourceReceiptPath],
+    args: ["--require-integrated", "--receipt", resourceReceiptPath,
+      "--dashboard-rss-receipt", dashboardRssReceiptPath],
     receipt: resourceReceiptPath,
+    dashboardRssReceipt: dashboardRssReceiptPath,
     home: machineAHome,
     temp: machineATmp,
     requiredAssertions: [

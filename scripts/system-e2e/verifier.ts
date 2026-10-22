@@ -141,12 +141,15 @@ function verifyMeasurements(
   exactKeys(rss, ["controllerMaxBytes", "maxBytes"], "RSS measurements");
   const controllerRss = nonnegative(rss.controllerMaxBytes, "controller RSS");
   const maxRss = nonnegative(rss.maxBytes, "maximum RSS");
-  assert.ok(maxRss <= SYSTEM_E2E_BUDGETS.maxRssBytes, "RSS budget exceeded");
+  assert.ok(maxRss <= SYSTEM_E2E_BUDGETS.maxRssBytes,
+    `RSS budget exceeded: maxRssBytes=${maxRss} budgetBytes=${SYSTEM_E2E_BUDGETS.maxRssBytes} sampleWindowMs=${wallMs}`);
 
   const phaseMeasurements = array(measurements.phases, "phase measurements").map((entry, index) => {
     exactKeys(
       entry,
-      ["name", "wallMs", "cpuMs", "maxRssBytes", "blockInputOperations", "blockOutputOperations", "capturedOutputBytes"],
+      ["name", "wallMs", "cpuMs", "maxRssBytes", "blockInputOperations", "blockOutputOperations", "capturedOutputBytes",
+        ...(object(entry, `phase measurement ${index}`).name === "idle_dashboard_resources"
+          ? ["rssSampleWindowMs", "rssSampleCount", "rssScope"] : [])],
       `phase measurement ${index}`,
     );
     return entry;
@@ -164,6 +167,16 @@ function verifyMeasurements(
     integer(phase.blockInputOperations, `phase ${index} block input`);
     integer(phase.blockOutputOperations, `phase ${index} block output`);
     integer(phase.capturedOutputBytes, `phase ${index} output bytes`);
+    if (phase.name === "idle_dashboard_resources") {
+      assert.equal(phase.rssScope, "owned-dashboard-process-tree", "dashboard RSS must measure its owned tree");
+      const windowMs = nonnegative(phase.rssSampleWindowMs, "dashboard RSS sample window");
+      assert.ok(windowMs > 0 && integer(phase.rssSampleCount, "dashboard RSS samples") > 0,
+        "dashboard RSS sample window is empty");
+      const measuredRss = nonnegative(phase.maxRssBytes, "dashboard maximum RSS");
+      assert.ok(measuredRss > 0 && measuredRss <= SYSTEM_E2E_BUDGETS.maxRssBytes,
+        `idle_dashboard_resources exceeded RSS budget: maxRssBytes=${measuredRss} ` +
+        `budgetBytes=${SYSTEM_E2E_BUDGETS.maxRssBytes} sampleWindowMs=${windowMs}`);
+    }
   }
   assert.equal(
     childCpu,
