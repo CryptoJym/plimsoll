@@ -1,0 +1,14 @@
+{
+  "name": "@plimsoll/lean-reader",
+  "version": "0.1.0",
+  "description": "A bounded session-file usage reader for Plimsoll",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": { "node": ">=22.20.0" },
+  "bin": { "plimsoll-lean": "dist/plimsoll-lean.mjs" },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}
