@@ -12,7 +12,26 @@ export const repositoryName = (s: unknown): s is string => typeof s === 'string'
 export function branchName(s: unknown): string | null {
   return typeof s === 'string' && s.length > 0 && s.length <= 240 && !/[\s\x00-\x1f\x7f~^:?*\[\\]/.test(s) && !s.includes('..') && !s.includes('@{') && !s.startsWith('/') && !s.endsWith('/') ? s : null;
 }
-function smallFile(file: string): string {
+// A background job must never open files where macOS may ask for permission or
+// iCloud may have to download them first: open() can then wait forever, while
+// stat() still answers. Repositories there are still named from stat alone.
+const PROTECTED = ['Desktop', 'Documents', 'Downloads', 'Movies', 'Music', 'Pictures', 'Library/Mobile Documents', 'Library/CloudStorage'];
+const protectedRoots = new Map<string, string[]>();
+export function protectedPath(file: string, home: string): boolean {
+  let roots = protectedRoots.get(home);
+  if (!roots) {
+    const homes = [path.resolve(home)];
+    try { const real = fs.realpathSync(home); if (!homes.includes(real)) homes.push(real); } catch { /* Missing home. */ }
+    roots = homes.flatMap(h => PROTECTED.map(d => path.join(h, d)));
+    protectedRoots.set(home, roots);
+  }
+  const inside = (p: string) => p === '/Volumes' || p.startsWith('/Volumes/') || roots!.some(r => p === r || p.startsWith(r + path.sep));
+  if (inside(path.resolve(file))) return true;
+  // A symlink elsewhere may point into one; resolving the link itself never opens files there.
+  try { return inside(path.join(fs.realpathSync(path.dirname(file)), path.basename(file))); } catch { return false; }
+}
+function smallFile(file: string, home: string): string {
+  if (protectedPath(file, home)) return '';
   try { const stat = fs.statSync(file, { throwIfNoEntry: false }); if (stat?.isFile() && stat.size <= 8192) return fs.readFileSync(file, 'utf8'); } catch { /* Optional local metadata. */ }
   return '';
 }
@@ -24,7 +43,7 @@ export function launchProject(cwd: string, home: string, cache = new Map<string,
   for (;;) {
     if (cache.has(at)) { project = cache.get(at)!; break; }
     walked.push(at);
-    const text = smallFile(path.join(at, '.conductor-project.json'));
+    const text = smallFile(path.join(at, '.conductor-project.json'), home);
     if (text) try {
       const tag = JSON.parse(text);
       if (tag.schema === 'conductor-source-project/v1' && repositoryName(tag.project)) { project = tag.project; break; }
@@ -60,17 +79,19 @@ class Repositories {
         if (stat.isDirectory() || stat.isFile()) {
           let main = physical, gitdir = marker;
           if (stat.isFile()) {
-            const value = smallFile(marker).match(/^gitdir:\s*(.+)/m)?.[1]?.trim();
+            // A worktree's folder name is not its repository's name; unread, it stays unnamed.
+            if (protectedPath(marker, this.home)) break;
+            const value = smallFile(marker, this.home).match(/^gitdir:\s*(.+)/m)?.[1]?.trim();
             if (value) {
               gitdir = path.resolve(physical, value);
-              const common = smallFile(path.join(gitdir, 'commondir')).trim();
+              const common = smallFile(path.join(gitdir, 'commondir'), this.home).trim();
               const split = gitdir.indexOf('/.git/worktrees/');
               if (common) { const dir = path.resolve(gitdir, common); if (path.basename(dir) === '.git') main = path.dirname(dir); }
               else if (split >= 0) main = gitdir.slice(0, split);
             }
           }
           const name = path.basename(main);
-          if (main !== this.canonicalHome && main !== path.parse(main).root && repositoryName(name)) result = { name, branch: branchName(smallFile(path.join(gitdir, 'HEAD')).trim().match(/^ref: refs\/heads\/(.+)$/)?.[1]) };
+          if (main !== this.canonicalHome && main !== path.parse(main).root && repositoryName(name)) result = { name, branch: branchName(smallFile(path.join(gitdir, 'HEAD'), this.home).trim().match(/^ref: refs\/heads\/(.+)$/)?.[1]) };
           break; // A home/root repository never falls through to a parent repo.
         }
       } catch { /* Walk to the nearest repository. */ }

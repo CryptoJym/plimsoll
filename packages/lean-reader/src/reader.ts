@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLines } from './lines.js';
-import { Evidence, launchProject, topRepositories } from './evidence.js';
+import { Evidence, launchProject, protectedPath, topRepositories } from './evidence.js';
 import { stateBytes } from './state-json.js';
 import { Seen } from './seen.js';
 import { counts, fields, HOUR, WINDOW, integer, string, peakMemory, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source } from './types.js';
@@ -126,6 +126,8 @@ class Projects {
         if (stat.isDirectory() || stat.isFile()) {
           let main = at;
           if (stat.isFile() && stat.size < 8192) {
+            // Opening a worktree pointer in a protected folder can block forever (see protectedPath).
+            if (protectedPath(marker, this.home)) { project = null; break; }
             const value = fs.readFileSync(marker, 'utf8').match(/^gitdir:\s*(.+)/m)?.[1]?.trim();
             if (value) {
               const gitdir = path.resolve(at, value), split = gitdir.indexOf('/.git/worktrees/');

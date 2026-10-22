@@ -846,3 +846,27 @@ test('evidence follows the cloud upload schema: case variants merge, names and b
   assert.equal(b.gitBranch, null);
   assert.deepEqual(b.reposTouched, []);
 });
+
+test('files in folders where macOS can make a background job wait are never opened', t => {
+  const home = fixture(t), inner = repository(home, 'Documents/inner', 'feature/private');
+  write(home, 'Documents/worktree/.git', `gitdir: ${path.join(home, 'Projects/main/.git/worktrees/wt')}\n`);
+  write(home, 'Documents/worktree/.conductor-project.json', JSON.stringify({ project: 'lane-project', schema: 'conductor-source-project/v1' }));
+  fs.symlinkSync(path.join(home, 'Documents'), path.join(home, 'linked-documents'));
+  const opened = [], real = { readFileSync: fs.readFileSync, openSync: fs.openSync };
+  fs.readFileSync = function (p, ...rest) { opened.push(String(p)); return real.readFileSync.call(this, p, ...rest); };
+  fs.openSync = function (p, ...rest) { opened.push(String(p)); return real.openSync.call(this, p, ...rest); };
+  t.after(() => Object.assign(fs, real));
+  const records = [
+    toolReply('docs', 'Read', { file_path: inner + '/src/a.ts' }),
+    toolReply('linked', 'Read', { file_path: path.join(home, 'linked-documents/inner/src/b.ts') }),
+  ].map(r => Object.assign(r, { cwd: path.join(home, 'Documents/worktree'), sessionId: 'synthetic-session' }));
+  write(home, '.claude/projects/x/a.jsonl', records);
+  const result = reader.scan(evidenceOptions(home));
+  Object.assign(fs, real);
+  const documents = [path.join(home, 'Documents'), path.join(fs.realpathSync(home), 'Documents')];
+  assert.deepEqual(opened.filter(p => documents.some(d => p.startsWith(d)) || p.includes('linked-documents')), []);
+  assert.deepEqual(session(result).reposTouched, [{ name: 'inner', events: 2 }]);
+  assert.equal(session(result).gitBranch, null);
+  assert.equal(session(result).projectHint, null);
+  assert.equal(Object.values(result.state.hours)[0].projectSource, 'none');
+});
