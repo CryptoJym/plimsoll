@@ -870,3 +870,22 @@ test('files in folders where macOS can make a background job wait are never open
   assert.equal(session(result).projectHint, null);
   assert.equal(Object.values(result.state.hours)[0].projectSource, 'none');
 });
+
+test('a collector config made large by its capture roots still supplies upload credentials', async t => {
+  const home = fixture(t), bodies = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.setHeader('content-type', 'application/json'); res.end('{"ok":true}');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const captureRoots = Array.from({ length: 40_000 }, (_, i) => `/synthetic/lanes/${String(i).padStart(6, '0')}/work/projects`);
+  const credentialsFrom = write(home, 'credentials.json', { uploadUrl: `http://127.0.0.1:${server.address().port}`, installKey: 'synthetic', uploadSigningSecret: 'synthetic', tenantId: 'synthetic', captureRoots });
+  assert.ok(fs.statSync(credentialsFrom).size > 1024 * 1024);
+  write(home, '.claude/projects/x/a.jsonl', [claude('one')]);
+  const { state } = reader.scan(options(home));
+  assert.equal(await reader.sendPending(state, { credentialsFrom }, { home, now }), 1);
+  assert.equal(state.lastError, null);
+  assert.equal(bodies.length, 1);
+});

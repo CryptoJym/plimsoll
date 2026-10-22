@@ -8,6 +8,8 @@ import { branchName, topRepositories } from './evidence.js';
 
 const ROUTE = '/api/work-intelligence/lean/usage';
 const MAX_BODY = 1024 * 1024;
+// The collector's own config carries its capture roots too: 18.8 MB on one Mac.
+const MAX_CREDENTIALS = 64 * 1024 * 1024;
 type Body = { schema: string; tenantId: string; reader: { version: string; machineName: string }; sentAt: string; hours: Hour[]; sessions: Session[]; seats: Seat[] };
 type Batch = { body: Body; keys: string[] };
 const wireFields = {
@@ -82,7 +84,7 @@ export async function sendPending(state: State, config: Config, options: { home:
     // Deliberately read credentials only inside the send path. Dry runs,
     // print-config, status and parser measurements never open this file.
     const file = expand(config.credentialsFrom ?? path.join(options.home, 'Library/Application Support/Plimsoll/collector.config.json'), options.home);
-    if (fs.statSync(file).size > MAX_BODY) throw new Error('invalid_credentials');
+    if (fs.statSync(file).size > MAX_CREDENTIALS) throw new Error('invalid_credentials');
     const credentials = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!['uploadUrl', 'installKey', 'uploadSigningSecret', 'tenantId'].every(k => typeof credentials[k] === 'string' && credentials[k])) throw new Error('invalid_credentials');
     const url = endpoint(credentials.uploadUrl, config.endpoint), deadline = Date.now() + 30_000;
