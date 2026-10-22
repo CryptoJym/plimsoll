@@ -1,0 +1,172 @@
+import fs from 'node:fs';
+
+// Only these leaves survive projection of an oversized record. Array contents,
+// prompts, instructions and tool outputs never become part of the projection.
+const paths = [
+  'type', 'timestamp', 'sessionId', 'cwd', 'requestId', 'uuid', 'ordinal', 'summary',
+  'message.id', 'message.model',
+  ...['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'].map(k => `message.usage.${k}`),
+  ...['type', 'cwd', 'id', 'session_id', 'creator_account_id', 'model', 'response_id', 'turn_id'].map(k => `payload.${k}`),
+  'payload.base_instructions.provenance.model',
+  ...['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'].flatMap(k => [`payload.usage.${k}`, `payload.info.total_token_usage.${k}`]),
+  'payload.rate_limits.plan_type', 'payload.rate_limits.credits.balance',
+  ...['used_percent', 'window_minutes', 'resets_at'].map(k => `payload.rate_limits.primary.${k}`),
+];
+const wanted = new Set(paths);
+const containers = new Set(paths.flatMap(p => p.split('.').map((_, i, parts) => parts.slice(0, i).join('.')).filter(Boolean)));
+type Frame = { kind: 'object' | 'array'; path: string; expect: 'key' | 'colon' | 'value' | 'comma'; key: string; count: number };
+
+/** A bounded JSON projection, including JSON validation, for arbitrarily long
+ * strings. Ignored string spans are searched with a regex in each 64 KiB chunk;
+ * their bytes are never concatenated. Nesting, keys and retained scalars are capped. */
+class Projection {
+  result: Record<string, any> = {};
+  stack: Frame[] = [];
+  mode: 'normal' | 'string' | 'scalar' = 'normal';
+  token = ''; keep = false; keyToken = false; escaped = false;
+  unicode = 0;
+  scalarPath = ''; rootDone = false; bad = false;
+  valuePath() {
+    const f = this.stack.at(-1);
+    return f ? (f.kind === 'array' ? `${f.path}[]` : [f.path, f.key].filter(Boolean).join('.')) : '';
+  }
+  valueDone() {
+    const f = this.stack.at(-1);
+    if (f) { f.expect = 'comma'; f.count++; } else this.rootDone = true;
+  }
+  set(value: unknown) {
+    if (!wanted.has(this.scalarPath)) return;
+    const parts = this.scalarPath.split('.');
+    let out = this.result;
+    for (const part of parts.slice(0, -1)) out = out[part] ??= {};
+    out[parts.at(-1)!] = value;
+  }
+  feed(text: string) {
+    if (this.bad) return;
+    let i = 0;
+    while (i < text.length && !this.bad) {
+      if (this.mode === 'string') {
+        const start = i;
+        if (this.unicode) {
+          if (!/[0-9a-fA-F]/.test(text[i])) { this.bad = true; continue; }
+          if (this.keep) this.token += text[i];
+          this.unicode--; i++; continue;
+        }
+        // A trailing escape is carried across chunks, including escaped quotes.
+        if (this.escaped) {
+          if (!/["\\/bfnrtu]/.test(text[i])) { this.bad = true; continue; }
+          if (this.keep) this.token += text[i];
+          if (text[i] === 'u') this.unicode = 4;
+          this.escaped = false; i++; continue;
+        }
+        const special = /["\\\x00-\x1f]/g; special.lastIndex = i;
+        const match = special.exec(text);
+        const end = match ? match.index : text.length;
+        if (this.keep) this.token += text.slice(start, end);
+        if (this.token.length > 8192) { this.bad = true; break; }
+        i = end;
+        if (!match) continue;
+        const c = text[i++];
+        if (c === '\\') { if (this.keep) this.token += c; this.escaped = true; }
+        else if (c === '"') {
+          let value: string;
+          try { value = this.keep ? JSON.parse('"' + this.token + '"') : ''; } catch { this.bad = true; break; }
+          if (this.keyToken) {
+            const f = this.stack.at(-1)!; f.key = value; f.expect = 'colon';
+          } else { this.set(value); this.valueDone(); }
+          this.mode = 'normal'; this.token = '';
+        } else this.bad = true;
+        continue;
+      }
+      if (this.mode === 'scalar') {
+        const c = text[i];
+        if (/[\s,}\]]/.test(c)) {
+          try { this.set(JSON.parse(this.token)); } catch { this.bad = true; break; }
+          this.valueDone(); this.mode = 'normal'; this.token = ''; continue;
+        }
+        this.token += c; i++;
+        if (this.token.length > 128) this.bad = true;
+        continue;
+      }
+      const c = text[i++];
+      if (/\s/.test(c)) continue;
+      const f = this.stack.at(-1);
+      if (c === '}' || c === ']') {
+        if (!f || f.kind !== (c === '}' ? 'object' : 'array') || !(f.expect === 'comma' || (f.count === 0 && (f.expect === 'key' || f.expect === 'value')))) { this.bad = true; continue; }
+        this.stack.pop(); this.valueDone(); continue;
+      }
+      if (f?.expect === 'colon') { if (c !== ':') this.bad = true; else f.expect = 'value'; continue; }
+      if (f?.expect === 'comma') { if (c !== ',') this.bad = true; else f.expect = f.kind === 'object' ? 'key' : 'value'; continue; }
+      if (f?.expect === 'key') {
+        if (c !== '"') { this.bad = true; continue; }
+        this.mode = 'string'; this.keyToken = true; this.keep = true; this.token = ''; continue;
+      }
+      if (this.rootDone) { this.bad = true; continue; }
+      const p = this.valuePath();
+      if (c === '{' || c === '[') {
+        if (this.stack.length >= 64) { this.bad = true; continue; }
+        if (c === '{' && containers.has(p)) {
+          let out = this.result;
+          for (const part of p.split('.')) out = out[part] ??= {};
+        }
+        this.stack.push({ kind: c === '{' ? 'object' : 'array', path: p, expect: c === '{' ? 'key' : 'value', key: '', count: 0 });
+      } else if (c === '"') {
+        this.mode = 'string'; this.keyToken = false; this.scalarPath = p; this.keep = wanted.has(p); this.token = '';
+      } else {
+        this.mode = 'scalar'; this.scalarPath = p; this.token = c;
+      }
+    }
+  }
+  finish(): Record<string, any> | null {
+    return !this.bad && this.rootDone && this.stack.length === 0 && this.mode === 'normal' ? this.result : null;
+  }
+}
+
+const LIMIT = 1024 * 1024;
+const buffer = Buffer.allocUnsafe(64 * 1024);
+export function readLines(file: string, offset: number, end: number, visit: (record: Record<string, any>, offset: number) => void): { offset: number; bytes: number } {
+  const fd = fs.openSync(file, 'r');
+  let position = offset, committed = offset, size = 0, chunks: Buffer[] = [];
+  let projector: Projection | null = null, dropped = false;
+  // StringDecoder is unnecessary here: Buffer chunks are retained for small
+  // lines; giant projections use a streaming decoder to preserve UTF-8 tags.
+  let decoder: TextDecoder | null = null;
+  const consume = (part: Buffer) => {
+    if (dropped) return;
+    if (projector) { projector.feed(decoder!.decode(part, { stream: true })); return; }
+    size += part.length;
+    if (size <= LIMIT) { chunks.push(Buffer.from(part)); return; }
+    const head = Buffer.concat(chunks, Math.min(size - part.length, 512)).subarray(0, 512).toString();
+    if (!/"(?:assistant|usage|session_meta|turn_context|token_usage_record|token_count)"/.test(head)) { chunks = []; dropped = true; return; }
+    projector = new Projection(); decoder = new TextDecoder();
+    for (const chunk of chunks) projector.feed(decoder.decode(chunk, { stream: true }));
+    chunks = []; projector.feed(decoder.decode(part, { stream: true }));
+  };
+  try {
+    while (position < end) {
+      const n = fs.readSync(fd, buffer, 0, Math.min(buffer.length, end - position), position);
+      if (!n) break;
+      let start = 0;
+      for (;;) {
+        const newline = buffer.indexOf(10, start);
+        if (newline === -1 || newline >= n) break;
+        consume(buffer.subarray(start, newline));
+        let record: Record<string, any> | null = null;
+        const completed = projector as Projection | null;
+        if (completed) { completed.feed(decoder!.decode()); record = completed.finish(); }
+        else if (!dropped) {
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (/"(?:assistant|summary|session_meta|turn_context|token_usage_record|token_count)"/.test(text)) {
+            try { record = JSON.parse(text); } catch { /* An invalid line is not usage. */ }
+          }
+        }
+        committed = position + newline + 1;
+        if (record && typeof record === 'object' && !Array.isArray(record)) visit(record, committed);
+        chunks = []; size = 0; projector = null; decoder = null; dropped = false; start = newline + 1;
+      }
+      consume(buffer.subarray(start, n)); position += n;
+    }
+    // Leave an unfinished line at its starting byte; never persist raw text.
+    return { offset: committed, bytes: position - offset };
+  } finally { fs.closeSync(fd); }
+}

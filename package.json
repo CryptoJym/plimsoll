@@ -15,6 +15,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "contracts:lean": "node --import tsx --test tests/contracts/lean/*.contract.ts",
+    "proof:lean-reader": "node --import tsx packages/lean-reader/proof.mjs",
     "collector": "tsx packages/collector-cli/src/cli.ts",
     "setup:claude-status-line": "tsx packages/collector-cli/src/cli.ts setup claude-status-line",
     "proof": "tsx scripts/run-proof.ts scripts/signal-fidelity-proof.ts",
