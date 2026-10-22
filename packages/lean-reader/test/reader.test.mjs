@@ -478,3 +478,354 @@ test('an explicit default Claude config directory uses its own account metadata'
   const result = reader.scan({ ...options(home), env: { CLAUDE_CONFIG_DIR: path.join(home, '.claude') } });
   assert.equal(result.rows[0].accountKey, reader.accountKey('synthetic-explicit'));
 });
+
+// Evidence fixtures use only temporary repositories and invented transcripts.
+const evidenceOptions = home => ({ ...options(home), config: { sendEvidence: true } });
+const session = result => Object.values(result.state.sessions)[0];
+const toolReply = (id, name, input, extra = {}) => claude(id, { message: { ...claude(id).message, content: [{ type: 'tool_use', id: 'call-' + id, name, input }] }, ...extra });
+function repository(home, name, branch = 'main') {
+  write(home, name + '/.git/HEAD', `ref: refs/heads/${branch}\n`);
+  return path.join(home, name);
+}
+
+test('Claude file tools, nested paths and shell calls count each repository once per call', t => {
+  const home = fixture(t), alpha = repository(home, 'alpha'), beta = repository(home, 'beta'), quoted = repository(home, 'quoted repo');
+  repository(home, '.', 'private-home-branch');
+  const cwd = path.join(home, 'Projects');
+  const records = [
+    toolReply('read', 'Read', { file_path: alpha + '/src/private-file.ts' }),
+    toolReply('edit', 'Edit', { path: '../alpha/new-file.ts', old_string: 'PRIVATE OLD', new_string: 'PRIVATE NEW' }),
+    toolReply('write', 'Write', { file_path: beta + '/new-file.ts', content: 'PRIVATE CONTENT' }),
+    toolReply('notebook', 'NotebookEdit', { notebook_path: alpha + '/notebook.ipynb', new_source: 'PRIVATE CELL' }),
+    toolReply('glob', 'Glob', { path: alpha, pattern: 'PRIVATE PATTERN' }),
+    toolReply('multi', 'MultiEdit', { edits: [{ file_path: alpha + '/a.ts' }, { path: beta + '/b.ts' }] }),
+    toolReply('shell', 'Bash', { command: `cat ${alpha}/a.ts ${alpha}/b.ts` }),
+    toolReply('git', 'Bash', { command: `git -C '${beta}' status` }),
+    toolReply('quoted', 'Bash', { command: `cat "${quoted}/src/private-file.ts"` }),
+    toolReply('outside', 'Read', { file_path: home + '/outside/a.ts' }),
+    toolReply('home', 'Read', { file_path: home + '/home-file.ts' }),
+    toolReply('root', 'Read', { file_path: '/' }),
+    { type: 'assistant', timestamp: '2026-10-20T01:03:00Z', message: { content: [{ type: 'tool_use', id: 'no-usage', name: 'Read', input: { file_path: alpha + '/last.ts' } }] } },
+  ];
+  for (const record of records) Object.assign(record, { cwd, sessionId: 'synthetic-session', gitBranch: 'feature/historical' });
+  write(home, '.claude/projects/x/a.jsonl', records);
+  write(home, '.claude/projects/x/copy.jsonl', [records[0]]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 7 }, { name: 'beta', events: 3 }, { name: 'quoted repo', events: 1 }]);
+  assert.equal(session(result).gitBranch, 'feature/historical');
+  const body = JSON.stringify(reader.makeBatches(result.state, 'synthetic', now, { sendEvidence: true }));
+  for (const forbidden of ['private-file.ts', 'PRIVATE', home, 'file_path', 'notebook_path', 'old_string']) assert.equal(body.includes(forbidden), false, forbidden);
+  assert.equal(JSON.stringify(result.state.evidence).includes('PRIVATE'), false);
+});
+
+test('Codex function arguments, workdirs and both patch formats provide evidence', t => {
+  const home = fixture(t), alpha = repository(home, 'alpha'), beta = repository(home, 'beta');
+  const call = (id, name, args) => ({ type: 'response_item', timestamp: '2026-10-20T02:00:00Z', payload: { type: 'function_call', name, call_id: id, arguments: typeof args === 'string' ? args : JSON.stringify(args) } });
+  const custom = { type: 'response_item', timestamp: '2026-10-20T02:00:01Z', payload: { type: 'custom_tool_call', name: 'functions.apply_patch', call_id: 'custom', input: `*** Begin Patch\n*** Add File: ${beta}/new.ts\n+PRIVATE CODE\n*** Update File: ${alpha}/old.ts\n@@\n-PRIVATE OLD\n+PRIVATE NEW\n*** Move to: ${beta}/moved.ts\n*** End Patch` } };
+  write(home, '.codex/sessions/rollout-evidence.jsonl', [
+    meta('codex-session', { cwd: path.join(home, 'Projects'), git: { branch: 'feature/recorded' } }), context,
+    call('cwd', 'functions.exec_command', { workdir: alpha, cmd: 'cat relative.ts' }),
+    call('patch', 'functions.apply_patch', { workdir: alpha, patch: '*** Begin Patch\n*** Update File: src/file.ts\n@@\n+PRIVATE CODE\n*** Delete File: stale.ts\n*** End Patch' }),
+    call('diff', 'apply_patch', { cwd: beta, patch: '--- a/src/a.ts\n+++ b/src/a.ts\n+PRIVATE CODE' }),
+    custom,
+    call('git', 'functions.shell_command', { command: `git -C ${beta} diff` }),
+    call('argv', 'functions.shell', { command: ['git', '-C', '../beta', 'status'] }),
+    { type: 'response_item', timestamp: '2026-10-20T02:00:02Z', payload: { type: 'function_call_output', output: JSON.stringify({ file_path: alpha + '/PRIVATE OUTPUT' }) } },
+    call('malformed', 'Read', '{bad json'), usage('one'),
+  ]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.deepEqual(session(result).reposTouched, [{ name: 'beta', events: 4 }, { name: 'alpha', events: 3 }]);
+  assert.equal(session(result).gitBranch, 'feature/recorded');
+  assert.equal(JSON.stringify(result.state.evidence).includes('PRIVATE'), false);
+});
+
+test('worktree evidence uses the main repository and its own HEAD; detached and absent branches are null', t => {
+  const home = fixture(t);
+  repository(home, 'main', 'main-branch');
+  write(home, 'main/.git/worktrees/lane/HEAD', 'ref: refs/heads/feature/worktree\n');
+  write(home, 'main/.git/worktrees/lane/commondir', '../..\n');
+  const cwd = path.join(home, 'lane');
+  write(home, 'lane/.git', 'gitdir: ../main/.git/worktrees/lane\n');
+  write(home, '.claude/projects/x/a.jsonl', [toolReply('one', 'Read', { file_path: cwd + '/new.ts' }, { cwd })]);
+  let result = reader.scan(evidenceOptions(home));
+  assert.deepEqual(session(result).reposTouched, [{ name: 'main', events: 1 }]);
+  assert.equal(session(result).gitBranch, 'feature/worktree');
+  write(home, 'main/.git/worktrees/lane/HEAD', '0123456789abcdef0123456789abcdef01234567\n');
+  result = reader.scan(evidenceOptions(home));
+  assert.equal(session(result).gitBranch, null);
+  write(home, '.claude/projects/x/a.jsonl', [claude('outside', { cwd: path.join(home, 'outside') })]);
+  result = reader.scan(evidenceOptions(home));
+  assert.equal(session(result).gitBranch, null);
+  assert.deepEqual(session(result).reposTouched, []);
+});
+
+test('home repositories, disk roots, tool output and paths outside repositories never name touched repositories', t => {
+  const home = fixture(t);
+  repository(home, '.', 'home-branch');
+  write(home, '.claude/projects/x/a.jsonl', [toolReply('home', 'Read', { file_path: home + '/PRIVATE.ts' }, { cwd: home }), toolReply('root', 'Read', { file_path: '/' }, { cwd: '/' }), toolReply('outside', 'Read', { file_path: path.join(os.tmpdir(), 'synthetic-no-repo', 'PRIVATE.ts') })]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.deepEqual(session(result).reposTouched, []);
+  assert.equal(session(result).gitBranch, null);
+});
+
+test('repositories are ranked by event count before the twenty-item wire cap', t => {
+  const home = fixture(t), calls = [];
+  for (let i = 1; i <= 25; i++) {
+    const dir = repository(home, 'repo-' + String(i).padStart(2, '0'));
+    for (let j = 0; j < i; j++) calls.push(toolReply(`${i}-${j}`, 'Read', { file_path: dir + '/file.ts' }));
+  }
+  write(home, '.claude/projects/x/a.jsonl', calls);
+  const result = reader.scan(evidenceOptions(home));
+  assert.equal(session(result).reposTouched.length, 20);
+  assert.deepEqual(session(result).reposTouched[0], { name: 'repo-25', events: 25 });
+  assert.deepEqual(session(result).reposTouched.at(-1), { name: 'repo-06', events: 6 });
+});
+
+test('evidence survives restart, backfill, partial lines, duplicate calls and enabling on a legacy cursor', t => {
+  const home = fixture(t), repo = repository(home, 'alpha');
+  const file = write(home, '.claude/projects/x/a.jsonl', [toolReply('one', 'Read', { file_path: repo + '/file.ts' }, { cwd: repo })]);
+  const legacy = reader.scan(options(home));
+  // The v1 ID representation written by 75bb4bee, with the same committed cursor.
+  legacy.state.version = 1;
+  legacy.state.seen = { [crypto.createHash('sha256').update('claude_code:' + JSON.stringify('one')).digest('hex').slice(0, 24)]: Math.floor(Date.parse('2026-10-20T01:02:03Z') / 3600000) };
+  delete legacy.state.seenPacked;
+  const before = JSON.stringify(legacy.rows);
+  assert.equal(legacy.state.version, 1);
+  assert.equal(legacy.state.seenPacked, undefined);
+  let result = reader.scan({ ...evidenceOptions(home), backfill: false, state: JSON.parse(JSON.stringify(legacy.state)) });
+  assert.equal(result.state.version, 2);
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 1 }]);
+  assert.equal(JSON.stringify(result.rows), before);
+  result = reader.scan({ ...evidenceOptions(home), state: JSON.parse(JSON.stringify(result.state)) });
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 1 }]);
+  const next = JSON.stringify(toolReply('two', 'Read', { path: repo + '/another.ts' }, { cwd: repo }));
+  fs.appendFileSync(file, next.slice(0, 80));
+  result = reader.scan({ ...evidenceOptions(home), state: result.state, backfill: false });
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 1 }]);
+  fs.appendFileSync(file, next.slice(80) + '\n' + next + '\n');
+  result = reader.scan({ ...evidenceOptions(home), state: result.state, backfill: false });
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 2 }]);
+  result = reader.scan({ ...options(home), state: result.state, backfill: false });
+  assert.equal(Object.hasOwn(session(result), 'reposTouched'), false);
+  fs.appendFileSync(file, JSON.stringify(toolReply('three', 'Read', { path: repo + '/third.ts' }, { cwd: repo })) + '\n');
+  result = reader.scan({ ...options(home), state: result.state, backfill: false });
+  result = reader.scan({ ...evidenceOptions(home), state: JSON.parse(JSON.stringify(result.state)), backfill: false });
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 3 }]);
+  assert.equal(totals(result.rows).requests, 3);
+});
+
+test('lane marker at cwd or a parent wins over Git; invalid markers and markers above home are ignored', t => {
+  const home = fixture(t), cwd = repository(home, 'copy');
+  const tag = { project: 'source-repository', schema: 'conductor-source-project/v1' };
+  const file = write(home, '.claude/projects/x/a.jsonl', [claude('one', { cwd })]);
+  write(home, 'copy/.conductor-project.json', tag);
+  let result = reader.scan(evidenceOptions(home));
+  assert.equal(result.rows[0].projectHint, 'source-repository');
+  assert.equal(result.rows[0].projectSource, 'launch_tag');
+  fs.writeFileSync(file, JSON.stringify(claude('nested', { cwd: cwd + '/nested/folder' })) + '\n');
+  result = reader.scan(evidenceOptions(home));
+  assert.equal(result.rows[0].projectHint, 'source-repository');
+  result = reader.scan(options(home));
+  assert.equal(result.rows[0].projectHint, 'copy', 'flag off retains legacy attribution');
+  write(home, 'copy/.conductor-project.json', { ...tag, project: '/PRIVATE/path' });
+  assert.equal(reader.scan(evidenceOptions(home)).rows[0].projectHint, 'copy');
+  write(home, 'copy/.conductor-project.json', { ...tag, schema: 'wrong' });
+  assert.equal(reader.scan(evidenceOptions(home)).rows[0].projectHint, 'copy');
+  // The real temp parent is above this synthetic home, and must not be read.
+  const inner = path.join(home, 'inner');
+  write(home, '.conductor-project.json', tag);
+  write(inner, '.claude/projects/x/a.jsonl', [claude('inner', { cwd: inner + '/Projects' })]);
+  assert.equal(reader.scan(evidenceOptions(inner)).rows[0].projectHint, null);
+  write(inner, '.conductor-project.json', tag);
+  assert.equal(reader.scan(evidenceOptions(inner)).rows[0].projectSource, 'launch_tag');
+});
+
+test('explicit session launch tags outrank a copied-folder marker', t => {
+  const home = fixture(t), cwd = repository(home, 'copy');
+  write(home, 'copy/.conductor-project.json', { project: 'folder-source', schema: 'conductor-source-project/v1' });
+  write(home, '.local/state/plimsoll-lean/launch-tags.jsonl', [{ tool: 'claude_code', sessionKey: 'synthetic-session', project: 'explicit-source', at: since }]);
+  write(home, '.claude/projects/x/a.jsonl', [claude('one', { cwd })]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.equal(result.rows[0].projectHint, 'explicit-source');
+  assert.equal(session(result).projectHint, 'explicit-source');
+});
+
+test('enabling evidence applies a lane marker to existing totals without recounting usage', t => {
+  const home = fixture(t), cwd = path.join(home, 'unversioned-lane');
+  write(home, 'unversioned-lane/.conductor-project.json', { project: 'source-repository', schema: 'conductor-source-project/v1' });
+  write(home, '.claude/projects/x/a.jsonl', [claude('one', { cwd })]);
+  const legacy = reader.scan(options(home));
+  assert.equal(legacy.rows[0].projectHint, null);
+  const result = reader.scan({ ...evidenceOptions(home), backfill: false, state: legacy.state });
+  assert.equal(result.rows[0].projectHint, 'source-repository');
+  assert.equal(result.rows[0].projectSource, 'launch_tag');
+  assert.equal(session(result).projectHint, 'source-repository');
+  assert.equal(totals(result.rows).requests, 1);
+});
+
+test('flag-off upload bytes match the frozen 75bb4bee session shape, including with evidence in state', t => {
+  const home = fixture(t);
+  write(home, '.claude/projects/x/a.jsonl', [claude('one')]);
+  const result = reader.scan(options(home));
+  const legacy = '{"schema":"plimsoll.lean.usage.v1","tenantId":"synthetic","reader":{"version":"0.1.0","machineName":' + JSON.stringify(os.hostname().split('.')[0]) + '},"sentAt":"2026-10-22T00:00:00.000Z","hours":[{"hour":"2026-10-20T01:00:00.000Z","tool":"claude_code","accountKey":"unknown","model":"synthetic-model","sessionKey":"synthetic-session","projectHint":null,"projectSource":"none","requests":1,"freshInput":10,"cacheRead":20,"cacheWrite":30,"output":40}],"sessions":[{"tool":"claude_code","sessionKey":"synthetic-session","title":null,"folderLabel":null,"projectHint":null,"firstSeen":"2026-10-20T01:02:03.000Z","lastSeen":"2026-10-20T01:02:03.000Z"}],"seats":[]}';
+  session(result).gitBranch = 'feature/example'; session(result).reposTouched = [{ name: 'alpha', events: 2 }];
+  for (const config of [{}, { sendEvidence: false }, { sendEvidence: 'true' }]) assert.equal(JSON.stringify(reader.makeBatches(result.state, 'synthetic', now, config)[0].body), legacy);
+  const body = reader.makeBatches(result.state, 'synthetic', now, { sendEvidence: true })[0].body;
+  assert.equal(body.sessions[0].gitBranch, 'feature/example');
+  assert.deepEqual(body.sessions[0].reposTouched, [{ name: 'alpha', events: 2 }]);
+  delete body.sessions[0].gitBranch; delete body.sessions[0].reposTouched;
+  assert.equal(JSON.stringify(body), legacy);
+});
+
+test('the wire boundary revalidates evidence and strips every nested extra field', t => {
+  const home = fixture(t);
+  write(home, '.claude/projects/x/a.jsonl', [claude('one')]);
+  const result = reader.scan(options(home));
+  Object.assign(session(result), { gitBranch: '/PRIVATE/path', reposTouched: [
+    { name: 'valid', events: 3, file_path: '/PRIVATE/file.ts' }, { name: '/PRIVATE/path', events: 5 }, { name: 'PRIVATE\\path', events: 5 }, { name: '.', events: 1 }, { name: 'bad-count', events: 0 }, { name: 'bad-count', events: 1.5 }, null,
+  ] });
+  const body = reader.makeBatches(result.state, 'synthetic', now, { sendEvidence: true })[0].body;
+  assert.equal(body.sessions[0].gitBranch, null);
+  assert.deepEqual(body.sessions[0].reposTouched, [{ name: 'valid', events: 3 }]);
+  assert.equal(JSON.stringify(body).includes('PRIVATE'), false);
+});
+
+test('sendEvidence is a strict boolean config option and session titles remain independent', t => {
+  const home = fixture(t), cwd = repository(home, 'alpha');
+  write(home, '.claude/projects/x/a.jsonl', [{ type: 'summary', summary: 'Synthetic title' }, toolReply('one', 'Read', { path: cwd + '/file.ts' }, { cwd })]);
+  const config = write(home, 'config.json', { sendEvidence: true, sendSessionTitles: true, dryRun: true });
+  const printed = spawnSync(process.execPath, [fileURLToPath(bundle), 'print-config', '--config', config], { encoding: 'utf8' });
+  assert.equal(printed.status, 0, printed.stderr);
+  assert.equal(JSON.parse(printed.stdout).sendEvidence, true);
+  const executed = spawnSync(process.execPath, [fileURLToPath(bundle), 'backfill', '--since', since, '--until', until, '--config', config, '--json'], { encoding: 'utf8', env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: home + '/.claude', CODEX_HOME: home + '/.codex' } });
+  assert.equal(executed.status, 0, executed.stderr);
+  assert.equal(JSON.parse(executed.stdout).sessions[0].title, 'Synthetic title');
+  assert.deepEqual(JSON.parse(executed.stdout).sessions[0].reposTouched, [{ name: 'alpha', events: 1 }]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.equal(session(result).title, null);
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 1 }]);
+});
+
+test('giant Claude content still projects tool paths at the tail without retaining text or edits', t => {
+  const home = fixture(t), cwd = repository(home, 'alpha');
+  const reply = claude('giant-evidence', { cwd });
+  reply.message.content = [{ type: 'text', text: 'PRIVATE SENTINEL'.repeat(100_000) }, { type: 'tool_use', id: 'giant-call', name: 'Edit', input: { new_string: 'PRIVATE CODE'.repeat(100_000), file_path: cwd + '/PRIVATE-file.ts' } }];
+  write(home, '.claude/projects/x/a.jsonl', [reply]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.equal(totals(result.rows).requests, 1);
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 1 }]);
+  assert.equal(JSON.stringify(result.state.evidence).includes('PRIVATE'), false);
+  assert.ok(JSON.stringify(result.state).length < 20_000);
+});
+
+test('signed sends forward the sendEvidence setting to the actual body', async t => {
+  const home = fixture(t), cwd = repository(home, 'alpha'), bodies = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.setHeader('content-type', 'application/json'); res.end('{"ok":true}');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const credentialsFrom = write(home, 'credentials.json', { uploadUrl: `http://127.0.0.1:${server.address().port}`, installKey: 'synthetic', uploadSigningSecret: 'synthetic', tenantId: 'synthetic' });
+  write(home, '.claude/projects/x/a.jsonl', [toolReply('one', 'Read', { path: cwd + '/file.ts' }, { cwd })]);
+  const { state } = reader.scan(evidenceOptions(home));
+  await reader.sendPending(state, { credentialsFrom, sendEvidence: true }, { home, now });
+  assert.deepEqual(bodies[0].sessions[0].reposTouched, [{ name: 'alpha', events: 1 }]);
+  state.metadataPending = true;
+  await reader.sendPending(state, { credentialsFrom, sendEvidence: false }, { home, now });
+  assert.equal(Object.hasOwn(bodies[1].sessions[0], 'reposTouched'), false);
+  assert.equal(Object.hasOwn(bodies[1].sessions[0], 'gitBranch'), false);
+});
+
+test('streamed state encoding matches JSON.stringify and compact deduplication survives reload', t => {
+  const home = fixture(t), cwd = repository(home, 'alpha');
+  const file = write(home, '.claude/projects/x/a.jsonl', [toolReply('two', 'Read', { path: cwd + '/two.ts' }, { cwd }), toolReply('one', 'Read', { path: cwd + '/one.ts' }, { cwd })]);
+  const result = reader.scan(evidenceOptions(home));
+  Object.values(result.state.files)[0].context.title = 'Synthetic "quotes", \\slashes and 汉字 🧪\n';
+  result.state.sessions.extra = { tool: 'codex', sessionKey: 'synthetic-extra', title: null, folderLabel: null, projectHint: null, firstSeen: since, lastSeen: until, gitBranch: undefined, reposTouched: [{ name: 'alpha', events: 2 }] };
+  const saved = path.join(home, 'state.json');
+  reader.saveState(saved, result.state);
+  assert.equal(fs.readFileSync(saved, 'utf8'), JSON.stringify(result.state));
+  assert.ok(result.state.seenPacked && result.state.evidenceSeenPacked);
+  assert.equal(Object.keys(result.state.seen).length, 0);
+  fs.appendFileSync(file, JSON.stringify(toolReply('two', 'Read', { path: cwd + '/two.ts' }, { cwd })) + '\n');
+  const resumed = reader.scan({ ...evidenceOptions(home), backfill: false, state: reader.readState(saved) });
+  assert.equal(totals(resumed.rows).requests, 2);
+  assert.deepEqual(session(resumed).reposTouched, [{ name: 'alpha', events: 2 }]);
+});
+
+test('giant Codex argument JSON and patch strings preserve paths after private content', t => {
+  const home = fixture(t), cwd = repository(home, 'alpha');
+  write(home, '.codex/sessions/rollout-giant-tools.jsonl', [meta('codex-session', { cwd }), context,
+    { type: 'response_item', timestamp: since, payload: { type: 'function_call', name: 'Edit', call_id: 'giant-json', arguments: JSON.stringify({ new_string: 'PRIVATE CONTENT'.repeat(100_000), file_path: cwd + '/PRIVATE.ts' }) } },
+    { type: 'response_item', timestamp: since, payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'giant-patch', input: '*** Begin Patch\n*** Update File: ' + cwd + '/PRIVATE.ts\n@@\n+' + 'PRIVATE CODE'.repeat(100_000) + '\n*** Add File: ' + cwd + '/PRIVATE-new.ts\n+synthetic\n*** End Patch' } }, usage('one'),
+  ]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.equal(totals(result.rows).requests, 1);
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 2 }]);
+  assert.equal(JSON.stringify(result.state.evidence).includes('PRIVATE'), false);
+});
+
+test('the standalone evidence-enabled incremental command preserves counts with existing state', t => {
+  const home = fixture(t), cwd = repository(home, 'alpha');
+  write(home, '.claude/projects/x/a.jsonl', [toolReply('one', 'Read', { path: cwd + '/file.ts' }, { cwd })]);
+  const result = reader.scan(options(home)), dir = path.join(home, 'state');
+  reader.saveState(path.join(dir, 'state.json'), result.state);
+  const config = write(home, 'config.json', { sendEvidence: false, dryRun: true });
+  const execute = () => spawnSync(process.execPath, [fileURLToPath(bundle), 'run', '--since', since, '--until', until, '--state-dir', dir, '--config', config, '--json'], { encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: '', HOME: home, CLAUDE_CONFIG_DIR: home + '/.claude', CODEX_HOME: home + '/.codex' } });
+  const off = execute();
+  assert.equal(off.status, 0, off.stderr);
+  assert.equal(Object.hasOwn(JSON.parse(off.stdout).sessions[0], 'reposTouched'), false);
+  fs.writeFileSync(config, JSON.stringify({ sendEvidence: true, dryRun: true }));
+  const migration = execute();
+  assert.equal(migration.status, 0, migration.stderr);
+  assert.deepEqual(JSON.parse(migration.stdout).sessions[0].reposTouched, [{ name: 'alpha', events: 1 }]);
+  const output = execute();
+  assert.equal(output.status, 0, output.stderr);
+  const parsed = JSON.parse(output.stdout);
+  assert.equal(totals(parsed.rows).requests, 1);
+  assert.deepEqual(parsed.sessions[0].reposTouched, [{ name: 'alpha', events: 1 }]);
+  assert.equal(parsed.run.bytesRead, 0);
+  assert.equal(fs.existsSync(path.join(dir, 'reader.lock')), false);
+  t.diagnostic(JSON.stringify({ incrementalPeakMemoryBytes: parsed.run.peakMemoryBytes, incrementalMilliseconds: parsed.run.milliseconds }));
+});
+
+test('Codex code-mode wrappers reveal literal working directories, shell paths and patch headers', t => {
+  const home = fixture(t), alpha = repository(home, 'alpha'), beta = repository(home, 'beta');
+  const wrapper = (id, input) => ({ type: 'response_item', timestamp: since, payload: { type: 'custom_tool_call', name: 'functions.exec', call_id: id, input } });
+  write(home, '.codex/sessions/rollout-code-mode.jsonl', [meta('codex-session', { cwd: home + '/Projects' }), context,
+    wrapper('shell', `text(await tools.exec_command({cmd: ${JSON.stringify('cat ' + beta + '/PRIVATE.ts')}, workdir: ${JSON.stringify(alpha)}}));`),
+    wrapper('patch', `await tools.apply_patch(${JSON.stringify('*** Begin Patch\n*** Update File: ' + alpha + '/PRIVATE.ts\n@@\n+PRIVATE CODE\n*** End Patch')});`),
+    wrapper('dynamic', 'await tools.exec_command({workdir: `${PRIVATE_DYNAMIC_PATH}`, cmd: "true"});'), usage('one'),
+  ]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 2 }, { name: 'beta', events: 1 }]);
+  assert.equal(JSON.stringify(result.state.evidence).includes('PRIVATE'), false);
+});
+
+test('bounded asynchronous discovery matches synchronous capture across nested sources and aliases', async t => {
+  const home = fixture(t), cwd = repository(home, 'alpha');
+  const first = write(home, '.claude/projects/x/a.jsonl', [toolReply('one', 'Read', { path: cwd + '/file.ts' }, { cwd })]);
+  write(home, '.claude/projects/x/nested/b.jsonl', [claude('two', { cwd })]);
+  fs.symlinkSync(first, path.join(home, '.claude/projects/x/copy.jsonl'));
+  fs.linkSync(first, path.join(home, '.claude/projects/x/hardlink.jsonl'));
+  const old = write(home, '.claude/projects/x/old.jsonl', [claude('ignored-old')]);
+  fs.utimesSync(old, 0, 0);
+  write(home, '.codex/sessions/nested/rollout-a.jsonl', [meta('codex-session', { cwd }), context, usage('one')]);
+  const sync = reader.scan(evidenceOptions(home));
+  const asynchronous = await reader.runPass({ ...evidenceOptions(home), dryRun: true });
+  assert.equal(asynchronous.stats.files, sync.stats.files);
+  assert.deepEqual(asynchronous.rows, sync.rows);
+  assert.deepEqual(reader.makeBatches(asynchronous.state, 'synthetic', now, { sendEvidence: true }), reader.makeBatches(sync.state, 'synthetic', now, { sendEvidence: true }));
+});
+
+test('calls without tool IDs use message identity and ordinal while copied messages deduplicate', t => {
+  const home = fixture(t), cwd = repository(home, 'alpha');
+  const call = { type: 'tool_use', name: 'Read', input: { file_path: cwd + '/file.ts' } };
+  const first = claude('one', { cwd, message: { ...claude('one').message, content: [call, call] } });
+  const second = claude('two', { cwd, message: { ...claude('two').message, content: [call] } });
+  write(home, '.claude/projects/x/a.jsonl', [first, second]);
+  write(home, '.claude/projects/x/copy.jsonl', [first]);
+  assert.deepEqual(session(reader.scan(evidenceOptions(home))).reposTouched, [{ name: 'alpha', events: 3 }]);
+});

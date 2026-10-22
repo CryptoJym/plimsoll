@@ -71,7 +71,12 @@ for the default profile without `CLAUDE_CONFIG_DIR`); Codex IDs come from `creat
 identity and model fields remain `unknown`.
 
 Project attribution prefers the newest matching line in
-`~/.local/state/plimsoll-lean/launch-tags.jsonl`, then the nearest Git repository.
+`~/.local/state/plimsoll-lean/launch-tags.jsonl`, then (with `sendEvidence: true`)
+a `.conductor-project.json` in the working folder or a parent up to and including
+home, then the nearest Git repository. The marker must have schema
+`conductor-source-project/v1` and a repository folder name as its `project`.
+Both kinds of launch tag use `projectSource: "launch_tag"`. Folder markers are
+gated too, preserving legacy attribution while the feature is off.
 Worktrees use the main repository name. A repository at home or a filesystem
 root does not name a project. Later launch tags also update open totals without
 re-reading transcripts. Unassigned folders may send up to three relative path
@@ -87,6 +92,29 @@ Only the fields in `docs/lean/LEAN-V1-CONTRACT.md`:
   only when a project is absent. Session titles are off by default.
 - The newest Codex rate-limit reading per account, including plan, used
   percentage, reset/window, and credit balance when present.
+- With `sendEvidence: true`, sessions also carry `gitBranch` (recorded branch,
+  otherwise the repository's local HEAD branch, or `null`) and `reposTouched`:
+  at most 20 `{name, events}` entries, sorted by descending event count with
+  repository name breaking ties. Each tool call counts once per repository.
+  Worktrees use the main repository name and their own branch. Home and disk
+  root repositories never name touched repositories; non-repository paths are
+  ignored. The upload boundary allows only names and positive integer counts.
+
+Evidence reads structured file and working-directory arguments, absolute shell
+paths, `git -C`, patch headers, and literal calls inside Codex code-mode wrappers.
+It never executes commands or JavaScript to infer paths. Dynamic expressions
+are ignored. Evidence inputs are transient; local evidence retains repository
+names, counts, branch metadata and hashed call IDs. Evidence-enabled reads
+stream onto a bounded field projection, including giant argument JSON and patch
+strings. The 256-element projection and 64 KiB patch-header bounds prevent
+arbitrary transcript content from exhausting memory.
+
+`sendEvidence` defaults to `false` and must be the boolean `true` to enable it.
+Leave it off until the server accepts these optional fields. With it off,
+neither field is serialized, including from state captured while it was on;
+the legacy upload encoding is preserved. Enabling it replays evidence from
+existing cursors without recounting usage. Session titles remain independently
+controlled by `sendSessionTitles`.
 
 It never sends prompts, responses, instruction text, tool output, file contents,
 full working paths, raw account IDs, emails, provider credentials, or Git remotes.
@@ -113,6 +141,7 @@ The optional `~/.config/plimsoll-lean/config.json` contains:
   "roots": [{ "tool": "claude_code", "path": "~/other-profile/projects" }],
   "sendSessionTitles": false,
   "sendFolderLabels": true,
+  "sendEvidence": false,
   "dryRun": false
 }
 ```
@@ -130,6 +159,17 @@ deduplication IDs, plus unsent rows. Truncation or inode changes restart a file;
 counted IDs prevent repeating usage. Partial lines remain at their starting byte
 until completed. One PID/token directory lock excludes concurrent runs and recovers dead
 owners. Source-read failures abort a pass before publishing incomplete totals.
+
+Deduplication IDs are stored as sorted binary prefixes grouped by UTC hour,
+encoded as base64 in JSON. Existing v1 state upgrades to v2 without recounting
+usage in either upload mode. This local format is independent of `sendEvidence`.
+Reader 75bb4bee refuses v2 state, so a rollback must use a separate state directory
+and backfill rather than reuse the compact state. State encoding streams
+in chunks, and discovery filters old files before sorting. These avoid expanding
+historical file lists and ID maps during incremental passes.
+CLI passes discover metadata in batches of at most four reads through Node's
+existing filesystem pool, then process files in the same deterministic order.
+The synchronous `scan` API remains available for in-process callers.
 
 Reads use 64 KiB chunks. Lines above 1 MiB are discarded unless their first
 512 bytes mark relevant usage/context; relevant oversized records are projected

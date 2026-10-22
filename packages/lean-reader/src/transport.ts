@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Config, State, Hour, Session, Seat } from './types.js';
 import { expand } from './reader.js';
+import { branchName, topRepositories } from './evidence.js';
 
 const ROUTE = '/api/work-intelligence/lean/usage';
 const MAX_BODY = 1024 * 1024;
@@ -15,12 +16,17 @@ const wireFields = {
   seats: ['tool', 'accountKey', 'plan', 'usedPercent', 'windowMinutes', 'resetsAt', 'creditsBalance', 'observedAt'],
 };
 
-export function makeBatches(state: State, tenantId: string, now: number): Batch[] {
+export function makeBatches(state: State, tenantId: string, now: number, config: Config = {}): Batch[] {
   const result: Batch[] = [];
   const empty = (): Batch => ({ body: { schema: 'plimsoll.lean.usage.v1', tenantId, reader: { version: '0.1.0', machineName: os.hostname().split('.')[0] }, sentAt: new Date(now).toISOString(), hours: [], sessions: [], seats: [] }, keys: [] });
   let batch = empty(), bytes = Buffer.byteLength(JSON.stringify(batch.body));
   const append = (kind: 'hours' | 'sessions' | 'seats', value: any, key?: string) => {
-    value = Object.fromEntries(wireFields[kind].map(field => [field, value[field]]));
+    const original = value;
+    value = Object.fromEntries(wireFields[kind].map(field => [field, original[field]]));
+    if (kind === 'sessions' && config.sendEvidence === true) {
+      value.gitBranch = branchName(original.gitBranch);
+      value.reposTouched = topRepositories(Array.isArray(original.reposTouched) ? original.reposTouched : []);
+    }
     const n = Buffer.byteLength(JSON.stringify(value)) + 1, limit = kind === 'hours' ? 2000 : kind === 'sessions' ? 500 : 50;
     if (batch.body[kind].length >= limit || bytes + n > MAX_BODY) { result.push(batch); batch = empty(); bytes = Buffer.byteLength(JSON.stringify(batch.body)); }
     if (bytes + n > MAX_BODY) throw new Error('row_too_large');
@@ -80,7 +86,7 @@ export async function sendPending(state: State, config: Config, options: { home:
     const credentials = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!['uploadUrl', 'installKey', 'uploadSigningSecret', 'tenantId'].every(k => typeof credentials[k] === 'string' && credentials[k])) throw new Error('invalid_credentials');
     const url = endpoint(credentials.uploadUrl, config.endpoint), deadline = Date.now() + 30_000;
-    for (const batch of makeBatches(state, credentials.tenantId, options.now)) {
+    for (const batch of makeBatches(state, credentials.tenantId, options.now, config)) {
       if (Date.now() >= deadline) throw new Error('upload_deadline');
       await post(url, JSON.stringify(batch.body), credentials.installKey, credentials.uploadSigningSecret, deadline);
       for (const key of batch.keys) delete state.pending[key];

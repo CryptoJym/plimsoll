@@ -5,6 +5,8 @@ import crypto from 'node:crypto';
 import { scan, emptyState } from './reader.js';
 import { sendPending } from './transport.js';
 import { peakMemory, type State, type Config, type Options } from './types.js';
+import { writeState } from './state-json.js';
+import { discover } from './discovery.js';
 
 const MAX_STATE = 9 * 1024 * 1024;
 const execFileSync: typeof import('node:child_process').execFileSync = (...args: any[]): any => {
@@ -15,18 +17,19 @@ export function readState(file: string): State {
   try {
     if (fs.statSync(file).size > MAX_STATE) throw new Error('state_capacity');
     const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (state.version !== 1 || !state.files || !state.hours || !state.seen || !state.pending || !state.sessions || !state.seats) throw new Error('invalid_state');
+    if (![1, 2].includes(state.version) || !state.files || !state.hours || !state.seen || !state.pending || !state.sessions || !state.seats) throw new Error('invalid_state');
     return state;
   } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState(); throw new Error('invalid_state'); }
 }
 export function saveState(file: string, state: State): number {
-  const data = JSON.stringify(state), size = Buffer.byteLength(data);
-  if (size > MAX_STATE) throw new Error('state_capacity'); // Refuse advancement, never silently discard unsent rows or IDs.
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
   const fd = fs.openSync(temp, 'wx', 0o600);
-  try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  try { fs.renameSync(temp, file); const parent = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); } }
+  let size = 0;
+  try {
+    try { size = writeState(fd, state, MAX_STATE); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(temp, file); const parent = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+  }
   finally { try { fs.unlinkSync(temp); } catch { /* Rename succeeded. */ } }
   return size;
 }
@@ -91,7 +94,9 @@ export async function runPass(options: Options = {}) {
   const dir = options.stateDir ?? stateDirectory(home), file = path.join(dir, 'state.json');
   const release = acquireLock(path.join(dir, 'reader.lock'));
   try {
-    const result = scan({ ...options, home, now, config, state: options.state ?? readState(file), backfill: options.command === 'backfill' || options.backfill });
+    const state = options.state ?? readState(file);
+    const discovered = options.discovered ?? await discover({ ...options, home, now, config });
+    const result = scan({ ...options, home, now, config, state, discovered, backfill: options.command === 'backfill' || options.backfill });
     // Persist the outbox before attempting any network operation. Replaying an
     // accepted batch after a crash is safe because cloud rows replace totals.
     result.stats.stateBytes = saveState(file, result.state);
@@ -152,7 +157,7 @@ export function loadConfig(file: string): Config {
   try { if (fs.statSync(file).size > 1024 * 1024) throw new Error(); input = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {}; throw new Error('invalid_config'); }
   const config: Config = {};
   for (const key of ['credentialsFrom', 'endpoint'] as const) if (typeof input[key] === 'string') config[key] = input[key];
-  for (const key of ['sendSessionTitles', 'sendFolderLabels', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
+  for (const key of ['sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
   if (Array.isArray(input.roots)) config.roots = input.roots.filter((r: any) => typeof r === 'string' || (r && typeof r.path === 'string' && ['codex', 'claude_code'].includes(r.tool))).slice(0, 256).map((r: any) => typeof r === 'string' ? r : { tool: r.tool, path: r.path });
   return config;
 }

@@ -25,7 +25,7 @@ async function main() {
     // printable; endpoint userinfo, query strings and fragments are redacted.
     let endpoint: string | undefined;
     try { const u = new URL(config.endpoint!); endpoint = u.origin; } catch { endpoint = config.endpoint ? '[invalid]' : undefined; }
-    print({ ...config, endpoint, sendSessionTitles: config.sendSessionTitles ?? false, sendFolderLabels: config.sendFolderLabels ?? true, dryRun: config.dryRun ?? false }, true); return;
+    print({ ...config, endpoint, sendSessionTitles: config.sendSessionTitles ?? false, sendFolderLabels: config.sendFolderLabels ?? true, sendEvidence: config.sendEvidence ?? false, dryRun: config.dryRun ?? false }, true); return;
   }
   if (command === 'status') {
     const state = readState(path.join(stateDir, 'state.json'));

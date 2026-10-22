@@ -3,7 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLines } from './lines.js';
-import { counts, fields, HOUR, WINDOW, integer, string, peakMemory, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats } from './types.js';
+import { Evidence, launchProject, topRepositories } from './evidence.js';
+import { stateBytes } from './state-json.js';
+import { Seen } from './seen.js';
+import { counts, fields, HOUR, WINDOW, integer, string, peakMemory, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
 // Exact port of shared/src/policy.ts providerAccountKey / hashProtectedValue.
@@ -31,26 +34,48 @@ export function roots(home: string, env: Record<string, string | undefined>, con
   const seen = new Set<string>();
   return result.filter(root => { try { root.path = fs.realpathSync(root.path); } catch { return false; } const key = root.tool + ':' + root.path; if (seen.has(key)) return false; seen.add(key); return true; });
 }
-function* files(root: string, visited: Set<string>): Generator<string> {
-  let entries: fs.Dirent[];
+function* files(root: string, visited: Set<string>, since: number): Generator<{ file: string; stat: fs.Stats }> {
+  const entries: { name: string; directory?: string; file?: string; stat?: fs.Stats }[] = [];
   try {
     const stat = fs.statSync(root), key = `${stat.dev}:${stat.ino}`;
     if (visited.has(key)) return;
-    visited.add(key); entries = fs.readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    visited.add(key);
+    // Some profiles keep years of rollouts in one directory. Filter while
+    // streaming, then sort only eligible files and directories, preserving the
+    // original traversal order without retaining all historical Dirents.
+    const directory = fs.opendirSync(root);
+    try {
+      let entry;
+      while ((entry = directory.readSync())) {
+        const file = path.join(root, entry.name);
+        if (entry.isDirectory()) entries.push({ name: entry.name, directory: file });
+        else if (entry.isSymbolicLink()) {
+          try {
+            const s = fs.statSync(file);
+            if (s.isDirectory()) entries.push({ name: entry.name, directory: file });
+            else if (s.isFile() && entry.name.endsWith('.jsonl') && s.mtimeMs >= since) entries.push({ name: entry.name, file: fs.realpathSync(file), stat: s });
+          } catch { /* Optional alias disappeared. */ }
+        } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+          let s: fs.Stats;
+          try { s = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
+          if (s.mtimeMs >= since) entries.push({ name: entry.name, file, stat: s });
+        }
+      }
+    } finally { directory.closeSync(); }
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('source_unreadable'); return; }
   for (const entry of entries) {
-    const file = path.join(root, entry.name);
-    if (entry.isDirectory()) yield* files(file, visited);
-    else if (entry.isSymbolicLink()) {
-      try { const s = fs.statSync(file); if (s.isDirectory()) yield* files(file, visited); else if (s.isFile() && entry.name.endsWith('.jsonl')) yield fs.realpathSync(file); } catch { /* Optional root disappeared. */ }
-    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) yield file;
+    if (entry.directory) yield* files(entry.directory, visited, since);
+    else yield { file: entry.file!, stat: entry.stat! };
   }
 }
 
 class Projects {
   tags = new Map<string, { project: string; at: number }>();
   cache = new Map<string, string | null>();
-  constructor(private home: string) {}
+  lanes = new Map<string, string | null>();
+  folderTags = new Map<string, { project: string; at: number }>();
+  constructor(private home: string, private sendEvidence: boolean) {}
   loadTags(active: Set<string>) {
     const file = path.join(this.home, '.local/state/plimsoll-lean/launch-tags.jsonl');
     try {
@@ -80,10 +105,15 @@ class Projects {
   }
   hint(cwd: string, tool: Tool, session: string): { projectHint: string | null; projectSource: Hour['projectSource']; folderLabel: string | null } {
     const tagged = this.tags.get(tool + ':' + session);
-    const project = tagged?.project ?? this.repo(cwd);
+    const lane = this.sendEvidence ? launchProject(cwd, this.home, this.lanes) : null;
+    const project = tagged?.project ?? lane ?? this.repo(cwd);
     const relative = cwd ? path.relative(this.home, cwd) : '';
     const folderLabel = !project && relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative.split(path.sep).slice(0, 3).join('/') : null;
-    return { projectHint: project, projectSource: tagged ? 'launch_tag' : project ? 'git_repo' : 'none', folderLabel };
+    return { projectHint: project, projectSource: tagged || lane ? 'launch_tag' : project ? 'git_repo' : 'none', folderLabel };
+  }
+  rememberFolder(cwd: string, tool: Tool, session: string, at: number) {
+    const project = this.sendEvidence ? launchProject(cwd, this.home, this.lanes) : null, key = tool + ':' + session;
+    if (project && at >= (this.folderTags.get(key)?.at ?? -Infinity)) this.folderTags.set(key, { project, at });
   }
   repo(cwd: string): string | null {
     if (!cwd || !path.isAbsolute(cwd)) return null;
@@ -130,7 +160,9 @@ function claudeAccount(root: string, home: string, env: Record<string, string | 
 
 function prune(state: State, cutoff: number) {
   for (const [key, row] of Object.entries(state.hours)) if (Date.parse(row.hour) < cutoff && !state.pending[key]) delete state.hours[key];
-  for (const [key, hour] of Object.entries(state.seen)) if (hour * HOUR < cutoff) delete state.seen[key];
+  for (const key in state.seen) if (state.seen[key] * HOUR < cutoff) delete state.seen[key];
+  for (const key in state.evidenceSeen ?? {}) if (state.evidenceSeen![key] * HOUR < cutoff) delete state.evidenceSeen![key];
+  for (const [key, evidence] of Object.entries(state.evidence ?? {})) if (evidence.lastSeen < cutoff && !state.metadataPending) delete state.evidence![key];
   for (const [file, tracked] of Object.entries(state.files)) {
     for (const key of Object.keys(tracked.fallback)) if (!state.hours[key]) delete tracked.fallback[key];
     if (tracked.mtime < cutoff && !Object.keys(tracked.fallback).some(k => state.pending[k])) delete state.files[file];
@@ -152,26 +184,29 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const inside = (hour: string) => Date.parse(hour) >= startHour && Date.parse(hour) < endHour;
   const stats: Stats = { files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 0, milliseconds: 0, peakMemoryBytes: 0, stateBytes: 0 };
   prune(state, cutoff);
+  const seen = new Seen(state, 'seen', 'seenPacked', cutoff);
+  const evidenceSeen = config.sendEvidence === true ? new Seen(state, 'evidenceSeen', 'evidenceSeenPacked', cutoff) : null;
   // Bound admission while scanning as well as at atomic save. A large source
   // must stop before its ID/metadata maps can exhaust memory. Sampling avoids
   // serializing state for every reply; the writer enforces the exact ceiling.
-  const checkBudget = () => { if (Buffer.byteLength(JSON.stringify(state)) > 9 * 1024 * 1024) throw new Error('state_capacity'); };
+  const checkBudget = () => { stateBytes(state, 9 * 1024 * 1024); };
   let admissions = 0;
   const budgetTick = () => { if (++admissions % 256 === 0) checkBudget(); };
   if (options.backfill) {
     // Zero rows act as replacement tombstones if a corrected source no longer
     // contains a formerly counted hour. Never leave a stale cloud total behind.
     for (const [key, row] of Object.entries(state.hours)) if (inside(row.hour)) { Object.assign(row, counts()); state.pending[key] = true; }
-    for (const [id, hour] of Object.entries(state.seen)) if (hour * HOUR >= startHour && hour * HOUR < endHour) delete state.seen[id];
+    seen.remove(hour => hour * HOUR >= startHour && hour * HOUR < endHour);
     for (const file of Object.values(state.files)) for (const key of Object.keys(file.fallback)) if (state.hours[key] && inside(state.hours[key].hour)) delete file.fallback[key];
   }
-  const projects = new Projects(home), visited = new Set<string>(), visitedFiles = new Set<string>();
+  const projects = new Projects(home, config.sendEvidence === true), visited = new Set<string>(), visitedFiles = new Set<string>();
+  const evidence = evidenceSeen ? new Evidence(home, state, evidenceSeen, startHour, endHour, budgetTick) : null;
   const add = (tool: Tool, ctx: Context, stamp: unknown, id: string, tokens: Counts, file?: FileState) => {
     const time = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
     if (!Number.isFinite(time) || time < startHour || time >= endHour) return;
     const hour = Math.floor(time / HOUR), seenKey = digest(tool + ':' + id);
-    if (Object.hasOwn(state.seen, seenKey)) return;
-    state.seen[seenKey] = hour;
+    if (seen.has(seenKey)) return;
+    seen.add(seenKey, hour);
     budgetTick();
     if (ctx.model === '<synthetic>') return;
     const sessionKey = ctx.session || 'unknown';
@@ -189,12 +224,15 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     summary.title = config.sendSessionTitles ? ctx.title : null;
     state.metadataPending = true;
   };
-  for (const root of roots(home, options.env ?? process.env, config)) {
+  const sources: Source[] = options.discovered ?? roots(home, options.env ?? process.env, config);
+  for (const root of sources) {
     let rootAccount: string | undefined;
     const getAccount = () => rootAccount ??= root.tool === 'claude_code' ? claudeAccount(root.path, home, options.env ?? process.env) : 'unknown';
-    for (const file of files(root.path, visited)) {
+    for (const { file, stat: discoveredStat } of root.files ?? files(root.path, visited, startHour)) {
       if (root.tool === 'codex' && !path.basename(file).startsWith('rollout-')) continue;
-      let stat: fs.Stats;
+      // Metadata discovery is a snapshot; refresh eligible files immediately
+      // before capture so rotations and truncations still reset their context.
+      let stat = discoveredStat;
       try { stat = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
       const fileIdentity = `${stat.dev}:${stat.ino}`;
       if (visitedFiles.has(fileIdentity) || stat.mtimeMs < startHour) continue;
@@ -205,10 +243,19 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       if (reset || options.backfill) { const records = tracked.context.records && !options.backfill; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
       const ctx = tracked.context;
       stats.files++;
-      if (tracked.offset === stat.size) continue;
+      // Upgrading an existing state (or re-enabling evidence) replays evidence
+      // alone. Usage cursors, cumulative baselines and replacement totals stay put.
+      let evidenceContext = reset || options.backfill ? { cwd: '', session: '' } : tracked.evidenceContext ?? { cwd: ctx.cwd, session: ctx.session };
+      if (evidence && !reset && !options.backfill && tracked.evidenceOffset !== tracked.offset) {
+        evidenceContext = { cwd: '', session: '' };
+        stats.bytesRead += readLines(file, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
+        tracked.evidenceOffset = tracked.offset; tracked.evidenceContext = evidenceContext;
+      }
+      if (tracked.offset === stat.size) { if (evidence) projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0); continue; }
       if (root.tool === 'claude_code') ctx.account = getAccount();
       try {
         const result = readLines(file, tracked.offset, stat.size, r => {
+          evidence?.observe(root.tool, evidenceContext, r);
           if (root.tool === 'claude_code') {
             if (r.type === 'summary' && config.sendSessionTitles) { ctx.title = string(r.summary); const summary = state.sessions[digest(root.tool + ':' + ctx.session)]; if (summary) { summary.title = ctx.title; state.metadataPending = true; } return; }
             if (r.type !== 'assistant' || !r.timestamp || !r.message?.usage) return;
@@ -261,8 +308,10 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
             }
             ctx.previous = current;
           }
-        });
+        }, Boolean(evidence));
         tracked.offset = result.offset; stats.bytesRead += result.bytes;
+        if (evidence) { tracked.evidenceOffset = result.offset; tracked.evidenceContext = evidenceContext; }
+        if (evidence) projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0);
         tracked.dev = stat.dev; tracked.ino = stat.ino; tracked.size = stat.size; tracked.mtime = stat.mtimeMs;
         budgetTick();
       } catch (error) { if (error instanceof Error && error.message === 'state_capacity') throw error; throw new Error('source_unreadable'); }
@@ -272,18 +321,28 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   for (const session of Object.values(state.sessions)) active.add(session.tool + ':' + session.sessionKey);
   projects.loadTags(active);
   for (const [key, row] of Object.entries(state.hours)) {
-    const tagged = projects.tags.get(row.tool + ':' + row.sessionKey);
+    const tagged = projects.tags.get(row.tool + ':' + row.sessionKey) ?? projects.folderTags.get(row.tool + ':' + row.sessionKey);
     if (tagged && (row.projectHint !== tagged.project || row.projectSource !== 'launch_tag')) {
       row.projectHint = tagged.project; row.projectSource = 'launch_tag'; state.pending[key] = true;
     }
   }
   for (const session of Object.values(state.sessions)) {
-    const tagged = projects.tags.get(session.tool + ':' + session.sessionKey);
+    const tagged = projects.tags.get(session.tool + ':' + session.sessionKey) ?? projects.folderTags.get(session.tool + ':' + session.sessionKey);
     if (tagged && session.projectHint !== tagged.project) { session.projectHint = tagged.project; session.folderLabel = null; state.metadataPending = true; }
   }
   if (since < cutoff) prune(state, cutoff);
   // Privacy changes also apply to metadata read from an earlier state.
   for (const session of Object.values(state.sessions)) { if (!config.sendSessionTitles) session.title = null; if (config.sendFolderLabels === false || session.projectHint) session.folderLabel = null; }
+  for (const [key, session] of Object.entries(state.sessions)) {
+    if (evidence) {
+      const collected = state.evidence?.[key];
+      const repos = topRepositories(collected?.repos ?? []), branch = collected?.gitBranch ?? null;
+      if (session.gitBranch !== branch || JSON.stringify(session.reposTouched) !== JSON.stringify(repos)) state.metadataPending = true;
+      session.gitBranch = branch; session.reposTouched = repos;
+    } else { delete session.gitBranch; delete session.reposTouched; }
+  }
+  seen.finish(); evidenceSeen?.finish();
+  state.version = 2;
   checkBudget();
   const rows = Object.values(state.hours).sort((a, b) => { const x = [a.hour, a.tool, a.sessionKey].join(':'), y = [b.hour, b.tool, b.sessionKey].join(':'); return x < y ? -1 : x > y ? 1 : 0; });
   stats.rows = rows.length; stats.milliseconds = performance.now() - started; stats.peakMemoryBytes = peakMemory();
