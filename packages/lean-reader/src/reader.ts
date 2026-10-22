@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLines } from './lines.js';
-import { Evidence, launchProject, protectedPath, topRepositories } from './evidence.js';
+import { Evidence, genericFolder, launchProject, protectedPath, topRepositories } from './evidence.js';
 import { stateBytes } from './state-json.js';
 import { Seen } from './seen.js';
 import { counts, fields, HOUR, WINDOW, integer, string, peakMemory, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source } from './types.js';
@@ -75,7 +75,7 @@ class Projects {
   cache = new Map<string, string | null>();
   lanes = new Map<string, string | null>();
   folderTags = new Map<string, { project: string; at: number }>();
-  constructor(private home: string, private sendEvidence: boolean) {}
+  constructor(private home: string) {}
   loadTags(active: Set<string>) {
     const file = path.join(this.home, '.local/state/plimsoll-lean/launch-tags.jsonl');
     try {
@@ -105,14 +105,14 @@ class Projects {
   }
   hint(cwd: string, tool: Tool, session: string): { projectHint: string | null; projectSource: Hour['projectSource']; folderLabel: string | null } {
     const tagged = this.tags.get(tool + ':' + session);
-    const lane = this.sendEvidence ? launchProject(cwd, this.home, this.lanes) : null;
+    const lane = launchProject(cwd, this.home, this.lanes);
     const project = tagged?.project ?? lane ?? this.repo(cwd);
     const relative = cwd ? path.relative(this.home, cwd) : '';
     const folderLabel = !project && relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative.split(path.sep).slice(0, 3).join('/') : null;
     return { projectHint: project, projectSource: tagged || lane ? 'launch_tag' : project ? 'git_repo' : 'none', folderLabel };
   }
   rememberFolder(cwd: string, tool: Tool, session: string, at: number) {
-    const project = this.sendEvidence ? launchProject(cwd, this.home, this.lanes) : null, key = tool + ':' + session;
+    const project = launchProject(cwd, this.home, this.lanes), key = tool + ':' + session;
     if (project && at >= (this.folderTags.get(key)?.at ?? -Infinity)) this.folderTags.set(key, { project, at });
   }
   repo(cwd: string): string | null {
@@ -137,7 +137,7 @@ class Projects {
               }
             }
           }
-          project = main === this.home || main === path.parse(main).root ? null : path.basename(main); break;
+          project = main === this.home || main === path.parse(main).root || genericFolder(path.basename(main)) ? null : path.basename(main); break;
         }
       } catch { /* Walk toward the nearest repository. */ }
       at = path.dirname(at);
@@ -201,7 +201,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     seen.remove(hour => hour * HOUR >= startHour && hour * HOUR < endHour);
     for (const file of Object.values(state.files)) for (const key of Object.keys(file.fallback)) if (state.hours[key] && inside(state.hours[key].hour)) delete file.fallback[key];
   }
-  const projects = new Projects(home, config.sendEvidence === true), visited = new Set<string>(), visitedFiles = new Set<string>();
+  const projects = new Projects(home), visited = new Set<string>(), visitedFiles = new Set<string>();
   const evidence = evidenceSeen ? new Evidence(home, state, evidenceSeen, startHour, endHour, budgetTick) : null;
   const add = (tool: Tool, ctx: Context, stamp: unknown, id: string, tokens: Counts, file?: FileState) => {
     const time = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
@@ -253,7 +253,12 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
         stats.bytesRead += readLines(file, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
         tracked.evidenceOffset = tracked.offset; tracked.evidenceContext = evidenceContext;
       }
-      if (tracked.offset === stat.size) { if (evidence) projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0); continue; }
+      // A lane marker in the session's latest folder also names rows counted
+      // before it was seen. Without evidence, the usage context has that folder.
+      const remember = (at: number) => evidence
+        ? projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0)
+        : projects.rememberFolder(ctx.cwd, root.tool, ctx.session, at);
+      if (tracked.offset === stat.size) { remember(tracked.mtime); continue; }
       if (root.tool === 'claude_code') ctx.account = getAccount();
       try {
         const result = readLines(file, tracked.offset, stat.size, r => {
@@ -313,7 +318,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
         }, Boolean(evidence));
         tracked.offset = result.offset; stats.bytesRead += result.bytes;
         if (evidence) { tracked.evidenceOffset = result.offset; tracked.evidenceContext = evidenceContext; }
-        if (evidence) projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0);
+        remember(stat.mtimeMs);
         tracked.dev = stat.dev; tracked.ino = stat.ino; tracked.size = stat.size; tracked.mtime = stat.mtimeMs;
         budgetTick();
       } catch (error) { if (error instanceof Error && error.message === 'state_capacity') throw error; throw new Error('source_unreadable'); }

@@ -131,12 +131,12 @@ test('all optional roots, environment roots and aliases are discovered once', t 
 test('project hints prefer newest launch tags; worktrees name the main repo; home repos remain unnamed', t => {
   const home = fixture(t);
   fs.mkdirSync(path.join(home, '.git'));
-  fs.mkdirSync(path.join(home, 'main/.git/worktrees/branch'), { recursive: true });
-  write(home, 'branch/.git', 'gitdir: ../main/.git/worktrees/branch\n');
+  fs.mkdirSync(path.join(home, 'primary/.git/worktrees/branch'), { recursive: true });
+  write(home, 'branch/.git', 'gitdir: ../primary/.git/worktrees/branch\n');
   write(home, '.local/state/plimsoll-lean/launch-tags.jsonl', [{ tool: 'claude_code', sessionKey: 'tagged', project: 'Older synthetic', at: since }, { tool: 'claude_code', sessionKey: 'tagged', project: 'Synthetic tag', at: until }]);
-  write(home, '.claude/projects/x/a.jsonl', [claude('one', { cwd: path.join(home, 'branch/src') }), claude('two', { sessionId: 'tagged', cwd: path.join(home, 'main') }), claude('three', { sessionId: 'home', cwd: path.join(home, 'one/two/three/four') })]);
+  write(home, '.claude/projects/x/a.jsonl', [claude('one', { cwd: path.join(home, 'branch/src') }), claude('two', { sessionId: 'tagged', cwd: path.join(home, 'primary') }), claude('three', { sessionId: 'home', cwd: path.join(home, 'one/two/three/four') })]);
   const result = reader.scan(options(home));
-  assert.ok(result.rows.some(r => r.projectHint === 'main' && r.projectSource === 'git_repo'));
+  assert.ok(result.rows.some(r => r.projectHint === 'primary' && r.projectSource === 'git_repo'));
   assert.ok(result.rows.some(r => r.projectHint === 'Synthetic tag' && r.projectSource === 'launch_tag'));
   assert.ok(result.rows.some(r => r.sessionKey === 'home' && r.projectHint === null && r.projectSource === 'none'));
   assert.equal(Object.values(result.state.sessions).find(s => s.sessionKey === 'home').folderLabel, 'one/two/three');
@@ -541,16 +541,16 @@ test('Codex function arguments, workdirs and both patch formats provide evidence
 
 test('worktree evidence uses the main repository and its own HEAD; detached and absent branches are null', t => {
   const home = fixture(t);
-  repository(home, 'main', 'main-branch');
-  write(home, 'main/.git/worktrees/lane/HEAD', 'ref: refs/heads/feature/worktree\n');
-  write(home, 'main/.git/worktrees/lane/commondir', '../..\n');
+  repository(home, 'primary', 'main-branch');
+  write(home, 'primary/.git/worktrees/lane/HEAD', 'ref: refs/heads/feature/worktree\n');
+  write(home, 'primary/.git/worktrees/lane/commondir', '../..\n');
   const cwd = path.join(home, 'lane');
-  write(home, 'lane/.git', 'gitdir: ../main/.git/worktrees/lane\n');
+  write(home, 'lane/.git', 'gitdir: ../primary/.git/worktrees/lane\n');
   write(home, '.claude/projects/x/a.jsonl', [toolReply('one', 'Read', { file_path: cwd + '/new.ts' }, { cwd })]);
   let result = reader.scan(evidenceOptions(home));
-  assert.deepEqual(session(result).reposTouched, [{ name: 'main', events: 1 }]);
+  assert.deepEqual(session(result).reposTouched, [{ name: 'primary', events: 1 }]);
   assert.equal(session(result).gitBranch, 'feature/worktree');
-  write(home, 'main/.git/worktrees/lane/HEAD', '0123456789abcdef0123456789abcdef01234567\n');
+  write(home, 'primary/.git/worktrees/lane/HEAD', '0123456789abcdef0123456789abcdef01234567\n');
   result = reader.scan(evidenceOptions(home));
   assert.equal(session(result).gitBranch, null);
   write(home, '.claude/projects/x/a.jsonl', [claude('outside', { cwd: path.join(home, 'outside') })]);
@@ -626,7 +626,8 @@ test('lane marker at cwd or a parent wins over Git; invalid markers and markers 
   result = reader.scan(evidenceOptions(home));
   assert.equal(result.rows[0].projectHint, 'source-repository');
   result = reader.scan(options(home));
-  assert.equal(result.rows[0].projectHint, 'copy', 'flag off retains legacy attribution');
+  assert.equal(result.rows[0].projectHint, 'source-repository', 'markers apply with evidence off');
+  assert.equal(result.rows[0].projectSource, 'launch_tag');
   write(home, 'copy/.conductor-project.json', { ...tag, project: '/PRIVATE/path' });
   assert.equal(reader.scan(evidenceOptions(home)).rows[0].projectHint, 'copy');
   write(home, 'copy/.conductor-project.json', { ...tag, schema: 'wrong' });
@@ -650,17 +651,68 @@ test('explicit session launch tags outrank a copied-folder marker', t => {
   assert.equal(session(result).projectHint, 'explicit-source');
 });
 
-test('enabling evidence applies a lane marker to existing totals without recounting usage', t => {
+test('a lane marker found later names existing totals without rereading or recounting, with evidence off or on', t => {
+  for (const evidence of [false, true]) {
+    const home = fixture(t), cwd = path.join(home, 'unversioned-lane');
+    const scanOptions = evidence ? evidenceOptions(home) : options(home);
+    write(home, '.claude/projects/x/a.jsonl', [claude('one', { cwd })]);
+    const before = reader.scan(scanOptions);
+    assert.equal(before.rows[0].projectHint, null);
+    for (const key of Object.keys(before.state.pending)) delete before.state.pending[key];
+    write(home, 'unversioned-lane/.conductor-project.json', { project: 'source-repository', schema: 'conductor-source-project/v1' });
+    const result = reader.scan({ ...scanOptions, backfill: false, state: before.state });
+    assert.equal(result.stats.bytesRead, 0);
+    assert.equal(result.rows[0].projectHint, 'source-repository');
+    assert.equal(result.rows[0].projectSource, 'launch_tag');
+    assert.equal(Object.keys(result.state.pending).length, 1, 'the corrected row is sent again');
+    assert.equal(session(result).projectHint, 'source-repository');
+    assert.equal(totals(result.rows).requests, 1);
+  }
+});
+
+test('enabling evidence keeps a lane marker on existing totals without recounting usage', t => {
   const home = fixture(t), cwd = path.join(home, 'unversioned-lane');
   write(home, 'unversioned-lane/.conductor-project.json', { project: 'source-repository', schema: 'conductor-source-project/v1' });
   write(home, '.claude/projects/x/a.jsonl', [claude('one', { cwd })]);
   const legacy = reader.scan(options(home));
-  assert.equal(legacy.rows[0].projectHint, null);
+  assert.equal(legacy.rows[0].projectHint, 'source-repository');
   const result = reader.scan({ ...evidenceOptions(home), backfill: false, state: legacy.state });
   assert.equal(result.rows[0].projectHint, 'source-repository');
   assert.equal(result.rows[0].projectSource, 'launch_tag');
   assert.equal(session(result).projectHint, 'source-repository');
   assert.equal(totals(result.rows).requests, 1);
+});
+
+test('checkout folders named for their role name no project; lane markers still name them', t => {
+  const home = fixture(t);
+  const generic = ['work', 'repo', 'head', 'base', 'main', 'main-10d48c98', 'src', 'app', 'tree', 'pr', 'pr1623', 'upstream', 'Work'];
+  const records = generic.map((name, i) => claude('generic-' + i, { sessionId: 'generic-' + i, cwd: repository(home, 'lanes/' + i + '/' + name) + '/nested' }));
+  records.push(claude('named', { sessionId: 'named', cwd: repository(home, 'lanes/named/synthetic-project') }));
+  records.push(claude('marked', { sessionId: 'marked', cwd: repository(home, 'lanes/marked/work') }));
+  write(home, 'lanes/marked/.conductor-project.json', { project: 'marked-project', schema: 'conductor-source-project/v1' });
+  // Lane cleanup can delete a work folder; the lane folder's marker still names it in a later backfill.
+  records.push(claude('deleted', { sessionId: 'deleted', cwd: path.join(home, 'lanes/deleted/work/nested') }));
+  write(home, 'lanes/deleted/.conductor-project.json', { project: 'deleted-project', schema: 'conductor-source-project/v1' });
+  write(home, '.claude/projects/x/a.jsonl', records);
+  for (const scanOptions of [options(home), evidenceOptions(home)]) {
+    const result = reader.scan(scanOptions);
+    const row = key => result.rows.find(r => r.sessionKey === key);
+    for (let i = 0; i < generic.length; i++) {
+      assert.equal(row('generic-' + i).projectHint, null, generic[i]);
+      assert.equal(row('generic-' + i).projectSource, 'none', generic[i]);
+    }
+    assert.equal(Object.values(result.state.sessions).find(s => s.sessionKey === 'generic-0').folderLabel, 'lanes/0/work');
+    assert.deepEqual([row('named').projectHint, row('named').projectSource], ['synthetic-project', 'git_repo']);
+    assert.deepEqual([row('marked').projectHint, row('marked').projectSource], ['marked-project', 'launch_tag']);
+    assert.deepEqual([row('deleted').projectHint, row('deleted').projectSource], ['deleted-project', 'launch_tag']);
+  }
+});
+
+test('touched repositories skip checkout folders named for their role', t => {
+  const home = fixture(t), work = repository(home, 'lane/work', 'lane-base'), named = repository(home, 'synthetic-project', 'feature/x');
+  write(home, '.claude/projects/x/a.jsonl', [toolReply('work', 'Read', { file_path: work + '/a.ts' }, { cwd: work }), toolReply('named', 'Read', { file_path: named + '/b.ts' }, { cwd: work })]);
+  const result = reader.scan(evidenceOptions(home));
+  assert.deepEqual(session(result).reposTouched, [{ name: 'synthetic-project', events: 1 }]);
 });
 
 test('flag-off upload bytes match the frozen 75bb4bee session shape, including with evidence in state', t => {

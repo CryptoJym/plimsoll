@@ -71,16 +71,21 @@ for the default profile without `CLAUDE_CONFIG_DIR`); Codex IDs come from `creat
 identity and model fields remain `unknown`.
 
 Project attribution prefers the newest matching line in
-`~/.local/state/plimsoll-lean/launch-tags.jsonl`, then (with `sendEvidence: true`)
-a `.conductor-project.json` in the working folder or a parent up to and including
-home, then the nearest Git repository. The marker must have schema
-`conductor-source-project/v1` and a repository folder name as its `project`.
-Both kinds of launch tag use `projectSource: "launch_tag"`. Folder markers are
-gated too, preserving legacy attribution while the feature is off.
+`~/.local/state/plimsoll-lean/launch-tags.jsonl`, then a `.conductor-project.json`
+in the working folder or a parent up to and including home, then the nearest Git
+repository. The marker must have schema `conductor-source-project/v1` and a
+repository folder name as its `project`. Both kinds of launch tag use
+`projectSource: "launch_tag"` and apply whether or not `sendEvidence` is on.
+Folders are matched by path, so a marker in a lane folder still names its
+deleted `work` copy in a later backfill.
 Worktrees use the main repository name. A repository at home or a filesystem
-root does not name a project. Later launch tags also update open totals without
-re-reading transcripts. Unassigned folders may send up to three relative path
-components within home. No Git command or remote is needed for attribution.
+root does not name a project, nor does a checkout folder named for its role:
+`work`, `repo`, `head`, `base`, `main`, `main-<hash>`, `src`, `app`, `tree`,
+`pr`, `pr<number>` and `upstream` (in hints and in touched repositories).
+Later launch tags, and markers found later in a session's latest folder, also
+update open totals without re-reading transcripts. Unassigned folders may send
+up to three relative path components within home. No Git command or remote is
+needed for attribution.
 
 ## What it sends
 

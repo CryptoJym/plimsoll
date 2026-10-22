@@ -9,6 +9,10 @@ import type { Seen } from './seen.js';
 // match it exactly: names up to 160 characters, trimmed, without / \ or :;
 // branches up to 240 characters.
 export const repositoryName = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 160 && s === s.trim() && s !== '.' && s !== '..' && !/[\/\\:\x00-\x1f\x7f]/.test(s);
+// A checkout folder named for its role (a lane's copy, a review's head or base,
+// a hashed worktree) names no project. Folder markers and launch tags still do.
+const GENERIC_FOLDER = /^(?:work|repo|head|base|main|src|app|tree|pr|upstream|main-[0-9a-f]{6,40}|pr-?\d+)$/i;
+export const genericFolder = (name: string): boolean => GENERIC_FOLDER.test(name);
 export function branchName(s: unknown): string | null {
   return typeof s === 'string' && s.length > 0 && s.length <= 240 && !/[\s\x00-\x1f\x7f~^:?*\[\\]/.test(s) && !s.includes('..') && !s.includes('@{') && !s.startsWith('/') && !s.endsWith('/') ? s : null;
 }
@@ -91,7 +95,7 @@ class Repositories {
             }
           }
           const name = path.basename(main);
-          if (main !== this.canonicalHome && main !== path.parse(main).root && repositoryName(name)) result = { name, branch: branchName(smallFile(path.join(gitdir, 'HEAD'), this.home).trim().match(/^ref: refs\/heads\/(.+)$/)?.[1]) };
+          if (main !== this.canonicalHome && main !== path.parse(main).root && repositoryName(name) && !genericFolder(name)) result = { name, branch: branchName(smallFile(path.join(gitdir, 'HEAD'), this.home).trim().match(/^ref: refs\/heads\/(.+)$/)?.[1]) };
           break; // A home/root repository never falls through to a parent repo.
         }
       } catch { /* Walk to the nearest repository. */ }
