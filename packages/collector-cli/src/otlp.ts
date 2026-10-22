@@ -341,9 +341,8 @@ function buildLogEvent(
   if (resolvedGit?.remoteUrlHash && resolvedGit.remoteLabel) {
     context.onRepoLabel?.(resolvedGit.remoteUrlHash, resolvedGit.remoteLabel);
   }
-  const gitContext = resolvedGit
-    ? (({ remoteLabel: _label, ...linkage }) => linkage)(resolvedGit)
-    : undefined;
+  const gitContext = resolvedGit ? { ...resolvedGit } : undefined;
+  if (gitContext) delete gitContext.remoteLabel;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
   const rawAttrs = flattenOtelAttributes(safeRecord.attributes);
@@ -460,7 +459,9 @@ function buildLogEvent(
       ...(costEstimated ? { costEstimated: true } : {}),
     },
   });
-  if (!context.resolveGit && repoContextCwd) {
+  // An inline null lookup still owns this cwd; keep its exclusion through
+  // deferred capture and sealing rather than falling back to old session git.
+  if ((!context.resolveGit || !resolvedGit) && repoContextCwd) {
     attachRepoContextSidecar(event, event.id, repoContextCwd);
   }
 
