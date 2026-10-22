@@ -818,6 +818,13 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-operator
 
+      - name: Test explicit snapshot removal and prove its fenced recovery (eco-6hoxj.165.258)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm test:lifecycle-snapshot-remove
+          pnpm proof:lifecycle-snapshot-remove
+          pnpm proof:ledger-retention-prototype
+
       - name: Prove bounded lifecycle snapshot retention and space-free snapshots (eco-6hoxj.163.30)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-retention
