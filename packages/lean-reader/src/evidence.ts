@@ -5,9 +5,12 @@ import type { EvidenceContext, RepoTouch, State, Tool } from './types.js';
 import type { Seen } from './seen.js';
 
 // These validators also run at the upload boundary, including for old state.
-export const repositoryName = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 255 && s !== '.' && s !== '..' && !/[\/\\\x00-\x1f\x7f]/.test(s);
+// The cloud's upload schema refuses a whole batch for one bad value, so these
+// match it exactly: names up to 160 characters, trimmed, without / \ or :;
+// branches up to 240 characters.
+export const repositoryName = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 160 && s === s.trim() && s !== '.' && s !== '..' && !/[\/\\:\x00-\x1f\x7f]/.test(s);
 export function branchName(s: unknown): string | null {
-  return typeof s === 'string' && s.length > 0 && s.length <= 512 && !/[\s\x00-\x1f\x7f~^:?*\[\\]/.test(s) && !s.includes('..') && !s.includes('@{') && !s.startsWith('/') && !s.endsWith('/') ? s : null;
+  return typeof s === 'string' && s.length > 0 && s.length <= 240 && !/[\s\x00-\x1f\x7f~^:?*\[\\]/.test(s) && !s.includes('..') && !s.includes('@{') && !s.startsWith('/') && !s.endsWith('/') ? s : null;
 }
 function smallFile(file: string): string {
   try { const stat = fs.statSync(file, { throwIfNoEntry: false }); if (stat?.isFile() && stat.size <= 8192) return fs.readFileSync(file, 'utf8'); } catch { /* Optional local metadata. */ }
@@ -179,9 +182,18 @@ function callPaths(name: string, input: any, cwd: string, home: string): string[
   return result;
 }
 
+// Names that differ only in letter case are one repository to the cloud, which
+// refuses duplicates: merge their counts under the spelling seen most often.
 export function topRepositories(repos: RepoTouch[]): RepoTouch[] {
-  return repos.filter(r => r && repositoryName(r.name) && Number.isSafeInteger(r.events) && r.events >= 1)
-    .map(r => ({ name: r.name, events: r.events }))
+  const merged = new Map<string, { name: string; best: number; events: number }>();
+  for (const r of repos) {
+    if (!r || !repositoryName(r.name) || !Number.isSafeInteger(r.events) || r.events < 1) continue;
+    const key = r.name.toLowerCase(), entry = merged.get(key);
+    if (!entry) { merged.set(key, { name: r.name, best: r.events, events: r.events }); continue; }
+    entry.events = Math.min(Number.MAX_SAFE_INTEGER, entry.events + r.events);
+    if (r.events > entry.best || (r.events === entry.best && r.name < entry.name)) { entry.name = r.name; entry.best = r.events; }
+  }
+  return [...merged.values()].map(r => ({ name: r.name, events: r.events }))
     .sort((a, b) => b.events - a.events || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)).slice(0, 20);
 }
 

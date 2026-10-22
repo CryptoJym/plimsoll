@@ -829,3 +829,20 @@ test('calls without tool IDs use message identity and ordinal while copied messa
   write(home, '.claude/projects/x/copy.jsonl', [first]);
   assert.deepEqual(session(reader.scan(evidenceOptions(home))).reposTouched, [{ name: 'alpha', events: 3 }]);
 });
+
+test('evidence follows the cloud upload schema: case variants merge, names and branches the cloud refuses are dropped', () => {
+  const state = reader.emptyState();
+  const base = { tool: 'claude_code', title: null, folderLabel: null, projectHint: null, firstSeen: '2026-10-21T00:00:00.000Z', lastSeen: '2026-10-21T01:00:00.000Z' };
+  state.sessions.a = { ...base, sessionKey: 'a', gitBranch: 'feature/' + 'x'.repeat(232), reposTouched: [
+    { name: 'Alpha', events: 2 }, { name: 'alpha', events: 5 }, { name: 'with:colon', events: 9 }, { name: ' padded', events: 9 },
+    { name: 'n'.repeat(161), events: 9 }, { name: 'n'.repeat(160), events: 1 },
+  ] };
+  state.sessions.b = { ...base, sessionKey: 'b', gitBranch: 'feature/' + 'x'.repeat(233), reposTouched: [] };
+  state.metadataPending = true;
+  const sessions = reader.makeBatches(state, 'synthetic', now, { sendEvidence: true })[0].body.sessions;
+  const a = sessions.find(s => s.sessionKey === 'a'), b = sessions.find(s => s.sessionKey === 'b');
+  assert.deepEqual(a.reposTouched, [{ name: 'alpha', events: 7 }, { name: 'n'.repeat(160), events: 1 }]);
+  assert.equal(a.gitBranch.length, 240);
+  assert.equal(b.gitBranch, null);
+  assert.deepEqual(b.reposTouched, []);
+});
