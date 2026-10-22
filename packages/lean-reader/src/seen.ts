@@ -3,14 +3,20 @@ import type { State } from './types.js';
 const WIDTH = 12;
 // SHA-256 prefixes, sorted inside UTC-hour buckets. Old JSON ID maps still
 // read. Entire expired/backfilled hours can be removed without decoding IDs.
+// IDs added during a pass stay out of the state until finish() packs them, so
+// a pass is bounded by the size it will save, not by a JSON map in flight.
 export class Seen {
   private buckets: Record<string, string>;
   private decoded = new Map<string, Buffer>();
-  constructor(private state: State, private field: 'seen' | 'evidenceSeen', packedField: 'seenPacked' | 'evidenceSeenPacked', cutoff: number) {
+  private added = new Map<string, number>();
+  constructor(private state: State, private field: 'seen' | 'evidenceSeen', private packedField: 'seenPacked' | 'evidenceSeenPacked', cutoff: number) {
     this.buckets = state[packedField] ?? {};
-    state[field] ??= {};
+    for (const [id, hour] of Object.entries(state[field] ?? {})) this.added.set(id, hour);
+    state[field] = {};
     this.remove(hour => hour * 3_600_000 < cutoff);
   }
+  /** Bytes the IDs added so far will take once packed: base64 of WIDTH bytes each. */
+  get pendingBytes(): number { return this.added.size * WIDTH / 3 * 4; }
   private buffer(hour: string): Buffer {
     let data = this.decoded.get(hour);
     if (!data) {
@@ -21,7 +27,7 @@ export class Seen {
     return data;
   }
   has(id: string): boolean {
-    if (Object.hasOwn(this.state[this.field]!, id)) return true;
+    if (this.added.has(id)) return true;
     const key = Buffer.from(id, 'hex');
     for (const hour in this.buckets) {
       const data = this.buffer(hour);
@@ -35,15 +41,14 @@ export class Seen {
     }
     return false;
   }
-  add(id: string, hour: number) { this.state[this.field]![id] = hour; }
+  add(id: string, hour: number) { this.added.set(id, hour); }
   remove(predicate: (hour: number) => boolean) {
-    const pending = this.state[this.field]!;
-    for (const id in pending) if (predicate(pending[id])) delete pending[id];
+    for (const [id, hour] of this.added) if (predicate(hour)) this.added.delete(id);
     for (const hour in this.buckets) if (predicate(Number(hour))) { delete this.buckets[hour]; this.decoded.delete(hour); }
   }
   finish() {
-    const pending = this.state[this.field]!, groups = new Map<string, string[]>();
-    for (const id of Object.keys(pending).sort()) { const hour = String(pending[id]); if (!groups.has(hour)) groups.set(hour, []); groups.get(hour)!.push(id); }
+    const groups = new Map<string, string[]>();
+    for (const id of [...this.added.keys()].sort()) { const hour = String(this.added.get(id)); if (!groups.has(hour)) groups.set(hour, []); groups.get(hour)!.push(id); }
     for (const [hour, ids] of groups) {
       const data = this.buffer(hour), next = Buffer.allocUnsafe(data.length + ids.length * WIDTH);
       let old = 0, index = 0, write = 0;
@@ -55,7 +60,8 @@ export class Seen {
       }
       this.buckets[hour] = next.toString('base64'); this.decoded.set(hour, next);
     }
+    this.added.clear();
     this.state[this.field] = {};
-    this.state[this.field === 'seen' ? 'seenPacked' : 'evidenceSeenPacked'] = this.buckets;
+    this.state[this.packedField] = this.buckets;
   }
 }

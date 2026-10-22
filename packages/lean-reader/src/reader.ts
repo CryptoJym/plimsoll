@@ -191,7 +191,8 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   // Bound admission while scanning as well as at atomic save. A large source
   // must stop before its ID/metadata maps can exhaust memory. Sampling avoids
   // serializing state for every reply; the writer enforces the exact ceiling.
-  const checkBudget = () => { stateBytes(state, 9 * 1024 * 1024); };
+  // IDs added this pass count at the packed size they will be saved at.
+  const checkBudget = () => { stateBytes(state, 9 * 1024 * 1024 - seen.pendingBytes - (evidenceSeen?.pendingBytes ?? 0)); };
   let admissions = 0;
   const budgetTick = () => { if (++admissions % 256 === 0) checkBudget(); };
   if (options.backfill) {
@@ -337,7 +338,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     const tagged = projects.tags.get(session.tool + ':' + session.sessionKey) ?? projects.folderTags.get(session.tool + ':' + session.sessionKey);
     if (tagged && session.projectHint !== tagged.project) { session.projectHint = tagged.project; session.folderLabel = null; state.metadataPending = true; }
   }
-  if (since < cutoff) prune(state, cutoff);
+  if (since < cutoff) { prune(state, cutoff); for (const ids of [seen, evidenceSeen]) ids?.remove(hour => hour * HOUR < cutoff); }
   // Privacy changes also apply to metadata read from an earlier state.
   for (const session of Object.values(state.sessions)) { if (!config.sendSessionTitles) session.title = null; if (config.sendFolderLabels === false || session.projectHint) session.folderLabel = null; }
   for (const [key, session] of Object.entries(state.sessions)) {

@@ -166,7 +166,9 @@ until completed. One PID/token directory lock excludes concurrent runs and recov
 owners. Source-read failures abort a pass before publishing incomplete totals.
 
 Deduplication IDs are stored as sorted binary prefixes grouped by UTC hour,
-encoded as base64 in JSON. Existing v1 state upgrades to v2 without recounting
+encoded as base64 in JSON. IDs read during a pass are held in memory and count
+toward the state ceiling at that packed size, so a backfill over a busy Mac's
+existing state fits whenever the state it saves does. Existing v1 state upgrades to v2 without recounting
 usage in either upload mode. This local format is independent of `sendEvidence`.
 Reader 75bb4bee refuses v2 state, so a rollback must use a separate state directory
 and backfill rather than reuse the compact state. State encoding streams

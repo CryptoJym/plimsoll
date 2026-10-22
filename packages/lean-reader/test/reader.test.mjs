@@ -390,6 +390,21 @@ test('the collector LaunchAgent takes precedence over other Plimsoll agents', t 
   assert.ok(reader.launchAgent(home, '/synthetic/lean.mjs').includes(process.execPath));
 });
 
+test('IDs read in a pass count at their packed size, so a pass fits when the state it saves does', t => {
+  const home = fixture(t), n = 300_000;
+  // Held as a JSON map in flight these IDs alone would pass the 9 MiB ceiling; packed they take 16 bytes each.
+  const lines = [JSON.stringify(meta()), JSON.stringify(context)];
+  for (let i = 0; i < n; i++) lines.push(JSON.stringify(usage('synthetic-' + i)));
+  write(home, '.codex/sessions/2026/10/20/rollout-large.jsonl', lines.join('\n') + '\n');
+  const file = path.join(home, 'state.json');
+  const result = reader.scan(options(home));
+  assert.equal(totals(result.rows).requests, n);
+  const bytes = reader.saveState(file, result.state);
+  assert.ok(bytes > n * 16 && bytes < 9 * 1024 * 1024, String(bytes));
+  const again = reader.scan({ ...options(home), state: reader.readState(file) });
+  assert.equal(totals(again.rows).requests, n, 'a backfill over the saved state neither fails nor recounts');
+});
+
 test('capacity refusal preserves the committed state instead of dropping pending rows', t => {
   const home = fixture(t), file = path.join(home, 'state.json');
   const state = reader.emptyState();
