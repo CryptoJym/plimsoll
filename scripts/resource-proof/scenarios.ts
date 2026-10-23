@@ -3482,6 +3482,11 @@ function requireRegularDirectory(candidate: string, errorCode: string) {
 
 function resourceFixtureManifest(root: string) {
   const entries = new Map<string, string>();
+  // The sandbox holds the bounded-capture scenario's two 500 MiB sparse
+  // preinstall files. Hash every file through one 64 KiB buffer: whole-file
+  // reads left the proof's own 500 MiB Buffers in the RSS that system E2E
+  // charges to this phase (1.37-1.46 GB of its 1.5 GB budget on CI).
+  const bytes = Buffer.allocUnsafe(64 * 1024);
   const visit = (current: string) => {
     for (const entry of fs
       .readdirSync(current, { withFileTypes: true })
@@ -3493,8 +3498,17 @@ function resourceFixtureManifest(root: string) {
         entries.set(relative, `directory:${stat.mode & 0o777}`);
         visit(full);
       } else if (entry.isFile()) {
-        const digest = createHash("sha256").update(fs.readFileSync(full)).digest("hex");
-        entries.set(relative, `file:${stat.mode & 0o777}:${stat.size}:${digest}`);
+        const hash = createHash("sha256");
+        const descriptor = fs.openSync(full, "r");
+        try {
+          let count: number;
+          while ((count = fs.readSync(descriptor, bytes, 0, bytes.length, null)) > 0) {
+            hash.update(bytes.subarray(0, count));
+          }
+        } finally {
+          fs.closeSync(descriptor);
+        }
+        entries.set(relative, `file:${stat.mode & 0o777}:${stat.size}:${hash.digest("hex")}`);
       } else if (entry.isSymbolicLink()) {
         entries.set(relative, `symlink:${fs.readlinkSync(full)}`);
       } else {
