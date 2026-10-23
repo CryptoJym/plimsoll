@@ -130,7 +130,7 @@ export function launchAgent(home: string, script: string): string {
       if (executable && /(?:^|\/)node(?:-\d+)?$/.test(xmlUnescape(executable))) { node = xmlUnescape(executable); break; }
     } catch { /* Another optional agent. */ }
   }
-  const env = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'].filter(k => process.env[k]).map(k => `<key>${k}</key><string>${xmlEscape(process.env[k]!)}</string>`).join('');
+  const env = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GROK_HOME'].filter(k => process.env[k]).map(k => `<key>${k}</key><string>${xmlEscape(process.env[k]!)}</string>`).join('');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -158,6 +158,6 @@ export function loadConfig(file: string): Config {
   const config: Config = {};
   for (const key of ['credentialsFrom', 'endpoint'] as const) if (typeof input[key] === 'string') config[key] = input[key];
   for (const key of ['sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
-  if (Array.isArray(input.roots)) config.roots = input.roots.filter((r: any) => typeof r === 'string' || (r && typeof r.path === 'string' && ['codex', 'claude_code'].includes(r.tool))).slice(0, 256).map((r: any) => typeof r === 'string' ? r : { tool: r.tool, path: r.path });
+  if (Array.isArray(input.roots)) config.roots = input.roots.filter((r: any) => typeof r === 'string' || (r && typeof r.path === 'string' && ['codex', 'claude_code', 'grok'].includes(r.tool))).slice(0, 256).map((r: any) => typeof r === 'string' ? r : { tool: r.tool, path: r.path });
   return config;
 }

@@ -28,6 +28,16 @@ const inputWanted = new Set(evidencePaths.filter(p => p.startsWith('message.cont
 const inputContainers = new Set([...inputWanted].flatMap(p => p.replaceAll('[]', '.[]').split('.').map((_, i, parts) => parts.slice(0, i).join('.').replaceAll('.[]', '[]')).filter(Boolean)));
 type Frame = { kind: 'object' | 'array'; path: string; expect: 'key' | 'colon' | 'value' | 'comma'; key: string; count: number };
 
+// Explicit selections stream even small records. A wildcard matches one object
+// key (model IDs and auth issuers contain dots, so encode keys before matching).
+function selection(paths: readonly string[]) {
+  const matches = (patterns: string[]) => {
+    const expressions = patterns.map(p => new RegExp('^' + p.split('.').map(k => k === '*' ? '[^.]+' : k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\.') + '$'));
+    return { has: (p: string) => expressions.some(re => re.test(p)) };
+  };
+  return { wanted: matches([...paths]), containers: matches(paths.flatMap(p => p.split('.').map((_, i, parts) => parts.slice(0, i).join('.')).filter(Boolean))) };
+}
+
 class PatchPaths {
   private pending = ''; private dropped = false; private headers: string[] = []; private bytes = 0;
   private line() {
@@ -50,7 +60,8 @@ class PatchPaths {
  * strings. Ignored string spans are searched with a regex in each 64 KiB chunk;
  * their bytes are never concatenated. Nesting, keys and retained scalars are capped. */
 class Projection {
-  constructor(private evidence = false, private input = false) {}
+  constructor(private evidence = false, private input = false, private selected?: ReturnType<typeof selection>) {}
+  private selectedAssignments = 0;
   result: Record<string, any> = {};
   stack: Frame[] = [];
   mode: 'normal' | 'string' | 'scalar' = 'normal';
@@ -61,14 +72,30 @@ class Projection {
   scalarPath = ''; rootDone = false; bad = false;
   valuePath() {
     const f = this.stack.at(-1);
-    return f ? (f.kind === 'array' ? `${f.path}[${this.evidence ? f.count : ''}]` : [f.path, f.key].filter(Boolean).join('.')) : '';
+    const key = f && this.selected ? encodeURIComponent(f.key).replaceAll('.', '%2E') : f?.key;
+    return f ? (f.kind === 'array' ? `${f.path}[${this.evidence ? f.count : ''}]` : [f.path, key].filter(Boolean).join('.')) : '';
   }
   normalized(p: string) { return p.replace(/\[\d+\]/g, '[]'); }
-  wanted() { return this.input ? inputWanted : this.evidence ? evidenceWanted : wanted; }
-  containers() { return this.input ? inputContainers : this.evidence ? evidenceContainers : containers; }
+  wanted() { return this.selected?.wanted ?? (this.input ? inputWanted : this.evidence ? evidenceWanted : wanted); }
+  containers() { return this.selected?.containers ?? (this.input ? inputContainers : this.evidence ? evidenceContainers : containers); }
   bounded(p: string) { return !this.evidence || ![...p.matchAll(/\[(\d+)\]/g)].some(m => Number(m[1]) >= 256); }
   assign(p: string, value: unknown, container = false) {
     const parts = (this.evidence ? p.replace(/\[(\d+)\]/g, '.$1') : p).split('.');
+    if (this.selected) {
+      // Dynamic model/issuer keys are bounded too. Reject the whole record if
+      // it exceeds the budget, rather than accepting incomplete usage totals.
+      if (++this.selectedAssignments > 4096) { this.bad = true; return; }
+      // Dynamic JSON keys must never traverse Object.prototype.
+      let out = this.result;
+      for (const part of parts.slice(0, -1)) {
+        const key = decodeURIComponent(part);
+        if (!Object.hasOwn(out, key)) Object.defineProperty(out, key, { value: {}, enumerable: true, writable: true, configurable: true });
+        out = out[key];
+      }
+      const key = decodeURIComponent(parts.at(-1)!);
+      if (!container || !Object.hasOwn(out, key)) Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+      return;
+    }
     let out = this.result;
     for (let i = 0; i < parts.length - 1; i++) out = out[parts[i]] ??= /^\d+$/.test(parts[i + 1]) ? [] : {};
     if (!container || out[parts.at(-1)!] === undefined) out[parts.at(-1)!] = value;
@@ -178,8 +205,9 @@ class Projection {
 
 const LIMIT = 1024 * 1024;
 const buffer = Buffer.allocUnsafe(64 * 1024);
-export function readLines(file: string, offset: number, end: number, visit: (record: Record<string, any>, offset: number) => void, evidence = false): { offset: number; bytes: number } {
+export function readLines(file: string, offset: number, end: number, visit: (record: Record<string, any>, offset: number) => void, evidence = false, selectedPaths?: readonly string[]): { offset: number; bytes: number } {
   const fd = fs.openSync(file, 'r');
+  const selected = selectedPaths ? selection(selectedPaths) : undefined;
   let position = offset, committed = offset, size = 0, chunks: Buffer[] = [];
   let projector: Projection | null = null, dropped = false;
   // StringDecoder is unnecessary here: Buffer chunks are retained for small
@@ -187,7 +215,7 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
   let decoder: TextDecoder | null = null;
   const consume = (part: Buffer) => {
     if (dropped) return;
-    if (evidence && !projector) { projector = new Projection(true); decoder = new TextDecoder(); }
+    if ((evidence || selected) && !projector) { projector = new Projection(evidence, false, selected); decoder = new TextDecoder(); }
     if (projector) { projector.feed(decoder!.decode(part, { stream: true })); return; }
     size += part.length;
     if (size <= LIMIT) { chunks.push(Buffer.from(part)); return; }
@@ -224,4 +252,23 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
     // Leave an unfinished line at its starting byte; never persist raw text.
     return { offset: committed, bytes: position - offset };
   } finally { fs.closeSync(fd); }
+}
+
+// Metadata may contain credentials or generated prose. Never materialize the
+// whole JSON object: retain only the explicitly requested leaves.
+export function readJsonFields(file: string, paths: readonly string[], maxBytes = 1024 * 1024): Record<string, any> | null {
+  const fd = fs.openSync(file, 'r'), chunk = Buffer.alloc(64 * 1024);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    const projection = new Projection(false, false, selection(paths)), decoder = new TextDecoder();
+    let position = 0;
+    while (position < stat.size) {
+      const n = fs.readSync(fd, chunk, 0, Math.min(chunk.length, stat.size - position), position);
+      if (!n) return null;
+      projection.feed(decoder.decode(chunk.subarray(0, n), { stream: true })); position += n;
+    }
+    projection.feed(decoder.decode());
+    return projection.finish();
+  } finally { chunk.fill(0); fs.closeSync(fd); }
 }

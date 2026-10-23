@@ -32,6 +32,7 @@ export function protectedPath(file: string, home: string): boolean {
   const inside = (p: string) => p === '/Volumes' || p.startsWith('/Volumes/') || roots!.some(r => p === r || p.startsWith(r + path.sep));
   if (inside(path.resolve(file))) return true;
   // A symlink elsewhere may point into one; resolving the link itself never opens files there.
+  try { if (inside(fs.realpathSync(file))) return true; } catch { /* A not-yet-created file can still have a symlinked parent. */ }
   try { return inside(path.join(fs.realpathSync(path.dirname(file)), path.basename(file))); } catch { return false; }
 }
 function smallFile(file: string, home: string): string {

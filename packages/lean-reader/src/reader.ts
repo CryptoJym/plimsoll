@@ -6,6 +6,7 @@ import { readLines } from './lines.js';
 import { Evidence, genericFolder, launchProject, protectedPath, topRepositories } from './evidence.js';
 import { stateBytes } from './state-json.js';
 import { Seen } from './seen.js';
+import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js';
 import { counts, fields, HOUR, WINDOW, integer, string, peakMemory, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
@@ -15,8 +16,8 @@ export const accountKey = (id: unknown): string => typeof id === 'string' && id 
 export const emptyState = (): State => ({ version: 1, files: {}, hours: {}, seen: {}, sessions: {}, seats: {}, pending: {}, metadataPending: false, lastSend: null, lastError: null, failures: 0, nextSend: 0, footprint: null });
 const context = (account = 'unknown'): Context => ({ model: 'unknown', cwd: '', session: '', account, title: null, records: false });
 export const expand = (p: string, home: string) => p === '~' ? home : p.startsWith('~/') ? path.join(home, p.slice(2)) : path.resolve(p);
-function directories(parent: string): string[] {
-  try { return fs.readdirSync(parent).sort().filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
+function directories(parent: string, prefix = ''): string[] {
+  try { return fs.readdirSync(parent).sort().filter(n => n.startsWith(prefix)).filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
 }
 export function roots(home: string, env: Record<string, string | undefined>, config: Config): { tool: Tool; path: string }[] {
   const result: { tool: Tool; path: string }[] = [
@@ -26,15 +27,19 @@ export function roots(home: string, env: Record<string, string | undefined>, con
     { tool: 'codex', path: path.join(home, '.codex/sessions') },
     ...['.codex-profiles', '.codex-accounts', '.codex-lanepool'].flatMap(parent => directories(path.join(home, parent)).map(n => ({ tool: 'codex' as const, path: path.join(home, parent, n, 'sessions') }))),
     ...(env.CODEX_HOME ? [{ tool: 'codex' as const, path: path.join(env.CODEX_HOME, 'sessions') }] : []),
+    { tool: 'grok', path: path.join(home, '.grok/sessions') },
+    ...directories(home, '.grok-').map(n => ({ tool: 'grok' as const, path: path.join(home, n, 'sessions') })),
+    ...(env.GROK_HOME ? [{ tool: 'grok' as const, path: path.join(env.GROK_HOME, 'sessions') }] : []),
   ];
   for (const root of config.roots ?? []) {
-    if (typeof root === 'string') result.push({ path: expand(root, home), tool: /codex|sessions/.test(root) ? 'codex' : 'claude_code' });
-    else if (root && ['codex', 'claude_code'].includes(root.tool) && typeof root.path === 'string') result.push({ tool: root.tool, path: expand(root.path, home) });
+    if (typeof root === 'string') result.push({ path: expand(root, home), tool: /grok/.test(root) ? 'grok' : /codex|sessions/.test(root) ? 'codex' : 'claude_code' });
+    else if (root && ['codex', 'claude_code', 'grok'].includes(root.tool) && typeof root.path === 'string') result.push({ tool: root.tool, path: expand(root.path, home) });
   }
   const seen = new Set<string>();
-  return result.filter(root => { try { root.path = fs.realpathSync(root.path); } catch { return false; } const key = root.tool + ':' + root.path; if (seen.has(key)) return false; seen.add(key); return true; });
+  return result.filter(root => { if (root.tool === 'grok' && protectedPath(root.path, home)) return false; try { root.path = fs.realpathSync(root.path); } catch { return false; } const key = root.tool + ':' + root.path; if (seen.has(key)) return false; seen.add(key); return true; });
 }
-function* files(root: string, visited: Set<string>, since: number): Generator<{ file: string; stat: fs.Stats }> {
+function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string): Generator<{ file: string; stat: fs.Stats }> {
+  if (tool === 'grok' && protectedPath(root, home)) return;
   const entries: { name: string; directory?: string; file?: string; stat?: fs.Stats }[] = [];
   try {
     const stat = fs.statSync(root), key = `${stat.dev}:${stat.ino}`;
@@ -48,12 +53,13 @@ function* files(root: string, visited: Set<string>, since: number): Generator<{ 
       let entry;
       while ((entry = directory.readSync())) {
         const file = path.join(root, entry.name);
+        if (tool === 'grok' && (protectedPath(file, home) || (!entry.isDirectory() && !entry.isSymbolicLink() && entry.name !== 'updates.jsonl'))) continue;
         if (entry.isDirectory()) entries.push({ name: entry.name, directory: file });
         else if (entry.isSymbolicLink()) {
           try {
             const s = fs.statSync(file);
             if (s.isDirectory()) entries.push({ name: entry.name, directory: file });
-            else if (s.isFile() && entry.name.endsWith('.jsonl') && s.mtimeMs >= since) entries.push({ name: entry.name, file: fs.realpathSync(file), stat: s });
+            else if (s.isFile() && entry.name.endsWith('.jsonl') && s.mtimeMs >= since && (tool !== 'grok' || grokFile(file, home))) entries.push({ name: entry.name, file: fs.realpathSync(file), stat: s });
           } catch { /* Optional alias disappeared. */ }
         } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
           let s: fs.Stats;
@@ -65,7 +71,7 @@ function* files(root: string, visited: Set<string>, since: number): Generator<{ 
     entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('source_unreadable'); return; }
   for (const entry of entries) {
-    if (entry.directory) yield* files(entry.directory, visited, since);
+    if (entry.directory) yield* files(entry.directory, visited, since, tool, home);
     else yield { file: entry.file!, stat: entry.stat! };
   }
 }
@@ -98,7 +104,7 @@ class Projects {
   }
   tag(r: Record<string, any>, active: Set<string>) {
     const at = Date.parse(r.at), project = string(r.project), session = string(r.sessionKey);
-    if (!['claude_code', 'codex'].includes(r.tool) || !session || !project || !Number.isFinite(at)) return;
+    if (!['claude_code', 'codex', 'grok'].includes(r.tool) || !session || !project || !Number.isFinite(at)) return;
     const key = r.tool + ':' + session;
     if (!active.has(key)) return;
     if (at >= (this.tags.get(key)?.at ?? -Infinity)) this.tags.set(key, { project, at });
@@ -204,12 +210,15 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   }
   const projects = new Projects(home), visited = new Set<string>(), visitedFiles = new Set<string>();
   const evidence = evidenceSeen ? new Evidence(home, state, evidenceSeen, startHour, endHour, budgetTick) : null;
-  const add = (tool: Tool, ctx: Context, stamp: unknown, id: string, tokens: Counts, file?: FileState) => {
+  const add = (tool: Tool, ctx: Context, stamp: unknown, id: string | null, tokens: Counts, file?: FileState) => {
     const time = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
     if (!Number.isFinite(time) || time < startHour || time >= endHour) return;
-    const hour = Math.floor(time / HOUR), seenKey = digest(tool + ':' + id);
-    if (seen.has(seenKey)) return;
-    seen.add(seenKey, hour);
+    const hour = Math.floor(time / HOUR);
+    if (id !== null) {
+      const seenKey = digest(tool + ':' + id);
+      if (seen.has(seenKey)) return;
+      seen.add(seenKey, hour);
+    }
     budgetTick();
     if (ctx.model === '<synthetic>') return;
     const sessionKey = ctx.session || 'unknown';
@@ -230,9 +239,17 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const sources: Source[] = options.discovered ?? roots(home, options.env ?? process.env, config);
   for (const root of sources) {
     let rootAccount: string | undefined;
-    const getAccount = () => rootAccount ??= root.tool === 'claude_code' ? claudeAccount(root.path, home, options.env ?? process.env) : 'unknown';
-    for (const { file, stat: discoveredStat } of root.files ?? files(root.path, visited, startHour)) {
+    const getAccount = () => {
+      if (rootAccount !== undefined) return rootAccount;
+      if (root.tool === 'grok') {
+        const id = grokUser(root.path, home);
+        return rootAccount = id ? accountKey(id) : 'grok:unknown';
+      }
+      return rootAccount = root.tool === 'claude_code' ? claudeAccount(root.path, home, options.env ?? process.env) : 'unknown';
+    };
+    for (const { file, stat: discoveredStat } of root.files ?? files(root.path, visited, startHour, root.tool, home)) {
       if (root.tool === 'codex' && !path.basename(file).startsWith('rollout-')) continue;
+      if (root.tool === 'grok' && !grokFile(file, home)) continue;
       // Metadata discovery is a snapshot; refresh eligible files immediately
       // before capture so rotations and truncations still reset their context.
       let stat = discoveredStat;
@@ -245,11 +262,24 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       if (!tracked) { tracked = state.files[file] = { dev: stat.dev, ino: stat.ino, size: stat.size, offset: 0, mtime: stat.mtimeMs, context: context(getAccount()), fallback: {} }; budgetTick(); }
       if (reset || options.backfill) { const records = tracked.context.records && !options.backfill; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
       const ctx = tracked.context;
+      const metadata = root.tool === 'grok' ? grokSummary(file, home) : null;
+      if (metadata) { ctx.cwd = metadata.cwd; ctx.model = metadata.model; ctx.account = getAccount(); }
+      const updateGrokSummary = () => {
+        if (!metadata) return;
+        const summary = state.sessions[digest('grok:' + ctx.session)];
+        if (!summary) return;
+        const before = JSON.stringify(summary), hint = projects.hint(ctx.cwd, 'grok', ctx.session);
+        if (metadata.firstSeen && metadata.firstSeen < summary.firstSeen) summary.firstSeen = metadata.firstSeen;
+        if (metadata.lastSeen && metadata.lastSeen > summary.lastSeen) summary.lastSeen = metadata.lastSeen;
+        summary.projectHint = hint.projectHint; summary.folderLabel = config.sendFolderLabels === false ? null : hint.folderLabel;
+        if (before !== JSON.stringify(summary)) state.metadataPending = true;
+      };
+      updateGrokSummary();
       stats.files++;
       // Upgrading an existing state (or re-enabling evidence) replays evidence
       // alone. Usage cursors, cumulative baselines and replacement totals stay put.
       let evidenceContext = reset || options.backfill ? { cwd: '', session: '' } : tracked.evidenceContext ?? { cwd: ctx.cwd, session: ctx.session };
-      if (evidence && !reset && !options.backfill && tracked.evidenceOffset !== tracked.offset) {
+      if (evidence && root.tool !== 'grok' && !reset && !options.backfill && tracked.evidenceOffset !== tracked.offset) {
         evidenceContext = { cwd: '', session: '' };
         stats.bytesRead += readLines(file, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
         tracked.evidenceOffset = tracked.offset; tracked.evidenceContext = evidenceContext;
@@ -263,6 +293,20 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       if (root.tool === 'claude_code') ctx.account = getAccount();
       try {
         const result = readLines(file, tracked.offset, stat.size, r => {
+          if (root.tool === 'grok') {
+            const turn = grokTurn(r);
+            if (!turn) return;
+            const time = Date.parse(turn.time), seenKey = digest('grok:' + JSON.stringify(turn.id));
+            if (time < startHour || time >= endHour || seen.has(seenKey)) return;
+            seen.add(seenKey, Math.floor(time / HOUR)); budgetTick();
+            ctx.session = turn.session || path.basename(path.dirname(file));
+            for (const { model, tokens } of turn.models) {
+              ctx.model = model || metadata!.model.replace(/-build$/, '');
+              add('grok', ctx, turn.time, null, tokens);
+            }
+            updateGrokSummary();
+            return;
+          }
           evidence?.observe(root.tool, evidenceContext, r);
           if (root.tool === 'claude_code') {
             if (r.type === 'summary' && config.sendSessionTitles) { ctx.title = string(r.summary); const summary = state.sessions[digest(root.tool + ':' + ctx.session)]; if (summary) { summary.title = ctx.title; state.metadataPending = true; } return; }
@@ -316,7 +360,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
             }
             ctx.previous = current;
           }
-        }, Boolean(evidence));
+        }, Boolean(evidence) && root.tool !== 'grok', root.tool === 'grok' ? grokFields : undefined);
         tracked.offset = result.offset; stats.bytesRead += result.bytes;
         if (evidence) { tracked.evidenceOffset = result.offset; tracked.evidenceContext = evidenceContext; }
         remember(stat.mtimeMs);

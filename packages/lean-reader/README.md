@@ -1,6 +1,6 @@
 # Plimsoll Lean reader
 
-A single Node 22.20+ ESM executable that reads local Claude Code and Codex session
+A single Node 22.20+ ESM executable that reads local Claude Code, Codex and Grok Build session
 files, aggregates usage by UTC hour, and sends replacement totals to Plimsoll.
 It has no runtime packages, database, local server, or resident daemon. A macOS
 LaunchAgent starts one short pass every five minutes.
@@ -52,6 +52,10 @@ All roots are optional, recursive, and deduplicated through filesystem identity:
 - Codex: `~/.codex/sessions`, `~/.codex-profiles/*/sessions`,
   `~/.codex-accounts/*/sessions`, `~/.codex-lanepool/*/sessions`, and
   `$CODEX_HOME/sessions`.
+- Grok Build: `~/.grok/sessions`, every `~/.grok-*/sessions`, and
+  `$GROK_HOME/sessions`. Only `updates.jsonl` is read for usage; `summary.json`
+  supplies the working folder, current model, and creation/update times.
+  Chat history, events and other session files are never opened.
 - Additional roots in the configuration. Claude reads `*.jsonl`, including
   subagents; Codex reads `rollout-*.jsonl`.
 
@@ -63,12 +67,23 @@ reading as baseline and negative differences treated as counter resets. Cached
 and cache-write tokens are subtracted from Codex's inclusive input count.
 Output already includes reasoning tokens; they are never added a second time.
 
+Grok `turn_completed` updates (method `session/update`, written with the `_x.ai/` prefix) contain per-turn usage. Each event ID is counted
+once across files and rereads. `modelUsage` splits a turn by model; absent that
+map, the summary's `current_model_id` names the model. A trailing `-build` is
+removed for API pricing. Requests use `modelCalls` when present, otherwise one
+per turn and model. Fresh input subtracts cached reads from inclusive input;
+cache creation and output are counted separately. Missing event IDs or invalid
+timestamps are skipped. A missing model remains `unknown`.
+
 Account keys use the collector's exact `providerAccountKey` derivation:
 `sha256:` plus the first 16 hex characters of SHA-256 of the serialized OTLP
 `{stringValue: rawId}`. That function needs no running collector or salt.
 Claude account UUIDs come from the profile's `.claude.json` (`~/.claude.json`
 for the default profile without `CLAUDE_CONFIG_DIR`); Codex IDs come from `creator_account_id`. Missing
-identity and model fields remain `unknown`.
+identity and model fields remain `unknown`. Grok reads only `user_id` from the
+`https://auth.x.ai::<id>` entries in its home directory's `auth.json`, through a
+streaming field projection that skips login secrets. Missing or ambiguous
+Grok identity produces `grok:unknown`; known IDs use the same hash derivation.
 
 Project attribution prefers the newest matching line in
 `~/.local/state/plimsoll-lean/launch-tags.jsonl`, then a `.conductor-project.json`
@@ -152,8 +167,9 @@ The optional `~/.config/plimsoll-lean/config.json` contains:
 ```
 
 `endpoint` may supply an override on the same origin. String roots are accepted
-as well; paths containing `codex` or `sessions` select Codex, and other paths
-select Claude. Explicit `{tool, path}` entries avoid ambiguity. `print-config`
+as well; paths containing `grok` select Grok, otherwise paths containing `codex`
+or `sessions` select Codex, and other paths select Claude. Explicit `{tool, path}`
+entries support `grok`, `codex` and `claude_code` and avoid ambiguity. `print-config`
 prints only recognized settings and strips endpoint userinfo, query and fragment;
 it never opens the credentials file. Credentials do not belong in this config.
 

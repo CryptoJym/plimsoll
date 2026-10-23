@@ -1,4 +1,4 @@
-export type Tool = 'claude_code' | 'codex';
+export type Tool = 'claude_code' | 'codex' | 'grok';
 export type Counts = { requests: number; freshInput: number; cacheRead: number; cacheWrite: number; output: number };
 export type Hour = Counts & { hour: string; tool: Tool; accountKey: string; model: string; sessionKey: string; projectHint: string | null; projectSource: 'launch_tag' | 'git_repo' | 'none' };
 export type RepoTouch = { name: string; events: number };

@@ -1,11 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { roots } from './reader.js';
-import { HOUR, WINDOW, type Options, type Source, type SourceFile } from './types.js';
+import { HOUR, WINDOW, type Options, type Source, type SourceFile, type Tool } from './types.js';
+import { protectedPath } from './evidence.js';
+import { grokFile } from './grok.js';
 
 // At most four outstanding metadata reads. libuv retains its native pool limit
 // (including any explicit UV_THREADPOOL_SIZE); no worker or daemon is launched.
-async function files(root: string, visited: Set<string>, since: number): Promise<SourceFile[]> {
+async function files(root: string, visited: Set<string>, since: number, tool: Tool, home: string): Promise<SourceFile[]> {
+  if (tool === 'grok' && protectedPath(root, home)) return [];
   const entries: { name: string; directory?: string; source?: SourceFile }[] = [];
   try {
     const stat = await fs.promises.stat(root), key = `${stat.dev}:${stat.ino}`;
@@ -21,13 +24,14 @@ async function files(root: string, visited: Set<string>, since: number): Promise
       let entry;
       while ((entry = directory.readSync())) {
         const name = entry.name, file = path.join(root, name), symlink = entry.isSymbolicLink();
+        if (tool === 'grok' && (protectedPath(file, home) || (!entry.isDirectory() && !symlink && name !== 'updates.jsonl'))) continue;
         if (entry.isDirectory()) { entries.push({ name, directory: file }); continue; }
         if (!symlink && !(entry.isFile() && name.endsWith('.jsonl'))) continue;
         pending.push((async () => {
           try {
             const s = await fs.promises.stat(file);
             if (symlink && s.isDirectory()) entries.push({ name, directory: file });
-            else if (name.endsWith('.jsonl') && s.mtimeMs >= since && (!symlink || s.isFile())) entries.push({ name, source: { file: symlink ? fs.realpathSync(file) : file, stat: s } });
+            else if (name.endsWith('.jsonl') && s.mtimeMs >= since && (!symlink || s.isFile()) && (tool !== 'grok' || grokFile(file, home))) entries.push({ name, source: { file: symlink ? fs.realpathSync(file) : file, stat: s } });
           } catch { if (!symlink) throw new Error('source_unreadable'); }
         })());
         if (pending.length === 4) await flush();
@@ -41,7 +45,7 @@ async function files(root: string, visited: Set<string>, since: number): Promise
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw new Error('source_unreadable'); }
   const result: SourceFile[] = [];
   for (const entry of entries) {
-    if (entry.directory) result.push(...await files(entry.directory, visited, since));
+    if (entry.directory) result.push(...await files(entry.directory, visited, since, tool, home));
     else result.push(entry.source!);
   }
   return result;
@@ -52,6 +56,6 @@ export async function discover(options: Options & { home: string; now: number })
   const until = options.until ? Date.parse(options.until) : options.now + HOUR;
   if (!Number.isFinite(since) || !Number.isFinite(until) || since >= until) throw new Error('invalid_window');
   const visited = new Set<string>(), result: Source[] = [];
-  for (const root of roots(options.home, options.env ?? process.env, options.config ?? {})) result.push({ ...root, files: await files(root.path, visited, Math.floor(since / HOUR) * HOUR) });
+  for (const root of roots(options.home, options.env ?? process.env, options.config ?? {})) result.push({ ...root, files: await files(root.path, visited, Math.floor(since / HOUR) * HOUR, root.tool, options.home) });
   return result;
 }
