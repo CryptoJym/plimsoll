@@ -1,0 +1,23 @@
+export type Tool = 'claude_code' | 'codex';
+export type Counts = { requests: number; freshInput: number; cacheRead: number; cacheWrite: number; output: number };
+export type Hour = Counts & { hour: string; tool: Tool; accountKey: string; model: string; sessionKey: string; projectHint: string | null; projectSource: 'launch_tag' | 'git_repo' | 'none' };
+export type Session = { tool: Tool; sessionKey: string; title: string | null; folderLabel: string | null; projectHint: string | null; firstSeen: string; lastSeen: string };
+export type Seat = { tool: Tool; accountKey: string; plan: string | null; usedPercent: number | null; windowMinutes: number | null; resetsAt: string | null; creditsBalance: string | null; observedAt: string };
+export type Context = { model: string; cwd: string; session: string; account: string; title: string | null; previous?: Record<string, number>; records: boolean };
+export type FileState = { dev: number; ino: number; size: number; offset: number; mtime: number; context: Context; fallback: Record<string, Counts> };
+export type State = {
+  version: 1; files: Record<string, FileState>; hours: Record<string, Hour>; seen: Record<string, number>;
+  sessions: Record<string, Session>; seats: Record<string, Seat>; pending: Record<string, boolean>;
+  metadataPending: boolean; lastSend: string | null; lastError: string | null; failures: number; nextSend: number;
+  footprint: { milliseconds: number; peakMemoryBytes: number; stateBytes: number } | null;
+};
+export type Config = { credentialsFrom?: string; endpoint?: string; roots?: (string | { tool: Tool; path: string })[]; sendSessionTitles?: boolean; sendFolderLabels?: boolean; dryRun?: boolean };
+export type Options = { home?: string; env?: Record<string, string | undefined>; config?: Config; state?: State; since?: string; until?: string; backfill?: boolean; now?: number; stateDir?: string; command?: string; dryRun?: boolean };
+export type Stats = { files: number; bytesRead: number; rows: number; sent: number; errors: number; milliseconds: number; peakMemoryBytes: number; stateBytes: number };
+export const HOUR = 3_600_000;
+export const WINDOW = 8 * 24 * HOUR;
+export const counts = (): Counts => ({ requests: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
+export const fields = ['requests', 'freshInput', 'cacheRead', 'cacheWrite', 'output'] as const;
+export const string = (x: unknown, max = 512): string => typeof x === 'string' ? x.slice(0, max) : '';
+export const integer = (x: unknown): number => typeof x === 'number' && Number.isFinite(x) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(x))) : 0;
+export const peakMemory = (): number => process.resourceUsage().maxRSS * 1024;
