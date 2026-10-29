@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const reader = await import(new URL('../dist/plimsoll-lean.mjs', import.meta.url));
 const window = { since: '2026-10-20T00:00:00Z', until: '2026-10-21T00:00:00Z', now: Date.parse('2026-10-21T00:00:00Z'), backfill: true, config: { sendVelocity: true } };
@@ -47,4 +48,22 @@ test('velocity-only backfill leaves the existing hours and session totals untouc
   assert.equal(batch.sessions.length, 0);
   assert.equal(batch.seats.length, 0);
   assert.equal(batch.velocity.length, 1);
+});
+
+test('velocity replay reads archived Codex zstd rollouts without changing legacy rows', t => {
+  const home = fixture(); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const source = write(home, '.codex/archived_sessions/rollout-2026-10-20T00-00-00-zst.jsonl', [
+    { type: 'session_meta', timestamp: '2026-10-20T00:00:00Z', payload: { id: 'zst-session', originator: 'cli' } },
+    { type: 'event_msg', timestamp: '2026-10-20T00:00:01Z', payload: { type: 'task_started' } },
+    { type: 'token_usage_record', timestamp: '2026-10-20T00:00:03Z', payload: { response_id: 'zst-reply', usage: { input_tokens: 10, output_tokens: 100 } } },
+  ]);
+  const compressed = source + '.zst', zstd = spawnSync('zstd', ['-q', '-f', source, '-o', compressed]);
+  if (zstd.status !== 0) { t.skip('zstd CLI unavailable'); return; }
+  fs.unlinkSync(source);
+  const replay = reader.scan({ ...window, home, env: {}, velocityOnly: true,
+    discovered: [{ tool: 'codex', path: path.join(home, '.codex', 'sessions') }, { tool: 'codex', path: path.join(home, '.codex', 'archived_sessions') }] });
+  const rows = Object.values(replay.state.velocity);
+  assert.equal(rows.length, 1);
+  assert.deepEqual(rows[0], { ...rows[0], replies: 1, output: 100, model: 'unknown', sessionKey: 'zst-session' });
+  assert.equal(replay.stats.files, 1);
 });

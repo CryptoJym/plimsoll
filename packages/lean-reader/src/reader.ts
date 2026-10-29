@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { readLines } from './lines.js';
 import { Evidence, genericFolder, launchProject, protectedPath, topRepositories } from './evidence.js';
 import { stateBytes } from './state-json.js';
@@ -58,6 +59,10 @@ export function roots(home: string, env: Record<string, string | undefined>, con
   const seen = new Set<string>();
   return result.filter(root => { if (root.tool === 'grok' && protectedPath(root.path, home)) return false; try { root.path = fs.realpathSync(root.path); } catch { return false; } const key = root.tool + ':' + root.path; if (seen.has(key)) return false; seen.add(key); return true; });
 }
+function archivedRollout(name: string, since: number): boolean {
+  const match = /^rollout-(\d{4}-\d{2}-\d{2})T/.exec(name);
+  return Boolean(match && Date.parse(`${match[1]}T00:00:00Z`) >= since - 24 * HOUR);
+}
 function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string): Generator<{ file: string; stat: fs.Stats }> {
   if (tool === 'grok' && protectedPath(root, home)) return;
   const entries: { name: string; directory?: string; file?: string; stat?: fs.Stats }[] = [];
@@ -79,12 +84,13 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
           try {
             const s = fs.statSync(file);
             if (s.isDirectory()) entries.push({ name: entry.name, directory: file });
-            else if (s.isFile() && entry.name.endsWith('.jsonl') && s.mtimeMs >= since && (tool !== 'grok' || grokFile(file, home))) entries.push({ name: entry.name, file: fs.realpathSync(file), stat: s });
+            else if (s.isFile() && (entry.name.endsWith('.jsonl') || (tool === 'codex' && entry.name.endsWith('.jsonl.zst') && archivedRollout(entry.name, since))) &&
+              (entry.name.endsWith('.jsonl') ? s.mtimeMs >= since : archivedRollout(entry.name, since)) && (tool !== 'grok' || grokFile(file, home))) entries.push({ name: entry.name, file: fs.realpathSync(file), stat: s });
           } catch { /* Optional alias disappeared. */ }
-        } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || (tool === 'codex' && entry.name.endsWith('.jsonl.zst') && archivedRollout(entry.name, since)))) {
           let s: fs.Stats;
           try { s = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
-          if (s.mtimeMs >= since) entries.push({ name: entry.name, file, stat: s });
+          if (entry.name.endsWith('.jsonl') ? s.mtimeMs >= since : archivedRollout(entry.name, since)) entries.push({ name: entry.name, file, stat: s });
         }
       }
     } finally { directory.closeSync(); }
@@ -94,6 +100,39 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
     if (entry.directory) yield* files(entry.directory, visited, since, tool, home);
     else yield { file: entry.file!, stat: entry.stat! };
   }
+}
+
+function archivedSources(sources: Source[]): Source[] {
+  const result = [...sources], seen = new Set(sources.map(source => `${source.tool}:${source.path}`));
+  for (const source of sources.filter(source => source.tool === 'codex')) {
+    const archived = path.join(path.dirname(source.path), 'archived_sessions');
+    let real: string;
+    try { real = fs.realpathSync(archived); } catch { continue; }
+    const key = `codex:${real}`;
+    if (!seen.has(key)) { seen.add(key); result.push({ tool: 'codex', path: real }); }
+  }
+  return result;
+}
+
+/** Decode one archived Codex rollout without retaining its uncompressed body in
+ * the reader process. The fleet has the small zstd CLI alongside Node 22; the
+ * output is mode-600 temporary data and is removed before the pass returns. */
+function materializeZstd(file: string): { path: string; size: number; cleanup: () => void } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plimsoll-lean-zstd-'));
+  const output = path.join(dir, 'rollout.jsonl');
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(output, 'wx', 0o600);
+    const result = spawnSync('zstd', ['-q', '-d', '-c', '--', file], { stdio: ['ignore', fd, 'ignore'] });
+    if (result.status !== 0) throw new Error('source_unreadable');
+  } catch (error) {
+    try { if (fd !== undefined) fs.closeSync(fd); } catch { /* best effort */ }
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw error instanceof Error && error.message === 'source_unreadable' ? error : new Error('source_unreadable');
+  }
+  if (fd !== undefined) fs.closeSync(fd);
+  const size = fs.statSync(output).size;
+  return { path: output, size, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 class Projects {
@@ -307,7 +346,10 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     addVelocity(tool, ctx, time, tokens, meta);
     return true;
   };
-  const sources: Source[] = options.discovered ?? roots(home, options.env ?? process.env, config);
+  const discoveredSources = options.discovered ?? roots(home, options.env ?? process.env, config);
+  // Archived Codex rollouts are only needed for the explicit velocity replay;
+  // keeping them out of ordinary passes preserves the incremental footprint.
+  const sources: Source[] = options.discovered ? discoveredSources : velocityOnly ? archivedSources(discoveredSources) : discoveredSources;
   for (const root of sources) {
     let rootAccount: string | undefined;
     const getAccount = () => {
@@ -325,11 +367,13 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       // before capture so rotations and truncations still reset their context.
       let stat = discoveredStat;
       try { stat = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
+      const compressed = file.endsWith('.jsonl.zst');
       const fileIdentity = `${stat.dev}:${stat.ino}`;
       if (visitedFiles.has(fileIdentity) || stat.mtimeMs < startHour) continue;
       visitedFiles.add(fileIdentity);
       let tracked = state.files[file];
-      const reset = !tracked || tracked.dev !== stat.dev || tracked.ino !== stat.ino || stat.size < tracked.size || stat.size < tracked.offset;
+      const reset = !tracked || tracked.dev !== stat.dev || tracked.ino !== stat.ino ||
+        (compressed ? stat.size !== tracked.size || stat.mtimeMs !== tracked.mtime : stat.size < tracked.size || stat.size < tracked.offset);
       if (!tracked) { tracked = state.files[file] = { dev: stat.dev, ino: stat.ino, size: stat.size, offset: 0, mtime: stat.mtimeMs, context: context(getAccount()), fallback: {} }; budgetTick(); }
       if (reset || (options.backfill && !velocityOnly) || velocityOnly) { const records = tracked.context.records && !options.backfill && !velocityOnly; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
       const ctx = tracked.context;
@@ -350,20 +394,26 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       // Upgrading an existing state (or re-enabling evidence) replays evidence
       // alone. Usage cursors, cumulative baselines and replacement totals stay put.
       let evidenceContext = reset || (options.backfill && !velocityOnly) ? { cwd: '', session: '' } : tracked.evidenceContext ?? { cwd: ctx.cwd, session: ctx.session };
-      if (evidence && root.tool !== 'grok' && !reset && !(options.backfill && !velocityOnly) && tracked.evidenceOffset !== tracked.offset) {
-        evidenceContext = { cwd: '', session: '' };
-        stats.bytesRead += readLines(file, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
-        tracked.evidenceOffset = tracked.offset; tracked.evidenceContext = evidenceContext;
-      }
       // A lane marker in the session's latest folder also names rows counted
       // before it was seen. Without evidence, the usage context has that folder.
       const remember = (at: number) => evidence
         ? projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0)
         : projects.rememberFolder(ctx.cwd, root.tool, ctx.session, at);
-      if (tracked.offset === stat.size && !velocityOnly) { remember(tracked.mtime); continue; }
       if (root.tool === 'claude_code') ctx.account = getAccount();
+      // Archived files are immutable in ordinary passes; avoid decoding them
+      // again when their source metadata has not changed. A velocity replay
+      // deliberately decodes each file for its bounded window.
+      if (compressed && !velocityOnly && tracked.offset > 0 && !reset && stat.size === tracked.size && stat.mtimeMs === tracked.mtime) { remember(tracked.mtime); continue; }
+      let sourcePath = file, sourceSize = stat.size, cleanup = () => {};
+      if (compressed) { const decoded = materializeZstd(file); sourcePath = decoded.path; sourceSize = decoded.size; cleanup = decoded.cleanup; }
       try {
-        const result = readLines(file, tracked.offset, stat.size, r => {
+        if (evidence && root.tool !== 'grok' && !reset && tracked.evidenceOffset !== tracked.offset) {
+          evidenceContext = { cwd: '', session: '' };
+          stats.bytesRead += readLines(sourcePath, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
+          tracked.evidenceOffset = tracked.offset; tracked.evidenceContext = evidenceContext;
+        }
+        if (tracked.offset === sourceSize && !velocityOnly) { remember(tracked.mtime); continue; }
+        const result = readLines(sourcePath, tracked.offset, sourceSize, r => {
           if (root.tool === 'grok') {
             const turn = grokTurn(r);
             if (!turn) return;
@@ -470,6 +520,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
         tracked.dev = stat.dev; tracked.ino = stat.ino; tracked.size = stat.size; tracked.mtime = stat.mtimeMs;
         budgetTick();
       } catch (error) { if (error instanceof Error && error.message === 'state_capacity') throw error; throw new Error('source_unreadable'); }
+      finally { cleanup(); }
     }
   }
   const active = new Set(Object.values(state.hours).map(row => row.tool + ':' + row.sessionKey));
