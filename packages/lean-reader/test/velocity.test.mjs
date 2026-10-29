@@ -60,8 +60,10 @@ test('velocity replay reads archived Codex zstd rollouts without changing legacy
   const compressed = source + '.zst', zstd = spawnSync('zstd', ['-q', '-f', source, '-o', compressed]);
   if (zstd.status !== 0) { t.skip('zstd CLI unavailable'); return; }
   fs.unlinkSync(source);
-  const replay = reader.scan({ ...window, home, env: {}, velocityOnly: true,
-    discovered: [{ tool: 'codex', path: path.join(home, '.codex', 'sessions') }, { tool: 'codex', path: path.join(home, '.codex', 'archived_sessions') }] });
+  const discovered = [{ tool: 'codex', path: path.join(home, '.codex', 'sessions') }, { tool: 'codex', path: path.join(home, '.codex', 'archived_sessions') }];
+  const ordinary = reader.scan({ ...window, home, env: {}, discovered });
+  assert.equal(ordinary.stats.files, 0, 'ordinary passes must not admit archived zstd rollouts');
+  const replay = reader.scan({ ...window, home, env: {}, velocityOnly: true, discovered });
   const rows = Object.values(replay.state.velocity);
   assert.equal(rows.length, 1);
   assert.deepEqual(rows[0], { ...rows[0], replies: 1, output: 100, model: 'unknown', sessionKey: 'zst-session' });

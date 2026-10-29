@@ -63,7 +63,7 @@ function archivedRollout(name: string, since: number): boolean {
   const match = /^rollout-(\d{4}-\d{2}-\d{2})T/.exec(name);
   return Boolean(match && Date.parse(`${match[1]}T00:00:00Z`) >= since - 24 * HOUR);
 }
-function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string): Generator<{ file: string; stat: fs.Stats }> {
+function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string, includeArchived = false): Generator<{ file: string; stat: fs.Stats }> {
   if (tool === 'grok' && protectedPath(root, home)) return;
   const entries: { name: string; directory?: string; file?: string; stat?: fs.Stats }[] = [];
   try {
@@ -84,10 +84,10 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
           try {
             const s = fs.statSync(file);
             if (s.isDirectory()) entries.push({ name: entry.name, directory: file });
-            else if (s.isFile() && (entry.name.endsWith('.jsonl') || (tool === 'codex' && entry.name.endsWith('.jsonl.zst') && archivedRollout(entry.name, since))) &&
+            else if (s.isFile() && (entry.name.endsWith('.jsonl') || (includeArchived && tool === 'codex' && entry.name.endsWith('.jsonl.zst') && archivedRollout(entry.name, since))) &&
               (entry.name.endsWith('.jsonl') ? s.mtimeMs >= since : archivedRollout(entry.name, since)) && (tool !== 'grok' || grokFile(file, home))) entries.push({ name: entry.name, file: fs.realpathSync(file), stat: s });
           } catch { /* Optional alias disappeared. */ }
-        } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || (tool === 'codex' && entry.name.endsWith('.jsonl.zst') && archivedRollout(entry.name, since)))) {
+        } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || (includeArchived && tool === 'codex' && entry.name.endsWith('.jsonl.zst') && archivedRollout(entry.name, since)))) {
           let s: fs.Stats;
           try { s = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
           if (entry.name.endsWith('.jsonl') ? s.mtimeMs >= since : archivedRollout(entry.name, since)) entries.push({ name: entry.name, file, stat: s });
@@ -97,7 +97,7 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
     entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('source_unreadable'); return; }
   for (const entry of entries) {
-    if (entry.directory) yield* files(entry.directory, visited, since, tool, home);
+    if (entry.directory) yield* files(entry.directory, visited, since, tool, home, includeArchived);
     else yield { file: entry.file!, stat: entry.stat! };
   }
 }
@@ -349,7 +349,10 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const discoveredSources = options.discovered ?? roots(home, options.env ?? process.env, config);
   // Archived Codex rollouts are only needed for the explicit velocity replay;
   // keeping them out of ordinary passes preserves the incremental footprint.
-  const sources: Source[] = options.discovered ? discoveredSources : velocityOnly ? archivedSources(discoveredSources) : discoveredSources;
+  // Velocity replay is the only mode that admits immutable archived Codex
+  // rollouts. Ordinary passes must never decode a new .jsonl.zst file: doing
+  // so turns the five-second incremental pass into a historical full scan.
+  const sources: Source[] = velocityOnly ? archivedSources(discoveredSources) : discoveredSources;
   for (const root of sources) {
     let rootAccount: string | undefined;
     const getAccount = () => {
@@ -360,7 +363,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       }
       return rootAccount = root.tool === 'claude_code' ? claudeAccount(root.path, home, options.env ?? process.env) : 'unknown';
     };
-    for (const { file, stat: discoveredStat } of root.files ?? files(root.path, visited, startHour, root.tool, home)) {
+    for (const { file, stat: discoveredStat } of root.files ?? files(root.path, visited, startHour, root.tool, home, velocityOnly)) {
       if (root.tool === 'codex' && !path.basename(file).startsWith('rollout-')) continue;
       if (root.tool === 'grok' && !grokFile(file, home)) continue;
       // Metadata discovery is a snapshot; refresh eligible files immediately
