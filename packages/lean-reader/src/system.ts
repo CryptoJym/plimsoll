@@ -139,7 +139,7 @@ export function launchAgent(home: string, script: string): string {
 <key>ProgramArguments</key><array><string>${xmlEscape(node)}</string><string>${xmlEscape(script)}</string><string>run</string></array>
 <key>StartInterval</key><integer>300</integer><key>RunAtLoad</key><true/>
 <key>ProcessType</key><string>Background</string><key>LowPriorityIO</key><true/><key>Nice</key><integer>10</integer>
-<key>EnvironmentVariables</key><dict>${env}</dict>
+<key>EnvironmentVariables</key><dict>${env}<key>NODE_OPTIONS</key><string>--jitless --max-old-space-size=48 --max-semi-space-size=1</string></dict>
 </dict></plist>\n`;
 }
 export function install(home: string, script: string, remove = false) {

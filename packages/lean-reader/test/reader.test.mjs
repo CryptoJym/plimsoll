@@ -281,7 +281,7 @@ test('LaunchAgent uses collector Node and required scheduling without installing
   const node = process.execPath;
   write(home, 'Library/LaunchAgents/com.plimsoll.collector.plist', `<?xml version="1.0"?><plist><dict><key>ProgramArguments</key><array><string>${node}</string><string>/synthetic/collector.mjs</string></array></dict></plist>`);
   const xml = reader.launchAgent(home, '/synthetic/lean.mjs');
-  for (const text of ['com.plimsoll.lean-reader', node, '<integer>300</integer>', '<key>RunAtLoad</key>', '<key>LowPriorityIO</key>', '<string>Background</string>', '<integer>10</integer>']) assert.ok(xml.includes(text));
+  for (const text of ['com.plimsoll.lean-reader', node, '<integer>300</integer>', '<key>RunAtLoad</key>', '<key>LowPriorityIO</key>', '<string>Background</string>', '<integer>10</integer>', '--jitless --max-old-space-size=48 --max-semi-space-size=1']) assert.ok(xml.includes(text));
   assert.equal(fs.existsSync(path.join(home, 'Library/LaunchAgents/com.plimsoll.lean-reader.plist')), false);
 });
 
