@@ -64,7 +64,11 @@ function archivedRollout(name: string, since: number): boolean {
   return Boolean(match && Date.parse(`${match[1]}T00:00:00Z`) >= since - 24 * HOUR);
 }
 function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string, includeArchived = false): Generator<{ file: string; stat: fs.Stats }> {
-  if (tool === 'grok' && protectedPath(root, home)) return;
+  // Any configured source can be symlinked into a macOS protected folder.
+  // stat() is safe there, but opening a directory or file can block forever
+  // while the OS waits for user/iCloud permission. Keep the whole traversal
+  // out of those locations, including velocity-only archived roots.
+  if (protectedPath(root, home)) return;
   const entries: { name: string; directory?: string; file?: string; stat?: fs.Stats }[] = [];
   try {
     const stat = fs.statSync(root), key = `${stat.dev}:${stat.ino}`;
@@ -78,7 +82,8 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
       let entry;
       while ((entry = directory.readSync())) {
         const file = path.join(root, entry.name);
-        if (tool === 'grok' && (protectedPath(file, home) || (!entry.isDirectory() && !entry.isSymbolicLink() && entry.name !== 'updates.jsonl'))) continue;
+        if (protectedPath(file, home)) continue;
+        if (tool === 'grok' && (!entry.isDirectory() && !entry.isSymbolicLink() && entry.name !== 'updates.jsonl')) continue;
         if (entry.isDirectory()) entries.push({ name: entry.name, directory: file });
         else if (entry.isSymbolicLink()) {
           try {

@@ -69,3 +69,14 @@ test('velocity replay reads archived Codex zstd rollouts without changing legacy
   assert.deepEqual(rows[0], { ...rows[0], replies: 1, output: 100, model: 'unknown', sessionKey: 'zst-session' });
   assert.equal(replay.stats.files, 1);
 });
+
+test('velocity replay skips configured roots in macOS protected folders', t => {
+  const home = fixture(); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  write(home, 'Documents/codex/archived_sessions/rollout-2026-10-20T00-00-00.jsonl', [
+    { type: 'session_meta', timestamp: '2026-10-20T00:00:00Z', payload: { id: 'protected-session' } },
+    { type: 'token_usage_record', timestamp: '2026-10-20T00:00:01Z', payload: { response_id: 'protected-reply', usage: { input_tokens: 1, output_tokens: 1 } } },
+  ]);
+  const replay = reader.scan({ ...window, home, env: {}, velocityOnly: true, discovered: [{ tool: 'codex', path: path.join(home, 'Documents', 'codex') }] });
+  assert.equal(replay.stats.files, 0);
+  assert.equal(Object.keys(replay.state.velocity).length, 0);
+});
