@@ -5,6 +5,14 @@ files, aggregates usage by UTC hour, and sends replacement totals to Plimsoll.
 It has no runtime packages, database, local server, or resident daemon. A macOS
 LaunchAgent starts one short pass every five minutes.
 
+Each counted reply also contributes to an additive `velocity[]` row keyed by
+tool, account, model, session, UTC hour, tier and effort. Rows carry token
+totals, reasoning tokens, timed-reply sums and rate histogram buckets. Timing
+uses the latest earlier user/tool input or previous counted reply; only replies
+with at least 50 output tokens and 0.3–900 seconds are timed. A
+`velocity-backfill --since ... --until ...` rewrites only these rows and never
+uploads hours, sessions or seats.
+
 ## Build and check
 
 From the repository root:
@@ -136,6 +144,13 @@ the legacy upload encoding is preserved. Enabling it replays evidence from
 existing cursors without recounting usage. Session titles remain independently
 controlled by `sendSessionTitles`.
 
+`sendVelocity` defaults to `true` for installed readers. Set it to `false` only
+for a compatibility run; the local velocity outbox remains pending and can be
+sent later. Session `parentSessionKey`, `entrypoint` and `actions` are sent
+only when the source files provide them. Action names are projected into
+`edit`, `shell`, `read`, `search`, `web`, `browser`, `mcp`, `agent` and `other`
+counts; arguments and tool output are never retained.
+
 It never sends prompts, responses, instruction text, tool output, file contents,
 full working paths, raw account IDs, emails, provider credentials, or Git remotes.
 It does not calculate prices: unknown pricing stays unknown in the cloud.
@@ -162,6 +177,7 @@ The optional `~/.config/plimsoll-lean/config.json` contains:
   "sendSessionTitles": false,
   "sendFolderLabels": true,
   "sendEvidence": false,
+  "sendVelocity": true,
   "dryRun": false
 }
 ```

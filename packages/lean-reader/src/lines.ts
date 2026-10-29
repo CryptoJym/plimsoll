@@ -3,10 +3,14 @@ import fs from 'node:fs';
 // Only these leaves survive projection of an oversized record. Array contents,
 // prompts, instructions and tool outputs never become part of the projection.
 const paths = [
-  'type', 'timestamp', 'sessionId', 'cwd', 'requestId', 'uuid', 'ordinal', 'summary',
-  'message.id', 'message.model',
+  'type', 'timestamp', 'sessionId', 'cwd', 'requestId', 'uuid', 'ordinal', 'summary', 'entrypoint', 'perTurnEffort', 'effort',
+  'parentSessionId', 'parentSessionKey', 'parent_session_id',
+  'message.id', 'message.model', 'message.content[].type', 'message.content[].name', 'message.role',
   ...['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'].map(k => `message.usage.${k}`),
-  ...['type', 'cwd', 'id', 'session_id', 'creator_account_id', 'model', 'response_id', 'turn_id'].map(k => `payload.${k}`),
+  'message.usage.service_tier', 'message.usage.output_tokens_details.thinking_tokens',
+  ...['type', 'cwd', 'id', 'session_id', 'creator_account_id', 'model', 'response_id', 'turn_id', 'originator', 'source', 'thread_source', 'parent_thread_id', 'parent_session_id', 'parentSessionKey', 'entrypoint', 'effort', 'reasoning_effort', 'service_tier', 'duration_ms', 'time_to_first_token_ms', 'role', 'name'].map(k => `payload.${k}`),
+  'payload.thread_settings.service_tier', 'payload.thread_settings.reasoning_effort',
+  'payload.session_meta.originator', 'payload.session_meta.parent_thread_id',
   'payload.base_instructions.provenance.model',
   ...['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'].flatMap(k => [`payload.usage.${k}`, `payload.info.total_token_usage.${k}`]),
   'payload.rate_limits.plan_type', 'payload.rate_limits.credits.balance',
@@ -220,7 +224,7 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
     size += part.length;
     if (size <= LIMIT) { chunks.push(Buffer.from(part)); return; }
     const head = Buffer.concat(chunks, Math.min(size - part.length, 512)).subarray(0, 512).toString();
-    if (!/"(?:assistant|usage|session_meta|turn_context|token_usage_record|token_count)"/.test(head) && !(evidence && /"response_item"/.test(head))) { chunks = []; dropped = true; return; }
+    if (!/"(?:assistant|user|response_item|usage|session_meta|turn_context|token_usage_record|token_count|event_msg)"/.test(head)) { chunks = []; dropped = true; return; }
     projector = new Projection(evidence); decoder = new TextDecoder();
     for (const chunk of chunks) projector.feed(decoder.decode(chunk, { stream: true }));
     chunks = []; projector.feed(decoder.decode(part, { stream: true }));
@@ -239,7 +243,7 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
         if (completed) { completed.feed(decoder!.decode()); record = completed.finish(); }
         else if (!dropped) {
           const text = Buffer.concat(chunks).toString('utf8');
-          if (/"(?:assistant|summary|session_meta|turn_context|token_usage_record|token_count)"/.test(text) || (evidence && /"response_item"/.test(text))) {
+          if (/"(?:assistant|summary|user|response_item|session_meta|turn_context|token_usage_record|token_count|event_msg)"/.test(text)) {
             try { record = JSON.parse(text); } catch { /* An invalid line is not usage. */ }
           }
         }

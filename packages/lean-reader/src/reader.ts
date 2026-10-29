@@ -7,14 +7,34 @@ import { Evidence, genericFolder, launchProject, protectedPath, topRepositories 
 import { stateBytes } from './state-json.js';
 import { Seen } from './seen.js';
 import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js';
-import { counts, fields, HOUR, WINDOW, integer, string, peakMemory, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source } from './types.js';
+import { actionCounts, counts, fields, HOUR, WINDOW, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
 // Exact port of shared/src/policy.ts providerAccountKey / hashProtectedValue.
 // Do not switch to raw-id hashing: that would break existing cloud seat labels.
 export const accountKey = (id: unknown): string => typeof id === 'string' && id ? 'sha256:' + crypto.createHash('sha256').update(JSON.stringify({ stringValue: id })).digest('hex').slice(0, 16) : 'unknown';
-export const emptyState = (): State => ({ version: 1, files: {}, hours: {}, seen: {}, sessions: {}, seats: {}, pending: {}, metadataPending: false, lastSend: null, lastError: null, failures: 0, nextSend: 0, footprint: null });
-const context = (account = 'unknown'): Context => ({ model: 'unknown', cwd: '', session: '', account, title: null, records: false });
+export const emptyState = (): State => ({ version: 1, files: {}, hours: {}, velocity: {}, velocityPending: {}, seen: {}, sessions: {}, seats: {}, pending: {}, metadataPending: false, lastSend: null, lastError: null, failures: 0, nextSend: 0, footprint: null });
+const context = (account = 'unknown'): Context => ({ model: 'unknown', cwd: '', session: '', account, title: null, records: false, tier: 'standard', effort: 'unknown' });
+const velocityCounts = (): Omit<Velocity, 'hour' | 'tool' | 'accountKey' | 'model' | 'sessionKey' | 'tier' | 'effort'> => ({ replies: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, timed: 0, sOut: 0, sDur: 0, sOutDur: 0, sOut2: 0, sDur2: 0, hist: Array(16).fill(0), turns: 0, turnMs: 0, ttftMs: 0, ttftN: 0 });
+const lower = (value: unknown, fallback = 'unknown') => typeof value === 'string' && value.trim() ? value.trim().toLowerCase().slice(0, 40) : fallback;
+const codexTier = (value: unknown) => value === undefined || value === null ? 'standard' : lower(value);
+const histBucket = (rate: number) => {
+  const bounds = [5, 10, 15, 20, 30, 40, 50, 60, 80, 100, 130, 170, 220, 300, 400];
+  for (let i = 0; i < bounds.length; i++) if (rate < bounds[i]) return i;
+  return 15;
+};
+const actionKind = (name: unknown): ActionKind => {
+  const n = typeof name === 'string' ? name.toLowerCase() : '';
+  if (/apply_patch|^(edit|write|notebookedit)$|\.apply_patch$/.test(n)) return 'edit';
+  if (/^(bash|shell|exec_command|functions\.exec|local_shell)|\.exec$/.test(n)) return 'shell';
+  if (/^(read|cat|sed|head|tail)$|\.read$/.test(n)) return 'read';
+  if (/^(glob|grep|rg|search)$|\.search$/.test(n)) return 'search';
+  if (/websearch|webfetch|search_query|open_url/.test(n)) return 'web';
+  if (/browser|chrome|playwright/.test(n)) return 'browser';
+  if (/spawn_agent|task|agent/.test(n)) return 'agent';
+  if (n.startsWith('mcp__') || n.startsWith('mcp.')) return 'mcp';
+  return 'other';
+};
 export const expand = (p: string, home: string) => p === '~' ? home : p.startsWith('~/') ? path.join(home, p.slice(2)) : path.resolve(p);
 function directories(parent: string, prefix = ''): string[] {
   try { return fs.readdirSync(parent).sort().filter(n => n.startsWith(prefix)).filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
@@ -168,6 +188,7 @@ function claudeAccount(root: string, home: string, env: Record<string, string | 
 
 function prune(state: State, cutoff: number) {
   for (const [key, row] of Object.entries(state.hours)) if (Date.parse(row.hour) < cutoff && !state.pending[key]) delete state.hours[key];
+  for (const [key, row] of Object.entries(state.velocity ?? {})) if (Date.parse(row.hour) < cutoff && !state.velocityPending?.[key]) delete state.velocity[key];
   for (const key in state.seen) if (state.seen[key] * HOUR < cutoff) delete state.seen[key];
   for (const key in state.evidenceSeen ?? {}) if (state.evidenceSeen![key] * HOUR < cutoff) delete state.evidenceSeen![key];
   for (const [key, evidence] of Object.entries(state.evidence ?? {})) if (evidence.lastSeen < cutoff && !state.metadataPending) delete state.evidence![key];
@@ -184,12 +205,18 @@ function prune(state: State, cutoff: number) {
 export function scan(options: Options = {}): { state: State; rows: Hour[]; stats: Stats } {
   const started = performance.now(), home = options.home ?? os.homedir(), now = options.now ?? Date.now();
   const config = options.config ?? {}, state = options.state ?? emptyState();
+  // States written by the pre-velocity reader remain valid and gain only the
+  // additive velocity outbox when this bundle first opens them.
+  state.velocity ??= {};
+  state.velocityPending ??= {};
   const cutoff = Math.floor((now - WINDOW) / HOUR) * HOUR;
   const since = options.since ? Date.parse(options.since) : cutoff;
   const until = options.until ? Date.parse(options.until) : now + HOUR;
   if (!Number.isFinite(since) || !Number.isFinite(until) || since >= until) throw new Error('invalid_window');
   const startHour = Math.floor(since / HOUR) * HOUR, endHour = Math.ceil(until / HOUR) * HOUR;
   const inside = (hour: string) => Date.parse(hour) >= startHour && Date.parse(hour) < endHour;
+  const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
+  const rebuildVelocity = velocityOnly || options.backfill === true;
   const stats: Stats = { files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 0, milliseconds: 0, peakMemoryBytes: 0, stateBytes: 0 };
   prune(state, cutoff);
   const seen = new Seen(state, 'seen', 'seenPacked', cutoff);
@@ -201,40 +228,84 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const checkBudget = () => { stateBytes(state, 9 * 1024 * 1024 - seen.pendingBytes - (evidenceSeen?.pendingBytes ?? 0)); };
   let admissions = 0;
   const budgetTick = () => { if (++admissions % 256 === 0) checkBudget(); };
-  if (options.backfill) {
+  if (options.backfill && !velocityOnly) {
     // Zero rows act as replacement tombstones if a corrected source no longer
     // contains a formerly counted hour. Never leave a stale cloud total behind.
     for (const [key, row] of Object.entries(state.hours)) if (inside(row.hour)) { Object.assign(row, counts()); state.pending[key] = true; }
     seen.remove(hour => hour * HOUR >= startHour && hour * HOUR < endHour);
     for (const file of Object.values(state.files)) for (const key of Object.keys(file.fallback)) if (state.hours[key] && inside(state.hours[key].hour)) delete file.fallback[key];
   }
+  if (rebuildVelocity) {
+    // A velocity-only backfill replaces only the additive rows. Existing hour,
+    // session, seat and dedup state is left untouched, while rows that vanish
+    // from a corrected transcript are replaced by zero tombstones.
+    for (const row of Object.values(state.velocity)) if (inside(row.hour)) Object.assign(row, velocityCounts());
+  }
+  // A normal/backfill scan must retain the established hour deduplication
+  // index. Velocity-only replay gets its own in-pass index because it is
+  // deliberately forbidden from changing the hours/sessions/seen data.
+  const velocitySeen = velocityOnly ? new Set<string>() : null;
   const projects = new Projects(home), visited = new Set<string>(), visitedFiles = new Set<string>();
   const evidence = evidenceSeen ? new Evidence(home, state, evidenceSeen, startHour, endHour, budgetTick) : null;
-  const add = (tool: Tool, ctx: Context, stamp: unknown, id: string | null, tokens: Counts, file?: FileState) => {
+  const markAction = (ctx: Context, name: unknown, tool?: Tool) => {
+    if (!ctx.actions) ctx.actions = actionCounts();
+    const kind = actionKind(name); ctx.actions[kind]++;
+    const session = tool && ctx.session ? state.sessions[digest(tool + ':' + ctx.session)] : undefined;
+    if (session) { if (!session.actions) session.actions = actionCounts(); session.actions[kind]++; state.metadataPending = true; }
+  };
+  const addVelocity = (tool: Tool, ctx: Context, stamp: number, tokens: Counts, meta?: { tier?: string; effort?: string; reasoning?: number; dur?: number; turnMs?: number; ttftMs?: number }) => {
+    if (!Number.isFinite(stamp) || stamp < startHour || stamp >= endHour || ctx.model === '<synthetic>') return;
+    const hour = Math.floor(stamp / HOUR), tier = lower(meta?.tier ?? ctx.tier, tool === 'codex' ? 'standard' : 'unknown'), effort = lower(meta?.effort ?? ctx.effort);
+    const sessionKey = ctx.session || 'unknown', key = digest(JSON.stringify([tool, ctx.account, ctx.model || 'unknown', sessionKey, hour, tier, effort]));
+    const row = state.velocity[key] ??= { ...velocityCounts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: ctx.account, model: ctx.model || 'unknown', sessionKey, tier, effort };
+    row.tier = tier; row.effort = effort;
+    row.replies = Math.min(Number.MAX_SAFE_INTEGER, row.replies + integer(tokens.requests));
+    for (const k of ['freshInput', 'cacheRead', 'cacheWrite', 'output'] as const) row[k] = Math.min(Number.MAX_SAFE_INTEGER, row[k] + integer(tokens[k]));
+    row.reasoning = Math.min(Number.MAX_SAFE_INTEGER, row.reasoning + integer(meta?.reasoning));
+    if (meta?.dur !== undefined && integer(tokens.requests) === 1 && integer(tokens.output) >= 50 && meta.dur >= 0.3 && meta.dur <= 900) {
+      const dur = Math.round(meta.dur * 1000) / 1000, output = integer(tokens.output), rate = output / dur;
+      row.timed++; row.sOut += output; row.sDur += dur; row.sOutDur += output * dur; row.sOut2 += output * output; row.sDur2 += dur * dur; row.hist[histBucket(rate)]++;
+    }
+    if (meta?.turnMs !== undefined) row.turns++; if (meta?.turnMs !== undefined) row.turnMs += integer(meta.turnMs);
+    if (meta?.ttftMs !== undefined) { row.ttftN++; row.ttftMs += integer(meta.ttftMs); }
+    state.velocityPending[key] = true; budgetTick();
+  };
+  const addSessionMetadata = (ctx: Context, summary: import('./types.js').Session) => {
+    if (ctx.parentSessionKey !== undefined && summary.parentSessionKey !== ctx.parentSessionKey) { summary.parentSessionKey = ctx.parentSessionKey; state.metadataPending = true; }
+    if (ctx.entrypoint !== undefined && summary.entrypoint !== ctx.entrypoint) { summary.entrypoint = ctx.entrypoint; state.metadataPending = true; }
+    if (ctx.actions && JSON.stringify(summary.actions ?? null) !== JSON.stringify(ctx.actions)) { summary.actions = { ...ctx.actions }; state.metadataPending = true; }
+  };
+  const add = (tool: Tool, ctx: Context, stamp: unknown, id: string | null, tokens: Counts, file?: FileState, meta?: { tier?: string; effort?: string; reasoning?: number; dur?: number }) => {
     const time = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
-    if (!Number.isFinite(time) || time < startHour || time >= endHour) return;
+    if (!Number.isFinite(time) || time < startHour || time >= endHour) return false;
     const hour = Math.floor(time / HOUR);
     if (id !== null) {
       const seenKey = digest(tool + ':' + id);
-      if (seen.has(seenKey)) return;
-      seen.add(seenKey, hour);
+      const deduped = velocityOnly ? velocitySeen!.has(seenKey) : seen.has(seenKey);
+      if (deduped) return false;
+      if (velocityOnly) velocitySeen!.add(seenKey); else seen.add(seenKey, hour);
     }
     budgetTick();
-    if (ctx.model === '<synthetic>') return;
+    if (ctx.model === '<synthetic>') return false;
     const sessionKey = ctx.session || 'unknown';
-    const key = digest(JSON.stringify([tool, ctx.account, ctx.model, sessionKey, hour]));
-    const hint = projects.hint(ctx.cwd, tool, sessionKey);
-    const row = state.hours[key] ??= { ...counts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: ctx.account, model: ctx.model, sessionKey, projectHint: hint.projectHint, projectSource: hint.projectSource };
-    row.projectHint = hint.projectHint; row.projectSource = hint.projectSource;
-    for (const k of fields) row[k] = Math.min(Number.MAX_SAFE_INTEGER, row[k] + tokens[k]);
-    state.pending[key] = true;
-    if (file) { const own = file.fallback[key] ??= counts(); for (const k of fields) own[k] += tokens[k]; }
-    const sessionId = digest(tool + ':' + sessionKey), when = new Date(time).toISOString();
-    const summary = state.sessions[sessionId] ??= { tool, sessionKey, title: null, folderLabel: null, projectHint: null, firstSeen: when, lastSeen: when };
-    if (when < summary.firstSeen) summary.firstSeen = when;
-    if (when >= summary.lastSeen) { summary.lastSeen = when; summary.projectHint = hint.projectHint; summary.folderLabel = config.sendFolderLabels === false ? null : hint.folderLabel; }
-    summary.title = config.sendSessionTitles ? ctx.title : null;
-    state.metadataPending = true;
+    if (!velocityOnly) {
+      const key = digest(JSON.stringify([tool, ctx.account, ctx.model, sessionKey, hour]));
+      const hint = projects.hint(ctx.cwd, tool, sessionKey);
+      const row = state.hours[key] ??= { ...counts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: ctx.account, model: ctx.model, sessionKey, projectHint: hint.projectHint, projectSource: hint.projectSource };
+      row.projectHint = hint.projectHint; row.projectSource = hint.projectSource;
+      for (const k of fields) row[k] = Math.min(Number.MAX_SAFE_INTEGER, row[k] + tokens[k]);
+      state.pending[key] = true;
+      if (file) { const own = file.fallback[key] ??= counts(); for (const k of fields) own[k] += tokens[k]; }
+      const sessionId = digest(tool + ':' + sessionKey), when = new Date(time).toISOString();
+      const summary = state.sessions[sessionId] ??= { tool, sessionKey, title: null, folderLabel: null, projectHint: null, firstSeen: when, lastSeen: when };
+      if (when < summary.firstSeen) summary.firstSeen = when;
+      if (when >= summary.lastSeen) { summary.lastSeen = when; summary.projectHint = hint.projectHint; summary.folderLabel = config.sendFolderLabels === false ? null : hint.folderLabel; }
+      summary.title = config.sendSessionTitles ? ctx.title : null;
+      addSessionMetadata(ctx, summary);
+      state.metadataPending = true;
+    }
+    addVelocity(tool, ctx, time, tokens, meta);
+    return true;
   };
   const sources: Source[] = options.discovered ?? roots(home, options.env ?? process.env, config);
   for (const root of sources) {
@@ -260,7 +331,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       let tracked = state.files[file];
       const reset = !tracked || tracked.dev !== stat.dev || tracked.ino !== stat.ino || stat.size < tracked.size || stat.size < tracked.offset;
       if (!tracked) { tracked = state.files[file] = { dev: stat.dev, ino: stat.ino, size: stat.size, offset: 0, mtime: stat.mtimeMs, context: context(getAccount()), fallback: {} }; budgetTick(); }
-      if (reset || options.backfill) { const records = tracked.context.records && !options.backfill; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
+      if (reset || (options.backfill && !velocityOnly) || velocityOnly) { const records = tracked.context.records && !options.backfill && !velocityOnly; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
       const ctx = tracked.context;
       const metadata = root.tool === 'grok' ? grokSummary(file, home) : null;
       if (metadata) { ctx.cwd = metadata.cwd; ctx.model = metadata.model; ctx.account = getAccount(); }
@@ -278,8 +349,8 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       stats.files++;
       // Upgrading an existing state (or re-enabling evidence) replays evidence
       // alone. Usage cursors, cumulative baselines and replacement totals stay put.
-      let evidenceContext = reset || options.backfill ? { cwd: '', session: '' } : tracked.evidenceContext ?? { cwd: ctx.cwd, session: ctx.session };
-      if (evidence && root.tool !== 'grok' && !reset && !options.backfill && tracked.evidenceOffset !== tracked.offset) {
+      let evidenceContext = reset || (options.backfill && !velocityOnly) ? { cwd: '', session: '' } : tracked.evidenceContext ?? { cwd: ctx.cwd, session: ctx.session };
+      if (evidence && root.tool !== 'grok' && !reset && !(options.backfill && !velocityOnly) && tracked.evidenceOffset !== tracked.offset) {
         evidenceContext = { cwd: '', session: '' };
         stats.bytesRead += readLines(file, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
         tracked.evidenceOffset = tracked.offset; tracked.evidenceContext = evidenceContext;
@@ -289,7 +360,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       const remember = (at: number) => evidence
         ? projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0)
         : projects.rememberFolder(ctx.cwd, root.tool, ctx.session, at);
-      if (tracked.offset === stat.size) { remember(tracked.mtime); continue; }
+      if (tracked.offset === stat.size && !velocityOnly) { remember(tracked.mtime); continue; }
       if (root.tool === 'claude_code') ctx.account = getAccount();
       try {
         const result = readLines(file, tracked.offset, stat.size, r => {
@@ -297,42 +368,70 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
             const turn = grokTurn(r);
             if (!turn) return;
             const time = Date.parse(turn.time), seenKey = digest('grok:' + JSON.stringify(turn.id));
-            if (time < startHour || time >= endHour || seen.has(seenKey)) return;
-            seen.add(seenKey, Math.floor(time / HOUR)); budgetTick();
+            if (time < startHour || time >= endHour || (velocityOnly ? velocitySeen!.has(seenKey) : seen.has(seenKey))) return;
+            if (velocityOnly) velocitySeen!.add(seenKey); else seen.add(seenKey, Math.floor(time / HOUR)); budgetTick();
             ctx.session = turn.session || path.basename(path.dirname(file));
             for (const { model, tokens } of turn.models) {
               ctx.model = model || metadata!.model.replace(/-build$/, '');
-              add('grok', ctx, turn.time, null, tokens);
+              add('grok', ctx, turn.time, null, tokens, undefined, { tier: 'unknown', effort: 'unknown', reasoning: 0 });
             }
             updateGrokSummary();
             return;
           }
           evidence?.observe(root.tool, evidenceContext, r);
           if (root.tool === 'claude_code') {
+            const eventTime = typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : NaN;
+            if (r.type === 'user' && Number.isFinite(eventTime)) ctx.lastInputAt = eventTime;
+            if (r.entrypoint !== undefined) ctx.entrypoint = lower(r.entrypoint);
+            const parent = r.parentSessionKey ?? r.parentSessionId ?? r.parent_session_id;
+            if (parent !== undefined) ctx.parentSessionKey = typeof parent === 'string' && parent ? parent.slice(0, 200) : null;
             if (r.type === 'summary' && config.sendSessionTitles) { ctx.title = string(r.summary); const summary = state.sessions[digest(root.tool + ':' + ctx.session)]; if (summary) { summary.title = ctx.title; state.metadataPending = true; } return; }
             if (r.type !== 'assistant' || !r.timestamp || !r.message?.usage) return;
             const msg = r.message, usage = msg.usage;
             ctx.model = string(msg.model) || 'unknown'; ctx.cwd = string(r.cwd, 4096); ctx.session = string(r.sessionId);
-            add(root.tool, ctx, r.timestamp, JSON.stringify(msg.id || r.requestId || r.uuid || null), { requests: 1, freshInput: integer(usage.input_tokens), cacheRead: integer(usage.cache_read_input_tokens), cacheWrite: integer(usage.cache_creation_input_tokens), output: integer(usage.output_tokens) });
+            for (const part of Array.isArray(msg.content) ? msg.content : []) if (part && typeof part === 'object' && part.type === 'tool_use') markAction(ctx, part.name, root.tool);
+            const tier = lower(usage.service_tier), effort = lower(r.effort ?? r.perTurnEffort), reasoning = integer(usage.output_tokens_details?.thinking_tokens);
+            const time = Date.parse(r.timestamp), base = Math.max(ctx.lastInputAt ?? -Infinity, ctx.lastReplyAt ?? -Infinity), dur = Number.isFinite(base) ? (time - base) / 1000 : NaN;
+            const accepted = add(root.tool, ctx, r.timestamp, JSON.stringify(msg.id || r.requestId || r.uuid || null), { requests: 1, freshInput: integer(usage.input_tokens), cacheRead: integer(usage.cache_read_input_tokens), cacheWrite: integer(usage.cache_creation_input_tokens), output: integer(usage.output_tokens) }, undefined, { tier, effort, reasoning, dur });
+            if (accepted) ctx.lastReplyAt = time;
             return;
           }
           const p = r.payload ?? {};
+          const eventTime = typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : NaN;
+          if (r.type === 'event_msg' && ['task_started', 'user_message'].includes(p.type) && Number.isFinite(eventTime)) ctx.lastInputAt = eventTime;
+          if (r.type === 'response_item' && (typeof p.type === 'string' && (p.type.endsWith('_call_output') || p.type === 'tool_search_output' || (p.type === 'message' && p.role === 'user'))) && Number.isFinite(eventTime)) ctx.lastInputAt = eventTime;
+          if (r.type === 'response_item' && ['function_call', 'custom_tool_call'].includes(p.type)) markAction(ctx, p.name, root.tool);
           if (r.type === 'session_meta') {
             ctx.cwd = string(p.cwd, 4096) || ctx.cwd; ctx.session = string(p.id || p.session_id) || ctx.session;
             if (p.creator_account_id) ctx.account = accountKey(p.creator_account_id);
             ctx.model = string(p.base_instructions?.provenance?.model) || ctx.model;
-          } else if (r.type === 'turn_context') { ctx.model = string(p.model) || ctx.model; ctx.cwd = string(p.cwd, 4096) || ctx.cwd; }
-          else if (r.type === 'token_usage_record' || p.type === 'token_usage_record') {
+            if (p.originator !== undefined) ctx.entrypoint = lower(p.originator);
+            const parent = p.parentSessionKey ?? p.parent_session_id ?? p.parent_thread_id;
+            if (parent !== undefined) ctx.parentSessionKey = typeof parent === 'string' && parent ? parent.slice(0, 200) : null;
+          } else if (r.type === 'turn_context') {
+            ctx.model = string(p.model) || ctx.model; ctx.cwd = string(p.cwd, 4096) || ctx.cwd;
+            if (p.effort !== undefined) ctx.effort = lower(p.effort);
+          } else if (r.type === 'event_msg' && p.type === 'thread_settings_applied') {
+            const settings = p.thread_settings ?? {};
+            ctx.tier = codexTier(settings.service_tier);
+            if (settings.reasoning_effort !== undefined) ctx.effort = lower(settings.reasoning_effort);
+            if (settings.model) ctx.model = string(settings.model) || ctx.model;
+          } else if (r.type === 'event_msg' && p.type === 'task_complete') {
+            if (Number.isFinite(eventTime)) addVelocity(root.tool, ctx, eventTime, counts(), { tier: ctx.tier, effort: ctx.effort, turnMs: integer(p.duration_ms), ttftMs: typeof p.time_to_first_token_ms === 'number' ? p.time_to_first_token_ms : undefined });
+          }
+          if (r.type === 'token_usage_record' || p.type === 'token_usage_record') {
             if (!ctx.records) {
               ctx.records = true;
-              for (const [key, previous] of Object.entries(tracked!.fallback)) {
+              if (!velocityOnly) for (const [key, previous] of Object.entries(tracked!.fallback)) {
                 const row = state.hours[key];
                 if (row) { for (const k of fields) row[k] = Math.max(0, row[k] - previous[k]); state.pending[key] = true; }
               }
               tracked!.fallback = {};
             }
             const u = p.usage ?? {}, cached = integer(u.cached_input_tokens), written = integer(u.cache_write_input_tokens);
-            add(root.tool, ctx, r.timestamp, JSON.stringify(p.response_id || [p.turn_id ?? null, r.ordinal ?? null]), { requests: 1, freshInput: Math.max(integer(u.input_tokens) - cached - written, 0), cacheRead: cached, cacheWrite: written, output: integer(u.output_tokens) });
+            const time = typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : NaN, base = Math.max(ctx.lastInputAt ?? -Infinity, ctx.lastReplyAt ?? -Infinity), dur = Number.isFinite(base) ? (time - base) / 1000 : NaN;
+            const accepted = add(root.tool, ctx, r.timestamp, JSON.stringify(p.response_id || [p.turn_id ?? null, r.ordinal ?? null]), { requests: 1, freshInput: Math.max(integer(u.input_tokens) - cached - written, 0), cacheRead: cached, cacheWrite: written, output: integer(u.output_tokens) }, tracked, { tier: ctx.tier, effort: ctx.effort, reasoning: integer(u.reasoning_output_tokens), dur });
+            if (accepted) ctx.lastReplyAt = time;
           } else if (p.type === 'token_count' || r.type === 'token_count') {
             const time = typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : NaN;
             if (p.rate_limits && ctx.account !== 'unknown' && Number.isFinite(time)) {
@@ -356,7 +455,11 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
               let delta: Record<string, number> = {};
               for (const k of Object.keys(current)) delta[k] = current[k] - (ctx.previous[k] ?? 0);
               if (Object.values(delta).some(n => n < 0)) delta = current;
-              if (delta.total_tokens > 0) add(root.tool, ctx, r.timestamp, JSON.stringify([file, r.timestamp, current]), { requests: 1, freshInput: Math.max((delta.input_tokens ?? 0) - (delta.cached_input_tokens ?? 0) - (delta.cache_write_input_tokens ?? 0), 0), cacheRead: delta.cached_input_tokens ?? 0, cacheWrite: delta.cache_write_input_tokens ?? 0, output: delta.output_tokens ?? 0 }, tracked);
+              if (delta.total_tokens > 0) {
+                const base = Math.max(ctx.lastInputAt ?? -Infinity, ctx.lastReplyAt ?? -Infinity), dur = Number.isFinite(base) ? (time - base) / 1000 : NaN;
+                const accepted = add(root.tool, ctx, r.timestamp, JSON.stringify([file, r.timestamp, current]), { requests: 1, freshInput: Math.max((delta.input_tokens ?? 0) - (delta.cached_input_tokens ?? 0) - (delta.cache_write_input_tokens ?? 0), 0), cacheRead: delta.cached_input_tokens ?? 0, cacheWrite: delta.cache_write_input_tokens ?? 0, output: delta.output_tokens ?? 0 }, tracked, { tier: ctx.tier, effort: ctx.effort, reasoning: delta.reasoning_output_tokens ?? 0, dur });
+                if (accepted) ctx.lastReplyAt = time;
+              }
             }
             ctx.previous = current;
           }

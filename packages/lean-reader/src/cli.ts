@@ -29,13 +29,13 @@ async function main() {
   }
   if (command === 'status') {
     const state = readState(path.join(stateDir, 'state.json'));
-    print({ filesTracked: Object.keys(state.files).length, pendingRows: Object.keys(state.pending).length, lastSend: state.lastSend, lastError: state.lastError, nextSend: state.nextSend ? new Date(state.nextSend).toISOString() : null, footprint: state.footprint }, true); return;
+    print({ filesTracked: Object.keys(state.files).length, pendingRows: Object.keys(state.pending).length, velocityRows: Object.keys(state.velocity ?? {}).length, pendingVelocityRows: Object.keys(state.velocityPending ?? {}).length, lastSend: state.lastSend, lastError: state.lastError, nextSend: state.nextSend ? new Date(state.nextSend).toISOString() : null, footprint: state.footprint }, true); return;
   }
   if (command === 'install' || command === 'uninstall') { install(home, fileURLToPath(import.meta.url), command === 'uninstall'); print({ status: command === 'install' ? 'installed' : 'uninstalled' }); return; }
-  if (!['run', 'backfill'].includes(command)) throw new Error('invalid_command');
-  if (command === 'backfill' && (!flags.has('--since') || !flags.has('--until'))) throw new Error('window_required');
-  const result = await runPass({ home, config, stateDir, command, since: flags.get('--since') as string | undefined, until: flags.get('--until') as string | undefined, dryRun: flags.has('--dry-run') ? true : undefined });
-  print(flags.has('--json') ? { run: result.stats, rows: result.rows, sessions: Object.values(result.state.sessions), seats: Object.values(result.state.seats) } : { ...result.stats, lastError: result.state.lastError });
+  if (['backfill', 'velocity-backfill'].includes(command) && (!flags.has('--since') || !flags.has('--until'))) throw new Error('window_required');
+  if (!['run', 'backfill', 'velocity-backfill'].includes(command)) throw new Error('invalid_command');
+  const result = await runPass({ home, config, stateDir, command, velocityOnly: command === 'velocity-backfill', since: flags.get('--since') as string | undefined, until: flags.get('--until') as string | undefined, dryRun: flags.has('--dry-run') ? true : undefined });
+  print(flags.has('--json') ? { run: result.stats, rows: result.rows, velocity: Object.values(result.state.velocity), sessions: Object.values(result.state.sessions), seats: Object.values(result.state.seats) } : { ...result.stats, lastError: result.state.lastError });
 }
 function isMain() {
   try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); }

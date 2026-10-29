@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import type { Config, State, Hour, Session, Seat } from './types.js';
+import type { Config, State, Hour, Session, Seat, Velocity } from './types.js';
 import { expand } from './reader.js';
 import { branchName, topRepositories } from './evidence.js';
 
@@ -10,36 +10,42 @@ const ROUTE = '/api/work-intelligence/lean/usage';
 const MAX_BODY = 1024 * 1024;
 // The collector's own config carries its capture roots too: 18.8 MB on one Mac.
 const MAX_CREDENTIALS = 64 * 1024 * 1024;
-type Body = { schema: string; tenantId: string; reader: { version: string; machineName: string }; sentAt: string; hours: Hour[]; sessions: Session[]; seats: Seat[] };
-type Batch = { body: Body; keys: string[] };
+type Body = { schema: string; tenantId: string; reader: { version: string; machineName: string }; sentAt: string; hours: Hour[]; sessions: Session[]; seats: Seat[]; velocity?: Velocity[] };
+type Batch = { body: Body; keys: string[]; velocityKeys: string[] };
 const wireFields = {
   hours: ['hour', 'tool', 'accountKey', 'model', 'sessionKey', 'projectHint', 'projectSource', 'requests', 'freshInput', 'cacheRead', 'cacheWrite', 'output'],
   sessions: ['tool', 'sessionKey', 'title', 'folderLabel', 'projectHint', 'firstSeen', 'lastSeen'],
   seats: ['tool', 'accountKey', 'plan', 'usedPercent', 'windowMinutes', 'resetsAt', 'creditsBalance', 'observedAt'],
+  velocity: ['hour', 'tool', 'accountKey', 'model', 'sessionKey', 'tier', 'effort', 'replies', 'freshInput', 'cacheRead', 'cacheWrite', 'output', 'reasoning', 'timed', 'sOut', 'sDur', 'sOutDur', 'sOut2', 'sDur2', 'hist', 'turns', 'turnMs', 'ttftMs', 'ttftN'],
 };
 
-export function makeBatches(state: State, tenantId: string, now: number, config: Config = {}): Batch[] {
+export function makeBatches(state: State, tenantId: string, now: number, config: Config = {}, velocityOnly = false): Batch[] {
   const result: Batch[] = [];
-  const empty = (): Batch => ({ body: { schema: 'plimsoll.lean.usage.v1', tenantId, reader: { version: '0.1.0', machineName: os.hostname().split('.')[0] }, sentAt: new Date(now).toISOString(), hours: [], sessions: [], seats: [] }, keys: [] });
+  const includeVelocity = velocityOnly || config.sendVelocity === true;
+  const empty = (): Batch => ({ body: { schema: 'plimsoll.lean.usage.v1', tenantId, reader: { version: '0.1.0', machineName: os.hostname().split('.')[0] }, sentAt: new Date(now).toISOString(), hours: [], sessions: [], seats: [] }, keys: [], velocityKeys: [] });
   let batch = empty(), bytes = Buffer.byteLength(JSON.stringify(batch.body));
-  const append = (kind: 'hours' | 'sessions' | 'seats', value: any, key?: string) => {
+  const append = (kind: 'hours' | 'sessions' | 'seats' | 'velocity', value: any, key?: string) => {
     const original = value;
     value = Object.fromEntries(wireFields[kind].map(field => [field, original[field]]));
     if (kind === 'sessions' && config.sendEvidence === true) {
       value.gitBranch = branchName(original.gitBranch);
       value.reposTouched = topRepositories(Array.isArray(original.reposTouched) ? original.reposTouched : []);
     }
-    const n = Buffer.byteLength(JSON.stringify(value)) + 1, limit = kind === 'hours' ? 2000 : kind === 'sessions' ? 500 : 50;
-    if (batch.body[kind].length >= limit || bytes + n > MAX_BODY) { result.push(batch); batch = empty(); bytes = Buffer.byteLength(JSON.stringify(batch.body)); }
+    if (kind === 'sessions') for (const field of ['parentSessionKey', 'entrypoint', 'actions'] as const) if (Object.hasOwn(original, field)) value[field] = original[field];
+    if (kind === 'velocity' && !batch.body.velocity) batch.body.velocity = [];
+    const n = Buffer.byteLength(JSON.stringify(value)) + 1, limit = kind === 'hours' || kind === 'velocity' ? 2000 : kind === 'sessions' ? 500 : 50;
+    const current = kind === 'velocity' ? (batch.body.velocity ?? []) : batch.body[kind];
+    if (current.length >= limit || bytes + n > MAX_BODY) { result.push(batch); batch = empty(); bytes = Buffer.byteLength(JSON.stringify(batch.body)); if (kind === 'velocity') batch.body.velocity = []; }
     if (bytes + n > MAX_BODY) throw new Error('row_too_large');
-    batch.body[kind].push(value); if (key) batch.keys.push(key); bytes += n;
+    batch.body[kind]!.push(value); if (key && kind === 'velocity') batch.velocityKeys.push(key); else if (key) batch.keys.push(key); bytes += n;
   };
-  for (const key of Object.keys(state.pending)) if (state.hours[key]) append('hours', state.hours[key], key);
-  if (state.metadataPending) {
+  if (!velocityOnly) for (const key of Object.keys(state.pending)) if (state.hours[key]) append('hours', state.hours[key], key);
+  if (!velocityOnly && state.metadataPending) {
     for (const session of Object.values(state.sessions)) append('sessions', session);
     for (const seat of Object.values(state.seats)) append('seats', seat);
   }
-  if (batch.body.hours.length || batch.body.sessions.length || batch.body.seats.length) result.push(batch);
+  if (includeVelocity) for (const key of Object.keys(state.velocityPending ?? {})) if (state.velocity[key]) append('velocity', state.velocity[key], key);
+  if (batch.body.hours.length || batch.body.sessions.length || batch.body.seats.length || batch.body.velocity?.length) result.push(batch);
   return result;
 }
 
@@ -77,8 +83,10 @@ function post(url: URL, body: string, key: string, secret: string, deadline: num
   });
 }
 
-export async function sendPending(state: State, config: Config, options: { home: string; now: number }): Promise<number> {
-  if ((!Object.keys(state.pending).length && !state.metadataPending) || options.now < state.nextSend) return 0;
+export async function sendPending(state: State, config: Config, options: { home: string; now: number; velocityOnly?: boolean }): Promise<number> {
+  const includeVelocity = options.velocityOnly === true || config.sendVelocity === true;
+  const hasPending = options.velocityOnly ? Object.keys(state.velocityPending ?? {}).length > 0 : Object.keys(state.pending).length > 0 || state.metadataPending || (includeVelocity && Object.keys(state.velocityPending ?? {}).length > 0);
+  if (!hasPending || options.now < state.nextSend) return 0;
   let sent = 0;
   try {
     // Deliberately read credentials only inside the send path. Dry runs,
@@ -88,14 +96,16 @@ export async function sendPending(state: State, config: Config, options: { home:
     const credentials = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!['uploadUrl', 'installKey', 'uploadSigningSecret', 'tenantId'].every(k => typeof credentials[k] === 'string' && credentials[k])) throw new Error('invalid_credentials');
     const url = endpoint(credentials.uploadUrl, config.endpoint), deadline = Date.now() + 30_000;
-    for (const batch of makeBatches(state, credentials.tenantId, options.now, config)) {
+    for (const batch of makeBatches(state, credentials.tenantId, options.now, config, options.velocityOnly === true)) {
       if (Date.now() >= deadline) throw new Error('upload_deadline');
       await post(url, JSON.stringify(batch.body), credentials.installKey, credentials.uploadSigningSecret, deadline);
       for (const key of batch.keys) delete state.pending[key];
-      sent += batch.body.hours.length;
+      for (const key of batch.velocityKeys) delete state.velocityPending[key];
+      sent += batch.body.hours.length + (batch.body.velocity?.length ?? 0);
       state.lastSend = new Date(options.now).toISOString();
     }
-    state.metadataPending = false; state.lastError = null; state.failures = 0; state.nextSend = 0;
+    if (!options.velocityOnly) state.metadataPending = false;
+    state.lastError = null; state.failures = 0; state.nextSend = 0;
   } catch (error) {
     const code = error instanceof Error ? error.message : '';
     // Never log filesystem paths, provider data, credentials or response text.

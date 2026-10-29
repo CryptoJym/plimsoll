@@ -18,6 +18,7 @@ export function readState(file: string): State {
     if (fs.statSync(file).size > MAX_STATE) throw new Error('state_capacity');
     const state = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (![1, 2].includes(state.version) || !state.files || !state.hours || !state.seen || !state.pending || !state.sessions || !state.seats) throw new Error('invalid_state');
+    state.velocity ??= {}; state.velocityPending ??= {};
     return state;
   } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState(); throw new Error('invalid_state'); }
 }
@@ -100,7 +101,7 @@ export async function runPass(options: Options = {}) {
     // Persist the outbox before attempting any network operation. Replaying an
     // accepted batch after a crash is safe because cloud rows replace totals.
     result.stats.stateBytes = saveState(file, result.state);
-    if (!(options.dryRun ?? config.dryRun)) result.stats.sent = await sendPending(result.state, config, { home, now });
+    if (!(options.dryRun ?? config.dryRun)) result.stats.sent = await sendPending(result.state, config, { home, now, velocityOnly: options.velocityOnly === true || options.command === 'velocity-backfill' });
     if (result.state.lastError) result.stats.errors++;
     result.stats.milliseconds = performance.now() - started; result.stats.peakMemoryBytes = peakMemory();
     result.state.footprint = { milliseconds: result.stats.milliseconds, peakMemoryBytes: result.stats.peakMemoryBytes, stateBytes: result.stats.stateBytes };
@@ -154,10 +155,13 @@ export function install(home: string, script: string, remove = false) {
 }
 export function loadConfig(file: string): Config {
   let input: Record<string, any>;
-  try { if (fs.statSync(file).size > 1024 * 1024) throw new Error(); input = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {}; throw new Error('invalid_config'); }
+  try { if (fs.statSync(file).size > 1024 * 1024) throw new Error(); input = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { sendVelocity: true }; throw new Error('invalid_config'); }
   const config: Config = {};
   for (const key of ['credentialsFrom', 'endpoint'] as const) if (typeof input[key] === 'string') config[key] = input[key];
-  for (const key of ['sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
+  for (const key of ['sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'sendVelocity', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
+  // Velocity is additive and enabled for every installed reader. An explicit
+  // false remains useful for a rollback or a local compatibility run.
+  config.sendVelocity ??= true;
   if (Array.isArray(input.roots)) config.roots = input.roots.filter((r: any) => typeof r === 'string' || (r && typeof r.path === 'string' && ['codex', 'claude_code', 'grok'].includes(r.tool))).slice(0, 256).map((r: any) => typeof r === 'string' ? r : { tool: r.tool, path: r.path });
   return config;
 }
