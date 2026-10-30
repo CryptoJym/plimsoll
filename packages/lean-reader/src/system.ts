@@ -5,8 +5,9 @@ import crypto from 'node:crypto';
 import { scan, emptyState } from './reader.js';
 import { sendPending } from './transport.js';
 import { peakMemory, type State, type Config, type Options } from './types.js';
-import { writeState } from './state-json.js';
+import { saveJson } from './state-json.js';
 import { discover } from './discovery.js';
+import { allowancePass } from './allowance.js';
 
 const MAX_STATE = 9 * 1024 * 1024;
 const execFileSync: typeof import('node:child_process').execFileSync = (...args: any[]): any => {
@@ -22,18 +23,7 @@ export function readState(file: string): State {
     return state;
   } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState(); throw new Error('invalid_state'); }
 }
-export function saveState(file: string, state: State): number {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
-  const fd = fs.openSync(temp, 'wx', 0o600);
-  let size = 0;
-  try {
-    try { size = writeState(fd, state, MAX_STATE); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    fs.renameSync(temp, file); const parent = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
-  }
-  finally { try { fs.unlinkSync(temp); } catch { /* Rename succeeded. */ } }
-  return size;
-}
+export const saveState = (file: string, state: State): number => saveJson(file, state, MAX_STATE);
 export function acquireLock(file: string): () => void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const token = crypto.randomBytes(16).toString('hex');
@@ -95,6 +85,11 @@ export async function runPass(options: Options = {}) {
   const dir = options.stateDir ?? stateDirectory(home), file = path.join(dir, 'state.json');
   const release = acquireLock(path.join(dir, 'reader.lock'));
   try {
+    // Allowance goes first and on its own: one small file, its own uploads and
+    // its own outbox, so a slow or failing usage pass never holds it up.
+    if (!options.velocityOnly && (options.command ?? 'run') === 'run') {
+      await allowancePass({ home, env: options.env ?? process.env, config, stateDir: dir, now, dryRun: (options.dryRun ?? config.dryRun) === true }).catch(() => 0);
+    }
     const state = options.state ?? readState(file);
     // Velocity replay has its own bounded traversal in scan(): it admits
     // immutable archived Codex .jsonl.zst sources. The ordinary async
@@ -162,7 +157,7 @@ export function loadConfig(file: string): Config {
   let input: Record<string, any>;
   try { if (fs.statSync(file).size > 1024 * 1024) throw new Error(); input = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { sendVelocity: true }; throw new Error('invalid_config'); }
   const config: Config = {};
-  for (const key of ['credentialsFrom', 'endpoint'] as const) if (typeof input[key] === 'string') config[key] = input[key];
+  for (const key of ['allowanceFile', 'credentialsFrom', 'endpoint'] as const) if (typeof input[key] === 'string') config[key] = input[key];
   for (const key of ['rootsOnly', 'sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'sendVelocity', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
   if (typeof input.velocityAccountMapFile === 'string' && input.velocityAccountMapFile.length <= 4096) config.velocityAccountMapFile = input.velocityAccountMapFile;
   // Velocity is additive and enabled for every installed reader. An explicit

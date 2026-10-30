@@ -55,7 +55,7 @@ function velocityAccountMap(home: string, config: Config): Map<string, string> |
     throw new Error('velocity_account_map_invalid');
   }
 }
-function directories(parent: string, prefix = ''): string[] {
+export function directories(parent: string, prefix = ''): string[] {
   try { return fs.readdirSync(parent).sort().filter(n => n.startsWith(prefix)).filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
 }
 export function roots(home: string, env: Record<string, string | undefined>, config: Config): { tool: Tool; path: string }[] {
