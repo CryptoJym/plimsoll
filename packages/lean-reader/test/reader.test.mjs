@@ -399,7 +399,7 @@ test('the collector LaunchAgent takes precedence over other Plimsoll agents', t 
 
 test('IDs read in a pass count at their packed size, so a pass fits when the state it saves does', t => {
   const home = fixture(t), n = 300_000;
-  // Held as a JSON map in flight these IDs alone would pass the 9 MiB ceiling; packed they take 16 bytes each.
+  // Held as a JSON map in flight these IDs alone would pass the 9 MiB ceiling; packed they take under 11 bytes each.
   const lines = [JSON.stringify(meta()), JSON.stringify(context)];
   for (let i = 0; i < n; i++) lines.push(JSON.stringify(usage('synthetic-' + i)));
   write(home, '.codex/sessions/2026/10/20/rollout-large.jsonl', lines.join('\n') + '\n');
@@ -407,7 +407,7 @@ test('IDs read in a pass count at their packed size, so a pass fits when the sta
   const result = reader.scan(options(home));
   assert.equal(totals(result.rows).requests, n);
   const bytes = reader.saveState(file, result.state);
-  assert.ok(bytes > n * 16 && bytes < 9 * 1024 * 1024, String(bytes));
+  assert.ok(bytes > n * 32 / 3 && bytes < 4 * 1024 * 1024, String(bytes));
   const again = reader.scan({ ...options(home), state: reader.readState(file) });
   assert.equal(totals(again.rows).requests, n, 'a backfill over the saved state neither fails nor recounts');
 });
@@ -615,7 +615,7 @@ test('evidence survives restart, backfill, partial lines, duplicate calls and en
   assert.equal(legacy.state.version, 1);
   assert.equal(legacy.state.seenPacked, undefined);
   let result = reader.scan({ ...evidenceOptions(home), backfill: false, state: JSON.parse(JSON.stringify(legacy.state)) });
-  assert.equal(result.state.version, 2);
+  assert.equal(result.state.version, 3);
   assert.deepEqual(session(result).reposTouched, [{ name: 'alpha', events: 1 }]);
   assert.equal(JSON.stringify(result.rows), before);
   result = reader.scan({ ...evidenceOptions(home), state: JSON.parse(JSON.stringify(result.state)) });
@@ -962,4 +962,26 @@ test('a collector config made large by its capture roots still supplies upload c
   assert.equal(await reader.sendPending(state, { credentialsFrom }, { home, now }), 1);
   assert.equal(state.lastError, null);
   assert.equal(bodies.length, 1);
+});
+
+test('a version 2 state narrows its 12-byte seen IDs to 8 bytes without counting a reply twice', t => {
+  const home = fixture(t), hour = Math.floor(Date.parse('2026-10-20T01:02:03Z') / 3600000);
+  const id = name => crypto.createHash('sha256').update('claude_code:' + JSON.stringify(name)).digest('hex').slice(0, 24);
+  write(home, '.claude/projects/x/a.jsonl', [claude('a')]);
+  const first = reader.scan({ ...options(home), backfill: false });
+  assert.equal(totals(first.rows).requests, 1);
+  // The version 2 layout: 12-byte prefixes, evidence IDs kept while evidence is off.
+  const legacy = JSON.parse(JSON.stringify(first.state));
+  legacy.version = 2;
+  legacy.seenPacked = { [hour]: Buffer.from(id('a'), 'hex').toString('base64') };
+  legacy.evidenceSeenPacked = { [hour]: Buffer.concat([id('x'), id('y')].sort().map(x => Buffer.from(x, 'hex'))).toString('base64') };
+  write(home, '.claude/projects/x/resumed.jsonl', [claude('a'), claude('b')]);
+  const result = reader.scan({ ...options(home), backfill: false, state: legacy });
+  assert.equal(totals(result.rows).requests, 2, 'the copied reply stays counted once');
+  assert.equal(result.state.version, 3);
+  assert.deepEqual(Buffer.from(result.state.seenPacked[hour], 'base64'), Buffer.concat([id('a'), id('b')].sort().map(x => Buffer.from(x, 'hex').subarray(0, 8))));
+  assert.deepEqual(Buffer.from(result.state.evidenceSeenPacked[hour], 'base64'), Buffer.concat([id('x'), id('y')].sort().map(x => Buffer.from(x, 'hex').subarray(0, 8))));
+  const saved = path.join(home, 'state.json');
+  fs.writeFileSync(saved, JSON.stringify(result.state));
+  assert.equal(reader.readState(saved).version, 3);
 });

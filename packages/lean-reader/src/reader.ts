@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { readLines } from './lines.js';
 import { Evidence, genericFolder, launchProject, protectedPath, topRepositories } from './evidence.js';
 import { stateBytes } from './state-json.js';
-import { Seen } from './seen.js';
+import { narrowPacked, Seen } from './seen.js';
 import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js';
 import { actionCounts, counts, fields, HOUR, WINDOW, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
 
@@ -263,6 +263,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const rebuildVelocity = velocityOnly || options.backfill === true;
   const stats: Stats = { files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 0, milliseconds: 0, peakMemoryBytes: 0, stateBytes: 0 };
   prune(state, cutoff);
+  narrowPacked(state);
   const seen = new Seen(state, 'seen', 'seenPacked', cutoff);
   const evidenceSeen = config.sendEvidence === true ? new Seen(state, 'evidenceSeen', 'evidenceSeenPacked', cutoff) : null;
   // Bound admission while scanning as well as at atomic save. A large source
@@ -556,7 +557,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     } else { delete session.gitBranch; delete session.reposTouched; }
   }
   seen.finish(); evidenceSeen?.finish();
-  state.version = 2;
+  state.version = 3;
   checkBudget();
   const rows = Object.values(state.hours).sort((a, b) => { const x = [a.hour, a.tool, a.sessionKey].join(':'), y = [b.hour, b.tool, b.sessionKey].join(':'); return x < y ? -1 : x > y ? 1 : 0; });
   stats.rows = rows.length; stats.milliseconds = performance.now() - started; stats.peakMemoryBytes = peakMemory();

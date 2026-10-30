@@ -17,7 +17,7 @@ export function readState(file: string): State {
   try {
     if (fs.statSync(file).size > MAX_STATE) throw new Error('state_capacity');
     const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (![1, 2].includes(state.version) || !state.files || !state.hours || !state.seen || !state.pending || !state.sessions || !state.seats) throw new Error('invalid_state');
+    if (![1, 2, 3].includes(state.version) || !state.files || !state.hours || !state.seen || !state.pending || !state.sessions || !state.seats) throw new Error('invalid_state');
     state.velocity ??= {}; state.velocityPending ??= {};
     return state;
   } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState(); throw new Error('invalid_state'); }
