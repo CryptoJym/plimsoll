@@ -96,7 +96,12 @@ export async function runPass(options: Options = {}) {
   const release = acquireLock(path.join(dir, 'reader.lock'));
   try {
     const state = options.state ?? readState(file);
-    const discovered = options.discovered ?? await discover({ ...options, home, now, config });
+    // Velocity replay has its own bounded traversal in scan(): it admits
+    // immutable archived Codex .jsonl.zst sources. The ordinary async
+    // discovery pass intentionally filters those files for the five-second
+    // incremental run, so do not replace the replay traversal with it.
+    const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
+    const discovered = options.discovered ?? (velocityOnly ? undefined : await discover({ ...options, home, now, config }));
     const result = scan({ ...options, home, now, config, state, discovered, backfill: options.command === 'backfill' || options.backfill });
     // Persist the outbox before attempting any network operation. Replaying an
     // accepted batch after a crash is safe because cloud rows replace totals.
@@ -159,6 +164,7 @@ export function loadConfig(file: string): Config {
   const config: Config = {};
   for (const key of ['credentialsFrom', 'endpoint'] as const) if (typeof input[key] === 'string') config[key] = input[key];
   for (const key of ['rootsOnly', 'sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'sendVelocity', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
+  if (typeof input.velocityAccountMapFile === 'string' && input.velocityAccountMapFile.length <= 4096) config.velocityAccountMapFile = input.velocityAccountMapFile;
   // Velocity is additive and enabled for every installed reader. An explicit
   // false remains useful for a rollback or a local compatibility run.
   config.sendVelocity ??= true;

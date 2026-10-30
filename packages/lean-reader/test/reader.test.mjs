@@ -135,6 +135,14 @@ test('rootsOnly confines a replay to its explicitly listed source', t => {
   assert.deepEqual(result, [{ tool: 'codex', path: fs.realpathSync(selected) }]);
 });
 
+test('velocity replay reuses the hours account key when a profile switched accounts', t => {
+  const home = fixture(t), map = path.join(home, 'velocity-account-map.json');
+  write(home, '.claude/projects/x/a.jsonl', [claude('one')]);
+  fs.writeFileSync(map, JSON.stringify({ ['claude_code\tsynthetic-model\tsynthetic-session\t2026-10-20T01:00:00.000Z']: 'historical-account' }));
+  const result = reader.scan({ ...options(home), velocityOnly: true, command: 'velocity-backfill', backfill: false, config: { velocityAccountMapFile: map } });
+  assert.equal(Object.values(result.state.velocity)[0].accountKey, 'historical-account');
+});
+
 test('project hints prefer newest launch tags; worktrees name the main repo; home repos remain unnamed', t => {
   const home = fixture(t);
   fs.mkdirSync(path.join(home, '.git'));
