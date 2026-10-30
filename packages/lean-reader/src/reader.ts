@@ -37,6 +37,24 @@ const actionKind = (name: unknown): ActionKind => {
   return 'other';
 };
 export const expand = (p: string, home: string) => p === '~' ? home : p.startsWith('~/') ? path.join(home, p.slice(2)) : path.resolve(p);
+function velocityAccountMap(home: string, config: Config): Map<string, string> | null {
+  if (!config.velocityAccountMapFile) return null;
+  try {
+    const file = expand(config.velocityAccountMapFile, home), stat = fs.statSync(file);
+    if (stat.size > 16 * 1024 * 1024) throw new Error('velocity_account_map_capacity');
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('velocity_account_map_invalid');
+    const result = new Map<string, string>();
+    for (const [key, account] of Object.entries(value)) {
+      if (result.size >= 200_000) break;
+      if (typeof account === 'string' && account.length <= 128) result.set(key, account);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof Error && (error.message === 'velocity_account_map_capacity' || error.message === 'velocity_account_map_invalid')) throw error;
+    throw new Error('velocity_account_map_invalid');
+  }
+}
 export function directories(parent: string, prefix = ''): string[] {
   try { return fs.readdirSync(parent).sort().filter(n => n.startsWith(prefix)).filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
 }
@@ -261,6 +279,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const inside = (hour: string) => Date.parse(hour) >= startHour && Date.parse(hour) < endHour;
   const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
   const rebuildVelocity = velocityOnly || options.backfill === true;
+  const accountMap = velocityOnly ? velocityAccountMap(home, config) : null;
   const stats: Stats = { files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 0, milliseconds: 0, peakMemoryBytes: 0, stateBytes: 0 };
   prune(state, cutoff);
   narrowPacked(state);
@@ -301,8 +320,15 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const addVelocity = (tool: Tool, ctx: Context, stamp: number, tokens: Counts, meta?: { tier?: string; effort?: string; reasoning?: number; dur?: number; turnMs?: number; ttftMs?: number }) => {
     if (!Number.isFinite(stamp) || stamp < startHour || stamp >= endHour || ctx.model === '<synthetic>') return;
     const hour = Math.floor(stamp / HOUR), tier = lower(meta?.tier ?? ctx.tier, tool === 'codex' ? 'standard' : 'unknown'), effort = lower(meta?.effort ?? ctx.effort);
-    const sessionKey = ctx.session || 'unknown', key = digest(JSON.stringify([tool, ctx.account, ctx.model || 'unknown', sessionKey, hour, tier, effort]));
-    const row = state.velocity[key] ??= { ...velocityCounts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: ctx.account, model: ctx.model || 'unknown', sessionKey, tier, effort };
+    const sessionKey = ctx.session || 'unknown', model = ctx.model || 'unknown';
+    // A historical replay must use the account key that the corresponding
+    // hours row used. Profiles can switch accounts after the hours row was
+    // written; using today's profile key would create a second, mismatched
+    // velocity key. The map is supplied only by the bounded replay job.
+    const mapKey = [tool, model, sessionKey, new Date(hour * HOUR).toISOString()].join('\t');
+    const account = accountMap?.get(mapKey) ?? ctx.account;
+    const key = digest(JSON.stringify([tool, account, model, sessionKey, hour, tier, effort]));
+    const row = state.velocity[key] ??= { ...velocityCounts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: account, model, sessionKey, tier, effort };
     row.tier = tier; row.effort = effort;
     row.replies = Math.min(Number.MAX_SAFE_INTEGER, row.replies + integer(tokens.requests));
     for (const k of ['freshInput', 'cacheRead', 'cacheWrite', 'output'] as const) row[k] = Math.min(Number.MAX_SAFE_INTEGER, row[k] + integer(tokens[k]));
@@ -314,6 +340,15 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     if (meta?.turnMs !== undefined) row.turns++; if (meta?.turnMs !== undefined) row.turnMs += integer(meta.turnMs);
     if (meta?.ttftMs !== undefined) { row.ttftN++; row.ttftMs += integer(meta.ttftMs); }
     state.velocityPending[key] = true; budgetTick();
+    // A prior replay may already have uploaded this same source under the
+    // current profile account. Replace that stale key with a zero row while
+    // writing the corrected historical account row above. This is still a
+    // velocity-only upload and keeps the additive table self-correcting.
+    if (accountMap && account !== ctx.account) {
+      const staleKey = digest(JSON.stringify([tool, ctx.account, model, sessionKey, hour, tier, effort]));
+      const stale = state.velocity[staleKey] ??= { ...velocityCounts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: ctx.account, model, sessionKey, tier, effort };
+      stale.tier = tier; stale.effort = effort; state.velocityPending[staleKey] = true; budgetTick();
+    }
   };
   const addSessionMetadata = (ctx: Context, summary: import('./types.js').Session) => {
     if (ctx.parentSessionKey !== undefined && summary.parentSessionKey !== ctx.parentSessionKey) { summary.parentSessionKey = ctx.parentSessionKey; state.metadataPending = true; }
@@ -378,7 +413,11 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       try { stat = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
       const compressed = file.endsWith('.jsonl.zst');
       const fileIdentity = `${stat.dev}:${stat.ino}`;
-      if (visitedFiles.has(fileIdentity) || stat.mtimeMs < startHour) continue;
+      // Velocity replay admits immutable archived rollouts whose filesystem
+      // mtime can predate the requested window; the record timestamps still
+      // enforce the window in the parser. Ordinary incremental scans retain
+      // the mtime filter that keeps their footprint bounded.
+      if (visitedFiles.has(fileIdentity) || (!velocityOnly && stat.mtimeMs < startHour)) continue;
       visitedFiles.add(fileIdentity);
       let tracked = state.files[file];
       const reset = !tracked || tracked.dev !== stat.dev || tracked.ino !== stat.ino ||

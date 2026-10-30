@@ -34,7 +34,7 @@ export type Outbox = {
   version: 1; pending: Record<string, AllowanceRow>; seen: Record<string, string>;
   lastSend: string | null; lastError: string | null; readError: string | null; failures: number; nextSend: number;
 };
-export type Config = { allowanceFile?: string; credentialsFrom?: string; endpoint?: string; roots?: (string | { tool: Tool; path: string })[]; rootsOnly?: boolean; sendSessionTitles?: boolean; sendFolderLabels?: boolean; sendEvidence?: boolean; sendVelocity?: boolean; dryRun?: boolean };
+export type Config = { allowanceFile?: string; credentialsFrom?: string; endpoint?: string; roots?: (string | { tool: Tool; path: string })[]; rootsOnly?: boolean; velocityAccountMapFile?: string; sendSessionTitles?: boolean; sendFolderLabels?: boolean; sendEvidence?: boolean; sendVelocity?: boolean; dryRun?: boolean };
 export type SourceFile = { file: string; stat: import('node:fs').Stats };
 export type Source = { tool: Tool; path: string; files?: SourceFile[] };
 export type Options = { home?: string; env?: Record<string, string | undefined>; config?: Config; state?: State; since?: string; until?: string; backfill?: boolean; velocityOnly?: boolean; now?: number; stateDir?: string; command?: string; dryRun?: boolean; discovered?: Source[] };
