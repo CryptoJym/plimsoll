@@ -128,6 +128,13 @@ test('all optional roots, environment roots and aliases are discovered once', t 
   assert.equal(totals(result.rows).requests, 10);
 });
 
+test('rootsOnly confines a replay to its explicitly listed source', t => {
+  const home = fixture(t), selected = path.join(home, 'selected', 'sessions');
+  fs.mkdirSync(selected, { recursive: true });
+  const result = reader.roots(home, { CLAUDE_CONFIG_DIR: home + '/other', CODEX_HOME: home + '/other-codex' }, { rootsOnly: true, roots: [{ tool: 'codex', path: selected }] });
+  assert.deepEqual(result, [{ tool: 'codex', path: fs.realpathSync(selected) }]);
+});
+
 test('project hints prefer newest launch tags; worktrees name the main repo; home repos remain unnamed', t => {
   const home = fixture(t);
   fs.mkdirSync(path.join(home, '.git'));

@@ -41,7 +41,7 @@ function directories(parent: string, prefix = ''): string[] {
   try { return fs.readdirSync(parent).sort().filter(n => n.startsWith(prefix)).filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
 }
 export function roots(home: string, env: Record<string, string | undefined>, config: Config): { tool: Tool; path: string }[] {
-  const result: { tool: Tool; path: string }[] = [
+  const result: { tool: Tool; path: string }[] = config.rootsOnly ? [] : [
     { tool: 'claude_code', path: path.join(home, '.claude/projects') },
     ...['.claude-seats', '.claude-accounts'].flatMap(parent => directories(path.join(home, parent)).map(n => ({ tool: 'claude_code' as const, path: path.join(home, parent, n, 'projects') }))),
     ...(env.CLAUDE_CONFIG_DIR ? [{ tool: 'claude_code' as const, path: path.join(env.CLAUDE_CONFIG_DIR, 'projects') }] : []),

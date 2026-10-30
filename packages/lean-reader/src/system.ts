@@ -158,7 +158,7 @@ export function loadConfig(file: string): Config {
   try { if (fs.statSync(file).size > 1024 * 1024) throw new Error(); input = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { sendVelocity: true }; throw new Error('invalid_config'); }
   const config: Config = {};
   for (const key of ['credentialsFrom', 'endpoint'] as const) if (typeof input[key] === 'string') config[key] = input[key];
-  for (const key of ['sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'sendVelocity', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
+  for (const key of ['rootsOnly', 'sendSessionTitles', 'sendFolderLabels', 'sendEvidence', 'sendVelocity', 'dryRun'] as const) if (typeof input[key] === 'boolean') config[key] = input[key];
   // Velocity is additive and enabled for every installed reader. An explicit
   // false remains useful for a rollback or a local compatibility run.
   config.sendVelocity ??= true;
