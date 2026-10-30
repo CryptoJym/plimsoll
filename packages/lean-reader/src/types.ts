@@ -16,7 +16,7 @@ export type Velocity = {
   turns: number; turnMs: number; ttftMs: number; ttftN: number;
 };
 export type State = {
-  version: 1 | 2; files: Record<string, FileState>; hours: Record<string, Hour>; velocity: Record<string, Velocity>; seen: Record<string, number>;
+  version: 1 | 2 | 3; files: Record<string, FileState>; hours: Record<string, Hour>; velocity: Record<string, Velocity>; seen: Record<string, number>;
   velocityPending: Record<string, boolean>;
   sessions: Record<string, Session>; seats: Record<string, Seat>; pending: Record<string, boolean>;
   evidence?: Record<string, { repos: RepoTouch[]; gitBranch: string | null; branchAt: number; lastSeen: number }>;

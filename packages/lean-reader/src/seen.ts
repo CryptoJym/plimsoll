@@ -1,10 +1,31 @@
 import type { State } from './types.js';
 
-const WIDTH = 12;
+// 8-byte SHA-256 prefixes since state version 3: a busy machine holds about
+// 400,000 IDs over the 8-day window, where a false match is near 1 in 10^9.
+// Version 2 stored 12 bytes and filled two thirds of the 9 MiB state budget.
+const WIDTH = 8, LEGACY_WIDTH = 12;
 // SHA-256 prefixes, sorted inside UTC-hour buckets. Old JSON ID maps still
 // read. Entire expired/backfilled hours can be removed without decoding IDs.
 // IDs added during a pass stay out of the state until finish() packs them, so
 // a pass is bounded by the size it will save, not by a JSON map in flight.
+
+/** Rewrites version 2's 12-byte buckets as 8-byte prefixes, once, for both ID
+ * sets whether or not evidence is enabled now. Prefixes of sorted IDs stay
+ * sorted. A reader older than version 3 refuses the narrowed state. */
+export function narrowPacked(state: State): void {
+  if (state.version === 3) return;
+  for (const field of ['seenPacked', 'evidenceSeenPacked'] as const) {
+    for (const [hour, packed] of Object.entries(state[field] ?? {})) {
+      const data = Buffer.from(packed, 'base64');
+      if (data.length % LEGACY_WIDTH) throw new Error('invalid_state');
+      const next = Buffer.allocUnsafe(data.length / LEGACY_WIDTH * WIDTH);
+      for (let at = 0, write = 0; at < data.length; at += LEGACY_WIDTH, write += WIDTH) data.copy(next, write, at, at + WIDTH);
+      state[field]![hour] = next.toString('base64');
+    }
+  }
+  state.version = 3;
+}
+
 export class Seen {
   private buckets: Record<string, string>;
   private decoded = new Map<string, Buffer>();
@@ -55,7 +76,7 @@ export class Seen {
       while (old < data.length || index < ids.length) {
         const key = index < ids.length ? Buffer.from(ids[index], 'hex') : null;
         if (old < data.length && (!key || data.compare(key, 0, WIDTH, old, old + WIDTH) < 0)) { data.copy(next, write, old, old + WIDTH); old += WIDTH; }
-        else { key!.copy(next, write); index++; }
+        else { key!.copy(next, write, 0, WIDTH); index++; }
         write += WIDTH;
       }
       this.buckets[hour] = next.toString('base64'); this.decoded.set(hour, next);
