@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 
 // State consists of plain JSON values. Stream its encoding so budget checks and
 // the two atomic saves do not each allocate another multi-megabyte state string.
@@ -37,4 +39,18 @@ export function writeState(fd: number, value: unknown, limit: number): number {
     if (length >= 32 * 1024) flush();
   });
   flush(); return size;
+}
+/** Atomic replace: a private temp file, fsynced, renamed over the target, then
+ * the folder fsynced. */
+export function saveJson(file: string, value: unknown, limit: number): number {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temp = `${file}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  const fd = fs.openSync(temp, 'wx', 0o600);
+  let size = 0;
+  try {
+    try { size = writeState(fd, value, limit); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(temp, file); const parent = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+  }
+  finally { try { fs.unlinkSync(temp); } catch { /* Rename succeeded. */ } }
+  return size;
 }

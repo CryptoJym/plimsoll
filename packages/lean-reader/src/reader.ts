@@ -37,7 +37,7 @@ const actionKind = (name: unknown): ActionKind => {
   return 'other';
 };
 export const expand = (p: string, home: string) => p === '~' ? home : p.startsWith('~/') ? path.join(home, p.slice(2)) : path.resolve(p);
-function directories(parent: string, prefix = ''): string[] {
+export function directories(parent: string, prefix = ''): string[] {
   try { return fs.readdirSync(parent).sort().filter(n => n.startsWith(prefix)).filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
 }
 export function roots(home: string, env: Record<string, string | undefined>, config: Config): { tool: Tool; path: string }[] {

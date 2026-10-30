@@ -36,6 +36,7 @@ node packages/lean-reader/dist/plimsoll-lean.mjs backfill \
 node packages/lean-reader/dist/plimsoll-lean.mjs run
 node packages/lean-reader/dist/plimsoll-lean.mjs status
 node packages/lean-reader/dist/plimsoll-lean.mjs print-config
+node packages/lean-reader/dist/plimsoll-lean.mjs allowance-keys
 ```
 
 `run` reads appended complete lines, updates totals, and attempts delivery once.
@@ -151,6 +152,22 @@ only when the source files provide them. Action names are projected into
 `edit`, `shell`, `read`, `search`, `web`, `browser`, `mcp`, `agent` and `other`
 counts; arguments and tool output are never retained.
 
+`allowanceFile` names the native usage meter's snapshot (on Studio0,
+`~/Library/Memory/ops/data/native-account-usage.json`). With it set, each `run`
+first queues every Claude and Codex allowance window's newest reading, at most
+one per window per UTC hour, and sends them in their own uploads as `allowance`
+rows: tool, hashed account key, bucket, slot, plan, model scope, window length,
+used and remaining percent, reset, reset precision, exhausted and account
+state. A Codex account is keyed by its provider account ID and a Claude account
+by the local profile whose email matches, the same keys hours and seats carry;
+an account with no key is skipped. Allowance keeps its own outbox,
+`allowance.json` beside the state, with its own backoff: a cloud that predates
+allowance refuses those uploads and usage uploads never wait on them. It runs
+even when the usage pass fails, never in a backfill or a dry-run send, and not
+at all without `allowanceFile`. `allowance-keys` prints each native account's
+provider, hashed key and whether hours or seats already carry it, never an email
+or ID.
+
 It never sends prompts, responses, instruction text, tool output, file contents,
 full working paths, raw account IDs, emails, provider credentials, or Git remotes.
 It does not calculate prices: unknown pricing stays unknown in the cloud.
@@ -178,6 +195,7 @@ The optional `~/.config/plimsoll-lean/config.json` contains:
   "sendFolderLabels": true,
   "sendEvidence": false,
   "sendVelocity": true,
+  "allowanceFile": "~/Library/Memory/ops/data/native-account-usage.json",
   "dryRun": false
 }
 ```
@@ -197,11 +215,12 @@ counted IDs prevent repeating usage. Partial lines remain at their starting byte
 until completed. One PID/token directory lock excludes concurrent runs and recovers dead
 owners. Source-read failures abort a pass before publishing incomplete totals.
 
-Deduplication IDs are stored as sorted binary prefixes grouped by UTC hour,
+Deduplication IDs are stored as sorted 8-byte binary prefixes grouped by UTC hour,
 encoded as base64 in JSON. IDs read during a pass are held in memory and count
 toward the state ceiling at that packed size, so a backfill over a busy Mac's
-existing state fits whenever the state it saves does. Existing v1 state upgrades to v2 without recounting
-usage in either upload mode. This local format is independent of `sendEvidence`.
+existing state fits whenever the state it saves does. Existing v1 state upgrades to v3 without recounting
+usage in either upload mode; v2 state, which stored 12-byte prefixes, is narrowed once on load. Readers
+before v3 refuse v3 state rather than misread it. This local format is independent of `sendEvidence`.
 Reader 75bb4bee refuses v2 state, so a rollback must use a separate state directory
 and backfill rather than reuse the compact state. State encoding streams
 in chunks, and discovery filters old files before sorting. These avoid expanding
