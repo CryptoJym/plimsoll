@@ -311,7 +311,9 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     // A velocity-only backfill replaces only the additive rows. Existing hour,
     // session, seat and dedup state is left untouched, while rows that vanish
     // from a corrected transcript are replaced by zero tombstones.
-    for (const row of Object.values(state.velocity)) if (inside(row.hour)) Object.assign(row, velocityCounts());
+    for (const [key, row] of Object.entries(state.velocity)) if (inside(row.hour)) {
+      Object.assign(row, velocityCounts()); state.velocityPending[key] = true;
+    }
   }
   // A normal/backfill scan must retain the established hour deduplication
   // index. Velocity-only replay gets its own in-pass index because it is
