@@ -17,6 +17,7 @@ export const accountKey = (id: unknown): string => typeof id === 'string' && id 
 export const emptyState = (): State => ({ version: 1, files: {}, hours: {}, velocity: {}, velocityPending: {}, seen: {}, sessions: {}, seats: {}, pending: {}, metadataPending: false, lastSend: null, lastError: null, failures: 0, nextSend: 0, footprint: null });
 const context = (account = 'unknown'): Context => ({ model: 'unknown', cwd: '', session: '', account, title: null, records: false, tier: 'standard', effort: 'unknown' });
 const velocityCounts = (): Omit<Velocity, 'hour' | 'tool' | 'accountKey' | 'model' | 'sessionKey' | 'tier' | 'effort'> => ({ replies: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, timed: 0, sOut: 0, sDur: 0, sOutDur: 0, sOut2: 0, sDur2: 0, hist: Array(16).fill(0), turns: 0, turnMs: 0, ttftMs: 0, ttftN: 0 });
+const velocityFields = ['replies', 'freshInput', 'cacheRead', 'cacheWrite', 'output', 'reasoning', 'timed', 'sOut', 'sDur', 'sOutDur', 'sOut2', 'sDur2', 'turns', 'turnMs', 'ttftMs', 'ttftN'] as const;
 const lower = (value: unknown, fallback = 'unknown') => typeof value === 'string' && value.trim() ? value.trim().toLowerCase().slice(0, 40) : fallback;
 const codexTier = (value: unknown) => value === undefined || value === null ? 'standard' : lower(value);
 const histBucket = (rate: number) => {
@@ -256,6 +257,7 @@ function prune(state: State, cutoff: number) {
   for (const [key, evidence] of Object.entries(state.evidence ?? {})) if (evidence.lastSeen < cutoff && !state.metadataPending) delete state.evidence![key];
   for (const [file, tracked] of Object.entries(state.files)) {
     for (const key of Object.keys(tracked.fallback)) if (!state.hours[key]) delete tracked.fallback[key];
+    for (const key of Object.keys(tracked.velocityFallback ?? {})) if (!state.velocity[key]) delete tracked.velocityFallback![key];
     if (tracked.mtime < cutoff && !Object.keys(tracked.fallback).some(k => state.pending[k])) delete state.files[file];
   }
   if (!state.metadataPending) {
@@ -265,6 +267,9 @@ function prune(state: State, cutoff: number) {
 }
 
 export function scan(options: Options = {}): { state: State; rows: Hour[]; stats: Stats } {
+  return scanSource(options);
+}
+function scanSource(options: Options, prefix?: { file: string; end: number }): { state: State; rows: Hour[]; stats: Stats } {
   const started = performance.now(), home = options.home ?? os.homedir(), now = options.now ?? Date.now();
   const config = options.config ?? {}, retainedState = options.state ?? emptyState();
   const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
@@ -306,6 +311,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     for (const [key, row] of Object.entries(state.hours)) if (inside(row.hour)) { Object.assign(row, counts()); state.pending[key] = true; }
     seen.remove(hour => hour * HOUR >= startHour && hour * HOUR < endHour);
     for (const file of Object.values(state.files)) for (const key of Object.keys(file.fallback)) if (state.hours[key] && inside(state.hours[key].hour)) delete file.fallback[key];
+    for (const file of Object.values(state.files)) for (const [key, row] of Object.entries(file.velocityFallback ?? {})) if (inside(row.hour)) delete file.velocityFallback![key];
   }
   if (rebuildVelocity) {
     // A velocity-only backfill replaces only the additive rows. Existing hour,
@@ -327,7 +333,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     const session = tool && ctx.session ? state.sessions[digest(tool + ':' + ctx.session)] : undefined;
     if (session) { if (!session.actions) session.actions = actionCounts(); session.actions[kind]++; state.metadataPending = true; }
   };
-  const addVelocity = (tool: Tool, ctx: Context, stamp: number, tokens: Counts, meta?: { tier?: string; effort?: string; reasoning?: number; dur?: number; turnMs?: number; ttftMs?: number }) => {
+  const addVelocity = (tool: Tool, ctx: Context, stamp: number, tokens: Counts, meta?: { tier?: string; effort?: string; reasoning?: number; dur?: number; turnMs?: number; ttftMs?: number }, fallback?: FileState) => {
     if (!Number.isFinite(stamp) || stamp < startHour || stamp >= endHour || ctx.model === '<synthetic>') return;
     const hour = Math.floor(stamp / HOUR), tier = lower(meta?.tier ?? ctx.tier, tool === 'codex' ? 'standard' : 'unknown'), effort = lower(meta?.effort ?? ctx.effort);
     const sessionKey = ctx.session || 'unknown', model = ctx.model || 'unknown';
@@ -339,6 +345,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     const account = accountMap?.get(mapKey) ?? ctx.account;
     const key = digest(JSON.stringify([tool, account, model, sessionKey, hour, tier, effort]));
     const row = state.velocity[key] ??= { ...velocityCounts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: account, model, sessionKey, tier, effort };
+    const before = fallback ? { ...row, hist: [...row.hist] } : null;
     row.tier = tier; row.effort = effort;
     row.replies = Math.min(Number.MAX_SAFE_INTEGER, row.replies + integer(tokens.requests));
     for (const k of ['freshInput', 'cacheRead', 'cacheWrite', 'output'] as const) row[k] = Math.min(Number.MAX_SAFE_INTEGER, row[k] + integer(tokens[k]));
@@ -349,6 +356,12 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
     }
     if (meta?.turnMs !== undefined) row.turns++; if (meta?.turnMs !== undefined) row.turnMs += integer(meta.turnMs);
     if (meta?.ttftMs !== undefined) { row.ttftN++; row.ttftMs += integer(meta.ttftMs); }
+    if (fallback && before) {
+      if (!fallback.velocityFallback) { fallback.velocityFallback = {}; fallback.fallbackLastReplyAt = ctx.lastReplyAt; }
+      const own = fallback.velocityFallback[key] ??= { ...row, ...velocityCounts() };
+      for (const field of velocityFields) own[field] += row[field] - before[field];
+      for (let i = 0; i < row.hist.length; i++) own.hist[i] += row.hist[i] - before.hist[i];
+    }
     state.velocityPending[key] = true; budgetTick();
     // A prior replay may already have uploaded this same source under the
     // current profile account. Replace that stale key with a zero row while
@@ -394,7 +407,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       addSessionMetadata(ctx, summary);
       state.metadataPending = true;
     }
-    addVelocity(tool, ctx, time, tokens, meta);
+    addVelocity(tool, ctx, time, tokens, meta, file && !ctx.records ? file : undefined);
     return true;
   };
   const discoveredSources = options.discovered ?? roots(home, options.env ?? process.env, config);
@@ -432,6 +445,16 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       let tracked = state.files[file];
       const reset = !tracked || tracked.dev !== stat.dev || tracked.ino !== stat.ino ||
         (compressed ? stat.size !== tracked.size || stat.mtimeMs !== tracked.mtime : stat.size < tracked.size || stat.size < tracked.offset);
+      // Older saved states have hour fallback totals but no velocity ledger.
+      // Reconstruct that ledger once from the already-consumed prefix, never
+      // from appended replies. This is local parsing with no upload or save.
+      if (!velocityOnly && tracked && !reset && !options.backfill && !tracked.context.records && !tracked.velocityFallback && Object.keys(tracked.fallback).length) {
+        let earliest = startHour;
+        for (const key of Object.keys(tracked.fallback)) earliest = Math.min(earliest, state.hours[key] ? Date.parse(state.hours[key].hour) : startHour);
+        const recovered = scanSource({ ...options, state: emptyState(), config: { ...config, sendEvidence: false }, since: new Date(earliest).toISOString(), discovered: [{ tool: root.tool, path: root.path, files: [{ file, stat }] }] }, { file, end: tracked.offset });
+        tracked.velocityFallback = recovered.state.files[file]?.velocityFallback ?? {};
+        tracked.fallbackLastReplyAt = recovered.state.files[file]?.fallbackLastReplyAt;
+      }
       if (!tracked) { tracked = state.files[file] = { dev: stat.dev, ino: stat.ino, size: stat.size, offset: 0, mtime: stat.mtimeMs, context: context(getAccount()), fallback: {} }; budgetTick(); }
       if (reset || (options.backfill && !velocityOnly) || velocityOnly) { const records = tracked.context.records && !options.backfill && !velocityOnly; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
       const ctx = tracked.context;
@@ -464,6 +487,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
       if (compressed && !velocityOnly && tracked.offset > 0 && !reset && stat.size === tracked.size && stat.mtimeMs === tracked.mtime) { remember(tracked.mtime); continue; }
       let sourcePath = file, sourceSize = stat.size, cleanup = () => {};
       if (compressed) { const decoded = materializeZstd(file); sourcePath = decoded.path; sourceSize = decoded.size; cleanup = decoded.cleanup; }
+      if (prefix?.file === file) sourceSize = Math.min(sourceSize, prefix.end);
       try {
         if (evidence && root.tool !== 'grok' && !reset && tracked.evidenceOffset !== tracked.offset) {
           evidenceContext = { cwd: '', session: '' };
@@ -539,6 +563,16 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
                 const row = state.hours[key];
                 if (row) { for (const k of fields) row[k] = Math.max(0, row[k] - previous[k]); state.pending[key] = true; }
               }
+              for (const [key, previous] of Object.entries(tracked!.velocityFallback ?? {})) {
+                const row = state.velocity[key];
+                if (row) {
+                  for (const field of velocityFields) row[field] = Math.max(0, row[field] - previous[field]);
+                  for (let i = 0; i < row.hist.length; i++) row.hist[i] = Math.max(0, row.hist[i] - previous.hist[i]);
+                  state.velocityPending[key] = true;
+                }
+              }
+              if (tracked!.velocityFallback) ctx.lastReplyAt = tracked!.fallbackLastReplyAt;
+              delete tracked!.velocityFallback; delete tracked!.fallbackLastReplyAt;
               tracked!.fallback = {};
             }
             const u = p.usage ?? {}, cached = integer(u.cached_input_tokens), written = integer(u.cache_write_input_tokens);

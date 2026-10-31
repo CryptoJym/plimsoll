@@ -8,7 +8,7 @@ export type Session = { tool: Tool; sessionKey: string; title: string | null; fo
 export type EvidenceContext = { cwd: string; session: string; gitBranch?: string | null; time?: number };
 export type Seat = { tool: Tool; accountKey: string; plan: string | null; usedPercent: number | null; windowMinutes: number | null; resetsAt: string | null; creditsBalance: string | null; observedAt: string };
 export type Context = { model: string; cwd: string; session: string; account: string; title: string | null; previous?: Record<string, number>; records: boolean; tier?: string; effort?: string; lastInputAt?: number; lastReplyAt?: number; parentSessionKey?: string | null; entrypoint?: string | null; actions?: Actions };
-export type FileState = { dev: number; ino: number; size: number; offset: number; mtime: number; context: Context; fallback: Record<string, Counts>; evidenceOffset?: number; evidenceContext?: EvidenceContext };
+export type FileState = { dev: number; ino: number; size: number; offset: number; mtime: number; context: Context; fallback: Record<string, Counts>; velocityFallback?: Record<string, Velocity>; fallbackLastReplyAt?: number; evidenceOffset?: number; evidenceContext?: EvidenceContext };
 export type Velocity = {
   hour: string; tool: Tool; accountKey: string; model: string; sessionKey: string; tier: string; effort: string;
   replies: number; freshInput: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number;
