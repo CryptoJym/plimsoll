@@ -266,7 +266,11 @@ function prune(state: State, cutoff: number) {
 
 export function scan(options: Options = {}): { state: State; rows: Hour[]; stats: Stats } {
   const started = performance.now(), home = options.home ?? os.homedir(), now = options.now ?? Date.now();
-  const config = options.config ?? {}, state = options.state ?? emptyState();
+  const config = options.config ?? {}, retainedState = options.state ?? emptyState();
+  const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
+  // Replay owns temporary cursors and metadata. Only its velocity outbox may
+  // flow back into the normal reader's state, including for newly found files.
+  const state = velocityOnly ? { ...emptyState(), velocity: retainedState.velocity ?? {}, velocityPending: retainedState.velocityPending ?? {} } : retainedState;
   // States written by the pre-velocity reader remain valid and gain only the
   // additive velocity outbox when this bundle first opens them.
   state.velocity ??= {};
@@ -277,19 +281,23 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   if (!Number.isFinite(since) || !Number.isFinite(until) || since >= until) throw new Error('invalid_window');
   const startHour = Math.floor(since / HOUR) * HOUR, endHour = Math.ceil(until / HOUR) * HOUR;
   const inside = (hour: string) => Date.parse(hour) >= startHour && Date.parse(hour) < endHour;
-  const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
   const rebuildVelocity = velocityOnly || options.backfill === true;
   const accountMap = velocityOnly ? velocityAccountMap(home, config) : null;
   const stats: Stats = { files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 0, milliseconds: 0, peakMemoryBytes: 0, stateBytes: 0 };
   prune(state, cutoff);
   narrowPacked(state);
+  if (velocityOnly) narrowPacked(retainedState);
   const seen = new Seen(state, 'seen', 'seenPacked', cutoff);
-  const evidenceSeen = config.sendEvidence === true ? new Seen(state, 'evidenceSeen', 'evidenceSeenPacked', cutoff) : null;
+  const evidenceSeen = !velocityOnly && config.sendEvidence === true ? new Seen(state, 'evidenceSeen', 'evidenceSeenPacked', cutoff) : null;
   // Bound admission while scanning as well as at atomic save. A large source
   // must stop before its ID/metadata maps can exhaust memory. Sampling avoids
   // serializing state for every reply; the writer enforces the exact ceiling.
   // IDs added this pass count at the packed size they will be saved at.
-  const checkBudget = () => { stateBytes(state, 9 * 1024 * 1024 - seen.pendingBytes - (evidenceSeen?.pendingBytes ?? 0)); };
+  const checkBudget = () => {
+    const limit = 9 * 1024 * 1024 - seen.pendingBytes - (evidenceSeen?.pendingBytes ?? 0);
+    stateBytes(state, limit);
+    if (velocityOnly) stateBytes({ ...retainedState, velocity: state.velocity, velocityPending: state.velocityPending }, limit);
+  };
   let admissions = 0;
   const budgetTick = () => { if (++admissions % 256 === 0) checkBudget(); };
   if (options.backfill && !velocityOnly) {
@@ -598,7 +606,8 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   seen.finish(); evidenceSeen?.finish();
   state.version = 3;
   checkBudget();
-  const rows = Object.values(state.hours).sort((a, b) => { const x = [a.hour, a.tool, a.sessionKey].join(':'), y = [b.hour, b.tool, b.sessionKey].join(':'); return x < y ? -1 : x > y ? 1 : 0; });
+  const resultState = velocityOnly ? Object.assign(retainedState, { velocity: state.velocity, velocityPending: state.velocityPending }) : state;
+  const rows = Object.values(resultState.hours).sort((a, b) => { const x = [a.hour, a.tool, a.sessionKey].join(':'), y = [b.hour, b.tool, b.sessionKey].join(':'); return x < y ? -1 : x > y ? 1 : 0; });
   stats.rows = rows.length; stats.milliseconds = performance.now() - started; stats.peakMemoryBytes = peakMemory();
-  return { state, rows, stats };
+  return { state: resultState, rows, stats };
 }
