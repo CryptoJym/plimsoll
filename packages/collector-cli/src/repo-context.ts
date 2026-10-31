@@ -17,7 +17,9 @@ const REPO_CONTEXT_ID = /^repoctx:v1:[0-9a-f]{64}$/;
 const LINKAGE_HASH = /^sha256:[0-9a-f]{64}$/;
 const HEAD_SHA = /^[0-9a-f]{40}$/;
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/;
-export const REPO_CONTEXT_RESOLVER_VERSION = "git-context:v1";
+// Capture policy only: never invalidate retained resolution results or history.
+export const REPO_CONTEXT_CAPTURE_POLICY_GENERATION = 3;
+export const REPO_CONTEXT_RESOLVER_VERSION = `git-context:v1:capture-policy:${REPO_CONTEXT_CAPTURE_POLICY_GENERATION}`;
 
 const CWD_KEYS = new Set([
   "cwd",

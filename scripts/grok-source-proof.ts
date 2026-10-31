@@ -30,6 +30,7 @@ import {
 } from "../packages/collector-cli/src/local-auth";
 import { discoverGrokSessionSummaries } from "../packages/collector-cli/src/grok-session-discovery";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { REPO_CONTEXT_CAPTURE_POLICY_GENERATION } from "../packages/collector-cli/src/repo-context";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import * as collectorHomeModule from "../packages/collector-cli/src/collector-home";
 import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
@@ -43,6 +44,10 @@ import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { toolSourceSchema } from "../packages/shared/src/index";
 
 type Check = { name: string; passed: true; detail: Record<string, unknown> };
+type GrokDoctorReceipt = {
+  grokHookCommand?: { code?: string; reason?: string };
+  readiness?: string;
+};
 const checks: Check[] = [];
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const cli = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
@@ -353,7 +358,7 @@ exec /usr/bin/curl "$@"
       if (!result.stdout.trim()) {
         throw new Error(`grok doctor empty stdout name=${fixture.name} status=${result.status} stderr=${result.stderr}`);
       }
-      const receipt = JSON.parse(result.stdout) as Record<string, any>;
+      const receipt = JSON.parse(result.stdout) as GrokDoctorReceipt;
       unresolvableGrokResults.push({
         name: fixture.name,
         exitCode: result.status,
@@ -432,7 +437,7 @@ exec /usr/bin/curl "$@"
           PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "200",
         },
       );
-      const receipt = JSON.parse(result.stdout) as Record<string, any>;
+      const receipt = JSON.parse(result.stdout) as GrokDoctorReceipt;
       unresolvableHeaderResults.push({
         name: fixture.name,
         exitCode: result.status,
@@ -912,6 +917,7 @@ exec /usr/bin/curl "$@"
         "permissionMode",
         "projectKey",
         "promptId",
+        "repoContextPolicyGeneration",
         "sessionId",
         "stopHookActive",
         "toolInputTruncated",
@@ -950,9 +956,11 @@ exec /usr/bin/curl "$@"
           stored.sessionId === payload.sessionId &&
           !String(stored.payloadJson).includes(contentSentinel) &&
           !String(stored.payloadJson).includes(String(auth.grokProducer)) &&
+          storedPayload?.metadata?.repoContextPolicyGeneration === REPO_CONTEXT_CAPTURE_POLICY_GENERATION &&
           upload.uploadedEvents === 1 && uploadBodies.length === 1 &&
           uploadBodies.every((body) =>
-            !body.includes(contentSentinel) && !body.includes(String(auth.grokProducer))) &&
+            !body.includes(contentSentinel) && !body.includes(String(auth.grokProducer)) &&
+            !body.includes("repoContextPolicyGeneration")) &&
           JSON.stringify(admittedMetadataKeys) === JSON.stringify(expectedMetadataKeys),
         {
           statusCode: response.statusCode,
