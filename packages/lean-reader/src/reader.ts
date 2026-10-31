@@ -363,7 +363,7 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
   const addSessionMetadata = (ctx: Context, summary: import('./types.js').Session) => {
     if (ctx.parentSessionKey !== undefined && summary.parentSessionKey !== ctx.parentSessionKey) { summary.parentSessionKey = ctx.parentSessionKey; state.metadataPending = true; }
     if (ctx.entrypoint !== undefined && summary.entrypoint !== ctx.entrypoint) { summary.entrypoint = ctx.entrypoint; state.metadataPending = true; }
-    if (ctx.actions && JSON.stringify(summary.actions ?? null) !== JSON.stringify(ctx.actions)) { summary.actions = { ...ctx.actions }; state.metadataPending = true; }
+    if (summary.tool !== 'claude_code' && ctx.actions && JSON.stringify(summary.actions ?? null) !== JSON.stringify(ctx.actions)) { summary.actions = { ...ctx.actions }; state.metadataPending = true; }
   };
   const add = (tool: Tool, ctx: Context, stamp: unknown, id: string | null, tokens: Counts, file?: FileState, meta?: { tier?: string; effort?: string; reasoning?: number; dur?: number }) => {
     const time = typeof stamp === 'string' ? Date.parse(stamp) : NaN;
@@ -497,11 +497,16 @@ export function scan(options: Options = {}): { state: State; rows: Hour[]; stats
             if (r.type !== 'assistant' || !r.timestamp || !r.message?.usage) return;
             const msg = r.message, usage = msg.usage;
             ctx.model = string(msg.model) || 'unknown'; ctx.cwd = string(r.cwd, 4096); ctx.session = string(r.sessionId);
-            for (const part of Array.isArray(msg.content) ? msg.content : []) if (part && typeof part === 'object' && part.type === 'tool_use') markAction(ctx, part.name, root.tool);
             const tier = lower(usage.service_tier), effort = lower(r.effort ?? r.perTurnEffort), reasoning = integer(usage.output_tokens_details?.thinking_tokens);
             const time = Date.parse(r.timestamp), base = Math.max(ctx.lastInputAt ?? -Infinity, ctx.lastReplyAt ?? -Infinity), dur = Number.isFinite(base) ? (time - base) / 1000 : NaN;
             const accepted = add(root.tool, ctx, r.timestamp, JSON.stringify(msg.id || r.requestId || r.uuid || null), { requests: 1, freshInput: integer(usage.input_tokens), cacheRead: integer(usage.cache_read_input_tokens), cacheWrite: integer(usage.cache_creation_input_tokens), output: integer(usage.output_tokens) }, undefined, { tier, effort, reasoning, dur });
-            if (accepted) ctx.lastReplyAt = time;
+            if (accepted) {
+              ctx.lastReplyAt = time;
+              // Claude message identity gates its actions as well as tokens.
+              // The session count spans files; a resumed file's context must
+              // not replace it with that file's smaller action count.
+              for (const part of Array.isArray(msg.content) ? msg.content : []) if (part && typeof part === 'object' && part.type === 'tool_use') markAction(ctx, part.name, root.tool);
+            }
             return;
           }
           const p = r.payload ?? {};
