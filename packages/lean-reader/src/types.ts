@@ -1,0 +1,50 @@
+export type Tool = 'claude_code' | 'codex' | 'grok';
+export type Counts = { requests: number; freshInput: number; cacheRead: number; cacheWrite: number; output: number };
+export type Hour = Counts & { hour: string; tool: Tool; accountKey: string; model: string; sessionKey: string; projectHint: string | null; projectSource: 'launch_tag' | 'git_repo' | 'none' };
+export type RepoTouch = { name: string; events: number };
+export type ActionKind = 'edit' | 'shell' | 'read' | 'search' | 'web' | 'browser' | 'mcp' | 'agent' | 'other';
+export type Actions = Record<ActionKind, number>;
+export type Session = { tool: Tool; sessionKey: string; title: string | null; folderLabel: string | null; projectHint: string | null; firstSeen: string; lastSeen: string; gitBranch?: string | null; reposTouched?: RepoTouch[]; parentSessionKey?: string | null; entrypoint?: string | null; actions?: Actions | null };
+export type EvidenceContext = { cwd: string; session: string; gitBranch?: string | null; time?: number };
+export type Seat = { tool: Tool; accountKey: string; plan: string | null; usedPercent: number | null; windowMinutes: number | null; resetsAt: string | null; creditsBalance: string | null; observedAt: string };
+export type Context = { model: string; cwd: string; session: string; account: string; title: string | null; previous?: Record<string, number>; records: boolean; tier?: string; effort?: string; lastInputAt?: number; lastReplyAt?: number; parentSessionKey?: string | null; entrypoint?: string | null; actions?: Actions };
+export type FileState = { dev: number; ino: number; size: number; offset: number; mtime: number; context: Context; fallback: Record<string, Counts>; velocityFallback?: Record<string, Velocity>; fallbackLastReplyAt?: number; evidenceOffset?: number; evidenceContext?: EvidenceContext };
+export type Velocity = {
+  hour: string; tool: Tool; accountKey: string; model: string; sessionKey: string; tier: string; effort: string;
+  replies: number; freshInput: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number;
+  timed: number; sOut: number; sDur: number; sOutDur: number; sOut2: number; sDur2: number; hist: number[];
+  turns: number; turnMs: number; ttftMs: number; ttftN: number;
+};
+export type State = {
+  version: 1 | 2 | 3; files: Record<string, FileState>; hours: Record<string, Hour>; velocity: Record<string, Velocity>; seen: Record<string, number>;
+  velocityPending: Record<string, boolean>;
+  velocityReplays?: Record<string, { dev: number; ino: number; windows: { start: number; end: number; offset: number }[] }>;
+  sessions: Record<string, Session>; seats: Record<string, Seat>; pending: Record<string, boolean>;
+  evidence?: Record<string, { repos: RepoTouch[]; gitBranch: string | null; branchAt: number; lastSeen: number }>;
+  evidenceSeen?: Record<string, number>;
+  seenPacked?: Record<string, string>; evidenceSeenPacked?: Record<string, string>;
+  metadataPending: boolean; lastSend: string | null; lastError: string | null; failures: number; nextSend: number;
+  footprint: { milliseconds: number; peakMemoryBytes: number; stateBytes: number } | null;
+};
+export type AllowanceRow = {
+  tool: 'claude_code' | 'codex'; accountKey: string; bucket: string; slot: string; plan: string | null; modelScope: string | null;
+  windowSeconds: number | null; usedPercent: number | null; remainingPercent: number | null; resetsAt: string | null;
+  resetPrecision: string | null; exhausted: boolean; accountState: string | null; observedAt: string;
+};
+export type Outbox = {
+  version: 1; pending: Record<string, AllowanceRow>; seen: Record<string, string>;
+  lastSend: string | null; lastError: string | null; readError: string | null; failures: number; nextSend: number;
+};
+export type Config = { allowanceFile?: string; credentialsFrom?: string; endpoint?: string; roots?: (string | { tool: Tool; path: string })[]; rootsOnly?: boolean; velocityAccountMapFile?: string; sendSessionTitles?: boolean; sendFolderLabels?: boolean; sendEvidence?: boolean; sendVelocity?: boolean; dryRun?: boolean };
+export type SourceFile = { file: string; stat: import('node:fs').Stats };
+export type Source = { tool: Tool; path: string; files?: SourceFile[] };
+export type Options = { home?: string; env?: Record<string, string | undefined>; config?: Config; state?: State; since?: string; until?: string; backfill?: boolean; velocityOnly?: boolean; now?: number; stateDir?: string; command?: string; dryRun?: boolean; discovered?: Source[] };
+export type Stats = { files: number; bytesRead: number; rows: number; sent: number; errors: number; milliseconds: number; peakMemoryBytes: number; stateBytes: number };
+export const HOUR = 3_600_000;
+export const WINDOW = 8 * 24 * HOUR;
+export const counts = (): Counts => ({ requests: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
+export const actionCounts = (): Actions => ({ edit: 0, shell: 0, read: 0, search: 0, web: 0, browser: 0, mcp: 0, agent: 0, other: 0 });
+export const fields = ['requests', 'freshInput', 'cacheRead', 'cacheWrite', 'output'] as const;
+export const string = (x: unknown, max = 512): string => typeof x === 'string' ? x.slice(0, max) : '';
+export const integer = (x: unknown): number => typeof x === 'number' && Number.isFinite(x) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(x))) : 0;
+export const peakMemory = (): number => process.resourceUsage().maxRSS * 1024;
