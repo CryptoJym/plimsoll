@@ -33,7 +33,9 @@ async function main() {
   const allowanceStatus = () => {
     const outbox = readOutbox(outboxFile(stateDir));
     return { pendingRows: Object.keys(outbox.pending).length, windows: Object.keys(outbox.seen).length, lastSend: outbox.lastSend, lastError: outbox.lastError,
-      readError: outbox.readError, nextSend: outbox.nextSend ? new Date(outbox.nextSend).toISOString() : null };
+      readError: outbox.readError, nextSend: outbox.nextSend ? new Date(outbox.nextSend).toISOString() : null,
+      accountStatus: { pendingRows: Object.keys(outbox.status.pending).length, accounts: Object.keys(outbox.status.seen).length, lastSend: outbox.status.lastSend,
+        lastError: outbox.status.lastError, nextSend: outbox.status.nextSend ? new Date(outbox.status.nextSend).toISOString() : null } };
   };
   if (command === 'status') {
     const state = readState(path.join(stateDir, 'state.json'));
@@ -47,7 +49,8 @@ async function main() {
     const seats = new Set(Object.values(state.seats).map(seat => seat.tool + ':' + seat.accountKey));
     const hours = new Set(Object.values(state.hours).map(row => row.tool + ':' + row.accountKey));
     const lines = (accounts ?? []).map(a => ({ tool: a.tool, accountKey: a.accountKey, state: a.state, windows: a.rows.length,
-      seat: a.accountKey !== null && seats.has(a.tool + ':' + a.accountKey), hours: a.accountKey !== null && hours.has(a.tool + ':' + a.accountKey) }));
+      seat: a.accountKey !== null && seats.has(a.tool + ':' + a.accountKey), hours: a.accountKey !== null && hours.has(a.tool + ':' + a.accountKey),
+      signedIn: a.status?.signedIn ?? null, resets: a.status?.resets?.available ?? null }));
     print({ allowanceFile: !config.allowanceFile ? 'not_configured' : accounts ? 'read' : 'missing', accounts: lines.length,
       keyed: lines.filter(l => l.accountKey).length, withSeat: lines.filter(l => l.seat).length, withHours: lines.filter(l => l.hours).length, lines }, true); return;
   }

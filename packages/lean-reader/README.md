@@ -168,6 +168,20 @@ at all without `allowanceFile`. `allowance-keys` prints each native account's
 provider, hashed key and whether hours or seats already carry it, never an email
 or ID.
 
+With the readings, each keyed account also queues one status row per UTC hour,
+sent after the readings in uploads of its own as `allowanceAccounts`: tool,
+hashed account key, snapshot time, account state, whether it is signed in (the
+provider check's `authLoggedIn`, else the identity's `authenticated`) with the
+check's `authState`, its banked resets (`resetCredits`, else
+`entitlements.rateLimitResetCredits`: the available count and, for at most 12,
+each one's expiry, type and status) and its credit balance (the first quota
+bucket's balance, `hasCredits` and `unlimited`). Reset and credit IDs, titles,
+descriptions and grant times are never sent. Status rows have their own queue
+and backoff inside `allowance.json`, so a cloud that predates them refuses only
+those uploads; the readings never wait. `status` reports that queue under
+`allowance.accountStatus`, and `allowance-keys` adds each account's signed-in
+state and banked reset count.
+
 It never sends prompts, responses, instruction text, tool output, file contents,
 full working paths, raw account IDs, emails, provider credentials, or Git remotes.
 It does not calculate prices: unknown pricing stays unknown in the cloud.

@@ -31,9 +31,25 @@ export type AllowanceRow = {
   windowSeconds: number | null; usedPercent: number | null; remainingPercent: number | null; resetsAt: string | null;
   resetPrecision: string | null; exhausted: boolean; accountState: string | null; observedAt: string;
 };
+/** One account's sign-in state, banked resets and credit balance at one
+ * snapshot. Reset and credit IDs, titles and descriptions never leave the
+ * reader; only counts, expiry instants, types, statuses and the balance do. */
+export type AccountStatusRow = {
+  tool: 'claude_code' | 'codex'; accountKey: string; observedAt: string; accountState: string | null;
+  signedIn: boolean | null; authState: string | null;
+  resets: { available: number | null; credits: { expiresAt: string | null; resetType: string | null; status: string | null }[] } | null;
+  credits: { balance: string | null; hasCredits: boolean | null; unlimited: boolean | null } | null;
+};
+/** Account status rows wait in their own queue, sent in their own uploads, so
+ * a cloud that predates them never holds back allowance readings. */
+export type StatusOutbox = {
+  pending: Record<string, AccountStatusRow>; seen: Record<string, string>;
+  lastSend: string | null; lastError: string | null; failures: number; nextSend: number;
+};
 export type Outbox = {
   version: 1; pending: Record<string, AllowanceRow>; seen: Record<string, string>;
   lastSend: string | null; lastError: string | null; readError: string | null; failures: number; nextSend: number;
+  status: StatusOutbox;
 };
 export type Config = { allowanceFile?: string; credentialsFrom?: string; endpoint?: string; roots?: (string | { tool: Tool; path: string })[]; rootsOnly?: boolean; velocityAccountMapFile?: string; sendSessionTitles?: boolean; sendFolderLabels?: boolean; sendEvidence?: boolean; sendVelocity?: boolean; dryRun?: boolean };
 export type SourceFile = { file: string; stat: import('node:fs').Stats };
