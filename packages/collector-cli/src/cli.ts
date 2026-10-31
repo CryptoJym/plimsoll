@@ -648,6 +648,12 @@ Config tools:
       proved, and the runtimes those restore. Every removal is recorded
       durably before it happens. Every completed update also applies this
       with the default count.
+  lifecycle snapshots remove --id ID [--apply --confirm-exact ID] [--operation-id ID] [--json]
+      Preview removing exactly one completed snapshot. The preview names any
+      rollback version that will become unavailable. Apply requires the same
+      ID as --confirm-exact, refuses unfinished lifecycle work or recovery,
+      keeps every runtime and receipt, and durably records the removal.
+      Interrupted removals are recovered by snapshots prune on this release.
   lifecycle snapshots reconcile [--keep-snapshots ID[,ID...]] [--apply] [--force] [--operation-id ID]
       When retention is blocked or a snapshot's operation cannot be read
       (list says why): shows what blocks it (default, changes nothing), or
@@ -7653,6 +7659,7 @@ async function main() {
       console.log(JSON.stringify(result, null, 2));
       // A preflight refuses the way the update itself would: before any change.
       if (result.kind === "preflight" && !result.preflight.ok) process.exitCode = 1;
+      if (result.kind === "remove" && result.removal.status === "refused") process.exitCode = 1;
       return;
     }
     let stopWindowStarted = false;

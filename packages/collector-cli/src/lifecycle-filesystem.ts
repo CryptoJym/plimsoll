@@ -10,6 +10,9 @@ import {
   immutableRuntimeRelativePath,
   parseCompletionReceipt,
   planLifecycleRetention,
+  planLifecycleSnapshotRemoval,
+  snapshotRemovalWarnings,
+  validSnapshotRemovalIntent,
   validRestoreRecord,
   type LifecycleAdapter,
   type LifecycleCloneFallback,
@@ -28,6 +31,8 @@ import {
   type LifecycleSnapshotMethod,
   type LifecycleSnapshotPlan,
   type LifecycleSnapshotRecord,
+  type LifecycleSnapshotRemovalIntent,
+  type LifecycleSnapshotRemovalResult,
   type LifecycleSupportSnapshot,
   type RuntimeArtifact,
 } from "./lifecycle";
@@ -276,7 +281,7 @@ function isOtherOperationReceipt(value: unknown, operationId: string) {
   const row = value as Record<string, unknown>;
   return row.schemaVersion === 1 && row.operationId === operationId && row.toVersion === null &&
     row.restoredVersion === null &&
-    ["uninstall", "purge", "support_bundle", "snapshots_prune", "snapshots_reconcile"].includes(String(row.operation));
+    ["uninstall", "purge", "support_bundle", "snapshots_prune", "snapshots_reconcile", "snapshots_remove"].includes(String(row.operation));
 }
 
 /**
@@ -291,7 +296,9 @@ type RemovalRecord = {
   operationId: string;
   items: RemovalItem[];
   /** Older CLIs must not finish this record without the way-back safety rule. */
-  requiresCliVersion?: "0.7.41";
+  requiresCliVersion?: "0.7.41" | "snapshot-remove-v1";
+  /** Exact, confirmed intent; older collectors refuse this unfamiliar record. */
+  snapshotRemoval?: LifecycleSnapshotRemovalIntent;
 };
 
 class RetentionPlanChanged extends Error {
@@ -311,8 +318,10 @@ function parseRemovalRecord(value: unknown, operationId: string): RemovalRecord 
   const row = value as Record<string, unknown>;
   const keys = Object.keys(row).sort().join(",");
   if ((keys !== "items,operationId,schemaVersion" &&
-       keys !== "items,operationId,requiresCliVersion,schemaVersion") ||
-      ("requiresCliVersion" in row && row.requiresCliVersion !== "0.7.41") || row.schemaVersion !== 1 ||
+       keys !== "items,operationId,requiresCliVersion,schemaVersion" &&
+       keys !== "items,operationId,requiresCliVersion,schemaVersion,snapshotRemoval") ||
+      ("snapshotRemoval" in row ? row.requiresCliVersion !== "snapshot-remove-v1" || !validSnapshotRemovalIntent(row.snapshotRemoval)
+        : "requiresCliVersion" in row && row.requiresCliVersion !== "0.7.41") || row.schemaVersion !== 1 ||
       row.operationId !== operationId || !Array.isArray(row.items) || row.items.length > MAX_COMPLETION_MARKERS) return null;
   const items: RemovalItem[] = [];
   for (const entry of row.items as unknown[]) {
@@ -327,6 +336,12 @@ function parseRemovalRecord(value: unknown, operationId: string): RemovalRecord 
       kind: item.kind as RemovalItem["kind"], name: item.name, bytes: item.bytes, trashName: item.trashName as string,
       origin: item.origin,
     });
+  }
+  if (validSnapshotRemovalIntent(row.snapshotRemoval)) {
+    const intent = row.snapshotRemoval;
+    if (items.length !== 1 || items[0]!.kind !== "snapshot" || items[0]!.name !== intent.snapshotId ||
+        items[0]!.bytes !== intent.bytes || items[0]!.origin !== "planned") return null;
+    return { schemaVersion: 1, operationId, items, requiresCliVersion: "snapshot-remove-v1", snapshotRemoval: intent };
   }
   return { schemaVersion: 1, operationId, items,
     ...(row.requiresCliVersion === "0.7.41" ? { requiresCliVersion: "0.7.41" as const } : {}) };
@@ -1480,7 +1495,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     const hasUsableWayBack = retention.snapshots.some((snapshot) =>
       snapshot.metadataValid && snapshot.restoresVersion !== null &&
       snapshot.restoresVersion !== retention.installedVersion && snapshot.restorable !== false);
-    const items = records.flatMap((record) => record.items);
+    // An operator explicitly accepted losing this rollback point. Recovery
+    // finishes that removal rather than silently resurrecting it.
+    const items = records.filter(record => !record.snapshotRemoval).flatMap((record) => record.items);
     const pendingWayBack = items.some((item) => item.kind === "snapshot" &&
       (lstatIfPresent(path.join(this.trashRoot, item.trashName)) || lstatIfPresent(this.removalSource(item))));
     if (hasUsableWayBack || !pendingWayBack) return null;
@@ -1599,6 +1616,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     planned: readonly RemovalItem[],
     moved: ReadonlySet<string>,
     initialStamps: ReadonlyMap<string, string | null>,
+    targeted?: { snapshot: LifecycleSnapshotRemovalIntent; operationId: string },
   ) {
     try {
       const fail = (reason: string): never => {
@@ -1607,6 +1625,13 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       const currentResult = this.retentionInput();
       if (currentResult.blockedReason) fail(`blocked:${currentResult.blockedReason}`);
       const current = currentResult.input;
+      if (targeted) {
+        const records = this.removalRecords().records;
+        if (records.some(record => record.operationId !== targeted.operationId ||
+            JSON.stringify(record.snapshotRemoval) !== JSON.stringify(targeted.snapshot))) fail("another_removal_pending");
+        const accounted = new Set(records.flatMap(record => record.items.map(item => item.trashName)));
+        if (this.trashEntries().some(entry => !accounted.has(entry.fileName))) fail("another_trash_item_pending");
+      }
       const basis = (value: LifecycleRetentionInput) => JSON.stringify({
         installedVersion: value.installedVersion,
         pinnedVersions: value.pinnedVersions,
@@ -1673,7 +1698,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         ...initialPlan.snapshots.map((row) => [`snapshot:${row.id}`, row.keep] as const),
         ...initialPlan.versions.map((row) => [`runtime_version:${row.version}`, row.keep] as const),
       ]);
-      const currentPlan = planLifecycleRetention(current, keep);
+      const currentPlan = targeted ? planLifecycleSnapshotRemoval(current, targeted.snapshot.snapshotId) : planLifecycleRetention(current, keep);
       const currentDecisions = new Map([
         ...currentPlan.snapshots.map((row) => [`snapshot:${row.id}`, row.keep] as const),
         ...currentPlan.versions.map((row) => [`runtime_version:${row.version}`, row.keep] as const),
@@ -1702,6 +1727,40 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     }
   }
 
+  private snapshotRemovalPreview(snapshotId: string): LifecycleSnapshotRemovalResult {
+    const { input, blockedReason } = this.retentionInput();
+    const refused = (refusal: string): LifecycleSnapshotRemovalResult =>
+      ({ status: "refused", refusal, snapshot: null, warnings: [], retention: null });
+    if (blockedReason) return refused(blockedReason);
+    if (input.journal) return refused("unfinished_lifecycle_operation");
+    if (this.removalRecords().records.length > 0 || this.trashEntries().length > 0) return refused("pending_removal_or_restore");
+    const markers = this.orderEvidence().markers;
+    if (markers.invalid.length > 0 || input.snapshots.some(row => !input.operations.some(operation => operation.id === row.id))) {
+      return refused("operation_state_unproven");
+    }
+    const snapshot = input.snapshots.find(row => row.id === snapshotId);
+    if (!snapshot) return refused("snapshot_not_found");
+    const operation = input.operations.find(row => row.id === snapshotId);
+    if (operation?.status !== "completed") return refused("snapshot_operation_not_completed");
+    if (!snapshot.metadataValid) return refused("snapshot_metadata_unreadable");
+    const intent: LifecycleSnapshotRemovalIntent = {
+      snapshotId, bytes: snapshot.bytes, restoresVersion: snapshot.restoresVersion,
+      rollbackUnavailable: snapshot.restoresVersion !== null && snapshot.restorable !== false &&
+        !input.snapshots.some(other => other.id !== snapshotId && other.metadataValid && other.restorable !== false &&
+          other.restoresVersion === snapshot.restoresVersion),
+    };
+    return { status: "preview", refusal: null, snapshot: intent, warnings: snapshotRemovalWarnings(intent), retention: null };
+  }
+
+  async removeSnapshot(input: { operationId: string; snapshotId: string; apply: boolean }): Promise<LifecycleSnapshotRemovalResult> {
+    const preview = this.snapshotRemovalPreview(input.snapshotId);
+    if (preview.status === "refused" || !preview.snapshot) return preview;
+    const retention = await this.retainSnapshots({ operationId: input.operationId, keep: LIFECYCLE_RETAINED_SNAPSHOTS,
+      apply: input.apply, releaseSnapshot: preview.snapshot });
+    return { ...preview, status: retention.status === "applied" ? "applied" : retention.status === "preview" ? "preview" : "refused",
+      refusal: retention.skippedReason, retention };
+  }
+
   /**
    * Crash-safe, audited removal. Before anything moves, this operation's
    * removal record (every planned item and every unaccounted trash entry,
@@ -1712,7 +1771,13 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
    * point leaves a record that the next apply finishes and reports as
    * recovered. Nothing is deleted while retention is blocked.
   */
-  async retainSnapshots(input: { operationId: string; keep: number; apply: boolean }): Promise<LifecycleRetentionRecord> {
+  async retainSnapshots(input: { operationId: string; keep: number; apply: boolean; releaseSnapshot?: LifecycleSnapshotRemovalIntent }): Promise<LifecycleRetentionRecord> {
+    if (input.releaseSnapshot) {
+      const preview = this.snapshotRemovalPreview(input.releaseSnapshot.snapshotId);
+      if (preview.status !== "preview" || JSON.stringify(preview.snapshot) !== JSON.stringify(input.releaseSnapshot)) {
+        throw new RetentionPlanChanged("targeted_removal_changed");
+      }
+    }
     if (this.keepAll && input.apply) {
       // Removes and recovers nothing; the read-only preview only informs the receipt.
       let wouldRemove: LifecycleRemovedItem[] | undefined;
@@ -1736,7 +1801,11 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       };
     }
     const { input: retention, blockedReason } = this.retentionInput();
-    const plan = planLifecycleRetention(retention, input.keep);
+    const plan = input.releaseSnapshot ? planLifecycleSnapshotRemoval(retention, input.releaseSnapshot.snapshotId)
+      : planLifecycleRetention(retention, input.keep);
+    const targeted = input.releaseSnapshot ? { snapshot: input.releaseSnapshot, operationId: input.operationId } : undefined;
+    const snapshotRemovals = [...this.removalRecords().records.flatMap(row => row.snapshotRemoval ? [row.snapshotRemoval] : []),
+      ...(input.releaseSnapshot ? [input.releaseSnapshot] : [])];
     const snapshotBytes = new Map(retention.snapshots.map((snapshot) => [snapshot.id, snapshot.bytes]));
     const versionBytes = new Map(retention.versions.map((version) => [version.version, version.bytes]));
     const removed: LifecycleRemovedItem[] = [
@@ -1758,6 +1827,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       removed: items,
       removedBytes: items.reduce((total, item) => total + item.bytes, 0),
       recovered,
+      ...(snapshotRemovals.length > 0 ? { snapshotRemovals: snapshotRemovals.filter(intent =>
+        [...items, ...recovered].some(item => item.kind === "snapshot" && item.name === intent.snapshotId && item.bytes === intent.bytes)) } : {}),
       ...(restored.length > 0 ? { restored } : {}),
       keptSnapshots: status === "skipped" ? [] : resultPlan.snapshots.filter((row) => row.keep).map((row) => row.id),
       keptVersions: status === "skipped" ? [] : resultPlan.versions.filter((row) => row.keep).map((row) => row.version),
@@ -1936,12 +2007,12 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       }
       // A refused retry must leave earlier trash untouched. Validate planned
       // removals before finishing an earlier record under the same operation ID.
-      this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+      this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps, targeted);
       for (const pending of earlier) {
         const alreadyRecorded = this.receiptNames(pending.operationId, pending.items);
         for (const item of pending.items) {
           if (lstatIfPresent(path.join(this.trashRoot, item.trashName))) {
-            this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+            this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps, targeted);
             await this.deleteTrashEntry(input.operationId, item.trashName);
           } else if (lstatIfPresent(this.removalSource(item))) {
             continue; // never moved: nothing was removed, and retention decides it afresh
@@ -1960,7 +2031,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       if (items.length > 0) {
         await this.assertFence(input.operationId);
         writeJsonDurable(removalRecordPath,
-          { schemaVersion: 1, operationId: input.operationId, items, requiresCliVersion: "0.7.41" } satisfies RemovalRecord, this.root);
+          { schemaVersion: 1, operationId: input.operationId, items,
+            ...(input.releaseSnapshot ? { requiresCliVersion: "snapshot-remove-v1" as const, snapshotRemoval: input.releaseSnapshot }
+              : { requiresCliVersion: "0.7.41" as const }) } satisfies RemovalRecord, this.root);
         committed.push(input.operationId);
       }
       const report = (item: RemovalItem): LifecycleRemovedItem => ({ kind: item.kind, name: item.name, bytes: item.bytes });
@@ -1968,7 +2041,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       this.pendingCommits.set(input.operationId, { records: committed, named: [...planned.map(report), ...reportedRecovered] });
       for (const item of planned) {
         await this.assertFence(input.operationId);
-        this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+        this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps, targeted);
         const source = this.removalSource(item);
         assertNoSymlink(source, this.root);
         if (!fs.lstatSync(source).isDirectory()) throw new RetentionPlanChanged();
@@ -1986,7 +2059,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         if (planned.some((item) => item.kind === "runtime_version")) fsyncDirectory(this.versionsRoot);
       }
       for (const item of items) {
-        this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps);
+        this.assertRetentionPlanStillSafe(retention, plan, input.keep, planned, moved, initialStamps, targeted);
         await this.deleteTrashEntry(input.operationId, item.trashName);
       }
       return record("applied", planned.map(report), reportedRecovered);
