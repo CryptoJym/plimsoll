@@ -577,6 +577,23 @@ async function shutdownBrowser(
   return { exited: true, protocolClose, escalatedTo: "SIGKILL" as const, durationMs: Date.now() - startedAt };
 }
 
+// Chrome's helper processes can still write into the profile for a moment after
+// the browser process exits, so a removal can meet a file that was not there when
+// it listed the folder (ENOTEMPTY: run 41161557787 failed that way after every
+// check had passed). rmSync's own retries repeat only the last rmdir, never the
+// listing, so the whole removal runs again, five tries over one second at most.
+async function removeProfile(profile: string) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.rmSync(profile, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || attempt === 5) throw error;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+    }
+  }
+}
+
 async function proveBoundedSignalEscalation() {
   const child = spawn(process.execPath, [
     "-e",
@@ -723,7 +740,7 @@ export async function runNeverResolvingCdpScenario(fixtureRoot?: string) {
         signalGraceMs: 100,
       });
     } finally {
-      fs.rmSync(profile, { recursive: true, force: true });
+      await removeProfile(profile);
     }
   })();
 
@@ -3192,7 +3209,7 @@ async function browserProof(html: string) {
       shutdownReceipt = await shutdownBrowser(cdp, chrome);
     } finally {
       serverClosed = await closeFixtureServer(fixtureServer);
-      fs.rmSync(profile, { recursive: true, force: true });
+      await removeProfile(profile);
     }
   })();
   const operation = (async () => {
