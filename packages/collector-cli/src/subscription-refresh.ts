@@ -124,6 +124,28 @@ function renderDashboard(status: Record<string, unknown>, report: ReturnType<typ
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>Subscription telemetry</title><style>body{font:15px system-ui;max-width:1180px;margin:36px auto;padding:0 20px;color:#163127;background:#f7faf8}h1{font-size:28px}h2{font-size:20px;margin-top:30px}table{border-collapse:collapse;width:100%;background:white}td,th{padding:10px;text-align:left;border-bottom:1px solid #dbe5df}code{font-size:12px}p{line-height:1.5}small{color:#52655a}.scroll{overflow:auto}</style></head><body><h1>Subscription telemetry</h1><p>Updated ${escape(status.observedAt)}. Native allowances, locally observed tokens, and actual money paid are separate measures.</p><div class="scroll"><table><thead><tr><th>Provider</th><th>Account records</th><th>Observed plans</th><th>Plan evidence</th><th>Current quota</th><th>Local token capture</th></tr></thead><tbody>${providerRows}</tbody></table></div><h2>Current account allowances</h2><p>UNKNOWN windows retain their last known readings in the JSON evidence, without displaying those readings as current. Account references are private aliases.</p><div class="scroll"><table><thead><tr><th>Provider</th><th>Account</th><th>Plan</th><th>Window</th><th>Used %</th><th>Remaining %</th><th>Reset</th><th>State</th></tr></thead><tbody>${windows}</tbody></table></div><h2>Captured usage by subscription account</h2><p>${escape(report.accountLinkCoverage.linkedEvents)} of ${escape(report.accountLinkCoverage.totalEvents)} captured events linked; ${escape(report.accountLinkCoverage.unknownEvents)} remain UNKNOWN. Fleet and history completeness: UNKNOWN.</p><div class="scroll"><table><thead><tr><th>Source</th><th>Account</th><th>Events</th><th>Input</th><th>Output</th><th>Identity proof</th></tr></thead><tbody>${accountRows}</tbody></table></div>${financial}<h2>Provider exports</h2><ul>${exports || "<li>No verified token export imported. UNKNOWN.</li>"}</ul>${comparisons}${exportThreadSection}<h2>Recent chats and projects</h2><p>Projects labeled inferred come from native repository metadata; conflicts remain UNKNOWN. Account links cover only events with captured identity proof. Token history, fleet completeness and cash allocation to chats remain UNKNOWN.</p><div class="scroll"><table><thead><tr><th>Source</th><th>Chat</th><th>Subscription account</th><th>Project</th><th>Input</th><th>Output</th><th>Cache read</th></tr></thead><tbody>${threads || '<tr><td colspan="7">UNKNOWN: no captured thread token events</td></tr>'}</tbody></table></div><p><small>${escape(report.note)}</small></p></body></html>`;
 }
 
+// studio0's disk serves a constant stream of other reads, so between two
+// 1-minute runs much of the store leaves the page cache; the report then
+// pays tens of thousands of random 4 KiB reads behind a saturated queue
+// (sampled in unixRead under Statement::JS_all, 11-02). One sequential pass
+// over the file brings it back in a few large reads. Bounded to 1 GiB.
+function warmStoreFile(file: string): void {
+  let fd: number | undefined;
+  try {
+    const size = fs.statSync(file).size;
+    if (size > 1024 * 1024 * 1024) return;
+    fd = fs.openSync(file, "r");
+    const chunk = Buffer.allocUnsafe(8 * 1024 * 1024);
+    for (let offset = 0; offset < size; offset += chunk.length) {
+      if (fs.readSync(fd, chunk, 0, chunk.length, offset) <= 0) break;
+    }
+  } catch {
+    // A failed warm read changes nothing; the queries read the pages themselves.
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 export function refreshSubscriptionTelemetry(options: { paths?: Partial<NativeSubscriptionPaths>; now?: string } = {}) {
   const paths = { ...defaultNativeSubscriptionPaths(), ...options.paths };
   const home = path.dirname(paths.nativeSubscriptionDb);
@@ -144,6 +166,7 @@ export function refreshSubscriptionTelemetry(options: { paths?: Partial<NativeSu
   // seconds, once a minute.
   db.pragma("temp_store = MEMORY");
   db.pragma("cache_size = -262144");
+  warmStoreFile(paths.nativeSubscriptionDb);
   try {
     const {inspection,receipt} = collectNativeTelemetry(db,options);
     const projectMetadataRefresh=enrichNativeProjectMetadata(db,{now:inspection.observedAt,
