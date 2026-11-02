@@ -18,9 +18,13 @@ const buffer = new LocalEventBuffer(ledgerPath, {
 });
 
 function ledgerHandles() {
-  const probe = spawnSync("/usr/sbin/lsof", ["-w", "-F", "n", "--", ledgerPath],
+  // Workers share our descriptor table. Survey only this proof process,
+  // so an unrelated process on a shared runner cannot stall the inventory.
+  const probe = spawnSync("/usr/sbin/lsof", ["-nP", "-a", "-p", String(process.pid), "-w", "-F", "n", "--", ledgerPath],
     { encoding: "utf8", timeout: 10_000 });
-  assert.ok(probe.status === 0 || probe.status === 1, String(probe.stderr));
+  assert.ok(probe.status === 0 || probe.status === 1, JSON.stringify({
+    status: probe.status, signal: probe.signal, errorCode: (probe.error as NodeJS.ErrnoException | undefined)?.code,
+  }));
   return probe.stdout.split("\n").filter(line => line === `n${ledgerPath}`).length;
 }
 

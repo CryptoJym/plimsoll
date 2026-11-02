@@ -31,6 +31,9 @@ fence renewal; completion then lost its fence after the runtime had switched.
   with a durable receipt of file names and field names only. The legacy
   diagnostic capture writer is absent from this release. Restorable config
   backups retain their existing credential-preservation guarantee.
+- The worker-close proof inventories only its own process (workers share
+  its file-descriptor table), avoiding a host-wide `lsof` scan on a shared
+  runner while retaining its handle-count and exclusive-barrier assertions.
 - `proof:lifecycle-update-recovery` exercises the long checkpoint, nonzero
   interruption process exit, both resume phases, clone bound, safe restore,
   preflight and value-blind diagnostic redaction. Pairing-index warnings and
