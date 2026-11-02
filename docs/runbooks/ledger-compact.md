@@ -68,4 +68,43 @@ back the pages retention has already freed.
 
 ## Large ledgers and lifecycle snapshots
 
-`lifecycle update` and `lifecycle rollback` keep an APFS clone of the whole ledger as the operation's rollback snapshot (`lifecycle/snapshots/<operation-id>/database`); retention keeps the two newest and `snapshots prune` keeps at least one. A clone costs nothing until the live file's pages change, then one block per changed page. Under a retention catch-up most pages change, so on a ledger of this size the clone can take the whole free disk (2026-11-01: a 171 GB ledger, free disk falling about 1 GB a minute). Right after an update or rollback on such a host, move the snapshot's `database` file to another volume (keep `config`, `service` and `snapshot.json` in place and leave a `database.moved.json` note with the destination and the time). Undo: move it back. While the file is away, `lifecycle snapshots list` shows the snapshot as not restorable and a rollback cannot restore the ledger from it.
+`lifecycle update` and `lifecycle rollback` normally keep an APFS clone of
+the ledger as their operation's recovery snapshot
+(`lifecycle/snapshots/<operation-id>/database`). Retention keeps the two
+newest completed snapshots and a usable way back. A clone shares blocks
+with the live ledger, so every page rewritten afterward costs new space
+until the clone is removed or moved to another volume. During retention
+catch-up most pages can change (2026-11-01: a 171 GB ledger, free disk
+falling about 1 GB a minute).
+
+Before stopping the collector, run `lifecycle update --preflight` to see
+the clone cost and space plan. From 0.7.54, pass
+`--snapshot-database-max-bytes N` or set `snapshotDatabaseMaxBytes` in config
+to omit the database snapshot above the measured ledger plus WAL size.
+Config and service remain backed up. The receipt and `snapshots list`
+report `skipped_by_operator` and `cannotRestoreReason`. If the operation
+fails, its automatic rollback restores runtime, config and service only;
+it leaves the live ledger untouched and says so in `restore`. No bound is
+the default. Recover such a journal with 0.7.54 or later.
+
+When retaining a database snapshot, move its `database` file to an archive
+volume right after a healthy update on a large host. Keep `config`,
+`service` and `snapshot.json` in place and leave a `database.moved.json`
+note containing the destination and time. Keep a move receipt before the
+move; undo is moving that same file back. While it is away, `snapshots list`
+reports `its database copy is missing` and the snapshot cannot restore the
+ledger.
+
+The rollback behavior is precise: a successful explicit `lifecycle rollback
+--artifact ...` installs the chosen runtime through a new transaction and
+keeps the live ledger; it does not select an earlier operation's snapshot.
+If an update or rollback fails and recovers its own snapshot (including a
+resumed `rollback_required` journal), metadata still says the moved database
+was present. Restoration checks that file before touching any live ledger,
+config, runtime pointer or service. A missing file refuses with
+`snapshot_database_missing` and leaves them alone; it never follows the
+`none` path that removes a ledger originally absent at snapshot time. Move
+the database file back to its original snapshot path **before** resuming a
+rollback that should restore the ledger, then rerun the original command
+with its original operation ID. Moving the file alone never changes the
+metadata to say the ledger was absent.

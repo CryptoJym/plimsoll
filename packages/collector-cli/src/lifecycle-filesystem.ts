@@ -6,6 +6,7 @@ import {
   LIFECYCLE_RETAINED_SNAPSHOTS,
   LIFECYCLE_SCHEMA_VERSION,
   LifecycleInterruption,
+  LifecycleRestoreRefusal,
   PURGE_CONFIRMATION,
   immutableRuntimeRelativePath,
   parseCompletionReceipt,
@@ -32,6 +33,8 @@ import {
   type RuntimeArtifact,
 } from "./lifecycle";
 import { LifecycleMutationAuthority, type LifecycleMutationLease } from "./lifecycle-authority";
+import { PLIMSOLL_VERSION } from "./version";
+import { redactLifecycleCapture } from "./lifecycle-captures";
 import { isStatusSummaryTempFile } from "./status-summary";
 
 const FILE_MODE = 0o600;
@@ -73,6 +76,8 @@ export type LifecycleDatabaseSnapshot = {
   method: LifecycleSnapshotMethod | null;
   quiesced: boolean;
   cloneFallback: LifecycleCloneFallback | null;
+  databaseBytes?: number;
+  cannotRestoreReason?: string;
 };
 
 export type LifecycleDatabaseRestore = {
@@ -102,7 +107,7 @@ export type LifecycleFenceGuard = {
  * Restore must leave the live ledger untouched unless the restored copy is
  * complete and valid; it may report how the copy was made. */
 export type LifecycleDatabaseAdapter = {
-  snapshot(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<boolean | LifecycleDatabaseSnapshot>;
+  snapshot(input: { source: string; destination: string; guard?: LifecycleFenceGuard; maxBytes?: number }): Promise<boolean | LifecycleDatabaseSnapshot>;
   restore(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<void | LifecycleDatabaseRestore>;
   /**
    * Removes the live ledger for a snapshot taken when no ledger existed, only
@@ -114,7 +119,7 @@ export type LifecycleDatabaseAdapter = {
    * Update --preflight for a snapshot of `source` under `destination` (which
    * may not exist yet). Read-only: creates, changes and removes nothing.
    */
-  plan?(input: { source: string; destination: string }): Promise<LifecycleSnapshotPlan>;
+  plan?(input: { source: string; destination: string; maxBytes?: number }): Promise<LifecycleSnapshotPlan>;
 };
 
 type SnapshotMetadata = {
@@ -134,6 +139,7 @@ type SnapshotMetadata = {
     quiesced: boolean;
     cloneFallback: LifecycleCloneFallback | null;
     bytes: number;
+    cannotRestoreReason?: string;
   };
 };
 
@@ -206,6 +212,9 @@ function isSnapshotMetadata(value: unknown): value is SnapshotMetadata {
   const currentPairValid =
     (row.currentVersion === null && row.currentExecutable === null) ||
     (isBoundedIdentifier(row.currentVersion) && typeof row.currentExecutable === "string" && path.isAbsolute(row.currentExecutable));
+  if (row.database?.method === "skipped_by_operator" && (present?.database !== false ||
+      !Number.isSafeInteger(row.database.bytes) || row.database.bytes < 0 ||
+      row.database.quiesced !== true || typeof row.database.cannotRestoreReason !== "string")) return false;
   return row.schemaVersion === 1 && currentPairValid && Boolean(present) &&
     typeof present?.config === "boolean" &&
     typeof present?.database === "boolean" &&
@@ -276,7 +285,7 @@ function isOtherOperationReceipt(value: unknown, operationId: string) {
   const row = value as Record<string, unknown>;
   return row.schemaVersion === 1 && row.operationId === operationId && row.toVersion === null &&
     row.restoredVersion === null &&
-    ["uninstall", "purge", "support_bundle", "snapshots_prune", "snapshots_reconcile"].includes(String(row.operation));
+    ["uninstall", "purge", "support_bundle", "snapshots_prune", "snapshots_reconcile", "captures_redact"].includes(String(row.operation));
 }
 
 /**
@@ -463,12 +472,13 @@ function fsyncDirectory(directory: string) {
 }
 
 function snapshotRecordFrom(metadata: SnapshotMetadata, databaseBytes: number): LifecycleSnapshotRecord {
-  const database = metadata.present.database ? metadata.database : undefined;
+  const database = metadata.database;
   return {
-    method: database?.method === "clone" || database?.method === "online_backup" ? database.method : null,
+    method: database?.method === "clone" || database?.method === "online_backup" || database?.method === "skipped_by_operator" ? database.method : null,
     quiesced: database?.quiesced === true,
     cloneFallback: CLONE_FALLBACKS.find((reason) => reason === database?.cloneFallback) ?? null,
-    databaseBytes,
+    databaseBytes: database?.method === "skipped_by_operator" ? database.bytes : databaseBytes,
+    ...(database?.cannotRestoreReason ? { cannotRestoreReason: database.cannotRestoreReason } : {}),
   };
 }
 
@@ -517,15 +527,20 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
    * entries stay, and display receipts are not trimmed.
    */
   private readonly keepAll: boolean;
+  private readonly snapshotDatabaseMaxBytes?: number;
 
   constructor(
     private readonly paths: ManagedLifecyclePaths,
     private readonly service: LifecycleServiceAdapter,
     private readonly database: LifecycleDatabaseAdapter,
     private readonly authority?: LifecycleMutationAuthority,
-    options: { keepAll?: boolean } = {},
+    options: { keepAll?: boolean; snapshotDatabaseMaxBytes?: number } = {},
   ) {
     this.keepAll = options.keepAll === true;
+    if (options.snapshotDatabaseMaxBytes !== undefined && (!Number.isSafeInteger(options.snapshotDatabaseMaxBytes) || options.snapshotDatabaseMaxBytes < 0)) {
+      throw new Error("snapshotDatabaseMaxBytes must be a nonnegative safe integer");
+    }
+    this.snapshotDatabaseMaxBytes = options.snapshotDatabaseMaxBytes;
     for (const [label, candidate] of Object.entries({
       lifecycleRoot: paths.lifecycleRoot,
       artifactSourceRoot: paths.artifactSourceRoot,
@@ -772,6 +787,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         source: this.paths.database,
         destination: path.join(snapshot, "database"),
         guard: this.fenceGuard(operationId),
+        ...(this.snapshotDatabaseMaxBytes !== undefined ? { maxBytes: this.snapshotDatabaseMaxBytes } : {}),
       });
       const database = typeof outcome === "boolean"
         ? { present: outcome, method: null, quiesced: false, cloneFallback: null }
@@ -794,13 +810,14 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         currentExecutableSha256: state?.executablePath ? regularFileSha256(state.executablePath) : null,
         present,
         createdAt: new Date().toISOString(),
-        ...(present.database
+        ...(present.database || database.method === "skipped_by_operator"
           ? {
               database: {
                 method: database.method,
                 quiesced: database.quiesced,
                 cloneFallback: database.cloneFallback,
-                bytes: databaseBytes,
+                bytes: database.databaseBytes ?? databaseBytes,
+                ...(database.cannotRestoreReason ? { cannotRestoreReason: database.cannotRestoreReason } : {}),
               },
             }
           : {}),
@@ -808,7 +825,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       writeJson(path.join(snapshot, "snapshot.json"), metadata, snapshot);
       return operationId;
     } catch (error) {
-      fs.rmSync(snapshot, { recursive: true, force: true });
+      // A successor may already own this directory after fence loss. Leave
+      // its unfinished snapshot for recovery under a fresh lease.
+      if (!(error instanceof LifecycleInterruption)) fs.rmSync(snapshot, { recursive: true, force: true });
       throw error;
     }
   }
@@ -961,9 +980,14 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     assertNoSymlink(databaseSnapshot, snapshot);
     assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
     let record: LifecycleRestoreRecord | undefined = { method: "none", cloneFallback: null, databaseBytes: 0 };
-    if (metadata.present.database) {
+    if (metadata.database?.method === "skipped_by_operator") {
+      record = { method: "skipped_by_operator", cloneFallback: null, databaseBytes: metadata.database.bytes,
+        cannotRestoreReason: metadata.database.cannotRestoreReason ?? "ledger snapshot skipped by operator size bound; live ledger left untouched" };
+    } else if (metadata.present.database) {
       const databaseSource = lstatIfPresent(databaseSnapshot);
-      if (!databaseSource?.isFile()) throw new Error("rollback database snapshot must be a regular file");
+      if (!databaseSource?.isFile()) throw new LifecycleRestoreRefusal({
+        reason: "snapshot_database_missing", requiredFreeBytes: null, freeBytes: null,
+      });
       const outcome = await this.database.restore({
         source: databaseSnapshot,
         destination: this.paths.database,
@@ -1043,7 +1067,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     // roots are ensured here.
     ensureDirectory(this.receiptsRoot, this.root);
     ensureDirectory(this.completedRoot, this.root);
-    if (receipt.status !== "rollback_required" && receipt.status !== "refused") {
+    if (receipt.status !== "rollback_required" && receipt.status !== "refused" && receipt.status !== "interrupted") {
       // The durable, unbounded marker is the operation-ID authority. Commit
       // it before the display receipt so a stop between the two can never
       // make a completed destructive operation reusable. A verified or
@@ -1054,6 +1078,55 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     // Display receipts are never trimmed: a refused or rollback_required
     // receipt is the only record of its operation.
     writeJsonDurable(path.join(this.receiptsRoot, `${receipt.operationId}-${receipt.operation}.json`), receipt, this.receiptsRoot);
+  }
+
+  async redactCaptures(operationId: string): Promise<LifecycleReceipt> {
+    if (!isBoundedIdentifier(operationId)) throw new Error("invalid capture redaction operation ID");
+    if (!await this.acquireLock(operationId)) throw new Error("another lifecycle operation owns the lock");
+    try {
+      if (await this.operationIdExists(operationId)) throw new Error("operationId was already completed; use a fresh operationId");
+      // Validate every input before the first replacement. Parse errors deliberately
+      // omit the JSON parser's message, which can contain a credential value.
+      const plans = fs.readdirSync(this.root).sort().filter((name) => /^capture-config-.*\.json$/.test(name)).map((file) => {
+        const candidate = path.join(this.root, file);
+        assertNoSymlink(candidate, this.root);
+        const stat = fs.lstatSync(candidate);
+        if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_MANIFEST_BYTES) throw new Error(`capture is not a bounded private regular file: ${file}`);
+        let value: unknown;
+        try { value = JSON.parse(fs.readFileSync(candidate, "utf8")); }
+        catch { throw new Error(`capture JSON is invalid: ${file}`); }
+        const redacted = redactLifecycleCapture(value);
+        return { file, ...redacted };
+      }).filter((plan) => plan.fields.length > 0);
+      const receipt: LifecycleReceipt = {
+        schemaVersion: 1, toolVersion: PLIMSOLL_VERSION, operationId, operation: "captures_redact", status: "interrupted",
+        fromVersion: null, toVersion: null, restoredVersion: null, health: null,
+        ownedTargets: ["lifecycle_captures"], retainedTargets: [], purgeOnlyTargets: [],
+        preserved: ["ledger", "history", "credentials", "workspace_membership"],
+        captureRedaction: plans.map(({ file, fields }) => ({ file, fields })),
+        reason: "capture redaction pending; rerun lifecycle captures redact with a fresh operation ID",
+      };
+      // A durable names-only receipt precedes removing any credential value.
+      await this.assertFence(operationId);
+      await this.persistReceipt(receipt);
+      for (const plan of plans) {
+        await this.assertFence(operationId);
+        writeJsonDurable(path.join(this.root, plan.file), plan.config, this.root);
+      }
+      receipt.status = "completed";
+      delete receipt.reason;
+      await this.assertFence(operationId);
+      await this.persistReceipt(receipt);
+      return receipt;
+    } finally { await this.releaseLock(operationId); }
+  }
+
+  async persistInterruptionReceipt(receipt: LifecycleReceipt) {
+    // Only a uniquely named observation may be written after losing the lease.
+    // Never overwrite a successor's receipt, completion marker or journal.
+    ensureDirectory(this.receiptsRoot, this.root);
+    writeJsonDurable(path.join(this.receiptsRoot, `${receipt.operationId}-interrupted-${randomBytes(8).toString("hex")}.json`),
+      receipt, this.receiptsRoot);
   }
 
   async uninstallOwned(input: { apply: boolean }) {
@@ -1147,7 +1220,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     if (!this.database.plan) throw new Error("the database adapter cannot plan snapshots");
     assertNoSymlink(this.root, this.paths.ownershipRoot);
     assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
-    return this.database.plan({ source: this.paths.database, destination: this.snapshotsRoot });
+    return this.database.plan({ source: this.paths.database, destination: this.snapshotsRoot,
+      ...(this.snapshotDatabaseMaxBytes !== undefined ? { maxBytes: this.snapshotDatabaseMaxBytes } : {}) });
   }
 
   /**
@@ -1395,6 +1469,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     for (const label of ["config", "service"] as const) {
       if (metadata.present[label] && !regularFile(path.join(directory, label))) return `its ${label} copy is missing`;
     }
+    if (metadata.database?.method === "skipped_by_operator") {
+      return metadata.database.cannotRestoreReason ?? "ledger snapshot skipped by operator size bound";
+    }
     if (metadata.present.database) {
       const database = regularFile(path.join(directory, "database"));
       if (!database) return "its database copy is missing";
@@ -1553,8 +1630,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         method: snapshot.method ?? "unrecorded" as const,
         restoresVersion: snapshot.restoresVersion,
         cannotRestoreReason: !snapshot.metadataValid ? "snapshot metadata is unreadable"
-          : snapshot.restoresVersion === null ? "no earlier runtime was recorded"
-          : unusable.get(decision.id) ?? null,
+          : unusable.get(decision.id) ?? (snapshot.restoresVersion === null ? "no earlier runtime was recorded" : null),
         operationState: decision.state,
         retention: decision.keep || pendingRestore ? "keep" as const : "prune" as const,
         reason: pendingRestore && (!decision.keep || pendingSnapshots.has(decision.id)) ? "pending_restore" as const : decision.reason,

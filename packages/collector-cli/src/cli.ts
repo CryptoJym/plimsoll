@@ -227,6 +227,8 @@ import {
 import {
   formatSnapshotInventory,
   lifecycleRetentionKeepAll,
+  lifecycleSnapshotDatabaseMaxBytes,
+  lifecycleCommandExitCode,
   runLifecycleCommand,
   runLifecycleSnapshotCommand,
 } from "./lifecycle-command";
@@ -612,7 +614,7 @@ Config tools:
   unload-launch-agent
   uninstall-launch-agent [--unload] [--dry-run]
   purge-local-data [--confirm] [--include-config]
-  lifecycle update --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V [--retention keep-all] [--readiness-timeout-ms MS]
+  lifecycle update --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V [--retention keep-all] [--readiness-timeout-ms MS] [--snapshot-database-max-bytes N]
   lifecycle rollback --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V [--retention keep-all]
       Stage the digest-verified bundle (plus its vendored native dependencies)
       into the immutable versions/VERSION/darwin-ARCH runtime, repoint the owned
@@ -636,13 +638,20 @@ Config tools:
   lifecycle support-bundle --operation-id ID
       Sanitized, bounded diagnostics: versions, coarse readiness, counters,
       aggregate log codes. No paths, prompts, tokens, or secrets.
-  lifecycle update --preflight
+  lifecycle captures redact [--operation-id ID]
+      Redact credential fields in old capture-config-*.json diagnostics in
+      place. Prints a receipt listing file names and field names only.
+  lifecycle update --preflight [--snapshot-database-max-bytes N]
       Read-only check (writes nothing) to run BEFORE stopping the collector for
       an update: the snapshot method the update will use and the free space it
       needs. Exits 1 when a full ledger copy is needed and the volume lacks
       twice the ledger size (snapshot plus a rollback's copy) plus
       max(2 GiB, 5%). Clone-capable volumes need no copy space. The update
-      itself refuses while any other process has the ledger open.
+      itself refuses while any other process has the ledger open. A clone
+      shares blocks with the live ledger: every page rewritten afterward costs
+      new space until the clone is removed or moved to another volume. The
+      optional byte bound skips the database copy above ledger + WAL size;
+      rollback then restores runtime/config/service and preserves the ledger.
   lifecycle pairing-indexes [--apply]
       Preview index readiness, or build the three Codex usage pairing indexes
       while the collector is stopped and producers spool. Refuses an open or
@@ -7748,8 +7757,8 @@ async function main() {
 
   if (command === "lifecycle") {
     const action = process.argv[3] ?? "";
-    if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots", "pairing-indexes"].includes(action)) {
-      throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots|pairing-indexes");
+    if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots", "pairing-indexes", "captures"].includes(action)) {
+      throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots|pairing-indexes|captures");
     }
     if (action === "pairing-indexes") {
       if (process.argv.slice(4).some((arg) => arg !== "--apply") ||
@@ -7793,10 +7802,12 @@ async function main() {
     }
     // Checked before any action runs, so a misplaced or mistyped --retention never falls back to pruning.
     const keepAll = lifecycleRetentionKeepAll([action, ...process.argv.slice(4)]);
+    const snapshotDatabaseMaxBytes = lifecycleSnapshotDatabaseMaxBytes(
+      [action, ...process.argv.slice(4)], config.snapshotDatabaseMaxBytes);
     if (action === "snapshots" || (action === "update" && flag("--preflight"))) {
       const result = await runLifecycleSnapshotCommand({
         argv: [action, ...process.argv.slice(4)],
-        adapter: composeLifecycleAdapter(),
+        adapter: composeLifecycleAdapter({ snapshotDatabaseMaxBytes }),
       });
       if (result.kind === "list" && !flag("--json")) {
         console.log(formatSnapshotInventory(result.snapshots));
@@ -7836,7 +7847,8 @@ async function main() {
       () => releaseStopWindowListener(config.port, resolveCollectorHome().home),
       () => runLifecycleCommand({
         argv: [action, ...process.argv.slice(4)],
-        adapter: composeLifecycleAdapter({ keepAll }),
+        adapter: composeLifecycleAdapter({ keepAll, snapshotDatabaseMaxBytes }),
+        resumeExecutable: [process.execPath, ...process.execArgv, fs.realpathSync(process.argv[1]!)],
         resolveArtifact,
         beforeRuntimeSwitch: artifact =>
           assertReplacementRuntimeCompatible(collectorBufferPath(), artifact.version),
@@ -7846,6 +7858,7 @@ async function main() {
           : {}),
       }));
     console.log(JSON.stringify(result, null, 2));
+    process.exitCode = lifecycleCommandExitCode(result);
     if (releaseError) {
       console.error(`stop_window_release_failed: ${releaseError.message}`);
       process.exitCode = 1;

@@ -99,7 +99,7 @@ export function snapshotHeadroomBytes(ledgerBytes: number) {
   return Math.max(2 * 1024 ** 3, Math.ceil(ledgerBytes * 0.05));
 }
 
-export type LifecycleSnapshotMethod = "clone" | "online_backup";
+export type LifecycleSnapshotMethod = "clone" | "online_backup" | "skipped_by_operator";
 
 /** Why a snapshot was not an APFS clone of the quiesced ledger. */
 export type LifecycleCloneFallback =
@@ -116,6 +116,7 @@ export type LifecycleSnapshotRecord = {
   quiesced: boolean;
   cloneFallback: LifecycleCloneFallback | null;
   databaseBytes: number;
+  cannotRestoreReason?: string;
 };
 
 /**
@@ -124,7 +125,8 @@ export type LifecycleSnapshotRecord = {
  * snapshot held no ledger, so any live ledger was removed.
  */
 export type LifecycleRestoreRecord = {
-  method: "clone" | "copy" | "none";
+  method: "clone" | "copy" | "none" | "skipped_by_operator";
+  cannotRestoreReason?: string;
   cloneFallback: "clone_unsupported" | null;
   databaseBytes: number;
   /**
@@ -136,7 +138,7 @@ export type LifecycleRestoreRecord = {
 
 /** Why a rollback left the live ledger untouched instead of restoring it. */
 export type LifecycleRestoreRefusalRecord = {
-  reason: "insufficient_free_space" | "integrity_check_failed" | "ledger_in_use" | "quiescence_unproven";
+  reason: "insufficient_free_space" | "integrity_check_failed" | "ledger_in_use" | "quiescence_unproven" | "snapshot_database_missing";
   requiredFreeBytes: number | null;
   freeBytes: number | null;
 };
@@ -158,7 +160,11 @@ export type LifecycleRefusal = {
 };
 
 /** Update --preflight: the snapshot the next update will take once the collector is stopped. */
+export const LIFECYCLE_CLONE_COST = "A clone shares blocks with the live ledger: every page rewritten afterward costs new space until the clone is removed or moved to another volume.";
+
 export type LifecycleSnapshotPlan = {
+  cloneCost?: string;
+  cannotRestoreReason?: string;
   method: LifecycleSnapshotMethod | "none";
   cloneCapable: boolean;
   ledgerBytes: number;
@@ -389,8 +395,8 @@ export type LifecycleReceipt = {
   schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
   toolVersion: string;
   operationId: string;
-  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle" | "snapshots_prune" | "snapshots_reconcile";
-  status: "completed" | "rolled_back" | "rollback_required" | "preview" | "purged" | "generated" | "refused";
+  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle" | "snapshots_prune" | "snapshots_reconcile" | "captures_redact";
+  status: "completed" | "rolled_back" | "rollback_required" | "preview" | "purged" | "generated" | "refused" | "interrupted";
   fromVersion: string | null;
   toVersion: string | null;
   restoredVersion: string | null;
@@ -399,6 +405,11 @@ export type LifecycleReceipt = {
   retainedTargets: readonly LifecycleRetainedTarget[];
   purgeOnlyTargets: readonly LifecyclePurgeOnlyTarget[];
   preserved: readonly ("ledger" | "history" | "credentials" | "workspace_membership")[];
+  /** Interrupted operations remain resumable; these fields contain no credentials. */
+  captureRedaction?: Array<{ file: string; fields: string[] }>;
+  phase?: LifecyclePhase;
+  reason?: string;
+  resumeCommand?: string;
   /** Update/rollback: how the operation's rollback snapshot was taken. */
   snapshot?: LifecycleSnapshotRecord;
   /** Completed update/rollback and snapshots_prune: what retention removed (names and bytes only). */
@@ -473,6 +484,9 @@ export type LifecycleAdapter = {
   /** Adapters that know how the ledger was restored return it for the receipt. */
   restore(snapshotId: string, operationId?: string): Promise<void | LifecycleRestoreRecord>;
   persistReceipt(receipt: LifecycleReceipt): Promise<void>;
+  /** Observation only: a unique interruption receipt never claims completion or rewrites the journal. */
+  persistInterruptionReceipt?(receipt: LifecycleReceipt): Promise<void>;
+  redactCaptures?(operationId: string): Promise<LifecycleReceipt>;
   uninstallOwned(input: { apply: boolean }): Promise<readonly string[]>;
   purgeOwnedData(input: { apply: boolean; confirmation: string | null }): Promise<readonly string[]>;
   supportSnapshot(): Promise<LifecycleSupportSnapshot>;
@@ -512,6 +526,7 @@ export type LifecycleAdapter = {
 
 export class LifecycleInterruption extends Error {
   readonly code = "LIFECYCLE_INTERRUPTED";
+  journal?: LifecycleJournal;
 }
 
 function snapshotRefusalMessage(refusal: LifecycleRefusal) {
@@ -551,6 +566,7 @@ const RESTORE_REFUSAL_MESSAGES: Record<Exclude<LifecycleRestoreRefusalRecord["re
   ledger_in_use: "another process has the live ledger open and could keep writing to the replaced file " +
     "(ledger_in_use); stop the collector service and every plimsoll command",
   quiescence_unproven: "the live ledger could not be locked exclusively (quiescence_unproven)",
+  snapshot_database_missing: "the recorded database snapshot is missing; move it back before retrying; the live ledger was left untouched",
 };
 
 /** Thrown by a ledger restore that changed nothing live; the rollback stays resumable. */
@@ -917,18 +933,21 @@ function isIdentifier(value: unknown): value is string {
 
 function validSnapshotRecord(value: unknown) {
   const record = ownPlainRecord(value);
-  if (!record || !exactKeys(record, ["method", "quiesced", "cloneFallback", "databaseBytes"])) return false;
-  if (record.method !== "clone" && record.method !== "online_backup" && record.method !== null) return false;
+  if (!record || !exactKeys(record, ["method", "quiesced", "cloneFallback", "databaseBytes"], ["cannotRestoreReason"])) return false;
+  if (record.method !== "clone" && record.method !== "online_backup" && record.method !== "skipped_by_operator" && record.method !== null) return false;
   if (typeof record.quiesced !== "boolean" || !nonnegativeInteger(record.databaseBytes)) return false;
   if (!CLONE_FALLBACK_VALUES.includes(record.cloneFallback as LifecycleCloneFallback | null)) return false;
+  if (record.method === "skipped_by_operator" ? typeof record.cannotRestoreReason !== "string" : "cannotRestoreReason" in record) return false;
   return record.method !== "clone" || (record.quiesced && record.cloneFallback === null);
 }
 
 export function validRestoreRecord(value: unknown) {
   const record = ownPlainRecord(value);
-  if (!record || !exactKeys(record, ["method", "cloneFallback", "databaseBytes"], ["integrity"])) return false;
+  if (!record || !exactKeys(record, ["method", "cloneFallback", "databaseBytes"], ["integrity", "cannotRestoreReason"])) return false;
   if (!nonnegativeInteger(record.databaseBytes)) return false;
   if ("integrity" in record && record.integrity !== "ok" && record.integrity !== "preexisting_damage") return false;
+  if (record.method === "skipped_by_operator") return record.cloneFallback === null && typeof record.cannotRestoreReason === "string";
+  if ("cannotRestoreReason" in record) return false;
   if (record.method === "clone" || record.method === "none") return record.cloneFallback === null;
   return record.method === "copy" && (record.cloneFallback === "clone_unsupported" || record.cloneFallback === null);
 }
@@ -1313,7 +1332,10 @@ export class LifecycleManager {
       await this.adapter.clearJournal(operationId);
       return await this.retainAfterCompletion(receipt);
     } catch (error) {
-      if (error instanceof LifecycleInterruption) throw error;
+      if (error instanceof LifecycleInterruption) {
+        if (journal) error.journal = { ...journal };
+        throw error;
+      }
       if (error instanceof LifecycleSnapshotRefusal && journal?.phase === "prepared") {
         await this.refuseBeforeChange(journal, error.refusal);
         throw error;
@@ -1339,7 +1361,7 @@ export class LifecycleManager {
   /** Read-only (creates nothing); takes no lock. Run before stopping the service for an update. */
   async preflightUpdate(): Promise<LifecycleSnapshotPlan> {
     if (!this.adapter.planSnapshot) throw new Error("this lifecycle adapter cannot plan snapshots");
-    return this.adapter.planSnapshot();
+    return { ...await this.adapter.planSnapshot(), cloneCost: LIFECYCLE_CLONE_COST };
   }
 
   /** Read-only; takes no lock and writes nothing. */

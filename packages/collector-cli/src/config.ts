@@ -55,18 +55,23 @@ export class CollectorPrivacyModeError extends Error {
   }
 }
 
+/** Credential names have one schema source, also used by value-blind lifecycle redaction. */
+export const collectorSecretConfigSchema = z.object({
+  ingestKey: z.string().trim().min(1).optional(),
+  uploadSigningSecret: z.string().trim().min(16).optional(),
+  installKey: z.string().trim().min(1).default("local-dev"),
+});
+
 export const collectorConfigSchema = z
   .object({
     port: z.number().int().min(1024).max(65535).default(DEFAULT_COLLECTOR_PORT),
-    ingestKey: z.string().trim().min(1).optional(),
-    uploadSigningSecret: z.string().trim().min(16).optional(),
+    ...collectorSecretConfigSchema.shape,
     uploadUrl: z.string().url().optional(),
     /** Authenticated non-event contact endpoint advertised by newer clouds. */
     installContactEndpoint: z.string().url().optional(),
     accountActorSaltEndpoint: z.string().url().optional(),
     tenantId: z.string().trim().min(1).default(LOCAL_TENANT_ID),
     workspaceName: z.string().trim().min(1).max(200).optional(),
-    installKey: z.string().trim().min(1).default("local-dev"),
     /** Report the bounded macOS computer name in install contacts. */
     reportMachineName: z.boolean().default(true),
     /** Stable local activation identity; never replaced by a hosted id. */
@@ -82,6 +87,8 @@ export const collectorConfigSchema = z
      * `studio0_scale` host derives its raw retention from its ledger budget
      * (retention-policy.ts) whenever `retentionDays` is still the default. */
     retentionDaysPinned: z.boolean().default(false),
+    /** Omitted: no bound. Above this measured ledger + WAL size, snapshot config/service only. */
+    snapshotDatabaseMaxBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
     startupWalCheckpointBytes: z.number().int().min(1).max(100 * 1024 * 1024 * 1024)
       .default(1024 * 1024 * 1024),
     captureRoots: z.array(captureRootSchema).max(64).optional().superRefine((roots, ctx) => {

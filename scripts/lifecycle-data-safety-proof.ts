@@ -16,6 +16,7 @@ import { createProofCompletion } from "./lib/proof-completion";
  * another. The run fails if any check fails.
  */
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -2266,10 +2267,20 @@ async function r3CrashLeftovers() {
       calls.push({ connection: this, source: source.replace(/\s+/g, " ").trim() });
       return original.call(this, source, ...rest);
     };
+    // The snapshot checkpoint now runs on a worker; observe its actual pragma
+    // calls too, preserving the same stable-storage-before-checkpoint assertion.
+    const database = new SqliteLedgerSnapshotAdapter({ quiesceWorker: (source, options) => {
+      const worker = new Worker(source.replace('connection.pragma("locking_mode = EXCLUSIVE");',
+        'const originalPragma = connection.pragma.bind(connection); connection.pragma = (source, ...rest) => { parentPort.postMessage({ proofPragma: source }); return originalPragma(source, ...rest); }; connection.pragma("locking_mode = EXCLUSIVE");'), options);
+      worker.on("message", (message: { proofPragma?: string }) => {
+        if (message.proofPragma) calls.push({ connection: worker, source: message.proofPragma });
+      });
+      return worker;
+    } });
     let failed: Awaited<ReturnType<typeof rejection>> = null;
     try {
       fixture.service.failReadiness = true;
-      failed = await rejection(() => fixture.manager().update({ operationId: "f2", artifact: fixture.artifact("10.1.2") }));
+      failed = await rejection(() => fixture.manager(database).update({ operationId: "f2", artifact: fixture.artifact("10.1.2") }));
     } finally {
       prototype.pragma = original;
       fixture.service.failReadiness = false;

@@ -39,6 +39,7 @@
     "proof:weekly-tool-stats-oversize": "tsx scripts/weekly-tool-stats-oversize-proof.ts",
     "proof:weekly-tool-stats-reader": "tsx scripts/weekly-tool-stats-reader-proof.ts",
     "proof:runtime-facts": "tsx scripts/runtime-facts-proof.ts",
+    "proof:lifecycle-update-recovery": "tsx scripts/run-proof.ts scripts/lifecycle-update-recovery-proof.ts",
     "proof:lifecycle": "tsx scripts/lifecycle-proof.ts",
     "proof:lifecycle-fence": "tsx scripts/lifecycle-fence-proof.ts",
     "proof:lifecycle-operator": "tsx scripts/run-proof.ts scripts/lifecycle-operator-proof.ts",

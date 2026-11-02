@@ -1,6 +1,7 @@
 import { otherProcessesWithFilesOpen, type OpenHandleCheck } from "./ledger-open-handles";
 export { otherProcessesWithFilesOpen, type OpenHandleCheck } from "./ledger-open-handles";
 import { openLedgerDatabase, openLedgerCopyDatabase, ledgerConnectionWorkerSource } from "./ledger-connection";
+import { quiesceLedgerOffThread, type QuiesceWorkerFactory } from "./lifecycle-quiesce";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -107,6 +108,7 @@ export type ComposeLifecycleAdapterOptions = {
   database?: LifecycleDatabaseAdapter;
   /** `--retention keep-all`: the operation removes no snapshot, runtime, trash entry or receipt. */
   keepAll?: boolean;
+  snapshotDatabaseMaxBytes?: number;
 };
 
 function sha256File(file: string): `sha256:${string}` {
@@ -1277,44 +1279,6 @@ async function discardLedger(destination: string, openHandles: OpenHandleCheck, 
  * frame into the database file and empties the WAL: the database file alone
  * is then the complete ledger, and nothing can change it until close.
  */
-function quiesceLedger(source: string, openHandles: OpenHandleCheck):
-  | { connection: InstanceType<typeof Database> }
-  | { fallback: LifecycleCloneFallback } {
-  let connection: InstanceType<typeof Database>;
-  try {
-    connection = openLedgerDatabase(source, { fileMustExist: true, timeout: 0 }, true);
-  } catch {
-    return { fallback: "quiescence_unproven" };
-  }
-  try {
-    connection.pragma("locking_mode = EXCLUSIVE");
-    connection.exec("BEGIN EXCLUSIVE");
-    connection.exec("COMMIT");
-    // Opened but unused connections hold no lock; only lsof can see them.
-    const elsewhere = openElsewhere(source, openHandles);
-    if (elsewhere) {
-      connection.close();
-      return { fallback: elsewhere };
-    }
-    if (connection.pragma("journal_mode", { simple: true }) !== "wal") {
-      connection.close();
-      return { fallback: "ledger_not_wal" };
-    }
-    // The ledger file must be on stable storage before the WAL is emptied: a
-    // plain fsync on macOS leaves both in the drive's cache, in any order.
-    connection.pragma("checkpoint_fullfsync = ON");
-    const [checkpoint] = connection.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
-    if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== 0 || regularFileBytes(`${source}-wal`) !== 0) {
-      connection.close();
-      return { fallback: "wal_not_empty" };
-    }
-    return { connection };
-  } catch (error) {
-    connection.close();
-    return { fallback: sqliteBusy(error) ? "ledger_in_use" : "quiescence_unproven" };
-  }
-}
-
 /**
  * Production ledger snapshots. When no other connection has the ledger open
  * (the managed update stops the collector first), the snapshot is an APFS
@@ -1332,6 +1296,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
 
   private readonly integrityCheck: LedgerIntegrityCheck;
   private readonly openHandles: OpenHandleCheck;
+  private readonly quiesceWorker?: QuiesceWorkerFactory;
 
   constructor(options: {
     clone?: FileCloner;
@@ -1339,15 +1304,17 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     freeBytes?: (directory: string) => number;
     integrityCheck?: LedgerIntegrityCheck;
     openHandles?: OpenHandleCheck;
+    quiesceWorker?: QuiesceWorkerFactory;
   } = {}) {
     this.clone = options.clone ?? cloneFileOrFail;
     this.cloneSupported = options.cloneSupported ?? volumeSupportsClone;
     this.freeBytes = options.freeBytes ?? volumeFreeBytes;
     this.integrityCheck = options.integrityCheck ?? integrityCheckOffThread;
     this.openHandles = options.openHandles ?? otherProcessesWithFilesOpen;
+    this.quiesceWorker = options.quiesceWorker;
   }
 
-  async snapshot(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<LifecycleDatabaseSnapshot> {
+  async snapshot(input: { source: string; destination: string; guard?: LifecycleFenceGuard; maxBytes?: number }): Promise<LifecycleDatabaseSnapshot> {
     // Before free space is measured: a crashed byte-copy restore's leftover.
     removeRestoreTemporaries(input.source);
     if (!fs.existsSync(input.source)) {
@@ -1355,7 +1322,8 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     }
     removeSqliteFiles(input.destination);
     input.guard?.keepAlive();
-    const quiesced = quiesceLedger(input.source, this.openHandles);
+    const measuredBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
+    const quiesced = await quiesceLedgerOffThread(input.source, this.openHandles, input.guard, this.quiesceWorker);
     if ("fallback" in quiesced && (quiesced.fallback === "ledger_in_use" || quiesced.fallback === "quiescence_unproven")) {
       // A rollback of this update would have to replace the ledger while that
       // connection could keep writing to the replaced file. Refuse first.
@@ -1371,19 +1339,28 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
       });
     }
     let cloneFallback: LifecycleCloneFallback;
-    if ("connection" in quiesced) {
+    if ("close" in quiesced) {
       try {
+        input.guard?.assertCurrent();
+        if (input.maxBytes !== undefined && measuredBytes > input.maxBytes) {
+          return { present: false, method: "skipped_by_operator", quiesced: true, cloneFallback: null,
+            databaseBytes: measuredBytes, cannotRestoreReason: "ledger snapshot skipped by operator size bound" };
+        }
         if (isCloneEvidence(this.clone(input.source, input.destination)) && isCloneResult(input.source, input.destination)) {
           fs.chmodSync(input.destination, 0o600);
           return { present: true, method: "clone", quiesced: true, cloneFallback: null };
         }
       } finally {
-        quiesced.connection.close();
+        await quiesced.close();
       }
       fs.rmSync(input.destination, { force: true });
       cloneFallback = "clone_unsupported";
     } else {
       cloneFallback = quiesced.fallback;
+    }
+    if (input.maxBytes !== undefined && measuredBytes > input.maxBytes) {
+      return { present: false, method: "skipped_by_operator", quiesced: true, cloneFallback,
+        databaseBytes: measuredBytes, cannotRestoreReason: "ledger snapshot skipped by operator size bound" };
     }
     const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
     const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
@@ -1401,7 +1378,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
       });
     }
     await this.backup.snapshot(input);
-    return { present: true, method: "online_backup", quiesced: "connection" in quiesced, cloneFallback };
+    return { present: true, method: "online_backup", quiesced: "close" in quiesced, cloneFallback };
   }
 
   restore(input: { source: string; destination: string; guard?: LifecycleFenceGuard }): Promise<LifecycleDatabaseRestore> {
@@ -1423,7 +1400,7 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
    * snapshot directory, otherwise a full copy that needs room for itself and
    * for a rollback's copy. Creates, changes and removes nothing.
    */
-  async plan(input: { source: string; destination: string }): Promise<LifecycleSnapshotPlan> {
+  async plan(input: { source: string; destination: string; maxBytes?: number }): Promise<LifecycleSnapshotPlan> {
     const freeBytes = this.freeBytes(nearestExistingDirectory(input.destination));
     if (!fs.existsSync(input.source)) {
       return {
@@ -1434,10 +1411,12 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
     const cloneCapable = this.cloneSupported(input.source, input.destination);
     const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
     const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
-    const requiredFreeBytes = cloneCapable ? 0 : fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes);
+    const skipped = input.maxBytes !== undefined && ledgerBytes > input.maxBytes;
+    const requiredFreeBytes = cloneCapable || skipped ? 0 : fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes);
     const ok = freeBytes >= requiredFreeBytes;
     return {
-      method: cloneCapable ? "clone" : "online_backup",
+      method: skipped ? "skipped_by_operator" : cloneCapable ? "clone" : "online_backup",
+      ...(skipped ? { cannotRestoreReason: "ledger snapshot skipped by operator size bound" } : {}),
       cloneCapable,
       ledgerBytes,
       headroomBytes,
@@ -1542,5 +1521,5 @@ export function composeLifecycleAdapter(options: ComposeLifecycleAdapterOptions 
     options.authorityRoot ?? defaultLifecycleAuthorityRoot(options.homeDir),
     ...(options.authorityLeaseMs !== undefined ? [{ defaultLeaseMs: options.authorityLeaseMs }] : []),
   );
-  return new FilesystemLifecycleAdapter(paths, service, database, authority, { keepAll: options.keepAll === true });
+  return new FilesystemLifecycleAdapter(paths, service, database, authority, { keepAll: options.keepAll === true, snapshotDatabaseMaxBytes: options.snapshotDatabaseMaxBytes });
 }

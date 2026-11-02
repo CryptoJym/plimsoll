@@ -1,12 +1,18 @@
 import { randomBytes } from "node:crypto";
+import { PLIMSOLL_VERSION } from "./version";
 
 import {
   LIFECYCLE_RETAINED_SNAPSHOTS,
+  LIFECYCLE_SCHEMA_VERSION,
+  LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+  LIFECYCLE_PURGE_ONLY_TARGETS,
+  LifecycleInterruption,
   PURGE_CONFIRMATION,
   LifecycleManager,
   lifecycleBoundaryStatement,
   type LifecycleAdapter,
   type LifecyclePairingIndexesRecord,
+  type LifecycleReceipt,
   type LifecycleSnapshotInventory,
   type RuntimeArtifact,
 } from "./lifecycle";
@@ -26,7 +32,7 @@ function keepOption(argv: readonly string[]) {
 }
 
 /** The only options `lifecycle update|rollback` take; each is followed by its value. */
-const UPDATE_VALUE_OPTIONS = ["--operation-id", "--artifact", "--artifact-version", "--readiness-timeout-ms", "--retention"];
+const UPDATE_VALUE_OPTIONS = ["--operation-id", "--artifact", "--artifact-version", "--readiness-timeout-ms", "--retention", "--snapshot-database-max-bytes"];
 
 /**
  * `--retention keep-all` (lifecycle update and rollback only): the operation
@@ -63,6 +69,25 @@ export function lifecycleRetentionKeepAll(argv: readonly string[]) {
   return true;
 }
 
+/** CLI and config share a nonnegative byte count; omitted means no bound. */
+export function lifecycleSnapshotDatabaseMaxBytes(argv: readonly string[], configured?: number) {
+  const indices = argv.flatMap((arg, index) => arg === "--snapshot-database-max-bytes" ? [index] : []);
+  if (indices.length > 1) throw new Error("--snapshot-database-max-bytes may be given only once");
+  if (indices.length === 0) return configured;
+  const raw = argv[indices[0]! + 1];
+  if (!raw || !/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw new Error("--snapshot-database-max-bytes requires a nonnegative safe integer byte count");
+  }
+  return Number(raw);
+}
+
+function shellWord(value: string) { return "'" + value.replace(/'/g, "'\"'\"'") + "'"; }
+
+/** Shared by the CLI and process-level proofs: incomplete operations cannot exit successfully. */
+export function lifecycleCommandExitCode(result: { receipt?: { status?: unknown } }) {
+  return ["interrupted", "rollback_required", "refused"].includes(String(result.receipt?.status)) ? 1 : 0;
+}
+
 /** Injectable command boundary used by the packaged installer. */
 export async function runLifecycleCommand(input: {
   argv: readonly string[];
@@ -71,6 +96,7 @@ export async function runLifecycleCommand(input: {
   beforeRuntimeSwitch?: (artifact: RuntimeArtifact) => void;
   readinessTimeoutMs?: number;
   pairingIndexes?: () => Promise<LifecyclePairingIndexesRecord>;
+  resumeExecutable?: readonly string[];
 }) {
   const [action] = input.argv;
   const operationId = option(input.argv, "--operation-id") ?? "";
@@ -83,9 +109,36 @@ export async function runLifecycleCommand(input: {
     const reference = option(input.argv, "--artifact");
     if (!reference) throw new Error(`${action} requires --artifact`);
     const artifact = await input.resolveArtifact(reference);
-    const receipt = action === "update"
-      ? await manager.update({ operationId, artifact })
-      : await manager.rollback({ operationId, artifact });
+    try {
+      const receipt = action === "update"
+        ? await manager.update({ operationId, artifact })
+        : await manager.rollback({ operationId, artifact });
+      return { receipt, boundary: lifecycleBoundaryStatement() };
+    } catch (error) {
+      if (!(error instanceof LifecycleInterruption) || !error.journal) throw error;
+      const journal = error.journal;
+      const receipt: LifecycleReceipt = {
+        schemaVersion: LIFECYCLE_SCHEMA_VERSION, toolVersion: PLIMSOLL_VERSION,
+        operationId: journal.operationId, operation: journal.kind, status: "interrupted",
+        phase: journal.phase, reason: error.message,
+        resumeCommand: [...(input.resumeExecutable ?? ["plimsoll"]), "lifecycle", ...input.argv].map(shellWord).join(" "),
+        fromVersion: journal.fromVersion, toVersion: journal.toVersion, restoredVersion: null,
+        health: null, ownedTargets: [], retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+        purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
+        preserved: ["ledger", "history", "credentials", "workspace_membership"],
+      };
+      try { await input.adapter.persistInterruptionReceipt?.(receipt); }
+      catch { receipt.reason += "; interruption receipt could not be persisted; retain this stdout receipt"; }
+      return { receipt, boundary: lifecycleBoundaryStatement() };
+    }
+  }
+  if (action === "captures" && input.argv[1] === "redact") {
+    for (let index = 2; index < input.argv.length; index += 1) {
+      if (input.argv[index] !== "--operation-id" || !input.argv[index + 1]) throw new Error("captures redact takes only --operation-id ID");
+      index += 1;
+    }
+    if (!input.adapter.redactCaptures) throw new Error("this lifecycle adapter cannot redact captures");
+    const receipt = await input.adapter.redactCaptures(operationId || `captures-redact-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`);
     return { receipt, boundary: lifecycleBoundaryStatement() };
   }
   if (action === "uninstall") {

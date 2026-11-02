@@ -278,6 +278,10 @@ jobs:
           pnpm --dir packages/collector-cli build
           pnpm proof:launch-agent-unload
 
+      - name: Prove long lifecycle checkpoints, interruption receipts, resume and snapshot bounds
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-update-recovery
+
       - name: Prove lifecycle receipts separate wrapper ownership and collector readiness (#148)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-readiness

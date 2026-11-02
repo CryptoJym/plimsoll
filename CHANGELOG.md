@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.7.54 — 2026-11-02
+
+The 2026-11-01 lifecycle incident applied a 12,555,559,952-byte WAL during
+quiescence for about eight minutes. The synchronous checkpoint prevented
+fence renewal; completion then lost its fence after the runtime had switched.
+
+- Quiescence and its TRUNCATE checkpoint run on a worker while the lifecycle
+  lease renews. The worker holds the exclusive SQLite lock through the clone
+  and exits before the operation proceeds. A lost fence still refuses further
+  mutation and leaves a resumable journal.
+- An interrupted update prints the normal JSON receipt envelope with
+  `status: interrupted`, phase, operation ID, reason and the exact resume
+  command, persists a uniquely named interruption receipt, and exits 1.
+  Retrying the original command with the same operation ID resumes from
+  `switched` or `verified` without snapshotting or switching again.
+- `--snapshot-database-max-bytes N` (config `snapshotDatabaseMaxBytes`) skips
+  the ledger snapshot above the measured ledger plus WAL size. Config and
+  service stay in the snapshot; its receipt and inventory report
+  `skipped_by_operator` and `cannotRestoreReason`. Automatic rollback restores
+  runtime, config and service while preserving the live ledger. No bound is
+  the default. A database file moved out of an ordinary snapshot is an explicit
+  restore refusal: move it back before resuming; no live ledger is removed.
+- Preflight explains that clones share blocks and cost new space for every
+  page rewritten until removed or moved to another volume. The large-ledger
+  runbook distinguishes explicit runtime rollback from an operation recovering
+  its own snapshot.
+- `lifecycle captures redact` rewrites existing `capture-config-*.json`
+  diagnostic captures using credential field names from the config schema,
+  with a durable receipt of file names and field names only. The legacy
+  diagnostic capture writer is absent from this release. Restorable config
+  backups retain their existing credential-preservation guarantee.
+- `proof:lifecycle-update-recovery` exercises the long checkpoint, nonzero
+  interruption process exit, both resume phases, clone bound, safe restore,
+  preflight and value-blind diagnostic redaction. Pairing-index warnings and
+  the stopped-service upgrade remain unchanged.
+
 ## 0.7.53 — 2026-11-01
 
 Incident: on the same `studio0_scale` host, eighteen minutes into the 0.7.52

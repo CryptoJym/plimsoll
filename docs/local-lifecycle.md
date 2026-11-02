@@ -139,6 +139,73 @@ cleanup. The canonical authority root is
 installs never acquire the mutation lease. No daemon, watcher, polling loop,
 credential movement, or hosted control surface is involved.
 
+## Interruptions and resuming (0.7.54)
+
+Quiescence opens SQLite and runs its TRUNCATE checkpoint on a worker. The
+main thread renews the lifecycle fence throughout; the worker keeps the
+exclusive lock until cloning finishes. A checkpoint can therefore take
+longer than one lease TTL without losing the fence.
+
+An interrupted update or rollback exits 1 and prints the existing JSON
+`{ "receipt": { ... }, "boundary": { ... } }` envelope. Its receipt has
+`status: "interrupted"`, `phase`, `operationId`, `reason`, and `resumeCommand`.
+A uniquely named `<operation-id>-interrupted-<nonce>.json` receipt is also
+written under `lifecycle/receipts/`; it cannot overwrite a successor's
+receipt, journal or completion marker. If disk receipt persistence fails,
+the stdout receipt says so; retain stdout. `snapshots list` continues to
+show `unfinished_operation`.
+
+Keep the collector stopped and execute `receipt.resumeCommand` exactly,
+including the same `--operation-id`, artifact and options. Do not invent a
+new ID or delete the journal. At `switched`, readiness runs again and the
+operation finishes; at `verified`, it verifies readiness again and commits
+its completion receipt. Neither phase takes another snapshot, stages
+another bundle, or switches again. Restart only after a completed receipt.
+A `rollback_required` journal retries restoration; a missing snapshot file
+must be moved back first.
+
+## Bounding the ledger snapshot (0.7.54)
+
+`lifecycle update --snapshot-database-max-bytes N` measures the database file
+plus its WAL before quiescence. If the measured size exceeds N, it keeps the
+config and service snapshot and records `snapshot.database.method` in
+`snapshot.json` as `"skipped_by_operator"`, with measured `bytes` and
+`cannotRestoreReason`. The stdout receipt has the same method, measured
+`databaseBytes`, and reason in `receipt.snapshot`; `snapshots list` also
+shows the reason. No `database` copy is created. The config key is
+`snapshotDatabaseMaxBytes`; an explicit CLI value overrides it. Omit both
+for the existing unbounded behavior; `0` skips every nonempty ledger.
+The option also applies to the snapshot taken by an explicit runtime
+rollback. Preflight accepts it and explains the clone's page rewrite cost.
+
+Quiescence is still required. If such an operation fails after switching,
+its automatic rollback restores runtime, config and service only, leaves
+the live ledger and all its sidecars untouched, and records
+`restore.method: "skipped_by_operator"` with `cannotRestoreReason`. This is
+an explicit choice to forgo ledger restoration; it is never interpreted as
+an originally absent ledger (`restore.method: "none"`). Use 0.7.54 or later
+to recover a journal whose snapshot skipped the database: older runtimes
+do not understand that distinction.
+
+## Redacting old diagnostic captures (0.7.54)
+
+Run `plimsoll lifecycle captures redact --operation-id redact-captures-001`.
+It replaces credential fields recursively in existing
+`lifecycle/capture-config-*.json` files with `[REDACTED]`, deriving the field
+names from `collectorSecretConfigSchema` (`installKey`, `ingestKey`,
+`uploadSigningSecret`). It never compares or logs credential values. A
+names-only receipt is durable before the first replacement and completed
+after all replacements; stdout prints that receipt in the normal envelope.
+Malformed, oversized, hard-linked or symlinked captures refuse before any
+replacement. An interruption is safe to rerun with a fresh redaction ID.
+The old diagnostic capture writer no longer exists in this source tree.
+
+Diagnostic captures are distinct from rollback snapshots' `config` files.
+Those private, mode-0600 backups still preserve the complete original
+config, including credentials, so rollback can restore them exactly;
+redacting those backups would weaken that guarantee. This command does not
+alter live config, credentials or restorable backups.
+
 ## Snapshots, retention and disk
 
 Every update or rollback first snapshots the collector config, the ledger
