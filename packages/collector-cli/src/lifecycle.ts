@@ -204,6 +204,8 @@ export type LifecycleRetentionRecord = {
   removedBytes: number;
   /** Removals an interrupted earlier retention left in the trash, finished now. */
   recovered: LifecycleRemovedItem[];
+  /** Explicitly confirmed rollback losses, including an interrupted removal recovered now. */
+  snapshotRemovals?: LifecycleSnapshotRemovalIntent[];
   /** Recorded trash entries restored to their original locations to preserve a usable way back. */
   restored?: LifecycleRemovedItem[];
   /** Read-only prune preview: pending recorded items and the attempted restore. */
@@ -217,6 +219,27 @@ export type LifecycleRetentionRecord = {
    */
   wouldRemove?: LifecycleRemovedItem[];
 };
+
+export type LifecycleSnapshotRemovalIntent = {
+  snapshotId: string;
+  bytes: number;
+  restoresVersion: string | null;
+  rollbackUnavailable: boolean;
+};
+
+export type LifecycleSnapshotRemovalResult = {
+  status: "preview" | "applied" | "refused";
+  refusal: string | null;
+  snapshot: LifecycleSnapshotRemovalIntent | null;
+  warnings: string[];
+  retention: LifecycleRetentionRecord | null;
+};
+
+export function snapshotRemovalWarnings(snapshot: LifecycleSnapshotRemovalIntent) {
+  return snapshot.rollbackUnavailable && snapshot.restoresVersion !== null
+    ? [`rollback to ${snapshot.restoresVersion} will no longer be possible from local lifecycle snapshots`]
+    : [];
+}
 
 /**
  * What `snapshots reconcile` found and did: names, counts and bytes only.
@@ -261,6 +284,8 @@ export type LifecycleReconcileRecord = {
 
 export type LifecycleSnapshotState = "completed" | "rolled_back" | "in_progress" | "rollback_required" | "unknown";
 export type LifecycleSnapshotRetentionReason =
+  | "removed_by_operator"
+  | "kept_by_targeted_removal"
   | "newest_completed"
   | "restores_previous_version"
   | "unfinished_operation"
@@ -274,6 +299,7 @@ export type LifecycleSnapshotRetentionReason =
   | "incomplete_snapshot"
   | "pending_restore";
 export type LifecycleVersionRetentionReason =
+  | "kept_by_targeted_removal"
   | "current"
   | "service_manifest"
   | "unfinished_operation"
@@ -389,7 +415,7 @@ export type LifecycleReceipt = {
   schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
   toolVersion: string;
   operationId: string;
-  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle" | "snapshots_prune" | "snapshots_reconcile";
+  operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle" | "snapshots_prune" | "snapshots_reconcile" | "snapshots_remove";
   status: "completed" | "rolled_back" | "rollback_required" | "preview" | "purged" | "generated" | "refused";
   fromVersion: string | null;
   toVersion: string | null;
@@ -417,6 +443,8 @@ export type LifecycleReceipt = {
   restoreRefusal?: LifecycleRestoreRefusalRecord;
   /** snapshots_reconcile: what was found and repaired. */
   reconcile?: LifecycleReconcileRecord;
+  /** Targeted removal preview and the explicitly acknowledged rollback boundary. */
+  snapshotRemoval?: LifecycleSnapshotRemovalResult;
   /** Completed update: best-effort stopped-service Codex pairing index upgrade. */
   pairingIndexes?: LifecyclePairingIndexesRecord;
 };
@@ -489,6 +517,8 @@ export type LifecycleAdapter = {
   planSnapshot?(): Promise<LifecycleSnapshotPlan>;
   /** Read-only: every snapshot and runtime version with its retention decision. */
   inspectSnapshots?(input: { keep: number }): Promise<LifecycleSnapshotInventory>;
+  /** Removes only a named completed snapshot; previews are entirely read-only. */
+  removeSnapshot?(input: { operationId: string; snapshotId: string; apply: boolean }): Promise<LifecycleSnapshotRemovalResult>;
   /**
    * Previews (apply false, read-only) or applies retention. Anything the
    * journal, an unknown operation, the installed state, the current pointer or
@@ -752,6 +782,16 @@ function assertBoundedIdentifier(value: string, label: string) {
   }
 }
 
+/** An explicit removal releases only its target, retaining every other snapshot and runtime. */
+export function planLifecycleSnapshotRemoval(input: LifecycleRetentionInput, snapshotId: string): LifecycleRetentionPlan {
+  const plan = planLifecycleRetention(input, LIFECYCLE_RETAINED_SNAPSHOTS);
+  return {
+    snapshots: plan.snapshots.map(row => ({ ...row, keep: row.id !== snapshotId,
+      reason: row.id === snapshotId ? "removed_by_operator" : "kept_by_targeted_removal" })),
+    versions: plan.versions.map(row => ({ ...row, keep: true, reason: "kept_by_targeted_removal" })),
+  };
+}
+
 export function validateRuntimeArtifact(artifact: RuntimeArtifact) {
   assertBoundedIdentifier(artifact.version, "version");
   if (artifact.platform !== "darwin") throw new Error("only darwin artifacts are supported");
@@ -937,10 +977,13 @@ function validRetentionRecord(value: unknown) {
   const record = ownPlainRecord(value);
   if (!record || !exactKeys(record, [
     "keepSnapshots", "status", "skippedReason", "removed", "removedBytes", "recovered", "keptSnapshots", "keptVersions",
-  ], ["wouldRemove", "restored"])) return false;
+  ], ["wouldRemove", "restored", "snapshotRemovals"])) return false;
   if (!nonnegativeInteger(record.keepSnapshots) || record.keepSnapshots < 1 ||
       record.keepSnapshots > LIFECYCLE_MAX_RETAINED_SNAPSHOTS) return false;
   if (!boundedList(record.removed, isRemovedItem) || !boundedList(record.recovered, isRemovedItem)) return false;
+  if ("snapshotRemovals" in record && (!boundedList(record.snapshotRemovals, validSnapshotRemovalIntent) ||
+      record.snapshotRemovals.some(intent => ![...record.removed as LifecycleRemovedItem[], ...record.recovered as LifecycleRemovedItem[]]
+        .some(item => item.kind === "snapshot" && item.name === intent.snapshotId && item.bytes === intent.bytes)))) return false;
   if ("restored" in record && (!boundedList(record.restored, isRemovedItem) || record.status !== "applied")) return false;
   if (!boundedList(record.keptSnapshots, isIdentifier) || !boundedList(record.keptVersions, isIdentifier)) return false;
   if (record.removedBytes !== record.removed.reduce((total, item) => total + item.bytes, 0)) return false;
@@ -954,6 +997,15 @@ function validRetentionRecord(value: unknown) {
   if (record.status === "applied") return record.skippedReason === null;
   return record.status === "skipped" && RETENTION_SKIPPED_REASONS.includes(record.skippedReason as string) &&
     record.removed.length === 0;
+}
+
+export function validSnapshotRemovalIntent(value: unknown): value is LifecycleSnapshotRemovalIntent {
+  const record = ownPlainRecord(value);
+  return record !== null && exactKeys(record, ["snapshotId", "bytes", "restoresVersion", "rollbackUnavailable"]) &&
+    isIdentifier(record.snapshotId) && nonnegativeInteger(record.bytes) &&
+    (record.restoresVersion === null || isIdentifier(record.restoresVersion)) &&
+    typeof record.rollbackUnavailable === "boolean" &&
+    (!record.rollbackUnavailable || record.restoresVersion !== null);
 }
 
 function validCompletedHealth(value: unknown, toVersion: string) {
@@ -1407,12 +1459,49 @@ export class LifecycleManager {
     }
   }
 
+  /** Read-only by default; apply requires exact confirmation and records any rollback loss. */
+  async removeSnapshot(input: { operationId: string; snapshotId: string; apply?: boolean; confirmation?: string }): Promise<{
+    receipt: LifecycleReceipt | null;
+    removal: LifecycleSnapshotRemovalResult;
+  }> {
+    assertBoundedIdentifier(input.operationId, "operationId");
+    assertBoundedIdentifier(input.snapshotId, "snapshot ID");
+    if (input.apply === true && input.confirmation !== input.snapshotId) {
+      throw new Error("snapshot removal requires --confirm-exact with the snapshot ID");
+    }
+    const remove = this.adapter.removeSnapshot?.bind(this.adapter);
+    if (!remove) throw new Error("this lifecycle adapter cannot remove a snapshot");
+    if (input.apply !== true) {
+      return { receipt: null, removal: await remove({ ...input, apply: false }) };
+    }
+    if (!(await this.adapter.acquireLock(input.operationId))) throw new Error("another lifecycle operation owns the lock");
+    try {
+      await this.assertFreshOperation(input.operationId);
+      await this.fence(input.operationId);
+      const removal = await remove({ ...input, apply: true });
+      const receipt: LifecycleReceipt = {
+        schemaVersion: LIFECYCLE_SCHEMA_VERSION, toolVersion: PLIMSOLL_VERSION,
+        operationId: input.operationId, operation: "snapshots_remove",
+        status: removal.status === "applied" ? "completed" : "refused",
+        fromVersion: await this.adapter.installedVersion().catch(() => null),
+        toVersion: null, restoredVersion: null, health: null,
+        ownedTargets: removal.status === "applied" ? ["lifecycle_snapshots"] : [],
+        retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS, purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
+        preserved: ["ledger", "history", "credentials", "workspace_membership"],
+        snapshotRemoval: removal, ...(removal.retention ? { retention: removal.retention } : {}),
+      };
+      await this.fence(input.operationId);
+      await this.adapter.persistReceipt(receipt);
+      if (removal.status === "applied") await this.adapter.commitRetention?.(input.operationId);
+      return { receipt, removal };
+    } finally {
+      await this.adapter.releaseLock(input.operationId);
+    }
+  }
+
   /**
-   * Dry run by default (read-only, no receipt). Apply holds the mutation lease,
-   * refuses while an interrupted operation awaits recovery, repairs what it
-   * can prove (or seals the order with the operator's keep-set) and records
-   * everything in a snapshots_reconcile receipt. It deletes no snapshot: the
-   * next prune or completed update does, with the usual removal records.
+   * Read-only by default. Apply repairs provable order evidence or seals the
+   * operator's keep-set under the mutation lease; it deletes no snapshot.
    */
   async reconcileSnapshots(input: { operationId: string; keep?: readonly string[]; apply?: boolean; force?: boolean }): Promise<{
     receipt: LifecycleReceipt | null;
