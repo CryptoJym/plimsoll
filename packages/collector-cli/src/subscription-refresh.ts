@@ -131,6 +131,12 @@ export function refreshSubscriptionTelemetry(options: { paths?: Partial<NativeSu
   const bankSourceRefresh=refreshStoredBankSource(home,options.now ?? new Date().toISOString());
   const db = new Database(paths.nativeSubscriptionDb,{timeout:1_000});
   fs.chmodSync(paths.nativeSubscriptionDb,0o600);
+  // Write-ahead log: one fsync per checkpoint instead of two per autocommit
+  // statement, and readers (the native snapshot, Lean) no longer wait on the
+  // writer. Under a saturated studio0 disk the rollback journal made a run of
+  // a few hundred small writes take minutes (sampled in unixWrite, 11-02).
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = NORMAL");
   try {
     const {inspection,receipt} = collectNativeTelemetry(db,options);
     const projectMetadataRefresh=enrichNativeProjectMetadata(db,{now:inspection.observedAt,

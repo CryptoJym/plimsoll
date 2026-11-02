@@ -27,7 +27,7 @@ const body=`<?xml version="1.0" encoding="UTF-8"?>
 <key>Label</key><string>${label}</string>
 <key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(entry)}</string></array>
 <key>RunAtLoad</key><true/><key>StartInterval</key><integer>60</integer>
-<key>ProcessType</key><string>Background</string>
+<key>ProcessType</key><string>Standard</string>
 <key>StandardOutPath</key><string>${xml(path.join(home,"subscription-native-refresh.log"))}</string>
 <key>StandardErrorPath</key><string>${xml(path.join(home,"subscription-native-refresh-errors.log"))}</string>
 </dict></plist>\n`;
