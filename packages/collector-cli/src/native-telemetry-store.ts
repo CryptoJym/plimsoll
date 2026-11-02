@@ -69,12 +69,23 @@ export function ensureNativeTelemetryStore(db: Database.Database): void {
   ]) if (!columns.has(column)) db.exec(`alter table native_thread_events add column ${column} ${definition}`);
   // Retain existing local candidates, including their evidence state. Old event
   // project_key values lack provenance and stay UNKNOWN until a bounded replay.
-  db.exec(`insert or ignore into native_project_link_evidence
-    select source,thread_id,project_key,project_label,state,evidence,updated_at,updated_at
-    from native_thread_projects where project_key is not null;
-    insert or ignore into native_event_project_evidence
-    select event_key,project_key,'UNKNOWN','legacy_unclassified' from native_thread_events
-    where project_key is not null and project_evidence is null`);
+  // This backfill scans every stored event, so it runs once per store and is
+  // recorded; a 1-minute service must not repeat a full-table scan each run
+  // (studio0 runs hung for hours in throttled I/O doing exactly that, 2026-10-31
+  // and 2026-11-01).
+  db.exec(`create table if not exists native_store_migrations (
+    name text primary key,applied_at text not null
+  )`);
+  const legacyBackfill = "legacy_project_evidence_backfill_v1";
+  if (!db.prepare("select 1 from native_store_migrations where name=?").get(legacyBackfill)) {
+    db.exec(`insert or ignore into native_project_link_evidence
+      select source,thread_id,project_key,project_label,state,evidence,updated_at,updated_at
+      from native_thread_projects where project_key is not null;
+      insert or ignore into native_event_project_evidence
+      select event_key,project_key,'UNKNOWN','legacy_unclassified' from native_thread_events
+      where project_key is not null and project_evidence is null`);
+    db.prepare("insert or ignore into native_store_migrations values (?,?)").run(legacyBackfill, new Date().toISOString());
+  }
 }
 
 function saveProjectCandidate(db: Database.Database, source: string, threadId: string,
