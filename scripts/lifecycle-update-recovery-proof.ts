@@ -8,6 +8,7 @@ import path from "node:path";
 import { Worker } from "node:worker_threads";
 
 import Database from "better-sqlite3";
+import { build } from "esbuild";
 
 import { collectorConfigSchema, collectorSecretConfigSchema } from "../packages/collector-cli/src/config";
 import { SqliteLedgerSnapshotAdapter } from "../packages/collector-cli/src/lifecycle-adapters";
@@ -18,7 +19,7 @@ import { LifecycleInterruption, LifecycleManager, parseCompletionReceipt, type L
 import { createProofCompletion } from "./lib/proof-completion";
 
 const childMode = process.argv.includes("--emit-interruption");
-const completion = childMode ? null : createProofCompletion("lifecycle-update-recovery", 16);
+const completion = childMode ? null : createProofCompletion("lifecycle-update-recovery", 17);
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "lifecycle-update-recovery-")));
 const digest = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const checks: Array<{ name: string; passed: boolean; detail?: unknown }> = [];
@@ -150,6 +151,30 @@ async function main() {
     assert.match(inventory.snapshots[0]!.cannotRestoreReason!, /skipped/);
     assert(parseCompletionReceipt(receipt, "skip-ledger"));
     return { measuredBytes: bytes, method: receipt.snapshot!.method, cannotRestoreReason: inventory.snapshots[0]!.cannotRestoreReason };
+  });
+  await check("actual_0_7_53_restore_refuses_a_skipped_database_without_reaching_discard", async () => {
+    const f = fixture("legacy-skip-refusal", 0);
+    await new LifecycleManager(f.adapter).update({ operationId: "legacy-skip", artifact: f.artifact("1.0.0") });
+    const source = spawnSync("git", ["show", "v0.7.53:packages/collector-cli/src/lifecycle-filesystem.ts"], { encoding: "utf8" });
+    assert.equal(source.status, 0, source.stderr);
+    const legacy = path.join(root, "legacy-0753-reader"); fs.mkdirSync(legacy);
+    fs.symlinkSync(path.resolve("node_modules"), path.join(legacy, "node_modules"), "dir");
+    const output = path.join(legacy, "reader.cjs");
+    await build({ stdin: { contents: source.stdout, resolveDir: path.resolve("packages/collector-cli/src"), sourcefile: "legacy-lifecycle-filesystem.ts", loader: "ts" },
+      bundle: true, platform: "node", format: "cjs", outfile: output, external: ["better-sqlite3"], logLevel: "silent" });
+    const { FilesystemLifecycleAdapter: LegacyAdapter } = createRequire(import.meta.url)(output);
+    const before = [f.paths.database, f.paths.collectorConfig, f.paths.serviceManifest].map(digest);
+    let discardCalls = 0;
+    const old = new LegacyAdapter(f.paths, { restore: async () => { throw new Error("legacy service must remain untouched"); } }, {
+      discard: async () => { discardCalls++; throw new Error("legacy would remove the live ledger"); },
+      restore: async () => { throw new Error("legacy database restore must remain untouched"); },
+    });
+    await assert.rejects(old.restore("legacy-skip"), /rollback database snapshot must be a regular file/);
+    assert.equal(discardCalls, 0); assert.deepEqual([f.paths.database, f.paths.collectorConfig, f.paths.serviceManifest].map(digest), before);
+    assert.equal(await f.adapter.installedVersion(), "1.0.0");
+    const metadata = JSON.parse(fs.readFileSync(path.join(f.paths.lifecycleRoot, "snapshots", "legacy-skip", "snapshot.json"), "utf8"));
+    assert.equal(metadata.present.database, true);
+    return { legacyVersion: "0.7.53", discardCalls, metadataDatabasePresent: true, legacySourceSha256: createHash("sha256").update(source.stdout).digest("hex") };
   });
   await check("skipped_snapshot_rollback_restores_runtime_config_service_and_preserves_live_ledger", async () => {
     const f = fixture("skip-rollback", 0);

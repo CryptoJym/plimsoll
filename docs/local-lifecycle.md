@@ -184,8 +184,11 @@ the live ledger and all its sidecars untouched, and records
 `restore.method: "skipped_by_operator"` with `cannotRestoreReason`. This is
 an explicit choice to forgo ledger restoration; it is never interpreted as
 an originally absent ledger (`restore.method: "none"`). Use 0.7.54 or later
-to recover a journal whose snapshot skipped the database: older runtimes
-do not understand that distinction.
+to recover a journal whose snapshot skipped the database. Its metadata keeps
+`present.database: true`: the ledger existed. Older readers therefore refuse
+the missing snapshot database before touching anything live; they cannot
+reach the originally-absent-ledger `none` path. The 0.7.54 reader recognizes
+the skip record and performs the limited runtime/config/service restore.
 
 ## Redacting old diagnostic captures (0.7.54)
 

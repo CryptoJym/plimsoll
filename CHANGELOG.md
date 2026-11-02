@@ -22,6 +22,9 @@ fence renewal; completion then lost its fence after the runtime had switched.
   runtime, config and service while preserving the live ledger. No bound is
   the default. A database file moved out of an ordinary snapshot is an explicit
   restore refusal: move it back before resuming; no live ledger is removed.
+  Skipped snapshots retain the metadata flag that a ledger existed: even the
+  actual 0.7.53 reader refuses their missing file before it can remove a live
+  ledger; 0.7.54 understands the limited restore.
 - Preflight explains that clones share blocks and cost new space for every
   page rewritten until removed or moved to another volume. The large-ledger
   runbook distinguishes explicit runtime rollback from an operation recovering
@@ -31,6 +34,8 @@ fence renewal; completion then lost its fence after the runtime had switched.
   with a durable receipt of file names and field names only. The legacy
   diagnostic capture writer is absent from this release. Restorable config
   backups retain their existing credential-preservation guarantee.
+- Quiescence handle probes disable address and service-name resolution in
+  `lsof`; they retain the all-process file search and fail-closed timeouts.
 - The worker-close proof inventories only its own process (workers share
   its file-descriptor table), avoiding a host-wide `lsof` scan on a shared
   runner while retaining its handle-count and exclusive-barrier assertions.

@@ -212,7 +212,7 @@ function isSnapshotMetadata(value: unknown): value is SnapshotMetadata {
   const currentPairValid =
     (row.currentVersion === null && row.currentExecutable === null) ||
     (isBoundedIdentifier(row.currentVersion) && typeof row.currentExecutable === "string" && path.isAbsolute(row.currentExecutable));
-  if (row.database?.method === "skipped_by_operator" && (present?.database !== false ||
+  if (row.database?.method === "skipped_by_operator" && (present?.database !== true ||
       !Number.isSafeInteger(row.database.bytes) || row.database.bytes < 0 ||
       row.database.quiesced !== true || typeof row.database.cannotRestoreReason !== "string")) return false;
   return row.schemaVersion === 1 && currentPairValid && Boolean(present) &&
@@ -792,10 +792,13 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       const database = typeof outcome === "boolean"
         ? { present: outcome, method: null, quiesced: false, cloneFallback: null }
         : outcome;
-      present.database = database.present;
+      // This flag also fences old readers: a ledger existed even when its
+      // copy was skipped. They must refuse the missing file, never interpret
+      // this as an originally absent ledger and remove the live database.
+      present.database = database.present || database.method === "skipped_by_operator";
       assertNoSymlink(snapshot, this.snapshotsRoot);
       let databaseBytes = 0;
-      if (present.database) {
+      if (database.present) {
         const databaseSnapshot = path.join(snapshot, "database");
         assertNoSymlink(databaseSnapshot, snapshot);
         const stat = fs.lstatSync(databaseSnapshot);

@@ -122,7 +122,7 @@ function ledgerConnectionRuntime(Sqlite: typeof Database, files: typeof fs, path
           const remainingMs = startupDeadlineMs === undefined ? 10_000
             : Math.floor(startupDeadlineMs - probeStarted);
           if (remainingMs <= 0) break;
-          const handles = children.spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...oldFiles],
+          const handles = children.spawnSync("/usr/sbin/lsof", ["-nP", "-S", "2", "-t", "-w", "--", ...oldFiles],
             { encoding: "utf8", timeout: remainingMs,
               ...(startupDeadlineMs === undefined ? {} : { killSignal: "SIGKILL" as const }), maxBuffer: 1024 * 1024,
               env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"] });

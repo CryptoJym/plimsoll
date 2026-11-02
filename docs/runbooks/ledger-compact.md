@@ -85,7 +85,9 @@ Config and service remain backed up. The receipt and `snapshots list`
 report `skipped_by_operator` and `cannotRestoreReason`. If the operation
 fails, its automatic rollback restores runtime, config and service only;
 it leaves the live ledger untouched and says so in `restore`. No bound is
-the default. Recover such a journal with 0.7.54 or later.
+the default. Recover such a journal with 0.7.54 or later. The metadata still
+says a database existed, so older readers refuse its missing file before
+touching the live ledger.
 
 When retaining a database snapshot, move its `database` file to an archive
 volume right after a healthy update on a large host. Keep `config`,

@@ -26,7 +26,9 @@ export const otherProcessesWithFilesOpen: OpenHandleCheck = (files) => {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const present = files.filter((file) => lstatIfPresent(file));
     if (present.length === 0) return [];
-    let result = spawnSync(LSOF, ["-S", "2", "-t", "-w", "--", ...present], {
+    // No address/service lookups while surveying a shared host. File and
+    // process coverage, timeout, and inconclusive-result refusals are unchanged.
+    let result = spawnSync(LSOF, ["-nP", "-S", "2", "-t", "-w", "--", ...present], {
       encoding: "utf8",
       env: { PATH: "/usr/bin:/bin:/usr/sbin" },
       stdio: ["ignore", "pipe", "pipe"],
