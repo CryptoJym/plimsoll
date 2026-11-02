@@ -137,6 +137,13 @@ export function refreshSubscriptionTelemetry(options: { paths?: Partial<NativeSu
   // a few hundred small writes take minutes (sampled in unixWrite, 11-02).
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
+  // The report groups and sorts every stored event; with SQLite's default 2 MiB
+  // page cache those temporary B-trees spilled a 50 MiB etilqs file to disk on
+  // every run (sampled in unixWrite under Statement::JS_all, studio0 11-02).
+  // Keep them in memory: a bounded 256 MiB cache for a process that lives
+  // seconds, once a minute.
+  db.pragma("temp_store = MEMORY");
+  db.pragma("cache_size = -262144");
   try {
     const {inspection,receipt} = collectNativeTelemetry(db,options);
     const projectMetadataRefresh=enrichNativeProjectMetadata(db,{now:inspection.observedAt,
