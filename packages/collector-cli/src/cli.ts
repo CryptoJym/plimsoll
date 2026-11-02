@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { openLedgerDatabase } from "./ledger-connection";
-import { AutomaticRetentionCadence, RETENTION_LARGE_BACKLOG_ROWS } from "./retention-cadence";
+import { AutomaticRetentionCadence, RETENTION_LARGE_BACKLOG_ROWS, RETENTION_WAL_PRESSURE_BYTES,
+  walPressureDefersRetention } from "./retention-cadence";
 import { claudeStatusLineCliMain } from "./claude-status-line-command";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
@@ -4223,6 +4224,7 @@ async function main() {
     // tables: acknowledged upload receipts past 30 days whose raw row is
     // gone, and orphan summary rows past retention.
     let largeBacklogCache: { at: number; value: boolean } | null = null;
+    let walPressureDeferring = false;
     retentionCadence = new AutomaticRetentionCadence(
       (request) => {
         const days = retentionPolicy().days;
@@ -4244,6 +4246,22 @@ async function main() {
         };
       },
       {
+        // 0.7.53: a reader that pins the WAL stops the checkpoint worker from
+        // copying anything back, and every pass then grows the file (incident
+        // of 2026-11-01: 1.4 GB to 12.6 GB in eighteen minutes). Defer passes
+        // while the pinned WAL is at or past the pressure bound; whatever
+        // holds it, the prune cannot outrun the checkpoint.
+        canRun: () => {
+          const checkpoint = walCheckpoint.status();
+          const deferring = walPressureDefersRetention(checkpoint);
+          if (deferring !== walPressureDeferring) {
+            walPressureDeferring = deferring;
+            console.warn(JSON.stringify({
+              warning: deferring ? "retention_deferred_wal_pressure" : "retention_resumed_wal_pressure_cleared",
+              walBytes: checkpoint.walBytes, heldByReader: checkpoint.heldByReader, limitBytes: RETENTION_WAL_PRESSURE_BYTES }));
+          }
+          return !deferring;
+        },
         passRows: { base: 128, max: 4_096, maxWriterMs: 250 },
         largeBacklog: () => {
           const at = Date.now();

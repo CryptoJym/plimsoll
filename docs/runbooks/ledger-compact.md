@@ -65,3 +65,7 @@ WAL on first open.
 one; it changes the installation epoch and is the tool when the old ledger must
 be retired. Compaction keeps the epoch, the rows and the receipts; it only gives
 back the pages retention has already freed.
+
+## Large ledgers and lifecycle snapshots
+
+`lifecycle update` and `lifecycle rollback` keep an APFS clone of the whole ledger as the operation's rollback snapshot (`lifecycle/snapshots/<operation-id>/database`); retention keeps the two newest and `snapshots prune` keeps at least one. A clone costs nothing until the live file's pages change, then one block per changed page. Under a retention catch-up most pages change, so on a ledger of this size the clone can take the whole free disk (2026-11-01: a 171 GB ledger, free disk falling about 1 GB a minute). Right after an update or rollback on such a host, move the snapshot's `database` file to another volume (keep `config`, `service` and `snapshot.json` in place and leave a `database.moved.json` note with the destination and the time). Undo: move it back. While the file is away, `lifecycle snapshots list` shows the snapshot as not restorable and a rollback cannot restore the ledger from it.

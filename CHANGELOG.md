@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.7.53 — 2026-11-01
+
+Incident: on the same `studio0_scale` host, eighteen minutes into the 0.7.52
+catch-up at 871 rows a second, the WAL grew from 1.4 GB to 12.6 GB and free
+disk fell toward zero. The checkpoint worker ran every 5 s and copied nothing
+back: the retention hold count (one `count(*)` over the 33 million rows past
+the cutoff, on a read-only worker with no deadline) held a read snapshot from
+the first status refresh on, and a snapshot pins every WAL frame written after
+it. The lifecycle update's APFS clone of the ledger would then have turned
+every checkpointed page into lost space.
+
+- The hold count reads in pages of 5,000 rows by `(created_at, id)` through
+  `idx_events_retention`, so no statement holds a snapshot for long, and gives
+  up after 30 s with `retention_hold_count_interrupted`; the next attempt
+  waits 10 minutes. The bounded 513-row sample stays the answer in between
+  (`heldForUploadExact: false`), as it did before an exact count arrived;
+  `retention.holdCount` in `/status` names the last interruption and the
+  remaining back-off.
+- Retention passes defer while a reader pins a WAL of 1 GiB or more
+  (`walCheckpoint.heldByReader` with `walBytes` at the bound): the cadence
+  counts them as `deferred`, logs `retention_deferred_wal_pressure` once and
+  `retention_resumed_wal_pressure_cleared` when the frames are copied back.
+  The prune can no longer outrun the checkpoint on a pinned WAL, whatever
+  holds it.
+- Operators of a large ledger: `lifecycle update` keeps an APFS clone of the
+  ledger as its rollback snapshot and `snapshots prune` keeps at least one.
+  Under heavy deletion the clone costs disk page by page; move the snapshot's
+  `database` file to another volume right after the update (runbook
+  `docs/runbooks/ledger-compact.md`, "Large ledgers and lifecycle snapshots").
+  A lifecycle option to skip the database clone above a size bound is a
+  follow-up.
+- Proof: `proof:collector-reliability` adds
+  `retention_hold_count_pages_its_read_and_stops_at_its_deadline` and
+  `retention_cadence_defers_while_a_reader_pins_a_large_wal` (20 checks).
+
 ## 0.7.52 — 2026-11-01
 
 Incident: on a `studio0_scale` host the ledger grew to 171 GB with raw

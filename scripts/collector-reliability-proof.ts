@@ -8,7 +8,8 @@ import type { AddressInfo } from "node:net";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
-import { AutomaticRetentionCadence } from "../packages/collector-cli/src/retention-cadence";
+import { AutomaticRetentionCadence, RETENTION_WAL_PRESSURE_BYTES, walPressureDefersRetention } from "../packages/collector-cli/src/retention-cadence";
+import { countRetentionHoldsOffThread } from "../packages/collector-cli/src/retention-hold-count";
 import { runRetentionDeletionStage } from "../packages/collector-cli/src/maintenance-stage-primitives";
 import { AutomaticMaintenanceCadence, CoalescingMaintenanceScheduler, CollectorMaintenance,
   automaticRepairServiceStatus, type MaintenanceRunOutcome } from "../packages/collector-cli/src/maintenance";
@@ -23,7 +24,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-reliability-"));
 const realNow = Date.now;
 const now = realNow();
 const checks: Array<{ name: string; passed: boolean; detail?: unknown; error?: string }> = [];
-const EXPECTED_CHECKS = 18;
+const EXPECTED_CHECKS = 20;
 let nextId = 0;
 function event() {
   return aiInteractionEventSchema.parse({
@@ -655,6 +656,76 @@ async function main() {
         return { delays, rested };
       } finally { cadence.stop(); }
     } finally { other.close(); buffer.close(); }
+  });
+  // 0.7.53: the exact hold count reads in pages and stops at its deadline, so
+  // no statement pins the WAL for long.
+  await check("retention_hold_count_pages_its_read_and_stops_at_its_deadline", async () => {
+    const buffer = fixture("hold-count");
+    try {
+      for (let i = 0; i < 2_400; i++) buffer.append(event());
+      buffer.database.prepare("update buffered_events set created_at='2000-01-01T00:00:00.000Z'").run();
+      const cutoff = "2001-01-01T00:00:00.000Z";
+      const expected = (buffer.database.prepare("select count(*) as n from buffered_events where created_at < ?")
+        .get(cutoff) as { n: number }).n;
+      const paged = countRetentionHoldsOffThread(buffer.database, cutoff, "e.input_tokens >= 0", { pageRows: 500 });
+      paged.worker.ref(); // the daemon keeps its loop alive; this script has nothing else running
+      const count = await paged.result;
+      await paged.exited;
+      assert.equal(count, expected);
+      assert.deepEqual({ pages: paged.progress()?.pages, rows: paged.progress()?.rows }, { pages: 5, rows: expected });
+      // A predicate that scans the table for every row cannot finish 2,400 rows inside the deadline.
+      const slow = countRetentionHoldsOffThread(buffer.database, cutoff,
+        "(select count(*) from buffered_events x where x.created_at <= e.created_at) >= 0", { pageRows: 200, maxMs: 20 });
+      slow.worker.ref();
+      const started = performance.now();
+      const outcome = await slow.result.then(() => "completed", (error: Error) => error.message);
+      const waitedMs = performance.now() - started;
+      await slow.exited;
+      assert.equal(outcome, "retention_hold_count_interrupted");
+      assert.ok(waitedMs < 10_000, `interrupted after ${waitedMs.toFixed(0)} ms`);
+      const seen = slow.progress();
+      assert.ok(seen && seen.pages >= 1 && seen.rows < expected, `stopped after ${JSON.stringify(seen)}`);
+      return { expected, pages: paged.progress()?.pages, interruptedAfterMs: Number(waitedMs.toFixed(0)),
+        pagesBeforeStop: seen?.pages, rowsBeforeStop: seen?.rows };
+    } finally { buffer.close(); }
+  });
+  // 0.7.53: while a reader pins a large WAL, the cadence defers instead of growing the file.
+  await check("retention_cadence_defers_while_a_reader_pins_a_large_wal", () => {
+    const bound = RETENTION_WAL_PRESSURE_BYTES;
+    assert.deepEqual([
+      walPressureDefersRetention(null), walPressureDefersRetention({ heldByReader: false, walBytes: bound * 4 }),
+      walPressureDefersRetention({ heldByReader: true, walBytes: bound - 1 }), walPressureDefersRetention({ heldByReader: true, walBytes: bound }),
+      walPressureDefersRetention({ heldByReader: true, walBytes: null }),
+    ], [false, false, false, true, false]);
+    const buffer = fixture("wal-pressure");
+    try {
+      for (let i = 0; i < 8; i++) buffer.append(event());
+      buffer.database.prepare("update buffered_events set created_at='2000-01-01T00:00:00.000Z'").run();
+      let checkpoint = { heldByReader: true, walBytes: bound * 2 };
+      let serial = 0;
+      const pending = new Map<number, { callback: () => void; delay: number }>();
+      const cadence = new AutomaticRetentionCadence(
+        (request) => buffer.prune(90, { maxRows: request.maxRows, busyTimeoutMs: 10 }),
+        { canRun: () => !walPressureDefersRetention(checkpoint), followupMs: 5_000, intervalMs: 60 * 60_000,
+          passRows: { base: 4, max: 8, maxWriterMs: 250 },
+          timer: { now: () => now,
+            setTimeout: (callback, delay) => { const id = ++serial; pending.set(id, { callback, delay }); return id; },
+            clearTimeout: handle => { pending.delete(handle as number); } } });
+      try {
+        cadence.start();
+        const run = () => { const [id, task] = pending.entries().next().value!; pending.delete(id); task.callback(); };
+        run();
+        assert.deepEqual({ deferred: cadence.status().counters.deferred, passes: cadence.status().counters.passes,
+          nextDelay: pending.values().next().value?.delay }, { deferred: 1, passes: 0, nextDelay: 5_000 });
+        run();
+        assert.equal(cadence.status().counters.deferred, 2);
+        checkpoint = { heldByReader: false, walBytes: 4_096 };
+        run();
+        assert.deepEqual({ passes: cadence.status().counters.passes, expired: cadence.status().counters.eventsExpired },
+          { passes: 1, expired: 4 });
+        return { deferred: 2, passes: 1 };
+      } finally { cadence.stop(); }
+    } finally { buffer.close(); }
   });
   await check("retention_backlog_of_half_a_million_rows_clears_in_bounded_passes", () => {
     const buffer = new LocalEventBuffer(path.join(root, "backlog.sqlite"));

@@ -32,7 +32,7 @@ import { ensureSessionContextIndexSchema } from "./session-context-index";
 import { ensureSessionSummarySchema } from "./session-summary";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { ensureUuidEventId, registerRetentionDeliveryId } from "./delivery-id";
-import { countRetentionHoldsOffThread } from "./retention-hold-count";
+import { countRetentionHoldsOffThread, RETENTION_HOLD_COUNT_BACKOFF_MS, RETENTION_HOLD_COUNT_INTERRUPTED } from "./retention-hold-count";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
@@ -280,6 +280,8 @@ export class LocalEventBuffer {
   private readonly retentionHoldWorkers = new Set<{ worker: Worker; exited: Promise<void> }>();
   private retentionHoldClose: Promise<void> | null = null;
   private retentionHoldCountDirty = false;
+  private retentionHoldCountRetryAfterMonotonic = 0;
+  private retentionHoldCountLastInterrupted: { at: string; rows: number; pages: number; elapsedMs: number } | null = null;
   private retentionHoldCountClosed = false;
   private retentionHoldGeneration = 0;
   private retentionHoldCountChanged: (() => void) | null = null;
@@ -3932,6 +3934,8 @@ export class LocalEventBuffer {
     }
     return {
       inspection: "bounded" as const,
+      holdCount: { lastInterrupted: this.retentionHoldCountLastInterrupted,
+        backoffMs: Math.max(0, Math.round(this.retentionHoldCountRetryAfterMonotonic - performance.now())) },
       policy: {retentionDays,cutoffAt},
       states: {retained:null,pendingDelivery:null,heldForUpload,quarantined:null,expired:pass.expired,notInspected:1},
       lastPass: {rowsVisited:pass.rowsVisited,rowsExpired:pass.rowsExpired,
@@ -3948,6 +3952,10 @@ export class LocalEventBuffer {
   refreshRetentionHoldCount(retentionDays = 90, now = new Date()): Promise<number> {
     if (this.retentionHoldCountClosed) return Promise.reject(new Error("retention_hold_count_closed"));
     if (this.retentionHoldTask) return this.retentionHoldTask.result;
+    // An interrupted count (0.7.53) waits before the ledger is asked again.
+    if (performance.now() < this.retentionHoldCountRetryAfterMonotonic) {
+      return Promise.reject(new Error("retention_hold_count_backoff"));
+    }
     const cutoffAt = new Date(now.getTime()-retentionDays*86_400_000).toISOString();
     const revision = this.retentionHoldRevision();
     const generation = this.retentionHoldGeneration;
@@ -3963,7 +3971,7 @@ export class LocalEventBuffer {
       }
       return Promise.resolve(count);
     }
-    const { worker, result, exited } = countRetentionHoldsOffThread(this.db, cutoffAt, this.rawRetentionUploadHoldSql());
+    const { worker, result, exited, progress } = countRetentionHoldsOffThread(this.db, cutoffAt, this.rawRetentionUploadHoldSql());
     const liveWorker = { worker, exited };
     this.retentionHoldWorkers.add(liveWorker);
     void exited.then(() => this.retentionHoldWorkers.delete(liveWorker));
@@ -3976,6 +3984,14 @@ export class LocalEventBuffer {
         this.retentionHoldCountChanged?.();
       }
       return count;
+    }, (error: unknown) => {
+      if (error instanceof Error && error.message === RETENTION_HOLD_COUNT_INTERRUPTED) {
+        const seen = progress();
+        this.retentionHoldCountRetryAfterMonotonic = performance.now() + RETENTION_HOLD_COUNT_BACKOFF_MS;
+        this.retentionHoldCountLastInterrupted = { at: new Date().toISOString(),
+          rows: seen?.rows ?? 0, pages: seen?.pages ?? 0, elapsedMs: Math.round(seen?.elapsedMs ?? 0) };
+      }
+      throw error;
     }).finally(() => {
       if (this.retentionHoldTask?.worker === worker) this.retentionHoldTask = null;
     });

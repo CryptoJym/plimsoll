@@ -166,3 +166,18 @@ export class AutomaticRetentionCadence {
     }
   }
 }
+
+/** Retention passes defer while a reader pins a WAL at least this large: a
+ * read snapshot pins every frame written after it, so the checkpoint worker
+ * copies nothing back and the file grows with every pass (incident of
+ * 2026-11-01: 1.4 GB to 12.6 GB in eighteen minutes at 871 rows a second). */
+export const RETENTION_WAL_PRESSURE_BYTES = 1024 * 1024 * 1024;
+
+/** True while the checkpoint worker reports a reader holding the WAL and the
+ * file is at or past `limitBytes`. */
+export function walPressureDefersRetention(
+  status: { heldByReader: boolean; walBytes: number | null } | null | undefined,
+  limitBytes = RETENTION_WAL_PRESSURE_BYTES,
+): boolean {
+  return Boolean(status && status.heldByReader && (status.walBytes ?? 0) >= limitBytes);
+}
