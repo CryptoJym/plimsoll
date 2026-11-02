@@ -259,3 +259,11 @@ collector never deletes them.
 
 If the restore command refuses, keep the daemon stopped and inspect its reason
 and the three paths. Do not hand the replacement pathname to an old runtime.
+
+## Giving space back without a cutover (0.7.52)
+
+When the goal is only to return the pages raw retention has already freed,
+keep the epoch and compact instead: `plimsoll ledger compact --into
+ABSOLUTE-PATH`, described in `docs/runbooks/ledger-compact.md`. The copy
+carries every row, so no week gate, archive manifest or epoch change is
+involved, and the old ledger stays aside for the one-step undo.

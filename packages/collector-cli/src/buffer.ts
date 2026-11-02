@@ -218,6 +218,40 @@ const EVENT_COLUMNS = [
 const enrollmentTimestampSchema = z.string().datetime({ offset: true });
 const installationEpochIdSchema = z.string().uuid();
 
+/** What one bounded raw-retention pass did. */
+export type RawRetentionPassReceipt = {
+  cutoff: string;
+  events: number;
+  metricSamples: number;
+  eventRowsVisited: number;
+  migrationProtectedRows: number;
+  metricRowsVisited: number;
+  hasMore: boolean;
+  madeProgress: boolean;
+  /** The writer was held by another connection past `busyTimeoutMs`; nothing changed. */
+  busy: boolean;
+  elapsedMs: number;
+};
+
+/** What one bounded pass over the secondary tables did. */
+export type SecondaryRetentionPassReceipt = {
+  uploadReceiptCutoff: string;
+  summaryRowCutoff: string;
+  uploadReceiptsVisited: number;
+  uploadReceiptsExpired: number;
+  summaryRowsVisited: number;
+  summaryRowsExpired: number;
+  hasMore: boolean;
+  madeProgress: boolean;
+  busy: boolean;
+  elapsedMs: number;
+};
+
+function isSqliteBusy(error: unknown) {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code.startsWith("SQLITE_BUSY");
+}
+
 export class LocalEventBuffer {
   private claudeReplayState: "inactive"|"pending"|"ready"|"timed_out"="inactive";
   private claudeReplayRootSetJson="[]";
@@ -474,6 +508,28 @@ export class LocalEventBuffer {
         expired_total integer not null default 0
       );
       insert or ignore into raw_retention_control (singleton)
+      values (1);
+      create table if not exists secondary_retention_receipts (
+        table_name text not null check (table_name in ('upload_receipts','session_sync_summary_rows')),
+        row_key text not null,
+        row_created_at text,
+        expired_at text not null,
+        reason text not null check (reason in ('acknowledged_receipt_window_elapsed','summary_row_raw_expired'))
+      );
+      create index if not exists idx_secondary_retention_receipts_table_expired
+        on secondary_retention_receipts (table_name, expired_at);
+      create table if not exists secondary_retention_control (
+        singleton integer primary key check (singleton = 1),
+        upload_receipts_expired_total integer not null default 0,
+        summary_rows_expired_total integer not null default 0,
+        upload_receipts_cursor integer not null default 0,
+        summary_rows_cursor integer not null default 0,
+        upload_receipts_sweep_completed_at text,
+        summary_rows_sweep_completed_at text,
+        last_run_at text,
+        last_has_more integer not null default 0
+      );
+      insert or ignore into secondary_retention_control (singleton)
       values (1);
       create table if not exists maintenance_stage_cursors (
         stage text primary key check (stage in (
@@ -3417,14 +3473,39 @@ export class LocalEventBuffer {
       and e.usage_duplicate_reason is null)`;
   }
 
+  /**
+   * One bounded raw-retention pass. `maxRows` bounds the page; `maxWriterMs`
+   * bounds the writer turn: once the budget is spent the pass stops after the
+   * row it is on, moves the cursor to that row and reports `hasMore`, so the
+   * rows it did not reach lead the next pass. `busyTimeoutMs` lowers this
+   * connection's busy timeout for the pass: a writer held by another
+   * connection past it yields a `busy` receipt (nothing read or written)
+   * instead of blocking the caller's event loop.
+   */
   prune(
     retentionDays = 90,
-    options: { maxRows?: number; now?: Date } = {},
-  ) {
+    options: {
+      maxRows?: number; now?: Date; maxWriterMs?: number; busyTimeoutMs?: number;
+      /** Monotonic milliseconds for the writer budget; tests inject one. */
+      clock?: () => number;
+    } = {},
+  ): RawRetentionPassReceipt {
+    const clock = options.clock ?? (() => performance.now());
+    const startedAt = clock();
     const requestedRows = Number.isFinite(options.maxRows) ? Math.trunc(options.maxRows!) : 1_000;
     const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
     const now = options.now ?? new Date();
     const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1_000).toISOString();
+    const maxWriterMs = Number.isFinite(options.maxWriterMs) && options.maxWriterMs! > 0
+      ? options.maxWriterMs! : Number.POSITIVE_INFINITY;
+    const overBudget = () => clock() - startedAt > maxWriterMs;
+    const elapsedMs = () => Math.round((clock() - startedAt) * 1_000) / 1_000;
+    const empty = (hasMore: boolean, madeProgress: boolean, busy: boolean): RawRetentionPassReceipt => ({
+      cutoff, events: 0, metricSamples: 0, eventRowsVisited: 0,
+      migrationProtectedRows: 0, metricRowsVisited: 0, hasMore, madeProgress, busy, elapsedMs: elapsedMs(),
+    });
+    const restoreBusyTimeout = this.lowerBusyTimeout(options.busyTimeoutMs);
+    try {
     // The ordinary retention cadence starts immediately and follows hasMore.
     // Keep repairing dead receipts between upload intervals without extending
     // any one writer turn beyond its existing 100 ms limit.
@@ -3433,11 +3514,7 @@ export class LocalEventBuffer {
     // more observations, defer this pass; the next call resumes at its durable
     // cursor. Every deletion also promotes its own observation atomically.
     const promotion=promoteLegacyClaudeRootSightings(this.db,maxRows);
-    if(!promotion.complete) return {
-      cutoff,events:0,metricSamples:0,eventRowsVisited:0,
-      migrationProtectedRows:0,metricRowsVisited:0,hasMore:true,
-      madeProgress:promotion.visited>0 || lineageRepair.visited>0,
-    };
+    if(!promotion.complete) return empty(true, promotion.visited>0 || lineageRepair.visited>0, false);
     // Seek through a bounded raw candidate page BEFORE checking migration.
     // A protected prefix must neither cause a full scan nor hide later rows.
     const scanKey = "raw_retention_scan_v1";
@@ -3479,8 +3556,14 @@ export class LocalEventBuffer {
       const removeRaw = this.db.prepare(`delete from buffered_events where rowid = ?`);
       let events = 0;
       let retirementPending = false;
+      let processed = 0;
+      let truncated = false;
       const expiredCandidates: typeof candidates = [];
       for (const row of candidates) {
+        // Yield the writer once the pass has spent its time budget. At least
+        // one row is visited per pass, so a pass always moves the cursor.
+        if (processed > 0 && overBudget()) { truncated = true; break; }
+        processed += 1;
         if (row.migrationProtected) { migrationProtectedRows += 1; continue; }
         if (row.workspaceId !== this.workspaceId || row.deviceId !== this.deviceId) {
           // Close one linked delivery per visit. A raw row with more than one
@@ -3512,8 +3595,10 @@ export class LocalEventBuffer {
         events += removeRaw.run(row.rawRowid).changes;
         expiredCandidates.push(row);
       }
+      const consumed = truncated ? candidates.slice(0, processed) : candidates;
       advanceFinanceRetentionWatermarks(this.db, expiredCandidates as FinanceCoverageMutationRow[], now.toISOString());
-      const remainingBudget = Math.max(0, maxRows - candidates.length);
+      // Metric samples share the page; a pass out of time leaves them to the next.
+      const remainingBudget = truncated || overBudget() ? 0 : Math.max(0, maxRows - candidates.length);
       const metricRows = remainingBudget === 0
         ? []
         : this.db.prepare(
@@ -3523,20 +3608,21 @@ export class LocalEventBuffer {
       let metricSamples = 0;
       const removeMetric = this.db.prepare(`delete from metric_samples where rowid = ?`);
       for (const row of metricRows) metricSamples += removeMetric.run(row.rowid).changes;
-      const last = candidates.at(-1);
+      const last = consumed.at(-1);
       // A full page alone does not prove more work. Probe just beyond its
-      // cursor so an idle ledger does not enter the five-second cadence.
-      const rawHasMore = (rawLimit === 0 || candidates.length === rawLimit) &&
+      // cursor so an idle ledger does not enter the five-second cadence. A
+      // pass cut short by its time budget has more work by construction.
+      const rawHasMore = truncated || ((rawLimit === 0 || candidates.length === rawLimit) &&
         Boolean(this.db.prepare(`select 1 from buffered_events e indexed by idx_events_retention
           where e.created_at < ? and (e.created_at,e.id) > (?,?) limit 1`)
-          .get(cutoff, last?.rawCreatedAt ?? scan.at, last?.eventId ?? scan.id));
+          .get(cutoff, last?.rawCreatedAt ?? scan.at, last?.eventId ?? scan.id)));
       const metricHasMore = metricsPending && Boolean(this.db.prepare(
         `select 1 from metric_samples indexed by idx_metrics_observed
          where created_at < ? limit 1`,
       ).get(cutoff));
       const hasMore = !lineageRepair.complete || retirementPending || rawHasMore || metricHasMore;
       const madeProgress = lineageRepair.visited > 0 || retirementPending ||
-        candidates.length > 0 || metricRows.length > 0;
+        consumed.length > 0 || metricRows.length > 0;
       const next = rawLimit === 0 ? scan : rawHasMore && last
         ? {at:last.rawCreatedAt,id:last.eventId,metricsFirst:scan.metricsFirst}
         : {at:"",id:"",metricsFirst:scan.metricsFirst};
@@ -3550,14 +3636,14 @@ export class LocalEventBuffer {
       ).run(
         cutoff,
         now.toISOString(),
-        candidates.length + metricRows.length,
+        consumed.length + metricRows.length,
         events + metricSamples,
         hasMore ? 1 : 0,
         events,
       );
       return {
         events,
-        eventRowsVisited: candidates.length,
+        eventRowsVisited: consumed.length,
         migrationProtectedRows,
         metricSamples,
         metricRowsVisited: metricRows.length,
@@ -3575,6 +3661,213 @@ export class LocalEventBuffer {
       metricRowsVisited: run.metricRowsVisited,
       hasMore: run.hasMore,
       madeProgress: run.madeProgress,
+      busy: false,
+      elapsedMs: elapsedMs(),
+    };
+    } catch (error) {
+      if (isSqliteBusy(error)) return empty(true, false, true);
+      throw error;
+    } finally {
+      restoreBusyTimeout();
+    }
+  }
+
+  /**
+   * Lower this connection's busy timeout for one bounded pass. The returned
+   * function restores the previous value; `undefined` leaves the connection
+   * alone. A pass that finds the writer held then yields at once instead of
+   * waiting out the connection's full timeout on the caller's event loop.
+   */
+  private lowerBusyTimeout(ms: number | undefined): () => void {
+    if (ms === undefined || !Number.isFinite(ms) || ms < 0) return () => undefined;
+    const previous = Number(this.db.pragma("busy_timeout", { simple: true }));
+    this.db.pragma(`busy_timeout = ${Math.trunc(ms)}`);
+    return () => {
+      try { this.db.pragma(`busy_timeout = ${Number.isFinite(previous) ? previous : 5_000}`); }
+      catch { /* the connection is closing; nothing to restore */ }
+    };
+  }
+
+  /**
+   * True when at least `rows` raw rows are older than the retention cutoff.
+   * The count stops at `rows` on the retention index; it never walks the
+   * whole backlog.
+   */
+  rawRetentionBacklogAtLeast(retentionDays: number, rows: number, now = new Date()) {
+    const cutoff = new Date(now.getTime() - retentionDays * 86_400_000).toISOString();
+    const limit = Math.max(1, Math.trunc(rows));
+    const count = (this.db.prepare(
+      `select count(*) as n from (select 1 from buffered_events e indexed by idx_events_retention
+         where e.created_at < ? limit ?)`,
+    ).get(cutoff, limit) as { n: number }).n;
+    return count >= limit;
+  }
+
+  /**
+   * One bounded pass over the secondary tables (0.7.52).
+   *
+   * `upload_receipts`: an acknowledged receipt whose `terminal_at` is older
+   * than `uploadReceiptDays` and whose raw row is gone expires with a receipt.
+   * A dead receipt never expires (the hold rule reads its lineage), nor does
+   * a receipt whose raw row still exists (its acknowledgement is what lets
+   * that row expire), nor a legacy receipt without `raw_rowid`. The sweep
+   * walks the table by rowid from a durable cursor; it ends when a page is
+   * short, or when a full page holds no acknowledged receipt older than the
+   * cutoff (rowid order follows terminal time; a late acknowledgement is
+   * caught by a later sweep). A finished sweep rests for `sweepIntervalMs`.
+   *
+   * `session_sync_summary_rows`: a row older than the effective retention
+   * whose raw row is gone expires with a receipt. A row whose raw row exists
+   * stays; the raw delete trigger removes it with its raw row.
+   */
+  pruneSecondary(
+    policy: { retentionDays: number; uploadReceiptDays?: number },
+    options: { maxRows?: number; now?: Date; maxWriterMs?: number; busyTimeoutMs?: number; sweepIntervalMs?: number } = {},
+  ): SecondaryRetentionPassReceipt {
+    const startedAt = performance.now();
+    const requestedRows = Number.isFinite(options.maxRows) ? Math.trunc(options.maxRows!) : 1_000;
+    const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
+    const now = options.now ?? new Date();
+    const nowIso = now.toISOString();
+    const uploadReceiptDays = Math.max(1, Math.trunc(policy.uploadReceiptDays ?? 30));
+    const retentionDays = Math.max(1, Math.trunc(policy.retentionDays));
+    const uploadReceiptCutoff = new Date(now.getTime() - uploadReceiptDays * 86_400_000).toISOString();
+    const summaryRowCutoff = new Date(now.getTime() - retentionDays * 86_400_000).toISOString();
+    const sweepIntervalMs = Math.max(0, options.sweepIntervalMs ?? 6 * 60 * 60_000);
+    const maxWriterMs = Number.isFinite(options.maxWriterMs) && options.maxWriterMs! > 0
+      ? options.maxWriterMs! : Number.POSITIVE_INFINITY;
+    const overBudget = () => performance.now() - startedAt > maxWriterMs;
+    const elapsedMs = () => Math.round((performance.now() - startedAt) * 1_000) / 1_000;
+    const resting = (completedAt: string | null) =>
+      completedAt !== null && now.getTime() - Date.parse(completedAt) < sweepIntervalMs;
+    const restoreBusyTimeout = this.lowerBusyTimeout(options.busyTimeoutMs);
+    try {
+      const run = this.db.transaction(() => {
+        const control = this.db.prepare(`select upload_receipts_cursor as receiptCursor,
+          summary_rows_cursor as summaryCursor,
+          upload_receipts_sweep_completed_at as receiptSweepCompletedAt,
+          summary_rows_sweep_completed_at as summarySweepCompletedAt
+          from secondary_retention_control where singleton=1`).get() as {
+            receiptCursor: number; summaryCursor: number;
+            receiptSweepCompletedAt: string | null; summarySweepCompletedAt: string | null;
+          };
+        const recordExpiry = this.db.prepare(`insert into secondary_retention_receipts
+          (table_name, row_key, row_created_at, expired_at, reason) values (?, ?, ?, ?, ?)`);
+        const rawPresent = this.db.prepare(
+          `select 1 from buffered_events e where e.rowid = ? and (? is null or e.id = ?)`);
+        // The session-summary schema is created lazily; a ledger without it has
+        // no summary rows to expire. The receipts table always exists.
+        const tableExists = this.db.prepare(`select 1 from sqlite_master where type='table' and name=?`);
+        const hasReceipts = Boolean(tableExists.get("upload_receipts"));
+        const hasSummaryRows = Boolean(tableExists.get("session_sync_summary_rows"));
+
+        let receiptsVisited = 0, receiptsExpired = 0;
+        let receiptCursor = control.receiptCursor;
+        let receiptSweepCompletedAt = control.receiptSweepCompletedAt;
+        let receiptsHasMore = false;
+        if (hasReceipts && !resting(control.receiptSweepCompletedAt)) {
+          const page = this.db.prepare(`select rowid as rowid, delivery_id as deliveryId,
+            raw_rowid as rawRowid, raw_id as rawId, terminal_state as terminalState, terminal_at as terminalAt
+            from upload_receipts where rowid > ? order by rowid limit ?`)
+            .all(control.receiptCursor, maxRows) as Array<{ rowid: number; deliveryId: string;
+              rawRowid: number | null; rawId: string | null; terminalState: string; terminalAt: string | null }>;
+          const removeReceipt = this.db.prepare(
+            `delete from upload_receipts where rowid = ? and terminal_state = 'acknowledged'`);
+          let truncated = false, olderSeen = false;
+          for (const row of page) {
+            if (receiptsVisited > 0 && overBudget()) { truncated = true; break; }
+            receiptsVisited += 1;
+            receiptCursor = row.rowid;
+            if (row.terminalState !== "acknowledged" || !row.terminalAt || row.terminalAt >= uploadReceiptCutoff) continue;
+            olderSeen = true;
+            if (row.rawRowid === null || rawPresent.get(row.rawRowid, row.rawId, row.rawId)) continue;
+            recordExpiry.run("upload_receipts", row.deliveryId, row.terminalAt, nowIso, "acknowledged_receipt_window_elapsed");
+            receiptsExpired += removeReceipt.run(row.rowid).changes;
+          }
+          receiptsHasMore = truncated || (page.length === maxRows && olderSeen);
+          if (!receiptsHasMore) { receiptCursor = 0; receiptSweepCompletedAt = nowIso; }
+        }
+
+        // Summary rows share the pass: they take the rows the receipts page
+        // left over, and only while the writer budget lasts.
+        const summaryBudget = maxRows - receiptsVisited;
+        let summaryVisited = 0, summaryExpired = 0;
+        let summaryCursor = control.summaryCursor;
+        let summarySweepCompletedAt = control.summarySweepCompletedAt;
+        let summaryHasMore = false;
+        if (hasSummaryRows && !resting(control.summarySweepCompletedAt) && summaryBudget > 0 &&
+          (receiptsVisited === 0 || !overBudget())) {
+          const page = this.db.prepare(`select raw_rowid as rawRowid, created_at as createdAt
+            from session_sync_summary_rows where raw_rowid > ? order by raw_rowid limit ?`)
+            .all(control.summaryCursor, summaryBudget) as Array<{ rawRowid: number; createdAt: string }>;
+          const removeSummary = this.db.prepare(`delete from session_sync_summary_rows where raw_rowid = ?`);
+          let truncated = false, olderSeen = false;
+          for (const row of page) {
+            if (summaryVisited > 0 && overBudget()) { truncated = true; break; }
+            summaryVisited += 1;
+            summaryCursor = row.rawRowid;
+            if (row.createdAt >= summaryRowCutoff) continue;
+            olderSeen = true;
+            if (rawPresent.get(row.rawRowid, null, null)) continue;
+            recordExpiry.run("session_sync_summary_rows", String(row.rawRowid), row.createdAt, nowIso, "summary_row_raw_expired");
+            summaryExpired += removeSummary.run(row.rawRowid).changes;
+          }
+          summaryHasMore = truncated || (page.length === summaryBudget && olderSeen);
+          if (!summaryHasMore) { summaryCursor = 0; summarySweepCompletedAt = nowIso; }
+        } else if (hasSummaryRows && !resting(control.summarySweepCompletedAt)) {
+          summaryHasMore = true;
+        }
+
+        const hasMore = receiptsHasMore || summaryHasMore;
+        this.db.prepare(`update secondary_retention_control set
+            upload_receipts_expired_total = upload_receipts_expired_total + ?,
+            summary_rows_expired_total = summary_rows_expired_total + ?,
+            upload_receipts_cursor = ?, summary_rows_cursor = ?,
+            upload_receipts_sweep_completed_at = ?, summary_rows_sweep_completed_at = ?,
+            last_run_at = ?, last_has_more = ? where singleton = 1`)
+          .run(receiptsExpired, summaryExpired, receiptCursor, summaryCursor,
+            receiptSweepCompletedAt, summarySweepCompletedAt, nowIso, hasMore ? 1 : 0);
+        return { receiptsVisited, receiptsExpired, summaryVisited, summaryExpired, hasMore };
+      }).immediate();
+      return {
+        uploadReceiptCutoff, summaryRowCutoff,
+        uploadReceiptsVisited: run.receiptsVisited, uploadReceiptsExpired: run.receiptsExpired,
+        summaryRowsVisited: run.summaryVisited, summaryRowsExpired: run.summaryExpired,
+        hasMore: run.hasMore, madeProgress: run.receiptsVisited > 0 || run.summaryVisited > 0,
+        busy: false, elapsedMs: elapsedMs(),
+      };
+    } catch (error) {
+      if (isSqliteBusy(error)) {
+        return { uploadReceiptCutoff, summaryRowCutoff, uploadReceiptsVisited: 0, uploadReceiptsExpired: 0,
+          summaryRowsVisited: 0, summaryRowsExpired: 0, hasMore: true, madeProgress: false, busy: true,
+          elapsedMs: elapsedMs() };
+      }
+      throw error;
+    } finally {
+      restoreBusyTimeout();
+    }
+  }
+
+  secondaryRetentionStatus() {
+    const row = this.db.prepare(`select upload_receipts_expired_total as uploadReceiptsExpired,
+      summary_rows_expired_total as summaryRowsExpired,
+      upload_receipts_cursor as uploadReceiptsCursor, summary_rows_cursor as summaryRowsCursor,
+      upload_receipts_sweep_completed_at as uploadReceiptsSweepCompletedAt,
+      summary_rows_sweep_completed_at as summaryRowsSweepCompletedAt,
+      last_run_at as lastRunAt, last_has_more as lastHasMore
+      from secondary_retention_control where singleton=1`).get() as {
+        uploadReceiptsExpired: number; summaryRowsExpired: number;
+        uploadReceiptsCursor: number; summaryRowsCursor: number;
+        uploadReceiptsSweepCompletedAt: string | null; summaryRowsSweepCompletedAt: string | null;
+        lastRunAt: string | null; lastHasMore: number;
+      };
+    return {
+      uploadReceipts: { expiredTotal: row.uploadReceiptsExpired, cursor: row.uploadReceiptsCursor,
+        sweepCompletedAt: row.uploadReceiptsSweepCompletedAt, windowDays: 30 },
+      summaryRows: { expiredTotal: row.summaryRowsExpired, cursor: row.summaryRowsCursor,
+        sweepCompletedAt: row.summaryRowsSweepCompletedAt },
+      lastRunAt: row.lastRunAt,
+      lastHasMore: Boolean(row.lastHasMore),
     };
   }
 

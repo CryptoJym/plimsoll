@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.7.52 — 2026-11-01
+
+Incident: on a `studio0_scale` host the ledger grew to 171 GB with raw
+retention set to 14 days. The daemon's retention pass ran 34 times (128 rows
+each) and then never again: its gate waited for the maintenance and enrichment
+schedulers to be idle, and on a busy host they rarely were. Enrichment
+children were left unreaped because one slow `ps` identity check folded into
+"not ours", so nothing was ever signalled and every later tick failed with
+`enrichment_child_not_reaped`.
+
+- Retention passes yield to the ledger, not to other schedulers. A writer held
+  by another connection past a 25 ms busy timeout defers the pass (a `busy`
+  receipt); the in-flight gate is gone. Each pass is bounded by rows and by a
+  250 ms writer budget, and a pass cut short moves its cursor to the last row
+  it visited, so nothing is skipped. The pass size doubles from 128 up to
+  4,096 rows while a large backlog (50,000 or more rows past the cutoff)
+  clears inside half the budget, halves after an overrun and resets once the
+  backlog is gone. While a large backlog clears, the next pass follows after
+  a wait equal to the last pass's own duration, at least 200 ms and at most
+  5 s, overrun or not (the overrun already halved the page): the prune takes
+  at most half of the collector's thread, and a pass stalled by cold reads
+  on a contended disk is followed by an equal pause for the intake queued
+  behind it. A held writer is retried after 200 ms, doubling on each
+  consecutive hold up to the 5 s follow-up; without a large backlog the
+  follow-up is 5 s. On the incident host the first cut of this release
+  waited 5 s after every pass cut short by cold reads and drained under a
+  hundred rows a second, days of catch-up. Proof: a 500,000-row synthetic
+  backlog clears in bounded passes with no 5 s wait while the backlog is
+  large, a 1 s stall is followed by a 1 s wait, and a held writer backs off
+  200, 400, 800 ms (`proof:collector-reliability`).
+- Enrichment children settle by their handle. The `ps` identity check now has
+  three answers (ours, another process, unknown) and a bounded cap; only a
+  positive mismatch refuses to signal, an unanswered check never does, and a
+  child Node already reports as exited is not signalled. A child whose parent
+  never sends `run` leaves on its own after 30 s. Proof: hung and throwing
+  verifiers settle within the deadline (`proof:enrichment-job`).
+- The default retention follows the ledger budget on a `studio0_scale` host.
+  `retentionDays` other than 90, or `retentionDaysPinned: true`, always wins;
+  otherwise the host keeps as many whole days as 16 GB holds at the measured
+  admission rate (2,400 bytes a row, an estimate), floored at 7 and capped at
+  90, once seven complete days are measured. `/status`, `plimsoll status` and
+  the maintenance worker use the same effective days; `retentionPolicy` names
+  the days, their source and basis. Proof: `proof:retention-policy`.
+- Secondary retention with receipts. Acknowledged upload receipts older than
+  30 days whose raw row is gone, and summary rows older than the effective
+  retention whose raw row is gone, expire into `secondary_retention_receipts`
+  with totals in `secondary_retention_control` (`secondaryRetention` in
+  `plimsoll status`). Dead receipts, receipts whose raw row still exists and
+  legacy receipts without lineage never expire. A finished sweep rests six
+  hours. Proof: `proof:collector-reliability`.
+- `plimsoll ledger compact --into ABSOLUTE-PATH [--plan] [--verify ...]`
+  copies the stopped ledger with `VACUUM INTO`, verifies every table's row
+  count against the source and prints the swap steps with their undo. It
+  refuses while a collector connection is open, when the destination exists or
+  its directory is not private, and when the destination lacks free space.
+  Runbook: `docs/runbooks/ledger-compact.md`. Proof: `proof:ledger-compact`.
+- The weekly tool-statistics read runs on a reader thread, through the
+  `observed_at` index, in one-hour chunks, under a 30-minute deadline; a
+  failed read backs off up to an hour. Incident, 2026-11-01, same host: the
+  week's coverage query, planned without statistics through the workspace
+  index, read every row of a 43-million-row table on the collector's main
+  thread for 3.5 hours, and intake, `/status` and retention waited. Proof:
+  the read is planned through the observed index, the reader thread's result
+  equals the in-process aggregate, a passed deadline ends the read, and the
+  frozen report is the same from either read
+  (`proof:weekly-tool-stats-reader`).
+
 ## 0.7.51 — 2026-10-05 (unpublished)
 
 - #453 adds the dispatch binding index, bounded dispatch history and explicit

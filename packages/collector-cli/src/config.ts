@@ -78,6 +78,10 @@ export const collectorConfigSchema = z
      * recognized from their upload/tenant/install credentials. */
     managed: z.boolean().default(false),
     retentionDays: z.number().int().min(1).max(3650).default(90),
+    /** Keep `retentionDays` even when it equals the default. Without it, a
+     * `studio0_scale` host derives its raw retention from its ledger budget
+     * (retention-policy.ts) whenever `retentionDays` is still the default. */
+    retentionDaysPinned: z.boolean().default(false),
     startupWalCheckpointBytes: z.number().int().min(1).max(100 * 1024 * 1024 * 1024)
       .default(1024 * 1024 * 1024),
     captureRoots: z.array(captureRootSchema).max(64).optional().superRefine((roots, ctx) => {

@@ -101,39 +101,116 @@ type Attempt = {
   startedAt: string; resultStatus: string; retryOf: string | null;
   runtimeVersion: string; collectorVersion: string;
 };
+type CoverageRow = { runtime: string; sessionId: string; hasTool: number };
+
+export type ToolStatsWeekInput = { workspaceId: string; deviceId: string; weekStart: string };
+export type ToolStatsWeekRows = { coverage: CoverageRow[]; attempts: Attempt[] };
+/** One week's reads as SQL text, parameters and time chunks, so a reader
+ * thread can run them without the schema inspection that produced them. */
+export type ToolStatsWeekReadPlan = {
+  coverage: { sql: string; workspaceId: string; deviceId: string; chunks: Array<[string, string]> };
+  attempts: { sql: string; workspaceId: string; deviceId: string; chunks: Array<[string, string]> };
+};
+
+/** Hours per chunk of the week's reads. Each chunk is its own short read. */
+export const TOOL_STATS_READ_CHUNK_HOURS = 1;
+export const TOOL_STATS_READ_DEADLINE_ERROR = "weekly_tool_stats_read_deadline";
 
 function emptyCounts(): ToolStatsCounts { return { attempts: 0, failures: 0, unknown: 0, retries: 0, longestChain: 0 }; }
 
-/** A complete calendar week, scoped to the joined workspace and local installation identity. */
-export function aggregateToolStatsWeek(db: Database.Database, input: {
-  workspaceId: string; deviceId: string; weekStart: string;
-}): WeeklyToolStats {
+function hourChunks(start: string, end: string, hours: number): Array<[string, string]> {
+  const chunks: Array<[string, string]> = [];
+  const step = Math.max(1, hours) * 3_600_000;
+  const last = Date.parse(end);
+  for (let from = Date.parse(start); from < last; from += step) {
+    chunks.push([new Date(from).toISOString(), new Date(Math.min(from + step, last)).toISOString()]);
+  }
+  return chunks;
+}
+
+function indexExists(db: Database.Database, name: string): boolean {
+  return db.prepare("select 1 from sqlite_master where type = 'index' and name = ?").get(name) !== undefined;
+}
+
+/** The reads behind one week's statistics, scoped to the joined workspace and local installation identity. */
+export function planToolStatsWeekRead(db: Database.Database, input: ToolStatsWeekInput): ToolStatsWeekReadPlan {
   const start = `${input.weekStart}T00:00:00.000Z`;
   const end = weekEnd(input.weekStart);
   const coverageEligible = terminalPrivacyEligibilitySql(db, "buffered_events");
   const attemptEligible = terminalPrivacyEligibilitySql(db, "e");
-  const coverageRows = db.prepare(`select source as runtime, session_id as sessionId,
-    max(case when event_type in ('tool_use','tool_result') then 1 else 0 end) as hasTool
-    from buffered_events where workspace_id = ? and device_id = ? and session_id is not null
-      and observed_at >= ? and observed_at < ? and data_mode = 'metadata' and ${coverageEligible}
-    group by source, session_id`).all(input.workspaceId, input.deviceId, start, end) as
-      Array<{ runtime: string; sessionId: string; hasTool: number }>;
+  // Without ANALYZE statistics SQLite may plan this week-bounded read through
+  // the workspace index, which on a large ledger is every row of the table
+  // with a table seek each (2026-11-01: 3.5 hours on the collector's main
+  // thread). The observed_at index bounds the read to the week.
+  const observed = indexExists(db, "idx_events_observed") ? " indexed by idx_events_observed" : "";
+  const chunks = hourChunks(start, end, TOOL_STATS_READ_CHUNK_HOURS);
+  return {
+    coverage: { workspaceId: input.workspaceId, deviceId: input.deviceId, chunks,
+      sql: `select source as runtime, session_id as sessionId,
+        max(case when event_type in ('tool_use','tool_result') then 1 else 0 end) as hasTool
+        from buffered_events${observed} where workspace_id = ? and device_id = ? and session_id is not null
+          and observed_at >= ? and observed_at < ? and data_mode = 'metadata' and ${coverageEligible}
+        group by source, session_id` },
+    attempts: { workspaceId: input.workspaceId, deviceId: input.deviceId, chunks,
+      sql: `select a.operation_id as operationId, a.source, a.session_id as sessionId,
+        a.tool_class as toolClass, a.tool_name as toolName, a.started_at as startedAt,
+        a.result_status as resultStatus, a.retry_of as retryOf,
+        d.runtime_version as runtimeVersion, d.collector_version as collectorVersion
+        from tool_attempt_facts a join tool_stat_attempt_dimensions d on d.operation_id = a.operation_id
+        join buffered_events e on e.id = d.event_id
+        where d.workspace_id = ? and d.device_id = ? and a.started_at >= ? and a.started_at < ?
+          and e.data_mode = 'metadata' and ${attemptEligible}
+        order by a.started_at, a.operation_id` },
+  };
+}
+
+/**
+ * Runs a plan chunk by chunk and merges the chunks. Each chunk is its own
+ * short read, so no long read transaction holds the ledger's WAL checkpoint
+ * back, and a deadline is honoured between chunks. Self-contained on purpose:
+ * the reader thread receives this function's source text.
+ */
+export function readToolStatsWeekRows(
+  db: { prepare(sql: string): { all(...params: unknown[]): unknown[] } },
+  plan: ToolStatsWeekReadPlan,
+  limit: { deadlineAt?: number; now?: () => number } = {},
+): ToolStatsWeekRows {
+  const now = limit.now ?? (() => Date.now());
+  const checkDeadline = () => {
+    if (limit.deadlineAt !== undefined && now() > limit.deadlineAt) throw new Error("weekly_tool_stats_read_deadline");
+  };
+  const coverage = new Map<string, CoverageRow>();
+  const coverageRead = db.prepare(plan.coverage.sql);
+  for (const [from, to] of plan.coverage.chunks) {
+    checkDeadline();
+    for (const row of coverageRead.all(plan.coverage.workspaceId, plan.coverage.deviceId, from, to) as CoverageRow[]) {
+      const key = `${row.runtime}\u0000${row.sessionId}`;
+      const seen = coverage.get(key);
+      if (seen) seen.hasTool = seen.hasTool || row.hasTool ? 1 : 0;
+      else coverage.set(key, { runtime: row.runtime, sessionId: row.sessionId, hasTool: row.hasTool ? 1 : 0 });
+    }
+  }
+  const attempts: Attempt[] = [];
+  const attemptRead = db.prepare(plan.attempts.sql);
+  for (const [from, to] of plan.attempts.chunks) {
+    checkDeadline();
+    for (const row of attemptRead.all(plan.attempts.workspaceId, plan.attempts.deviceId, from, to) as Attempt[]) {
+      attempts.push(row);
+    }
+  }
+  return { coverage: [...coverage.values()], attempts };
+}
+
+/** Builds the week's cells from its rows. Pure; runs on the calling thread. */
+export function assembleToolStatsWeek(input: ToolStatsWeekInput, rows: ToolStatsWeekRows): WeeklyToolStats {
   const coverageMap = new Map<string, { runtime: string; sessions: number; sessionsWithToolEvents: number }>();
-  for (const row of coverageRows) {
+  for (const row of rows.coverage) {
     const coverage = coverageMap.get(row.runtime) ?? { runtime: row.runtime, sessions: 0, sessionsWithToolEvents: 0 };
     coverage.sessions += 1;
     coverage.sessionsWithToolEvents += row.hasTool ? 1 : 0;
     coverageMap.set(row.runtime, coverage);
   }
-  const attempts = db.prepare(`select a.operation_id as operationId, a.source, a.session_id as sessionId,
-    a.tool_class as toolClass, a.tool_name as toolName, a.started_at as startedAt,
-    a.result_status as resultStatus, a.retry_of as retryOf,
-    d.runtime_version as runtimeVersion, d.collector_version as collectorVersion
-    from tool_attempt_facts a join tool_stat_attempt_dimensions d on d.operation_id = a.operation_id
-    join buffered_events e on e.id = d.event_id
-    where d.workspace_id = ? and d.device_id = ? and a.started_at >= ? and a.started_at < ?
-      and e.data_mode = 'metadata' and ${attemptEligible}
-    order by a.started_at, a.operation_id`).all(input.workspaceId, input.deviceId, start, end) as Attempt[];
+  const attempts = rows.attempts;
   const cells = new Map<string, ToolStatsCell>();
   const sessionsByCell = new Map<string, Map<string, ToolStatsSession>>();
   const attemptById = new Map(attempts.map((attempt) => [attempt.operationId, attempt]));
@@ -189,6 +266,11 @@ export function aggregateToolStatsWeek(db: Database.Database, input: {
     cells: [...cells.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, cell]) => ({
       ...cell, sessions: cell.sessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
     })) };
+}
+
+/** A complete calendar week, read on the calling thread. */
+export function aggregateToolStatsWeek(db: Database.Database, input: ToolStatsWeekInput): WeeklyToolStats {
+  return assembleToolStatsWeek(input, readToolStatsWeekRows(db, planToolStatsWeekRead(db, input)));
 }
 
 /** Keep D2 candidates, with a deterministic cap that favors failures and retries. */

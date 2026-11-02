@@ -13,6 +13,7 @@ import { runRetentionDeletionStage } from "../packages/collector-cli/src/mainten
 import { AutomaticMaintenanceCadence, CoalescingMaintenanceScheduler, CollectorMaintenance,
   automaticRepairServiceStatus, type MaintenanceRunOutcome } from "../packages/collector-cli/src/maintenance";
 import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
+import { ensureSessionSummarySchema } from "../packages/collector-cli/src/session-summary";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { MAINTENANCE_PROTOCOL_SCHEMA, parseMaintenanceWorkerReceipt } from "../packages/collector-cli/src/maintenance-protocol";
@@ -22,7 +23,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-reliability-"));
 const realNow = Date.now;
 const now = realNow();
 const checks: Array<{ name: string; passed: boolean; detail?: unknown; error?: string }> = [];
-const EXPECTED_CHECKS = 14;
+const EXPECTED_CHECKS = 18;
 let nextId = 0;
 function event() {
   return aiInteractionEventSchema.parse({
@@ -561,6 +562,285 @@ async function main() {
       assert.ok(recovered.stages.projection.completed>0);
       return recovered;
     } finally {maintenance.close();buffer.close();}
+  });
+  // 0.7.52: the pass yields to the ledger, not to another scheduler's flag.
+  await check("retention_pass_defers_when_the_writer_is_held", () => {
+    const file = path.join(root, "busy-writer.sqlite");
+    const buffer = new LocalEventBuffer(file);
+    const other = new Database(file, { timeout: 100 });
+    try {
+      for (let i = 0; i < 8; i++) buffer.append(event());
+      buffer.database.prepare("update buffered_events set created_at='2000-01-01T00:00:00.000Z'").run();
+      const before = Number(buffer.database.pragma("busy_timeout", { simple: true }));
+      other.exec("begin immediate");
+      const started = performance.now();
+      const held = buffer.prune(90, { maxRows: 4, maxWriterMs: 250, busyTimeoutMs: 10 });
+      const waitedMs = performance.now() - started;
+      assert.deepEqual({ busy: held.busy, events: held.events, hasMore: held.hasMore, madeProgress: held.madeProgress },
+        { busy: true, events: 0, hasMore: true, madeProgress: false });
+      assert.ok(waitedMs < 1_000, `held pass waited ${waitedMs.toFixed(1)} ms`);
+      assert.equal(Number(buffer.database.pragma("busy_timeout", { simple: true })), before, "busy timeout restored");
+      other.exec("rollback");
+      const free = buffer.prune(90, { maxRows: 4, maxWriterMs: 250, busyTimeoutMs: 10 });
+      assert.deepEqual({ busy: free.busy, events: free.events }, { busy: false, events: 4 });
+      assert.ok(free.elapsedMs >= 0);
+      // The cadence counts a held pass as a busy deferral, keeps its pass size and retries at the follow-up.
+      let serial = 0, hold = true;
+      const pending = new Map<number, { callback: () => void; delay: number }>();
+      const cadence = new AutomaticRetentionCadence((request) => {
+        if (!hold) return buffer.prune(90, { maxRows: request.maxRows, busyTimeoutMs: 10 });
+        other.exec("begin immediate");
+        try { return buffer.prune(90, { maxRows: request.maxRows, busyTimeoutMs: 10 }); }
+        finally { other.exec("rollback"); }
+      }, { followupMs: 5_000, intervalMs: 60 * 60_000, passRows: { base: 4, max: 8, maxWriterMs: 250 },
+        timer: { now: () => now,
+          setTimeout: (callback, delay) => { const id = ++serial; pending.set(id, { callback, delay }); return id; },
+          clearTimeout: handle => { pending.delete(handle as number); } } });
+      try {
+        cadence.start();
+        let [id, task] = pending.entries().next().value!; pending.delete(id); task.callback();
+        assert.deepEqual({ busy: cadence.status().counters.busyDeferrals, passes: cadence.status().counters.passes,
+          rows: cadence.status().passRows }, { busy: 1, passes: 0, rows: 4 });
+        assert.equal(pending.values().next().value?.delay, 5_000);
+        hold = false;
+        [id, task] = pending.entries().next().value!; pending.delete(id); task.callback();
+        assert.deepEqual({ passes: cadence.status().counters.passes, expired: cadence.status().counters.eventsExpired },
+          { passes: 1, expired: 4 });
+        return { waitedMs: Number(waitedMs.toFixed(1)), busyDeferrals: 1 };
+      } finally { cadence.stop(); }
+    } finally { other.close(); buffer.close(); }
+  });
+  await check("retention_cadence_busy_retry_backs_off_under_a_large_backlog", () => {
+    const file = path.join(root, "busy-backoff.sqlite");
+    const buffer = new LocalEventBuffer(file);
+    const other = new Database(file, { timeout: 100 });
+    try {
+      for (let i = 0; i < 4; i++) buffer.append(event());
+      buffer.database.prepare("update buffered_events set created_at='2000-01-01T00:00:00.000Z'").run();
+      let serial = 0, hold = true;
+      const pending = new Map<number, { callback: () => void; delay: number }>();
+      const cadence = new AutomaticRetentionCadence((request) => {
+        if (!hold) return buffer.prune(90, { maxRows: request.maxRows, busyTimeoutMs: 10 });
+        other.exec("begin immediate");
+        try { return buffer.prune(90, { maxRows: request.maxRows, busyTimeoutMs: 10 }); }
+        finally { other.exec("rollback"); }
+      }, { followupMs: 5_000, fastFollowupMs: 200, intervalMs: 60 * 60_000, passRows: { base: 4, max: 8, maxWriterMs: 250 },
+        largeBacklog: () => true,
+        timer: { now: () => now,
+          setTimeout: (callback, delay) => { const id = ++serial; pending.set(id, { callback, delay }); return id; },
+          clearTimeout: handle => { pending.delete(handle as number); } } });
+      const fire = () => {
+        const [id, task] = pending.entries().next().value!;
+        pending.delete(id); task.callback();
+        return pending.values().next().value?.delay;
+      };
+      try {
+        cadence.start();
+        // Under a large backlog a held writer is retried soon; each
+        // consecutive hold doubles the wait, up to the follow-up.
+        const delays = Array.from({ length: 6 }, () => fire());
+        assert.deepEqual(delays, [200, 400, 800, 1_600, 3_200, 5_000]);
+        assert.deepEqual({ busy: cadence.status().counters.busyDeferrals, passes: cadence.status().counters.passes,
+          rows: cadence.status().passRows, streak: cadence.status().busyStreak }, { busy: 6, passes: 0, rows: 4, streak: 6 });
+        hold = false;
+        fire();
+        assert.deepEqual({ passes: cadence.status().counters.passes, expired: cadence.status().counters.eventsExpired,
+          streak: cadence.status().busyStreak }, { passes: 1, expired: 4, streak: 0 });
+        let rested: number | undefined;
+        for (let i = 0; i < 3 && rested === undefined; i++) {
+          if (cadence.status().lastPass?.hasMore === false) rested = pending.values().next().value?.delay;
+          else fire();
+        }
+        assert.equal(rested, 60 * 60_000, "an empty backlog rests for the full interval");
+        return { delays, rested };
+      } finally { cadence.stop(); }
+    } finally { other.close(); buffer.close(); }
+  });
+  await check("retention_backlog_of_half_a_million_rows_clears_in_bounded_passes", () => {
+    const buffer = new LocalEventBuffer(path.join(root, "backlog.sqlite"));
+    try {
+      const old = "2000-01-01T00:00:00.000Z";
+      const total = 500_000;
+      const insert = buffer.database.prepare(`insert into buffered_events
+        (id,source,event_type,data_mode,observed_at,payload_json,created_at)
+        values (?, 'codex', 'assistant_response', 'metadata', ?, '{}', ?)`);
+      const seeded = performance.now();
+      buffer.database.transaction(() => {
+        for (let i = 0; i < total; i++) insert.run(`backlog-${String(i).padStart(7, "0")}`, old, old);
+      })();
+      const seedMs = performance.now() - seeded;
+      const count = () => (buffer.database.prepare("select count(*) as n from buffered_events").get() as { n: number }).n;
+      assert.equal(count(), total);
+      assert.equal(buffer.rawRetentionBacklogAtLeast(90, 50_000, new Date(now)), true);
+      // Real time first: a one-millisecond writer budget cuts a 4,096-row page
+      // short after at least one row, and the cut page reports more work.
+      const cut = buffer.prune(90, { maxRows: 4_096, maxWriterMs: 1, now: new Date(now) });
+      assert.deepEqual({ hasMore: cut.hasMore, progress: cut.madeProgress, busy: cut.busy },
+        { hasMore: true, progress: true, busy: false });
+      assert.ok(cut.eventRowsVisited >= 1 && cut.eventRowsVisited < 4_096, `cut page visited ${cut.eventRowsVisited}`);
+      // Then the cadence on a fake timer and a fake writer clock: 0.02 ms a
+      // call, with one 1,000 ms stall injected into the first full-size pass.
+      let fake = 0, stallArmed = -1, stalled = false;
+      const clock = () => {
+        fake += 0.02;
+        if (stallArmed >= 0 && ++stallArmed === 2) { fake += 1_000; stallArmed = -1; }
+        return fake;
+      };
+      let tick = now, serial = 0;
+      const pending = new Map<number, { callback: () => void; delay: number }>();
+      const cadence = new AutomaticRetentionCadence(
+        (request) => buffer.prune(90, { maxRows: request.maxRows, maxWriterMs: request.maxWriterMs, now: new Date(now), clock }),
+        { followupMs: 5_000, fastFollowupMs: 1_000, intervalMs: 60 * 60_000,
+          passRows: { base: 128, max: 4_096, maxWriterMs: 250 },
+          largeBacklog: () => buffer.rawRetentionBacklogAtLeast(90, 50_000, new Date(now)),
+          timer: { now: () => tick,
+            setTimeout: (callback, delay) => { const id = ++serial; pending.set(id, { callback, delay }); return id; },
+            clearTimeout: handle => { pending.delete(handle as number); } } },
+      );
+      let passes = 0, maxPassMs = 0, fastFollowups = 0, overBudgetPasses = 0, maxRowsVisited = 0;
+      let nextDelay: number | undefined, overBudgetNextDelay: number | undefined, slowFollowupsUnderBacklog = 0;
+      const wall = performance.now();
+      try {
+        cadence.start();
+        while (pending.size && passes < 5_000) {
+          const [id, task] = pending.entries().next().value!;
+          pending.delete(id); tick += task.delay;
+          if (!stalled && cadence.status().passRows === 4_096) { stallArmed = 0; stalled = true; }
+          task.callback(); passes += 1;
+          const last = cadence.status().lastPass;
+          if (last) {
+            maxPassMs = Math.max(maxPassMs, last.elapsedMs ?? 0);
+            maxRowsVisited = Math.max(maxRowsVisited, last.eventRowsVisited);
+            if ((last.elapsedMs ?? 0) > 250) overBudgetPasses += 1;
+          }
+          const next = pending.values().next().value;
+          if (next?.delay === 1_000) fastFollowups += 1;
+          if (last && (last.elapsedMs ?? 0) > 250) overBudgetNextDelay = next?.delay;
+          // A 5 s wait is right only once the backlog has shrunk below "large".
+          if (next?.delay === 5_000 && last?.hasMore &&
+            buffer.rawRetentionBacklogAtLeast(90, 50_000, new Date(now))) slowFollowupsUnderBacklog += 1;
+          if (cadence.status().counters.passes > 0 && !last?.hasMore) break;
+        }
+        // Read the next delay before stop() clears the timer.
+        nextDelay = pending.values().next().value?.delay;
+      } finally { cadence.stop(); }
+      const wallMs = performance.now() - wall;
+      const status = cadence.status();
+      assert.equal(count(), 0, "every backlog row expired");
+      assert.equal(status.counters.eventsExpired, total - cut.events);
+      assert.equal(status.counters.busyDeferrals, 0);
+      assert.ok(passes <= 1_500, `${passes} passes`);
+      assert.ok(stalled, "the pass size reached its maximum");
+      assert.ok(maxRowsVisited <= 4_096, `largest page ${maxRowsVisited} rows`);
+      // 128 to 4,096 is five doublings; the stalled pass halves once and the
+      // next pass, inside its budget, doubles back.
+      assert.deepEqual({ grown: status.counters.grownPasses, shrunk: status.counters.shrunkPasses, overBudget: overBudgetPasses },
+        { grown: 6, shrunk: 1, overBudget: 1 });
+      assert.ok(fastFollowups > 0, "the follow-up shortened under the large backlog");
+      assert.equal(overBudgetNextDelay, Math.min(5_000, Math.max(1_000, maxPassMs)),
+        "the overrun pass was followed after its own duration, its page already halved");
+      assert.equal(slowFollowupsUnderBacklog, 0, "no 5 s wait while the backlog was large");
+      assert.ok(maxPassMs >= 1_000 && maxPassMs < 1_100, `stalled pass ${maxPassMs} ms`);
+      assert.equal(status.passRows, 128, "pass size resets once the backlog is gone");
+      assert.equal(buffer.rawRetentionBacklogAtLeast(90, 1, new Date(now)), false);
+      assert.equal((buffer.database.prepare("select count(*) as n from raw_retention_receipts").get() as { n: number }).n, total);
+      assert.equal(nextDelay, 60 * 60_000, "an empty backlog rests for the full interval");
+      return { passes, grownPasses: status.counters.grownPasses, shrunkPasses: status.counters.shrunkPasses,
+        fastFollowups, overBudgetPasses, overBudgetNextDelay, cutPageRows: cut.eventRowsVisited, maxRowsVisited,
+        maxPassMs: Number(maxPassMs.toFixed(1)), seedMs: Number(seedMs.toFixed(0)), wallMs: Number(wallMs.toFixed(0)) };
+    } finally { buffer.close(); }
+  });
+  await check("secondary_retention_expires_only_settled_receipts_and_orphan_summary_rows", () => {
+    const buffer = new LocalEventBuffer(path.join(root, "secondary.sqlite"));
+    try {
+      const db = buffer.database;
+      // A ledger without the lazily created session-summary schema sweeps receipts only.
+      const bare = buffer.pruneSecondary({ retentionDays: 90 }, { maxRows: 10, now: new Date(now), sweepIntervalMs: 0 });
+      assert.deepEqual({ summaries: bare.summaryRowsVisited, hasMore: bare.hasMore, busy: bare.busy },
+        { summaries: 0, hasMore: false, busy: false });
+      ensureSessionSummarySchema(db);
+      const items = Array.from({ length: 6 }, () => event());
+      for (const item of items) buffer.append(item);
+      const rowids = items.map(item => (db.prepare("select rowid as r from buffered_events where id=?").get(item.id) as { r: number }).r);
+      const at = (daysAgo: number) => new Date(now - daysAgo * 86_400_000).toISOString();
+      const receipt = db.prepare(`insert into upload_receipts
+        (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+        values (?,?,?,?,null,?,?,?,1,?,?)`);
+      // d0: acknowledged 40 days ago, raw row gone -> expires.
+      // d1: acknowledged 40 days ago, raw row present -> stays (its acknowledgement lets the raw row expire).
+      // d2: dead 40 days ago, raw row gone -> stays (lineage the hold rule reads).
+      // d3: acknowledged 10 days ago, raw row gone -> stays (inside the 30-day window).
+      // d4: legacy acknowledged receipt without raw lineage, 40 days ago -> stays.
+      receipt.run("d0", rowids[0], items[0]!.id, at(60), "acknowledged", "remote_acknowledged", "success", at(40), at(40));
+      receipt.run("d1", rowids[1], items[1]!.id, at(60), "acknowledged", "remote_acknowledged", "success", at(40), at(40));
+      receipt.run("d2", rowids[2], items[2]!.id, at(60), "dead", "local_item_oversize", "client_error", at(40), at(40));
+      receipt.run("d3", rowids[3], items[3]!.id, at(60), "acknowledged", "remote_acknowledged", "success", at(10), at(10));
+      db.prepare(`insert into upload_receipts (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+        values ('d4','acknowledged','remote_acknowledged','success',1,?,?)`).run(at(40), at(40));
+      const summary = db.prepare("insert into session_sync_summary_rows (raw_rowid, session_id, created_at) values (?,?,?)");
+      summary.run(rowids[1], "s-present", at(100));
+      summary.run(9_000_001, "s-orphan-old", at(100));
+      summary.run(9_000_002, "s-orphan-new", at(1));
+      for (const index of [0, 2, 3]) db.prepare("delete from buffered_events where rowid=?").run(rowids[index]);
+      const first = buffer.pruneSecondary({ retentionDays: 90 }, { maxRows: 1_000, now: new Date(now), sweepIntervalMs: 0 });
+      assert.deepEqual(
+        { receipts: first.uploadReceiptsExpired, summaries: first.summaryRowsExpired, hasMore: first.hasMore, busy: first.busy,
+          visited: first.uploadReceiptsVisited },
+        { receipts: 1, summaries: 1, hasMore: false, busy: false, visited: 5 });
+      assert.deepEqual((db.prepare("select delivery_id as d from upload_receipts order by delivery_id").all() as Array<{ d: string }>).map(r => r.d),
+        ["d1", "d2", "d3", "d4"]);
+      assert.deepEqual((db.prepare("select session_id as s from session_sync_summary_rows order by session_id").all() as Array<{ s: string }>).map(r => r.s),
+        ["s-orphan-new", "s-present"]);
+      assert.deepEqual(db.prepare("select table_name as t, row_key as k, reason from secondary_retention_receipts order by t").all(), [
+        { t: "session_sync_summary_rows", k: "9000001", reason: "summary_row_raw_expired" },
+        { t: "upload_receipts", k: "d0", reason: "acknowledged_receipt_window_elapsed" },
+      ]);
+      const status = buffer.secondaryRetentionStatus();
+      assert.deepEqual({ receipts: status.uploadReceipts.expiredTotal, summaries: status.summaryRows.expiredTotal,
+        cursor: status.uploadReceipts.cursor, hasMore: status.lastHasMore }, { receipts: 1, summaries: 1, cursor: 0, hasMore: false });
+      assert.ok(status.uploadReceipts.sweepCompletedAt && status.summaryRows.sweepCompletedAt);
+      // A finished sweep rests: inside the interval the pass visits nothing.
+      const resting = buffer.pruneSecondary({ retentionDays: 90 }, { maxRows: 1_000, now: new Date(now + 1_000) });
+      assert.deepEqual({ visited: resting.uploadReceiptsVisited, progress: resting.madeProgress, hasMore: resting.hasMore },
+        { visited: 0, progress: false, hasMore: false });
+      // Paging: five more expired receipts behind the kept ones, two rows a pass, cursor carried between passes.
+      for (let i = 0; i < 5; i++) {
+        db.prepare(`insert into upload_receipts (delivery_id,raw_rowid,raw_id,raw_created_at,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+          values (?,?,?,?,'acknowledged','remote_acknowledged','success',1,?,?)`)
+          .run(`page-${i}`, 8_000_000 + i, `raw-${i}`, at(60), at(40), at(40));
+      }
+      // Seven hours on, both sweeps are due again. Two rows a pass, shared by
+      // both tables, cursor carried between passes: receipts page first; the
+      // short fifth page completes their sweep and hands its spare row to the
+      // summary table, whose sweep completes on the sixth pass while the
+      // finished receipt sweep rests.
+      const later = new Date(now + 7 * 3_600_000);
+      const pages: Array<{ visited: number; expired: number; hasMore: boolean }> = [];
+      for (let i = 0; i < 10; i++) {
+        const pass = buffer.pruneSecondary({ retentionDays: 90 }, { maxRows: 2, now: later });
+        pages.push({ visited: pass.uploadReceiptsVisited + pass.summaryRowsVisited, expired: pass.uploadReceiptsExpired,
+          hasMore: pass.hasMore });
+        if (!pass.hasMore) break;
+      }
+      assert.deepEqual(pages, [
+        { visited: 2, expired: 0, hasMore: true }, { visited: 2, expired: 0, hasMore: true },
+        { visited: 2, expired: 2, hasMore: true }, { visited: 2, expired: 2, hasMore: true },
+        { visited: 2, expired: 1, hasMore: true }, { visited: 1, expired: 0, hasMore: false },
+      ]);
+      const paged = buffer.secondaryRetentionStatus();
+      assert.deepEqual({ receipts: paged.uploadReceipts.expiredTotal, summaries: paged.summaryRows.expiredTotal,
+        cursors: [paged.uploadReceipts.cursor, paged.summaryRows.cursor], hasMore: paged.lastHasMore },
+        { receipts: 6, summaries: 1, cursors: [0, 0], hasMore: false });
+      // A busy writer defers the secondary pass too, with nothing changed.
+      const other = new Database(path.join(root, "secondary.sqlite"), { timeout: 100 });
+      try {
+        other.exec("begin immediate");
+        const held = buffer.pruneSecondary({ retentionDays: 90 }, { maxRows: 2, now: new Date(now), sweepIntervalMs: 0, busyTimeoutMs: 10 });
+        assert.deepEqual({ busy: held.busy, hasMore: held.hasMore, progress: held.madeProgress }, { busy: true, hasMore: true, progress: false });
+        other.exec("rollback");
+      } finally { other.close(); }
+      return { expiredReceipts: 6, expiredSummaryRows: 1, pages };
+    } finally { buffer.close(); }
   });
   const receipt = { schema: "plimsoll-collector-reliability-proof/v1", complete: checks.length === EXPECTED_CHECKS,
     checks, expected: EXPECTED_CHECKS, passed: checks.filter(c => c.passed).length,

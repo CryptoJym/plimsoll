@@ -344,7 +344,7 @@ function rootEpoch(input: CutoverInput): string | null {
   return epoch;
 }
 
-function assertPrivateDirectory(directory: string, reason: string): fs.Stats {
+export function assertPrivateDirectory(directory: string, reason: string): fs.Stats {
   const absolute = path.resolve(directory);
   let current = path.parse(absolute).root;
   for (const part of absolute.slice(current.length).split(path.sep).filter(Boolean)) {

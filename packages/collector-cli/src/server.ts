@@ -7,6 +7,7 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
+import type { RetentionPolicy } from "./retention-policy";
 import { claudeDispatchSkipStatus, currentDispatchCaptureRoots } from "./capture-root-inventory";
 import { countUnlinkableDispatchBindings } from "./dispatch-command";
 import { readJevAnalysis, type JevAnalysisSnapshot } from "./jev-analysis";
@@ -753,6 +754,12 @@ export function createCollectorServer(
     /** One in-memory footprint snapshot; the sampler owns all filesystem and ledger reads. */
     budgetStatus?: () => unknown;
     /**
+     * 0.7.52: the retention the daemon enforces. The configured days when they
+     * were set or pinned; the budget-derived default on a studio0_scale host.
+     * Absent, status reports the configured days alone.
+     */
+    retentionPolicy?: () => RetentionPolicy;
+    /**
      * Environment the intake spool reads its kill switch and its home from.
      * Production is `process.env`, exactly as the drain's is.
      */
@@ -786,6 +793,8 @@ export function createCollectorServer(
   const healthzKey = crypto.randomBytes(32);
   const localAuth = options.localAuth ?? null;
   const authEnforced = localAuth !== null;
+  const retentionPolicy = () => options.retentionPolicy?.() ?? null;
+  const effectiveRetentionDays = () => retentionPolicy()?.days ?? config.retentionDays;
   // Keep one bounded read result, not another persistent ledger or worker.
   let jevCache: { days: number; at: number; snapshot: JevAnalysisSnapshot } | null = null;
   const sourceRateLimiter = createSourceRateLimiter(
@@ -1184,8 +1193,9 @@ export function createCollectorServer(
       dataMode: config.policy.dataMode,
       privacyMode: "metadata_only",
       privacy: collectorPrivacyReadiness(config),
-      retentionDays: config.retentionDays,
-      retention: refreshControl ? buffer.retentionProgressStatus(config.retentionDays) : cachedControl?.retention ?? null,
+      retentionDays: effectiveRetentionDays(),
+      retentionPolicy: retentionPolicy(),
+      retention: refreshControl ? buffer.retentionProgressStatus(effectiveRetentionDays()) : cachedControl?.retention ?? null,
       learningFacts: refreshControl ? learningFactsStatus() : cachedControl?.learningFacts ?? null,
       enrollment: { futureOnlyEnrollment: true, inspection: "not_inspected", quarantinedHistoryRows: null },
       stats,
@@ -1269,11 +1279,12 @@ export function createCollectorServer(
       dataMode: config.policy.dataMode,
       privacyMode: "metadata_only",
       privacy: collectorPrivacyReadiness(config),
-      retentionDays: config.retentionDays,
+      retentionDays: effectiveRetentionDays(),
+      retentionPolicy: retentionPolicy(),
       learningFacts: learningFactsStatus(),
       retention: {
         inspection: "not_inspected",
-        policy: { retentionDays: config.retentionDays, cutoffAt: null },
+        policy: { retentionDays: effectiveRetentionDays(), cutoffAt: null },
         states: {
           retained: null,
           pendingDelivery: null,
@@ -1475,11 +1486,12 @@ export function createCollectorServer(
             dataMode: config.policy.dataMode,
             privacyMode: "metadata_only",
             privacy: collectorPrivacyReadiness(config),
-            retentionDays: config.retentionDays,
+            retentionDays: effectiveRetentionDays(),
+            retentionPolicy: retentionPolicy(),
             learningFacts: null,
             retention: {
               inspection: "not_inspected",
-              policy: { retentionDays: config.retentionDays, cutoffAt: null },
+              policy: { retentionDays: effectiveRetentionDays(), cutoffAt: null },
               states: {
                 retained: null,
                 pendingDelivery: null,

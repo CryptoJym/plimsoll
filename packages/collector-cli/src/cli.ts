@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { openLedgerDatabase } from "./ledger-connection";
-import { AutomaticRetentionCadence } from "./retention-cadence";
+import { AutomaticRetentionCadence, RETENTION_LARGE_BACKLOG_ROWS } from "./retention-cadence";
 import { claudeStatusLineCliMain } from "./claude-status-line-command";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
 import Database from "better-sqlite3";
@@ -84,6 +84,7 @@ import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
 import { uploadCompletedToolStatsWeek } from "./weekly-tool-stats-upload";
+import { aggregateToolStatsWeekOffThread, WEEKLY_TOOL_STATS_READ_MS } from "./weekly-tool-stats-reader";
 import {
   DEFAULT_PRODUCER_ROTATION_GRACE_MS,
   MAX_PRODUCER_ROTATION_GRACE_MS,
@@ -212,6 +213,8 @@ import {
   lowerEnrichmentProcessPriority,
   runEnrichmentWorkerService,
 } from "./enrichment-job";
+import { compactLedger, planLedgerCompaction } from "./ledger-compact";
+import { resolveRetentionPolicy, type RetentionPolicy } from "./retention-policy";
 import { runEnrichmentMaintenanceJob } from "./maintenance-stage-primitives";
 import { readLocalIdentities } from "./local-identity";
 import {
@@ -436,6 +439,12 @@ Commands:
   capture-roots import-history --root ROOT_ID [--since ISO] [--apply] [--json]
                         Plan fenced pre-enrollment usage without writing;
                         --apply admits missing rows in bounded writer slices
+  ledger compact --into ABSOLUTE-PATH [--plan] [--verify counts|quick-check|none]
+                        With the collector stopped: copy the ledger into a fresh
+                        compact file (VACUUM INTO) on any volume, verify it and
+                        print the swap steps with their undo; --plan only reads.
+                        Never changes the live ledger; refuses while a collector
+                        connection is open
   dispatch bind --session-id S --work-item-id beads:eco-ID --project-key sha256:HASH --attempt-id UUIDv4
                 [--parent-attempt-id LEAD_SESSION] [--role author|reviewer|lead]
                 [--work-class C] [--complexity-band B]
@@ -2985,7 +2994,8 @@ async function main() {
         return {
           maintenance: workerMaintenance,
           buffer: workerBuffer,
-          retentionDays: workerConfig.retentionDays,
+          // 0.7.52: the worker deletes under the same effective policy as the daemon.
+          retentionDays: resolveRetentionPolicy(workerConfig, workerBuffer.database).days,
           repoContextDrain: {
             config: workerConfig.repoContextDrain,
             captureRoots: workerConfig.captureRoots,
@@ -3020,6 +3030,13 @@ async function main() {
       close: () => {
         workerBuffer?.close();
         workerBuffer = null;
+      },
+      // 0.7.52: a child whose parent never sends `run` leaves on its own
+      // instead of idling until the next restart (incident of 2026-11-01).
+      runWaitMs: 30_000,
+      onAbandon: (reason) => {
+        console.error(JSON.stringify({ warning: "enrichment_worker_abandoned", reason }));
+        process.exitCode = 0;
       },
     });
     return;
@@ -3379,6 +3396,7 @@ async function main() {
     "unload-launch-agent",
     "uninstall-launch-agent",
     "lifecycle",
+    "ledger",
     "__stop_window_listener",
   ]);
   const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
@@ -3717,6 +3735,18 @@ async function main() {
     // drain armed below replays it. PLIMSOLL_OTLP_SPOOL=off disables both.
     const otlpSpool = new OtlpIntakeSpool({ home: collectorHome() });
     const syncBackoff = new SyncBackoff(config.syncIntervalSeconds * 1_000);
+    // 0.7.52: the retention the daemon enforces. A configured value other than
+    // the schema default, or a pinned one, wins; a studio0_scale host otherwise
+    // takes the budget-derived default. Re-resolved hourly so a host whose
+    // admission rate matures after start picks its class up without a restart.
+    let retentionPolicyCache: { at: number; policy: RetentionPolicy } | null = null;
+    const retentionPolicy = () => {
+      const at = Date.now();
+      if (!retentionPolicyCache || at - retentionPolicyCache.at > 60 * 60_000) {
+        retentionPolicyCache = { at, policy: resolveRetentionPolicy(config, buffer.database) };
+      }
+      return retentionPolicyCache.policy;
+    };
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
@@ -3727,6 +3757,7 @@ async function main() {
         p50: null, p95: null, hostClass: null, targets: null,
         targetStatus: "hypothesis", writeRateStatus: "uncalibrated_physical_bytes_unavailable",
         unavailable: ["sampler_disabled"] },
+      retentionPolicy,
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the
@@ -4183,14 +4214,55 @@ async function main() {
       }
       return result;
     });
+    // 0.7.52: the prune yields to the ledger (a 25 ms busy timeout; a held
+    // writer defers the pass), never to another scheduler's in-flight flag,
+    // which starved it on a busy host (incident of 2026-11-01: 34 passes of
+    // 128 rows, then none). Each pass is bounded by rows and by a 250 ms
+    // writer budget; the pass size grows while a large backlog clears. Once
+    // the raw backlog has no more work, the same pass sweeps the secondary
+    // tables: acknowledged upload receipts past 30 days whose raw row is
+    // gone, and orphan summary rows past retention.
+    let largeBacklogCache: { at: number; value: boolean } | null = null;
     retentionCadence = new AutomaticRetentionCadence(
-      () => buffer.prune(config.retentionDays, { maxRows: 128 }),
+      (request) => {
+        const days = retentionPolicy().days;
+        const raw = buffer.prune(days, {
+          maxRows: request.maxRows, maxWriterMs: request.maxWriterMs, busyTimeoutMs: 25,
+        });
+        if (raw.busy || raw.hasMore) return raw;
+        const secondary = buffer.pruneSecondary({ retentionDays: days }, {
+          maxRows: request.maxRows, maxWriterMs: Math.max(25, request.maxWriterMs - raw.elapsedMs),
+          busyTimeoutMs: 25,
+        });
+        if (secondary.busy && !raw.madeProgress) return { ...raw, busy: true, secondary };
+        return {
+          ...raw,
+          hasMore: secondary.busy || secondary.hasMore,
+          madeProgress: raw.madeProgress || secondary.madeProgress,
+          elapsedMs: raw.elapsedMs + secondary.elapsedMs,
+          secondary,
+        };
+      },
       {
-        canRun: () => !scheduler?.status().inFlight && !enrichmentScheduler?.status().inFlight,
-        onPass: (receipt) => {
-          if (receipt.events || receipt.metricSamples) console.log(JSON.stringify({ status: "pruned", ...receipt }));
+        passRows: { base: 128, max: 4_096, maxWriterMs: 250 },
+        largeBacklog: () => {
+          const at = Date.now();
+          if (!largeBacklogCache || at - largeBacklogCache.at > 60_000) {
+            largeBacklogCache = { at,
+              value: buffer.rawRetentionBacklogAtLeast(retentionPolicy().days, RETENTION_LARGE_BACKLOG_ROWS) };
+          }
+          return largeBacklogCache.value;
         },
-        onError: () => console.warn(JSON.stringify({ warning: "prune_failed" })),
+        onPass: (receipt) => {
+          const secondary = receipt.secondary as
+            { uploadReceiptsExpired?: number; summaryRowsExpired?: number } | undefined;
+          if (receipt.events || receipt.metricSamples ||
+              secondary?.uploadReceiptsExpired || secondary?.summaryRowsExpired) {
+            console.log(JSON.stringify({ status: "pruned", ...receipt }));
+          }
+        },
+        onError: (error) => console.warn(JSON.stringify({ warning: "prune_failed",
+          message: error instanceof Error ? error.message : String(error) })),
       },
     );
     maintenanceCadence = new AutomaticMaintenanceCadence(
@@ -4285,16 +4357,34 @@ async function main() {
       syncBackoff.arm();
       timers.push(setInterval(() => { syncBackoff.tick(); void runSync(); }, config.syncIntervalSeconds * 1000));
       let toolStatsInFlight = false;
+      let toolStatsRetryAt = 0;
+      let toolStatsFailures = 0;
+      const weeklyToolStatsFailureReason = (error: unknown) =>
+        String((error as { code?: unknown } | null)?.code ?? (error as { message?: unknown } | null)?.message ?? error)
+          .replace(/[^A-Za-z0-9_.:-]+/g, "_").slice(0, 96);
       const runWeeklyToolStats = async () => {
-        if (toolStatsInFlight || shuttingDown) return;
+        if (toolStatsInFlight || shuttingDown || Date.now() < toolStatsRetryAt) return;
         toolStatsInFlight = true;
         try {
-          const status = await uploadCompletedToolStatsWeek(config, buffer.database);
+          // The week is read on a reader thread in short chunks under a
+          // deadline, never on this thread (2026-11-01: a read planned without
+          // statistics held the main thread for 3.5 hours).
+          const status = await uploadCompletedToolStatsWeek(config, buffer.database, {
+            aggregate: (input) => aggregateToolStatsWeekOffThread(buffer.database, input,
+              { maxMs: WEEKLY_TOOL_STATS_READ_MS }),
+          });
+          toolStatsFailures = 0;
           if (status === "accepted" || status === "conflict") {
             console.log(JSON.stringify({ status: `weekly_tool_stats_${status}` }));
           }
-        } catch {
-          console.warn(JSON.stringify({ warning: "weekly_tool_stats_retry_pending" }));
+        } catch (error) {
+          // Each failure doubles the wait before the next attempt, up to an hour.
+          toolStatsFailures += 1;
+          const retryInMs = Math.min(60 * 60_000,
+            config.syncIntervalSeconds * 1000 * 2 ** Math.min(toolStatsFailures - 1, 10));
+          toolStatsRetryAt = Date.now() + retryInMs;
+          console.warn(JSON.stringify({ warning: "weekly_tool_stats_retry_pending",
+            reason: weeklyToolStatsFailureReason(error), retryInMs }));
         } finally {
           toolStatsInFlight = false;
         }
@@ -4708,6 +4798,8 @@ async function main() {
         })(),
       })
       : null;
+    // 0.7.52: the effective policy, named with its source and basis.
+    const statusRetentionPolicy = resolveRetentionPolicy(config, buffer.database);
     console.log(
       JSON.stringify(
         {
@@ -4737,7 +4829,8 @@ async function main() {
           dataMode: config.policy.dataMode,
           privacyMode: "metadata_only",
           privacy: collectorPrivacyReadiness(config),
-          retentionDays: config.retentionDays,
+          retentionDays: statusRetentionPolicy.days,
+          retentionPolicy: statusRetentionPolicy,
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
           codexUsagePairing: codexUsagePairingStatus(buffer.database),
@@ -4746,7 +4839,8 @@ async function main() {
           unlinkableBindCount: countUnlinkableDispatchBindings(config.captureRoots ?? []),
           claudeDispatchSkips: daemonState.claudeDispatchSkips,
           stats: projectedStatus?.stats ?? null,
-          retention: buffer.retentionStatus(config.retentionDays),
+          retention: buffer.retentionStatus(statusRetentionPolicy.days),
+          secondaryRetention: buffer.secondaryRetentionStatus(),
           learningFacts: buffer.learningFacts.statusWithWindow(),
           // Hook events the collector could not accept live, and what the
           // drain has recovered since (bead eco-6hoxj.61).
@@ -6205,7 +6299,8 @@ async function main() {
           dataMode: config.policy.dataMode,
           privacyMode: "metadata_only",
           privacy: collectorPrivacyReadiness(config),
-          retentionDays: config.retentionDays,
+          // The daemon's effective days when it answered; the configured days otherwise.
+          retentionDays: connectivity.retention?.policy.retentionDays ?? config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           uploadSigningConfigured: Boolean(config.uploadSigningSecret),
           retention: connectivity.retention ?? {
@@ -6263,6 +6358,45 @@ async function main() {
   // invisible and was repaired by host-sealed one-off scripts. This command is
   // those scripts' reviewed semantics: derive the same identity, append, never
   // change an existing root, epoch or enrollment field.
+  // 0.7.52: offline compaction. With the collector stopped, copy the ledger
+  // into a fresh compact file on any volume (VACUUM INTO), verify it and print
+  // the swap steps with their undo. The live ledger is never modified; an open
+  // collector connection, an existing destination, a destination directory
+  // that is not private, or too little free space refuses the run.
+  if (command === "ledger") {
+    const usage = "Expected ledger compact --into ABSOLUTE-PATH [--plan] [--verify counts|quick-check|none] [--json]";
+    if ((process.argv[3] ?? "") !== "compact") throw new Error(usage);
+    const args = process.argv.slice(4);
+    const allowed = new Set(["--into", "--plan", "--verify", "--json"]);
+    const takesValue = new Set(["--into", "--verify"]);
+    if (args.some((value, index) =>
+          (!allowed.has(value) && !(index > 0 && takesValue.has(args[index - 1]!))) ||
+          (takesValue.has(value) && (!args[index + 1] || args[index + 1]!.startsWith("--"))))) {
+      throw new Error(usage);
+    }
+    if (configRead?.status !== "valid") throw new Error("ledger compact requires a valid collector config");
+    const into = optionValue("--into");
+    if (!into || !path.isAbsolute(into)) throw new Error("ledger compact requires --into ABSOLUTE-PATH");
+    const verifyOption = optionValue("--verify") ?? "counts";
+    const verify = verifyOption === "counts" ? "counts" : verifyOption === "quick-check" ? "quick_check"
+      : verifyOption === "none" ? "none" : null;
+    if (!verify) throw new Error("--verify must be counts, quick-check or none");
+    const ledgerPath = collectorBufferPath();
+    if (flag("--plan")) {
+      const plan = planLedgerCompaction({ ledgerPath, intoPath: into });
+      console.log(JSON.stringify({ ...plan,
+        status: plan.status === "ready" ? "ledger_compact_plan" : "ledger_compact_refused" }, null, 2));
+      process.exitCode = plan.status === "ready" ? 0 : 1;
+      return;
+    }
+    const receipt = compactLedger({ ledgerPath, intoPath: into, verify,
+      onProgress: (step) => console.error(JSON.stringify({ progress: "ledger_compact", step })) });
+    const ok = receipt.status === "compacted" && receipt.verification.passed !== false;
+    console.log(JSON.stringify({ ...receipt, status: ok ? "ledger_compacted" : "ledger_compact_refused" }, null, 2));
+    process.exitCode = ok ? 0 : 1;
+    return;
+  }
+
   if (command === "capture-roots") {
     const action = process.argv[3] ?? "";
     if (!["discover", "epoch-plan", "epoch-switch", "epoch-restore", "add", "import-history"].includes(action)) {

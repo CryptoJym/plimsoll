@@ -197,6 +197,12 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:receipt-lineage-scale
 
+      - name: Prove the 0.7.52 retention policy and ledger compaction
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:retention-policy
+          pnpm proof:ledger-compact
+
       - name: Prove event allocation conservation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:allocation
@@ -1162,11 +1168,12 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:runtime-facts
 
-      - name: Prove weekly tool statistics collection, upload bounds and later weeks (eco-6hoxj.165.25)
+      - name: Prove weekly tool statistics collection, upload bounds, later weeks and the reader-thread read (eco-6hoxj.165.25)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
           pnpm proof:weekly-tool-stats
           pnpm proof:weekly-tool-stats-oversize
+          pnpm proof:weekly-tool-stats-reader
 
       - name: Run signal-fidelity proof
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

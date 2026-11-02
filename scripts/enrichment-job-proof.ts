@@ -7,6 +7,7 @@ import {
   EnrichmentProcessBoundary,
   IdleEnrichmentScheduler,
   lowerEnrichmentProcessPriority,
+  runEnrichmentWorkerService,
   type EnrichmentBoundaryChild,
 } from "../packages/collector-cli/src/enrichment-job";
 
@@ -168,8 +169,145 @@ assert.equal(lowerEnrichmentProcessPriority((pid, priority) => {
 }), true);
 assert.deepEqual(priorityCall, [0, 15]);
 
+// 0.7.52: an identity check that cannot answer never leaves a child unreaped.
+// Before, a slow or failing `ps` folded into "not ours", the boundary refused
+// to signal, and every later tick failed with enrichment_child_not_reaped.
+type BoundaryOptions = ConstructorParameters<typeof EnrichmentProcessBoundary>[0];
+async function pass(options: Partial<BoundaryOptions>, child: () => FakeChild) {
+  let spawned!: FakeChild;
+  const boundary = new EnrichmentProcessBoundary({
+    entryPath: "unused", deadlineMs: 200, readyDeadlineMs: 200, termGraceMs: 5, killGraceMs: 30, verifyTimeoutMs: 20,
+    spawnChild: (spawnNonce) => {
+      spawned = child();
+      queueMicrotask(() => spawned.emit("message", { schema: 1, type: "ready", spawnNonce }));
+      return spawned;
+    },
+    ...options,
+  });
+  const started = performance.now();
+  const outcome = await boundary.run({ acceptPartial: true }).then(
+    (value) => ({ value, error: null as string | null }),
+    (error: Error) => ({ value: null, error: error.message }),
+  );
+  return { boundary, child: spawned, outcome, elapsedMs: performance.now() - started };
+}
+
+const hung = await pass({ verifyChild: () => new Promise<boolean | null>(() => undefined) }, () => new FakeChild());
+assert.equal(hung.outcome.value?.outcome, "PARTIAL_OK");
+assert.ok(hung.elapsedMs < 1_500, `hung verifier settled in ${hung.elapsedMs.toFixed(0)} ms`);
+assert.deepEqual(hung.child.signals, ["SIGTERM", "SIGKILL"]);
+assert.ok(hung.boundary.status().identityUnknown >= 2, "unknown identity counted");
+assert.deepEqual(
+  { childPresent: hung.boundary.status().childPresent, orphanRisk: hung.boundary.status().orphanRisk,
+    inFlight: hung.boundary.status().inFlight, pidMismatches: hung.boundary.status().pidMismatches },
+  { childPresent: false, orphanRisk: false, inFlight: false, pidMismatches: 0 },
+);
+
+const throwing = await pass({ verifyChild: async () => { throw new Error("ps_unavailable"); } }, () => new FakeChild());
+assert.equal(throwing.outcome.value?.outcome, "PARTIAL_OK");
+assert.ok(throwing.boundary.status().identityUnknown >= 2);
+assert.deepEqual({ orphanRisk: throwing.boundary.status().orphanRisk, childPresent: throwing.boundary.status().childPresent },
+  { orphanRisk: false, childPresent: false });
+
+// A positive mismatch still refuses to signal; the boundary is not left in flight,
+// and the child's own close (its run-wait deadline) recovers it without a restart.
+const mismatch = await pass({ verifyChild: async () => false }, () => new FakeChild());
+assert.equal(mismatch.outcome.error, "enrichment_child_not_reaped");
+assert.deepEqual(mismatch.child.signals, []);
+assert.deepEqual(
+  { orphanRisk: mismatch.boundary.status().orphanRisk, inFlight: mismatch.boundary.status().inFlight,
+    pidMismatches: mismatch.boundary.status().pidMismatches, childPresent: mismatch.boundary.status().childPresent },
+  { orphanRisk: true, inFlight: false, pidMismatches: 2, childPresent: true },
+);
+mismatch.child.connected = false;
+mismatch.child.emit("close", 0, null);
+assert.deepEqual(
+  { orphanRisk: mismatch.boundary.status().orphanRisk, childPresent: mismatch.boundary.status().childPresent,
+    reaped: mismatch.boundary.status().reapedChildren },
+  { orphanRisk: false, childPresent: false, reaped: 1 },
+);
+
+// A child Node already reports as exited is never signalled; its close is awaited.
+class ExitedChild extends FakeChild {
+  exitCode: number | null = null;
+  send(raw: unknown, callback?: (error: Error | null) => void) {
+    const request = raw as { type?: string; generation?: number; nonce?: string };
+    callback?.(null);
+    if (request.type === "run") {
+      queueMicrotask(() => this.emit("message", {
+        schema: 1, type: "enrichment_job_progress", generation: request.generation,
+        nonce: request.nonce, sequence: 1, rows: 1, ms: 1, remaining: 10,
+      }));
+      setTimeout(() => { this.exitCode = 0; }, 5);
+      setTimeout(() => { this.connected = false; this.emit("close", 0, null); }, 60);
+    }
+    return true;
+  }
+}
+const exited = await pass({ verifyChild: async () => true, deadlineMs: 20, readyDeadlineMs: 20, killGraceMs: 200 },
+  () => new ExitedChild());
+assert.equal(exited.outcome.value?.outcome, "PARTIAL_OK");
+assert.deepEqual(exited.child.signals, []);
+assert.deepEqual(
+  { term: exited.boundary.status().termSignals, kill: exited.boundary.status().killSignals,
+    orphanRisk: exited.boundary.status().orphanRisk, childPresent: exited.boundary.status().childPresent },
+  { term: 0, kill: 0, orphanRisk: false, childPresent: false },
+);
+
+// The worker side: a child whose parent never sends `run` leaves on its own.
+function fakeTransport() {
+  const listeners: Partial<Record<"message" | "disconnect", (raw?: unknown) => void>> = {};
+  const sent: unknown[] = [];
+  let disconnects = 0;
+  return {
+    sent, listeners, disconnects: () => disconnects,
+    transport: {
+      send: (receipt: unknown, callback?: (error: Error | null) => void) => { sent.push(receipt); callback?.(null); return true; },
+      on: (event: "message" | "disconnect", listener: (raw?: unknown) => void) => { listeners[event] = listener; },
+      disconnect: () => { disconnects += 1; },
+    },
+  };
+}
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const nonce = "0123456789abcdef0123456789abcdef";
+const abandoned = fakeTransport();
+let abandonedReason: string | null = null, abandonedClosed = 0, abandonedExecuted = 0;
+runEnrichmentWorkerService({
+  spawnNonce: nonce, transport: abandoned.transport, runWaitMs: 20,
+  execute: () => { abandonedExecuted += 1; return { rows: 0, ms: 0 }; },
+  close: () => { abandonedClosed += 1; },
+  onAbandon: (reason) => { abandonedReason = reason; },
+});
+assert.deepEqual(abandoned.sent, [{ schema: 1, type: "ready", spawnNonce: nonce }]);
+await sleep(80);
+assert.deepEqual(
+  { reason: abandonedReason, closed: abandonedClosed, disconnects: abandoned.disconnects(), executed: abandonedExecuted },
+  { reason: "run_not_received", closed: 1, disconnects: 1, executed: 0 },
+);
+abandoned.listeners.message?.({ schema: 1, type: "run", generation: 1, nonce, deadlineMs: 50 });
+assert.deepEqual({ executed: abandonedExecuted, sent: abandoned.sent.length }, { executed: 0, sent: 1 });
+
+const served = fakeTransport();
+let servedAbandon = 0, servedExecuted = 0;
+runEnrichmentWorkerService({
+  spawnNonce: nonce, transport: served.transport, runWaitMs: 20,
+  execute: () => { servedExecuted += 1; return { rows: 3, ms: 1 }; },
+  onAbandon: () => { servedAbandon += 1; },
+});
+served.listeners.message?.({ schema: 1, type: "run", generation: 1, nonce, deadlineMs: 50 });
+await sleep(60);
+assert.deepEqual(
+  { executed: servedExecuted, abandon: servedAbandon, progress: (served.sent[1] as { type?: string } | undefined)?.type },
+  { executed: 1, abandon: 0, progress: "enrichment_job_progress" },
+);
+
 console.log(JSON.stringify({
-  proof: "enrichment_job", checks: 5, passed: 5,
+  proof: "enrichment_job", checks: 11, passed: 11,
+  hungVerifierMs: Number(hung.elapsedMs.toFixed(0)),
+  identityUnknown: { hung: hung.boundary.status().identityUnknown, throwing: throwing.boundary.status().identityUnknown },
+  mismatchRecovered: !mismatch.boundary.status().orphanRisk,
+  exitedChildSignals: exited.child.signals,
+  workerAbandon: abandonedReason,
   fixtureEvents: 100_000,
   oldMs: Number(oldMs.toFixed(3)), boundedMs: Number(boundedMs.toFixed(3)),
   timeoutSignals: timeoutChild.signals,

@@ -6,7 +6,7 @@ import { LOCAL_TENANT_ID } from "../../shared/src/index";
 import type { CollectorConfig } from "./config";
 import { authenticatedJsonPost, MAX_POST_BYTES, validatedTransportUrl } from "./http-transport";
 import { aggregateToolStatsWeek, countsOnlyToolStats, foldToolStatsVersions, selectToolStatsSessions,
-  utcWeekStart, type UploadWeeklyToolStats } from "./weekly-tool-stats";
+  utcWeekStart, type ToolStatsWeekInput, type UploadWeeklyToolStats, type WeeklyToolStats } from "./weekly-tool-stats";
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -38,7 +38,9 @@ type Receipt = { schema?: unknown; deviceId?: unknown; reportSequence?: unknown;
 export async function uploadCompletedToolStatsWeek(
   config: CollectorConfig,
   db: Database.Database,
-  options: { now?: () => Date; fetchImpl?: typeof fetch; maxReportBytes?: number } = {},
+  options: { now?: () => Date; fetchImpl?: typeof fetch; maxReportBytes?: number;
+    /** Reads the week. The daemon supplies a reader-thread read with a deadline. */
+    aggregate?: (input: ToolStatsWeekInput) => WeeklyToolStats | Promise<WeeklyToolStats> } = {},
 ): Promise<"not_joined" | "not_due" | "accepted" | "retry" | "conflict"> {
   if (!config.uploadUrl || !config.cloudDeviceId || !config.deviceId ||
     config.tenantId === LOCAL_TENANT_ID || config.installKey === "local-dev" ||
@@ -65,8 +67,8 @@ export async function uploadCompletedToolStatsWeek(
     if (last.weekStart) weekStart.setUTCDate(weekStart.getUTCDate() + 7);
     if (weekStart.toISOString().slice(0, 10) >= currentWeek) return "not_due";
     const date = weekStart.toISOString().slice(0, 10);
-    let toolStats = selectToolStatsSessions(aggregateToolStatsWeek(db,
-      { workspaceId: config.tenantId, deviceId: config.deviceId, weekStart: date }));
+    const input = { workspaceId: config.tenantId, deviceId: config.deviceId, weekStart: date };
+    let toolStats = selectToolStatsSessions(await (options.aggregate ? options.aggregate(input) : aggregateToolStatsWeek(db, input)));
     const reportSequence = (last.reportSequence ?? 0) + 1;
     const identity = { tenantId: config.tenantId, deviceId: config.cloudDeviceId,
       reportSequence, observedAt: now.toISOString() };

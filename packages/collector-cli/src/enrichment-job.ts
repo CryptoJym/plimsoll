@@ -23,6 +23,9 @@ export type EnrichmentJobOutcome =
 export type EnrichmentBoundaryChild = {
   pid?: number;
   connected: boolean;
+  /** Set by Node once the process has exited: positive evidence it is gone. */
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | string | null;
   send: (message: unknown, callback?: (error: Error | null) => void) => boolean;
   kill: (signal: NodeJS.Signals) => boolean;
   on: (event: string, listener: (...args: any[]) => void) => unknown;
@@ -37,6 +40,10 @@ export type EnrichmentBoundaryStatus = {
   killSignals: number;
   reapedChildren: number;
   orphanRisk: boolean;
+  /** Identity checks that positively named another process under the pid. */
+  pidMismatches: number;
+  /** Identity checks that could not answer (ps failed, timed out or hung); the handle decided. */
+  identityUnknown: number;
 };
 
 type EnrichmentBoundaryOptions = {
@@ -48,7 +55,10 @@ type EnrichmentBoundaryOptions = {
   termGraceMs?: number;
   killGraceMs?: number;
   spawnChild?: (spawnNonce: string) => EnrichmentBoundaryChild;
-  verifyChild?: (pid: number, spawnNonce: string) => Promise<boolean>;
+  /** Three answers: true (ours), false (positively another process), null (unknown). */
+  verifyChild?: (pid: number, spawnNonce: string) => Promise<boolean | null>;
+  /** Bound on one identity check; a check that overruns twice this settles as unknown. */
+  verifyTimeoutMs?: number;
 };
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -65,16 +75,32 @@ function enrichmentEnvironment(source: NodeJS.ProcessEnv, spawnNonce: string) {
   return env;
 }
 
-function verifyProcess(pid: number, spawnNonce: string) {
-  return new Promise<boolean>((resolve) => {
-    execFile("/bin/ps", ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "command="], {
-      encoding: "utf8", timeout: 500,
-      env: { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC" },
-    }, (error, stdout) => {
-      const row = !error && typeof stdout === "string" ? stdout.trim().replace(/\s+/g, " ") : "";
-      const parent = /^(\d+)\s+/.exec(row);
-      resolve(Boolean(parent && Number(parent[1]) === process.pid && new RegExp(`(?:^|\\s)__enrichment_worker ${spawnNonce}(?:\\s|$)`).test(row)));
-    });
+/**
+ * Identity check with three answers. `true`: the pid is our child running this
+ * spawn nonce. `false`: ps positively shows another process under the pid.
+ * `null`: the check could not answer (ps failed, timed out, or printed no
+ * row, which is also what a just-exited child looks like). An unanswered
+ * check never decides on its own; the child handle's exit evidence does.
+ * Before 0.7.52 every failure folded into `false`, and one slow `ps` left a
+ * live idle child unreaped until the next restart.
+ */
+function verifyProcess(pid: number, spawnNonce: string, timeoutMs = 500): Promise<boolean | null> {
+  return new Promise<boolean | null>((resolve) => {
+    try {
+      execFile("/bin/ps", ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "command="], {
+        encoding: "utf8", timeout: Math.max(1, timeoutMs),
+        env: { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC" },
+      }, (error, stdout) => {
+        if (error) return resolve(null);
+        const row = typeof stdout === "string" ? stdout.trim().replace(/\s+/g, " ") : "";
+        const parent = /^(\d+)\s+/.exec(row);
+        if (!parent) return resolve(null);
+        resolve(Number(parent[1]) === process.pid &&
+          new RegExp(`(?:^|\\s)__enrichment_worker ${spawnNonce}(?:\\s|$)`).test(row));
+      });
+    } catch {
+      resolve(null);
+    }
   });
 }
 
@@ -87,6 +113,8 @@ export class EnrichmentProcessBoundary {
   private killSignals = 0;
   private reapedChildren = 0;
   private orphanRisk = false;
+  private pidMismatches = 0;
+  private identityUnknown = 0;
   private accepting = true;
   private recoverChild: (() => Promise<boolean>) | null = null;
   private abortCurrent: (() => Promise<void>) | null = null;
@@ -105,6 +133,8 @@ export class EnrichmentProcessBoundary {
       killSignals: this.killSignals,
       reapedChildren: this.reapedChildren,
       orphanRisk: this.orphanRisk,
+      pidMismatches: this.pidMismatches,
+      identityUnknown: this.identityUnknown,
     };
   }
 
@@ -200,24 +230,40 @@ export class EnrichmentProcessBoundary {
             const timer = setTimeout(() => { if (!ended) { ended = true; closeWaiter = null; done(false); } }, ms);
             closeWaiter = () => { if (!ended) { ended = true; clearTimeout(timer); closeWaiter = null; done(true); } };
           });
+      // Node sets exitCode or signalCode the moment the process exits, before
+      // `close` (which also waits for the IPC channel). Either is positive
+      // evidence that no signal is needed.
+      const childExited = () => typeof child.exitCode === "number" || typeof child.signalCode === "string";
       const terminate = async () => {
         if (!this.child) return true;
+        if (this.child !== child) return false;
         const pid = child.pid;
-        const verified = pid && await (this.options.verifyChild ?? verifyProcess)(pid, spawnNonce);
-        if (!verified || this.child !== child) {
-          this.orphanRisk = this.child === child;
+        const identity = pid ? await this.verify(pid, spawnNonce) : null;
+        if (!this.child) return true;
+        if (this.child !== child) return false;
+        if (identity === false) {
+          // ps positively named another process under this pid. Never signal
+          // it. The handle's own close is the only way out, and a child that
+          // never received its run leaves on its run-wait deadline.
+          this.pidMismatches += 1;
+          this.orphanRisk = true;
           return false;
         }
-        try { if (child.kill("SIGTERM")) this.termSignals += 1; }
-        catch { this.orphanRisk = this.child === child; return false; }
+        if (identity === null) this.identityUnknown += 1;
+        // Signals go through the child handle, which Node binds to the process
+        // it spawned for as long as the handle lives: a reused pid is never
+        // signalled by it. The ps row is corroboration, not the gate.
+        if (!childExited()) {
+          try { if (child.kill("SIGTERM")) this.termSignals += 1; }
+          catch { this.orphanRisk = this.child === child; return false; }
+        }
         if (await waitForClose(this.termGraceMs())) return true;
-        const verifiedAgain = pid && await (this.options.verifyChild ?? verifyProcess)(pid, spawnNonce);
-        if (!verifiedAgain || this.child !== child) {
-          this.orphanRisk = this.child === child;
-          return false;
+        if (!this.child) return true;
+        if (this.child !== child) return false;
+        if (!childExited()) {
+          try { if (child.kill("SIGKILL")) this.killSignals += 1; }
+          catch { this.orphanRisk = this.child === child; return false; }
         }
-        try { if (child.kill("SIGKILL")) this.killSignals += 1; }
-        catch { this.orphanRisk = this.child === child; return false; }
         const gone = await waitForClose(this.killGraceMs());
         this.orphanRisk = !gone;
         return gone;
@@ -227,7 +273,8 @@ export class EnrichmentProcessBoundary {
         if (ending || settled) return;
         ending = true;
         cleanupTimers();
-        const gone = await terminate();
+        let gone = false;
+        try { gone = await terminate(); } catch { gone = false; }
         if (!gone) return fail("enrichment_child_not_reaped");
         if (acknowledged && options.acceptPartial) {
           return finish({ outcome: "PARTIAL_OK", ...acknowledged });
@@ -243,11 +290,16 @@ export class EnrichmentProcessBoundary {
         if (row.type === "ready") {
           if (ready || row.spawnNonce !== spawnNonce) return void timeout("enrichment_ready_identity_mismatch");
           void (async () => {
-            const verified = child.pid && await (this.options.verifyChild ?? verifyProcess)(child.pid, spawnNonce);
+            // The IPC channel itself names the child: only the process this
+            // boundary forked holds it, and the nonce matched. The ps row can
+            // refuse a positive mismatch; an unanswered check proceeds.
+            const identity = child.pid ? await this.verify(child.pid, spawnNonce) : null;
             if (settled || ending || this.child !== child) return;
-            if (!verified) {
+            if (identity === false) {
+              this.pidMismatches += 1;
               return timeout("enrichment_ready_pid_mismatch");
             }
+            if (identity === null) this.identityUnknown += 1;
             ready = true;
             if (readyTimer) clearTimeout(readyTimer);
             readyTimer = null;
@@ -322,6 +374,33 @@ export class EnrichmentProcessBoundary {
   private readyDeadlineMs() { return Math.max(1, Math.min(this.options.readyDeadlineMs ?? 5_000, this.deadlineMs())); }
   private termGraceMs() { return Math.max(1, Math.min(this.options.termGraceMs ?? 250, 5_000)); }
   private killGraceMs() { return Math.max(1, Math.min(this.options.killGraceMs ?? 750, 5_000)); }
+  private verifyTimeoutMs() { return Math.max(1, Math.min(this.options.verifyTimeoutMs ?? 500, 5_000)); }
+
+  /**
+   * Bounded identity check. A verifier that hangs, throws or overruns twice
+   * the verify timeout settles as unknown, so a ready or terminate step never
+   * waits past its own deadline on it.
+   */
+  private verify(pid: number, spawnNonce: string): Promise<boolean | null> {
+    const timeoutMs = this.verifyTimeoutMs();
+    const verifier = this.options.verifyChild ??
+      ((candidate: number, nonce: string) => verifyProcess(candidate, nonce, timeoutMs));
+    return new Promise<boolean | null>((resolve) => {
+      let done = false;
+      let cap: Timer | null = null;
+      const settle = (value: boolean | null) => {
+        if (done) return;
+        done = true;
+        if (cap) clearTimeout(cap);
+        resolve(value);
+      };
+      cap = setTimeout(() => settle(null), timeoutMs * 2);
+      Promise.resolve().then(() => verifier(pid, spawnNonce)).then(
+        (value) => settle(value === true ? true : value === false ? false : null),
+        () => settle(null),
+      );
+    });
+  }
 }
 
 export type IdleEnrichmentOutcome = EnrichmentJobOutcome | { outcome: "skipped_main_busy" };
@@ -388,6 +467,14 @@ export function runEnrichmentWorkerService(input: {
   execute: (deadlineMs: number) => EnrichmentJobResult;
   close?: () => void;
   transport?: EnrichmentWorkerTransport;
+  /**
+   * How long to wait for the parent's run message after `ready`. A child whose
+   * parent never sends it (the parent refused the ready, or died) leaves on its
+   * own instead of idling until a signal. Default 30 s; the parent's ready
+   * deadline is 5 s.
+   */
+  runWaitMs?: number;
+  onAbandon?: (reason: "run_not_received") => void;
 }) {
   const transport = input.transport ?? {
     send: (receipt: unknown, callback?: (error: Error | null) => void) => callback
@@ -397,8 +484,17 @@ export function runEnrichmentWorkerService(input: {
     disconnect: () => process.disconnect?.(),
   };
   let active = false;
+  let abandoned = false;
   let awaitingAck: { generation: number; nonce: string; sequence: number; result: EnrichmentJobResult } | null = null;
+  const runWait = setTimeout(() => {
+    if (active || abandoned) return;
+    abandoned = true;
+    input.onAbandon?.("run_not_received");
+    input.close?.();
+    transport.disconnect?.();
+  }, Math.max(1, Math.min(input.runWaitMs ?? 30_000, 600_000)));
   transport.on("message", (raw) => {
+    if (abandoned) return;
     if (!raw || typeof raw !== "object") return;
     const row = raw as Record<string, unknown>;
     if (row.type === "ack" && awaitingAck && row.schema === ENRICHMENT_PROTOCOL_SCHEMA &&
@@ -420,6 +516,7 @@ export function runEnrichmentWorkerService(input: {
         !Number.isSafeInteger(row.generation) || Number(row.generation) < 1 ||
         !validNonce(row.nonce) || !Number.isSafeInteger(row.deadlineMs) || Number(row.deadlineMs) < 1) return;
     active = true;
+    clearTimeout(runWait);
     const started = performance.now();
     try {
       const result = input.execute(Number(row.deadlineMs));
@@ -437,6 +534,6 @@ export function runEnrichmentWorkerService(input: {
       transport.disconnect?.();
     }
   });
-  transport.on("disconnect", () => input.close?.());
+  transport.on("disconnect", () => { clearTimeout(runWait); input.close?.(); });
   transport.send({ schema: ENRICHMENT_PROTOCOL_SCHEMA, type: "ready", spawnNonce: input.spawnNonce });
 }

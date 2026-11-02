@@ -286,6 +286,19 @@ function attemptedClass(db: Database.Database, nowMs: number) {
     rateBasis: "lower_bound_local_admitted_rows_only; counted_gaps_and_other_writers_unavailable" };
 }
 
+/** The host class, its measured admission rate and its targets, from the
+ * last seven complete days of `budget_daily`. Safe before the sampler has
+ * started: a ledger without the budget schema reports no class. */
+export function budgetHostClass(db: Database.Database, nowMs = Date.now()) {
+  if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_daily'`).get() ||
+      !db.prepare(`select 1 from sqlite_master where type='table' and name='budget_control'`).get()) {
+    return { hostClass: null, attemptedRowsPerDay: null, observedDays: 0, provisional: true,
+      rateBasis: "budget_schema_absent", targets: null };
+  }
+  const host = attemptedClass(db, nowMs);
+  return { ...host, targets: host.hostClass ? TARGETS[host.hostClass] : null };
+}
+
 /** CLI read; the daemon calls this only after a sample, and /status uses its cached return. */
 function budgetSamples(db: Database.Database, nowMs = Date.now()): BudgetSample[] {
   if (!db.prepare(`select 1 from sqlite_master where type='table' and name='budget_samples'`).get()) return [];
