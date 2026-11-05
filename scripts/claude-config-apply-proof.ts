@@ -200,7 +200,7 @@ function main() {
       ownedHook.type === "http" &&
         ownedHook.headers?.["x-plimsoll-source"] === "claude_code" &&
         ownedHook.headers?.["x-plimsoll-token"] === undefined &&
-        generated.hooks.UserPromptSubmit[0].hooks[0].headers?.["x-plimsoll-source"] === "claude_code",
+        (generated.hooks.UserPromptSubmit[0].hooks[0] as { headers?: Record<string, string> }).headers?.["x-plimsoll-source"] === "claude_code",
       { hookHeaders: ownedHook.headers },
     );
     const tokened = generateClaudeCodeSettings({

@@ -43,9 +43,14 @@ import { isDeepStrictEqual } from "node:util";
 import { useFixtureRoot } from "./lib/fixture-root";
 import {
   ManagedConfigTargetError,
+  applyClaudeHookHeaderFile,
+  applyClaudeOtelHeadersHelper,
   applyClaudeSettings,
+  claudeTelemetryPaths,
   discoverClaudeSeats,
   generateClaudeCodeSettings,
+  generateClaudeHookHeader,
+  generateClaudeOtelHeadersHelper,
 } from "../packages/collector-config/src/index";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 
@@ -140,6 +145,7 @@ function managedSeatDocument(generated: ReturnType<typeof generateClaudeCodeSett
   return {
     model: fleet.model,
     env: { ...generated.env },
+    ...(generated.otelHeadersHelper ? { otelHeadersHelper: generated.otelHeadersHelper } : {}),
     hooks: {
       SessionStart: fleet.hooks.SessionStart,
       SubagentStart: fleet.hooks.SubagentStart,
@@ -156,6 +162,7 @@ function expectedPlanKeys(target: string, generated: ReturnType<typeof generateC
   return [
     ...Object.keys(generated.env).map((key) => `${target}.env.${key}`),
     ...Object.keys(generated.hooks).map((event) => `${target}.hooks.${event}`),
+    ...(generated.otelHeadersHelper ? [`${target}.otelHeadersHelper`] : []),
   ];
 }
 
@@ -369,12 +376,23 @@ function commandChecks(fixtureRoot: string) {
   // seat below carries exactly the token `setup` will generate with. The value
   // never leaves this process.
   const auth = loadOrCreateLocalIngestAuth(plimsollHome);
+  // The token-free form (plimsoll N60): `setup` writes the shared header and
+  // the OTLP helper the seats read; the already-managed seat is seeded with
+  // exactly what `setup` generates, and both files exist before doctor reads.
+  const files = claudeTelemetryPaths(path.join(home, ".claude", "settings.json"), plimsollHome);
   const generated = generateClaudeCodeSettings({
     repoRoot: "/synthetic/plimsoll/source",
     port,
     dataMode: "metadata",
     claudeCodeProducerToken: auth.claudeCodeProducer,
+    ...files,
   });
+  applyClaudeHookHeaderFile(files.claudeHeaderFile, generateClaudeHookHeader({
+    repoRoot: "/synthetic/plimsoll/source", claudeCodeProducerToken: auth.claudeCodeProducer,
+  }));
+  applyClaudeOtelHeadersHelper(files.claudeOtelHeadersHelperFile, generateClaudeOtelHeadersHelper({
+    repoRoot: "/synthetic/plimsoll/source", ...files,
+  }));
 
   const fleetSeatFile = writeSeatSettings(seatsRoot, FLEET_SEAT, fleetSeatDocument());
   const managedSeatFile = writeSeatSettings(seatsRoot, MANAGED_SEAT, managedSeatDocument(generated));
@@ -430,7 +448,8 @@ function commandChecks(fixtureRoot: string) {
     dryRun.code === 0 &&
       fleetLines.length === expectedPlanKeys(`claudeSeat[${FLEET_SEAT}]`, generated).length &&
       fleetLines.every((line) => line.startsWith(`${fleetSeatFile}: claudeSeat[${FLEET_SEAT}].`)) &&
-      fleetLines.filter((line) => line.endsWith(" added")).length === Object.keys(generated.env).length &&
+      fleetLines.filter((line) => line.endsWith(" added")).length ===
+        Object.keys(generated.env).length + (generated.otelHeadersHelper ? 1 : 0) &&
       fleetLines.filter((line) => line.endsWith(" updated")).length === Object.keys(generated.hooks).length &&
       dryTargets[`claudeSeat[${FLEET_SEAT}]`]?.status === "would_apply" &&
       dryTargets[`claudeSeat[${MANAGED_SEAT}]`]?.status === "unchanged" &&
@@ -516,12 +535,23 @@ function commandHome(fixtureRoot: string, name: string, port: number) {
   fs.writeFileSync(path.join(plimsollHome, "collector.config.json"),
     `${JSON.stringify({ port }, null, 2)}\n`, { mode: 0o600 });
   const auth = loadOrCreateLocalIngestAuth(plimsollHome);
+  // The token-free form (plimsoll N60): `setup` writes the shared header and
+  // the OTLP helper the seats read; the already-managed seat is seeded with
+  // exactly what `setup` generates, and both files exist before doctor reads.
+  const files = claudeTelemetryPaths(path.join(home, ".claude", "settings.json"), plimsollHome);
   const generated = generateClaudeCodeSettings({
     repoRoot: "/synthetic/plimsoll/source",
     port,
     dataMode: "metadata",
     claudeCodeProducerToken: auth.claudeCodeProducer,
+    ...files,
   });
+  applyClaudeHookHeaderFile(files.claudeHeaderFile, generateClaudeHookHeader({
+    repoRoot: "/synthetic/plimsoll/source", claudeCodeProducerToken: auth.claudeCodeProducer,
+  }));
+  applyClaudeOtelHeadersHelper(files.claudeOtelHeadersHelperFile, generateClaudeOtelHeadersHelper({
+    repoRoot: "/synthetic/plimsoll/source", ...files,
+  }));
   const env = {
     HOME: home,
     USERPROFILE: home,

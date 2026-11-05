@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.55 — 2026-11-05
+
+- Claude Code telemetry keeps its producer token out of `~/.claude/settings.json`
+  and every `~/.claude-seats/<seat>/settings.json` (plimsoll N60, eco-754vw6.46).
+  The token lives in one private `~/.claude/plimsoll-claude.headers` (0600); the three
+  managed hooks are command hooks that read it at run time and write the
+  producer-parity receipt, and OTLP headers come from a collector-owned
+  `otelHeadersHelper` script (`<collector home>/bin/claude-otel-headers.sh`,
+  0700). `setup --yes`, the managed-config reconcile and
+  `rotate-producer-token --source claude_code` write both files before any
+  settings file, migrate the inline http-hook form and the legacy inline curl
+  hooks in place with backups, and `doctor` reads `telemetry.claude` valid only
+  when settings, header and helper all match. A host updated from an older
+  collector heals on its next reconcile cadence or with `plimsoll setup --yes`.
+
 ## 0.7.54 — 2026-11-05
 
 - Fresh-ledger cutover skips checkpoints the tailer would rebuild and reports

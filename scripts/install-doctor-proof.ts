@@ -489,7 +489,9 @@ esac
   const rejectedSetupHome = path.join(sandbox, "rejected-setup-home");
   const rejectedSetupPlimsoll = path.join(sandbox, "rejected-setup-plimsoll");
   const rejectedToolDir = path.join(sandbox, "rejected-tool-config");
-  const rejectedClaude = path.join(rejectedToolDir, "settings.json");
+  // Claude settings get their own directory: the Claude header (plimsoll N60)
+  // lives beside them and must not collide with the Codex header beside config.toml.
+  const rejectedClaude = path.join(rejectedToolDir, "claude", "settings.json");
   const rejectedGemini = path.join(rejectedToolDir, "gemini.json");
   // Grok and Codex keep separate directories, as they do in a real home: each
   // source owns its own plimsoll.headers beside its own config.
@@ -548,7 +550,7 @@ esac
   const freshApplyHome = path.join(sandbox, "fresh-apply-home");
   const freshApplyPlimsoll = path.join(sandbox, "fresh-apply-plimsoll");
   const freshToolDir = path.join(sandbox, "fresh-tool-config");
-  const freshClaude = path.join(freshToolDir, "settings.json");
+  const freshClaude = path.join(freshToolDir, "claude", "settings.json");
   const freshGemini = path.join(freshToolDir, "gemini.json");
   const freshGrok = path.join(freshToolDir, "grok", "grok-hooks.json");
   const freshCodex = path.join(freshToolDir, "config.toml");
@@ -1051,6 +1053,21 @@ esac
     defaultCodexConfig,
     fs.readFileSync(defaultCodexConfig, "utf8").replaceAll(codexDir, path.join(defaultHome, ".codex")),
   );
+  // The same for Claude (plimsoll N60): the managed command hooks name the
+  // header beside the settings file and `otelHeadersHelper` names the script
+  // under this home's own collector store, which reads that header.
+  const rehome = (text: string) =>
+    text.replaceAll(claudeDir, path.join(defaultHome, ".claude")).replaceAll(fixturePlimsoll, defaultPlimsoll);
+  const defaultClaudeSettings = path.join(defaultHome, ".claude", "settings.json");
+  const defaultClaudeHelper = path.join(defaultPlimsoll, "bin", "claude-otel-headers.sh");
+  const rehomedSettings = JSON.parse(rehome(fs.readFileSync(defaultClaudeSettings, "utf8"))) as Record<string, unknown>;
+  // The store path carries a space, so the helper command is single-quoted as setup writes it.
+  rehomedSettings.otelHeadersHelper = `'${defaultClaudeHelper.replace(/'/g, "'\\''")}'`;
+  fs.writeFileSync(defaultClaudeSettings, `${JSON.stringify(rehomedSettings, null, 2)}\n`);
+  if (fs.existsSync(defaultClaudeHelper)) {
+    fs.writeFileSync(defaultClaudeHelper, rehome(fs.readFileSync(defaultClaudeHelper, "utf8")));
+    fs.chmodSync(defaultClaudeHelper, 0o700);
+  }
   fs.chmodSync(path.join(defaultHome, ".claude"), 0o700);
   fs.chmodSync(path.join(defaultHome, ".codex"), 0o700);
   fs.mkdirSync(defaultLaunchAgents, { recursive: true, mode: 0o700 });

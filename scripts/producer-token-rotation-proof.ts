@@ -86,6 +86,7 @@ import {
 } from "../packages/collector-cli/src/local-auth";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { useFixtureRoot } from "./lib/fixture-root";
+import { isManagedClaudeHookCommand } from "../packages/collector-config/src/index";
 
 type Check = { name: string; passed: boolean; detail: Record<string, unknown> };
 
@@ -218,18 +219,35 @@ function readJson(file: string): Record<string, any> {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-/** Every producer token a Claude settings file carries: OTLP env header and hook headers. */
+/**
+ * The producer token a Claude settings file consumes (plimsoll N60): the file
+ * itself carries none; its command hooks and `otelHeadersHelper` read the
+ * shared header beside it (`~/.claude/plimsoll-claude.headers`). `otlp` is that
+ * header's token when the settings are the managed token-free form, and
+ * `hooks` is one entry per managed command hook that reads it; `inline` is
+ * true only if a token value still sits in the settings text.
+ */
 function claudeTokens(file: string) {
   const settings = readJson(file);
-  const otlp = String(settings.env?.OTEL_EXPORTER_OTLP_HEADERS ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .find((entry) => entry.startsWith("x-plimsoll-token="))
-    ?.slice("x-plimsoll-token=".length);
-  const hooks = Object.values(settings.hooks ?? {}).flatMap((groups: any) =>
-    (groups as any[]).flatMap((group) => (group.hooks ?? []).map((handler: any) => handler.headers?.["x-plimsoll-token"]))
-  ).filter((token): token is string => typeof token === "string");
-  return { otlp, otlpHeaders: String(settings.env?.OTEL_EXPORTER_OTLP_HEADERS ?? ""), hooks };
+  const text = fs.readFileSync(file, "utf8");
+  const home = file.includes(`${path.sep}.claude-seats${path.sep}`)
+    ? path.dirname(path.dirname(path.dirname(file)))
+    : path.dirname(path.dirname(file));
+  const sharedHeader = path.join(home, ".claude", "plimsoll-claude.headers");
+  const header = fs.existsSync(sharedHeader) ? headerFileToken(sharedHeader) : undefined;
+  const handlers = Object.values(settings.hooks ?? {}).flatMap((groups: any) =>
+    (groups as any[]).flatMap((group) => group.hooks ?? []));
+  const hooks = handlers
+    .filter((handler: any) => typeof handler.command === "string" && isManagedClaudeHookCommand(handler.command))
+    .map(() => header)
+    .filter((token): token is string => typeof token === "string");
+  const managed = typeof settings.otelHeadersHelper === "string" && hooks.length > 0;
+  return {
+    otlp: managed ? header : undefined,
+    otlpHeaders: String(settings.env?.OTEL_EXPORTER_OTLP_HEADERS ?? ""),
+    hooks,
+    inline: /[A-Za-z0-9_-]{43}/.test(text) && (header !== undefined && text.includes(header)),
+  };
 }
 
 function codexExporterTokens(file: string) {
@@ -279,6 +297,8 @@ async function main() {
 
   const plimsollHome = env.PLIMSOLL_HOME!;
   const claudeFile = path.join(home, ".claude", "settings.json");
+  // The shared Claude header (plimsoll N60): the one claude_code surface a rotation rewrites.
+  const claudeHeader = path.join(home, ".claude", "plimsoll-claude.headers");
   const seatsRoot = path.join(home, ".claude-seats");
   const managedSeatFile = path.join(seatsRoot, "rot-managed-seat", "settings.json");
   const unmanagedSeatFile = path.join(seatsRoot, "rot-unmanaged-seat", "settings.json");
@@ -379,9 +399,10 @@ async function main() {
     /** The request the rewritten surface itself makes: its token read back from disk. */
     const surfaceRequest: Record<(typeof SOURCES)[number], () => ReturnType<typeof post>> = {
       claude_code: () => {
-        const seat = claudeTokens(managedSeatFile);
-        const headers = Object.fromEntries(seat.otlpHeaders.split(",").map((entry) => entry.split("=") as [string, string]));
-        return post("/v1/logs", headers, emptyLogs);
+        // What Claude Code itself does: run the settings' otelHeadersHelper and send its JSON.
+        const helper = String(readJson(managedSeatFile).otelHeadersHelper ?? "");
+        const printed = spawnSync("/bin/sh", ["-c", helper], { encoding: "utf8" }).stdout;
+        return post("/v1/logs", JSON.parse(printed), emptyLogs);
       },
       codex: () => {
         const document = parseToml(fs.readFileSync(codexConfig, "utf8")) as Record<string, any>;
@@ -399,7 +420,7 @@ async function main() {
 
     /** Every managed surface per source, for isolation and dry-run digests. */
     const surfaces: Record<(typeof SOURCES)[number], string[]> = {
-      claude_code: [claudeFile, managedSeatFile],
+      claude_code: [claudeHeader],
       codex: [codexHeader, codexConfig, codexProfileConfig],
       gemini_cli: [geminiFile],
       grok: [grokHeader, grokHooks],
@@ -451,7 +472,7 @@ async function main() {
       const surfaceState = {
         claude_code: () => [claudeFile, managedSeatFile].every((file) => {
           const tokens = claudeTokens(file);
-          return tokens.otlp === replacement && tokens.hooks.length === 3 && tokens.hooks.every((token) => token === replacement);
+          return tokens.otlp === replacement && tokens.hooks.length === 3 && tokens.hooks.every((token) => token === replacement) && !tokens.inline;
         }),
         codex: () => headerFileToken(codexHeader) === replacement &&
           [codexConfig, codexProfileConfig].every((file) => codexExporterTokens(file).every((token) => token === replacement)),
@@ -635,7 +656,9 @@ async function main() {
             run.code === 1 && receipt.status === "rotation_incomplete" && receipt.rotated === true &&
             entry?.status === expected.status && expected.reason(String(entry?.reason ?? "")) &&
             fs.readFileSync(target).equals(targetBytes) &&
-            others.length > 0 && others.every((candidate: any) => candidate.status === "rotated") &&
+            // A Claude settings file carries no token (plimsoll N60): it is rewritten only when its shape is stale.
+            others.length > 0 && others.every((candidate: any) => candidate.status === "rotated" ||
+              (source === "claude_code" && candidate.status === "unchanged")) &&
             afterAuth[AUTH_FIELDS[source]] !== beforeAuth[AUTH_FIELDS[source]] &&
             afterAuth.rotations?.[source]?.token === beforeAuth[AUTH_FIELDS[source]] &&
             afterAuth.rotations?.[source]?.expiresAt! > Date.now() &&
@@ -654,12 +677,7 @@ async function main() {
           fs.linkSync(managedSeatFile, hardlink);
           return () => fs.rmSync(hardlink, { force: true });
         });
-      incomplete("claude_code_unwritable_discovered_seat_makes_rotation_incomplete", "claude_code", managedSeatFile,
-        { status: "failed", reason: (reason) => reason === "CLAUDE_CONFIG_IO_FAILURE", dryRunRefused: false },
-        () => {
-          fs.chmodSync(path.dirname(managedSeatFile), 0o500);
-          return () => fs.chmodSync(path.dirname(managedSeatFile), 0o700);
-        });
+      // An unwritable Claude seat no longer blocks a rotation: the seat carries no token (plimsoll N60).
       incomplete("codex_unwritable_discovered_profile_makes_rotation_incomplete", "codex", codexProfileConfig,
         { status: "failed", reason: (reason) => reason.length > 0, dryRunRefused: false },
         () => {

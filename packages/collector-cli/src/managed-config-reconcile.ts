@@ -7,7 +7,12 @@ import {
   type ApplyPlanEntry,
   type ApplyResult,
   type ToolConfigOptions,
+  applyClaudeHookHeaderFile,
+  applyClaudeOtelHeadersHelper,
   applyClaudeSettings,
+  claudeTelemetryPaths,
+  generateClaudeHookHeader,
+  generateClaudeOtelHeadersHelper,
   applyCodexConfig,
   applyCodexConfigOrHookCommands,
   discoverClaudeSeats,
@@ -51,6 +56,8 @@ import {
 export type ManagedConfigFamily = "claude" | "codex";
 
 export type ManagedConfigTargetName =
+  | "claudeHeaders"
+  | "claudeOtelHeadersHelper"
   | "claude"
   | `claudeSeat[${string}]`
   | "codex"
@@ -62,10 +69,20 @@ export type ManagedConfigTarget = {
   family: ManagedConfigFamily;
   /** True for a target found on disk rather than declared by Plimsoll. */
   discovered?: true;
+  /**
+   * A Plimsoll-owned telemetry file (the Claude header or OTLP helper) the
+   * reconcile may create from already provisioned credentials, so an install
+   * updated from the inline-token form heals without a manual `setup --yes`.
+   */
+  provision?: true;
+  /** Targets whose report must read applied or unchanged before this one is written. */
+  requires?: ManagedConfigTargetName[];
   run: (options: ToolConfigOptions, dryRun: boolean) => ApplyResult;
 };
 
 export type ManagedConfigTargetOptions = {
+  /** The collector home the Claude OTLP helper lives under (`bin/claude-otel-headers.sh`). */
+  collectorHome?: string;
   /**
    * Also compose a discovered seat/profile directory whose config file does
    * not exist (review r1, F7). Reconcile then reports it as `skipped: absent`
@@ -128,23 +145,54 @@ export function composeManagedClaudeTargets(
   home: string,
   options: ManagedConfigTargetOptions = {},
 ): ManagedConfigTarget[] {
+  // The token-free form (plimsoll N60): the private header and the OTLP helper
+  // come first, and every settings file depends on both, so a settings file is
+  // never written pointing at a secret or a script that is not there.
+  const files = claudeTelemetryPaths(claudeFile, options.collectorHome ?? path.join(home, ".plimsoll"));
+  const requires: ManagedConfigTargetName[] = ["claudeHeaders", "claudeOtelHeadersHelper"];
+  const seats = discoverClaudeSeats(home);
+  // A host with no Claude settings file at all gets nothing created: the two
+  // files exist for the settings files that read them.
+  const provision = fs.existsSync(claudeFile) || seats.some((seat) => seat.hasSettings) ? true as const : undefined;
   return [
+    {
+      name: "claudeHeaders",
+      path: files.claudeHeaderFile,
+      family: "claude",
+      ...(provision ? { provision } : {}),
+      run: (toolOptions, preview) =>
+        applyClaudeHookHeaderFile(files.claudeHeaderFile, generateClaudeHookHeader(toolOptions), { dryRun: preview }),
+    },
+    {
+      name: "claudeOtelHeadersHelper",
+      path: files.claudeOtelHeadersHelperFile,
+      family: "claude",
+      ...(provision ? { provision } : {}),
+      run: (toolOptions, preview) =>
+        applyClaudeOtelHeadersHelper(
+          files.claudeOtelHeadersHelperFile,
+          generateClaudeOtelHeadersHelper({ ...toolOptions, ...files }),
+          { dryRun: preview },
+        ),
+    },
     {
       name: "claude",
       path: claudeFile,
       family: "claude",
+      requires,
       run: (toolOptions, preview) =>
-        applyClaudeSettings(claudeFile, generateClaudeCodeSettings(toolOptions), { dryRun: preview }),
+        applyClaudeSettings(claudeFile, generateClaudeCodeSettings({ ...toolOptions, ...files }), { dryRun: preview }),
     },
-    ...discoverClaudeSeats(home)
+    ...seats
       .filter((seat) => seat.hasSettings || options.includeAbsent === true)
       .map((seat): ManagedConfigTarget => ({
         name: `claudeSeat[${seat.slug}]`,
         path: seat.path,
         family: "claude",
         discovered: true,
+        requires,
         run: (toolOptions, preview) =>
-          applyClaudeSettings(seat.path, generateClaudeCodeSettings(toolOptions), {
+          applyClaudeSettings(seat.path, generateClaudeCodeSettings({ ...toolOptions, ...files }), {
             dryRun: preview,
             managedTarget: `claudeSeat[${seat.slug}]`,
           }),
@@ -877,9 +925,11 @@ function reconcileOneTarget(
     run.backoffDecided.add(target.name);
   }
   const before = witness(target.path);
-  if (before === null) {
-    // Reconcile never provisions: the seat/conductor tooling owns whether the
-    // file exists at all, and `setup --yes` owns first installation.
+  if (before === null && !target.provision) {
+    // Reconcile never provisions a seat or profile: the seat/conductor tooling
+    // owns whether that file exists at all, and `setup --yes` owns first
+    // installation. Only Plimsoll's own Claude header and helper are created
+    // here, from credentials that are already provisioned.
     run.reports.push({
       ...base,
       status: "skipped",
@@ -905,6 +955,11 @@ function reconcileOneTarget(
       reason,
     });
   };
+  if (target.requires?.some((name) => run.reports.some((report) =>
+    report.name === name && report.status !== "applied" && report.status !== "unchanged"))) {
+    refuse("dependent managed Claude telemetry file was refused or skipped");
+    return;
+  }
   let plan: ApplyResult;
   try {
     plan = target.run(options.toolOptions, true);
@@ -942,7 +997,7 @@ function reconcileOneTarget(
   }
   options.onPlanned?.(target);
   const after = witness(target.path);
-  if (after === null || !sameWitness(before, after)) {
+  if (before === null ? after !== null : after === null || !sameWitness(before, after)) {
     // Another writer owns this file right now. The plan was computed against
     // content that no longer exists, so this run stands down; the next one
     // plans the file as it is.

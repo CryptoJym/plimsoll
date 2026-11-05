@@ -46,8 +46,10 @@ import { parse as parseToml } from "smol-toml";
 
 import { useFixtureRoot } from "./lib/fixture-root";
 import {
+  claudeTelemetryPaths,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
+  isManagedClaudeHookCommand,
 } from "../packages/collector-config/src/index";
 import {
   MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE,
@@ -210,7 +212,8 @@ function hookCommands(value: unknown): string[] {
     }
     if (node && typeof node === "object") {
       const record = node as Record<string, unknown>;
-      if (typeof record.command === "string") found.push(record.command);
+      // The fleet's own commands only: the managed Claude hook is a command too (plimsoll N60).
+      if (typeof record.command === "string" && !isManagedClaudeHookCommand(record.command)) found.push(record.command);
       for (const entry of Object.values(record)) visit(entry);
     }
   };
@@ -294,7 +297,9 @@ function commandChecks(fixtureRoot: string) {
       (healthyJson.targets as Array<Record<string, unknown>>)
         .filter((entry) => entry.name !== `claudeSeat[${EMPTY_SEAT}]`)
         .every((entry) => entry.status === "unchanged") &&
-      (healthyJson.targets as unknown[]).length === 6 &&
+      // claudeHeaders, claudeOtelHeadersHelper, claude, two seats and one absent
+      // seat, then the Codex home and profile (plimsoll N60 added the two files).
+      (healthyJson.targets as unknown[]).length === 8 &&
       healthyJson.absent === 1 &&
       receipts(plimsollHome).length === 0 &&
       digestOf(churnedSeatFile) === healthySeatDigest &&
@@ -374,7 +379,7 @@ function commandChecks(fixtureRoot: string) {
       healedJson.status === "managed_config_reconciled" &&
       healedJson.applied === 2 &&
       healedJson.refused === 0 &&
-      healedJson.unchanged === 3 &&
+      healedJson.unchanged === 5 &&
       healedJson.absent === 1 &&
       healedSeat?.status === "applied" &&
       healedProfile?.status === "applied" &&
@@ -423,6 +428,8 @@ function commandChecks(fixtureRoot: string) {
     port,
     dataMode: "metadata",
     claudeCodeProducerToken: loadOrCreateLocalIngestAuth(plimsollHome).claudeCodeProducer,
+    // The token-free form (plimsoll N60): the CLI generates with the managed files.
+    ...claudeTelemetryPaths(path.join(home, ".claude", "settings.json"), plimsollHome),
   }).env;
   check(
     "the_healed_seat_carries_the_managed_keys_with_every_foreign_hook_and_unknown_key_intact",
@@ -693,7 +700,8 @@ function concurrentWriterChecks(fixtureRoot: string) {
     repoRoot,
     port: 49172,
     dataMode: "metadata" as const,
-    claudeCodeProducerToken: "synthetic-claude-producer-token-concurrent-00",
+    // A real-shaped (43-character) fixture token: the managed header refuses any other.
+    claudeCodeProducerToken: "synthetic-claude-producer-token-concurrent0",
   };
   const targets = composeManagedClaudeTargets(claudeFile, home);
   const racedDocument = { ...fleetSeatDocument("r3"), racedByAnotherWriter: true };
@@ -716,14 +724,15 @@ function concurrentWriterChecks(fixtureRoot: string) {
       racedAfter.racedByAnotherWriter === true &&
       racedAfter.env === undefined &&
       backups(seatFile).length === 0 &&
-      result.applied === 1 &&
+      // The shared header and OTLP helper are created first (plimsoll N60), then the home settings.
+      result.applied === 3 &&
       result.skipped === 1 &&
       result.targets.find((entry) => entry.name === "claude")?.status === "applied",
     { status: raced?.status, reason: raced?.reason, applied: result.applied },
   );
   check(
     "the_skipped_file_is_reconciled_on_the_next_run_because_no_backoff_was_armed",
-    readManagedConfigReconcileState(collectorHome).lastApplied === 1 &&
+    readManagedConfigReconcileState(collectorHome).lastApplied === 3 &&
       Object.keys(readManagedConfigReconcileState(collectorHome).backoff).length === 0 &&
       runManagedConfigReconcile({ collectorHome, targets, toolOptions })
         .targets.find((entry) => entry.name === `claudeSeat[${CHURNED_SEAT}]`)?.status === "applied",
@@ -881,7 +890,7 @@ function applyRaceChecks(fixtureRoot: string) {
     repoRoot,
     port: 49174,
     dataMode: "metadata" as const,
-    claudeCodeProducerToken: "synthetic-claude-producer-token-apply-race-0",
+    claudeCodeProducerToken: "synthetic-claude-producer-token-apply-race-",
   };
   // A target whose *plan* succeeds and whose *apply* fails the way the
   // transactional writer fails when another writer lands inside it.
@@ -968,7 +977,7 @@ function planRaceChecks(fixtureRoot: string) {
     repoRoot,
     port: 49176,
     dataMode: "metadata" as const,
-    claudeCodeProducerToken: "synthetic-claude-producer-token-plan-race-00",
+    claudeCodeProducerToken: "synthetic-claude-producer-token-plan-race-0",
   };
   // The exact strings apply.ts throws out of its preimage reads:
   // `unsafePath(file, "config.toml was replaced while opening it")` at
@@ -1048,11 +1057,11 @@ function stateIntegrityChecks(fixtureRoot: string) {
     repoRoot,
     port: 49177,
     dataMode: "metadata" as const,
-    claudeCodeProducerToken: "synthetic-claude-producer-token-state-0000000",
+    claudeCodeProducerToken: "synthetic-claude-producer-token-state-00000",
   };
   const seatTarget = (slug: string): ManagedConfigTarget => {
     const file = writeSeatSettings(seats, slug, fleetSeatDocument(slug));
-    const composed = composeManagedClaudeTargets(file, absent)[0]!;
+    const composed = composeManagedClaudeTargets(file, absent).find((target) => target.name === "claude")!;
     return { ...composed, name: `claudeSeat[${slug}]`, path: file, discovered: true };
   };
 
@@ -1225,7 +1234,7 @@ function setupBackupChecks(fixtureRoot: string) {
     repoRoot,
     port: 49178,
     dataMode: "metadata" as const,
-    claudeCodeProducerToken: "synthetic-claude-producer-token-setup-bak-00",
+    claudeCodeProducerToken: "synthetic-claude-producer-token-setup-bak-0",
   };
   const churn = (round: number, prune: Record<string, number> | undefined) => {
     fs.writeFileSync(claudeFile, `${JSON.stringify(fleetSeatDocument(`setup-backup-${round}`), null, 2)}\n`, {
@@ -1316,7 +1325,7 @@ function pruneChecks(fixtureRoot: string) {
     repoRoot,
     port: 49175,
     dataMode: "metadata" as const,
-    claudeCodeProducerToken: "synthetic-claude-producer-token-prune-000000",
+    claudeCodeProducerToken: "synthetic-claude-producer-token-prune-00000",
   };
   const churn = (round: number, prune: Record<string, number> | undefined) => {
     fs.writeFileSync(claudeFile, `${JSON.stringify(fleetSeatDocument(`churn-${round}`), null, 2)}\n`, { mode: 0o600 });
@@ -1451,7 +1460,7 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
     repoRoot,
     port: 49176,
     dataMode: "metadata" as const,
-    claudeCodeProducerToken: "synthetic-claude-producer-token-scale-000000",
+    claudeCodeProducerToken: "synthetic-claude-producer-token-scale-00000",
     codexProducerToken: "synthetic-codex-producer-token-scale-00000000",
     codexHeaderFile,
   };
@@ -1508,12 +1517,14 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
   const asyncMs = Number(process.hrtime.bigint() - asyncStart) / 1e6;
   check(
     "the_fleet_scale_fixture_is_the_reviewers_twenty_eight_targets",
-    targetCount === SEATS + PROFILES + 2 && readback.targets.length === targetCount,
+    // The two home targets plus the Claude header and OTLP helper (plimsoll N60).
+    targetCount === SEATS + PROFILES + 4 && readback.targets.length === targetCount,
     { targets: targetCount, seats: SEATS, profiles: PROFILES },
   );
   check(
     "the_async_tick_never_holds_the_event_loop_for_more_than_the_chunk_budget_on_a_full_churn_run",
-    asyncRun.applied === targetCount &&
+    // Every settings file churned; the Claude header and OTLP helper stay unchanged (plimsoll N60).
+    asyncRun.applied === targetCount - 2 &&
       withinChunkBudget(measured, targetCount, syncCpuMs),
     {
       targets: targetCount,
@@ -1534,7 +1545,7 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
     runManagedConfigReconcile({ ...runOptions, targets: targets() }));
   check(
     "the_chunk_measurement_rejects_a_tick_that_does_not_yield",
-    nonYielding.result.applied === targetCount &&
+    nonYielding.result.applied === targetCount - 2 &&
       !withinChunkBudget(nonYielding, targetCount, syncCpuMs),
     {
       turns: nonYielding.turns,
@@ -1544,11 +1555,14 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
   );
   check(
     "the_async_tick_reconciles_exactly_what_the_synchronous_run_reconciles",
-    syncRun.applied === asyncRun.applied &&
+    // The synchronous run came first and also created the Claude header and helper.
+    syncRun.applied === asyncRun.applied + 2 &&
       syncRun.refused === asyncRun.refused &&
       syncRun.skipped === asyncRun.skipped &&
-      syncRun.targets.map((entry) => `${entry.name}:${entry.status}`).join(",") ===
-        asyncRun.targets.map((entry) => `${entry.name}:${entry.status}`).join(","),
+      syncRun.targets.filter((entry) => entry.name !== "claudeHeaders" && entry.name !== "claudeOtelHeadersHelper")
+        .map((entry) => `${entry.name}:${entry.status}`).join(",") ===
+        asyncRun.targets.filter((entry) => entry.name !== "claudeHeaders" && entry.name !== "claudeOtelHeadersHelper")
+          .map((entry) => `${entry.name}:${entry.status}`).join(","),
     { sync: syncRun.applied, async: asyncRun.applied },
   );
   return {

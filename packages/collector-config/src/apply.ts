@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
 import { assertManagedConfigTarget } from "./fixture-root";
+import { CLAUDE_OTEL_HEADERS_HELPER_MARKER, isManagedClaudeHookCommand } from "./templates";
 import { generateGrokHookSettings, hookCommandHasRetryContract } from "./templates";
 
 /**
@@ -48,6 +49,8 @@ type ClaudePathSnapshot = {
   ancestors: ClaudePathIdentity[];
   exists: boolean;
   leaf?: ClaudeFileIdentity;
+  /** The managed Claude OTLP helper is the one owner-executable leaf (0700). */
+  allowExecutable?: boolean;
 };
 
 export type ClaudeApplyOptions = {
@@ -127,12 +130,12 @@ function currentUid() {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
-function assertSafeClaudeLeaf(stat: fs.Stats) {
+function assertSafeClaudeLeaf(stat: fs.Stats, allowExecutable = false) {
   if (stat.isSymbolicLink()) claudeFail("UNSAFE_LEAF_SYMLINK");
   if (!stat.isFile()) claudeFail("UNSAFE_LEAF_TYPE");
   if (stat.nlink !== 1) claudeFail("UNSAFE_LEAF_LINK_COUNT");
   const permissions = stat.mode & 0o777;
-  if ((permissions & 0o111) !== 0 || (permissions & 0o022) !== 0) {
+  if ((!allowExecutable && (permissions & 0o111) !== 0) || (permissions & 0o022) !== 0) {
     claudeFail("UNSAFE_LEAF_MODE");
   }
   const uid = currentUid();
@@ -152,7 +155,7 @@ function assertSafeClaudeAncestor(stat: fs.Stats) {
   }
 }
 
-function inspectClaudePath(file: string): ClaudePathSnapshot {
+function inspectClaudePath(file: string, allowExecutable = false): ClaudePathSnapshot {
   const absolutePath = path.resolve(file);
   const parsed = path.parse(absolutePath);
   const segments = absolutePath.slice(parsed.root.length).split(path.sep).filter(Boolean);
@@ -178,10 +181,10 @@ function inspectClaudePath(file: string): ClaudePathSnapshot {
   }
 
   const leafStat = claudeLstat(absolutePath);
-  if (!leafStat) return { absolutePath, ancestors, exists: false };
+  if (!leafStat) return { absolutePath, ancestors, exists: false, allowExecutable };
   if (missingAncestor) claudeFail("PATH_CHANGED");
-  assertSafeClaudeLeaf(leafStat);
-  return { absolutePath, ancestors, exists: true, leaf: claudeIdentity(leafStat) };
+  assertSafeClaudeLeaf(leafStat, allowExecutable);
+  return { absolutePath, ancestors, exists: true, leaf: claudeIdentity(leafStat), allowExecutable };
 }
 
 function sameClaudeAncestors(left: ClaudePathIdentity[], right: ClaudePathIdentity[]) {
@@ -195,7 +198,7 @@ function sameClaudeAncestors(left: ClaudePathIdentity[], right: ClaudePathIdenti
 }
 
 function assertStableClaudePath(expected: ClaudePathSnapshot) {
-  const current = inspectClaudePath(expected.absolutePath);
+  const current = inspectClaudePath(expected.absolutePath, expected.allowExecutable);
   if (current.absolutePath !== expected.absolutePath || current.exists !== expected.exists) {
     claudeFail("PATH_CHANGED");
   }
@@ -258,13 +261,13 @@ function assertClaudeBoundContent(
   }
 }
 
-function readClaudePreimage(file: string) {
-  const snapshot = inspectClaudePath(file);
+function readClaudePreimage(file: string, allowExecutable = false) {
+  const snapshot = inspectClaudePath(file, allowExecutable);
   if (!snapshot.exists) return { snapshot, current: "" };
   const descriptor = claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY, "UNSAFE_LEAF_SYMLINK");
   try {
     const opened = claudeIdentity(fs.fstatSync(descriptor));
-    assertSafeClaudeLeaf(fs.fstatSync(descriptor));
+    assertSafeClaudeLeaf(fs.fstatSync(descriptor), allowExecutable);
     if (!snapshot.leaf || !sameClaudeIdentity(opened, snapshot.leaf)) claudeFail("LEAF_CHANGED");
     const current = claudeReadDescriptor(descriptor);
     assertClaudeBoundContent(descriptor, snapshot.leaf, current);
@@ -368,7 +371,7 @@ function ensureClaudeParent(
     claudeFail("UNSAFE_PARENT_MODE");
   }
 
-  const createdReady = inspectClaudePath(snapshot.absolutePath);
+  const createdReady = inspectClaudePath(snapshot.absolutePath, snapshot.allowExecutable);
   if (createdReady.exists !== snapshot.exists) claudeFail("PATH_CHANGED");
   for (const ancestor of snapshot.ancestors) {
     const current = createdReady.ancestors.find((entry) => entry.path === ancestor.path);
@@ -383,7 +386,7 @@ function ensureClaudeParent(
     }
   }
   runClaudeHook(hook);
-  const ready = inspectClaudePath(snapshot.absolutePath);
+  const ready = inspectClaudePath(snapshot.absolutePath, snapshot.allowExecutable);
   if (
     ready.exists !== createdReady.exists ||
     !sameClaudeAncestors(ready.ancestors, createdReady.ancestors) ||
@@ -400,7 +403,7 @@ function assertVisibleClaudeContent(
   expectedIdentity: ClaudeFileIdentity,
   expectedContent: string,
 ) {
-  const visible = inspectClaudePath(snapshot.absolutePath);
+  const visible = inspectClaudePath(snapshot.absolutePath, snapshot.allowExecutable);
   if (
     !visible.exists ||
     !visible.leaf ||
@@ -415,7 +418,7 @@ function assertVisibleClaudeContent(
   } finally {
     fs.closeSync(descriptor);
   }
-  const after = inspectClaudePath(snapshot.absolutePath);
+  const after = inspectClaudePath(snapshot.absolutePath, snapshot.allowExecutable);
   if (
     !after.exists ||
     !after.leaf ||
@@ -719,6 +722,7 @@ function hookUrlKinds(value: unknown): Array<"owned" | "alias"> {
     if (!isJsonRecord(node)) return;
     for (const [key, entry] of Object.entries(node)) {
       if (aliasFold(key) === "url" && key !== "url") claudeFail("HOOK_FIELD_ALIAS");
+      if (key === "command" && typeof entry === "string" && isOwnedClaudeCommand(entry)) kinds.push("owned");
       if (key === "url" && typeof entry === "string") {
         const folded = aliasFold(entry);
         if (/^http:\/\/127\.0\.0\.1:\d+\/hooks\/claude-code$/.test(folded)) {
@@ -738,8 +742,23 @@ function isOwnedClaudeHook(value: unknown) {
   return kinds.includes("owned");
 }
 
+/**
+ * A command hook the collector owns (plimsoll N60): the managed token-free
+ * command, or the older seat-tooling form that posted straight to the local
+ * receiver with the token inline. Both are migrated to the managed command.
+ */
+function isOwnedClaudeCommand(command: string) {
+  return isManagedClaudeHookCommand(command) ||
+    (/^(?:\/usr\/bin\/)?curl -/.test(command) &&
+      / -H ['"]x-plimsoll-token: [A-Za-z0-9_-]{43}['"](?: |$)/.test(command) &&
+      / --data-binary @-/.test(command) &&
+      / http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/claude-code(?: \|\| true)?$/.test(command));
+}
+
 function isDirectOwnedClaudeHook(value: unknown) {
-  if (!isJsonRecord(value) || typeof value.url !== "string") return false;
+  if (!isJsonRecord(value)) return false;
+  if (value.type === "command" && typeof value.command === "string" && isOwnedClaudeCommand(value.command)) return true;
+  if (typeof value.url !== "string") return false;
   const folded = aliasFold(value.url);
   if (!/^http:\/\/127\.0\.0\.1:\d+\/hooks\/claude-code$/.test(folded)) return false;
   if (value.url !== folded) claudeFail("HOOK_URL_ALIAS");
@@ -797,6 +816,8 @@ function reconcileClaudeDocument(
     hooks?: Record<string, unknown[]>;
     /** Optional managed statusLine entry (issue #169). Strictly owned shape. */
     statusLine?: Record<string, unknown>;
+    /** The collector-owned OTLP headers helper command (plimsoll N60). */
+    otelHeadersHelper?: string;
   },
   target = "claude",
 ) {
@@ -872,6 +893,24 @@ function reconcileClaudeDocument(
 
   const next: Record<string, unknown> = { ...current, env, hooks };
 
+  // Managed otelHeadersHelper (plimsoll N60): one string key, same alias
+  // discipline as env/hooks; an operator value is replaced, never merged.
+  if (generated.otelHeadersHelper !== undefined) {
+    if (typeof generated.otelHeadersHelper !== "string") claudeFail("INVALID_GENERATED_OTEL_HELPER");
+    rejectManagedAliases(
+      Object.keys(current).filter((key) => key !== "otelHeadersHelper"),
+      ["otelHeadersHelper"],
+      "OTEL_HELPER_KEY_ALIAS",
+    );
+    if (current.otelHeadersHelper !== generated.otelHeadersHelper) {
+      next.otelHeadersHelper = generated.otelHeadersHelper;
+      changes.push(`${target}.otelHeadersHelper.set`);
+      plan.push({ key: `${target}.otelHeadersHelper`, action: current.otelHeadersHelper === undefined ? "added" : "updated" });
+    } else {
+      plan.push({ key: `${target}.otelHeadersHelper`, action: "unchanged" });
+    }
+  }
+
   // Managed statusLine (issue #169): same alias discipline as env/hooks. An
   // operator key that folds to the managed name but is spelled differently
   // (e.g. "statusline") is refused rather than silently shadowed; a
@@ -911,6 +950,7 @@ export function applyClaudeSettings(
     env: Record<string, string>;
     hooks?: Record<string, unknown[]>;
     statusLine?: Record<string, unknown>;
+    otelHeadersHelper?: string;
   },
   options: ClaudeSettingsApplyOptions = {},
 ): ApplyResult {
@@ -1391,7 +1431,7 @@ export type HookHeaderFileApplyOptions = ClaudeApplyOptions & {
  * refusal, and the backup convention cannot drift apart between them.
  */
 function applyManagedHookHeaderFile(
-  source: "grok" | "codex",
+  source: "grok" | "codex" | "claude",
   label: string,
   file: string,
   generated: string,
@@ -1449,6 +1489,63 @@ export function applyGrokHookHeaderFile(
   options: HookHeaderFileApplyOptions = {},
 ): ApplyResult {
   return applyManagedHookHeaderFile("grok", "Grok", file, generated, options);
+}
+
+/** Reconcile the private header shared by the managed Claude command hooks and OTLP helper (plimsoll N60). */
+export function applyClaudeHookHeaderFile(
+  file: string,
+  generated: string,
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  return applyManagedHookHeaderFile("claude", "Claude", file, generated, options);
+}
+
+/**
+ * Reconcile the collector-owned `otelHeadersHelper` script. It carries no
+ * secret, so its content is compared whole; its owner-only executable mode
+ * (0700) is part of the managed state, like the 0600 of a header file.
+ */
+export function applyClaudeOtelHeadersHelper(
+  file: string,
+  generated: string,
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  assertManagedConfigTarget(file);
+  try {
+    if (!generated.startsWith(CLAUDE_OTEL_HEADERS_HELPER_MARKER)) {
+      throw new Error(`${file}: generated Claude OTLP helper is invalid.`);
+    }
+    const { snapshot, current } = readClaudePreimage(file, true);
+    if (snapshot.exists && !current.startsWith(CLAUDE_OTEL_HEADERS_HELPER_MARKER)) {
+      return {
+        path: file,
+        changed: false,
+        changes: [],
+        plan: [],
+        conflict: `${file}: existing file is not a Plimsoll-managed Claude OTLP helper; refusing this target.`,
+      };
+    }
+    const plan: ApplyPlanEntry[] = [{
+      key: "claude.otelHeadersHelper.file",
+      action: !snapshot.exists ? "added" : current === generated ? "unchanged" : "updated",
+    }];
+    if (snapshot.exists && snapshot.leaf && (snapshot.leaf.mode & 0o777) !== 0o700) {
+      plan.push({ key: "claude.otelHeadersHelper.fileMode", action: "updated" });
+    }
+    const changes = plan
+      .filter((entry) => entry.action !== "unchanged")
+      .map((entry) => `${entry.key}.reconcile`);
+    if (changes.length === 0 || options.dryRun) {
+      if (snapshot.exists && snapshot.leaf) assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+      else assertStableClaudePath(snapshot);
+      return { path: file, changed: changes.length > 0, changes, plan };
+    }
+    const backupPath = writeClaudePlan(snapshot, current, generated, options.transactionHooks, 0o700);
+    return { path: file, changed: true, changes, plan, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) throw error;
+    claudeFail("IO_FAILURE");
+  }
 }
 
 /** Reconcile the private curl header consumed by the managed Codex hooks. */

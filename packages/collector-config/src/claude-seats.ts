@@ -33,9 +33,27 @@ export function claudeSeatsRoot(home: string) {
   return path.join(home, CLAUDE_SEATS_DIRECTORY);
 }
 
+/**
+ * The managed Claude telemetry files (plimsoll N60): one private header file
+ * beside the home's Claude settings file (`~/.claude/plimsoll-claude.headers` by
+ * default), shared by that file and every seat (one collector and one
+ * claude_code token per Mac), and the collector-owned `otelHeadersHelper`
+ * script under the collector home.
+ */
+export function claudeTelemetryPaths(claudeFile: string, collectorHome: string) {
+  return {
+    // Its own name: a Codex config.toml beside the same settings file keeps its own `plimsoll.headers`.
+    claudeHeaderFile: path.join(path.dirname(claudeFile), "plimsoll-claude.headers"),
+    claudeOtelHeadersHelperFile: path.join(collectorHome, "bin", "claude-otel-headers.sh"),
+  };
+}
+
 /** Every seat directory under `<home>/.claude-seats`, slug-ordered. */
 export function discoverClaudeSeats(home: string): ClaudeSeat[] {
   return discoverHomeDirectories(home, CLAUDE_SEATS_DIRECTORY, "settings.json")
+    // `~/.claude-seats/.claude.json.lock/` and other dot-directories are seat
+    // tooling state, never a seat.
+    .filter(({ slug }) => !slug.startsWith("."))
     .map(({ slug, path: file, exists, unresolved }) => ({
       slug,
       path: file,

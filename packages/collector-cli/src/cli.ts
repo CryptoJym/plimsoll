@@ -250,6 +250,11 @@ import {
   applyGrokHookHeaderFile,
   applyGrokHookFile,
   claudeSeatsRoot,
+  claudeTelemetryFiles,
+  claudeTelemetryPaths,
+  generateClaudeHookHeader,
+  generateClaudeOtelHeadersHelper,
+  isManagedClaudeHookCommand,
   codexProfilesRoot,
   diagnoseManagedCodexHookCommand,
   diagnoseManagedGrokHookCommand,
@@ -2257,7 +2262,37 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
   }
 }
 
-function readClaudeTelemetryConfig(file: string, expected: ReturnType<typeof generateClaudeCodeSettings>) {
+/**
+ * The managed Claude telemetry files behind a token-free settings file
+ * (plimsoll N60): the private header must be a 0600 regular file holding the
+ * current token and the OTLP helper a 0700 regular file with the generated
+ * script. Names only, never a byte of either.
+ */
+function claudeTelemetryFilesMissing(options: Parameters<typeof generateClaudeCodeSettings>[0]) {
+  const files = claudeTelemetryFiles(options);
+  if (!files) return [];
+  const missing: string[] = [];
+  const expectations: ReadonlyArray<[string, number, string | null, string]> = [
+    [files.claudeHeaderFile, 0o600, options.claudeCodeProducerToken ? generateClaudeHookHeader(options) : null, "headerFile"],
+    [files.claudeOtelHeadersHelperFile, 0o700, generateClaudeOtelHeadersHelper(options), "otelHeadersHelper.file"],
+  ];
+  for (const [file, mode, content, label] of expectations) {
+    try {
+      const stat = fs.lstatSync(file);
+      if (!stat.isFile() || (stat.mode & 0o777) !== mode ||
+        (content !== null && fs.readFileSync(file, "utf8") !== content)) missing.push(label);
+    } catch {
+      missing.push(label);
+    }
+  }
+  return missing;
+}
+
+function readClaudeTelemetryConfig(
+  file: string,
+  expected: ReturnType<typeof generateClaudeCodeSettings>,
+  options?: Parameters<typeof generateClaudeCodeSettings>[0],
+) {
   if (!fs.existsSync(file)) {
     return { ok: false, status: "missing" as const, path: file, missing: ["settings file"] };
   }
@@ -2265,8 +2300,13 @@ function readClaudeTelemetryConfig(file: string, expected: ReturnType<typeof gen
     const current = JSON.parse(fs.readFileSync(file, "utf8")) as {
       env?: Record<string, unknown>;
       hooks?: Record<string, unknown[]>;
+      otelHeadersHelper?: unknown;
     };
     const missing: string[] = [];
+    if (expected.otelHeadersHelper !== undefined && current.otelHeadersHelper !== expected.otelHeadersHelper) {
+      missing.push("otelHeadersHelper");
+    }
+    if (options) missing.push(...claudeTelemetryFilesMissing(options));
     for (const [key, value] of Object.entries(expected.env)) {
       if (current.env?.[key] !== value) missing.push(`env.${key}`);
     }
@@ -2398,8 +2438,18 @@ function managedConfigTargetReadback(
   target: ManagedConfigTarget,
   options: Parameters<typeof generateClaudeCodeSettings>[0],
 ): ManagedConfigReadback {
+  if (target.name === "claudeHeaders" || target.name === "claudeOtelHeadersHelper") {
+    // A file with no JSON to compare: its own dry-run plan is the readback.
+    try {
+      const plan = target.run(options, true);
+      const ok = !plan.conflict && !plan.changed;
+      return { ok, status: ok ? "valid" : "incomplete", missing: ok ? [] : [target.name] };
+    } catch {
+      return { ok: false, status: "incomplete", missing: [target.name] };
+    }
+  }
   return target.family === "claude"
-    ? readClaudeTelemetryConfig(target.path, generateClaudeCodeSettings(options))
+    ? readClaudeTelemetryConfig(target.path, generateClaudeCodeSettings(options), options)
     : readCodexTelemetryConfig(target.path, generateCodexConfigToml(options));
 }
 
@@ -2439,6 +2489,7 @@ async function runManagedConfigReconcileTick(
   const auth = readLocalIngestAuth(home);
   const toolOptions = {
     repoRoot: process.cwd(),
+    ...claudeTelemetryPaths(claudeFile, home),
     port: bootConfig.port,
     dataMode: bootConfig.policy.dataMode,
     codexHeaderFile,
@@ -2458,7 +2509,7 @@ async function runManagedConfigReconcileTick(
   const targets: ManagedConfigTarget[] = auth === null
     ? []
     : [
-        ...composeManagedClaudeTargets(claudeFile, os.homedir(), { includeAbsent: true }),
+        ...composeManagedClaudeTargets(claudeFile, os.homedir(), { includeAbsent: true, collectorHome: home }),
         ...(fs.existsSync(codexHeaderFile)
           ? composeManagedCodexTargets(codexFile, os.homedir(), { includeAbsent: true })
           : []),
@@ -2598,14 +2649,21 @@ function claudeSeatTokenState(file: string): DiscoveredTokenState {
     return { state: "managed" };
   }
   const groups = Object.values(record(parsed.hooks) ?? {}).flatMap((value) => Array.isArray(value) ? value : []);
-  const carriesToken = groups.some((group) => {
-    const handlers = record(group)?.hooks;
-    return Array.isArray(handlers) && handlers.some((handler) => {
-      const headers = record(record(handler)?.headers);
-      return headers !== undefined && Object.hasOwn(headers, "x-plimsoll-token");
-    });
+  const handlers = groups.flatMap((group) => {
+    const entries = record(group)?.hooks;
+    return Array.isArray(entries) ? entries : [];
   });
-  return { state: carriesToken ? "managed" : "unmanaged" };
+  const carriesToken = handlers.some((handler) => {
+    const headers = record(record(handler)?.headers);
+    return headers !== undefined && Object.hasOwn(headers, "x-plimsoll-token");
+  });
+  // The token-free form (plimsoll N60): the managed command hook reads the
+  // shared header file, so the seat is a consumer of that file's token.
+  const readsHeaderFile = typeof parsed.otelHeadersHelper === "string" && handlers.some((handler) => {
+    const command = record(handler)?.command;
+    return typeof command === "string" && isManagedClaudeHookCommand(command);
+  });
+  return { state: carriesToken || readsHeaderFile ? "managed" : "unmanaged" };
 }
 
 /** Receipt key and reasons for the discovered targets each source can skip. */
@@ -5004,6 +5062,7 @@ async function main() {
     const localAuth = loadOrCreateLocalIngestAuth(collectorHome(), { dryRun: true });
     const toolOptions = {
       repoRoot: process.cwd(),
+      ...claudeTelemetryPaths(claudeFile, collectorHome()),
       port: config.port,
       dataMode: config.policy.dataMode,
       claudeCodeProducerToken: localAuth.claudeCodeProducer,
@@ -5023,9 +5082,11 @@ async function main() {
     // eco-6hoxj.50) so that `setup --yes`, `setup --reconcile` and the
     // collector's self-healing maintenance cadence all manage exactly the same
     // target set from one definition.
-    const managedClaudeTargets = composeManagedClaudeTargets(claudeFile, os.homedir());
+    const managedClaudeTargets = composeManagedClaudeTargets(claudeFile, os.homedir(), { collectorHome: collectorHome() });
     const managedCodexTargets = composeManagedCodexTargets(codexFile, os.homedir());
     type SetupTargetName =
+      | "claudeHeaders"
+      | "claudeOtelHeadersHelper"
       | "claude"
       | `claudeSeat[${string}]`
       | "gemini"
@@ -5095,6 +5156,14 @@ async function main() {
     // would post without its producer token, so the config target is refused
     // with its header target rather than left pointing at a missing secret.
     const headerDependencies: ReadonlyArray<{ header: SetupTargetName; dependent: SetupTargetName }> = [
+      // Every Claude settings file (the home's and each seat's) reads the shared
+      // header through its command hooks and the OTLP helper (plimsoll N60).
+      ...managedClaudeTargets
+        .filter((target) => target.requires)
+        .flatMap((target) => target.requires!.map((header) => ({
+          header: header as SetupTargetName,
+          dependent: target.name as SetupTargetName,
+        }))),
       { header: "grokHeaders", dependent: "grok" },
       { header: "codexHeaders", dependent: "codex" },
       // A profile's hooks reference the same per-user header file as the
@@ -5110,9 +5179,10 @@ async function main() {
     // Two sources must never share one header file: each source's hook would
     // then send the other's token, collapsing the per-source audience boundary
     // that makes a producer token unable to impersonate another tool.
-    const headerTargetPaths = [...new Set(headerDependencies.map(({ header }) => header))].map(
-      (header) => targets.find((target) => target.name === header)!.path,
-    );
+    const headerTargetPaths = [...new Set(headerDependencies.map(({ header }) => header))]
+      // The OTLP helper is a script, not a token file; only header files collide.
+      .filter((header) => header !== "claudeOtelHeadersHelper")
+      .map((header) => targets.find((target) => target.name === header)!.path);
     const collidingHeaderPaths = new Set(
       headerTargetPaths.filter((value, index) => headerTargetPaths.indexOf(value) !== index),
     );
@@ -5193,6 +5263,7 @@ async function main() {
       // Setup's own target list stays exactly what it may write.
       const reconcileClaudeTargets = composeManagedClaudeTargets(claudeFile, os.homedir(), {
         includeAbsent: true,
+        collectorHome: collectorHome(),
       });
       const reconcileCodexTargets = composeManagedCodexTargets(codexFile, os.homedir(), {
         includeAbsent: true,
@@ -5337,8 +5408,8 @@ async function main() {
     if (configRead?.status === "missing") loadCollectorConfig();
     const refusedHeaderTargets = new Set<SetupTargetName>();
     const applied: SetupTargetState[] = planned.map((state) => {
-      const dependency = headerDependencies.find((entry) => entry.dependent === state.target.name);
-      if (dependency && refusedHeaderTargets.has(dependency.header)) {
+      if (headerDependencies.some((entry) =>
+        entry.dependent === state.target.name && refusedHeaderTargets.has(entry.header))) {
         return {
           target: state.target,
           refusal: `${state.target.path}: dependent managed header target was refused.`,
@@ -5458,6 +5529,10 @@ async function main() {
     }
     const rotateOptions = {
       repoRoot: process.cwd(),
+      ...claudeTelemetryPaths(
+        argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json"),
+        collectorHome(),
+      ),
       port: config.port,
       dataMode: config.policy.dataMode,
       claudeCodeProducerToken: currentAuth.claudeCodeProducer,
@@ -5597,7 +5672,7 @@ async function main() {
       const unresolvedSeats = new Set(
         discoverClaudeSeats(rotateHome).filter((seat) => seat.unresolved).map((seat) => seat.slug),
       );
-      const claudeTargets = composeManagedClaudeTargets(claudeFile, rotateHome, { includeAbsent: true })
+      const claudeTargets = composeManagedClaudeTargets(claudeFile, rotateHome, { includeAbsent: true, collectorHome: collectorHome() })
         .map((target) => ({ target, slug: target.name.slice("claudeSeat[".length, -1) }))
         .map(({ target, slug }) => ({
           target,
@@ -5620,7 +5695,9 @@ async function main() {
           .filter((entry) => entry.token.state !== "unmanaged" && entry.token.state !== "malformed")
           .map(({ target, slug, token }): RotateTarget =>
             !target.discovered
-              ? ownedTarget(target.path, target.run)
+              // The shared header and OTLP helper are rewritten (or created, on a
+              // host updated from the inline form) before any settings file.
+              ? target.provision ? { path: target.path, run: target.run } : ownedTarget(target.path, target.run)
               : token.state === "unresolved"
                 ? unresolvedTarget("claude_code", { path: target.path, slug })
                 : token.state === "absent"
@@ -6063,6 +6140,7 @@ async function main() {
     const localAuth = readLocalIngestAuth(collectorHome());
     const toolOptions = {
       repoRoot: process.cwd(),
+      ...claudeTelemetryPaths(claudePath, collectorHome()),
       port: config.port,
       dataMode: config.policy.dataMode,
       ...(localAuth
@@ -6076,7 +6154,7 @@ async function main() {
       grokHeaderFile: grokHeaderPath,
       codexHeaderFile: codexHeaderPath,
     };
-    const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
+    const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions), toolOptions);
     // Fleet Claude seat coverage (bead eco-6hoxj.48). A seat whose settings.json
     // carries no managed exporter or hooks emits transcript rows only, so it is
     // reported here as a coverage diagnostic — slug and managed key names, never
@@ -6103,7 +6181,7 @@ async function main() {
       if (!seat.hasSettings) {
         return { slug: seat.slug, ...seatPath, status: "skipped" as const, missing: [] as string[] };
       }
-      const read = readClaudeTelemetryConfig(seat.path, generateClaudeCodeSettings(toolOptions));
+      const read = readClaudeTelemetryConfig(seat.path, generateClaudeCodeSettings(toolOptions), toolOptions);
       return {
         slug: seat.slug,
         ...seatPath,
@@ -7738,6 +7816,7 @@ async function main() {
     const codexHeaderFile = path.join(os.homedir(), ".codex", "plimsoll.headers");
     const options = {
       repoRoot: optionValue("--repo-root") ?? process.cwd(),
+      ...claudeTelemetryPaths(path.join(os.homedir(), ".claude", "settings.json"), collectorHome()),
       port: config.port,
       dataMode: flag("--evidence") ? "evidence" as const : config.policy.dataMode,
       confirmEvidence: flag("--confirm-evidence"),

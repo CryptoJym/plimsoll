@@ -324,6 +324,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-seats-apply
 
+      - name: Prove Claude Code telemetry tokens stay out of settings.json (plimsoll N60)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:claude-headers
+
       - name: Prove managed Codex seat profile reconciliation (eco-6hoxj.52)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-profiles-apply

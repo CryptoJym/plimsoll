@@ -1,6 +1,9 @@
 import path from "node:path";
 import type { DataMode } from "../../shared/src/index";
 
+/** Claude Code hook source as the collector names it; the hook path keeps its hyphen. */
+const CLAUDE_HOOK_PATH = "claude-code";
+
 const DEFAULT_PORT = 48271;
 
 export type ToolConfigOptions = {
@@ -15,6 +18,16 @@ export type ToolConfigOptions = {
   grokHeaderFile?: string;
   /** Absolute managed curl header file used by the managed Codex hook command. */
   codexHeaderFile?: string;
+  /**
+   * Plimsoll N60 (eco-754vw6.46): the Claude Code producer token lives in a
+   * private 0600 header file shared by ~/.claude/settings.json and every fleet
+   * seat, read at run time by command hooks and by the collector-owned
+   * `otelHeadersHelper` script. With both paths set, generated settings carry
+   * no token; without them (library callers, older fixtures) the legacy inline
+   * http-hook form is generated unchanged.
+   */
+  claudeHeaderFile?: string;
+  claudeOtelHeadersHelperFile?: string;
   /**
    * Issue 0056 (#104): Plimsoll-local producer credentials. When provided,
    * generated configs bind each tool's exporter/hook traffic to its own
@@ -78,7 +91,7 @@ export function hookCommandHasRetryContract(command: string) {
  * log so accepted ids reconcile to ledger ids. Failures stay visible: there is
  * no `|| true`.
  */
-export function generateHookForwardCommand(options: ToolConfigOptions, source: "codex" | "grok") {
+export function generateHookForwardCommand(options: ToolConfigOptions, source: "codex" | "grok" | "claude_code") {
   // curl into the local receiver keeps per-event overhead at ~10ms; spawning
   // pnpm/node per hook event costs 1-2s per tool call across the whole fleet.
   // The producer token lives only in a private 0600 header file, so neither the
@@ -86,13 +99,18 @@ export function generateHookForwardCommand(options: ToolConfigOptions, source: "
   const curlCommand = source === "grok"
     ? shellQuote(options.grokCurlCommand ?? "/usr/bin/curl")
     : "curl";
-  const headerFile = source === "grok" ? options.grokHeaderFile : options.codexHeaderFile;
+  const headerFile = source === "grok"
+    ? options.grokHeaderFile
+    : source === "claude_code" ? options.claudeHeaderFile : options.codexHeaderFile;
   if (!headerFile || !path.isAbsolute(headerFile)) {
     throw new Error(
-      `${source === "grok" ? "Grok" : "Codex"} managed header file must be an absolute path.`,
+      `${source === "grok" ? "Grok" : source === "claude_code" ? "Claude Code" : "Codex"} managed header file must be an absolute path.`,
     );
   }
-  const url = `http://127.0.0.1:${port(options)}/hooks/${source}`;
+  const url = `http://127.0.0.1:${port(options)}/hooks/${source === "claude_code" ? CLAUDE_HOOK_PATH : source}`;
+  // Claude's hook path identifies the producer; the source header keeps the
+  // collector's rejection diagnostics classifying the client as before.
+  const sourceHeader = source === "claude_code" ? " -H 'x-plimsoll-source: claude_code'" : "";
   const retryFlags = [
     "-sS",
     "--noproxy '*'",
@@ -106,7 +124,7 @@ export function generateHookForwardCommand(options: ToolConfigOptions, source: "
     "id=$(uuidgen | tr '[:upper:]' '[:lower:]')",
     'log="${PLIMSOLL_HOME:-$HOME/.plimsoll}/producer-parity/hooks.jsonl"',
     'mkdir -p "$(dirname "$log")"',
-    `code=$(${curlCommand} ${retryFlags} -X POST -H 'Content-Type: application/json' -H x-plimsoll-event-id:$id -H ${shellQuote(`@${headerFile}`)} --data-binary @- -o /dev/null -w '%{http_code}' ${url})`,
+    `code=$(${curlCommand} ${retryFlags} -X POST -H 'Content-Type: application/json' -H x-plimsoll-event-id:$id${sourceHeader} -H ${shellQuote(`@${headerFile}`)} --data-binary @- -o /dev/null -w '%{http_code}' ${url})`,
     "st=$?",
     `printf '{"v":1,"id":"%s","src":"${source}","http":"%s","exit":%s,"ts":"%s"}\\n' "$id" "$code" "$st" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$log"`,
     '[ "$code" = 202 ]',
@@ -134,11 +152,78 @@ function port(options: ToolConfigOptions) {
   return options.port ?? DEFAULT_PORT;
 }
 
+/** Both managed Claude telemetry files, when a caller provisions them. */
+export function claudeTelemetryFiles(options: ToolConfigOptions) {
+  const { claudeHeaderFile, claudeOtelHeadersHelperFile } = options;
+  if (!claudeHeaderFile || !claudeOtelHeadersHelperFile) return undefined;
+  if (!path.isAbsolute(claudeHeaderFile) || !path.isAbsolute(claudeOtelHeadersHelperFile)) {
+    throw new Error("Claude managed telemetry files must be absolute paths.");
+  }
+  return { claudeHeaderFile, claudeOtelHeadersHelperFile };
+}
+
+/** Curl header file read at run time by the managed Claude command hooks. */
+export function generateClaudeHookHeader(options: ToolConfigOptions) {
+  assertSupportedDataMode(options);
+  if (!options.claudeCodeProducerToken || !/^[A-Za-z0-9_-]{43}$/.test(options.claudeCodeProducerToken)) {
+    throw new Error("Claude producer token must be a 43-character URL-safe value.");
+  }
+  return `x-plimsoll-token: ${options.claudeCodeProducerToken}\n`;
+}
+
+export const CLAUDE_OTEL_HEADERS_HELPER_MARKER = "#!/bin/sh\n# Plimsoll Claude OTLP headers helper.\n";
+
+/**
+ * Claude Code runs `otelHeadersHelper` like `apiKeyHelper` and takes its
+ * stdout as a JSON object of header values, so the script reads the private
+ * header file and prints exactly that object: no diagnostics, no token in
+ * argv, nothing in settings.json.
+ */
+export function generateClaudeOtelHeadersHelper(options: ToolConfigOptions) {
+  const files = claudeTelemetryFiles(options);
+  if (!files) throw new Error("Claude managed telemetry files must be set to generate the OTLP helper.");
+  return [
+    CLAUDE_OTEL_HEADERS_HELPER_MARKER.trimEnd(),
+    `IFS= read -r header < ${shellQuote(files.claudeHeaderFile)} || exit 1`,
+    'token=${header#"x-plimsoll-token: "}',
+    '[ "$header" != "$token" ] && [ "${#token}" = 43 ] || exit 1',
+    'case "$token" in *[!A-Za-z0-9_-]*) exit 1 ;; esac',
+    `printf '{"x-plimsoll-source":"claude_code","x-plimsoll-token":"%s"}\\n' "$token"`,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Value-blind recognition of the whole managed Claude command: the header file
+ * and port are read back out of the command and the command is regenerated
+ * from them, so neither the stored string nor this check ever sees a token.
+ */
+export function isManagedClaudeHookCommand(command: string) {
+  const word = String.raw`(?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*')`;
+  const unquote = (value: string) => value.startsWith("'")
+    ? value.slice(1, -1).split("'\\''").join("'")
+    : value;
+  const header = command.match(new RegExp(String.raw` -H (${word}) --data-binary @-`));
+  const endpoint = command.match(/http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/hooks\/claude-code\)/);
+  if (!header || !endpoint) return false;
+  const reference = unquote(header[1]!);
+  if (!reference.startsWith("@") || !path.isAbsolute(reference.slice(1))) return false;
+  try {
+    return command === generateHookForwardCommand(
+      { repoRoot: "/", port: Number(endpoint[1]), claudeHeaderFile: reference.slice(1) },
+      "claude_code",
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function generateClaudeCodeSettings(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
 
+  const files = claudeTelemetryFiles(options);
   const hookUrl = `http://127.0.0.1:${port(options)}/hooks/claude-code`;
-  const otlpHeaders = options.claudeCodeProducerToken
+  const otlpHeaders = options.claudeCodeProducerToken && !files
     ? `x-plimsoll-source=claude_code,x-plimsoll-token=${options.claudeCodeProducerToken}`
     : "x-plimsoll-source=claude_code";
   // HTTP hooks identify the producer by path, but rejection diagnostics use
@@ -146,12 +231,18 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
   // label; add the token only when one is provisioned.
   const hookHeaders: Record<string, string> = {
     "x-plimsoll-source": "claude_code",
-    ...(options.claudeCodeProducerToken
+    ...(options.claudeCodeProducerToken && !files
       ? { "x-plimsoll-token": options.claudeCodeProducerToken }
       : {}),
   };
+  // With the managed files provisioned, every hook is a command that reads the
+  // private header at run time, and OTLP headers come from the helper script.
+  const hook = () => files
+    ? { type: "command" as const, command: generateHookForwardCommand(options, "claude_code"), timeout: HOOK_RETRY_CONTRACT.timeoutSeconds }
+    : claudeHttpHook(hookUrl, hookHeaders);
 
   return {
+    ...(files ? { otelHeadersHelper: shellQuote(files.claudeOtelHeadersHelperFile) } : {}),
     env: {
       CLAUDE_CODE_ENABLE_TELEMETRY: "1",
       OTEL_LOGS_EXPORTER: "otlp",
@@ -169,18 +260,18 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
     hooks: {
       UserPromptSubmit: [
         {
-          hooks: [claudeHttpHook(hookUrl, hookHeaders)],
+          hooks: [hook()],
         },
       ],
       PostToolUse: [
         {
           matcher: ".*",
-          hooks: [claudeHttpHook(hookUrl, hookHeaders)],
+          hooks: [hook()],
         },
       ],
       Stop: [
         {
-          hooks: [claudeHttpHook(hookUrl, hookHeaders)],
+          hooks: [hook()],
         },
       ],
     },
