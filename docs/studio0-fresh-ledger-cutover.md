@@ -1,6 +1,6 @@
 # Studio0 replacement ledger cutover and rollback
 
-This procedure applies to the collector **0.7.46 cutover build** and a stopped
+This procedure applies to collector **0.7.54 or later** and a stopped
 collector. The old ledger remains archived. Keep its archive path and manifest
 under the rollout lead's existing copy inventory. The device identity, upload
 keys, and capture-root configuration stay in place.
@@ -13,22 +13,36 @@ keys, and capture-root configuration stay in place.
    the primary key. Confirm that contract has applied **before any replacement
    ledger window**. An expanded-only schema still has the four-column primary
    key, so it rejects the second same-epoch ledger watermark row.
-2. Schedule this cutover early in a UTC week. Run the weekly tool-stats upload
-   first and verify acknowledgement for **every due week with attempts**, from
+2. On a busy host, drain delivery and hook/OTLP spools before the UTC week
+   boundary, then stop the collector a few minutes before Monday 00:00 UTC
+   with `plimsoll unload-launch-agent`. Leave it stopped across the boundary.
+   After Monday 00:00 UTC, run:
+
+   ```sh
+   plimsoll upload --tool-stats-weeks
+   ```
+
+   This command sends completed-week reports through the daemon's existing
+   acknowledgement path, using its bounded reader; it never starts capture,
+   event upload or hook replay. Require `result: not_due` and exit 0. A retry,
+   conflict or missing join exits 1; resolve it before proceeding. The default
+   limit is 52 accepted weeks; `limit_reached` also exits 1, so rerun to continue
+   from the retained acknowledgements, or set `--max-weeks` (1–520).
+   Verify acknowledgement for **every due week with attempts**, from
    `first_week` through the last completed UTC week. There must be no current
    week tool attempt and no unacknowledged report row. `epoch-plan --archive`
    lists `dueWeeksWithoutAcknowledgement` and an `operatorAction` on refusal.
    A current-week attempt means waiting until the next Monday 00:00 UTC and
-   for that week's report to be acknowledged. No weekly aggregate is carried
+   delivering that week's report while still stopped. No weekly aggregate is carried
    into the replacement.
-3. Drain delivery and hook/OTLP spools using the rollout plan's three stable
-   zero readings. Stop the collector using the plan's supported unload. Check
-   its outbox, receipt, session-sync and spool gates with the old ledger still
-   present. If any gate fails, restart the old runtime without changing files.
+3. Before step 2's stop, require the rollout plan's three stable zero readings
+   for delivery and hook/OTLP spools. While stopped, check its outbox, receipt,
+   session-sync and spool gates with the old ledger still present. If any gate
+   fails, restart the old runtime without changing ledger files and reschedule.
 
 ## Switch
 
-4. Run the lifecycle update to the 0.7.46 cutover build **while the old ledger
+4. Run the lifecycle update to the 0.7.54-or-later cutover build **while the old ledger
    is still in place**. Keep the snapshot and its receipts. Leave the daemon
    stopped. This preserves the B2 rollback ordering.
 5. Create an archive directory **owned by the collector user, mode 0700** on
@@ -56,8 +70,11 @@ keys, and capture-root configuration stay in place.
    Actual Studio0 latency is still unverified. A refused budget requires a new plan, not an
    override. On the final stopped collector, require
    `status: capture_roots_epoch_plan`, `sidecarsMayAppear: false`, the root
-   count and epoch, the listed `carriedRows` and `carriedBytes`, and the count
-   of `untrackedFileFences`. The plan checks the archived
+   count and epoch, the listed `carriedRows` and `carriedBytes`, and the counts
+   of `untrackedFileFences` and `invalidCursorsNotCarried`. A legacy or invalid
+   checkpoint is not carried. Its file, if present, gets a byte fence at its
+   observed size; an absent file contributes neither a cursor nor a fence.
+   The archive retains all old rows. The plan checks the archived
    binding against the configured tenant, device and root epoch.
    A closed ledger uses an immutable SQLite read and leaves no new ledger
    WAL or SHM files. The opener barrier uses the persistent
@@ -66,8 +83,9 @@ keys, and capture-root configuration stay in place.
    the ledger is open or closure cannot be proved, the result explicitly says
    `sidecarsMayAppear: true`; stop the owner and rerun. Never delete sidecars.
    The plan reads the old ledger; it does not write a replacement. It refuses
-   invalid or mixed root epochs, malformed or unreadable archive cursors/live
-   rows, an unsafe archive path, a regressed host clock, unreadable root
+   invalid or mixed root epochs, unreadable cursor schemas, malformed cursor
+   keys/times or unsupported parser kinds, unreadable live rows, an unsafe
+   archive path, a regressed host clock, unreadable root
    inventory, and the weekly conditions above. Resolve the
    stated refusal before proceeding. Do not edit `collector.config.json`.
 6. The rollout tool's exact cutover action is:
@@ -195,7 +213,7 @@ keys, and capture-root configuration stay in place.
    completed. If a crash occurs after the swap but before verified publication
    completes, keep the collector stopped and restore the archive with the
    command below before attempting another cutover.
-7. Start the 0.7.46 collector. Check readiness, queue/spool gates, session
+7. Start the qualified 0.7.54-or-later collector. Check readiness, queue/spool gates, session
    sync, all 23 roots, zero `epoch_mismatch`, Claude/Codex forward appends,
    Codex live producer authentication, and Grok's historical
    `before_enrollment` refusals. A replaced ledger retains the old epoch for

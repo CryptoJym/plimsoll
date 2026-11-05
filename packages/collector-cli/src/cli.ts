@@ -552,6 +552,7 @@ Config tools:
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|gemini-cli|grok|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
+  upload --tool-stats-weeks [--max-weeks 52]   Deliver completed weeks without starting capture
       --url here and on upload-history, push-repo-labels and sync-outcomes must be on the
       joined workspace's origin; without a joined workspace it is refused. For a test server
       on this machine, add --dev-loopback-url to that one command: it allows only a plainly
@@ -3409,6 +3410,7 @@ async function main() {
     "ledger",
     "__stop_window_listener",
   ]);
+  if (command === "upload" && flag("--tool-stats-weeks")) noCreateConfigCommands.add(command);
   const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
   if (command === "setup" && configRead?.status === "invalid") {
@@ -7252,6 +7254,43 @@ async function main() {
   }
 
   if (command === "upload") {
+    if (flag("--tool-stats-weeks")) {
+      // This path only freezes and acknowledges completed-week reports. It
+      // never runs capture, hook replay, event upload or the daemon cycle.
+      if (configRead?.status !== "valid" || !fs.existsSync(collectorBufferPath())) {
+        throw new Error("Weekly tool-stats upload requires an existing collector config and ledger");
+      }
+      const args = process.argv.slice(3);
+      for (let index = 0; index < args.length; index += 1) {
+        if (args[index] === "--tool-stats-weeks" || args[index] === "--json") continue;
+        if (args[index] === "--max-weeks") { index += 1; continue; }
+        throw new Error(`Unsupported weekly tool-stats option: ${args[index]}`);
+      }
+      const maxWeeks = Number(optionValue("--max-weeks") ?? 52);
+      if (!Number.isSafeInteger(maxWeeks) || maxWeeks < 1 || maxWeeks > 520 ||
+          flag("--max-weeks") && !optionValue("--max-weeks")) {
+        throw new Error("--max-weeks must be an integer from 1 to 520");
+      }
+      const buffer = openBuffer(config);
+      try {
+        let acceptedWeeks = 0;
+        let result: Awaited<ReturnType<typeof uploadCompletedToolStatsWeek>> | "limit_reached" = "limit_reached";
+        while (acceptedWeeks < maxWeeks) {
+          result = await uploadCompletedToolStatsWeek(config, buffer.database, {
+            aggregate: (input) => aggregateToolStatsWeekOffThread(buffer.database, input,
+              { maxMs: WEEKLY_TOOL_STATS_READ_MS }),
+          });
+          if (result !== "accepted") break;
+          acceptedWeeks += 1;
+          result = "limit_reached";
+        }
+        console.log(JSON.stringify({ status: "weekly_tool_stats_upload", result, acceptedWeeks, maxWeeks }));
+        // A bound, missing join or unacknowledged report requires another
+        // operator action; only reaching the current week completes the drain.
+        if (result !== "not_due") process.exitCode = 1;
+      } finally { buffer.close(); }
+      return;
+    }
     const buffer = openBuffer(config, Boolean(optionValue("--url")));
     const markUploaded = !flag("--no-mark");
     const maxBatches = optionValue("--max-batches") ? Number(optionValue("--max-batches")) : 20;

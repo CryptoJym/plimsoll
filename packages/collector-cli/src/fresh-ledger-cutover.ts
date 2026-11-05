@@ -69,6 +69,7 @@ export type FreshLedgerCutoverPlan = {
   archiveIdentity: string | null;
   archiveLatestRecordedAt: string | null;
   cursorRows: number;
+  invalidCursorsNotCarried: number;
   carriedRows: Record<string, number>;
   carriedBytes: Record<string, number>;
   totalCarriedBytes: number;
@@ -159,8 +160,30 @@ function latestRecordedTime(db: Database.Database, cursorLatest: string | null):
     Date.parse(at) > Date.parse(latest) ? at : latest) : null;
 }
 
+/** Use the tailer's validation for both planning and copying. A checkpoint
+ * the tailer would rebuild carries no state; its present file needs a fence. */
+function cursorForCarry(db: Database.Database, row: Record<string, unknown>) {
+  if (typeof row.file !== "string" || !CURSOR_KEY.test(row.file)) {
+    throw new Error("archive_cursor_state_inconsistent");
+  }
+  const cursor = row.parser_kind === "codex-rollout-v2" && row.checkpoint_version === 2 ||
+      row.parser_kind === null && row.checkpoint_version === null
+    ? loadJsonlScanCursorByKey(db, row.file, "codex-rollout-v2", 2, validateRolloutParserState)
+    : row.parser_kind === "claude-transcript-v3" && row.checkpoint_version === 3
+      ? loadJsonlScanCursorByKey(db, row.file, "claude-transcript-v3", 3, validateTranscriptParserState)
+      : undefined;
+  if (!cursor) throw new Error("archive_cursor_state_inconsistent");
+  if (cursor.checkpointStatus !== "valid") return null;
+  if (!cursor.fileIdentity || !CURSOR_IDENTITY.test(cursor.fileIdentity) || cursor.committedOffset === null) {
+    throw new Error("archive_cursor_state_inconsistent");
+  }
+  return cursor;
+}
+
 function inspectCursors(db: Database.Database, staleFileKeys: ReadonlySet<string>) {
-  if (!hasTable(db, "rollout_scan_state")) return { rows: 0, bytes: 0, latest: null as string | null };
+  if (!hasTable(db, "rollout_scan_state")) return {
+    rows: 0, bytes: 0, invalidCursorsNotCarried: 0, latest: null as string | null,
+  };
   const required = [
     "file", "size", "scanned_at", "committed_offset", "deferred_bytes",
     "file_identity", "head_hash", "head_bytes", "continuity_hash", "continuity_bytes",
@@ -173,30 +196,25 @@ function inspectCursors(db: Database.Database, staleFileKeys: ReadonlySet<string
   }
   let rows = 0;
   let bytes = 0;
+  let invalidCursorsNotCarried = 0;
   let latest: string | null = null;
   for (const row of db.prepare("select * from rollout_scan_state").iterate() as Iterable<Record<string, unknown>>) {
-    const scannedAt = row.scanned_at, parserKind = row.parser_kind,
-      checkpointVersion = row.checkpoint_version;
+    const scannedAt = row.scanned_at;
     if (typeof row.file !== "string" || !CURSOR_KEY.test(row.file) ||
         typeof scannedAt !== "string" || !Number.isFinite(Date.parse(scannedAt))) {
       throw new Error("archive_cursor_state_inconsistent");
     }
-    const cursor = parserKind === "codex-rollout-v2" && checkpointVersion === 2
-      ? loadJsonlScanCursorByKey(db, row.file, "codex-rollout-v2", 2, validateRolloutParserState)
-      : parserKind === "claude-transcript-v3" && checkpointVersion === 3
-        ? loadJsonlScanCursorByKey(db, row.file, "claude-transcript-v3", 3, validateTranscriptParserState)
-        : undefined;
-    if (!cursor || cursor.checkpointStatus !== "valid" || !cursor.fileIdentity ||
-        !CURSOR_IDENTITY.test(cursor.fileIdentity) || cursor.committedOffset === null) {
-      throw new Error("archive_cursor_state_inconsistent");
-    }
     if (!latest || Date.parse(scannedAt) > Date.parse(latest)) latest = scannedAt;
+    if (!cursorForCarry(db, row)) {
+      invalidCursorsNotCarried += 1;
+      continue;
+    }
     if (!staleFileKeys.has(row.file)) {
       rows += 1;
       bytes += valueBytes(row);
     }
   }
-  return { rows, bytes, latest };
+  return { rows, bytes, latest, invalidCursorsNotCarried };
 }
 
 function inspectLiveState(db: Database.Database, home: string) {
@@ -317,7 +335,7 @@ function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.
   const archiveIdentity = fileIdentityDigest(input.ledgerPath, oldStat,
     input.config.tenantId, input.config.deviceId, path.resolve(input.archivePath));
   return { archiveIdentity, latest, cursorRows: cursors.rows, carriedRows, carriedBytes,
-    totalCarriedBytes, dueWeeksWithoutAcknowledgement,
+    invalidCursorsNotCarried: cursors.invalidCursorsNotCarried, totalCarriedBytes, dueWeeksWithoutAcknowledgement,
     pending, attempts, priorAttempts, priorAcknowledged,
     nextSafeWindowAt: attempts ? next : pending || !priorAcknowledged || dueWeeksWithoutAcknowledgement.length
       ? now.toISOString() : null };
@@ -437,10 +455,10 @@ function observedRootFiles(input: CutoverInput, heartbeat?: () => void): Array<{
 
 function untrackedRootFiles(db: Database.Database, input: CutoverInput) {
   const cursor = hasTable(db, "rollout_scan_state")
-    ? db.prepare("select file_identity as fileIdentity from rollout_scan_state where file=?") : null;
+    ? db.prepare("select file,parser_kind,checkpoint_version from rollout_scan_state where file=?") : null;
   return observedRootFiles(input).filter(({ fileKey, observation }) => {
-    const row = cursor?.get(fileKey) as { fileIdentity: string } | undefined;
-    return row?.fileIdentity !==
+    const row = cursor?.get(fileKey) as Record<string, unknown> | undefined;
+    return (row && cursorForCarry(db, row))?.fileIdentity !==
       `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
   });
 }
@@ -556,7 +574,7 @@ function openReadOnlyPlanDatabase(ledgerPath: string): {
   db: Database.Database; sidecarsMayAppear: boolean;
 } {
   const files = [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`].filter(fs.existsSync);
-  const check = spawnSync("/usr/sbin/lsof", ["-S", "2", "-t", "-w", "--", ...files], {
+  const check = spawnSync("/usr/sbin/lsof", ["-nP", "-S", "2", "-t", "-w", "--", ...files], {
     encoding: "utf8", timeout: 60_000,
     env: { PATH: "/usr/bin:/bin:/usr/sbin" }, stdio: ["ignore", "pipe", "pipe"],
   });
@@ -597,7 +615,7 @@ export function planFreshLedgerCutover(input: CutoverInput, heldBarrier?: Ledger
   const base = {
     readOnly: true as const, rootCount: roots.length, installationEpochId: null as string | null,
     archiveIdentity: null as string | null, archiveLatestRecordedAt: null as string | null,
-    cursorRows: 0, carriedRows: {} as Record<string, number>,
+    cursorRows: 0, invalidCursorsNotCarried: 0, carriedRows: {} as Record<string, number>,
     carriedBytes: {} as Record<string, number>, totalCarriedBytes: 0,
     carryBudgetBytes: MAX_CARRIED_VALUE_BYTES, untrackedFileFences: 0,
     dueWeeksWithoutAcknowledgement: [] as string[], recoveryStagePresent: false,
@@ -622,6 +640,7 @@ export function planFreshLedgerCutover(input: CutoverInput, heldBarrier?: Ledger
       const fields = { ...base, installationEpochId: epoch,
         archiveIdentity: inspection.archiveIdentity, archiveLatestRecordedAt: inspection.latest,
         cursorRows: inspection.cursorRows, carriedRows: inspection.carriedRows,
+        invalidCursorsNotCarried: inspection.invalidCursorsNotCarried,
         carriedBytes: inspection.carriedBytes, totalCarriedBytes: inspection.totalCarriedBytes,
         untrackedFileFences: untracked.length,
         dueWeeksWithoutAcknowledgement: inspection.dueWeeksWithoutAcknowledgement,
@@ -1019,6 +1038,7 @@ function switchFreshLedgerUnderBarrier(input: CutoverInput, barrier: LedgerConne
         let copied = 0;
         for (const row of old!.prepare(`select ${names} from rollout_scan_state`).iterate() as
           Iterable<Record<string, unknown>>) {
+          if (!cursorForCarry(old!, row)) continue;
           insert.run(...cursorColumns.map(column => row[column]));
           mark.run(row.file, row.parser_kind === "codex-rollout-v2" ? "codex" : "claude_code",
             row.file_identity, row.committed_offset);

@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.7.54 — 2026-11-02
+## 0.7.54 — 2026-11-05
+
+- Fresh-ledger cutover skips checkpoints the tailer would rebuild and reports
+  `invalidCursorsNotCarried`. Present files without carried cursors retain byte
+  fences, so legacy rows no longer block the plan or replay archived history.
+- `upload --tool-stats-weeks` delivers completed-week reports without starting
+  capture, using the daemon's bounded reader and existing acknowledgements.
+  Busy hosts can stop before Monday 00:00 UTC, deliver the previous week after
+  the boundary, then plan and switch without recording current-week attempts.
 
 The 2026-11-01 lifecycle incident applied a 12,555,559,952-byte WAL during
 quiescence for about eight minutes. The synchronous checkpoint prevented

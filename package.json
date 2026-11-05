@@ -232,6 +232,7 @@
     "proof:capture-history-import-symlink_parent_race": "tsx scripts/pr431-review-r1-repro.ts symlink_parent_race",
     "proof:capture-history-import-wal": "tsx scripts/pr431-wal-pin.ts gate",
     "proof:pr426-r6-cutover-append-race": "tsx scripts/pr426-r6-cutover-append-race.ts",
+    "proof:fresh-ledger-busy-host": "tsx scripts/pr426-review-archive-preflight.ts",
     "proof:pr426-r6-archive-permissions": "tsx scripts/pr426-r6-archive-permissions.ts",
     "proof:pr426-r6-min-version-045": "tsx scripts/pr426-r6-min-version-045.ts",
     "proof:pr426-r6-older-week-backlog": "tsx scripts/pr426-r6-older-week-backlog.ts",
