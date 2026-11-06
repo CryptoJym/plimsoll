@@ -97,7 +97,7 @@ export const rolloutTokenCountCases: Array<{ name: string; run: () => Promise<vo
     assert.deepEqual(scan.tokensAppended, { input: 0, cachedInput: 0, output: 0 });
     assert.equal((scan as unknown as { planLimitReadingsSkippedNoAccount: number }).planLimitReadingsSkippedNoAccount, 0,
       "failed slice must restore skip accounting");
-    assert.equal((buffer.database.prepare("select count(*) as n from rollout_scan_state").get() as { n: number }).n, 0);
+    assert.equal((buffer.database.prepare("select count(*) as n from rollout_scan_state where committed_offset is not null").get() as { n: number }).n, 0);
     assert.equal(logs.length, 1);
     const diagnostic = JSON.parse(logs[0]);
     assert.equal(diagnostic.status, "rollout_commit_error");
@@ -127,7 +127,7 @@ export const rolloutTokenCountCases: Array<{ name: string; run: () => Promise<vo
     assert.equal(scan.eventsAppended, 0);
     assert.equal(logs.length, 1);
     assert.equal(JSON.parse(logs[0]).message, "rollout_slice_parse_failed");
-    assert.equal((buffer.database.prepare("select count(*) as n from rollout_scan_state").get() as { n: number }).n, 0);
+    assert.equal((buffer.database.prepare("select count(*) as n from rollout_scan_state where committed_offset is not null").get() as { n: number }).n, 0);
   }) },
 ];
 

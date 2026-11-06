@@ -125,7 +125,8 @@ test("diagnostic_never_copies_an_arbitrary_error_message", async () => {
         status: "rollout_commit_error", errorClass: "SqliteError", message: "[redacted error message]",
         messageHash: hash(message), fileHandleHash: hash(file), offset: 0,
       }, "native SQLite errors obey the same exact six-field protocol");
-      assert.equal((buffer.database.prepare("select count(*) as rows from rollout_scan_state").get() as { rows: number }).rows, 0);
+      assert.equal((buffer.database.prepare("select count(*) as rows from rollout_scan_state where committed_offset is not null").get() as { rows: number }).rows, 0);
+      assert.equal((buffer.database.prepare("select count(*) as rows from rollout_scan_state where committed_offset is null and commit_failure_json is not null").get() as { rows: number }).rows, 1);
     } finally {
       console.error = originalError;
       tailer.close();

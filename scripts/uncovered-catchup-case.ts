@@ -205,7 +205,8 @@ try {
     nonUsageLoss.bytes > 16 * 1024 * 1024 && !uncoveredLarge, {nonUsageLoss,uncoveredLarge:!!uncoveredLarge});
   const lossColumns=(buffer.database.prepare(`pragma table_info(capture_record_losses)`).all() as Array<{name:string}>).map(x=>x.name).sort();
   check("loss receipts store counts and classification only",JSON.stringify(lossColumns)===JSON.stringify([
-    "detected_at","identity_key","installation_epoch_id","kind","reason","skipped_bytes","source","usage_possible",
+    "cached_input_tokens","detected_at","identity_key","input_tokens","installation_epoch_id","kind",
+    "output_tokens","reason","reasoning_output_tokens","skipped_bytes","source","usage_possible",
   ]),{columns:lossColumns});
 
   const lossId = id("8"), usageLoss = codexFile(old, "oversized-usage");

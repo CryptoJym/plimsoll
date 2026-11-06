@@ -621,7 +621,7 @@ export async function runBoundedCaptureContract(
 
   fs.unlinkSync(boundary);
   fs.writeFileSync(
-    boundary,
+    path.join(day, `rollout-boundary-${uuid(7)}.jsonl`),
     `${JSON.stringify({ type: "session_meta", payload: { id: uuid(7) } })}\n${tokenLine(uuid(7), 1)}\n`,
     { mode: 0o600 },
   );

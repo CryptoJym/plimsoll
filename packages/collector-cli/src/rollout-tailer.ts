@@ -19,6 +19,9 @@ import {
   loadJsonlScanCursor,
   prepareJsonlCommittedPrefixHash,
   rememberJsonlScanCursor,
+  jsonlCommitFailureParked,
+  rememberJsonlCommitFailure,
+  clearJsonlCommitFailure,
   type JsonlScanCursor,
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
@@ -57,6 +60,7 @@ import { AUTOMATIC_CAPTURE_LIMITS, CaptureWorkBudget, type CaptureBudgetStatus }
 import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageDirectoryCache, CaptureCoverageWalk, KnownPartialJsonlFiles, changedDirectoryCoverageFile, hasCompleteCaptureCoverage, jsonlCoverageCheck, linkCoverageFile, lstatIfPresent, openCaptureCoverageDirectory } from "./capture-frontier";
 import { CaptureRevisitQueue } from "./capture-revisit-queue";
 import { recordCaptureRecordLoss } from "./capture-record-loss";
+import { PLIMSOLL_VERSION } from "./version";
 import {
   DISCOVERY_FIRST_ADMITTED_QUANTUM,
   IncrementalJsonlDiscovery,
@@ -436,6 +440,8 @@ const ROLLOUT_COMMIT_ERROR_CLASSES = new Set([
 const ROLLOUT_COMMIT_MESSAGE_CODES = new Set([
   "rollout_slice_parse_failed", "maintenance_progress_budget_exhausted",
   "capture_generation_changed_before_commit", "rollout_repo_context_binding_failed",
+  "capture_logical_source_conflict", "source_changed",
+  "JSONL file generation changed before cursor commit",
 ]);
 
 /** Error text can contain source values. Only finite, exact internal codes may
@@ -1007,6 +1013,7 @@ export class RolloutTailer {
       stat: fs.Stats;
       cursor: JsonlScanCursor<RolloutParserState> | undefined;
       initialOffset?: number;
+      commitSignature: string;
     }> = [];
     const automaticFilesConsumed = new Set<string>();
     const automaticFilesPartial = new Set<string>();
@@ -1058,6 +1065,15 @@ export class RolloutTailer {
       }
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
       const observation = baselineObservation(file, stat, discovered.precise);
+      const commitSignature = maintenanceCandidateHash(
+        `${observation.device}:${observation.inode}:${observation.birthtimeNs}:${observation.size}:${stat.mtimeMs}:${stat.ctimeMs}`);
+      const parked = jsonlCommitFailureParked(this.buffer.database, this.cursorKey(file), commitSignature, PLIMSOLL_VERSION);
+      if (parked) {
+        result.unresolvedRecords += 1;
+        result.bytesDeferred += Math.max(0, stat.size - parked.offset);
+        consumeAutomaticFile(file);
+        continue;
+      }
       let growthStart: number | null = null;
       if (automatic?.phase === "capture") {
         const decision = classifyCaptureBaselineFile(
@@ -1124,7 +1140,7 @@ export class RolloutTailer {
         }
         if (!cursor) initialOffset = growthStart;
       }
-      candidates.push({ file, stat, cursor, initialOffset });
+      candidates.push({ file, stat, cursor, initialOffset, commitSignature });
     }
 
     // Newest first on the automatic path; explicit scans retain cursor-first
@@ -1286,6 +1302,9 @@ export class RolloutTailer {
             const initialState = read.reset || !cursor?.parserState
               ? this.initialParserState(candidate.file)
               : structuredClone(cursor.parserState);
+            // Repair old fork checkpoints in place: never replay admitted
+            // bytes or reset their counter index / previous cumulative totals.
+            initialState.conversationId = codexRolloutIdFromFilename(candidate.file) ?? initialState.conversationId;
             // Git work is deferred until after capture. Validate the open
             // generation immediately before the event/cursor transaction so a
             // changed source never advances durable truth.
@@ -1329,6 +1348,7 @@ export class RolloutTailer {
                   read,
                   initialState,
                 );
+                clearJsonlCommitFailure(this.buffer.database, this.cursorKey(candidate.file));
                 return;
               }
               const parseErrorsBefore = result.parseErrors;
@@ -1347,6 +1367,8 @@ export class RolloutTailer {
                 initialState,
                 fallbackObservedAt,
                 read.fileIdentity,
+                { fileKey: jsonlScanStateKey(this.cursorKey(candidate.file)),
+                  offset: read.committedSourceSpan?.offset ?? cursor?.committedOffset ?? 0 },
               );
               if (result.parseErrors !== parseErrorsBefore) {
                 parseFailure = true;
@@ -1360,6 +1382,7 @@ export class RolloutTailer {
                 read,
                 parserState,
               );
+              clearJsonlCommitFailure(this.buffer.database, this.cursorKey(candidate.file));
             });
             committed = true;
             if (read.skippedRecord) {
@@ -1387,9 +1410,15 @@ export class RolloutTailer {
             result.slicesCommitted += 1;
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch (error) {
+            const diagnostic = rolloutCommitDiagnostic(error);
+            const offset = read.committedSourceSpan?.offset ?? cursor?.committedOffset ?? 0;
+            if (!validationDeferred) {
+              rememberJsonlCommitFailure(this.buffer.database,
+                this.cursorKey(candidate.file), {signature:candidate.commitSignature, version:PLIMSOLL_VERSION,
+                  offset, messageHash:diagnostic.messageHash});
+            }
             console.error(JSON.stringify({ status: "rollout_commit_error",
-              ...rolloutCommitDiagnostic(error), fileHandleHash: maintenanceCandidateHash(candidate.file),
-              offset: read.committedSourceSpan?.offset ?? cursor?.committedOffset ?? 0 }));
+              ...diagnostic, fileHandleHash: maintenanceCandidateHash(candidate.file), offset }));
             this.activeCaptureRoot = activeRootBefore;
             this.activeCarriedBytes = carriedBytesBefore;
             this.activeReplacementCutoverAt = cutoverBefore;
@@ -1804,6 +1833,7 @@ export class RolloutTailer {
     state: RolloutParserState,
     fallbackObservedAt: { observedAt: string; clamped: boolean },
     fileIdentity: string,
+    lossContext: { fileKey: string; offset: number },
   ) {
     type ActiveContext =
       | { kind: "persisted"; contextId: string }
@@ -1858,7 +1888,7 @@ export class RolloutTailer {
       const payload = (parsed.payload ?? {}) as Record<string, unknown>;
       if (type === "session_meta") {
         const verifiedId = verifiedCodexSessionMetaId(parsed);
-        if (verifiedId) state.conversationId = verifiedId;
+        if (verifiedId) state.conversationId ??= verifiedId;
         if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
         else if (typeof payload.timestamp === "string") state.sessionStartedAt = payload.timestamp as string;
         activeRepoContext = observeContext("session_meta", payload.cwd);
@@ -2053,7 +2083,19 @@ export class RolloutTailer {
       if (repoContextId && !attachRepoContextId(event, repoContextId)) {
         throw new Error("rollout_repo_context_binding_failed");
       }
-      const inserted = appendRootObservation(this.buffer, event, activeCaptureRoot, this.activeCarriedBytes);
+      let inserted: boolean;
+      try {
+        inserted = appendRootObservation(this.buffer, event, activeCaptureRoot, this.activeCarriedBytes);
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "capture_logical_source_conflict") throw error;
+        // Catch inside the slice transaction: retain both the conflict and its
+        // countable loss while leaving the first immutable event untouched.
+        recordCaptureRecordLoss(this.buffer.database, {source:"codex", ...lossContext,
+          eventId:event.id, tokens:entry.delta, record:{offset:lossContext.offset, bytes:0,
+            fingerprint:maintenanceCandidateHash(event.id), kind:"codex_token_count",
+            usagePossible:true, reason:"logical_source_conflict"}});
+        continue;
+      }
       if (inserted) {
         result.eventsAppended += 1;
         result.tokensAppended.input += marginal.input;

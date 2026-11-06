@@ -54,6 +54,9 @@ export function ensureJsonlContinuationStore(db: Database.Database) {
 }
 export function jsonlCursorDigest(db: Database.Database, key: string): string {
  const row = db.prepare("select * from rollout_scan_state where file=?").get(jsonlScanStateKey(key)) as Record<string, unknown> | undefined;
+ // Diagnostics are outside the committed cursor. Preserve pre-0.7.56 hashes
+ // when the additive, nullable receipt column appears on existing ledgers.
+ if (row) delete row.commit_failure_json;
  return digest(row ? Object.fromEntries(Object.keys(row).sort().map(k => [k, row[k]])) : null);
 }
 function optionalRow(db: Database.Database, table: string, sql: string, arg?: string) {

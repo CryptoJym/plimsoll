@@ -187,6 +187,15 @@ export function ensureCaptureRecordLosses(database: Database.Database) {
     detected_at text not null,
     primary key(installation_epoch_id,source,identity_key)
   ) without rowid`);
+  const columns = new Set((database.pragma("table_info(capture_record_losses)") as Array<{name:string}>).map(c => c.name));
+  for (const name of ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"]) {
+    if (!columns.has(name)) {
+      try { database.exec(`alter table capture_record_losses add column ${name} integer`); }
+      catch (error) {
+        if (!(error instanceof Error) || !error.message.includes("duplicate column name")) throw error;
+      }
+    }
+  }
 }
 
 export function recordCaptureRecordLoss(database: Database.Database, input: {
@@ -194,6 +203,8 @@ export function recordCaptureRecordLoss(database: Database.Database, input: {
   fileKey: string;
   record: CaptureSkippedRecord;
   detectedAt?: string;
+  eventId?: string;
+  tokens?: { input: number; cachedInput?: number; output: number; reasoningOutput: number };
 }) {
   ensureCaptureRecordLosses(database);
   const epoch = database.prepare(`select current_installation_epoch_id as id
@@ -201,15 +212,19 @@ export function recordCaptureRecordLoss(database: Database.Database, input: {
   // A collector can scan before workspace enrollment. Keep its local loss
   // receipt without assigning it to a later cloud installation epoch.
   const epochId = epoch?.id ?? "unbound";
-  const identity = crypto.createHash("sha256").update(JSON.stringify([
+  const identity = crypto.createHash("sha256").update(JSON.stringify(input.eventId ? [
+    input.fileKey, input.record.reason, input.eventId,
+  ] : [
     input.fileKey, input.record.offset, input.record.reason, input.record.kind, input.record.bytes,
     input.record.fingerprint,
   ])).digest("hex");
   database.prepare(`insert or ignore into capture_record_losses
-    (installation_epoch_id,source,identity_key,kind,reason,skipped_bytes,usage_possible,detected_at)
-    values (?,?,?,?,?,?,?,?)`).run(epochId, input.source, identity, input.record.kind, input.record.reason,
+    (installation_epoch_id,source,identity_key,kind,reason,skipped_bytes,usage_possible,detected_at,
+      input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens)
+    values (?,?,?,?,?,?,?,?,?,?,?,?)`).run(epochId, input.source, identity, input.record.kind, input.record.reason,
       input.record.bytes, input.record.usagePossible ? 1 : 0,
-      input.detectedAt ?? new Date().toISOString());
+      input.detectedAt ?? new Date().toISOString(), input.tokens?.input ?? null,
+      input.tokens?.cachedInput ?? null, input.tokens?.output ?? null, input.tokens?.reasoningOutput ?? null);
 }
 
 /** Permanent gaps survive EOF. Without source content, a lost event's time is

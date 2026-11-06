@@ -190,6 +190,7 @@ export function ensureJsonlScanState(database: Database.Database) {
     "unresolved_observed_bytes integer",
     "unresolved_available_bytes integer",
     "unresolved_byte_budget integer",
+    "commit_failure_json text",
     "parser_kind text",
     "checkpoint_version integer",
     "parser_state_json text",
@@ -452,6 +453,44 @@ export function rememberJsonlScanCursor<T>(
       checkpointVersion,
       JSON.stringify(parserState),
     );
+}
+
+type CommitFailure = { signature: string; version: string; offset: number; messageHash: string; attempts: number };
+const commitFailureKey = (file: string) => jsonlScanStateKey(`codex-commit-failure:${file}`);
+
+function loadCommitFailure(database: Database.Database, file: string): CommitFailure | undefined {
+  const row = database.prepare(`select commit_failure_json as failure from ${STATE_TABLE} where file=?`)
+    .get(commitFailureKey(file)) as { failure: string | null } | undefined;
+  if (!row?.failure) return undefined;
+  try { return JSON.parse(row.failure) as CommitFailure; } catch { return undefined; }
+}
+
+/** Metadata and collector version fence a parked failure; committed parser
+ * state and byte evidence are never replaced by the failed slice. */
+export function jsonlCommitFailureParked(database: Database.Database, file: string, signature: string, version: string) {
+  const failure = loadCommitFailure(database, file);
+  return failure?.signature === signature && failure.version === version && failure.attempts >= 2 ? failure : undefined;
+}
+
+export function rememberJsonlCommitFailure(database: Database.Database, file: string,
+  failure: Omit<CommitFailure, "attempts">) {
+  const prior = loadCommitFailure(database, file);
+  const attempts = prior?.signature === failure.signature && prior.version === failure.version &&
+    prior.offset === failure.offset ? Math.min(2, prior.attempts + 1) : 1;
+  database.prepare(`insert into ${STATE_TABLE}(file,size,scanned_at,commit_failure_json,unresolved_kind,unresolved_offset)
+    values (?,0,?,?,?,?) on conflict(file) do update set
+      commit_failure_json=excluded.commit_failure_json,
+      unresolved_kind=case when ? then 'commit_error_parked'
+        when unresolved_kind='commit_error_parked' then null else unresolved_kind end,
+      unresolved_offset=case when ? then excluded.unresolved_offset
+        when unresolved_kind='commit_error_parked' then null else unresolved_offset end`)
+    .run(commitFailureKey(file), new Date().toISOString(), JSON.stringify({...failure, attempts}),
+      attempts >= 2 ? "commit_error_parked" : null, failure.offset, attempts >= 2 ? 1 : 0, attempts >= 2 ? 1 : 0);
+  return attempts >= 2;
+}
+
+export function clearJsonlCommitFailure(database: Database.Database, file: string) {
+  database.prepare(`delete from ${STATE_TABLE} where file=?`).run(commitFailureKey(file));
 }
 
 type PrefixHashState = { offset: number; identity: string; hash: crypto.Hash; digest: string };

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.56 — 2026-11-05
+
+- Codex forked rollouts keep their own filename session id when inherited
+  parent metadata appears later (plimsoll N61). Existing cursors repair the id
+  on resume while preserving their byte offset, counter index and totals.
+- Conflicting usage leaves the first event intact and commits a durable
+  conflict observation and token-counted loss, allowing the cursor to advance.
+  Other repeated slice failures park at their offset until the file metadata
+  or collector version changes; diagnostics name the known commit errors.
+
 ## 0.7.55 — 2026-11-05
 
 - Claude Code telemetry keeps its producer token out of `~/.claude/settings.json`

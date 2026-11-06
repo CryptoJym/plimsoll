@@ -2447,7 +2447,7 @@ export async function runNoChangeConstantWorkContract(
     );
     const parseFailureCursorsAbsent =
       (buffer.database
-        .prepare(`select count(*) as count from rollout_scan_state where file in (?, ?)`)
+        .prepare(`select count(*) as count from rollout_scan_state where file in (?, ?) and committed_offset is not null`)
         .get(
           jsonlScanStateKey(malformedRollout),
           jsonlScanStateKey(malformedTranscript),
@@ -2510,9 +2510,10 @@ export async function runNoChangeConstantWorkContract(
       transcriptParseRestart,
     );
     const parseFailuresPersistAcrossRestart =
-      rolloutParseRestart.filesRead === 1 &&
+      rolloutParseRestart.filesRead === 0 &&
+      rolloutParseRestart.unresolvedRecords === 1 &&
       transcriptParseRestart.filesRead === 1 &&
-      rolloutParseRestart.parseErrors === 1 &&
+      rolloutParseRestart.parseErrors === 0 &&
       transcriptParseRestart.parseErrors === 1 &&
       !rolloutParseRestartCoverage.promoted &&
       !transcriptParseRestartCoverage.promoted &&
@@ -2520,7 +2521,7 @@ export async function runNoChangeConstantWorkContract(
       transcriptParseRestartCoverage.coverage.status === "complete" &&
       rolloutParseRestartCoverage.coverage.sources.find(
         (source) => source.source === "codex",
-      )?.latestFullAttempt?.parseErrors === 1 &&
+      )?.latestFullAttempt?.parseErrors === 0 &&
       transcriptParseRestartCoverage.coverage.sources.find(
         (source) => source.source === "claude_code",
       )?.latestFullAttempt?.parseErrors === 1;

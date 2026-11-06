@@ -258,8 +258,8 @@ function verifyMeasurements(
   ], "idle measurements");
   assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 2);
   assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
-  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_608);
-  assert.equal(integer(idle.filesOpened, "history files opened"), 2_614);
+  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_607);
+  assert.equal(integer(idle.filesOpened, "history files opened"), 2_613);
   assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
   assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
   // Directory enumeration: the same invariants system-e2e-proof.ts checks before it writes the receipt.

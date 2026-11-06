@@ -887,6 +887,7 @@ jobs:
       - name: Prove current-day Codex capture during a multi-GB scan backlog
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
+          pnpm proof:codex-fork-identity
           pnpm proof:codex-scan-backlog
           pnpm proof:codex-scan-discovery
           pnpm proof:collector-named-usage-rollback

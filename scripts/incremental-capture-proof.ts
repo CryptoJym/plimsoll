@@ -328,7 +328,11 @@ async function proveRolloutTailing() {
     () => [],
   ).scan({ scope: "full" });
   assert.equal(afterReplacementGeneration.filesReset, 1);
-  assert.equal(afterReplacementGeneration.eventsAppended, 1);
+  // A new inode permits parser recovery, not a foreign metadata identity.
+  assert.equal(afterReplacementGeneration.eventsAppended, 0);
+  const recoveredState = JSON.parse((buffer.database.prepare(`select parser_state_json as state from rollout_scan_state where file=?`)
+    .get(jsonlScanStateKey(file)) as {state:string}).state);
+  assert.deepEqual([recoveredState.conversationId,recoveredState.previous.input], [ROLLOUT_SESSION,40]);
 
   const legacyFile = path.join(
     rolloutDay,
@@ -433,7 +437,7 @@ async function proveRolloutTailing() {
     (buffer.database
       .prepare(`select count(*) as n from buffered_events where session_id = ?`)
       .get(CONTINUITY_REPLACEMENT_SESSION) as { n: number }).n,
-    1,
+    0,
   );
 
   // A same-inode rewrite can deliberately restore the original size and
@@ -503,7 +507,7 @@ async function proveRolloutTailing() {
     (buffer.database
       .prepare(`select count(*) as n from buffered_events where session_id = ?`)
       .get(EQUAL_REWRITE_REPLACEMENT_SESSION) as { n: number }).n,
-    1,
+    0,
   );
 
   // Forced replay is deterministic: deleting only the scan cursor cannot
@@ -723,7 +727,9 @@ async function proveParseFailuresRemainUnresolved() {
       "claude_code",
       transcriptRestart,
     );
-    assert.equal(rolloutRestart.parseErrors, 1);
+    assert.equal(rolloutRestart.parseErrors, 0);
+    assert.equal(rolloutRestart.filesRead, 0);
+    assert.equal(rolloutRestart.unresolvedRecords, 1);
     assert.equal(transcriptRestart.parseErrors, 1);
     assert.equal(restartCoverage.promoted, false);
     assert.equal(restartCoverage.coverage.status, "complete");
