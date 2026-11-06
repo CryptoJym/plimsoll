@@ -8,7 +8,7 @@ import { Evidence, genericFolder, launchProject, protectedPath, topRepositories 
 import { stateBytes } from './state-json.js';
 import { narrowPacked, Seen } from './seen.js';
 import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js';
-import { actionCounts, counts, fields, HOUR, WINDOW, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
+import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
 // Exact port of shared/src/policy.ts providerAccountKey / hashProtectedValue.
@@ -304,7 +304,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   // serializing state for every reply; the writer enforces the exact ceiling.
   // IDs added this pass count at the packed size they will be saved at.
   const checkBudget = () => {
-    const limit = 9 * 1024 * 1024 - seen.pendingBytes - (evidenceSeen?.pendingBytes ?? 0);
+    const limit = MAX_STATE - seen.pendingBytes - (evidenceSeen?.pendingBytes ?? 0);
     const velocityReplays = Object.keys(replayProgress).length ? replayProgress : undefined;
     stateBytes({ ...state, velocityReplays }, limit);
     if (velocityOnly) stateBytes({ ...retainedState, velocity: state.velocity, velocityPending: state.velocityPending, velocityReplays }, limit);

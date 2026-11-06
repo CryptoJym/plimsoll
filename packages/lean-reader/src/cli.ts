@@ -9,6 +9,7 @@ import { expand } from './reader.js';
 export { scan, roots, emptyState, accountKey } from './reader.js';
 export { readState, saveState, acquireLock, runPass, launchAgent } from './system.js';
 export { makeBatches, sendPending } from './transport.js';
+export { MAX_STATE } from './types.js';
 export { allowancePass, nativeAccounts, readOutbox } from './allowance.js';
 const print = (value: unknown, pretty = false) => process.stdout.write(JSON.stringify(value, null, pretty ? 2 : undefined) + '\n');
 

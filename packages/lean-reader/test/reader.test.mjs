@@ -296,7 +296,7 @@ test('LaunchAgent uses collector Node and required scheduling without installing
   const node = process.execPath;
   write(home, 'Library/LaunchAgents/com.plimsoll.collector.plist', `<?xml version="1.0"?><plist><dict><key>ProgramArguments</key><array><string>${node}</string><string>/synthetic/collector.mjs</string></array></dict></plist>`);
   const xml = reader.launchAgent(home, '/synthetic/lean.mjs');
-  for (const text of ['com.plimsoll.lean-reader', node, '<integer>300</integer>', '<key>RunAtLoad</key>', '<key>LowPriorityIO</key>', '<string>Background</string>', '<integer>10</integer>', '--jitless --max-old-space-size=48 --max-semi-space-size=1']) assert.ok(xml.includes(text));
+  for (const text of ['com.plimsoll.lean-reader', node, '<integer>300</integer>', '<key>RunAtLoad</key>', '<key>LowPriorityIO</key>', '<string>Background</string>', '<integer>10</integer>', '--jitless --max-old-space-size=128 --max-semi-space-size=1']) assert.ok(xml.includes(text));
   assert.equal(fs.existsSync(path.join(home, 'Library/LaunchAgents/com.plimsoll.lean-reader.plist')), false);
 });
 
@@ -407,7 +407,7 @@ test('the collector LaunchAgent takes precedence over other Plimsoll agents', t 
 
 test('IDs read in a pass count at their packed size, so a pass fits when the state it saves does', t => {
   const home = fixture(t), n = 300_000;
-  // Held as a JSON map in flight these IDs alone would pass the 9 MiB ceiling; packed they take under 11 bytes each.
+  // Held as a JSON map in flight these IDs would take about 9 MB; packed they take under 11 bytes each.
   const lines = [JSON.stringify(meta()), JSON.stringify(context)];
   for (let i = 0; i < n; i++) lines.push(JSON.stringify(usage('synthetic-' + i)));
   write(home, '.codex/sessions/2026/10/20/rollout-large.jsonl', lines.join('\n') + '\n');
@@ -425,7 +425,7 @@ test('capacity refusal preserves the committed state instead of dropping pending
   const state = reader.emptyState();
   reader.saveState(file, state);
   const before = fs.readFileSync(file, 'utf8');
-  state.sessions.giant = { title: 'x'.repeat(10 * 1024 * 1024) };
+  state.sessions.giant = { title: 'x'.repeat(reader.MAX_STATE) };
   assert.throws(() => reader.saveState(file, state), /state_capacity/);
   assert.equal(fs.readFileSync(file, 'utf8'), before);
 });
@@ -459,7 +459,8 @@ test('the copied standalone and symlinked command execute without node_modules',
 
 test('a scan refuses growing state before its deduplication and metadata exceed the bound', t => {
   const home = fixture(t);
-  const records = Array.from({ length: 6000 }, (_, i) => claude('bounded-' + i, { sessionId: String(i).padEnd(500, 's'), message: { id: 'bounded-' + i, model: 'm'.repeat(512), usage: { input_tokens: 1 } } }));
+  // Each record adds a session and rows carrying a 512-character model: over 1.4 KB of state.
+  const records = Array.from({ length: Math.ceil(reader.MAX_STATE / 1400) }, (_, i) => claude('bounded-' + i, { sessionId: String(i).padEnd(500, 's'), message: { id: 'bounded-' + i, model: 'm'.repeat(512), usage: { input_tokens: 1 } } }));
   write(home, '.claude/projects/x/a.jsonl', records);
   assert.throws(() => reader.scan(options(home)), /state_capacity/);
 });

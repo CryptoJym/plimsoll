@@ -247,7 +247,11 @@ Reads use 64 KiB chunks. Lines above 1 MiB are discarded unless their first
 512 bytes mark relevant usage/context; relevant oversized records are projected
 onto a bounded field allowlist without retaining their content. Closed delivered
 hours and expired IDs leave state. Pending data is never silently evicted: a
-9 MiB serialized state ceiling stops cursor advancement with `state_capacity`.
+32 MiB serialized state ceiling stops cursor advancement with `state_capacity`.
+Loading holds the file's text and its parse at once, so the LaunchAgent's V8 heap
+is four times the ceiling (`--max-old-space-size=128`); the two move together.
+On 2026-11-05 Studio0's eight-day state reached the old 9 MiB ceiling and every
+pass failed from 19:51Z until the ceiling and heap were raised.
 Delivery failures retain pending data and retry with exponential backoff from
 one minute to one hour. `status` reports the last send/error and measured run
 footprint. Resolve a persistent capacity error before leaving the reader unattended.
