@@ -472,7 +472,10 @@ function homeScopedRotationReceiptChecks(fixtureRoot: string) {
     "fixture_setup_manages_inside_profile_and_seat",
     setup.exit === 0 &&
       managedToml.includes("x-plimsoll-token") &&
-      managedJson.includes("x-plimsoll-token"),
+      // A managed Claude seat carries no token (plimsoll N60): its command hooks
+      // name the shared header file and its OTLP helper key is set.
+      managedJson.includes("plimsoll-claude.headers") &&
+      managedJson.includes("otelHeadersHelper"),
     { exit: setup.exit },
   );
 
@@ -516,7 +519,8 @@ function homeScopedRotationReceiptChecks(fixtureRoot: string) {
       `${source}_applied_outside_home_target_reports_link_path`,
       run.exit === 0 &&
         run.receipt.status === "rotation_applied" &&
-        rm?.status === "rotated" &&
+        // A Claude seat carries no token (plimsoll N60): the shared header rotates, the seat reads unchanged.
+        rm?.status === (source === "claude_code" ? "unchanged" : "rotated") &&
         rm?.path === linked(family, "out-managed", file) &&
         rm?.outsideHome === true,
       {
