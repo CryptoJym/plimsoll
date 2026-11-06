@@ -1210,6 +1210,8 @@ jobs:
           pnpm proof:account-binding-history
           pnpm proof:plan-limit-event-id
           pnpm proof:claude-status-line-account
+          pnpm proof:claude-plan-limit-parser
+          pnpm proof:claude-plan-limit-emission
           pnpm proof:claude-status-line-edits
           pnpm proof:claude-status-line-races
           pnpm proof:claude-status-line-r5-restore
