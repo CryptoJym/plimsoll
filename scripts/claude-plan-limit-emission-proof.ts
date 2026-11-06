@@ -74,7 +74,7 @@ try {
   assert.equal((buffer.database.prepare("select count(*) as n from plan_limit_emission_state").get() as { n: number }).n, 4);
   checks.push("two enrolled accounts reach emission state and upload gate with event account hashes");
 
-  collector.stop();
+  await collector.stop();
   collector = new ClaudePlanLimitCollector(buffer, options);
   assert.equal((await collector.tick()).planLimitReadingsSkippedBackoff, 7);
   assert.equal(requests, 5, "restart preserves success cadence and failure backoff");
@@ -84,7 +84,7 @@ try {
   assert.equal(collector.status().planLimitReadingsSkippedNoCredential, 2);
   checks.push("restart spacing and unchanged ten-minute heartbeat");
 
-  collector.stop();
+  await collector.stop();
   const oneSeat = { ...options, captureRoots: roots.slice(0, 1) };
   collector = new ClaudePlanLimitCollector(buffer, oneSeat);
   clock += CLAUDE_PLAN_LIMIT_POLL_MS; mode = "401";
@@ -95,19 +95,39 @@ try {
   assert.equal((await collector.tick()).planLimitReadingsFailed, 1);
   clock += CLAUDE_PLAN_LIMIT_POLL_MS;
   assert.equal((await collector.tick()).planLimitReadingsSkippedBackoff, 1);
+  const otherSeat = new ClaudePlanLimitCollector(buffer, { ...options, captureRoots: [roots[2]!] });
+  assert.equal((await otherSeat.tick()).planLimitReadingsSkippedBackoff, 1, "Retry-After also spaces another seat after restart");
+  await otherSeat.stop();
   clock += 20 * 60_000; mode = "rotate";
   assert.equal((await collector.tick()).planLimitReadingsSkippedAccountMismatch, 1);
   assert.equal(rows().length, 8);
-  const stateDir = path.join(home, "capacity", "adapters");
+  const stateDir = path.join(home, "claude-plan-limits");
+  assert.equal(fs.existsSync(path.join(home, "capacity")), false, "the reader writes no adapter state or receipt");
+  assert.equal(fs.statSync(stateDir).mode & 0o777, 0o700);
+  for (const file of fs.readdirSync(stateDir)) assert.equal(fs.statSync(path.join(stateDir, file)).mode & 0o777, 0o600);
   const persisted = JSON.stringify(rows()) + fs.readdirSync(stateDir).map(file => fs.readFileSync(path.join(stateDir, file), "utf8")).join("");
   for (const secret of ["fixture-token", "fixture-private-error", "fixture-account", "@fixture.invalid"])
     assert.ok(!persisted.includes(secret), "only hashed identity and allowlisted facts persist");
   checks.push("401, Retry-After and identity rotation skip without leaking or emitting");
-  collector.stop();
+  await collector.stop();
+  clock += CLAUDE_PLAN_LIMIT_POLL_MS;
+  let release!: () => void;
+  collector = new ClaudePlanLimitCollector(buffer, { ...options, captureRoots: [roots[2]!],
+    readCredential: async () => { await new Promise<void>(resolve => { release = resolve; }); return null; } });
+  const interruptedPoll = collector.tick();
+  const restarted = new ClaudePlanLimitCollector(buffer, { ...options, captureRoots: [roots[2]!] });
+  assert.equal((await restarted.tick()).planLimitReadingsSkippedBackoff, 1, "reservation survives a restart during credential I/O");
+  await restarted.stop();
+  let drained = false;
+  const stopping = collector.stop().then(() => { drained = true; });
+  await Promise.resolve();
+  assert.equal(drained, false, "stop waits for the in-flight tick");
+  release(); await stopping; await interruptedPoll;
+  assert.equal(rows().length, 8, "a stopped read cannot emit after the ledger is released");
   const disabled = new ClaudePlanLimitCollector(buffer, { ...options, captureRoots: [] });
   assert.equal((await disabled.tick()).accountsChecked, 0);
-  disabled.stop();
+  await disabled.stop();
   console.log(JSON.stringify({ proof: "claude-plan-limit-emission", checks: checks.length, passed: checks.length, failed: 0, names: checks }));
-} finally { collector.stop(); buffer.close(); fs.rmSync(root, { recursive: true, force: true }); }
+} finally { await collector.stop(); buffer.close(); fs.rmSync(root, { recursive: true, force: true }); }
 }
 void main().catch(error => { console.error(error); process.exitCode = 1; });

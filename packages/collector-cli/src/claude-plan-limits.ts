@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
 import https from "node:https";
 import os from "node:os";
 import path from "node:path";
@@ -8,9 +9,6 @@ import type { CollectorConfig } from "./config";
 import { providerAccountKey } from "../../shared/src/policy";
 import { readBoundedRegularFile } from "./safe-file-read";
 import { PlanLimitEmitter } from "./plan-limit-observation";
-import { buildCapacityAdapterReceipt, capacityAdaptersStateDir, computeAdapterBackoff,
-  loadBackoffState, persistBackoffState, persistLatestAdapterReceipt, parseClaudeUsageResponse,
-  CLAUDE_USAGE_MAX_BYTES, type CapacityAdapterError, type CapacityWindowFact } from "./provider-capacity-adapters";
 
 // Ten-minute reads leave room for the daemon's one-minute tick and request
 // latency inside the fifteen-minute freshness target. Refusals have the same
@@ -18,6 +16,14 @@ import { buildCapacityAdapterReceipt, capacityAdaptersStateDir, computeAdapterBa
 export const CLAUDE_PLAN_LIMIT_POLL_MS = 10 * 60_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 const AUTH_MAX_BYTES = 4 * 1024 * 1024;
+export const CLAUDE_PLAN_USAGE_MAX_BYTES = 256 * 1024;
+export const CLAUDE_PLAN_USAGE_WINDOWS = ["five_hour", "seven_day", "seven_day_oauth_apps",
+  "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included"] as const;
+type ClaudePlanWindow = { window: typeof CLAUDE_PLAN_USAGE_WINDOWS[number];
+  usedPercent: number; windowMinutes: number; resetsAt: string };
+type PollState = { consecutiveFailures: number; nextAllowedAt: string };
+type ReadError = "none" | "no_account" | "no_credential" | "account_mismatch" |
+  "output_bound_exceeded" | "timeout" | "io_error" | "provider_error" | "parse_failed";
 type Json = Record<string, unknown>;
 function record(value: unknown): Json {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Json : {};
@@ -34,6 +40,61 @@ function text(value: unknown): string | undefined {
 }
 function planType(value: unknown): string | undefined {
   return typeof value === "string" && /^(?:claude_)?(?:free|pro|max|team|enterprise)$/.test(value) ? value : undefined;
+}
+
+/** Only allowlisted usage facts leave this parser; raw provider fields never do. */
+export function parseClaudePlanUsage(raw: Buffer | string):
+  { kind: "ok"; windows: ClaudePlanWindow[] } | { kind: "parse_failed" } {
+  if (Buffer.byteLength(raw) > CLAUDE_PLAN_USAGE_MAX_BYTES) return { kind: "parse_failed" };
+  let document: Json;
+  try {
+    const value: unknown = JSON.parse(raw.toString());
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "parse_failed" };
+    document = value as Json;
+  } catch { return { kind: "parse_failed" }; }
+  if (document.error !== undefined) return { kind: "parse_failed" };
+  const windows: ClaudePlanWindow[] = [];
+  for (const label of CLAUDE_PLAN_USAGE_WINDOWS) {
+    const slot = record(document[label]);
+    const reset = slot.resets_at;
+    const ms = typeof reset === "string" && reset.length > 0 && reset.length <= 64 ? Date.parse(reset) : NaN;
+    if (typeof slot.utilization !== "number" || !Number.isFinite(slot.utilization) ||
+        slot.utilization < 0 || !Number.isFinite(ms)) continue;
+    windows.push({ window: label, usedPercent: slot.utilization,
+      windowMinutes: label === "five_hour" ? 300 : 10080, resetsAt: new Date(ms).toISOString() });
+  }
+  return { kind: "ok", windows };
+}
+
+function nextPoll(previous: PollState | null, failed: boolean, now: Date, retryAfterMs = 0): PollState {
+  const failures = failed ? Math.min(16, (previous?.consecutiveFailures ?? 0) + 1) : 0;
+  const backoffMs = failures ? Math.min(60_000, 2_000 * 2 ** (failures - 1)) : 0;
+  return { consecutiveFailures: failures, nextAllowedAt: new Date(now.getTime() +
+    Math.max(CLAUDE_PLAN_LIMIT_POLL_MS, backoffMs, retryAfterMs)).toISOString() };
+}
+
+function readPoll(file: string): PollState | null {
+  const read = readBoundedRegularFile(file, 1024);
+  if (read.kind === "missing") return null;
+  const value = read.kind === "ok" ? json(read.value) : {};
+  if (!Number.isInteger(value.consecutiveFailures) || Number(value.consecutiveFailures) < 0 ||
+      Number(value.consecutiveFailures) > 16 || typeof value.nextAllowedAt !== "string" ||
+      !Number.isFinite(Date.parse(value.nextAllowedAt))) throw new UsageError("io_error");
+  return { consecutiveFailures: Number(value.consecutiveFailures), nextAllowedAt: value.nextAllowedAt };
+}
+
+function writePoll(file: string, state: PollState) {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (!fs.lstatSync(dir).isDirectory()) throw new UsageError("io_error");
+  fs.chmodSync(dir, 0o700);
+  const temp = `${file}.${randomUUID()}.tmp`;
+  try {
+    const fd = fs.openSync(temp, "wx", 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify(state)); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(temp, file);
+  } finally { fs.rmSync(temp, { force: true }); }
 }
 
 export type ClaudeUsageCredential = { accessToken: string; expiresAt: number; planType?: string };
@@ -72,14 +133,13 @@ function run(args) {
 }`;
 
 async function readCredential(configDir: string, defaultDir: string, now: Date,
-  signal: AbortSignal, explicit: boolean, onSpawn: () => void): Promise<ClaudeUsageCredential | null> {
+  signal: AbortSignal, explicit: boolean): Promise<ClaudeUsageCredential | null> {
   if (process.platform === "darwin") {
     const raw = await new Promise<string>((resolve) => {
-      const child = execFile("/usr/bin/osascript", ["-l", "JavaScript", "-e", KEYCHAIN_READ_SCRIPT,
+      execFile("/usr/bin/osascript", ["-l", "JavaScript", "-e", KEYCHAIN_READ_SCRIPT,
         claudeKeychainService(configDir, defaultDir, explicit)],
       { encoding: "utf8", timeout: 2_000, maxBuffer: AUTH_MAX_BYTES, signal },
       (error, stdout) => resolve(error ? "" : stdout));
-      if (child.pid) onSpawn();
     });
     const credential = parseClaudeUsageCredential(raw, now);
     if (credential) return credential;
@@ -91,7 +151,7 @@ async function readCredential(configDir: string, defaultDir: string, now: Date,
 type UsagePath = "/api/oauth/profile" | "/api/oauth/usage";
 type UsageResponse = { status: number; body: string; retryAfterMs?: number };
 class UsageError extends Error {
-  constructor(readonly code: CapacityAdapterError) { super(code); }
+  constructor(readonly code: ReadError) { super(code); }
 }
 
 /** Fixed Anthropic origin, no redirects or retries, one deadline over the
@@ -121,7 +181,7 @@ function requestUsage(endpoint: UsagePath, token: string, signal: AbortSignal): 
       let bytes = 0;
       response.on("data", (chunk: Buffer) => {
         bytes += chunk.length;
-        if (bytes > CLAUDE_USAGE_MAX_BYTES) {
+        if (bytes > CLAUDE_PLAN_USAGE_MAX_BYTES) {
           reject(new UsageError("output_bound_exceeded"));
           response.destroy();
         } else chunks.push(chunk);
@@ -164,7 +224,7 @@ export class ClaudePlanLimitCollector {
   private stopped = false;
   private latest = emptyCounters();
   private readonly totals = emptyCounters();
-  private readonly pollState = new Map<string, ReturnType<typeof computeAdapterBackoff>>();
+  private readonly pollState = new Map<string, PollState>();
   private readonly now: () => Date;
   private readonly defaultDir: string;
   private readonly configDirs: string[];
@@ -201,10 +261,11 @@ export class ClaudePlanLimitCollector {
     this.timer.unref();
   }
 
-  stop() {
+  async stop() {
     this.stopped = true;
     this.abort.abort();
     if (this.timer) clearInterval(this.timer);
+    await this.inFlight;
   }
 
   tick(): Promise<ReturnType<typeof emptyCounters>> {
@@ -221,51 +282,55 @@ export class ClaudePlanLimitCollector {
 
   private async collect() {
     const counters = emptyCounters();
-    const readAccounts = new Set<string>();
     for (const configDir of this.configDirs) {
       if (this.stopped) break;
       const startedAt = this.now();
       const profileId = createHash("sha256").update(configDir).digest("hex").slice(0, 16);
-      const stateDir = capacityAdaptersStateDir(this.options.home);
-      const backoffFile = path.join(stateDir, `claude_oauth_usage.${profileId}.backoff.json`);
+      const stateDir = path.join(this.options.home, "claude-plan-limits");
+      const backoffFile = path.join(stateDir, `profile-${profileId}.json`);
       let previous = this.pollState.get(profileId) ?? null;
-      try { previous ??= loadBackoffState(backoffFile, startedAt); } catch { /* Use in-memory spacing. */ }
+      try { previous ??= readPoll(backoffFile); }
+      catch { counters.planLimitReadingsFailed++; continue; }
       if (previous?.nextAllowedAt && Date.parse(previous.nextAllowedAt) > startedAt.getTime()) {
         counters.planLimitReadingsSkippedBackoff++;
         continue;
       }
-      let error: CapacityAdapterError = "none";
+      let error: ReadError = "none";
       let accountKey: string | undefined;
-      let windows: CapacityWindowFact[] = [];
+      let accountFile: string | undefined;
       let retryAfterMs = 0;
-      let spawnCount = 0;
-      let bytesRead = 0;
       try {
         const account = this.account(configDir);
         if (!account) throw new UsageError("no_account");
         accountKey = providerAccountKey(account.uuid);
-        if (readAccounts.has(accountKey)) continue;
-        // Several enrolled seats may share one account. A successful account
-        // read spaces all of them, including a different seat after restart.
+        // Several seats may share one account. All attempts, including denied
+        // credentials and provider refusals, share its persisted deadline.
         const accountStateKey = `account:${accountKey}`;
-        let accountState = this.pollState.get(accountStateKey) ?? null;
-        try { accountState ??= loadBackoffState(path.join(stateDir,
-          `claude_oauth_usage.account-${accountKey.slice(7)}.backoff.json`), startedAt); } catch { /* Memory remains authoritative this run. */ }
+        accountFile = path.join(stateDir, `account-${accountKey.slice(7)}.json`);
+        const accountState = this.pollState.get(accountStateKey) ?? readPoll(accountFile);
         if (accountState?.nextAllowedAt && Date.parse(accountState.nextAllowedAt) > startedAt.getTime()) {
           counters.planLimitReadingsSkippedBackoff++;
           continue;
         }
+        previous = accountState ?? previous;
         counters.accountsChecked++;
+        // Reserve before any asynchronous read: even a crash or restart mid-
+        // request must leave ten minutes of spacing. Failed writes refuse I/O.
+        const reservation = nextPoll(previous, false, startedAt);
+        writePoll(backoffFile, reservation);
+        writePoll(accountFile, reservation);
+        this.pollState.set(profileId, reservation);
+        this.pollState.set(accountStateKey, reservation);
         const credential = await (this.options.readCredential
           ? this.options.readCredential(configDir, startedAt, this.abort.signal)
           : readCredential(configDir, this.defaultDir, startedAt, this.abort.signal,
-            Boolean(this.env.CLAUDE_CONFIG_DIR && path.resolve(this.env.CLAUDE_CONFIG_DIR) === configDir),
-            () => { spawnCount++; }));
+            Boolean(this.env.CLAUDE_CONFIG_DIR && path.resolve(this.env.CLAUDE_CONFIG_DIR) === configDir)));
+        if (this.stopped) break;
         if (!credential || credential.expiresAt <= this.now().getTime() + REQUEST_TIMEOUT_MS)
           throw new UsageError("no_credential");
         const get = async (endpoint: UsagePath) => {
           const response = await (this.options.request ?? requestUsage)(endpoint, credential.accessToken, this.abort.signal);
-          bytesRead += Buffer.byteLength(response.body);
+          if (Buffer.byteLength(response.body) > CLAUDE_PLAN_USAGE_MAX_BYTES) throw new UsageError("output_bound_exceeded");
           retryAfterMs = Math.max(retryAfterMs, response.retryAfterMs ?? 0);
           if (response.status !== 200) throw new UsageError(response.status === 401 ? "no_credential" : "provider_error");
           return response.body;
@@ -278,17 +343,16 @@ export class ClaudePlanLimitCollector {
             (typeof actual.email !== "string" || actual.email.toLowerCase() !== account.email.toLowerCase())) ||
             (account.organization && record(profile.organization).uuid !== account.organization))
           throw new UsageError("account_mismatch");
-        const parsed = parseClaudeUsageResponse(await get("/api/oauth/usage"));
+        if (this.stopped) break;
+        const parsed = parseClaudePlanUsage(await get("/api/oauth/usage"));
         if (parsed.kind !== "ok" || !parsed.windows.length) throw new UsageError("parse_failed");
-        // Scoped buckets stay in the local receipt. The cloud contract for
-        // this reader is the account's five-hour and seven-day windows.
+        // Only the account's five-hour and seven-day windows are emitted.
         const accountWindows = parsed.windows.filter(window => window.window === "five_hour" || window.window === "seven_day");
         if (!accountWindows.length) throw new UsageError("parse_failed");
         // A seat may rotate while the requests are outstanding. Its new UUID
         // cannot inherit the previous account's response.
         if (JSON.stringify(this.account(configDir)) !== JSON.stringify(account)) throw new UsageError("account_mismatch");
         if (this.stopped) break;
-        windows = parsed.windows;
         const observedAt = this.now().toISOString();
         for (const window of accountWindows) {
           counters.planLimitReadingsSeen++;
@@ -297,10 +361,8 @@ export class ClaudePlanLimitCollector {
             window: { window: window.window, minutes: window.windowMinutes ?? undefined,
               usedPercent: window.usedPercent, resetsAt: window.resetsAt! } })) counters.planLimitReadingsEmitted++;
         }
-        readAccounts.add(accountKey);
       } catch (failure) {
         error = failure instanceof UsageError ? failure.code : "io_error";
-        windows = [];
         if (error === "no_account") counters.planLimitReadingsSkippedNoAccount++;
         else if (error === "no_credential") counters.planLimitReadingsSkippedNoCredential++;
         else if (error === "account_mismatch") counters.planLimitReadingsSkippedAccountMismatch++;
@@ -308,19 +370,12 @@ export class ClaudePlanLimitCollector {
       }
       if (this.stopped) break;
       const completed = this.now();
-      const backoff = computeAdapterBackoff({ previous, failed: error !== "none", now: completed });
-      backoff.nextAllowedAt = new Date(Math.max(completed.getTime() + CLAUDE_PLAN_LIMIT_POLL_MS,
-        Date.parse(backoff.nextAllowedAt ?? completed.toISOString()), completed.getTime() + retryAfterMs)).toISOString();
+      const backoff = nextPoll(previous, error !== "none", completed, retryAfterMs);
       this.pollState.set(profileId, backoff);
-      if (error === "none" && accountKey) this.pollState.set(`account:${accountKey}`, backoff);
+      if (accountKey) this.pollState.set(`account:${accountKey}`, backoff);
       try {
-        persistBackoffState(backoff, backoffFile, stateDir);
-        if (error === "none" && accountKey) persistBackoffState(backoff,
-          path.join(stateDir, `claude_oauth_usage.account-${accountKey.slice(7)}.backoff.json`), stateDir);
-        persistLatestAdapterReceipt(buildCapacityAdapterReceipt({ adapter: "claude_oauth_usage", profileId,
-          ok: error === "none", phase: error === "none" ? "complete" : "rate_limits_read", errorCode: error,
-          startedAt, now: completed, windows, providerVersion: null, maxAgeMs: 15 * 60_000,
-          resourceCost: { spawnCount, bytesWritten: 0, bytesRead, exitCode: null, signal: null } }), this.options.home);
+        writePoll(backoffFile, backoff);
+        if (accountFile) writePoll(accountFile, backoff);
       } catch { /* In-memory backoff still protects the daemon; no raw errors are logged. */ }
     }
     this.latest = counters;

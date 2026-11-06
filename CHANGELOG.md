@@ -12,8 +12,12 @@
   as Claude events. The OAuth heartbeat leaves room for polling jitter.
 - Missing accounts, unavailable/expired credentials, identity mismatches and
   failed reads are counted in `/status`. Keychain reads refuse permission UI;
-  tokens stay in memory, and only allowlisted facts enter receipts or uploads.
-  Persisted backoff, Retry-After and single-flight polling bound failures.
+  tokens stay in memory, and only allowlisted plan-limit facts enter uploads.
+  The reader keeps private spacing and backoff state under `claude-plan-limits`
+  in the collector home, independently of the manual provider adapters; it
+  produces no adapter receipt. Attempts reserve ten-minute spacing per account
+  across seats and restarts before reading credentials. Retry-After and
+  single-flight polling bound failures; shutdown drains the in-flight read.
 
 ## 0.7.56 — 2026-11-05
 

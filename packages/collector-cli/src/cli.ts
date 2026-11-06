@@ -4557,7 +4557,7 @@ async function main() {
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
-      claudePlanLimits.stop();
+      const planLimitsStopped = claudePlanLimits.stop();
       void walCheckpoint.stop();
       budgetSampler?.stop();
       maintenanceCadence?.stop();
@@ -4578,6 +4578,7 @@ async function main() {
         enrichmentScheduler?.waitForIdle() ?? Promise.resolve(),
         enrichmentBoundary.shutdown(),
         summaryStopped,
+        planLimitsStopped,
       ]);
       const maintenanceIdle = idle.status === "fulfilled";
       const maintenanceChildReaped = child.status === "fulfilled" && child.value;
@@ -4610,7 +4611,8 @@ async function main() {
         return;
       }
       shuttingDown = true;
-      claudePlanLimits.stop();
+      let planLimitsIdle = false;
+      const planLimitsStopped = claudePlanLimits.stop().then(() => { planLimitsIdle = true; });
       flushRejectionSummaries();
       void walCheckpoint.stop();
       budgetSampler?.stop();
@@ -4661,7 +4663,7 @@ async function main() {
       void (async () => {
         try {
           await Promise.race([
-            Promise.allSettled([serverClose, idle, childShutdown, enrichmentShutdown, summaryStopped]).then(() => undefined),
+            Promise.allSettled([serverClose, idle, childShutdown, enrichmentShutdown, summaryStopped, planLimitsStopped]).then(() => undefined),
             deadline,
           ]);
           if (!serverClosed) {
@@ -4680,7 +4682,7 @@ async function main() {
           }
           // Never close SQLite until the child is reaped and the parent
           // scheduler no longer has a boundary call in flight.
-          if (maintenanceIdle && maintenanceChildReaped && enrichmentChildReaped) {
+          if (maintenanceIdle && maintenanceChildReaped && enrichmentChildReaped && planLimitsIdle) {
             buffer.close();
             closeOutcomeTimelineStore();
           }
@@ -4704,7 +4706,7 @@ async function main() {
             remaining.kind === "missing" &&
             !persistentCleanup.ambiguous &&
             !cleanupAttempt?.ambiguous;
-          const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped && enrichmentChildReaped;
+          const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped && enrichmentChildReaped && planLimitsIdle;
           console.log(
             JSON.stringify({
               // The process is still executing this receipt. Only the stop or
@@ -4719,6 +4721,7 @@ async function main() {
               maintenanceIdle,
               maintenanceChildReaped,
               enrichmentChildReaped,
+              planLimitsIdle,
               listenerClosed: serverClosed,
               listenerState: serverClosed ? "closed" : "close_incomplete",
               processState: "exiting",
