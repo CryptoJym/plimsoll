@@ -929,8 +929,11 @@ function proveDoctrineAndFreshness() {
         "spawn_failed",
         "timeout",
         "io_error",
+        "no_account",
+        "no_credential",
+        "account_mismatch",
       ].includes(code),
-    ) && CAPACITY_ADAPTER_ERRORS.length === 13,
+    ) && CAPACITY_ADAPTER_ERRORS.length === 16,
     { count: CAPACITY_ADAPTER_ERRORS.length },
   );
 

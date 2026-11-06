@@ -65,7 +65,7 @@ type Observation = {
   accountKey?: string;
   observedAt: string;
   window: PlanLimitWindow;
-  planLimitSource: "codex_rollout" | "claude_status_line";
+  planLimitSource: "codex_rollout" | "claude_status_line" | "claude_usage_api";
   planType?: string;
   planLimitId?: string;
   sessionId?: string;
@@ -105,10 +105,13 @@ export class PlanLimitEmitter {
       this.last.set(cacheKey, row ?? null);
     }
     const previous = this.last.get(cacheKey);
+    // OAuth polling runs every ten minutes. A five-minute dedupe fence leaves
+    // room for request/timer jitter while keeping its rows inside fifteen minutes.
+    const heartbeatMs = input.planLimitSource === "claude_usage_api" ? 5 * 60_000 : 15 * 60_000;
     if (previous && (Date.parse(observedAt) < Date.parse(previous.observedAt) ||
       (Math.abs(window.usedPercent - previous.usedPercent) < 1 &&
         window.resetsAt === previous.resetsAt &&
-        Date.parse(observedAt) - Date.parse(previous.observedAt) < 15 * 60_000))) return false;
+        Date.parse(observedAt) - Date.parse(previous.observedAt) < heartbeatMs))) return false;
 
     const accountField = source === "codex" ? "user.account_id" : "user.account_uuid";
     const metadata: Record<string, unknown> = {
@@ -124,7 +127,7 @@ export class PlanLimitEmitter {
     };
     const event: AiInteractionEvent = aiInteractionEventSchema.parse({
       id: deterministicEventId(["plan-limit", source, stateKey, window.window, window.resetsAt,
-        String(Math.floor(window.usedPercent)), String(Math.floor(Date.parse(observedAt) / (15 * 60_000)))]),
+        String(Math.floor(window.usedPercent)), String(Math.floor(Date.parse(observedAt) / heartbeatMs))]),
       source,
       dataMode: "metadata",
       eventType: "plan_limit_observation",

@@ -749,6 +749,8 @@ export function createCollectorServer(
     hookSpoolStatus?: () => HookSpoolStatus | null;
     /** Process-local upload scheduler state; no DB or filesystem work. */
     syncStatus?: () => unknown;
+    /** Cached counters only; provider reads never run on the HTTP path. */
+    claudePlanLimitStatus?: () => unknown;
     /** In-memory WAL checkpoint worker state (eco-6hoxj.163.24); no DB or filesystem work. */
     walCheckpointStatus?: () => unknown;
     /** One in-memory footprint snapshot; the sampler owns all filesystem and ledger reads. */
@@ -1592,6 +1594,7 @@ export function createCollectorServer(
           // In-memory index and counters only; no filesystem or ledger read.
           body.otlpSpool = otlpSpool?.status() ?? null;
           body.sync = options.syncStatus?.() ?? null;
+          body.claudePlanLimits = options.claudePlanLimitStatus?.() ?? null;
           body.walCheckpoint = options.walCheckpointStatus?.() ?? null;
           body.budget = options.budgetStatus?.() ?? { mode: "advisory", latest: null,
             p50: null, p95: null, hostClass: null, targets: null,

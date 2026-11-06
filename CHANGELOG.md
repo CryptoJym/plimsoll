@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.57 — 2026-11-06
+
+- The daemon reads Claude plan limits for enrolled seats without interactive
+  sessions or status-line setup (eco-6hoxj.165.99, issue #172). It reads the
+  provider's OAuth usage endpoint every ten minutes, verifies the token's
+  profile against the seat's account UUID, email and organization, and emits
+  `claude_code` observations through the existing plan-limit emission state.
+  Five-hour and seven-day windows retain their provider names, percentages,
+  reset times and credential-reported plan type, with the same account hash
+  as Claude events. The OAuth heartbeat leaves room for polling jitter.
+- Missing accounts, unavailable/expired credentials, identity mismatches and
+  failed reads are counted in `/status`. Keychain reads refuse permission UI;
+  tokens stay in memory, and only allowlisted facts enter receipts or uploads.
+  Persisted backoff, Retry-After and single-flight polling bound failures.
+
 ## 0.7.56 — 2026-11-05
 
 - Codex forked rollouts keep their own filename session id when inherited

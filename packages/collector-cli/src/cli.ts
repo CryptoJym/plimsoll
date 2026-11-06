@@ -84,6 +84,7 @@ import { startClaudeReplayBarrier } from "./claude-replay-barrier";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
+import { ClaudePlanLimitCollector } from "./claude-plan-limits";
 import { uploadCompletedToolStatsWeek } from "./weekly-tool-stats-upload";
 import { aggregateToolStatsWeekOffThread, WEEKLY_TOOL_STATS_READ_MS } from "./weekly-tool-stats-reader";
 import {
@@ -3805,6 +3806,9 @@ async function main() {
     // drain armed below replays it. PLIMSOLL_OTLP_SPOOL=off disables both.
     const otlpSpool = new OtlpIntakeSpool({ home: collectorHome() });
     const syncBackoff = new SyncBackoff(config.syncIntervalSeconds * 1_000);
+    const claudePlanLimits = new ClaudePlanLimitCollector(buffer, {
+      home: collectorHome(), captureRoots: config.captureRoots,
+    });
     // 0.7.52: the retention the daemon enforces. A configured value other than
     // the schema default, or a pinned one, wins; a studio0_scale host otherwise
     // takes the budget-derived default. Re-resolved hourly so a host whose
@@ -3819,6 +3823,7 @@ async function main() {
     };
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
+      claudePlanLimitStatus: () => claudePlanLimits.status(),
       otlpSpool,
       syncStatus: () => ({ ...syncBackoff.status(syncInFlight),
         sessionSync: sessionSyncClockSkewStatus(sessionSyncState) }),
@@ -4440,6 +4445,7 @@ async function main() {
     // files are available only through the explicit scan commands below.
     maintenanceCadence.start();
     enrichmentCadence.start();
+    claudePlanLimits.start();
     if (config.uploadUrl) {
       syncBackoff.arm();
       timers.push(setInterval(() => { syncBackoff.tick(); void runSync(); }, config.syncIntervalSeconds * 1000));
@@ -4551,6 +4557,7 @@ async function main() {
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
+      claudePlanLimits.stop();
       void walCheckpoint.stop();
       budgetSampler?.stop();
       maintenanceCadence?.stop();
@@ -4603,6 +4610,7 @@ async function main() {
         return;
       }
       shuttingDown = true;
+      claudePlanLimits.stop();
       flushRejectionSummaries();
       void walCheckpoint.stop();
       budgetSampler?.stop();

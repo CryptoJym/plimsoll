@@ -1,8 +1,10 @@
 /**
  * Provider capacity adapters (issue #169, child of #167/#168).
  *
- * Collects PROVIDER-REPORTED capacity locally without copying credentials,
- * making ad-hoc network calls, or starting inference. Two P0 adapters:
+ * Collects PROVIDER-REPORTED capacity without persisting credentials or
+ * starting inference. The daemon's Claude OAuth usage reader lives in
+ * `claude-plan-limits.ts`; its bounded snapshot parser and receipt contract
+ * are shared here with the two interactive/manual adapters:
  *
  * - `claude_status_line`: a status-line PROXY. Claude Code feeds session JSON
  *   to whatever `statusLine.command` is configured in ~/.claude/settings.json.
@@ -30,8 +32,8 @@
  * drop everything else on the floor, so hostile payloads cannot echo into
  * receipts even by accident.
  *
- * Cadence: manual refresh only. Nothing here schedules, retries on its own,
- * or runs in the background.
+ * The status-line and app-server adapters remain manual. The daemon schedules
+ * the Claude OAuth usage reader independently of interactive sessions.
  *
  * The standalone Claude status-line setup command accepts explicit config
  * directories; the Codex app-server probe remains default-profile only.
@@ -80,11 +82,12 @@ const SECRET_SHAPED_PREFIX_PATTERN =
 
 export const ADAPTER_DEFAULT_PROFILE_ID = "default" as const;
 
-export type CapacityAdapterId = "claude_status_line" | "codex_app_server";
+export type CapacityAdapterId = "claude_status_line" | "codex_app_server" | "claude_oauth_usage";
 
 export const CAPACITY_ADAPTER_IDS: readonly CapacityAdapterId[] = [
   "claude_status_line",
   "codex_app_server",
+  "claude_oauth_usage",
 ];
 
 /** Closed set of symbolic adapter error codes. No free text ever. */
@@ -102,6 +105,9 @@ export const CAPACITY_ADAPTER_ERRORS = [
   "spawn_failed",
   "timeout",
   "io_error",
+  "no_account",
+  "no_credential",
+  "account_mismatch",
 ] as const;
 export type CapacityAdapterError = (typeof CAPACITY_ADAPTER_ERRORS)[number];
 
@@ -247,7 +253,7 @@ function isUtilizationPercent(value: unknown): value is number {
   );
 }
 
-function buildReceipt(input: {
+export function buildCapacityAdapterReceipt(input: {
   adapter: CapacityAdapterId;
   profileId: string;
   ok: boolean;
@@ -287,6 +293,43 @@ function buildReceipt(input: {
     },
     resourceCost: input.resourceCost,
   };
+}
+
+const buildReceipt = buildCapacityAdapterReceipt;
+
+export const CLAUDE_USAGE_MAX_BYTES = 256 * 1024;
+export const CLAUDE_USAGE_WINDOW_LABELS = ["five_hour", "seven_day", "seven_day_oauth_apps",
+  "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included"] as const;
+
+export type ClaudeUsageParseOutcome =
+  | { kind: "ok"; windows: CapacityWindowFact[] }
+  | { kind: "parse_failed" };
+
+/** OAuth /api/oauth/usage uses utilization, not status-line used_percentage.
+ * Only known buckets with a percentage and an ISO reset are publishable.
+ * Provider-reported overage (>100%) is retained without inventing capacity.
+ */
+export function parseClaudeUsageResponse(raw: Buffer | string): ClaudeUsageParseOutcome {
+  if (Buffer.byteLength(raw) > CLAUDE_USAGE_MAX_BYTES) return { kind: "parse_failed" };
+  let document: Record<string, unknown>;
+  try {
+    const value: unknown = JSON.parse(raw.toString());
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "parse_failed" };
+    document = value as Record<string, unknown>;
+  } catch { return { kind: "parse_failed" }; }
+  if (document.error !== undefined) return { kind: "parse_failed" };
+  const windows: CapacityWindowFact[] = [];
+  for (const label of CLAUDE_USAGE_WINDOW_LABELS) {
+    const slot = document[label];
+    if (!slot || typeof slot !== "object" || Array.isArray(slot)) continue;
+    const value = slot as Record<string, unknown>;
+    const resetsAt = requireIsoTimestamp(value.resets_at);
+    if (typeof value.utilization !== "number" || !Number.isFinite(value.utilization) ||
+        value.utilization < 0 || !resetsAt) continue;
+    windows.push({ window: label, usedPercent: value.utilization,
+      windowMinutes: label === "five_hour" ? 300 : 10080, resetsAt });
+  }
+  return { kind: "ok", windows };
 }
 
 function nowOrNow(now: Date | undefined): Date {
@@ -537,7 +580,7 @@ export function loadLatestAdapterReceipt(input: {
   return receipt;
 }
 
-function persistLatestAdapterReceipt(receipt: ProviderCapacityAdapterReceipt, home: string): void {
+export function persistLatestAdapterReceipt(receipt: ProviderCapacityAdapterReceipt, home: string): void {
   const { dir, receiptFile } = adapterStatePaths(home, receipt.adapter, receipt.profileId);
   ensurePrivateDir(dir);
   atomicWritePrivate(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`);
@@ -579,7 +622,7 @@ export function computeAdapterBackoff(input: {
   };
 }
 
-function loadBackoffState(file: string, now: Date): AdapterBackoffState | null {
+export function loadBackoffState(file: string, now: Date): AdapterBackoffState | null {
   const stored = readJsonIfExists(file);
   if (stored === null || typeof stored !== "object") return null;
   const candidate = stored as Partial<AdapterBackoffState>;
@@ -611,7 +654,7 @@ function loadBackoffState(file: string, now: Date): AdapterBackoffState | null {
   return state;
 }
 
-function persistBackoffState(state: AdapterBackoffState, file: string, dir: string): void {
+export function persistBackoffState(state: AdapterBackoffState, file: string, dir: string): void {
   ensurePrivateDir(dir);
   atomicWritePrivate(file, `${JSON.stringify(state, null, 2)}\n`);
 }
