@@ -410,6 +410,8 @@ export function runDeadlineMaintenanceStages(
     retentionDays: number;
     parityReady: boolean;
     prune?: (maxRows: number) => { events: number; metricSamples: number };
+    /** The daemon cadence owns retention and its WAL-pressure gate. */
+    retentionScheduledExternally?: boolean;
     now?: () => number;
     onDurableCommit?: (progress: {
       stage: "wal_checkpoint" | "retention" | "fill_pending_event_links";
@@ -431,7 +433,9 @@ export function runDeadlineMaintenanceStages(
   const checkpointBudget = Math.min(1_000, remaining());
   const checkpoint = runWalCheckpointStage(database, { remainingMs: checkpointBudget, batchSize: 1, now });
   if (!emit("wal_checkpoint", checkpoint)) return { remainingMs: remaining(), stages };
-  const retention = runRetentionDeletionStage(database, {
+  const retention = options.retentionScheduledExternally ? {
+    rows: 0, ms: 0, remaining: remaining(), batchSize: 0,
+  } : runRetentionDeletionStage(database, {
     remainingMs: Math.min(3_000, remaining()), batchSize: 64,
     retentionDays: options.retentionDays, parityReady: options.parityReady, now, prune: options.prune,
   });

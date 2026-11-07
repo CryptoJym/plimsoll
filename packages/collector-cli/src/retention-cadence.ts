@@ -1,11 +1,16 @@
 import type { LocalEventBuffer } from "./buffer";
 import type { AutomaticMaintenanceCadenceTimer } from "./maintenance";
+import { pruneDisposableTelemetry, TELEMETRY_SWEEP_INTERVAL_MS, type DisposableTelemetryReceipt } from "./disposable-telemetry";
+import { isSqliteContentionError } from "./sqlite-contention";
 
 type Receipt = ReturnType<LocalEventBuffer["prune"]> & {
   /** The writer was held by another connection; nothing was read or written. */
   busy?: boolean;
   elapsedMs?: number;
   secondary?: unknown;
+  telemetry?: DisposableTelemetryReceipt;
+  stage?: "telemetry" | "raw" | "secondary";
+  pendingStages?: string[];
 };
 
 /** What one pass may do. The prune bounds itself by rows and by writer time. */
@@ -17,6 +22,8 @@ export const RETENTION_PASS_WRITER_MS = 250;
 /** The wait before the next pass while no large backlog waits, after a held
  * writer without one, and after an error. */
 export const RETENTION_FOLLOWUP_MS = 5_000;
+/** Sustained contention/failure yields up to a minute between attempts. */
+export const RETENTION_RETRY_MAX_MS = 60_000;
 /** The least wait before the next pass while a large backlog clears. The
  * wait is the last pass's own duration, never less than this and never more
  * than the follow-up, so the prune takes at most half of its thread and
@@ -26,6 +33,46 @@ export const RETENTION_FAST_FOLLOWUP_MS = 200;
  * and the follow-up shortens only while at least this many wait. The probe
  * that answers it stops counting at this number. */
 export const RETENTION_LARGE_BACKLOG_ROWS = 50_000;
+
+/** One writer turn, one stage. Completed stages rest six hours; unfinished
+ * stages rotate, so a raw backlog cannot starve disposable/secondary cleanup.
+ * The daemon owns this runner and applies the WAL-pressure gate to all stages. */
+export class LocalStorageRetention {
+  private readonly stages = ["telemetry", "raw", "secondary"] as const;
+  private readonly dueAt = { telemetry: 0, raw: 0, secondary: 0 };
+  private nextStage = 0;
+  constructor(private readonly buffer: LocalEventBuffer, private readonly days: () => number,
+    private readonly now = () => Date.now()) {}
+
+  run(request: RetentionPassRequest): Receipt {
+    const at = this.now();
+    const empty: Receipt = { cutoff: new Date(at - this.days() * 86_400_000).toISOString(),
+      events: 0, metricSamples: 0, eventRowsVisited: 0, metricRowsVisited: 0,
+      migrationProtectedRows: 0, hasMore: false, madeProgress: false, busy: false, elapsedMs: 0 };
+    for (let offset = 0; offset < this.stages.length; offset++) {
+      const index = (this.nextStage + offset) % this.stages.length;
+      const stage = this.stages[index];
+      if (this.dueAt[stage] > at) continue;
+      const options = { ...request, busyTimeoutMs: 25, now: new Date(at) };
+      const pass = stage === "raw" ? this.buffer.prune(this.days(), options)
+        : stage === "secondary" ? this.buffer.pruneSecondary({ retentionDays: this.days() }, options)
+        : pruneDisposableTelemetry(this.buffer.database, options);
+      if (!pass.busy) {
+        this.dueAt[stage] = pass.hasMore ? 0 : at + TELEMETRY_SWEEP_INTERVAL_MS;
+        this.nextStage = (index + 1) % this.stages.length;
+      }
+      const pendingStages = this.stages.filter(name => this.dueAt[name] <= at);
+      return { ...empty, ...(stage === "raw" ? pass as ReturnType<LocalEventBuffer["prune"]> : {}),
+        stage, pendingStages,
+        ...(stage === "telemetry" ? { telemetry: pass as DisposableTelemetryReceipt } : {}),
+        ...(stage === "secondary" ? { secondary: pass } : {}),
+        busy: pass.busy, elapsedMs: pass.elapsedMs, hasMore: pendingStages.length > 0,
+        // Finishing an empty stage advances the cycle to the next due stage.
+        madeProgress: pass.madeProgress || (!pass.busy && !pass.hasMore && pendingStages.length > 0) };
+    }
+    return empty;
+  }
+}
 
 /**
  * One bounded pass per turn; schedule the next only after the pass settles.
@@ -46,8 +93,8 @@ export const RETENTION_LARGE_BACKLOG_ROWS = 50_000;
  * ledger drained at under a hundred rows a second: most passes were cut
  * short by cold reads, and each cut was followed by a 5 s wait.) A held
  * writer under a large backlog is retried after `fastFollowupMs`, doubling
- * on each consecutive hold up to `followupMs`, so a writer held for long is
- * not hammered. Without a large backlog the follow-up is `followupMs`; an
+ * on each consecutive hold up to 60 seconds, so a writer held for long is
+ * not hammered. Without a large backlog retries start at `followupMs`; an
  * empty backlog rests `intervalMs`.
  */
 export class AutomaticRetentionCadence {
@@ -58,9 +105,11 @@ export class AutomaticRetentionCadence {
   private lastPass: Receipt | null = null;
   private rows: number;
   private busyStreak = 0;
+  private failureStreak = 0;
   private counters = { passes: 0, deferred: 0, busyDeferrals: 0, failures: 0,
     eventRowsVisited: 0, metricRowsVisited: 0, eventsExpired: 0, metricsExpired: 0,
-    migrationProtectedRows: 0, grownPasses: 0, shrunkPasses: 0 };
+    migrationProtectedRows: 0, grownPasses: 0, shrunkPasses: 0,
+    telemetrySamplesExpired: 0, telemetryDaysExpired: 0, secondaryRowsExpired: 0 };
 
   constructor(private readonly prune: (request: RetentionPassRequest) => Receipt, private readonly options: {
     canRun?: () => boolean;
@@ -85,7 +134,7 @@ export class AutomaticRetentionCadence {
   }
   status() {
     return { accepting: this.accepting, inFlight: this.inFlight, nextRetryAt: this.nextRetryAt,
-      lastPass: this.lastPass, passRows: this.rows, busyStreak: this.busyStreak,
+      lastPass: this.lastPass, passRows: this.rows, busyStreak: this.busyStreak, failureStreak: this.failureStreak,
       passBounds: { base: this.baseRows(), max: this.maxRows(), maxWriterMs: this.maxWriterMs() },
       followup: { ms: this.followupMs(), fastMs: this.fastFollowupMs() },
       counters: { ...this.counters } };
@@ -128,26 +177,31 @@ export class AutomaticRetentionCadence {
         // known large backlog retry soon, doubling on each consecutive hold.
         this.counters.busyDeferrals += 1;
         this.busyStreak += 1;
-        delay = this.options.largeBacklog?.() === true
-          ? Math.min(followup, fastFollowup * 2 ** Math.min(this.busyStreak - 1, 30))
-          : followup;
+        delay = Math.min(RETENTION_RETRY_MAX_MS,
+          (this.options.largeBacklog?.() === true ? fastFollowup : followup) * 2 ** Math.min(this.busyStreak - 1, 30));
         return;
       }
       this.busyStreak = 0;
+      this.failureStreak = 0;
       this.counters.passes += 1;
       this.counters.eventRowsVisited += receipt.eventRowsVisited;
       this.counters.metricRowsVisited += receipt.metricRowsVisited;
       this.counters.eventsExpired += receipt.events;
       this.counters.metricsExpired += receipt.metricSamples;
       this.counters.migrationProtectedRows += receipt.migrationProtectedRows;
+      this.counters.telemetrySamplesExpired += receipt.telemetry?.samplesExpired ?? 0;
+      this.counters.telemetryDaysExpired += receipt.telemetry?.daysExpired ?? 0;
+      const secondary = receipt.secondary as { uploadReceiptsExpired?: number; summaryRowsExpired?: number } | undefined;
+      this.counters.secondaryRowsExpired += (secondary?.uploadReceiptsExpired ?? 0) + (secondary?.summaryRowsExpired ?? 0);
       const continuing = receipt.hasMore && receipt.madeProgress;
       if (continuing) delay = followup;
       const elapsed = receipt.elapsedMs ?? 0;
       const backlog = continuing && (this.options.largeBacklog?.() ?? true);
-      if (elapsed > maxWriterMs && this.rows > this.baseRows()) {
+      const adaptRows = receipt.stage === undefined || receipt.stage === "raw";
+      if (adaptRows && elapsed > maxWriterMs && this.rows > this.baseRows()) {
         this.rows = Math.max(this.baseRows(), Math.floor(this.rows / 2));
         this.counters.shrunkPasses += 1;
-      } else if (backlog && elapsed * 2 <= maxWriterMs && this.rows < this.maxRows()) {
+      } else if (adaptRows && backlog && elapsed * 2 <= maxWriterMs && this.rows < this.maxRows()) {
         this.rows = Math.min(this.maxRows(), this.rows * 2);
         this.counters.grownPasses += 1;
       }
@@ -158,7 +212,12 @@ export class AutomaticRetentionCadence {
       this.options.onPass?.(receipt);
     } catch (error) {
       this.counters.failures += 1;
-      delay = followup;
+      this.failureStreak += 1;
+      if (isSqliteContentionError(error)) {
+        this.busyStreak += 1;
+        this.counters.busyDeferrals += 1;
+      }
+      delay = Math.min(RETENTION_RETRY_MAX_MS, followup * 2 ** Math.min(this.failureStreak - 1, 30));
       this.options.onError?.(error);
     } finally {
       this.inFlight = false;

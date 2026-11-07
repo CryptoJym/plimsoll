@@ -202,6 +202,7 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
           pnpm proof:retention-policy
+          pnpm proof:storage-retention
           pnpm proof:ledger-compact
 
       - name: Prove event allocation conservation

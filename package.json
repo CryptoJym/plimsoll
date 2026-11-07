@@ -98,6 +98,7 @@
     "proof:retention-worker-fence": "tsx scripts/retention-worker-fence-proof.ts",
     "proof:retention-worker-close": "tsx scripts/retention-worker-close-proof.ts",
     "proof:retention-policy": "tsx scripts/retention-policy-proof.ts",
+    "proof:storage-retention": "tsx scripts/run-proof.ts scripts/storage-retention-proof.ts",
     "proof:ledger-compact": "tsx scripts/run-proof.ts scripts/ledger-compact-proof.ts",
     "proof:receipt-lineage-scale": "tsx scripts/receipt-lineage-scale-proof.ts",
     "proof:maintenance-worker-ready": "tsx scripts/maintenance-worker-ready-proof.ts",

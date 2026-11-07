@@ -517,7 +517,9 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           teardownMarginMs: 0,
           retentionDays: worker.retentionDays ?? 90,
           parityReady: true,
-          prune: (maxRows) => worker.buffer.prune(worker.retentionDays ?? 90, { maxRows }),
+          // One scheduler owns pruning. The child must not bypass the
+          // daemon's WAL-pressure deferral or contend with its writer turn.
+          retentionScheduledExternally: true,
           onDurableCommit: reportJobProgress,
         });
       } catch (error) {

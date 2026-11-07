@@ -8,9 +8,10 @@ deletes the old ledger.
 
 ## Before you start
 
-- Let retention catch up first. In `/status`, `retention.lastPass.hasMore` is
+- Retention can catch up first. In `/status`, `retention.lastPass.hasMore` is
   `false`, and in `plimsoll status`, `secondaryRetention.lastHasMore` is
-  `false`. Compacting earlier gives back only the space already freed.
+  `false`. Compacting earlier gives back the space already freed; a pending
+  upload or a continuous raw backlog does not prevent offline compaction.
 - Pick a destination directory on a volume with free space of at least the
   live bytes plus 5% (`--plan` prints `requiredFreeBytes`). The directory must
   be private: owned by you, mode 0700, reached through no symlink and no
@@ -28,10 +29,16 @@ deletes the old ledger.
    (the expected size of the copy) and `destinationFreeBytes`.
 3. Compact and verify: the same command without `--plan`. The default
    verification compares every table's row count and the number of schema
-   objects between the ledger and the copy. `--verify quick-check` runs
-   SQLite's `quick_check` on the copy instead; `--verify none` only copies.
+   objects between the ledger and the copy. Every verification mode also
+   checks the `buffered_events` rowid/id and `upload_receipts` rowid/delivery-id
+   mappings: raw lineage and receipt cursors must keep their identities.
+   A mismatch refuses the copy for use. `--verify quick-check` runs
+   SQLite's `quick_check` on the copy instead; `--verify none` skips counts
+   and integrity checks but still checks lineage.
    The receipt is printed and written next to the copy as
-   `<copy>.compaction-receipt.json` (mode 0600). A refused run writes no copy.
+   `<copy>.compaction-receipt.json` (mode 0600). Preflight refusals write no
+   copy; a copy/verification failure can leave a partial or rejected copy.
+   Use only a `compacted` receipt with both verification and lineage passed.
    If the process was killed mid-write, remove `<copy>` and `<copy>-journal`
    before trying again.
 4. Swap, following the receipt's `swap` lines exactly: move the old ledger and
@@ -52,12 +59,63 @@ compacted ledger to `<ledger>.compacted-rejected`, move
 `<ledger>.before-compaction` and its sidecars back to the ledger path, start
 the collector.
 
+The receipt moves each main file with its own WAL/SHM family, including the
+rejected compacted ledger during undo. It refuses an existing destination or
+backup instead of overwriting it. Keep all three files together; never pair
+the old main file with the compacted copy's WAL.
+
 ## What the copy carries
 
 `VACUUM INTO` copies every row of every table, so the current week's rows,
 upload holds, migration protection and all receipts travel with it; the week
 gate needs no exception. The collector sets the copy's journal mode back to
 WAL on first open.
+
+The source connections are read-only, including when committed rows remain
+in its WAL. Compaction reads those rows into the copy without checkpointing
+or consuming the source WAL. The verified copy is fsynced before success is
+reported. This is an offline copy and explicit swap, not an online `VACUUM`
+or an automatic rewrite of a large ledger; an existing freelist needs no
+extra deletion before it can be reclaimed. The opener barrier covers
+Plimsoll connections; keep any external SQLite writers stopped too.
+
+## Bounded local retention
+
+The daemon rotates one stage per turn: disposable footprint measurements,
+raw retention, then secondary cleanup. A raw `hasMore=true` never blocks the
+other stages. Each turn starts at 128 rows and may grow to 4,096, with a
+250 ms cooperative writer budget and a 25 ms SQLite busy wait. Statements
+and the current row may overrun that budget; it is not a hard I/O deadline.
+Completed stages rest six hours. Cursors/aggregate receipts survive restart;
+the stage rotation itself restarts with the daemon.
+
+Disposable retention is an explicit two-table allowlist, using the existing
+footprint contract, even when sampling has stopped:
+
+| Table | Policy |
+|---|---|
+| `budget_samples` | At most the newest 1,440 IDs; expire samples strictly older than 24 hours. |
+| `budget_daily` | Current UTC day and seven prior days; expire strictly earlier days. |
+
+Catch-up deletes at most the turn's row budget; one aggregate record in
+`maintenance_state` records totals, completion time and whether more remains.
+No per-row retention log is added. The existing sampling path enforces the
+same policy on insertion. No new window applies to `metric_samples`, billable
+usage, raw lineage, raw/upload/secondary receipts, pending delivery, audit,
+privacy, or client/account evidence. Existing guarded raw and secondary
+retention semantics remain in force.
+
+All stages defer while the checkpoint worker reports a reader pinning a WAL
+of at least 1 GiB. The maintenance child leaves retention to this cadence,
+so it cannot bypass that guard. Busy retries start at 200 ms under a known
+large raw backlog, otherwise five seconds, then double up to 60 seconds;
+other repeated failures start at five seconds and double to the same cap.
+Each attempt yields to the timer; no synchronous retry loop runs.
+`maintenance.retentionCadence` in `/status` exposes the
+last stage/receipt, due stages, counts, busy/failure streaks and `nextRetryAt`.
+Raw/secondary cursors and the telemetry aggregate remain in the ledger.
+Retention deferral only bounds maintenance writes: it cannot bound WAL
+growth from ongoing intake while an external reader pins it.
 
 ## Relation to the fresh-ledger cutover
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.58 — 2026-11-07
+
+- One retention scheduler (plimsoll N50, N87). The daemon's cadence is the
+  only pruner: the maintenance child no longer prunes outside the daemon's
+  WAL-pressure gate. Raw, secondary and disposable-telemetry stages take one
+  bounded writer turn each and rotate, so an unfinished raw sweep no longer
+  postpones the other tables; finished stages rest six hours. Busy and failed
+  passes back off from 200 ms (large backlog) or 5 s, doubling to a 60 s cap,
+  instead of retrying every follow-up. `/status` `maintenance.retentionCadence`
+  shows the stage, pending stages, streaks and counters.
+- Disposable footprint telemetry keeps its existing limits as an explicit
+  allowlist: `budget_samples` the newest 1,440 rows and 24 hours,
+  `budget_daily` the current UTC day and seven before it. No new window or
+  cap applies to usage, metric samples, lineage, receipts, pending delivery,
+  audit, privacy or account evidence.
+- `ledger compact` opens the source read-only, always verifies
+  `buffered_events` and `upload_receipts` rowid identities (also under
+  `--verify none`), refuses unknown destination free space, fsyncs the copy,
+  never overwrites a receipt, and moves each main/WAL/SHM family together in
+  its swap and undo steps.
+
 ## 0.7.57 — 2026-11-06
 
 - The daemon reads Claude plan limits for enrolled seats without interactive

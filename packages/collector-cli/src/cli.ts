@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { openLedgerDatabase } from "./ledger-connection";
-import { AutomaticRetentionCadence, RETENTION_LARGE_BACKLOG_ROWS, RETENTION_WAL_PRESSURE_BYTES,
+import { AutomaticRetentionCadence, LocalStorageRetention, RETENTION_LARGE_BACKLOG_ROWS, RETENTION_WAL_PRESSURE_BYTES,
   walPressureDefersRetention } from "./retention-cadence";
 import { claudeStatusLineCliMain } from "./claude-status-line-command";
 import { BudgetSampler, budgetCsv, budgetDailyRows, budgetExport, budgetStatus } from "./budget-sampler";
@@ -4293,32 +4293,14 @@ async function main() {
     // writer defers the pass), never to another scheduler's in-flight flag,
     // which starved it on a busy host (incident of 2026-11-01: 34 passes of
     // 128 rows, then none). Each pass is bounded by rows and by a 250 ms
-    // writer budget; the pass size grows while a large backlog clears. Once
-    // the raw backlog has no more work, the same pass sweeps the secondary
-    // tables: acknowledged upload receipts past 30 days whose raw row is
-    // gone, and orphan summary rows past retention.
+    // writer budget; the pass size grows while a large backlog clears.
+    // Rotate raw, secondary and disposable telemetry turns independently:
+    // an unfinished raw sweep must not postpone the other tables forever.
     let largeBacklogCache: { at: number; value: boolean } | null = null;
     let walPressureDeferring = false;
+    const storageRetention = new LocalStorageRetention(buffer, () => retentionPolicy().days);
     retentionCadence = new AutomaticRetentionCadence(
-      (request) => {
-        const days = retentionPolicy().days;
-        const raw = buffer.prune(days, {
-          maxRows: request.maxRows, maxWriterMs: request.maxWriterMs, busyTimeoutMs: 25,
-        });
-        if (raw.busy || raw.hasMore) return raw;
-        const secondary = buffer.pruneSecondary({ retentionDays: days }, {
-          maxRows: request.maxRows, maxWriterMs: Math.max(25, request.maxWriterMs - raw.elapsedMs),
-          busyTimeoutMs: 25,
-        });
-        if (secondary.busy && !raw.madeProgress) return { ...raw, busy: true, secondary };
-        return {
-          ...raw,
-          hasMore: secondary.busy || secondary.hasMore,
-          madeProgress: raw.madeProgress || secondary.madeProgress,
-          elapsedMs: raw.elapsedMs + secondary.elapsedMs,
-          secondary,
-        };
-      },
+      request => storageRetention.run(request),
       {
         // 0.7.53: a reader that pins the WAL stops the checkpoint worker from
         // copying anything back, and every pass then grows the file (incident
@@ -4349,7 +4331,8 @@ async function main() {
           const secondary = receipt.secondary as
             { uploadReceiptsExpired?: number; summaryRowsExpired?: number } | undefined;
           if (receipt.events || receipt.metricSamples ||
-              secondary?.uploadReceiptsExpired || secondary?.summaryRowsExpired) {
+              secondary?.uploadReceiptsExpired || secondary?.summaryRowsExpired ||
+              receipt.telemetry?.samplesExpired || receipt.telemetry?.daysExpired) {
             console.log(JSON.stringify({ status: "pruned", ...receipt }));
           }
         },

@@ -50,6 +50,8 @@ export type LedgerCompactionReceipt = Omit<LedgerCompactionPlan, "status"> & {
     mismatches: Array<{ table: string; source: number; target: number }>;
     detail: string | null;
   };
+  /** Row counts alone cannot prove raw_rowid links or receipt cursors survived. */
+  lineage: { passed: boolean | null; tables: string[]; detail: string | null };
   receiptPath: string | null;
   swap: string[];
   undo: string[];
@@ -73,7 +75,7 @@ function assertDestination(ledgerPath: string, intoPath: string) {
   if (!path.isAbsolute(ledgerPath) || !path.isAbsolute(intoPath)) throw new Error("paths_must_be_absolute");
   const ledger = path.resolve(ledgerPath), into = path.resolve(intoPath);
   if (ledger === into || path.dirname(into) === path.dirname(ledger)) throw new Error("destination_must_leave_ledger_directory");
-  for (const sidecar of [into, `${into}-wal`, `${into}-shm`, `${into}-journal`]) {
+  for (const sidecar of [into, `${into}-wal`, `${into}-shm`, `${into}-journal`, `${into}.compaction-receipt.json`]) {
     if (fs.existsSync(sidecar)) throw new Error(`destination_exists:${path.basename(sidecar)}`);
   }
   const old = fs.lstatSync(ledger);
@@ -83,19 +85,30 @@ function assertDestination(ledgerPath: string, intoPath: string) {
   return { old, directory };
 }
 
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+/** Move a stopped ledger together with its sidecars, refusing to overwrite
+ * any existing backup. A rejected copy's WAL must never accompany the undo. */
+function moveLedgerFamily(from: string, to: string) {
+  const absent = ["", "-wal", "-shm"].map(suffix =>
+    `[ ! -e ${shellQuote(to + suffix)} ] && [ ! -L ${shellQuote(to + suffix)} ]`).join(" && ");
+  return `( ${absent} && mv ${shellQuote(from)} ${shellQuote(to)} && ` +
+    `for s in -wal -shm; do if [ -e ${shellQuote(from)}"$s" ] || [ -L ${shellQuote(from)}"$s" ]; then ` +
+    `mv ${shellQuote(from)}"$s" ${shellQuote(to)}"$s" || exit 1; fi; done )`;
+}
+
 function swapSteps(ledgerPath: string, intoPath: string) {
   const aside = `${ledgerPath}.before-compaction`;
   return {
     swap: [
-      "With the collector stopped (plimsoll unload-launch-agent) and this receipt's verification passed:",
-      `mv "${ledgerPath}" "${aside}"; for s in -wal -shm; do [ -e "${ledgerPath}$s" ] && mv "${ledgerPath}$s" "${aside}$s"; done`,
-      `cp "${intoPath}" "${ledgerPath}" && chmod 600 "${ledgerPath}"`,
+      "With the collector stopped (plimsoll unload-launch-agent) and this receipt's verification and lineage passed:",
+      moveLedgerFamily(ledgerPath, aside),
+      `[ ! -e ${shellQuote(ledgerPath)} ] && [ ! -L ${shellQuote(ledgerPath)} ] && cp ${shellQuote(intoPath)} ${shellQuote(ledgerPath)} && chmod 600 ${shellQuote(ledgerPath)}`,
       "plimsoll load-launch-agent, then check /status (retention, delivery and the weekly report fields) before deleting anything.",
       `Keep "${aside}" until the next weekly report is acknowledged; the opener barrier sidecar (${path.basename(ledgerPath)}.connections.lock.sqlite) is never moved or deleted.`,
     ],
     undo: [
       "plimsoll unload-launch-agent",
-      `mv "${ledgerPath}" "${ledgerPath}.compacted-rejected"; mv "${aside}" "${ledgerPath}"; for s in -wal -shm; do [ -e "${aside}$s" ] && mv "${aside}$s" "${ledgerPath}$s"; done`,
+      `${moveLedgerFamily(ledgerPath, `${ledgerPath}.compacted-rejected`)} && ${moveLedgerFamily(aside, ledgerPath)}`,
       "plimsoll load-launch-agent",
     ],
   };
@@ -114,7 +127,7 @@ export function planLedgerCompaction(input: { ledgerPath: string; intoPath: stri
     const { old, directory } = assertDestination(input.ledgerPath, input.intoPath);
     base.sameDevice = old.dev === directory.dev;
     barrier = acquireLedgerConnectionLock(input.ledgerPath, "exclusive");
-    const db = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
+    const db = new Database(input.ledgerPath, { fileMustExist: true, readonly: true, timeout: 0 });
     try {
       base.pageSize = Number(db.pragma("page_size", { simple: true }));
       base.pageCount = Number(db.pragma("page_count", { simple: true }));
@@ -123,6 +136,9 @@ export function planLedgerCompaction(input: { ledgerPath: string; intoPath: stri
     base.liveBytesEstimate = Math.max(0, base.pageCount - base.freelistPages) * base.pageSize;
     base.destinationFreeBytes = freeBytes(path.dirname(input.intoPath));
     base.requiredFreeBytes = Math.ceil(base.liveBytesEstimate * FREE_SPACE_MARGIN) + FREE_SPACE_FLOOR_BYTES;
+    if (base.destinationFreeBytes === null) {
+      return { ...base, status: "refused", reason: "destination_free_space_unavailable" };
+    }
     if (base.destinationFreeBytes !== null && base.destinationFreeBytes < base.requiredFreeBytes) {
       return { ...base, status: "refused", reason: "destination_free_space_insufficient" };
     }
@@ -153,6 +169,7 @@ export function compactLedger(input: {
   const receipt: LedgerCompactionReceipt = {
     ...plan, status: "refused", compactedBytes: null, reclaimableBytes: null, journalMode: null,
     elapsedMs: 0, verification: { mode: verify, passed: null, tables: null, mismatches: [], detail: null },
+    lineage: { passed: null, tables: [], detail: null },
     receiptPath: null, swap, undo,
   };
   if (plan.status !== "ready") return { ...receipt, elapsedMs: Math.round(performance.now() - started) };
@@ -160,7 +177,9 @@ export function compactLedger(input: {
   try {
     barrier = acquireLedgerConnectionLock(input.ledgerPath, "exclusive");
     assertDestination(input.ledgerPath, input.intoPath);
-    const source = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
+    // A writable last connection may checkpoint on close, changing the source
+    // and consuming its WAL. Both the plan and copy use a read-only source.
+    const source = new Database(input.ledgerPath, { fileMustExist: true, readonly: true, timeout: 0 });
     try {
       input.onProgress?.("vacuum_into");
       source.prepare("vacuum into ?").run(input.intoPath);
@@ -197,12 +216,33 @@ export function compactLedger(input: {
           receipt.verification = { mode: verify, passed: null, tables: null, mismatches: [], detail: "not verified" };
         }
       } finally { target.close(); }
+      // Always check identity, including --verify none: pending delivery,
+      // summary/finance links and the secondary cursor address these rowids.
+      source.prepare("attach database ? as compacted").run(input.intoPath);
+      try {
+        const tables: string[] = [];
+        for (const [table, key] of [["buffered_events", "id"], ["upload_receipts", "delivery_id"]] as const) {
+          if (!source.prepare("select 1 from main.sqlite_master where type='table' and name=?").get(table)) continue;
+          tables.push(table);
+          const mismatch = source.prepare(`select 1 from main.${table} s
+            left join compacted.${table} t on t.rowid=s.rowid
+            where t.rowid is null or t.${key} is not s.${key} limit 1`).get();
+          if (mismatch) {
+            receipt.lineage = { passed: false, tables, detail: `rowid_identity_mismatch:${table}` };
+            throw new Error(`compaction_lineage_mismatch:${table}`);
+          }
+        }
+        receipt.lineage = { passed: true, tables, detail: "rowid identities preserved" };
+      } finally { source.exec("detach database compacted"); }
+      if (receipt.verification.passed === false) throw new Error("compaction_verification_failed");
+      const fd = fs.openSync(input.intoPath, "r");
+      try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     } finally { source.close(); }
     const receiptPath = `${input.intoPath}.compaction-receipt.json`;
     const compacted: LedgerCompactionReceipt = {
       ...receipt, status: "compacted", elapsedMs: Math.round(performance.now() - started), receiptPath,
     };
-    fs.writeFileSync(receiptPath, `${JSON.stringify(compacted, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(receiptPath, `${JSON.stringify(compacted, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     return compacted;
   } catch (error) {
     const code = (error as { code?: string }).code;

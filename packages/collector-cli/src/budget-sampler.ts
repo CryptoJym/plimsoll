@@ -4,10 +4,11 @@ import { promisify } from "node:util";
 import type Database from "better-sqlite3";
 
 import { DAEMON_SESSION_SYNC_STATE_KEY, readLedgerOffThread } from "./session-sync";
+import { BUDGET_RING_LIMIT, BUDGET_SAMPLE_MAX_AGE_MS, BUDGET_DAILY_PRIOR_DAYS } from "./disposable-telemetry";
+export { BUDGET_RING_LIMIT } from "./disposable-telemetry";
 
 const execFileAsync = promisify(execFile);
 export const BUDGET_SAMPLE_VERSION = 2;
-export const BUDGET_RING_LIMIT = 1_440;
 export const BUDGET_DBSTAT_MAX_BYTES = 2 * 1024 ** 3;
 const DEAD_AGE_MAX_ROWS = 1_000;
 const DAY_MS = 86_400_000;
@@ -223,9 +224,9 @@ export function recordBudgetSample(db: Database.Database, sample: BudgetSample):
       new Date(sample.atMs).toISOString().slice(0, 10), sample.attemptedRowsDelta,
     );
     db.prepare(`delete from budget_samples where id <= ? or at_ms < ?`)
-      .run(Number(inserted.lastInsertRowid) - BUDGET_RING_LIMIT, sample.atMs - DAY_MS);
+      .run(Number(inserted.lastInsertRowid) - BUDGET_RING_LIMIT, sample.atMs - BUDGET_SAMPLE_MAX_AGE_MS);
     db.prepare(`delete from budget_daily where day < ?`).run(
-      new Date(sample.atMs - 7 * DAY_MS).toISOString().slice(0, 10),
+      new Date(sample.atMs - BUDGET_DAILY_PRIOR_DAYS * DAY_MS).toISOString().slice(0, 10),
     );
   })();
 }

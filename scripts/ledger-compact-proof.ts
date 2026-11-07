@@ -2,6 +2,7 @@ import { createProofCompletion } from "./lib/proof-completion";
 const completion = createProofCompletion("ledger_compact", 12);
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -33,7 +34,14 @@ try {
   const ledgerDir = path.join(root, "home");
   fs.mkdirSync(ledgerDir, { mode: 0o700 });
   const ledger = path.join(ledgerDir, "work-ledger.sqlite");
-  const buffer = new LocalEventBuffer(ledger);
+  const buffer = new LocalEventBuffer(ledger, {
+    workspaceId: "compact-workspace", deviceId: "compact-device", delivery: { enabled: true },
+    enrollmentNow: () => new Date("2026-10-01T00:00:00.000Z"),
+  });
+  // Leave a hole before the first retained row: counts cannot detect renumbering.
+  buffer.database.exec(`insert into buffered_events
+    (rowid,id,source,event_type,data_mode,observed_at,payload_json,created_at)
+    values (100,'rowid-pad','codex','assistant_response','metadata','2000-01-01','{}','2000-01-01')`);
   for (let index = 0; index < 200; index += 1) {
     buffer.append(aiInteractionEventSchema.parse({
       id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
@@ -43,6 +51,10 @@ try {
     }));
   }
   const db = buffer.database;
+  db.prepare("delete from buffered_events where id='rowid-pad'").run();
+  const rawIdentities = db.prepare("select rowid,id from buffered_events order by rowid").all();
+  const pending = db.prepare("select delivery_id,raw_rowid,raw_id from upload_outbox order by delivery_id").all();
+  assert.equal(pending.length, 200);
   // Bloat the file with pages that are then freed: 256 MiB of zero blobs.
   db.exec("create table proof_pad (x blob)");
   const pad = db.prepare("insert into proof_pad values (zeroblob(1048576))");
@@ -111,6 +123,7 @@ try {
   assert.equal(receipt.status, "compacted", receipt.reason ?? "");
   assert.equal(receipt.verification.mode, "counts");
   assert.equal(receipt.verification.passed, true);
+  assert.deepEqual(receipt.lineage, { passed: true, tables: ["buffered_events", "upload_receipts"], detail: "rowid identities preserved" });
   assert.deepEqual(receipt.verification.mismatches, []);
   assert.ok((receipt.verification.tables ?? 0) >= 10, "tables compared");
   assert.ok((receipt.compactedBytes ?? Infinity) < bloatedBytes / 4, `compacted ${receipt.compactedBytes} of ${bloatedBytes}`);
@@ -133,6 +146,8 @@ try {
   try {
     assert.deepEqual(tableCounts(copy), sourceCounts);
     assert.equal((copy.prepare("select count(*) as n from buffered_events").get() as { n: number }).n, 200);
+    assert.deepEqual(copy.prepare("select rowid,id from buffered_events order by rowid").all(), rawIdentities);
+    assert.deepEqual(copy.prepare("select delivery_id,raw_rowid,raw_id from upload_outbox order by delivery_id").all(), pending);
   } finally { copy.close(); }
   completion.check("every_table_row_is_in_the_copy", true);
 
@@ -148,7 +163,17 @@ try {
   const none = compactLedger({ ledgerPath: ledger, intoPath: path.join(outDir, "none.sqlite"), verify: "none" });
   assert.equal(none.status, "compacted");
   assert.equal(none.verification.passed, null);
+  assert.equal(none.lineage.passed, true, "even --verify none must preserve lineage");
   completion.check("quick_check_and_none_verification_modes", true);
+  const rejected = path.join(outDir, "rejected.sqlite");
+  const bad = compactLedger({ ledgerPath: ledger, intoPath: rejected, verify: "none", onProgress: step => {
+    if (step !== "verify") return;
+    const tamper = new Database(rejected);
+    try { tamper.exec("update buffered_events set rowid=rowid+10000"); } finally { tamper.close(); }
+  } });
+  assert.equal(bad.status, "refused");
+  assert.equal(bad.lineage.passed, false);
+  assert.equal(bad.reason, "compaction_lineage_mismatch:buffered_events");
 
   // 11. The compacted copy opens as a collector ledger and answers status.
   const swapped = path.join(path.join(root, "swapped"), "work-ledger.sqlite");
@@ -162,6 +187,40 @@ try {
     assert.equal(reopened.retentionProgressStatus(90).policy.retentionDays, 90);
   } finally { reopened.close(); }
   completion.check("compacted_copy_opens_as_a_collector_ledger", true);
+
+  // Keep a committed row in the source WAL. The read-only compactor must
+  // include it without consuming or changing either source file.
+  const walWriter = new Database(ledger);
+  try {
+    walWriter.pragma("wal_autocheckpoint=0");
+    walWriter.exec("create table protected_wal_evidence(id integer primary key, value text); insert into protected_wal_evidence values(7,'fixture')");
+    const beforeMain = sha256(ledger), beforeWal = sha256(`${ledger}-wal`);
+    const walCopy = path.join(outDir, "wal-copy.sqlite");
+    const withWal = compactLedger({ ledgerPath: ledger, intoPath: walCopy });
+    assert.equal(withWal.status, "compacted", withWal.reason ?? "");
+    assert.equal(withWal.verification.passed, true);
+    assert.equal(sha256(ledger), beforeMain);
+    assert.equal(sha256(`${ledger}-wal`), beforeWal);
+    const readback = new Database(walCopy, { readonly: true });
+    try { assert.deepEqual(readback.prepare("select * from protected_wal_evidence").get(), { id: 7, value: "fixture" }); }
+    finally { readback.close(); }
+  } finally { walWriter.close(); }
+
+  // Exercise only the printed undo's file moves in this disposable directory.
+  // The old family has no SHM; restoring it must leave no rejected-copy SHM.
+  fs.writeFileSync(`${ledger}.before-compaction`, "old-main");
+  fs.writeFileSync(`${ledger}.before-compaction-wal`, "old-wal");
+  fs.writeFileSync(`${ledger}-wal`, "new-wal");
+  fs.writeFileSync(`${ledger}-shm`, "new-shm");
+  const undone = spawnSync("/bin/sh", ["-c", receipt.undo[1]], { encoding: "utf8" });
+  assert.equal(undone.status, 0, undone.stderr);
+  assert.equal(fs.readFileSync(ledger, "utf8"), "old-main");
+  assert.equal(fs.readFileSync(`${ledger}-wal`, "utf8"), "old-wal");
+  assert.equal(fs.existsSync(`${ledger}-shm`), false);
+  assert.equal(fs.readFileSync(`${ledger}.compacted-rejected-wal`, "utf8"), "new-wal");
+  assert.equal(fs.readFileSync(`${ledger}.compacted-rejected-shm`, "utf8"), "new-shm");
+  assert.notEqual(spawnSync("/bin/sh", ["-c", receipt.undo[1]]).status, 0, "existing backups must not be overwritten");
+  assert.equal(fs.readFileSync(ledger, "utf8"), "old-main");
 
   console.log(JSON.stringify({
     proof: "ledger_compact", bloatedBytes, compactedBytes: receipt.compactedBytes,

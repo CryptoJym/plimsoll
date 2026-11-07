@@ -638,9 +638,9 @@ async function main() {
       try {
         cadence.start();
         // Under a large backlog a held writer is retried soon; each
-        // consecutive hold doubles the wait, up to the follow-up.
+        // consecutive hold doubles the wait, up to the one-minute ceiling.
         const delays = Array.from({ length: 6 }, () => fire());
-        assert.deepEqual(delays, [200, 400, 800, 1_600, 3_200, 5_000]);
+        assert.deepEqual(delays, [200, 400, 800, 1_600, 3_200, 6_400]);
         assert.deepEqual({ busy: cadence.status().counters.busyDeferrals, passes: cadence.status().counters.passes,
           rows: cadence.status().passRows, streak: cadence.status().busyStreak }, { busy: 6, passes: 0, rows: 4, streak: 6 });
         hold = false;
