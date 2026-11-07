@@ -133,6 +133,7 @@
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
     "proof:projection-convergence": "tsx scripts/projection-convergence-proof.ts",
     "proof:projection-active-convergence": "tsx scripts/active-projection-convergence-proof.ts",
+    "proof:projection-window-upgrade": "tsx scripts/run-proof.ts scripts/projection-window-upgrade-proof.ts",
     "proof:last-token-event-backfill": "tsx scripts/last-token-event-backfill-proof.ts",
     "rehearse:ledger-open": "tsx scripts/rehearse-ledger-open.ts",
     "measure:session-attribution": "tsx scripts/measure-session-attribution-coverage.ts",
