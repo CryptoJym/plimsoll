@@ -1,20 +1,5 @@
 # Changelog
 
-## 0.7.59 — 2026-11-07
-
-- Dashboard window adds, replacements, deletions and expiry use the same
-  cutoff and cursor membership (plimsoll N89). A late historical event ahead
-  of a partial expiry cursor is counted before expiry removes it, preserving
-  its stored model contribution instead of subtracting usage never added.
-- Existing projections rebuild their window, source, daily, model and action
-  aggregates from retained facts and uncanceled compact history, one settled
-  window per maintenance pass. Negative totals and parity drift schedule the
-  affected window for automatic repair; invalid source evidence still refuses
-  publication. No usage, lineage, receipt or delivery retention changes.
-- Derived schema version 4 fences older projection writers while repair is
-  pending. Rolling back the collector preserves the ledger; older readers
-  report `projection_schema_newer` until this version returns.
-
 ## 0.7.58 — 2026-11-07
 
 - One retention scheduler (plimsoll N50, N87). The daemon's cadence is the
