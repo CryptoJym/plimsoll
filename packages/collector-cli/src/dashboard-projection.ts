@@ -39,11 +39,13 @@ import type { LedgerOpenTimingSink } from "./open-timing";
  * `DASHBOARD_SCHEMA_SHAPE_DIGEST` is the mechanical twin: the dashboard
  * projection proof fails when `dashboard_*` table shape moves without this
  * constant. Version 3 changes compatibility but not table shape, so the
- * canonical shape digest is unchanged. A loss-aware rebuild that can recover a
+ * canonical shape digest is unchanged. Version 4 repairs window contribution
+ * accounting and fences older writers during the one-time aggregate rebuild;
+ * it also leaves the table shape unchanged. A loss-aware rebuild that can recover a
  * host stuck on `projection_schema_newer` without the newer binary is owed
  * work (`issues/0177-loss-aware-projection-rebuild.md`); this binary only
  * withholds. */
-export const DASHBOARD_SCHEMA_VERSION = 3;
+export const DASHBOARD_SCHEMA_VERSION = 4;
 /** Canonical digest of `dashboard_*` table_info at `DASHBOARD_SCHEMA_VERSION`.
  * Computed by `dashboardProjectionSchemaShapeDigest` on a freshly opened
  * ledger. The proof pins the pair so a shape change cannot ship at the
@@ -1203,6 +1205,22 @@ export class DashboardProjectionStore {
     }
     markOpenStep("projection.control_rows");
 
+    // Keep the migration receipt separate from the schema stamp: a crash after
+    // the stamp must still schedule the repair on the next open. No source fact,
+    // compact history, lineage or delivery receipt is discarded by a rebuild.
+    this.db.exec(`create table if not exists projection_window_rebuild (
+      days integer primary key
+    ); create table if not exists projection_window_rebuild_migration (
+      singleton integer primary key check (singleton=1)
+    )`);
+    if (!this.openRefusalReason()) this.db.transaction(() => {
+      const first = this.db.prepare(`insert or ignore into projection_window_rebuild_migration
+        (singleton) values (1)`).run().changes;
+      if (first && !newLedger) for (const days of INTERNAL_WINDOWS) {
+        this.queueWindowRebuild(days,false);
+      }
+    }).immediate();
+
     // Existing ledgers may have facts written before a Codex span was marked
     // duplicate. Scan those facts in bounded maintenance slices once per
     // ledger; later changes are covered by the trigger below.
@@ -2134,7 +2152,8 @@ export class DashboardProjectionStore {
     }
   }
 
-  private applyCompactAggregates(items:CompactProjectionItem[],sign:1|-1,lifetime=true) {
+  private applyCompactAggregates(items:CompactProjectionItem[],sign:1|-1,lifetime=true,staging=false) {
+    const prefix=staging?"temp.projection_rebuild_":"";
     if(!items.length)return;
     const sourceCounts=new Map<string,number>(),dailyCounts=new Map<string,number>(),actionCounts=new Map<string,number>();
     const windowCounts=new Map<number,number>();
@@ -2149,18 +2168,18 @@ export class DashboardProjectionStore {
       }
     }
     for(const [days,count] of windowCounts)this.db.prepare(
-      `update dashboard_window_totals set events=events+? where days=?`,
+      `update ${prefix}dashboard_window_totals set events=events+? where days=?`,
     ).run(sign*count,days);
     for(const [key,count] of sourceCounts){const [days,source]=key.split("\u0000");this.db.prepare(
-      `insert into dashboard_source_window (days,source,events)
+      `insert into ${prefix}dashboard_source_window (days,source,events)
        values (?,?,?) on conflict(days,source) do update set events=events+excluded.events`,
     ).run(Number(days),source,sign*count);}
     for(const [key,count] of dailyCounts){const [days,bucket]=key.split("\u0000");this.db.prepare(
-      `insert into dashboard_daily_window (days,day,events)
+      `insert into ${prefix}dashboard_daily_window (days,day,events)
        values (?,?,?) on conflict(days,day) do update set events=events+excluded.events`,
     ).run(Number(days),bucket,sign*count);}
     for(const [key,count] of actionCounts){const [days,action]=key.split("\u0000");this.db.prepare(
-      `insert into dashboard_action_window (days,action_class,events)
+      `insert into ${prefix}dashboard_action_window (days,action_class,events)
        values (?,?,?) on conflict(days,action_class) do update set events=events+excluded.events`,
     ).run(Number(days),action,sign*count);}
     if(lifetime){
@@ -2201,7 +2220,7 @@ export class DashboardProjectionStore {
     const reference=this.control();
     const table=reference.backfillHighWater!==null?(previous.rawRowid>reference.backfillHighWater
       ?"dashboard_post_highwater_window":reference.parityCursor>=previous.rawRowid?"dashboard_parity_window":null):null;
-    if(table)for(const window of windows)if(DASHBOARD_WINDOWS.includes(window.days as typeof DASHBOARD_WINDOWS[number])&&previous.observedAt>=(window.targetCutoffAt??window.cutoffAt))this.applyReferenceDelta(table,window.days,previous,-1);
+    if(table)for(const window of windows)if(DASHBOARD_WINDOWS.includes(window.days as typeof DASHBOARD_WINDOWS[number])&&this.factIncludedInWindow(previous,window))this.applyReferenceDelta(table,window.days,previous,-1);
     this.applyLifetimeDelta(previous,-1);
     this.db.prepare(`delete from dashboard_event_facts where projection_id=?`).run(previous.projectionId);
     if(bounds.oldest===previous.observedAt||bounds.newest===previous.observedAt)this.refreshLifetimeBounds();
@@ -2227,8 +2246,10 @@ export class DashboardProjectionStore {
         this.applyFlatDelta(window.days, previous, -1);
         if (previous.sessionHash) changedSessions.add(previous.sessionHash);
       }
-      const admissionCutoff = window.targetCutoffAt ?? window.cutoffAt;
-      if (next.observedAt >= admissionCutoff) {
+      // Adds, replacements and expiry must use the same membership. A late
+      // fact ahead of an active expiry cursor will be subtracted by that walk;
+      // withholding its add until the target cutoff subtracts uncounted usage.
+      if (this.factIncludedInWindow(next, window)) {
         this.applyFlatDelta(window.days, next, 1);
         if (next.sessionHash) changedSessions.add(next.sessionHash);
       }
@@ -2252,11 +2273,10 @@ export class DashboardProjectionStore {
       if (referenceTable) {
         for (const window of windows) {
           if (!DASHBOARD_WINDOWS.includes(window.days as typeof DASHBOARD_WINDOWS[number])) continue;
-          const cutoff = window.targetCutoffAt ?? window.cutoffAt;
-          if (previous && previous.observedAt >= cutoff) {
+          if (previous && this.factIncludedInWindow(previous, window)) {
             this.applyReferenceDelta(referenceTable, window.days, previous, -1);
           }
-          if (next.observedAt >= cutoff) {
+          if (this.factIncludedInWindow(next, window)) {
             this.applyReferenceDelta(referenceTable, window.days, next, 1);
           }
         }
@@ -3420,6 +3440,16 @@ export class DashboardProjectionStore {
       // own cursor guard yields until that scan completes.
       if (hasActiveTime()) expiryFacts = this.advanceExpiry(
         now,BACKFILL_ROWS,hasActiveTime,expiryBatchRows,options.onWorkRowForProof);
+      // Rebuild a settled window before parity checks. Each admitted window
+      // commits atomically, so capture cannot observe a half-rebuilt aggregate.
+      const rebuildState = this.control(), rebuildBacklog = this.backlog();
+      if (hasActiveTime() && rebuildState.backfillComplete &&
+          !rebuildBacklog.repairs && !rebuildBacklog.compactMutations &&
+          !rebuildBacklog.compactGcDays && !rebuildBacklog.expiryWindows) {
+        const pending=this.db.prepare(`select days from projection_window_rebuild
+          order by days limit 1`).get() as {days:number}|undefined;
+        if(pending)this.rebuildWindow(pending.days,now);
+      }
       // Legacy privacy migration queues rows that have not entered flat totals.
       // Admit them before parity scans, or later repairs count them twice.
       const parityControl = this.control();
@@ -3459,7 +3489,7 @@ export class DashboardProjectionStore {
       const complete = Boolean(settled.backfillComplete && settled.parityComplete &&
         settled.metricBackfillComplete && duplicateScanComplete);
       if (complete && backlog.repairs === 0 && backlog.compactMutations===0 && backlog.compactGcDays===0 && backlog.dirtySessions === 0 &&
-        backlog.accountInvalidations === 0 && backlog.expiryWindows === 0 &&
+        backlog.accountInvalidations === 0 && backlog.expiryWindows === 0 && backlog.windowRebuilds === 0 &&
         settled.degradedReason !== "projection_clock_rollback") {
         if (settled.dirty || !settled.ready) {
           const published=hasActiveTime() && this.publishSnapshots(now);
@@ -3597,6 +3627,7 @@ export class DashboardProjectionStore {
          )`,
       ).all() as Array<{days:number}>;
       if (mismatches.length) {
+        for(const window of mismatches)this.queueWindowRebuild(window.days);
         complete = false;
         this.db.prepare(
           `update dashboard_projection_control set degraded_reason='projection_parity_mismatch',
@@ -3815,6 +3846,7 @@ export class DashboardProjectionStore {
       dirtySessions:control.dirtySessionBacklog,
       accountInvalidations:control.accountInvalidationBacklog,
       expiryWindows: (this.db.prepare(`select count(*) as n from dashboard_window_control where target_cutoff_at is not null`).get() as {n:number}).n,
+      windowRebuilds: (this.db.prepare(`select count(*) as n from projection_window_rebuild`).get() as {n:number}).n,
     };
   }
 
@@ -3978,22 +4010,139 @@ export class DashboardProjectionStore {
     return true;
   }
 
+  private queueWindowRebuild(days:number,invalidate=true){
+    this.db.prepare(`insert or ignore into projection_window_rebuild (days) values (?)`).run(days);
+    if(invalidate)this.db.prepare(`update dashboard_projection_control set dirty=1,parity_ready=0
+      where singleton=1`).run();
+  }
+
+  /** Reconstruct only disposable aggregates from retained projection evidence.
+   * Raw retention may already have removed the source event, so replaying only
+   * buffered_events would silently lose retained usage and compact history.
+   * The caller holds the writer and has finished expiry/mutations. */
+  private rebuildWindow(days:number,now:Date){
+    const {cutoffAt}=this.db.prepare(`select cutoff_at as cutoffAt
+      from dashboard_window_control where days=?`).get(days) as {cutoffAt:string};
+    const args={days,cutoffAt};
+    const sums=`count(*),coalesce(sum(input_tokens is not null or output_tokens is not null),0),
+      coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),
+      coalesce(sum(cache_read_tokens),0),coalesce(sum(cache_creation_tokens),0),
+      coalesce(sum(cost_nanos),0)`;
+    const publicWindow=DASHBOARD_WINDOWS.includes(days as typeof DASHBOARD_WINDOWS[number]);
+    const tables=["dashboard_window_totals","dashboard_source_window",
+      "dashboard_daily_window","dashboard_model_window","dashboard_action_window",
+      ...(publicWindow?["dashboard_parity_window","dashboard_post_highwater_window"]:[])];
+    const staged=(table:string)=>`temp.projection_rebuild_${table}`;
+    // Build privately, then compare and swap under the maintenance transaction.
+    // A restart discards only temporary rows; readers keep the published snapshot.
+    for(const table of tables){
+      const {sql}=this.db.prepare(`select sql from sqlite_master where name=?`).get(table) as {sql:string};
+      this.db.exec(sql.replace(/^create table [^(]+/i,
+        `create temp table if not exists projection_rebuild_${table} `));
+      this.db.prepare(`delete from ${staged(table)}`).run();
+    }
+    this.db.prepare(`insert into ${staged("dashboard_window_totals")}
+      (days,events,token_events,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos)
+      select @days,${sums} from dashboard_event_facts where observed_at>=@cutoffAt`).run(args);
+    this.db.prepare(`insert into ${staged("dashboard_source_window")}
+      (days,source,events,token_events,input_tokens,output_tokens,cost_nanos)
+      select @days,source,count(*),sum(input_tokens is not null or output_tokens is not null),
+        coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cost_nanos),0)
+      from dashboard_event_facts where observed_at>=@cutoffAt group by source`).run(args);
+    this.db.prepare(`insert into ${staged("dashboard_daily_window")} (days,day,events,cost_nanos,tokens)
+      select @days,substr(observed_at,1,10),count(*),coalesce(sum(cost_nanos),0),
+        coalesce(sum(input_tokens),0)+coalesce(sum(output_tokens),0)
+      from dashboard_event_facts where observed_at>=@cutoffAt group by substr(observed_at,1,10)`).run(args);
+    this.db.prepare(`insert into ${staged("dashboard_model_window")}
+      (days,model,calls,unpriced_calls,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos)
+      select @days,model,count(*),sum(cost_nanos is null),coalesce(sum(input_tokens),0),
+        coalesce(sum(output_tokens),0),coalesce(sum(cache_read_tokens),0),
+        coalesce(sum(cache_creation_tokens),0),coalesce(sum(cost_nanos),0)
+      from dashboard_event_facts where observed_at>=@cutoffAt and model is not null
+        and (input_tokens is not null or output_tokens is not null or cost_nanos is not null)
+      group by model`).run(args);
+    this.db.prepare(`insert into ${staged("dashboard_action_window")} (days,action_class,events)
+      select @days,coalesce(action_class,'other'),count(*) from dashboard_event_facts
+      where observed_at>=@cutoffAt and event_type in ('tool_use','tool_result')
+      group by coalesce(action_class,'other')`).run(args);
+    const control=this.control();
+    if(publicWindow)for(const [table,bound] of [
+      ["dashboard_parity_window",`raw_rowid<=${control.parityCursor}`],
+      ["dashboard_post_highwater_window",control.backfillHighWater===null?"0":`raw_rowid>${control.backfillHighWater}`],
+    ]){
+      this.db.prepare(`insert into ${staged(table)}
+        (days,events,token_events,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos)
+        select @days,${sums} from dashboard_event_facts
+        where observed_at>=@cutoffAt and ${bound}`).run(args);
+    }
+    // Decode at most one 1,000-item segment at a time; cancellations are
+    // independent evidence and remain intact. Never count a canceled item or
+    // add these event-only contributions to lifetime totals a second time.
+    const cancelled=this.db.prepare(`select 1 from dashboard_compact_cancellations
+      where raw_rowid=? and observed_at=? and source=? and event_type=? and action_key=?`);
+    const bit=1<<INTERNAL_WINDOWS.indexOf(days as typeof INTERNAL_WINDOWS[number]);
+    let parityCompact=0,postCompact=0,compactVisited=0;
+    const nextSegment=this.db.prepare(`select segment_id as id,payload_gzip as payload
+      from dashboard_compact_segments where segment_id>? and max_observed_at>=?
+      order by segment_id limit 1`);
+    let segmentCursor=0;
+    while(true){
+      const segment=nextSegment.get(segmentCursor,cutoffAt) as {id:number;payload:Buffer}|undefined;
+      if(!segment)break;
+      segmentCursor=segment.id;
+      const items=decodeCompact(segment.payload).filter(item=>item.observedAt>=cutoffAt&&
+        !cancelled.get(item.rawRowid,item.observedAt,item.source,item.eventType,item.actionClass??""))
+        .map(item=>({...item,windowMask:bit}));
+      this.applyCompactAggregates(items,1,false,true);
+      compactVisited+=items.length;
+      for(const item of items){
+        if(control.backfillHighWater!==null&&item.rawRowid>control.backfillHighWater)postCompact++;
+        else if(item.rawRowid<=control.parityCursor)parityCompact++;
+      }
+    }
+    if(publicWindow){
+      this.db.prepare(`update ${staged("dashboard_parity_window")} set events=events+? where days=?`).run(parityCompact,days);
+      this.db.prepare(`update ${staged("dashboard_post_highwater_window")} set events=events+? where days=?`).run(postCompact,days);
+    }
+    const changed=tables.some(table=>Boolean(this.db.prepare(`select 1 from (
+      select * from ${table} where days=? except select * from ${staged(table)}) limit 1`).get(days))||
+      Boolean(this.db.prepare(`select 1 from (select * from ${staged(table)}
+        except select * from ${table} where days=?) limit 1`).get(days)));
+    if(changed){
+      for(const table of tables){
+        this.db.prepare(`delete from ${table} where days=?`).run(days);
+        this.db.prepare(`insert into ${table} select * from ${staged(table)}`).run();
+      }
+      const {events}=this.db.prepare(`select events from dashboard_window_totals where days=?`).get(days) as {events:number};
+      this.db.prepare(`update dashboard_projection_control set dirty=1,parity_ready=0,
+        projection_rows_visited=projection_rows_visited+?,projection_rows_written=projection_rows_written+?
+        where singleton=1`).run(events,events+compactVisited);
+      markFinancePublicationDirty(this.db,now.toISOString());
+    }
+    this.db.prepare(`delete from projection_window_rebuild where days=?`).run(days);
+  }
+
   private publishSnapshots(now: Date) {
     const control = this.control();
     if (!control.backfillComplete||!control.metricBackfillComplete) return false;
     const backlog = this.backlog();
     if (!control.parityComplete || backlog.repairs || backlog.compactMutations ||
         backlog.compactGcDays || backlog.dirtySessions || backlog.accountInvalidations ||
-        backlog.expiryWindows || control.degradedReason === "projection_clock_rollback") return false;
+        backlog.expiryWindows || backlog.windowRebuilds || control.degradedReason === "projection_clock_rollback") return false;
     // A negative model row with calls <= 0 is filtered out of byModel, so
     // inspect the persisted aggregate as well as the candidate payloads.
-    const negativeWindow=this.db.prepare(`select days from dashboard_window_totals
+    const negativeWindows=this.db.prepare(`select days from dashboard_window_totals
       where events<0 or token_events<0 or input_tokens<0 or output_tokens<0
-        or cache_read_tokens<0 or cache_creation_tokens<0 limit 1`).get();
-    const negativeModel=this.db.prepare(`select days,model from dashboard_model_window
+        or cache_read_tokens<0 or cache_creation_tokens<0
+      union select days from dashboard_model_window
       where calls<0 or unpriced_calls<0 or input_tokens<0 or output_tokens<0
-        or cache_read_tokens<0 or cache_creation_tokens<0 limit 1`).get();
-    if(negativeWindow||negativeModel){
+        or cache_read_tokens<0 or cache_creation_tokens<0
+      union select days from dashboard_source_window where events<0 or token_events<0
+        or input_tokens<0 or output_tokens<0
+      union select days from dashboard_daily_window where events<0 or tokens<0
+      union select days from dashboard_action_window where events<0`).all() as Array<{days:number}>;
+    if(negativeWindows.length){
+      for(const window of negativeWindows)this.queueWindowRebuild(window.days);
       this.refuseNegativeTotal(now);
       return false;
     }
@@ -4003,6 +4152,7 @@ export class DashboardProjectionStore {
     for (const days of DASHBOARD_WINDOWS) {
       const built = this.buildSnapshot(days, generation, now);
       if(negativeSnapshotTotal(built.snapshot)){
+        this.queueWindowRebuild(days);
         this.refuseNegativeTotal(now);
         return false;
       }
@@ -4036,10 +4186,10 @@ export class DashboardProjectionStore {
   }
 
   private quarantineNegativeSnapshots(now:Date){
-    const rows=this.db.prepare(`select payload_json as payloadJson
-      from dashboard_snapshots`).all() as Array<{payloadJson:string}>;
-    if(rows.some(row=>negativeSnapshotTotal(json<SnapshotCore>(row.payloadJson)))){
-      this.refuseNegativeTotal(now);
+    const rows=this.db.prepare(`select days,payload_json as payloadJson
+      from dashboard_snapshots`).all() as Array<{days:number;payloadJson:string}>;
+    for(const row of rows)if(negativeSnapshotTotal(json<SnapshotCore>(row.payloadJson))){
+      this.queueWindowRebuild(row.days);this.refuseNegativeTotal(now);
     }
   }
 
@@ -4459,7 +4609,12 @@ export class DashboardProjectionStore {
     const row=this.db.prepare(
       `select payload_json as payloadJson,generation from dashboard_snapshots where days=?`,
     ).get(days) as {payloadJson:string;generation:number}|undefined;
-    if(!row||!control.ready)return {kind:"backfilling",status:this.status()};
+    // An older binary can clear ready on rollback. A forward reopen still has
+    // the last published generation while its private window rebuilds drain.
+    // Keep serving that full snapshot, explicitly stale, until replacement;
+    // schema refusals and invalid published payloads remain withheld.
+    const repairingWindows=!control.ready&&!this.openRefusalReason()&&this.backlog().windowRebuilds>0;
+    if(!row||(!control.ready&&!repairingWindows))return {kind:"backfilling",status:this.status()};
     const snapshot=json<SnapshotCore>(row.payloadJson);
     // A prior binary may already have published an invalid generation. Even
     // if a stale writer restores green control flags, never serve its totals.
