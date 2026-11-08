@@ -64,9 +64,15 @@ if (process.argv[2] === "--child") {
         freshCaptureRootEpoch: epoch });
       old.close();
       const oldInode = fs.statSync(ledgerPath).ino;
+      // The cutover itself runs lsof twice before the rename, 60 s each
+      // (ledger-open-handles LSOF_TIMEOUT_MS), so a loaded runner can spend the
+      // old 120 s budget on handle probes alone and the child dies by SIGTERM
+      // here instead of its own SIGKILL (plimsoll N97, CI run 42481237042 on
+      // plim-bow-2). The budget sits above the cutover's own worst case, so a
+      // refusal surfaces as the cutover's own error, never as this timeout.
       const child = spawnSync(process.execPath,
         ["--import", loader, import.meta.filename, "--child", fixture, point],
-        { encoding: "utf8", timeout: 120_000 });
+        { encoding: "utf8", timeout: 300_000 });
       assert.equal(child.signal, "SIGKILL", `${point}: ${child.stderr}`);
       const oldActive = fs.statSync(ledgerPath).ino === oldInode;
       const db = new Database(ledgerPath, { readonly: true, fileMustExist: true });
