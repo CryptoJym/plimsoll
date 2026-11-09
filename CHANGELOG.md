@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.61 — 2026-11-09
+
+- An expired checkpoint whose predecessor search already began under the old
+  delete trigger stays valid too (plimsoll N89): hosts upgraded from 0.7.58
+  carry such summaries with state complete=false and a search cursor, and the
+  0.7.60 rule covered only complete summaries. No search, no recompute.
+
 ## 0.7.60 — 2026-11-09
 
 - A retention expiry is not an edit (plimsoll N89, N105). The session-summary
