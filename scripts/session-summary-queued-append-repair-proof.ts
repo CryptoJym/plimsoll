@@ -25,7 +25,7 @@ async function main() {
       // The incremental queue was read. Insert before the segment repair's
       // independent SQL read, with a rowid inside that segment's range.
       if (!appended && queries[0]?.sql.includes("select e.rowid as rowid") &&
-          queries[0].sql.includes("from session_sync_summary_rows r join buffered_events e")) {
+          queries[0].sql.includes("from session_sync_summary_rows r cross join buffered_events e")) {
         assert.equal(rows.length, 0);
         appendBackdatedRow(buffer, size + 1);
         appended = true;

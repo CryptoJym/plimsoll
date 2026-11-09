@@ -23,7 +23,7 @@ const legacyTriggerNames = ["raw_update", "raw_delete", "outbox_insert", "outbox
   "outbox_delete", "receipt_insert", "receipt_update", "receipt_delete"]
   .map((suffix) => `trg_session_summary_${suffix}`);
 const headTriggerName = (legacyName: string) =>
-  `${legacyName}_${legacyName.includes("_outbox_") ? "v43" : "v42"}`;
+  `${legacyName}_${legacyName.includes("_outbox_") || legacyName.endsWith("_raw_delete") ? "v43" : "v42"}`;
 
 function put(buffer: LocalEventBuffer, sid: string, n: number): void {
   buffer.database.prepare(`insert into buffered_events
