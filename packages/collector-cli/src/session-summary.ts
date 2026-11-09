@@ -1280,7 +1280,9 @@ async function checkpointValid(
     ? "valid" : "invalid";
   if (state.checkpointId === null) return "invalid";
   let rows = await read<{ id: string; sessionId: string | null; observedAt: string }>(rowCheckpointQuery(state, maxMs));
-  if (rows.length === 0 && state.complete) {
+  if (rows.length === 0 && (state.complete || accumulator.checkpointSearchRowid !== null)) {
+    // A search already in progress (begun before this rule existed, complete
+    // set false by the search) is covered too: the frozen prefix is intact.
     const expired = await read<{ hit: number }>([{
       sql: `select 1 as hit from raw_retention_receipts
         where raw_rowid = @rowid and event_id = @id limit 1`,
