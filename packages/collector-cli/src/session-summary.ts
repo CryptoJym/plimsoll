@@ -316,7 +316,24 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       "trg_session_summary_repair_update_old_v1",
       "trg_session_summary_repair_update_new_v1",
     ]) db.exec(`drop trigger if exists ${trigger}`);
+    // retention_expiry_aware_v1 (plimsoll N89, N105): the v42 delete trigger
+    // and the v1 repair-delete trigger treated a retention expiry as an edit,
+    // so every expired raw row re-dirtied its session, bumped the ledger
+    // revision and queued a segment repair; expired checkpoints then walked a
+    // bounded predecessor search and ended in a from-scratch recompute.
+    for (const trigger of [
+      "trg_session_summary_raw_delete_v42",
+      "trg_session_summary_repair_delete_v1",
+    ]) db.exec(`drop trigger if exists ${trigger}`);
     db.exec(`
+    create table if not exists raw_retention_receipts (
+      event_id text not null,
+      raw_rowid integer not null,
+      raw_created_at text not null,
+      raw_generation text,
+      expired_at text not null,
+      reason text not null check (reason = 'retention_window_elapsed')
+    );
     create table if not exists session_sync_summary_control (
       singleton integer primary key check (singleton = 1),
       mutation_revision integer not null default 0,
@@ -553,8 +570,19 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           reason = excluded.reason, updated_at = excluded.updated_at;
     end;
 
-    create trigger if not exists trg_session_summary_raw_delete_v42
+    create trigger if not exists trg_session_summary_raw_delete_rows_v1
     after delete on buffered_events
+    begin
+      delete from session_sync_summary_rows where raw_rowid = old.rowid;
+    end;
+    -- retention_expiry_aware_v1: a raw row whose retention window elapsed is
+    -- already counted by its summary, and its receipt is written before the
+    -- delete (buffer.ts recordExpiry). Only an erasure or reattribution
+    -- delete marks the session dirty and advances the ledger revision.
+    create trigger if not exists trg_session_summary_raw_delete_v43
+    after delete on buffered_events
+    when not exists (select 1 from raw_retention_receipts x
+      where x.raw_rowid = old.rowid and x.event_id = old.id)
     begin
       update session_sync_summary_control
         set mutation_revision = mutation_revision + 1,
@@ -568,7 +596,6 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
         where old.session_id is not null and not ${oldUnscanned}
         on conflict(session_id) do update set
           reason = excluded.reason, updated_at = excluded.updated_at;
-      delete from session_sync_summary_rows where raw_rowid = old.rowid;
     end;
     -- These additive triggers survive upgrades from the v42 trigger names.
     -- A scanned mutation records only its bounded rowid segment; an unscanned
@@ -609,11 +636,12 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
         values (new.session_id, cast((new.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1)
         on conflict(session_id, segment) do update set revision = revision + 1;
     end;
-    create trigger if not exists trg_session_summary_repair_delete_v1
+    create trigger if not exists trg_session_summary_repair_delete_v2
     after delete on buffered_events
     when old.session_id is not null and exists (
       select 1 from session_sync_summary_state where session_id = old.session_id
-    ) and not ${oldUnscanned}
+    ) and not ${oldUnscanned} and not exists (select 1 from raw_retention_receipts x
+      where x.raw_rowid = old.rowid and x.event_id = old.id)
     begin
       insert into session_sync_summary_repairs (session_id, segment, revision)
         values (old.session_id, cast((old.rowid - 1) / ${SESSION_SUMMARY_SEGMENT_ROWS} as integer), 1)
@@ -1252,6 +1280,22 @@ async function checkpointValid(
     ? "valid" : "invalid";
   if (state.checkpointId === null) return "invalid";
   let rows = await read<{ id: string; sessionId: string | null; observedAt: string }>(rowCheckpointQuery(state, maxMs));
+  if (rows.length === 0 && state.complete) {
+    const expired = await read<{ hit: number }>([{
+      sql: `select 1 as hit from raw_retention_receipts
+        where raw_rowid = @rowid and event_id = @id limit 1`,
+      params: { rowid: state.highWater, id: state.checkpointId },
+      ...(maxMs === undefined ? {} : { maxMs }),
+    }]);
+    if (expired.length === 1) {
+      // retention_expiry_aware_v1: the checkpoint row's retention window
+      // elapsed. Expiry is not an edit: the frozen prefix already counts the
+      // row and appends land above the high water, so the stored position
+      // stays valid and no predecessor search or recompute is owed.
+      accumulator.checkpointSearchRowid = null;
+      return "valid";
+    }
+  }
   if (rows.length === 1 && rows[0]?.sessionId === sessionId &&
       rows[0]?.id !== state.checkpointId && highWaterSegmentQueued && accumulator.scanComplete) {
     // A raw ID rewrite or same-session rowid reuse changes the checkpoint's
@@ -1373,10 +1417,10 @@ function summaryRowsQuery(
        e.account_hash as accountHash,
        case when ${eligible} then 1 else 0 end as eligible
      from ${appendRows
-       ? "session_sync_summary_rows r join buffered_events e on e.rowid = r.raw_rowid"
+       ? "session_sync_summary_rows r cross join buffered_events e on e.rowid = r.raw_rowid"
        : historicalRows}
      ${appendRows ? "where r.session_id = @sessionId and r.raw_rowid > @highWater" : ""}
-     order by ${appendRows ? "e.rowid" : "scan.sort_observed_at, scan.raw_rowid"} asc limit @limit`,
+     order by ${appendRows ? "r.raw_rowid" : "scan.sort_observed_at, scan.raw_rowid"} asc limit @limit`,
     params: { sessionId, highWater, cursorObservedAt: cursorObservedAt ?? "", cursorRowid, scanBoundary, limit },
     ...(maxMs === undefined ? {} : { maxMs }),
   };
@@ -1435,7 +1479,7 @@ function repairRowsQuery(
        e.repo_hash as repoHash, e.branch_hash as branchHash,
        e.account_hash as accountHash,
        case when ${eligible} then 1 else 0 end as eligible
-     from buffered_events e
+     from buffered_events e not indexed
      where e.rowid > @cursorRowid and e.rowid <= @upperRowid and e.session_id = @sessionId
      order by e.rowid limit @limit`,
     params: { sessionId, cursorRowid: repair.cursorRowid,
