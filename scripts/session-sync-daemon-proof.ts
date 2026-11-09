@@ -436,12 +436,24 @@ async function main() {
       "insert into session_sync_summary_dirty (session_id, reason, updated_at) values (?, 'raw_delete', ?)");
     dirty.run(missedSession, "2026-11-08T20:32:27.522Z");
     dirty.run(otlpSession, "2026-11-08T20:32:58.824Z");
+    blockedLedger.database.prepare(`insert into session_sync_summary_pending (session_id, reason, mutation_revision,
+      queued_high_water, consecutive_zero_progress, next_retry_at, updated_at) values (?, 'raw_delete', 1, 0, 0, null, ?)`)
+      .run(missedSession, "2026-11-08T20:32:27.522Z");
+    blockedLedger.database.prepare("insert into session_sync_summary_due (session_id, next_due_at) values (?, ?)")
+      .run(missedSession, "2026-11-08T20:40:00.000Z");
+    blockedLedger.database.prepare("insert into session_sync_summary_repairs (session_id, segment, revision) values (?, 1, 1)")
+      .run(missedSession);
     const removed = dischargeBlockedSessionWork(blockedLedger.database, [missedSession]);
+    const count = (table: string) => (blockedLedger.database
+      .prepare(`select count(*) as n from ${table} where session_id = ?`).get(missedSession) as { n: number }).n;
     const left = blockedLedger.database.prepare("select session_id from session_sync_summary_dirty").all() as
       Array<{ session_id: string }>;
     completion.check(
       "blocked_session_carries_no_queued_work",
-      removed === 1 && left.length === 1 && left[0].session_id === otlpSession &&
+      removed === 3 && left.length === 1 && left[0].session_id === otlpSession &&
+        count("session_sync_summary_pending") === 0 && count("session_sync_summary_due") === 0 &&
+        count("session_sync_summary_repairs") === 1 &&
+        dischargeBlockedSessionWork(blockedLedger.database, [missedSession]) === 0 &&
         cliSource.includes("dischargeBlockedSessionWork(buffer.database, sessionSyncState.blockedSessionIds ?? [])"),
     );
   } finally {

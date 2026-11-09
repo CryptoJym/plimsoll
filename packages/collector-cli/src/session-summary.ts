@@ -1634,19 +1634,29 @@ export function listSessionSummaryPendingIds(db: Database.Database, until: strin
 }
 
 /**
- * A session the cloud rejected stays blocked and is never passed again, yet
- * the delete and append triggers keep queueing work for it. Those rows would
- * age forever and read as a stalled sync (plimsoll N89: two retention-dirtied
- * rows per host held the 0.7.60 canary). A blocked session carries no queued
- * work; its revision mismatch alone marks the pass it would need once unblocked.
+ * A session the cloud rejected stays blocked: the daemon's planner never
+ * passes it again, yet the delete and append triggers keep queueing work for
+ * it. Those rows would age forever and read as a stalled sync (plimsoll N89:
+ * two retention-dirtied rows per host held the 0.7.60 canary). A blocked
+ * session carries no dirty, pending or due row. Its repair queue stays: the
+ * legacy rebuild and upload-history still pass blocked sessions, and a
+ * dropped repair would let a stale prefix be marked complete. Its revision
+ * mismatch still marks the pass it would need once unblocked.
  */
 export function dischargeBlockedSessionWork(db: Database.Database, blockedIds: readonly string[]): number {
-  const tables = ["session_sync_summary_dirty", "session_sync_summary_pending",
-    "session_sync_summary_due", "session_sync_summary_repairs"].filter((table) => tableExists(db, table));
+  const tables = ["session_sync_summary_dirty", "session_sync_summary_pending", "session_sync_summary_due"]
+    .filter((table) => tableExists(db, table));
   if (blockedIds.length === 0 || tables.length === 0) return 0;
+  // Read first: the daemon's connection waits nothing for the write lock, so
+  // an idle cycle must not take it.
+  const queued = tables.filter((table) => {
+    const probe = db.prepare(`select 1 from ${table} where session_id = ? limit 1`);
+    return blockedIds.some((sessionId) => probe.get(sessionId) !== undefined);
+  });
+  if (queued.length === 0) return 0;
   return db.transaction(() => {
     let removed = 0;
-    for (const table of tables) {
+    for (const table of queued) {
       const remove = db.prepare(`delete from ${table} where session_id = ?`);
       for (const sessionId of blockedIds) removed += remove.run(sessionId).changes;
     }

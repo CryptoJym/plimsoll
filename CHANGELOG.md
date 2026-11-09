@@ -9,8 +9,9 @@
 - A session the cloud rejected stays blocked and is never passed again, yet
   retention deletes kept queueing work for it; those dirty rows aged forever and
   read as a stalled sync, which rolled the 0.7.60 canary back (plimsoll N89).
-  A blocked session now carries no queued work: the daemon discharges its dirty,
-  pending, due and repair rows every cycle.
+  A blocked session now carries no dirty, pending or due row: the daemon
+  discharges them every cycle. Its repair queue stays, because the legacy
+  rebuild and upload-history still pass blocked sessions.
 
 ## 0.7.60 — 2026-11-09
 
