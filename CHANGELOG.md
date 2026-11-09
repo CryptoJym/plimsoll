@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.60 — 2026-11-09
+
+- A retention expiry is not an edit (plimsoll N89, N105). The session-summary
+  delete triggers skip dirty marks, ledger revision bumps and segment repairs
+  for a raw row whose retention receipt is written, and an expired checkpoint
+  on a complete summary stays valid instead of walking a predecessor search
+  into a from-scratch recompute. Hosts stop re-sending thousands of old
+  sessions a day, and a rollout gate's targets complete inside their bound.
+- Session summary reads: the append read orders by the queue rowid and the
+  repair read seeks its bounded rowid window without the session index, which
+  removes two temporary sorts per read.
+
 ## 0.7.59 — 2026-11-07
 
 - Dashboard window adds, replacements, deletions and expiry use the same
