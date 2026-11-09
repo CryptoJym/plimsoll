@@ -1633,6 +1633,27 @@ export function listSessionSummaryPendingIds(db: Database.Database, until: strin
   return rows.map((row) => row.sessionId);
 }
 
+/**
+ * A session the cloud rejected stays blocked and is never passed again, yet
+ * the delete and append triggers keep queueing work for it. Those rows would
+ * age forever and read as a stalled sync (plimsoll N89: two retention-dirtied
+ * rows per host held the 0.7.60 canary). A blocked session carries no queued
+ * work; its revision mismatch alone marks the pass it would need once unblocked.
+ */
+export function dischargeBlockedSessionWork(db: Database.Database, blockedIds: readonly string[]): number {
+  const tables = ["session_sync_summary_dirty", "session_sync_summary_pending",
+    "session_sync_summary_due", "session_sync_summary_repairs"].filter((table) => tableExists(db, table));
+  if (blockedIds.length === 0 || tables.length === 0) return 0;
+  return db.transaction(() => {
+    let removed = 0;
+    for (const table of tables) {
+      const remove = db.prepare(`delete from ${table} where session_id = ?`);
+      for (const sessionId of blockedIds) removed += remove.run(sessionId).changes;
+    }
+    return removed;
+  }).immediate();
+}
+
 function queuedRowsAfter(db: Database.Database, sessionId: string, highWater: number, until: string): boolean {
   return Boolean(db.prepare(`select 1 from session_sync_summary_rows r
     join buffered_events e on e.rowid = r.raw_rowid

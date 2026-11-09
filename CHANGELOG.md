@@ -6,6 +6,11 @@
   delete trigger stays valid too (plimsoll N89): hosts upgraded from 0.7.58
   carry such summaries with state complete=false and a search cursor, and the
   0.7.60 rule covered only complete summaries. No search, no recompute.
+- A session the cloud rejected stays blocked and is never passed again, yet
+  retention deletes kept queueing work for it; those dirty rows aged forever and
+  read as a stalled sync, which rolled the 0.7.60 canary back (plimsoll N89).
+  A blocked session now carries no queued work: the daemon discharges its dirty,
+  pending, due and repair rows every cycle.
 
 ## 0.7.60 — 2026-11-09
 

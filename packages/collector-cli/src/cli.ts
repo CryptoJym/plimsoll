@@ -323,6 +323,7 @@ import {
   recordSessionSyncSettlement,
   runSessionSync,
   saveDaemonSessionSyncStateWithRetry,
+  dischargeBlockedSessionWork,
   sessionIdsFromBatches,
   sessionSyncClockSkewStatus,
   shouldDeferDaemonSessionSync,
@@ -4009,6 +4010,12 @@ async function main() {
           })();
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
+          try {
+            dischargeBlockedSessionWork(buffer.database, sessionSyncState.blockedSessionIds ?? []);
+          } catch (error) {
+            console.warn(JSON.stringify({ warning: "session_sync_blocked_discharge_failed",
+              message: error instanceof Error ? error.message : String(error) }));
+          }
           if (!await persistSessionCarry()) return;
           if (sessionSyncState.clockSkewRetryAt &&
               Date.now() < Date.parse(sessionSyncState.clockSkewRetryAt)) return;

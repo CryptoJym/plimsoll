@@ -37,6 +37,7 @@ import {
 } from "./session-summary";
 
 export type { SessionSnapshot } from "./session-summary";
+export { dischargeBlockedSessionWork } from "./session-summary";
 
 /** Even a sustained event backlog must give the session planner a turn. */
 export const SESSION_SYNC_MAX_DEFERRAL_MS = 60_000;

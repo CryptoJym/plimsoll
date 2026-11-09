@@ -7,6 +7,7 @@ import {
   collectSessionSnapshots,
   commitDaemonSessionSyncFailure,
   commitDaemonSessionSyncSuccess,
+  dischargeBlockedSessionWork,
   loadDaemonSessionSyncState,
   planDaemonSessionSync,
   runSessionSync,
@@ -14,12 +15,13 @@ import {
   sessionIdsFromBatches,
   shouldDeferDaemonSessionSync,
 } from "../packages/collector-cli/src/session-sync";
+import { ensureSessionSummarySchema } from "../packages/collector-cli/src/session-summary";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const completion = createProofCompletion("session-sync-daemon", 15);
+const completion = createProofCompletion("session-sync-daemon", 16);
 const root = process.env.PLIMSOLL_PROOF_ROOT!;
 const installKey = "session-sync-daemon-proof-key";
 const tenantId = "00000000-0000-4000-8000-000000000070";
@@ -424,6 +426,27 @@ async function main() {
       deferSessionPass({ ...backlogInput, elapsedSinceLastSessionPassMs: 59_999 }) &&
       deferSessionPass({ ...backlogInput, elapsedSinceLastSessionPassMs: 60_000 }) === false,
   );
+
+  // A cloud-rejected session is never passed again; the work rows the delete
+  // trigger queued for it must not age into a stalled-sync reading.
+  const blockedLedger = openLedger("blocked-discharge");
+  try {
+    ensureSessionSummarySchema(blockedLedger.database);
+    const dirty = blockedLedger.database.prepare(
+      "insert into session_sync_summary_dirty (session_id, reason, updated_at) values (?, 'raw_delete', ?)");
+    dirty.run(missedSession, "2026-11-08T20:32:27.522Z");
+    dirty.run(otlpSession, "2026-11-08T20:32:58.824Z");
+    const removed = dischargeBlockedSessionWork(blockedLedger.database, [missedSession]);
+    const left = blockedLedger.database.prepare("select session_id from session_sync_summary_dirty").all() as
+      Array<{ session_id: string }>;
+    completion.check(
+      "blocked_session_carries_no_queued_work",
+      removed === 1 && left.length === 1 && left[0].session_id === otlpSession &&
+        cliSource.includes("dischargeBlockedSessionWork(buffer.database, sessionSyncState.blockedSessionIds ?? [])"),
+    );
+  } finally {
+    blockedLedger.close();
+  }
 
   completion.complete();
 }
