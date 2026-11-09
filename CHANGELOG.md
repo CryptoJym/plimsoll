@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.62 — 2026-11-09
+
+- A host that re-upgrades over a projection an older binary refused no longer
+  keeps the `projection_schema_newer` stamp (plimsoll N123): the open clears a
+  stale open-refusal stamp once the stored schema is not newer than the
+  binary's, so the ordinary rebuild resumes. studio4 carried the stamp from
+  its 0.7.58 interlude under 0.7.61, read degraded with ready false on the
+  right binary, and its capture health read codex red for it.
+
 ## 0.7.61 — 2026-11-09
 
 - An expired checkpoint whose predecessor search already began under the old

@@ -1636,6 +1636,18 @@ export class DashboardProjectionStore {
       this.stampOpenRefusal();
       return;
     }
+    // A binary that can read this schema is back (the newer binary returned,
+    // or the host re-upgraded). An open-refusal stamp an older binary left
+    // behind would otherwise stay sticky through every later writer and keep
+    // the counts withheld and the host's capture health red for good
+    // (plimsoll N123: studio4 under 0.7.61 after a 0.7.58 interlude). Clear it
+    // so the ordinary rebuild resumes; that is what "a plain restart" means.
+    if (stored !== null) {
+      this.db.prepare(
+        `update dashboard_projection_control set degraded_reason=null
+          where singleton=1 and degraded_reason in (${OPEN_REFUSAL_REASONS_SQL})`,
+      ).run();
+    }
     if (stored !== null && stored < DASHBOARD_SCHEMA_VERSION) {
       this.db.prepare(
         `update dashboard_projection_control set schema_version=? where singleton=1`,

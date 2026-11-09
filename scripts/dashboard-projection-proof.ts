@@ -3813,6 +3813,27 @@ async function main() {
         binaryVersion:DASHBOARD_SCHEMA_VERSION});
     rolledBack.close();
 
+    // The binary that can read the schema returns (or the host re-upgrades):
+    // the stale stamp the older binary left must clear on open, or ready stays
+    // 0 and the host's capture health red for good (plimsoll N123).
+    const returning=new Database(downgradePath);
+    returning.prepare(`update dashboard_projection_control set schema_version=? where singleton=1`)
+      .run(DASHBOARD_SCHEMA_VERSION);
+    returning.exec(`alter table dashboard_repo_session_window drop column future_column`);
+    returning.close();
+    const reupgraded=new LocalEventBuffer(downgradePath);
+    const reupgradedStored=(reupgraded.database.prepare(
+      `select schema_version as version, degraded_reason as reason, dirty, ready
+       from dashboard_projection_control where singleton=1`)
+      .get() as {version:number;reason:string|null;dirty:number;ready:number});
+    const reupgradedStatus=reupgraded.projection.status();
+    check("a_re_upgraded_projection_clears_the_stale_schema_newer_stamp_on_open",
+      reupgradedStored.version===DASHBOARD_SCHEMA_VERSION&&
+        reupgradedStored.reason!=="projection_schema_newer"&&reupgradedStored.dirty===1&&
+        reupgradedStatus.degradedReason!=="projection_schema_newer",
+      {stored:reupgradedStored,statusReason:reupgradedStatus.degradedReason});
+    reupgraded.close();
+
     // The forward half of the same guard. A projection written before the
     // version moved must adopt it on open — every equality test against
     // DASHBOARD_SCHEMA_VERSION, finance publication among them, would otherwise
