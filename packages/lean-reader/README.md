@@ -63,8 +63,29 @@ their existing file cursors):
 ```
 
 Glob roots stream transcripts into compact UTC-day/session totals and share
-the reply-ID deduplication index. They reread eligible files on each pass;
-they retain no per-file cursor, prompt, or tool evidence. Their uploads contain
+the reply-ID deduplication index. Each pass reads files modified since that
+root's previous completed pass start, with five minutes of overlap. Compact
+file cursors skip committed bytes, including inside that overlap; closed-day
+cursors are pruned once the root watermark excludes them. A capped root keeps
+its old watermark so unread files carry over. All glob roots together admit at
+most 1,200 file slices, 512 MiB of transcript bytes, or 12 seconds of capture
+per pass. A slice stops at a complete record after 1 MiB or 256 new replies;
+larger records stream within the remaining byte budget. Files that exceed the
+remaining budget resume from the last complete record on the next pass.
+The capture deadline also checks between 64 KiB reads. An explicit backfill
+starts a bounded rebuild; subsequent regular `run` passes drain its remaining
+files. Repeating `backfill` starts that rebuild again.
+
+Only the current slice's session/hour deltas are accumulated before committing.
+Reply hashes use binary sorted runs and a fixed 2 MiB lookup filter, retaining
+the same exact deduplication check. `sdk-journal.jsonl` fsyncs each slice's
+counts, hashes and cursor together; recovery replays only commits newer than
+the atomic state snapshot. The journal clears after that snapshot is durable.
+The job runs every 300 seconds with `NODE_OPTIONS=--jitless
+--max-old-space-size=128 --max-semi-space-size=1`: a 128 MiB old-space heap and
+1 MiB semi-spaces. Its state ceiling stays 32 MiB; admission stops with room
+for the current slice when the serialized state approaches that ceiling.
+No prompts or tool evidence enter the glob state or journal. Their uploads contain
 the existing usage and session fields; optional velocity rows are not generated
 for glob roots. Fixed roots continue to collect velocity as before.
 `~/.local/state/fleet-launch/launches-sdk.jsonl` joins `kind: "sdk"` rows by
@@ -90,10 +111,14 @@ hour/velocity keys with zero tombstones and correctly keyed totals. Older
 delivered windows require an explicit backfill.
 
 `node packages/lean-reader/measure-sdk.mjs /private/tmp/PRIVATE-DIRECTORY`
-creates 20,000 synthetic transcripts in 30 glob roots and measures a standalone
-Node 22 backfill with `/usr/bin/time -l` on macOS. It prints elapsed time, whole
-process peak RSS, serialized state bytes, and threshold results; no real source
-or upload credentials are read. The named directory must be private.
+creates 3,000 synthetic 500,000-byte transcripts (100 cache-read-heavy usage
+lines each) in 30 glob roots. Run it with Node 22 and a private directory under
+`/private/tmp`. It measures three real `run` passes, adding files between them,
+under the job's exact `NODE_OPTIONS`, with a loopback upload receiver. It also
+SIGTERMs a reader between journaled files and verifies that recovery reads only
+uncommitted bytes. It prints elapsed time, whole-process peak RSS, state bytes,
+and exact totals; each pass must stay below 20 seconds, 100 MB RSS and 16 MB
+state. No real source or upload credentials are read.
 
 All roots are optional, recursive, and deduplicated through filesystem identity:
 

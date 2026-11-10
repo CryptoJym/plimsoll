@@ -209,7 +209,7 @@ class Projection {
 
 const LIMIT = 1024 * 1024;
 const buffer = Buffer.allocUnsafe(64 * 1024);
-export function readLines(file: string, offset: number, end: number, visit: (record: Record<string, any>, offset: number) => void, evidence = false, selectedPaths?: readonly string[]): { offset: number; bytes: number } {
+export function readLines(file: string, offset: number, end: number, visit: (record: Record<string, any>, offset: number) => void | boolean, evidence = false, selectedPaths?: readonly string[], deadline?: number): { offset: number; bytes: number } {
   const fd = fs.openSync(file, 'r');
   const selected = selectedPaths ? selection(selectedPaths) : undefined;
   let position = offset, committed = offset, size = 0, chunks: Buffer[] = [];
@@ -231,6 +231,7 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
   };
   try {
     while (position < end) {
+      if (deadline !== undefined && performance.now() >= deadline) break;
       const n = fs.readSync(fd, buffer, 0, Math.min(buffer.length, end - position), position);
       if (!n) break;
       let start = 0;
@@ -248,7 +249,7 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
           }
         }
         committed = position + newline + 1;
-        if (record && typeof record === 'object' && !Array.isArray(record)) visit(record, committed);
+        if (record && typeof record === 'object' && !Array.isArray(record) && visit(record, committed) === false) return { offset: committed, bytes: committed - offset };
         chunks = []; size = 0; projector = null; decoder = null; dropped = false; start = newline + 1;
       }
       consume(buffer.subarray(start, n)); position += n;

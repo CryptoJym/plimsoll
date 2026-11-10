@@ -8,6 +8,7 @@ import { peakMemory, MAX_STATE, HEAP_MB, type State, type Config, type Options }
 import { saveJson } from './state-json.js';
 import { discover } from './discovery.js';
 import { allowancePass } from './allowance.js';
+import { sdkJournal } from './sdk-reader.js';
 
 const execFileSync: typeof import('node:child_process').execFileSync = (...args: any[]): any => {
   return (process.getBuiltinModule('node:child_process') as any).execFileSync(...args);
@@ -83,6 +84,7 @@ export async function runPass(options: Options = {}) {
   const started = performance.now(), home = options.home ?? os.homedir(), now = options.now ?? Date.now(), config = options.config ?? {};
   const dir = options.stateDir ?? stateDirectory(home), file = path.join(dir, 'state.json');
   const release = acquireLock(path.join(dir, 'reader.lock'));
+  let journal: ReturnType<typeof sdkJournal> | undefined;
   try {
     // Allowance goes first and on its own: one small file, its own uploads and
     // its own outbox, so a slow or failing usage pass never holds it up.
@@ -96,10 +98,12 @@ export async function runPass(options: Options = {}) {
     // incremental run, so do not replace the replay traversal with it.
     const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
     const discovered = options.discovered ?? (velocityOnly ? undefined : await discover({ ...options, home, now, config }));
-    const result = scan({ ...options, home, now, config, state, discovered, backfill: options.command === 'backfill' || options.backfill });
+    if (!velocityOnly && (discovered?.some(root => root.aggregate) || fs.existsSync(path.join(dir, 'sdk-journal.jsonl')))) journal = sdkJournal(state, dir);
+    const result = scan({ ...options, home, now, config, state, discovered, sdkJournal: journal?.append, sdkReset: journal ? () => { saveState(file, state); journal!.clear(); } : undefined, backfill: options.command === 'backfill' || options.backfill });
     // Persist the outbox before attempting any network operation. Replaying an
     // accepted batch after a crash is safe because cloud rows replace totals.
     result.stats.stateBytes = saveState(file, result.state);
+    journal?.clear();
     if (!(options.dryRun ?? config.dryRun)) result.stats.sent = await sendPending(result.state, config, { home, now, velocityOnly: options.velocityOnly === true || options.command === 'velocity-backfill' });
     if (result.state.lastError) result.stats.errors++;
     result.stats.milliseconds = performance.now() - started; result.stats.peakMemoryBytes = peakMemory();
@@ -111,7 +115,7 @@ export async function runPass(options: Options = {}) {
     const reason = error instanceof Error && ['state_capacity', 'invalid_state', 'invalid_window', 'source_unreadable'].includes(error.message) ? error.message : 'reader_error';
     try { log(home, { at: new Date(now).toISOString(), files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 1, milliseconds: performance.now() - started, peakMemoryBytes: peakMemory(), error: reason }); } catch { /* Preserve the original failure. */ }
     throw new Error(reason);
-  } finally { release(); }
+  } finally { journal?.close(); release(); }
 }
 
 const xmlEscape = (s: string) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');

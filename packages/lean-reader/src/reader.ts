@@ -11,6 +11,7 @@ import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js
 import { accountKey, Accounts, profileAccount } from './accounts.js';
 import { globRoots } from './glob.js';
 import { addSdk, sdkHours, sdkLaunches, refreshSdk } from './sdk.js';
+import { SdkCapture } from './sdk-reader.js';
 import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
@@ -309,7 +310,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   prune(state, cutoff);
   narrowPacked(state);
   if (velocityOnly) narrowPacked(retainedState);
-  const seen = new Seen(state, 'seen', 'seenPacked', cutoff);
+  let seen = new Seen(state, 'seen', 'seenPacked', cutoff);
   const evidenceSeen = !velocityOnly && config.sendEvidence === true ? new Seen(state, 'evidenceSeen', 'evidenceSeenPacked', cutoff) : null;
   // Bound admission while scanning as well as at atomic save. A large source
   // must stop before its ID/metadata maps can exhaust memory. Sampling avoids
@@ -326,6 +327,9 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   // after every handful of files creates more garbage than capture itself.
   const budgetTick = () => { if (++admissions % (aggregate ? 4096 : 256) === 0) checkBudget(); };
   if (options.backfill && !velocityOnly) {
+    // A bounded SDK rebuild continues through ordinary run passes. Old full
+    // cursors/watermarks must not conceal files beyond this pass's budget.
+    delete state.sdkFiles; delete state.sdkRoots;
     // Zero rows act as replacement tombstones if a corrected source no longer
     // contains a formerly counted hour. Never leave a stale cloud total behind.
     for (const [key, row] of Object.entries(state.hours)) if (inside(row.hour)) { Object.assign(row, counts()); state.pending[key] = true; }
@@ -458,6 +462,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   const sources: Source[] = velocityOnly ? archivedSources(discoveredSources) : discoveredSources;
   for (const root of sources) {
     aggregate = root.aggregate === true && root.tool === 'claude_code';
+    if (aggregate && !velocityOnly) continue;
     let rootAccount: string | undefined;
     const getAccount = () => {
       if (rootAccount !== undefined) return rootAccount;
@@ -678,6 +683,24 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       } catch (error) { if (error instanceof Error && error.message === 'state_capacity') throw error; throw new Error('source_unreadable'); }
       finally { cleanup(); }
     }
+  }
+  if (!velocityOnly && sources.some(root => root.aggregate && root.tool === 'claude_code')) {
+    seen.finish();
+    // Journal deltas from a rebuild must recover onto its zeroed baseline,
+    // never onto the pre-backfill totals in an older atomic snapshot.
+    if (options.backfill) options.sdkReset?.();
+    let sourceAccount = 'unknown';
+    const capture = new SdkCapture(state, now, startHour, endHour, (session, cwd) => {
+      const tag = launches.get(session), account = sourceAccount === 'unknown' || tag ? accounts.resolve(tag?.seat ?? '') : sourceAccount;
+      return { account, project: tag?.project ?? projects.hint(cwd, 'claude_code', session).projectHint };
+    }, options.sdkJournal, options.backfill);
+    for (const root of sources) if (root.aggregate && root.tool === 'claude_code') {
+      sourceAccount = claudeAccount(root.path, home, options.env ?? process.env, accounts);
+      const captured = capture.root(root.path, since => root.files ?? files(root.path, visited, since, root.tool, home));
+      stats.files += captured.files; stats.bytesRead += captured.bytes;
+    }
+    capture.finish();
+    seen = new Seen(state, 'seen', 'seenPacked', cutoff);
   }
   const active = new Set(Object.values(state.hours).map(row => row.tool + ':' + row.sessionKey));
   for (const session of Object.values(state.sessions)) active.add(session.tool + ':' + session.sessionKey);
