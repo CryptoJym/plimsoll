@@ -18,7 +18,9 @@ defaults:
 jobs:
   proof:
     # James, 3 Oct 2026 12:05 MDT: no CI on GitHub's cloud; every check runs on our own machines.
-    runs-on: [self-hosted, macOS, ARM64, plimsoll]
+    # Timing proofs run only on quiet Macs (runner label `quiet`, plimsoll N135, fleet N905): studio1's
+    # loaded runners failed round-9, round-13, lifecycle and busy-host proofs on 11-10 without a code change.
+    runs-on: [self-hosted, macOS, ARM64, plimsoll, quiet]
     # Allow the measured sequential artifact, repeated E2E and resource gates.
     # Per-proof deadlines and acceptance thresholds remain unchanged. A full run
     # took about 56 minutes on 30 Sep 2026, so 60 cut off healthy runs.
