@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 
 import type Database from "better-sqlite3";
 
@@ -28,6 +30,8 @@ import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
 import { DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH } from "./learning-facts";
 import { isSessionSyncUploadLeaseError } from "./sqlite-contention";
+import { listHookSpoolArrivals } from "./hook-spool";
+import { listOtlpSpoolArrivals } from "./otlp-spool";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
@@ -739,6 +743,22 @@ const PROJECTION_DRAIN_MAX_SLICES=40;
 const PROJECTION_DRAIN_MAX_ACTIVE_MS=2_000;
 const PROJECTION_CADENCE_SECONDS=60;
 
+/** Catch up only on spare capacity; keep each writer turn at 25 ms. */
+export function projectionRepairAllowance(
+  backlog: number,
+  loadPerCore: number,
+  intakeSpooling: boolean,
+) {
+  const busy = intakeSpooling || !Number.isFinite(loadPerCore) || loadPerCore > 1;
+  const maxSlices = busy || !Number.isFinite(backlog)
+    ? 1
+    : Math.max(1, Math.min(40, Math.ceil(
+      Math.max(0, backlog) / (5_000 * (1 + Math.max(0, loadPerCore))),
+    )));
+  // At most 1 s per 5 s (20% of one core), leaving room below the 25% ceiling.
+  return { maxSlices, maxActiveMs: maxSlices * 25 };
+}
+
 function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projection"]["status"]>){
   const high=status.backfill.highWater??0;
   const metricHigh=status.backfill.metricHighWater??0;
@@ -762,7 +782,7 @@ function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projec
 export async function drainProjectionMigration(
   projection:LocalEventBuffer["projection"],
   options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number|(()=>number);
-    signal?:AbortSignal;budget?:CaptureWorkBudget}={},
+    signal?:AbortSignal;budget?:CaptureWorkBudget;canContinue?:()=>boolean}={},
 ){
   const maxSlices=Math.max(1,Math.min(options.maxSlices??PROJECTION_DRAIN_MAX_SLICES,100));
   const maxActiveMs=Math.max(1,Math.min(options.maxActiveMs??PROJECTION_DRAIN_MAX_ACTIVE_MS,5_000));
@@ -770,16 +790,25 @@ export async function drainProjectionMigration(
   let receipt:ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>|undefined;
   while(slices<maxSlices && !options.signal?.aborted && (options.budget?.canStart(5) ?? true)){
     if(slices>0){await new Promise<void>((resolve)=>setImmediate(resolve));yields++;}
+    if (slices > 0 && options.canContinue?.() === false) break;
     const started=performance.now();
     // The outer active-time limit controls the whole drain. Each synchronous
     // transaction admits phases for at most 25 ms of that allowance; an
     // already-admitted bounded unit is allowed to finish before yielding.
-    receipt=projection.runMaintenance(undefined, {maxActiveMs:Math.min(25,
+    const next=projection.runMaintenance(undefined, {maxActiveMs:Math.min(25,
       Math.max(1,maxActiveMs-activeMs))});
+    migrationRowsVisited+=next.backfillRowsVisited+next.parityRowsVisited+
+      next.metricRowsVisited+next.duplicateFactScanRowsVisited;
+    // Multi-slice turns report all committed work, with the final readiness.
+    for (const key of Object.keys(next) as Array<keyof typeof next>) {
+      if (receipt && typeof next[key] === "number") {
+        (next as unknown as Record<string, unknown>)[key] =
+          Number(next[key]) + Number(receipt[key]);
+      }
+    }
+    receipt=next;
     activeMs+=performance.now()-started;
     slices++;
-    migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+
-      receipt.metricRowsVisited+receipt.duplicateFactScanRowsVisited;
     const status=projection.status();
     const stillMigrating=!status.parityReady||status.dirty||!status.backfill.complete||
       !status.backfill.parityComplete||!status.backfill.metricComplete||
@@ -804,6 +833,7 @@ export async function drainProjectionMigration(
 }
 
 export class CollectorMaintenance {
+  private projectionCatchupAfter = 0;
   private current: {
     phase: "baseline" | "capture";
     source: "codex" | "claude_code" | "grok";
@@ -819,7 +849,8 @@ export class CollectorMaintenance {
     private readonly signal?: AbortSignal,
     /** Grok usage files (bead eco-6hoxj.163.20); absent callers keep the two-source cadence. */
     private readonly grokTailer?: GrokUsageTailer,
-    private readonly options: { captureCoverageIntervalMs?: number; captureCoverageTurnMs?: number } = {},
+    private readonly options: { captureCoverageIntervalMs?: number; captureCoverageTurnMs?: number;
+      projectionPressure?: () => { loadPerCore: number; intakeSpooling: boolean } } = {},
   ) {
     ensureAutomaticCaptureRuntimeState(this.buffer.database);
   }
@@ -927,6 +958,8 @@ export class CollectorMaintenance {
     clock?: () => number;
     /** Fixture-only admission clock; production keeps the monotonic default. */
     budgetClock?: () => number;
+    /** Fixture cadence clock; production catch-up uses monotonic real time. */
+    projectionClock?: () => number;
   } = {}): Promise<CollectorMaintenanceRunResult> {
     // Monotonic stage timing source. Injectable so fixture proofs can assert
     // exact per-stage durations deterministically (issue #61 first step).
@@ -1003,7 +1036,8 @@ export class CollectorMaintenance {
     const migrationPending=!migrationStatus.complete || !migrationStatus.parityComplete ||
       !migrationStatus.metricComplete || !migrationStatus.duplicateFactScan.complete;
     let priorityProjectionRan = false;
-    const executeRepairStage = async (stage: RepairStage) => {
+    const executeRepairStage = async (stage: RepairStage,
+      allowance = { maxSlices: 1, maxActiveMs: 25 }, canContinue?: () => boolean) => {
       const counter = repairService.stages[stage];
       counter.attempts += 1;
       saveRepairService();
@@ -1012,8 +1046,8 @@ export class CollectorMaintenance {
         let rows = 0;
         switch (stage) {
           case "projection":
-            drained = await drainProjectionMigration(this.buffer.projection, {
-              maxSlices: 1, maxActiveMs: 25, signal: this.signal,
+            { const next = await drainProjectionMigration(this.buffer.projection, {
+              ...allowance, canContinue, signal: this.signal,
               cadenceSeconds:()=>{
                 const migration=this.buffer.projection.status().backfill;
                 return !migration.duplicateFactScan.complete ? 0.25 :
@@ -1021,11 +1055,24 @@ export class CollectorMaintenance {
                     ? 1 : 5;
               },
             });
-            rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
-              drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
-              drained.receipt.duplicateFactScanRowsVisited +
-              drained.receipt.sessionRepairRowsVisited;
-            projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
+            rows = next.receipt.repairRowsVisited + next.receipt.backfillRowsVisited +
+              next.receipt.parityRowsVisited + next.receipt.metricRowsVisited +
+              next.receipt.duplicateFactScanRowsVisited + next.receipt.sessionRepairRowsVisited;
+            if (drained) {
+              for (const key of Object.keys(next.receipt) as Array<keyof typeof next.receipt>) {
+                if (typeof next.receipt[key] === "number")
+                  (next.receipt as unknown as Record<string, unknown>)[key] =
+                    Number(next.receipt[key]) + Number(drained.receipt[key]);
+              }
+              next.drain.slices += drained.drain.slices;
+              next.drain.yields += drained.drain.yields;
+              next.drain.activeMs += drained.drain.activeMs;
+              next.drain.maxSlices += drained.drain.maxSlices;
+              next.drain.maxActiveMs += drained.drain.maxActiveMs;
+              next.drain.migrationRowsVisited += drained.drain.migrationRowsVisited;
+            }
+            drained = next;
+            projectionDrainMs += Math.max(0, Math.round(clock() - stageStarted)); }
             break;
           case "reconciliation":
             reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
@@ -1286,6 +1333,39 @@ export class CollectorMaintenance {
       transcript,
       grok,
     );
+    // Bonus work follows capture, coverage and the rotating repair stages. It
+    // never spends their shared 200 ms admission budget or changes scan cadence.
+    const catchupAt = options.projectionClock?.() ?? performance.now();
+    if (!migrationPending && catchupAt >= this.projectionCatchupAfter && !this.signal?.aborted) {
+      const backlog = this.buffer.projection.status().backlog;
+      const pressure = () => {
+        if (this.options.projectionPressure) return this.options.projectionPressure();
+        const home = path.dirname(this.buffer.database.name);
+        return { loadPerCore: Math.max(...os.loadavg().slice(0, 2)) / os.cpus().length,
+          // Missing directories are empty; unreadable directories withhold bonus work.
+          intakeSpooling: listHookSpoolArrivals(home)?.length !== 0 ||
+            listOtlpSpoolArrivals(home)?.length !== 0 };
+      };
+      const allowance = () => {
+        const current = pressure();
+        return projectionRepairAllowance(backlog.repairs + backlog.compactMutations,
+          current.loadPerCore, current.intakeSpooling);
+      };
+      const grant = allowance();
+      if (grant.maxSlices > 1) {
+        this.projectionCatchupAfter = catchupAt + 5_000;
+        await executeRepairStage("projection", { maxSlices: grant.maxSlices - 1,
+          maxActiveMs: grant.maxActiveMs - 25 }, () => allowance().maxSlices > 1);
+        // Mutation-only progress also earns the normal five-second repair retry.
+        repairService.stages.projection.rowsVisited += Math.max(0,
+          backlog.compactMutations - (drained?.receipt.backlog.compactMutations ?? backlog.compactMutations));
+        saveRepairService();
+        // An admitted unit (including fsync) can overrun: repay that time before
+        // another grant, even when capture requests faster maintenance ticks.
+        this.projectionCatchupAfter = Math.max(this.projectionCatchupAfter,
+          catchupAt + 5 * (drained?.drain.activeMs ?? 0));
+      }
+    }
     return {
       recentOnly: true,
       rollout,

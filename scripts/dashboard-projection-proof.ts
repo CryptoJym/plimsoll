@@ -37,6 +37,7 @@ import {
   CollectorMaintenance,
   automaticRepairServiceStatus,
   drainProjectionMigration,
+  projectionRepairAllowance,
   type AutomaticMaintenanceCadenceTimer,
 } from "../packages/collector-cli/src/maintenance";
 import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
@@ -940,6 +941,82 @@ function proveMillionFactVersionFenceCost(root: string) {
 }
 
 type MillionFactRowCosts = {scanMsPerRow:number;repairMsPerRow:number};
+async function proveProjectionRepairCatchup(root: string) {
+  const measuredRealCadence = process.argv.includes("--repair-catchup-only");
+  const buffer = new LocalEventBuffer(path.join(root, "repair-catchup.sqlite"));
+  const db = buffer.database, count = 200_000, day = NOW.toISOString().slice(0, 10);
+  const codex = path.join(root, "catchup-codex"), claude = path.join(root, "catchup-claude");
+  fs.mkdirSync(codex); fs.mkdirSync(claude);
+  settle(buffer);
+  // Retained facts whose raw rows have gone: the production delete-repair path.
+  db.exec(`with recursive seq(n) as (select 1 union all select n+1 from seq where n<${count})
+    insert into dashboard_event_facts (projection_id,raw_rowid,source,event_type,observed_at,suppressed)
+    select 'catchup-'||n,n,'codex','otel_span','${NOW.toISOString()}',1 from seq;
+    insert into dashboard_projection_repairs (raw_rowid,reason,queued_at)
+    select raw_rowid,'raw_delete','${NOW.toISOString()}' from dashboard_event_facts;
+    update dashboard_window_totals set events=${count};
+    update dashboard_parity_window set events=${count};
+    update dashboard_projection_control set backfill_high_water=${count},backfill_cursor=${count},
+      parity_cursor=${count},dirty=1,parity_ready=0 where singleton=1;
+    update dashboard_lifetime_totals set events=${count} where singleton=1;`);
+  for (const days of [7, ...DASHBOARD_WINDOWS]) {
+    db.prepare(`insert into dashboard_source_window (days,source,events) values (?,'codex',?)`).run(days,count);
+    db.prepare(`insert into dashboard_daily_window (days,day,events) values (?,?,?)`).run(days,day,count);
+  }
+  const load = () => Math.max(...os.loadavg().slice(0, 2)) / os.cpus().length;
+  let forcedLoad: number | null = 1.01, spooling = false;
+  const maintenance = new CollectorMaintenance(buffer, new RolloutTailer(buffer,codex,()=>[]),
+    new TranscriptTailer(buffer,claude), undefined, undefined, {
+      projectionPressure: () => ({loadPerCore: forcedLoad ?? load(), intakeSpooling: spooling}) });
+  let syntheticNow = 0, due: {at: number; callback: () => void} | null = null;
+  const timer: AutomaticMaintenanceCadenceTimer = { now: () => syntheticNow,
+    setTimeout: (callback, ms) => (due = {at: syntheticNow+ms, callback}),
+    clearTimeout: () => {due = null;} };
+  const scheduler = new CoalescingMaintenanceScheduler(() => maintenance.runRecent(
+    measuredRealCadence ? {} : {projectionClock: () => syntheticNow}));
+  const cadence = new AutomaticMaintenanceCadence(scheduler, () => captureBaselineStatus(db), {
+    ...(measuredRealCadence ? {} : {timer}),
+    repairProgress: () => ({pending: buffer.projection.status().backlog.repairs > 0,
+      units: automaticRepairServiceStatus(db).stages.projection.rowsVisited}) });
+  try {
+    const loaded = (await scheduler.trigger()).at(-1)!;
+    forcedLoad = 0; spooling = true;
+    const spooled = (await scheduler.trigger()).at(-1)!;
+    forcedLoad = measuredRealCadence ? null : 0; spooling = false;
+    const before = buffer.projection.status().backlog.repairs, startLoad = load();
+    const cpu = process.cpuUsage(), started = performance.now();
+    let maxSlices = 0, maxActiveMs = 0, peakLoad = startLoad;
+    cadence.start();
+    while (buffer.projection.status().backlog.repairs > 0 && performance.now()-started < 3_600_000) {
+      if (measuredRealCadence) await new Promise(resolve => setTimeout(resolve, 100));
+      else {
+        const next = due as {at: number; callback: () => void} | null;
+        assert.ok(next); due = null; syntheticNow = next.at; next.callback();
+        while (cadence.status().inFlight) await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      const drain = scheduler.status().lastRun?.projectionDrain;
+      maxSlices = Math.max(maxSlices, drain?.slices ?? 0);
+      maxActiveMs = Math.max(maxActiveMs, drain?.activeMs ?? 0);
+      peakLoad = Math.max(peakLoad, load());
+    }
+    const elapsedMs = measuredRealCadence ? performance.now()-started : syntheticNow;
+    const used = process.cpuUsage(cpu);
+    const pending = buffer.projection.status().backlog.repairs, rate = (before-pending)/(elapsedMs/1_000);
+    const cpuFraction = (used.user+used.system)/(elapsedMs*1_000), endLoad = load();
+    check("backlog_scaled_repairs_drain_on_real_cadence_and_busy_hosts_keep_one_slice",
+      loaded.projectionDrain?.slices === 1 && spooled.projectionDrain?.slices === 1 &&
+      projectionRepairAllowance(count,0,false).maxSlices > projectionRepairAllowance(10_000,0,false).maxSlices &&
+      pending === 0 && rate > 2_100_000/86_400 && (!measuredRealCadence || cpuFraction <= 0.25) && maxSlices > 1 &&
+      (db.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n === 0 &&
+      Object.values(automaticRepairServiceStatus(db).stages).every(stage=>stage.completed>0),
+      {measuredRealCadence,count,before,pending,elapsedMs,rowsPerSecond:rate,extrapolatedHours:2_100_000/rate/3_600,
+        cpuFraction: measuredRealCadence ? cpuFraction : null,maxSlices,activeMsPer5s:maxActiveMs,startLoad,peakLoad,endLoad});
+  } finally {
+    cadence.stop(); scheduler.stopAccepting(); await scheduler.waitForIdle();
+    maintenance.close(); buffer.close();
+  }
+}
+
 async function proveMillionFactDuplicateRepairCadence(root: string, slow = false,
   reference?: MillionFactRowCosts): Promise<MillionFactRowCosts> {
   const prefix = slow ? "slow-" : "";
@@ -1529,6 +1606,11 @@ async function main() {
   ];
 
   try {
+    if (process.argv.includes("--repair-catchup-only")) {
+      await proveProjectionRepairCatchup(root);
+      console.log(JSON.stringify({status:"pass",checks},null,2));
+      return;
+    }
     if (process.argv.includes("--r10-guard-only")) {
       proveNegativeTotalPublicationGuard(root);
       console.log(JSON.stringify({status:"pass",checks},null,2));
@@ -1612,6 +1694,7 @@ async function main() {
     proveMillionFactVersionFenceCost(root);
     const millionDuplicateReference = await proveMillionFactDuplicateRepairCadence(root);
     await proveMillionFactDuplicateRepairCadence(root, true, millionDuplicateReference);
+    await proveProjectionRepairCatchup(root);
     await prove044RollbackScanFence(root);
     buffer.recordRepoLabel(repoA, "proof/repo-a");
     buffer.recordRepoLabel(repoB, "proof/repo-b");
@@ -5447,6 +5530,8 @@ async function main() {
           "million_duplicate_fact_scan_drains_repairs_on_fast_production_cadence")?.detail,
         millionDuplicateSlowCadence:checks.find((entry)=>entry.name===
           "million_duplicate_slow_rows_obey_active_budget_on_production_scheduler")?.detail,
+        repairCatchup:checks.find((entry)=>entry.name===
+          "backlog_scaled_repairs_drain_on_real_cadence_and_busy_hosts_keep_one_slice")?.detail,
         idleRestartReads:restartReads,
         missedClaude:missedClaudeEvidence,
         compactStorage:checks.find((entry)=>entry.name==="generic_zero_value_spans_use_bounded_compressed_projection_storage")?.detail,
