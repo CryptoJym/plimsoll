@@ -11,7 +11,7 @@ import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js
 import { accountKey, Accounts, profileAccount } from './accounts.js';
 import { globRoots } from './glob.js';
 import { addSdk, sdkHours, sdkLaunches, refreshSdk } from './sdk.js';
-import { SdkCapture } from './sdk-reader.js';
+import { SdkCapture, activity } from './sdk-reader.js';
 import { claudeUsage } from './claude-usage.js';
 import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
 
@@ -704,7 +704,9 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       const tag = launches.get(session), account = sourceAccount === 'unknown' || tag ? accounts.resolve(tag?.seat ?? '') : sourceAccount;
       return { account, project: tag?.project ?? projects.hint(cwd, 'claude_code', session).projectHint };
     }, options.sdkJournal, options.backfill);
-    for (const root of sources) if (root.aggregate && root.tool === 'claude_code') {
+    // Newest folder first: a freshly started brain is read in its first pass.
+    const aggregates = sources.filter(root => root.aggregate && root.tool === 'claude_code').map(root => ({ root, at: activity(root.path) })).sort((a, b) => b.at - a.at);
+    for (const { root } of aggregates) {
       sourceAccount = claudeAccount(root.path, home, options.env ?? process.env, accounts);
       const captured = capture.root(root.path, since => root.files ?? files(root.path, visited, since, root.tool, home));
       stats.files += captured.files; stats.bytesRead += captured.bytes;

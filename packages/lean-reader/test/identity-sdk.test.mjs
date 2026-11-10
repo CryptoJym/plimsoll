@@ -83,3 +83,17 @@ test('a sidecar can name a fixed-root session; learning a glob account replaces 
   assert.ok(Object.values(result.state.velocity).filter(r => r.replies).every(r => r.accountKey === key));
   assert.deepEqual(Object.keys(result.state.files), [fs.realpathSync(fixed)]); assert.ok(!Object.hasOwn(result.state.files, fs.realpathSync(temp)));
 });
+
+test('the newest glob root is read first, and a root of read files still reaches its unread ones', t => {
+  const { home, write, options } = setup(t);
+  const config = { rootsOnly: true, roots: [{ tool: 'claude_code', path: home + '/temp/hindsight-claude-code-*/projects' }] };
+  const old = Date.parse('2026-11-09T00:00:00Z') / 1000, fresh = Date.parse('2026-11-09T06:00:00Z') / 1000;
+  for (let i = 0; i < 1200; i++) fs.utimesSync(write(`temp/hindsight-claude-code-a/projects/x/${String(i).padStart(4, '0')}.jsonl`, line(reply(`a${i}`, `a${i}`))), old, old);
+  fs.utimesSync(path.join(home, 'temp/hindsight-claude-code-a/projects/x'), old, old);
+  fs.utimesSync(write('temp/hindsight-claude-code-b/projects/x/b.jsonl', line(reply('b', 'b-session'))), fresh, fresh);
+  let result = scan({ ...options, config, backfill: false });
+  assert.equal(total(result.rows), 1200); assert.ok(result.rows.some(r => r.sessionKey === 'b-session'));
+  assert.deepEqual(Object.keys(result.state.sdkRoots).map(r => path.basename(path.dirname(r))), ['hindsight-claude-code-b']);
+  result = scan({ ...options, config, backfill: false, state: result.state });
+  assert.equal(total(result.rows), 1201); assert.equal(Object.keys(result.state.sdkRoots).length, 2);
+});

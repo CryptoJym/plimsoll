@@ -51,11 +51,22 @@ export function sdkJournal(state: State, dir: string) {
   };
 }
 
+/** Newest directory activity under a root: a call file is created per call, so
+ * a live brain folder reads first and a dead one is told apart cheaply. */
+export function activity(root: string): number {
+  let newest = 0;
+  try {
+    newest = fs.statSync(root).mtimeMs;
+    for (const name of fs.readdirSync(root)) { try { newest = Math.max(newest, fs.statSync(path.join(root, name)).mtimeMs); } catch { /* gone */ } }
+  } catch { /* unreadable roots are refused by enumeration */ }
+  return newest;
+}
+
 /** One capture owns the global pass budget across every expanded glob root.
  * Only the current file's small session/hour deltas and ID set are transient. */
 export class SdkCapture {
   private ids: SdkIds;
-  private files = 0; private bytes = 0; private started = performance.now();
+  private files = 0; private bytes = 0; private reading = 0;
   private room: number;
   constructor(private state: State, private now: number, private since: number, private until: number,
     private identity: (session: string, cwd: string) => { account: string; project: string | null },
@@ -67,23 +78,27 @@ export class SdkCapture {
     for (const [file, cursor] of Object.entries(state.sdkFiles ?? {})) if (cursor[4] < since || (cursor[4] < closed && Object.entries(state.sdkRoots ?? {}).some(([root, start]) => file.startsWith(root + path.sep) && cursor[4] < start - SLACK))) delete state.sdkFiles![file];
     this.room = MAX_STATE - SLICE - stateBytes(state, MAX_STATE);
   }
-  private full(): boolean { return this.room <= 0 || this.files >= FILES || this.bytes >= BYTES || performance.now() - this.started >= 12_000; }
+  private full(): boolean { return this.room <= 0 || this.files >= FILES || this.bytes >= BYTES || this.reading >= 12_000; }
   root(root: string, files: (since: number) => Iterable<SourceFile>): { files: number; bytes: number } {
     const beforeFiles = this.files, beforeBytes = this.bytes;
-    const since = this.backfill ? this.since : Math.max(this.since, (this.state.sdkRoots?.[root] ?? this.since) - SLACK);
+    const watermark = this.backfill ? undefined : this.state.sdkRoots?.[root];
+    // A watermarked root whose directories are untouched since holds no newer file.
+    if (watermark !== undefined && activity(root) < watermark - SLACK) return { files: 0, bytes: 0 };
+    const since = watermark === undefined ? this.since : Math.max(this.since, watermark - SLACK);
     let complete = true;
     for (const source of files(since)) {
-      if (this.full()) { complete = false; break; }
-      const file = source.file;
-      let stat: fs.Stats;
-      try { stat = fs.statSync(file); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw new Error('source_unreadable'); }
+      // Skipping costs the budget nothing, so a root of thousands of read files
+      // still reaches its unread ones; only reading is charged.
+      const file = source.file, stat = source.stat;
       if (stat.mtimeMs < since) continue;
       const cursor = this.state.sdkFiles?.[file];
       const offset = !this.backfill && cursor && cursor[0] === stat.dev && cursor[1] === stat.ino && (stat.size > cursor[2] || (stat.size === cursor[2] && stat.mtimeMs === cursor[4])) ? cursor[3] : 0;
       if (offset === stat.size) continue;
+      if (this.full()) { complete = false; break; }
       if (stat.size - offset <= SLICE && stat.size - offset > BYTES - this.bytes) { complete = false; break; }
-      const local = new Set<string>(), groups: Record<string, string[]> = {}, delta = { sdk: {} } as State;
-      const result = readLines(file, offset, Math.min(stat.size, offset + BYTES - this.bytes), (r, end) => {
+      const local = new Set<string>(), groups: Record<string, string[]> = {}, delta = { sdk: {} } as State, started = performance.now();
+      let result: { offset: number; bytes: number };
+      try { result = readLines(file, offset, Math.min(stat.size, offset + BYTES - this.bytes), (r, end) => {
         if (r.type === 'assistant' && r.timestamp && r.message?.usage) {
           const time = Date.parse(r.timestamp);
           if (Number.isFinite(time) && time >= this.since && time < this.until) for (const item of claudeUsage(r)) {
@@ -96,7 +111,8 @@ export class SdkCapture {
           }
         }
         if (end - offset >= SLICE || local.size >= 256) return false;
-      }, false, undefined, this.started + 12_000);
+      }, false, undefined, started + 12_000 - this.reading); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw new Error('source_unreadable'); }
+      this.reading += performance.now() - started;
       const packed = Object.fromEntries(Object.entries(groups).map(([hour, keys]) => [hour, Buffer.from(keys.sort().join(''), 'hex').toString('base64')]));
       const rows: SdkCommit['rows'] = [];
       for (const [day, sessions] of Object.entries(delta.sdk!)) for (const [id, row] of Object.entries(sessions)) rows.push([day, id, row]);
