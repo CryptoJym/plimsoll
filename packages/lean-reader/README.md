@@ -339,8 +339,12 @@ node /absolute/path/plimsoll-lean.mjs uninstall
 Installation creates and bootstraps
 `~/Library/LaunchAgents/com.plimsoll.lean-reader.plist`, using the Node executable
 from the existing Plimsoll LaunchAgent when available, otherwise the current
-Node. It sets `StartInterval=300`, `RunAtLoad`, `ProcessType=Background`,
-`LowPriorityIO`, and `Nice=10`. Provider-root environment overrides are preserved.
+Node. It sets `StartInterval=300`, `RunAtLoad`, `ProcessType=Standard`,
+`LowPriorityIO=false`, and `Nice=10`. Provider-root environment overrides are preserved.
+A Background job runs at priority 4 on the efficiency cores with throttled I/O and
+can wait without end on a loaded Mac: on 2026-11-10 studio1 (load 150 on 32 cores)
+gave one pass 9 s of CPU in 44 minutes and it took 2,996 s; the next pass under
+Standard took 103 s. Nice 10 keeps the reader behind ordinary work.
 Use the default config/state locations for installed runs. Uninstall unloads and
 removes this reader's plist; local state and logs remain available for inspection.
 The existing collector continues independently during shadow comparison.
