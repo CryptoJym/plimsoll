@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.63 — 2026-11-09
+
+- The dashboard projection repair backlog drains on spare capacity (plimsoll
+  N123, N47, N89): a backlog-scaled allowance runs up to 40 slices of 25 ms
+  per 5 s turn while load per core stays under 1 and intake is not spooling,
+  and falls back to today's single slice otherwise. Every rollout host had
+  read degraded since early October at about 280 repairs an hour (2.06 million
+  on studio4, about 300 days); the fixture drains 200,000 repairs at 218 rows
+  a second on 3.4 percent of one core.
+- One unreadable session no longer freezes the session-sync horizon (plimsoll
+  N105, N103): a summary read interrupted by the storage-busy budget marks its
+  session pending with a reason and the walk carries on, the horizon advances
+  past the sessions that completed, and the interrupted session's read chunk
+  halves and resumes across cycles until it completes. studio3 and studio1 had
+  sat behind one 4,010-event session for hours; a daemon restart did not help.
+  The daemon state carries `pendingSessionReads` (session, reason, cycles) for
+  readers.
+- Lean reader (plimsoll N115, N125): a seat whose `.claude.json` carries no
+  account resolves through the email-to-key map learned from the other seats
+  and a shared `~/.local/state/plimsoll-lean/account-keys.json`; hash-to-email
+  labels land in `account-labels.json` beside the reader for the cloud's
+  `provider_account_labels`; glob roots (the colony brain's temp config dirs)
+  are read per UTC day and session, with seat and project taken from
+  `launches-sdk.jsonl`, inside the existing upload contract.
+
 ## 0.7.62 — 2026-11-09
 
 - A host that re-upgrades over a projection an older binary refused no longer
