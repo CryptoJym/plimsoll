@@ -261,8 +261,10 @@ function claudeAccount(root: string, home: string, env: Record<string, string | 
 }
 
 function prune(state: State, cutoff: number) {
+  // A sent SDK day is kept two days for cross-day session merges; the packed
+  // reply ids, not these rows, stop a reread from counting twice.
   for (const [day, sessions] of Object.entries(state.sdk ?? {})) {
-    if (Date.parse(day) + 24 * HOUR <= cutoff && Object.values(sessions).every(row => !row[6])) delete state.sdk![day];
+    if (Date.parse(day) + 24 * HOUR <= cutoff + WINDOW - 2 * 24 * HOUR && Object.values(sessions).every(row => !row[6])) delete state.sdk![day];
   }
   for (const [key, row] of Object.entries(state.hours)) if (Date.parse(row.hour) < cutoff && !state.pending[key]) delete state.hours[key];
   for (const [key, row] of Object.entries(state.velocity ?? {})) if (Date.parse(row.hour) < cutoff && !state.velocityPending?.[key]) delete state.velocity[key];

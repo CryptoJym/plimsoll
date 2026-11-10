@@ -9,7 +9,9 @@ import { stateBytes } from './state-json.js';
 import { claudeUsage } from './claude-usage.js';
 import { HOUR, MAX_STATE, string, type State, type SourceFile, type SdkCursor, type SdkSession } from './types.js';
 
-const SLACK = 5 * 60_000, FILES = 1200, BYTES = 512 * 1024 * 1024, SLICE = 1024 * 1024;
+// Reading is the only charge, so a pass on a loaded hub still reads for a minute;
+// the file cap bounds state growth (a cursor and a session row per file).
+const SLACK = 5 * 60_000, FILES = 4000, BYTES = 512 * 1024 * 1024, SLICE = 1024 * 1024, READ_MS = 60_000;
 export type SdkCommit = { type: 'event_msg'; seq: number; file: string; cursor: SdkCursor; rows: [string, string, SdkSession][]; ids: Record<string, string> };
 function apply(state: State, commit: SdkCommit, ids: SdkIds): void {
   if (!Number.isSafeInteger(commit.seq)) throw new Error('invalid_state');
@@ -78,7 +80,7 @@ export class SdkCapture {
     for (const [file, cursor] of Object.entries(state.sdkFiles ?? {})) if (cursor[4] < since || (cursor[4] < closed && Object.entries(state.sdkRoots ?? {}).some(([root, start]) => file.startsWith(root + path.sep) && cursor[4] < start - SLACK))) delete state.sdkFiles![file];
     this.room = MAX_STATE - SLICE - stateBytes(state, MAX_STATE);
   }
-  private full(): boolean { return this.room <= 0 || this.files >= FILES || this.bytes >= BYTES || this.reading >= 12_000; }
+  private full(): boolean { return this.room <= 0 || this.files >= FILES || this.bytes >= BYTES || this.reading >= READ_MS; }
   root(root: string, files: (since: number) => Iterable<SourceFile>): { files: number; bytes: number } {
     const beforeFiles = this.files, beforeBytes = this.bytes;
     const since = this.backfill ? this.since : Math.max(this.since, (this.state.sdkRoots?.[root] ?? this.since) - SLACK);
@@ -110,7 +112,7 @@ export class SdkCapture {
           }
         }
         if (end - offset >= SLICE || local.size >= 256) return false;
-      }, false, undefined, started + 12_000 - this.reading); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw new Error('source_unreadable'); }
+      }, false, undefined, started + READ_MS - this.reading); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw new Error('source_unreadable'); }
       this.reading += performance.now() - started;
       const packed = Object.fromEntries(Object.entries(groups).map(([hour, keys]) => [hour, Buffer.from(keys.sort().join(''), 'hex').toString('base64')]));
       const rows: SdkCommit['rows'] = [];
