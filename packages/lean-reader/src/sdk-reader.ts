@@ -52,7 +52,7 @@ export function sdkJournal(state: State, dir: string) {
 }
 
 /** Newest directory activity under a root: a call file is created per call, so
- * a live brain folder reads first and a dead one is told apart cheaply. */
+ * a live brain folder sorts first. Priority only; every root is still read. */
 export function activity(root: string): number {
   let newest = 0;
   try {
@@ -81,15 +81,14 @@ export class SdkCapture {
   private full(): boolean { return this.room <= 0 || this.files >= FILES || this.bytes >= BYTES || this.reading >= 12_000; }
   root(root: string, files: (since: number) => Iterable<SourceFile>): { files: number; bytes: number } {
     const beforeFiles = this.files, beforeBytes = this.bytes;
-    const watermark = this.backfill ? undefined : this.state.sdkRoots?.[root];
-    // A watermarked root whose directories are untouched since holds no newer file.
-    if (watermark !== undefined && activity(root) < watermark - SLACK) return { files: 0, bytes: 0 };
-    const since = watermark === undefined ? this.since : Math.max(this.since, watermark - SLACK);
+    const since = this.backfill ? this.since : Math.max(this.since, (this.state.sdkRoots?.[root] ?? this.since) - SLACK);
     let complete = true;
     for (const source of files(since)) {
       // Skipping costs the budget nothing, so a root of thousands of read files
       // still reaches its unread ones; only reading is charged.
-      const file = source.file, stat = source.stat;
+      const file = source.file;
+      let stat: fs.Stats;
+      try { stat = fs.statSync(file); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw new Error('source_unreadable'); }
       if (stat.mtimeMs < since) continue;
       const cursor = this.state.sdkFiles?.[file];
       const offset = !this.backfill && cursor && cursor[0] === stat.dev && cursor[1] === stat.ino && (stat.size > cursor[2] || (stat.size === cursor[2] && stat.mtimeMs === cursor[4])) ? cursor[3] : 0;
