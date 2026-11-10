@@ -13,7 +13,8 @@ export function globRoots(pattern: string, home: string): string[] {
       if (protectedPath(root, home)) continue;
       let names: string[];
       try { names = part.includes('*') ? fs.readdirSync(root).filter(n => expression.test(n)).sort() : [part]; } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        // Another user's temp folder under /var/folders is not ours to read; skip it like a missing one.
+        if (['ENOENT', 'EACCES', 'EPERM'].includes((e as NodeJS.ErrnoException).code ?? '')) continue;
         throw new Error('source_unreadable');
       }
       for (const name of names) {
@@ -22,7 +23,7 @@ export function globRoots(pattern: string, home: string): string[] {
           if (protectedPath(candidate, home) || !fs.statSync(candidate).isDirectory()) continue;
           const real = fs.realpathSync(candidate);
           if (!protectedPath(real, home)) next.push(real);
-        } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('source_unreadable'); }
+        } catch (e) { if (!['ENOENT', 'EACCES', 'EPERM'].includes((e as NodeJS.ErrnoException).code ?? '')) throw new Error('source_unreadable'); }
       }
     }
     roots = [...new Set(next)];
