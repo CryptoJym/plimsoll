@@ -7,7 +7,9 @@
   days, dirty sessions, account invalidations, expiry windows and window
   rebuilds. A host between one and two load per core gets a bounded quarter
   share, at most 10 slices, instead of one; intake spooling still means one
-  slice. Timed passes drain mutations, GC units and dirty-session chunks in
+  slice. Catch-up uses only the admission budget left after capture and
+  stops admitting slices at the shared 200 ms ceiling. Timed passes drain
+  mutations, GC units and dirty-session chunks in
   small batches, so a turn is not spent on eight mutations while sessions wait.
   The live reads showed studio4 at load 1.2 per core with 11,068 dirty sessions
   falling about two a minute and only two repairs, while quiet studio5's

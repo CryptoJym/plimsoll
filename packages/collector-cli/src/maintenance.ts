@@ -1336,8 +1336,8 @@ export class CollectorMaintenance {
       transcript,
       grok,
     );
-    // Bonus work follows capture, coverage and the rotating repair stages. It
-    // never spends their shared 200 ms admission budget or changes scan cadence.
+    // Catch-up follows capture, coverage and the rotating repair stages, using
+    // only the admission budget they leave before the shared 200 ms ceiling.
     const catchupAt = options.projectionClock?.() ?? performance.now();
     if (!migrationPending && catchupAt >= this.projectionCatchupAfter && !this.signal?.aborted) {
       const backlog = this.buffer.projection.status().backlog;
@@ -1355,10 +1355,10 @@ export class CollectorMaintenance {
           current.loadPerCore, current.intakeSpooling);
       };
       const grant = allowance();
-      if (grant.maxSlices > 1) {
+      if (grant.maxSlices > 1 && budget.canStart(5)) {
         this.projectionCatchupAfter = catchupAt + 5_000;
         await executeRepairStage("projection", { maxSlices: grant.maxSlices - 1,
-          maxActiveMs: grant.maxActiveMs - 25 }, () => allowance().maxSlices > 1);
+          maxActiveMs: grant.maxActiveMs - 25 }, () => allowance().maxSlices > 1 && budget.canStart(5));
         // Completing an empty session, GC day or other publication queue is
         // progress too: retain the five-second retry even without fact rows.
         const remaining = this.buffer.projection.status().backlog;
