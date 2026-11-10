@@ -173,6 +173,7 @@
     "proof:session-carry-retry-budget": "tsx scripts/session-carry-retry-budget-proof.ts",
     "proof:sync-backoff": "tsx scripts/sync-backoff-proof.ts",
     "proof:session-sync-daemon": "tsx scripts/run-proof.ts scripts/session-sync-daemon-proof.ts",
+    "proof:session-sync-horizon": "tsx scripts/run-proof.ts scripts/session-sync-horizon-proof.ts",
     "proof:session-sync-upgrade": "tsx scripts/session-sync-upgrade-proof.ts",
     "proof:session-sync-worker-parity": "tsx scripts/session-sync-worker-parity-proof.ts",
     "proof:session-sync-liveness": "tsx scripts/session-sync-liveness-proof.ts",

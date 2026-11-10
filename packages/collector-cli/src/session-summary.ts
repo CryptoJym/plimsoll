@@ -74,6 +74,8 @@ type SummaryRepair = {
 
 type SummaryAccumulator = SummaryAggregate & {
   sessionId: string;
+  /** Persist a smaller SQL chunk after a deadline, including zero-row passes. */
+  readLimit: number;
   /** Rows through this rowid belong to the frozen historical scan. */
   scanBoundary: number;
   /** Historical scan cursor follows idx_events_session (session, observation, rowid). */
@@ -980,7 +982,7 @@ function emptyAggregate(): SummaryAggregate {
 
 function emptyAccumulator(sessionId: string): SummaryAccumulator {
   return {
-    ...emptyAggregate(), sessionId, scanBoundary: 0,
+    ...emptyAggregate(), sessionId, readLimit: SESSION_SUMMARY_DEFAULT_MAX_ROWS, scanBoundary: 0,
     cursorObservedAt: null, cursorRowid: 0, cursorId: null,
     checkpointSearchRowid: null,
     segments: {}, legacyAggregate: null, legacyHighWater: 0,
@@ -1170,6 +1172,8 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
     const parsed = JSON.parse(value) as Partial<SummaryAccumulator>;
     const candidate = { ...emptyAccumulator(sessionId), ...parsed } as SummaryAccumulator;
     if (candidate.sessionId !== sessionId) return null;
+    if (!Number.isSafeInteger(candidate.readLimit) || candidate.readLimit < 1 ||
+        candidate.readLimit > SESSION_SUMMARY_DEFAULT_MAX_ROWS) return null;
     if (typeof parsed.scanBoundary !== "number" ||
         !Number.isSafeInteger(parsed.scanBoundary) || parsed.scanBoundary < 0) return null;
     if (typeof candidate.cursorObservedAt !== "string" && candidate.cursorObservedAt !== null) return null;
@@ -2004,7 +2008,7 @@ async function updateSessionSummaryAttempt(
     throw new Error("session_summary_until_invalid");
   }
   state.coveredUntil = until;
-  const queryLimit = Math.min(maxRows, 5_000);
+  const queryLimit = Math.min(maxRows, state.accumulator.readLimit);
   let rowsRead = 0;
   let rowsApplied = 0;
   let complete = state.accumulator.scanComplete && state.mode !== "incremental";
@@ -2029,6 +2033,7 @@ async function updateSessionSummaryAttempt(
       ]);
     } catch (error) {
       if (error instanceof Error && error.message.includes("session_summary_read_interrupted")) {
+        state.accumulator.readLimit = Math.max(1, Math.floor(limit / 2));
         readInterrupted = true;
         break;
       }
@@ -2090,7 +2095,7 @@ async function updateSessionSummaryAttempt(
           aggregate: emptyAggregate(),
         };
       }
-      const limit = maxRows - rowsRead;
+      const limit = Math.min(state.accumulator.readLimit, maxRows - rowsRead);
       try {
         const repairRows = await options.read<RawSummaryRow>([
           repairRowsQuery(db, sessionId, repair, state.highWater, limit,
@@ -2118,21 +2123,13 @@ async function updateSessionSummaryAttempt(
         }
       } catch (error) {
         if (error instanceof Error && error.message.includes("session_summary_read_interrupted")) {
+          state.accumulator.readLimit = Math.max(1, Math.floor(limit / 2));
           readInterrupted = true;
         } else throw error;
       }
     }
   }
   refreshAggregate(state.accumulator);
-
-  if (readInterrupted && rowsRead === 0) {
-    return finish({
-      snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
-      durationMs: Math.round(performance.now() - started), highWater: state.highWater,
-      mode, fullRecompute, fallbackReason: "rows_read_timeout",
-      mutationRevision: state.mutationRevision,
-    }, true);
-  }
 
   // Revision, queued-row check, and state write share one write transaction.
   // A concurrent append can land before it (and is observed) or afterward
@@ -2162,7 +2159,7 @@ async function updateSessionSummaryAttempt(
     }
     const repairsRemaining = repairQueueRow(db, sessionId) !== null ||
       state.accumulator.activeRepair !== null || dueSegment(state.accumulator, until) !== null;
-    const finalComplete = complete && revisionStable && noQueuedRows && !repairsRemaining;
+    const finalComplete = complete && !readInterrupted && revisionStable && noQueuedRows && !repairsRemaining;
     state.complete = finalComplete;
     state.mode = complete ? "incremental" : needsFallback ? "fallback" : state.mode;
     writeState(db, state);
@@ -2194,12 +2191,12 @@ async function updateSessionSummaryAttempt(
     highWater: state.highWater,
     mode: finalMode,
     fullRecompute,
-    fallbackReason: fullRecompute ? reason
+    fallbackReason: readInterrupted ? "rows_read_timeout" : fullRecompute ? reason
       : !stability.revisionStable ? "ledger_mutation_during_slice"
       : !stability.activityStable ? "ledger_edit_during_slice"
       : stability.repairsRemaining ? "segment_repair_in_progress"
       : !complete && state.mode === "fallback" ? "fallback_in_progress"
       : !stability.noQueuedRows ? "append_queue" : null,
     mutationRevision: state.mutationRevision,
-  });
+  }, readInterrupted && rowsRead === 0);
 }

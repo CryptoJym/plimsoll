@@ -315,6 +315,7 @@ import {
   advanceLegacySessionSummaryRebuild,
   beginLegacySessionSummaryRebuild,
   commitDaemonSessionSyncFailure,
+  commitDaemonSessionSyncResult,
   commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState,
   planDaemonSessionSync,
@@ -4038,18 +4039,10 @@ async function main() {
               // Only the completed historical scan may advance the daemon's
               // full-catch-up horizon. A current-id batch still uploads real
               // complete snapshots and retains unfinished ids for next time.
-              const unfinished = new Set(sessionResult.pendingSummarySessionIds);
-              const completed = sessionResult.ok
-                ? new Set(foregroundIds.filter((id) => !unfinished.has(id)))
-                : new Set<string>();
-              const blockedNext = new Set([
-                ...blocked, ...sessionResult.rejectedSessionIds,
-              ]);
-              pendingSessionIds = [...new Set([
-                ...pendingSessionIds.filter((id) => !completed.has(id)), ...unfinished,
-              ])].filter((id) => !blockedNext.has(id));
-              sessionSyncState = { ...sessionSyncState, pendingSessionIds,
-                blockedSessionIds: [...blockedNext] };
+              sessionSyncState = commitDaemonSessionSyncResult(
+                sessionSyncState, foregroundIds, sessionResult, false,
+              );
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
               if (sessionResult.ok && sessionResult.summaryComplete &&
                   currentIds.length === foregroundIds.length && sessionSyncState.caughtUp) {
                 sessionSyncState = commitDaemonSessionSyncSuccess(
@@ -4057,27 +4050,10 @@ async function main() {
                 );
                 pendingSessionIds = sessionSyncState.pendingSessionIds;
               }
-            } else if (sessionResult.ok && sessionResult.summaryComplete) {
-              sessionSyncState = commitDaemonSessionSyncSuccess(
-                sessionSyncState,
-                sessionPlan.until,
-                sessionResult.rejectedSessionIds,
-              );
-              pendingSessionIds = sessionSyncState.pendingSessionIds;
-            } else if (sessionResult.ok) {
-              // A bounded summary slice is a successful maintenance step, but
-              // it is not a valid daemon horizon advance until every touched
-              // session has a complete accumulator. Keep the exact ids for the
-              // next cycle and never send a partial snapshot.
-              sessionSyncState = commitDaemonSessionSyncFailure(
-                sessionSyncState,
-                sessionPlan.sessionIds === undefined
-                  ? undefined
-                  : [...sessionPlan.sessionIds, ...summaryPending],
-              );
-              pendingSessionIds = sessionSyncState.pendingSessionIds;
             } else {
-              sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
+              sessionSyncState = commitDaemonSessionSyncResult(
+                sessionSyncState, sessionPlan.sessionIds, sessionResult,
+              );
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             }
             for (const settlement of sessionResult.settlements) {

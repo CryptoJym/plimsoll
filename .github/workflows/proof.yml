@@ -922,7 +922,9 @@ jobs:
 
       - name: Prove daemon session sync catch-up without upload-history (eco-6hoxj.70.1)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        run: pnpm proof:session-sync-daemon
+        run: |
+          pnpm proof:session-sync-daemon
+          pnpm proof:session-sync-horizon
 
       - name: Prove incremental session summary exactness and race fences (eco-6hoxj.163.41)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

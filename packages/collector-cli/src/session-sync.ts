@@ -13,7 +13,7 @@ import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
 import { BOUNDED_SQL_READ_PREDICATE, BoundedSqlReadError, boundedSqlRows } from "./bounded-sql-read";
 import { TransportError } from "./http-transport";
-import { SyncStorageRetryController } from "./sqlite-contention";
+import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { POSTGRES_UUID_RE as DELIVERY_UUID_RE, RETENTION_DELIVERY_ID_WORKER_SOURCE } from "./delivery-id";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
@@ -137,6 +137,8 @@ const sessionReadWorkerSource = `
         id: message.id,
         error: error && error.code === 'SQLITE_INTERRUPT'
           ? 'session_summary_read_interrupted'
+          : error && /^SQLITE_(BUSY|LOCKED)/.test(error.code)
+          ? 'sync_storage_busy'
           : error instanceof Error ? error.message : String(error),
       });
     }
@@ -448,13 +450,15 @@ const MAX_SESSION_ID_CHARS = 128;
 
 export type DaemonSessionSyncState = {
   schemaVersion: typeof DAEMON_SESSION_SYNC_SCHEMA_VERSION;
-  /** False until a full ledger walk has been accepted. */
+  /** False until a full walk uploads complete summaries and carries the rest. */
   caughtUp: boolean;
   lastSuccessfulUntil: string | null;
   pendingSessionIds: string[];
   /** Explicit cloud rejections are retained locally and excluded from the
    * next automatic walk. They are not counted as acknowledged progress. */
   blockedSessionIds?: string[];
+  /** Bounded diagnostics for unfinished reads; removed when the id completes. */
+  pendingSessionReads?: Array<{ sessionId: string; reason: string; cycles: number }>;
   clockSkewRefusalStreak?: number;
   clockSkewServerTime?: string | null;
   clockSkewRetryAt?: string | null;
@@ -476,6 +480,7 @@ export function emptyDaemonSessionSyncState(): DaemonSessionSyncState {
     lastSuccessfulUntil: null,
     pendingSessionIds: [],
     blockedSessionIds: [],
+    pendingSessionReads: [],
     clockSkewRefusalStreak: 0,
     clockSkewServerTime: null,
     clockSkewRetryAt: null,
@@ -522,6 +527,21 @@ function mergeSessionIds(...groups: Array<Iterable<string>>): string[] {
   return out;
 }
 
+function sanitizePendingSessionReads(value: unknown, pendingIds: string[]):
+  NonNullable<DaemonSessionSyncState["pendingSessionReads"]> {
+  if (!Array.isArray(value)) return [];
+  const pending = new Set(pendingIds);
+  const seen = new Set<string>();
+  return value.slice(0, MAX_PENDING_SESSION_IDS).filter((entry) => {
+    if (!entry || typeof entry.sessionId !== "string" || !pending.has(entry.sessionId) ||
+        seen.has(entry.sessionId) || typeof entry.reason !== "string" ||
+        !/^[a-z0-9_]{1,96}$/.test(entry.reason) || !Number.isSafeInteger(entry.cycles) ||
+        entry.cycles < 1) return false;
+    seen.add(entry.sessionId);
+    return true;
+  }).map(({ sessionId, reason, cycles }) => ({ sessionId, reason, cycles: Math.min(cycles, 65_535) }));
+}
+
 export function loadDaemonSessionSyncState(db: Database.Database): DaemonSessionSyncState {
   const empty = emptyDaemonSessionSyncState();
   try {
@@ -536,6 +556,7 @@ export function loadDaemonSessionSyncState(db: Database.Database): DaemonSession
       lastSuccessfulUntil?: unknown;
       pendingSessionIds?: unknown;
       blockedSessionIds?: unknown;
+      pendingSessionReads?: unknown;
       clockSkewRefusalStreak?: unknown;
       clockSkewServerTime?: unknown;
       clockSkewRetryAt?: unknown;
@@ -565,6 +586,7 @@ export function loadDaemonSessionSyncState(db: Database.Database): DaemonSession
       lastSuccessfulUntil: parsed.lastSuccessfulUntil,
       pendingSessionIds,
       blockedSessionIds,
+      pendingSessionReads: sanitizePendingSessionReads(parsed.pendingSessionReads, pendingSessionIds),
       clockSkewRefusalStreak: Number.isSafeInteger(parsed.clockSkewRefusalStreak) &&
         Number(parsed.clockSkewRefusalStreak) >= 0 ? Math.min(3, Number(parsed.clockSkewRefusalStreak)) : 0,
       clockSkewServerTime: typeof parsed.clockSkewServerTime === "string" &&
@@ -594,6 +616,7 @@ export function saveDaemonSessionSyncState(
           lastSuccessfulUntil: state.lastSuccessfulUntil,
           pendingSessionIds,
           blockedSessionIds,
+          pendingSessionReads: sanitizePendingSessionReads(state.pendingSessionReads, pendingSessionIds),
           clockSkewRefusalStreak: Math.max(0, Math.min(3, state.clockSkewRefusalStreak ?? 0)),
           clockSkewServerTime: state.clockSkewServerTime ?? null,
           clockSkewRetryAt: state.clockSkewRetryAt ?? null,
@@ -1012,6 +1035,39 @@ export function commitDaemonSessionSyncFailure(
   return { ...state, pendingSessionIds, blockedSessionIds: [...blocked] };
 }
 
+/** A successful walk may advance with durable per-session carry. No partial
+ * accumulator is uploaded; network failures still retain the old horizon. */
+export function commitDaemonSessionSyncResult(
+  state: DaemonSessionSyncState,
+  attemptedIds: string[] | undefined,
+  result: SessionSyncResult,
+  advanceHorizon = true,
+): DaemonSessionSyncState {
+  const blocked = mergeSessionIds(state.blockedSessionIds ?? [], result.rejectedSessionIds);
+  const blockedSet = new Set(blocked);
+  const attempted = attemptedIds === undefined ? null : new Set(attemptedIds);
+  const pending = mergeSessionIds(
+    state.pendingSessionIds.filter((id) => !result.ok || (attempted !== null && !attempted.has(id))),
+    result.ok ? [] : attemptedIds ?? [],
+    result.pendingSummarySessionIds,
+  ).filter((id) => !blockedSet.has(id));
+  const previousReads = new Map((state.pendingSessionReads ?? []).map((entry) => [entry.sessionId, entry]));
+  const reasons = result.pendingSummarySessionReasons;
+  const pendingSessionReads = pending.flatMap((sessionId) => {
+    const prior = previousReads.get(sessionId);
+    const reason = reasons[sessionId];
+    return reason ? [{ sessionId, reason, cycles: Math.min(65_535, (prior?.cycles ?? 0) + 1) }]
+      : prior ? [prior] : [];
+  }).slice(0, MAX_PENDING_SESSION_IDS);
+  const next = { ...state, blockedSessionIds: blocked, pendingSessionIds: pending, pendingSessionReads };
+  if (pending.length > MAX_PENDING_SESSION_IDS) {
+    return { ...next, caughtUp: false, pendingSessionIds: [], pendingSessionReads: [] };
+  }
+  return result.ok && advanceHorizon
+    ? { ...next, caughtUp: true, lastSuccessfulUntil: result.until }
+    : next;
+}
+
 export type SessionAuditCell = {
   sessions: number;
   events: number;
@@ -1199,6 +1255,7 @@ export type SessionSyncOptions = {
   /** Disposable proof only: inject read latency and capture each bounded update. */
   proofSummaryHooks?: {
     read?: SessionSummaryRead;
+    now?: () => Date;
     onUpdate?: (sessionId: string, update: SessionSummaryUpdateResult) => void;
   };
   fetchImpl?: typeof fetch;
@@ -1239,6 +1296,7 @@ export type SessionSyncResult = {
   pendingSummarySessionIds: string[];
   /** Counts of why summaries remain pending in this pass. */
   pendingSummaryReasons: Record<string, number>;
+  pendingSummarySessionReasons: Record<string, string>;
   summaryStats: {
     rowsRead: number;
     rowsApplied: number;
@@ -1324,6 +1382,7 @@ export async function runSessionSync(
   let ledgerSessions = 0;
   const pendingSummarySessionIds: string[] = [];
   const pendingSummaryReasons: Record<string, number> = {};
+  const pendingSummarySessionReasons: Record<string, string> = Object.create(null);
   const summaryStats = {
     rowsRead: 0,
     rowsApplied: 0,
@@ -1354,12 +1413,27 @@ export async function runSessionSync(
       const sessionIds = [...new Set(ids)].filter((id) => !excluded.has(id));
       ledgerSessions = sessionIds.length;
       for (const sessionId of sessionIds) {
-        const update = await updateSessionSummary(ledger, sessionId, until, {
-          read: options.proofSummaryHooks?.read ?? summaryReader.read,
-          maxRows: options.summaryMaxRows,
-          maxMs: options.summaryMaxMs,
-          writeRetry: summaryWriteRetry,
-        });
+        let update: SessionSummaryUpdateResult;
+        try {
+          update = await updateSessionSummary(ledger, sessionId, until, {
+            read: options.proofSummaryHooks?.read ?? summaryReader.read,
+            now: options.proofSummaryHooks?.now,
+            maxRows: options.summaryMaxRows,
+            maxMs: options.summaryMaxMs,
+            writeRetry: summaryWriteRetry,
+          });
+        } catch (error) {
+          if (!(error instanceof SyncStorageBusyError) && !(error instanceof Error &&
+              ["session_summary_read_interrupted", "sync_storage_busy"].includes(error.message))) throw error;
+          // The next id can still succeed after this session exhausts its
+          // storage budget. Its last committed accumulator remains resumable.
+          summaryComplete = false;
+          pendingSummarySessionIds.push(sessionId);
+          const reason = (error as Error).message;
+          pendingSummarySessionReasons[sessionId] = reason;
+          pendingSummaryReasons[reason] = (pendingSummaryReasons[reason] ?? 0) + 1;
+          continue;
+        }
         options.proofSummaryHooks?.onUpdate?.(sessionId, update);
         summaryStats.rowsRead += update.rowsRead;
         summaryStats.rowsApplied += update.rowsApplied;
@@ -1371,6 +1445,7 @@ export async function runSessionSync(
           summaryComplete = false;
           pendingSummarySessionIds.push(sessionId);
           const pendingReason = update.fallbackReason ?? `${update.mode}_in_progress`;
+          pendingSummarySessionReasons[sessionId] = pendingReason;
           pendingSummaryReasons[pendingReason] = (pendingSummaryReasons[pendingReason] ?? 0) + 1;
         } else if (update.snapshot) {
           snapshots.push(update.snapshot);
@@ -1456,6 +1531,7 @@ export async function runSessionSync(
     const rawSessionId = snapshotVersions.get(sessionId)?.rawSessionId ?? sessionId;
     if (!pendingSummarySessionIds.includes(rawSessionId)) {
       pendingSummarySessionIds.push(rawSessionId);
+      pendingSummarySessionReasons[rawSessionId] = "snapshot_changed_before_send";
       pendingSummaryReasons.snapshot_changed_before_send =
         (pendingSummaryReasons.snapshot_changed_before_send ?? 0) + 1;
     }
@@ -1708,6 +1784,7 @@ export async function runSessionSync(
     summaryComplete,
     pendingSummarySessionIds,
     pendingSummaryReasons,
+    pendingSummarySessionReasons,
     summaryStats,
   };
 
