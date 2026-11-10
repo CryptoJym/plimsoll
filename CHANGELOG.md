@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.64 — 2026-11-10
+
+- Fresh-ledger cutover and recovery quiescence probes retry an inconclusive
+  lsof answer or a transient foreign handle through one helper, with up to
+  three attempts 100 ms apart before refusing (plimsoll N135). Refusal messages
+  stay unchanged. On a loaded Mac, main CI run 42788472210 failed on 11-10:
+  attempt 1 refused durable owned-stage recovery in
+  `review-r5-untracked-swap-race.ts`, and attempt 2 refused the archive restore
+  in `pr426-r13-ledger-connections.ts` after one unproven handle check.
+- The dashboard projection proof measures slice work separately from its
+  commit fsync (plimsoll N92): the 750 ms work bound excludes the commit,
+  which keeps its own 10 s bound, and both timings remain in the receipt.
+  A loaded CI run measured 1,662 ms for a slice, 1,629 ms of it in the commit,
+  while the scheduler's simulated slices stayed at 26 ms.
+
 ## 0.7.63 — 2026-11-09
 
 - The dashboard projection repair backlog drains on spare capacity (plimsoll
