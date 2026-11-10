@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.65 — 2026-11-10
+
+- The dashboard projection catch-up allowance counts every queue that gates
+  a publish (plimsoll N123, N47): repairs, compact mutations, compaction GC
+  days, dirty sessions, account invalidations, expiry windows and window
+  rebuilds. A host between one and two load per core gets a bounded quarter
+  share, at most 10 slices, instead of one; intake spooling still means one
+  slice. Timed passes drain mutations, GC units and dirty-session chunks in
+  small batches, so a turn is not spent on eight mutations while sessions wait.
+  The live reads showed studio4 at load 1.2 per core with 11,068 dirty sessions
+  falling about two a minute and only two repairs, while quiet studio5's
+  110,157 mutations drained at about 1,000 a minute.
+
 ## 0.7.64 — 2026-11-10
 
 - Fresh-ledger cutover and recovery quiescence probes retry an inconclusive
