@@ -94,6 +94,7 @@ test('the newest glob root is read first, and a root of read files still reaches
   let result = scan({ ...options, config, backfill: false });
   assert.equal(total(result.rows), 4000); assert.ok(result.rows.some(r => r.sessionKey === 'b-session'));
   assert.deepEqual(Object.keys(result.state.sdkRoots).map(r => path.basename(path.dirname(r))), ['hindsight-claude-code-b']);
+  for (const sessions of Object.values(result.state.sdk)) for (const row of Object.values(sessions)) row[6] = false; // uploaded between passes
   result = scan({ ...options, config, backfill: false, state: result.state });
   assert.equal(total(result.rows), 4001); assert.equal(Object.keys(result.state.sdkRoots).length, 2);
 });

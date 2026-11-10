@@ -68,8 +68,8 @@ root's previous completed pass start, with five minutes of overlap. Compact
 file cursors skip committed bytes, including inside that overlap; closed-day
 cursors are pruned once the root watermark excludes them. A capped root keeps
 its old watermark so unread files carry over. All glob roots together admit at
-most 1,200 file slices, 512 MiB of transcript bytes, or 12 seconds of capture
-per pass. A slice stops at a complete record after 1 MiB or 256 new replies;
+most 4,000 file slices, 8,000 pending hour-and-session rows, 512 MiB of transcript
+bytes, or 60 seconds of reading (enumeration and skipping are not charged) per pass. A slice stops at a complete record after 1 MiB or 256 new replies;
 larger records stream within the remaining byte budget. Files that exceed the
 remaining budget resume from the last complete record on the next pass.
 The capture deadline also checks between 64 KiB reads. An explicit backfill
