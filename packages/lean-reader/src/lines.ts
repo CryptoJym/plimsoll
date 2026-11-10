@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 
-// Only these leaves survive projection of an oversized record. Array contents,
-// prompts, instructions and tool outputs never become part of the projection.
+// Only these leaves survive projection of an oversized record. Prompts,
+// instructions and tool outputs never become part of the projection.
 const paths = [
   'type', 'timestamp', 'sessionId', 'cwd', 'requestId', 'uuid', 'ordinal', 'summary', 'entrypoint', 'perTurnEffort', 'effort',
   'parentSessionId', 'parentSessionKey', 'parent_session_id',
   'message.id', 'message.model', 'message.content[].type', 'message.content[].name', 'message.role',
   ...['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'].map(k => `message.usage.${k}`),
+  ...['type', 'model', 'input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'].map(k => `message.usage.iterations[].${k}`),
   'message.usage.service_tier', 'message.usage.output_tokens_details.thinking_tokens',
   ...['type', 'cwd', 'id', 'session_id', 'creator_account_id', 'model', 'response_id', 'turn_id', 'originator', 'source', 'thread_source', 'parent_thread_id', 'parent_session_id', 'parentSessionKey', 'entrypoint', 'effort', 'reasoning_effort', 'service_tier', 'duration_ms', 'time_to_first_token_ms', 'role', 'name'].map(k => `payload.${k}`),
   'payload.thread_settings.service_tier', 'payload.thread_settings.reasoning_effort',
@@ -77,14 +78,20 @@ class Projection {
   valuePath() {
     const f = this.stack.at(-1);
     const key = f && this.selected ? encodeURIComponent(f.key).replaceAll('.', '%2E') : f?.key;
-    return f ? (f.kind === 'array' ? `${f.path}[${this.evidence ? f.count : ''}]` : [f.path, key].filter(Boolean).join('.')) : '';
+    return f ? (f.kind === 'array' ? `${f.path}[${this.evidence || f.path === 'message.usage.iterations' ? f.count : ''}]` : [f.path, key].filter(Boolean).join('.')) : '';
   }
   normalized(p: string) { return p.replace(/\[\d+\]/g, '[]'); }
   wanted() { return this.selected?.wanted ?? (this.input ? inputWanted : this.evidence ? evidenceWanted : wanted); }
   containers() { return this.selected?.containers ?? (this.input ? inputContainers : this.evidence ? evidenceContainers : containers); }
-  bounded(p: string) { return !this.evidence || ![...p.matchAll(/\[(\d+)\]/g)].some(m => Number(m[1]) >= 256); }
+  bounded(p: string) {
+    // Usage arrays must never inherit the evidence sampler's 256-item cutoff.
+    // Reject an excessive usage projection rather than accept partial totals.
+    const iteration = /^message\.usage\.iterations\[(\d+)\]/.exec(p);
+    if (iteration) { if (Number(iteration[1]) >= 4096) throw new Error('usage_projection_capacity'); return true; }
+    return !this.evidence || ![...p.matchAll(/\[(\d+)\]/g)].some(m => Number(m[1]) >= 256);
+  }
   assign(p: string, value: unknown, container = false) {
-    const parts = (this.evidence ? p.replace(/\[(\d+)\]/g, '.$1') : p).split('.');
+    const parts = (this.evidence || p.startsWith('message.usage.iterations[') ? p.replace(/\[(\d+)\]/g, '.$1') : p).split('.');
     if (this.selected) {
       // Dynamic model/issuer keys are bounded too. Reject the whole record if
       // it exceeds the budget, rather than accepting incomplete usage totals.

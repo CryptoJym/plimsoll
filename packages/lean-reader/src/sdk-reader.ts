@@ -6,7 +6,8 @@ import { addSdk } from './sdk.js';
 import { SdkIds } from './sdk-index.js';
 import { narrowPacked } from './seen.js';
 import { stateBytes } from './state-json.js';
-import { HOUR, MAX_STATE, integer, string, type State, type SourceFile, type SdkCursor, type SdkSession } from './types.js';
+import { claudeUsage } from './claude-usage.js';
+import { HOUR, MAX_STATE, string, type State, type SourceFile, type SdkCursor, type SdkSession } from './types.js';
 
 const SLACK = 5 * 60_000, FILES = 1200, BYTES = 512 * 1024 * 1024, SLICE = 1024 * 1024;
 export type SdkCommit = { type: 'event_msg'; seq: number; file: string; cursor: SdkCursor; rows: [string, string, SdkSession][]; ids: Record<string, string> };
@@ -84,13 +85,13 @@ export class SdkCapture {
       const local = new Set<string>(), groups: Record<string, string[]> = {}, delta = { sdk: {} } as State;
       const result = readLines(file, offset, Math.min(stat.size, offset + BYTES - this.bytes), (r, end) => {
         if (r.type === 'assistant' && r.timestamp && r.message?.usage) {
-          const time = Date.parse(r.timestamp), msg = r.message, usage = msg.usage, model = string(msg.model) || 'unknown';
-          if (Number.isFinite(time) && time >= this.since && time < this.until && model !== '<synthetic>') {
-            const key = crypto.createHash('sha256').update('claude_code:' + JSON.stringify(msg.id || r.requestId || r.uuid || null)).digest().subarray(0, 8), hex = key.toString('hex');
+          const time = Date.parse(r.timestamp);
+          if (Number.isFinite(time) && time >= this.since && time < this.until) for (const item of claudeUsage(r)) {
+            const key = crypto.createHash('sha256').update('claude_code:' + item.id).digest().subarray(0, 8), hex = key.toString('hex');
             if (!local.has(hex) && !this.ids.has(key)) {
               local.add(hex); const hour = String(Math.floor(time / HOUR)); (groups[hour] ??= []).push(hex);
               const session = string(r.sessionId) || 'unknown', tag = this.identity(session, string(r.cwd, 4096));
-              addSdk(delta, session, tag.account, tag.project, model, time, { requests: 1, freshInput: integer(usage.input_tokens), cacheRead: integer(usage.cache_read_input_tokens), cacheWrite: integer(usage.cache_creation_input_tokens), output: integer(usage.output_tokens) });
+              addSdk(delta, session, tag.account, tag.project, item.model, time, item.tokens);
             }
           }
         }

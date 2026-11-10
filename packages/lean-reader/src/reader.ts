@@ -12,6 +12,7 @@ import { accountKey, Accounts, profileAccount } from './accounts.js';
 import { globRoots } from './glob.js';
 import { addSdk, sdkHours, sdkLaunches, refreshSdk } from './sdk.js';
 import { SdkCapture } from './sdk-reader.js';
+import { claudeUsage } from './claude-usage.js';
 import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
@@ -575,7 +576,16 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
             ctx.model = string(msg.model) || 'unknown'; ctx.cwd = string(r.cwd, 4096); ctx.session = string(r.sessionId);
             const tier = lower(usage.service_tier), effort = lower(r.effort ?? r.perTurnEffort), reasoning = integer(usage.output_tokens_details?.thinking_tokens);
             const time = Date.parse(r.timestamp), base = Math.max(ctx.lastInputAt ?? -Infinity, ctx.lastReplyAt ?? -Infinity), dur = Number.isFinite(base) ? (time - base) / 1000 : NaN;
-            const accepted = add(root.tool, ctx, r.timestamp, JSON.stringify(msg.id || r.requestId || r.uuid || null), { requests: 1, freshInput: integer(usage.input_tokens), cacheRead: integer(usage.cache_read_input_tokens), cacheWrite: integer(usage.cache_creation_input_tokens), output: integer(usage.output_tokens) }, undefined, { tier, effort, reasoning, dur }, wasReplayed(time, recordEnd));
+            let accepted = false;
+            const executorModel = ctx.model;
+            for (const item of claudeUsage(r)) {
+              ctx.model = item.model;
+              // Advisor latency and thinking are not separately recorded. Do
+              // not invent speed samples or count the executor's actions twice.
+              const added = add(root.tool, ctx, r.timestamp, item.id, item.tokens, undefined, item.advisor ? { tier, effort } : { tier, effort, reasoning, dur }, wasReplayed(time, recordEnd));
+              if (!item.advisor) accepted = added;
+            }
+            ctx.model = executorModel;
             if (accepted) {
               ctx.lastReplyAt = time;
               // Claude message identity gates its actions as well as tokens.
