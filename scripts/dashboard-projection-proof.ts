@@ -964,7 +964,7 @@ async function proveProjectionRepairCatchup(root: string) {
     db.prepare(`insert into dashboard_daily_window (days,day,events) values (?,?,?)`).run(days,day,count);
   }
   const load = () => Math.max(...os.loadavg().slice(0, 2)) / os.cpus().length;
-  let forcedLoad: number | null = 1.01, spooling = false;
+  let forcedLoad: number | null = 2.01, spooling = false;
   const maintenance = new CollectorMaintenance(buffer, new RolloutTailer(buffer,codex,()=>[]),
     new TranscriptTailer(buffer,claude), undefined, undefined, {
       projectionPressure: () => ({loadPerCore: forcedLoad ?? load(), intakeSpooling: spooling}) });
@@ -1015,6 +1015,54 @@ async function proveProjectionRepairCatchup(root: string) {
     cadence.stop(); scheduler.stopAccepting(); await scheduler.waitForIdle();
     maintenance.close(); buffer.close();
   }
+}
+
+async function provePublicationQueueCatchup(root: string) {
+  const outcomes = [];
+  for (const loadPerCore of [0.5, 1.5]) {
+    const buffer = new LocalEventBuffer(path.join(root, `publication-queues-${loadPerCore}.sqlite`));
+    const db = buffer.database, directory = path.join(root, `publication-queues-${loadPerCore}`);
+    fs.mkdirSync(directory); settle(buffer);
+    db.exec(`with recursive seq(n) as (select 1 union all select n+1 from seq where n<128)
+      insert into dashboard_dirty_sessions(days,session_hash,reason,queued_at)
+      select 30,'sha256:'||printf('%064x',n),'proof_backlog','${NOW.toISOString()}' from seq;
+      with recursive seq(n) as (select 1 union all select n+1 from seq where n<45)
+      insert into dashboard_compact_gc_days(bucket_day,queued_at,updated_at)
+      select date('${NOW.toISOString()}','-'||n||' days'),'${NOW.toISOString()}','${NOW.toISOString()}' from seq;
+      insert into projection_window_rebuild select days from dashboard_window_control;
+      update dashboard_projection_control set dirty=1,parity_ready=0 where singleton=1;`);
+    const initial = buffer.projection.status();
+    let spooling = true, tick = 0, turns = 0, maxSlices = 0, sessionsPerSlice = 0, gcDaysPerSlice = 0;
+    const runSlice = buffer.projection.runMaintenance.bind(buffer.projection);
+    buffer.projection.runMaintenance = (now, options) => {
+      assert.ok(options?.maxActiveMs && options.maxActiveMs <= 25);
+      const result = runSlice(now, options);
+      sessionsPerSlice = Math.max(sessionsPerSlice, result.dirtySessionsVisited);
+      gcDaysPerSlice = Math.max(gcDaysPerSlice, result.compactGcDaysCompleted);
+      return result;
+    };
+    const maintenance = new CollectorMaintenance(buffer, new RolloutTailer(buffer,directory,()=>[]),
+      new TranscriptTailer(buffer,directory), undefined, undefined, {
+        projectionPressure: () => ({loadPerCore,intakeSpooling:spooling}) });
+    try {
+      const spooled = await maintenance.runRecent({projectionClock:()=>tick});
+      spooling = false;
+      while (!buffer.projection.status().parityReady && turns < 32) {
+        tick += 5_000; turns++;
+        const run = await maintenance.runRecent({projectionClock:()=>tick});
+        maxSlices = Math.max(maxSlices, run.projectionDrain?.slices ?? 0);
+      }
+      const final = buffer.projection.status();
+      assert.ok(initial.backlog.repairs === 0 && initial.backlog.compactMutations === 0 &&
+        initial.backlog.dirtySessions === 128 && initial.backlog.compactGcDays === 45 && initial.backlog.windowRebuilds === 6);
+      assert.ok(spooled.projectionDrain?.slices === 1 && maxSlices > 1 && maxSlices <= (loadPerCore > 1 ? 10 : 40));
+      assert.ok(final.parityReady && !final.dirty && final.generation > initial.generation &&
+        Object.values(final.backlog).every(count=>count===0) && sessionsPerSlice > 1 && gcDaysPerSlice > 1 &&
+        automaticRepairServiceStatus(db).stages.projection.rowsVisited > 0);
+      outcomes.push({loadPerCore,turns,maxSlices,sessionsPerSlice,gcDaysPerSlice,generation:final.generation});
+    } finally { maintenance.close(); buffer.close(); }
+  }
+  check("all_publication_queues_catch_up_at_quiet_and_moderate_load_without_spooling_bonus", true, {outcomes});
 }
 
 async function proveMillionFactDuplicateRepairCadence(root: string, slow = false,
@@ -1695,6 +1743,7 @@ async function main() {
     const millionDuplicateReference = await proveMillionFactDuplicateRepairCadence(root);
     await proveMillionFactDuplicateRepairCadence(root, true, millionDuplicateReference);
     await proveProjectionRepairCatchup(root);
+    await provePublicationQueueCatchup(root);
     await prove044RollbackScanFence(root);
     buffer.recordRepoLabel(repoA, "proof/repo-a");
     buffer.recordRepoLabel(repoB, "proof/repo-b");

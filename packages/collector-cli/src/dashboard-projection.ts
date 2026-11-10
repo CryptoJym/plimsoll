@@ -3361,8 +3361,14 @@ export class DashboardProjectionStore {
         ).run(cursor,cursor>=(metricControl.metricBackfillHighWater??0)?1:0,metricRowsVisited);
       }
 
-      if (hasActiveTime()) this.drainCompactMutations(
-        options.maxActiveMs === undefined ? REPAIR_ROWS : TIMED_REPAIR_BATCH_ROWS);
+      // Drain the row allowance in small timed batches, rather than spending a
+      // whole slice on eight mutations while other publication queues wait.
+      for (let visited = 0; visited < REPAIR_ROWS && hasActiveTime();) {
+        const rows = this.drainCompactMutations(Math.min(REPAIR_ROWS - visited,
+          options.maxActiveMs === undefined ? REPAIR_ROWS : TIMED_REPAIR_BATCH_ROWS));
+        if (!rows) break;
+        visited += rows;
+      }
       markPhase("pre_repair");
       type RepairRow=RawProjectionRow&{repairRawRowid:number;reason:string;id:string|null};
       const repairColumns=`r.raw_rowid as repairRawRowid,r.reason,
@@ -3443,7 +3449,15 @@ export class DashboardProjectionStore {
       // revision once per burst instead of repeatedly rescanning a hot day
       // while thousands of cancellation receipts are still arriving.
       if(hasActiveTime()&&preGc.compactMutationBacklog===0&&preGc.repairBacklog===0){
-        compactGc=this.runCompactGcSlice(now);
+        // Each GC unit retains its segment bound. Timed maintenance may admit
+        // another unit before the same deadline, including empty queued days.
+        do {
+          const next = this.runCompactGcSlice(now);
+          for (const key of Object.keys(compactGc) as Array<keyof typeof compactGc>) {
+            compactGc[key] += next[key];
+          }
+          if (!next.itemsVisited && !next.daysCompleted && !next.restarts) break;
+        } while (options.maxActiveMs !== undefined && hasActiveTime());
       }
       // Expiry must finish its current cutoff before a new parity scan starts.
       // Otherwise a faster backfill can reach high water after only part of
@@ -3477,21 +3491,24 @@ export class DashboardProjectionStore {
         options.maxActiveMs === undefined ? REPAIR_ROWS : TIMED_REPAIR_BATCH_ROWS);
 
       const repairStarted=performance.now();
-      // Session repair can finish one 1,000-row checkpoint in a transaction;
-      // keep that durable unit intact, admitting it only while time remains.
+      // Keep the 1,000-row ceiling, but timed work checkpoints small chunks so
+      // it can yield at the deadline or continue the next session in this slice.
       const sessionRows = SESSION_REPAIR_ROWS;
+      const sessionBatchRows = options.maxActiveMs === undefined ? sessionRows : TIMED_REPAIR_BATCH_ROWS;
       while(sessionRepairRowsVisited<sessionRows&&hasActiveTime()&&
-        (performance.now()-repairStarted<SESSION_REPAIR_BUDGET_MS||sessionRepairRowsVisited===0)){
+        (performance.now()-repairStarted<SESSION_REPAIR_BUDGET_MS||sessionRepairRowsVisited+dirtySessionsVisited===0)){
         const row=this.db.prepare(
           `select days,session_hash as sessionHash from dashboard_dirty_sessions
            order by queued_at,days,session_hash limit 1`,
         ).get() as {days:number;sessionHash:string}|undefined;
         if(!row)break;
         const result=this.repairSessionChunk(row.days,row.sessionHash,
-          sessionRows-sessionRepairRowsVisited,now);
+          Math.min(sessionBatchRows,sessionRows-sessionRepairRowsVisited),now);
         sessionRepairRowsVisited+=result.rowsVisited;
         if(result.finalized)dirtySessionsVisited++;
-        if(!result.finalized||result.rowsVisited===0)break;
+        if (options.maxActiveMs === undefined
+          ? !result.finalized || result.rowsVisited === 0
+          : !result.finalized && result.rowsVisited === 0) break;
       }
 
       const backlog = this.backlog();

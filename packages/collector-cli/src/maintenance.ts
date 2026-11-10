@@ -743,18 +743,21 @@ const PROJECTION_DRAIN_MAX_SLICES=40;
 const PROJECTION_DRAIN_MAX_ACTIVE_MS=2_000;
 const PROJECTION_CADENCE_SECONDS=60;
 
-/** Catch up only on spare capacity; keep each writer turn at 25 ms. */
+/** Catch up on spare capacity, with a smaller share on a moderately busy host.
+ * Each writer slice still admits at most 25 ms of work. */
 export function projectionRepairAllowance(
   backlog: number,
   loadPerCore: number,
   intakeSpooling: boolean,
 ) {
-  const busy = intakeSpooling || !Number.isFinite(loadPerCore) || loadPerCore > 1;
-  const maxSlices = busy || !Number.isFinite(backlog)
-    ? 1
-    : Math.max(1, Math.min(40, Math.ceil(
-      Math.max(0, backlog) / (5_000 * (1 + Math.max(0, loadPerCore))),
-    )));
+  const busy = intakeSpooling || !Number.isFinite(loadPerCore) || loadPerCore >= 2;
+  // A small remaining queue still needs follow-through after its first slice.
+  const minimum = backlog > 0 ? 2 : 1;
+  const quietSlices = Math.max(minimum, Math.min(40, Math.ceil(
+    Math.max(0, backlog) / (5_000 * (1 + Math.max(0, Math.min(1, loadPerCore)))),
+  )));
+  const maxSlices = busy || !Number.isFinite(backlog) ? 1 : loadPerCore > 1
+    ? Math.max(minimum, Math.min(10, Math.floor(quietSlices / 4))) : quietSlices;
   // At most 1 s per 5 s (20% of one core), leaving room below the 25% ceiling.
   return { maxSlices, maxActiveMs: maxSlices * 25 };
 }
@@ -1348,7 +1351,7 @@ export class CollectorMaintenance {
       };
       const allowance = () => {
         const current = pressure();
-        return projectionRepairAllowance(backlog.repairs + backlog.compactMutations,
+        return projectionRepairAllowance(Object.values(backlog).reduce((sum, count) => sum + count, 0),
           current.loadPerCore, current.intakeSpooling);
       };
       const grant = allowance();
@@ -1356,9 +1359,11 @@ export class CollectorMaintenance {
         this.projectionCatchupAfter = catchupAt + 5_000;
         await executeRepairStage("projection", { maxSlices: grant.maxSlices - 1,
           maxActiveMs: grant.maxActiveMs - 25 }, () => allowance().maxSlices > 1);
-        // Mutation-only progress also earns the normal five-second repair retry.
-        repairService.stages.projection.rowsVisited += Math.max(0,
-          backlog.compactMutations - (drained?.receipt.backlog.compactMutations ?? backlog.compactMutations));
+        // Completing an empty session, GC day or other publication queue is
+        // progress too: retain the five-second retry even without fact rows.
+        const remaining = this.buffer.projection.status().backlog;
+        repairService.stages.projection.rowsVisited += Object.entries(backlog).reduce(
+          (sum, [queue, count]) => sum + Math.max(0, count - remaining[queue as keyof typeof remaining]), 0);
         saveRepairService();
         // An admitted unit (including fsync) can overrun: repay that time before
         // another grant, even when capture requests faster maintenance ticks.
