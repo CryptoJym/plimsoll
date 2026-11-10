@@ -5,13 +5,14 @@ import crypto from 'node:crypto';
 import type { Config, State, Hour, Session, Seat, Velocity } from './types.js';
 import { expand } from './reader.js';
 import { branchName, topRepositories } from './evidence.js';
+import { sdkHours, sdkSession } from './sdk.js';
 
 const ROUTE = '/api/work-intelligence/lean/usage';
 const MAX_BODY = 1024 * 1024;
 // The collector's own config carries its capture roots too: 18.8 MB on one Mac.
 const MAX_CREDENTIALS = 64 * 1024 * 1024;
 type Body = { schema: string; tenantId: string; reader: { version: string; machineName: string }; sentAt: string; hours: Hour[]; sessions: Session[]; seats: Seat[]; velocity?: Velocity[] };
-type Batch = { body: Body; keys: string[]; velocityKeys: string[] };
+type Batch = { body: Body; keys: string[]; velocityKeys: string[]; sdkKeys: [string, string][] };
 export type Upload = { url: URL; installKey: string; secret: string; tenantId: string };
 export const readerInfo = () => ({ version: '0.1.0', machineName: os.hostname().split('.')[0] });
 const wireFields = {
@@ -24,7 +25,7 @@ const wireFields = {
 export function makeBatches(state: State, tenantId: string, now: number, config: Config = {}, velocityOnly = false): Batch[] {
   const result: Batch[] = [];
   const includeVelocity = velocityOnly || config.sendVelocity === true;
-  const empty = (): Batch => ({ body: { schema: 'plimsoll.lean.usage.v1', tenantId, reader: readerInfo(), sentAt: new Date(now).toISOString(), hours: [], sessions: [], seats: [] }, keys: [], velocityKeys: [] });
+  const empty = (): Batch => ({ body: { schema: 'plimsoll.lean.usage.v1', tenantId, reader: readerInfo(), sentAt: new Date(now).toISOString(), hours: [], sessions: [], seats: [] }, keys: [], velocityKeys: [], sdkKeys: [] });
   let batch = empty(), bytes = Buffer.byteLength(JSON.stringify(batch.body));
   const append = (kind: 'hours' | 'sessions' | 'seats' | 'velocity', value: any, key?: string) => {
     const original = value;
@@ -45,6 +46,12 @@ export function makeBatches(state: State, tenantId: string, now: number, config:
   if (!velocityOnly && state.metadataPending) {
     for (const session of Object.values(state.sessions)) append('sessions', session);
     for (const seat of Object.values(state.seats)) append('seats', seat);
+  }
+  if (!velocityOnly) for (const [day, sessions] of Object.entries(state.sdk ?? {})) for (const [id, row] of Object.entries(sessions)) if (row[6]) {
+    for (const hour of sdkHours(day, row)) append('hours', hour);
+    append('sessions', sdkSession(row, state, id));
+    // Clear only after every hour AND its metadata have been acknowledged.
+    batch.sdkKeys.push([day, id]);
   }
   if (includeVelocity) for (const key of Object.keys(state.velocityPending ?? {})) if (state.velocity[key]) append('velocity', state.velocity[key], key);
   if (batch.body.hours.length || batch.body.sessions.length || batch.body.seats.length || batch.body.velocity?.length) result.push(batch);
@@ -104,7 +111,8 @@ export function uploadError(error: unknown): string {
 
 export async function sendPending(state: State, config: Config, options: { home: string; now: number; velocityOnly?: boolean }): Promise<number> {
   const includeVelocity = options.velocityOnly === true || config.sendVelocity === true;
-  const hasPending = options.velocityOnly ? Object.keys(state.velocityPending ?? {}).length > 0 : Object.keys(state.pending).length > 0 || state.metadataPending || (includeVelocity && Object.keys(state.velocityPending ?? {}).length > 0);
+  const hasPending = options.velocityOnly ? Object.keys(state.velocityPending ?? {}).length > 0 : Object.keys(state.pending).length > 0 || state.metadataPending || (includeVelocity && Object.keys(state.velocityPending ?? {}).length > 0)
+    || Object.values(state.sdk ?? {}).some(sessions => Object.values(sessions).some(row => row[6]));
   if (!hasPending || options.now < state.nextSend) return 0;
   let sent = 0;
   try {
@@ -114,6 +122,7 @@ export async function sendPending(state: State, config: Config, options: { home:
       await post(upload.url, JSON.stringify(batch.body), upload.installKey, upload.secret, deadline);
       for (const key of batch.keys) delete state.pending[key];
       for (const key of batch.velocityKeys) delete state.velocityPending[key];
+      for (const [day, id] of batch.sdkKeys) state.sdk![day][id][6] = false;
       sent += batch.body.hours.length + (batch.body.velocity?.length ?? 0);
       state.lastSend = new Date(options.now).toISOString();
     }

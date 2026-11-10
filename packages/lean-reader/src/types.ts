@@ -9,6 +9,8 @@ export type EvidenceContext = { cwd: string; session: string; gitBranch?: string
 export type Seat = { tool: Tool; accountKey: string; plan: string | null; usedPercent: number | null; windowMinutes: number | null; resetsAt: string | null; creditsBalance: string | null; observedAt: string };
 export type Context = { model: string; cwd: string; session: string; account: string; title: string | null; previous?: Record<string, number>; records: boolean; tier?: string; effort?: string; lastInputAt?: number; lastReplyAt?: number; parentSessionKey?: string | null; entrypoint?: string | null; actions?: Actions };
 export type FileState = { dev: number; ino: number; size: number; offset: number; mtime: number; context: Context; fallback: Record<string, Counts>; velocityFallback?: Record<string, Velocity>; fallbackLastReplyAt?: number; evidenceOffset?: number; evidenceContext?: EvidenceContext };
+// Glob roots retain one compact record per UTC day/session, never file cursors.
+export type SdkSession = [session: string, account: string, project: string | null, first: number, last: number, hours: Record<string, number[]>, pending: boolean];
 export type Velocity = {
   hour: string; tool: Tool; accountKey: string; model: string; sessionKey: string; tier: string; effort: string;
   replies: number; freshInput: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number;
@@ -16,6 +18,7 @@ export type Velocity = {
   turns: number; turnMs: number; ttftMs: number; ttftN: number;
 };
 export type State = {
+  sdk?: Record<string, Record<string, SdkSession>>;
   version: 1 | 2 | 3; files: Record<string, FileState>; hours: Record<string, Hour>; velocity: Record<string, Velocity>; seen: Record<string, number>;
   velocityPending: Record<string, boolean>;
   velocityReplays?: Record<string, { dev: number; ino: number; windows: { start: number; end: number; offset: number }[] }>;
@@ -53,7 +56,7 @@ export type Outbox = {
 };
 export type Config = { allowanceFile?: string; credentialsFrom?: string; endpoint?: string; roots?: (string | { tool: Tool; path: string })[]; rootsOnly?: boolean; velocityAccountMapFile?: string; sendSessionTitles?: boolean; sendFolderLabels?: boolean; sendEvidence?: boolean; sendVelocity?: boolean; dryRun?: boolean };
 export type SourceFile = { file: string; stat: import('node:fs').Stats };
-export type Source = { tool: Tool; path: string; files?: SourceFile[] };
+export type Source = { tool: Tool; path: string; aggregate?: boolean; files?: SourceFile[] };
 export type Options = { home?: string; env?: Record<string, string | undefined>; config?: Config; state?: State; since?: string; until?: string; backfill?: boolean; velocityOnly?: boolean; now?: number; stateDir?: string; command?: string; dryRun?: boolean; discovered?: Source[] };
 export type Stats = { files: number; bytesRead: number; rows: number; sent: number; errors: number; milliseconds: number; peakMemoryBytes: number; stateBytes: number };
 export const HOUR = 3_600_000;

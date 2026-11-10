@@ -54,6 +54,47 @@ alternate configuration. Neither override changes the session roots.
 
 ## What it reads
 
+Configured Claude roots may contain `*` within path components. For the
+colony brain's isolated SDK directories, add this root (fixed roots still keep
+their existing file cursors):
+
+```json
+{"tool":"claude_code","path":"/var/folders/*/*/T/hindsight-claude-code-*/projects"}
+```
+
+Glob roots stream transcripts into compact UTC-day/session totals and share
+the reply-ID deduplication index. They reread eligible files on each pass;
+they retain no per-file cursor, prompt, or tool evidence. Their uploads contain
+the existing usage and session fields; optional velocity rows are not generated
+for glob roots. Fixed roots continue to collect velocity as before.
+`~/.local/state/fleet-launch/launches-sdk.jsonl` joins `kind: "sdk"` rows by
+`session`, taking the seat from `account` (email or fleet seat folder name)
+and the project from `project`. A sidecar alone never fabricates usage: the
+transcript must contain an assistant usage record with the matching session.
+
+For a Claude seat missing its `oauthAccount`, account lookup falls back to
+the seat folder name or matching SDK launch row. Only `accountUuid` and
+`emailAddress` are projected from each profile's `.claude.json`.
+The reader merges locally learned identities with
+`~/.local/state/plimsoll-lean/account-keys.json`, which accepts either an
+email-to-`sha256:<16 hex>` JSON map or JSONL `{email, accountKey}` records.
+Conflicting identities remain unknown. After a successful identity read it
+atomically writes the merged map (0600), ready for the fleet to copy to another
+Mac. The reader itself does no cross-machine transfer.
+
+Email labels are local only: the reader writes the hash-to-email JSON map
+`~/Library/Application Support/Plimsoll Lean/account-labels.json` (0600).
+The owner can load it into `provider_account_labels`; emails and labels are
+never added to the usage upload. Newly learned identities replace open unknown
+hour/velocity keys with zero tombstones and correctly keyed totals. Older
+delivered windows require an explicit backfill.
+
+`node packages/lean-reader/measure-sdk.mjs /private/tmp/PRIVATE-DIRECTORY`
+creates 20,000 synthetic transcripts in 30 glob roots and measures a standalone
+Node 22 backfill with `/usr/bin/time -l` on macOS. It prints elapsed time, whole
+process peak RSS, serialized state bytes, and threshold results; no real source
+or upload credentials are read. The named directory must be private.
+
 All roots are optional, recursive, and deduplicated through filesystem identity:
 
 - Claude: `~/.claude/projects`, `~/.claude-seats/*/projects`,

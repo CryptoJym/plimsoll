@@ -8,12 +8,15 @@ import { Evidence, genericFolder, launchProject, protectedPath, topRepositories 
 import { stateBytes } from './state-json.js';
 import { narrowPacked, Seen } from './seen.js';
 import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js';
+import { accountKey, Accounts, profileAccount } from './accounts.js';
+import { globRoots } from './glob.js';
+import { addSdk, sdkHours, sdkLaunches, refreshSdk } from './sdk.js';
 import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
 // Exact port of shared/src/policy.ts providerAccountKey / hashProtectedValue.
 // Do not switch to raw-id hashing: that would break existing cloud seat labels.
-export const accountKey = (id: unknown): string => typeof id === 'string' && id ? 'sha256:' + crypto.createHash('sha256').update(JSON.stringify({ stringValue: id })).digest('hex').slice(0, 16) : 'unknown';
+export { accountKey } from './accounts.js';
 export const emptyState = (): State => ({ version: 1, files: {}, hours: {}, velocity: {}, velocityPending: {}, seen: {}, sessions: {}, seats: {}, pending: {}, metadataPending: false, lastSend: null, lastError: null, failures: 0, nextSend: 0, footprint: null });
 const context = (account = 'unknown'): Context => ({ model: 'unknown', cwd: '', session: '', account, title: null, records: false, tier: 'standard', effort: 'unknown' });
 const velocityCounts = (): Omit<Velocity, 'hour' | 'tool' | 'accountKey' | 'model' | 'sessionKey' | 'tier' | 'effort'> => ({ replies: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0, timed: 0, sOut: 0, sDur: 0, sOutDur: 0, sOut2: 0, sDur2: 0, hist: Array(16).fill(0), turns: 0, turnMs: 0, ttftMs: 0, ttftN: 0 });
@@ -59,8 +62,8 @@ function velocityAccountMap(home: string, config: Config): Map<string, string> |
 export function directories(parent: string, prefix = ''): string[] {
   try { return fs.readdirSync(parent).sort().filter(n => n.startsWith(prefix)).filter(n => { try { return fs.statSync(path.join(parent, n)).isDirectory(); } catch { return false; } }); } catch { return []; }
 }
-export function roots(home: string, env: Record<string, string | undefined>, config: Config): { tool: Tool; path: string }[] {
-  const result: { tool: Tool; path: string }[] = config.rootsOnly ? [] : [
+export function roots(home: string, env: Record<string, string | undefined>, config: Config): Source[] {
+  const result: Source[] = config.rootsOnly ? [] : [
     { tool: 'claude_code', path: path.join(home, '.claude/projects') },
     ...['.claude-seats', '.claude-accounts'].flatMap(parent => directories(path.join(home, parent)).map(n => ({ tool: 'claude_code' as const, path: path.join(home, parent, n, 'projects') }))),
     ...(env.CLAUDE_CONFIG_DIR ? [{ tool: 'claude_code' as const, path: path.join(env.CLAUDE_CONFIG_DIR, 'projects') }] : []),
@@ -76,7 +79,8 @@ export function roots(home: string, env: Record<string, string | undefined>, con
     else if (root && ['codex', 'claude_code', 'grok'].includes(root.tool) && typeof root.path === 'string') result.push({ tool: root.tool, path: expand(root.path, home) });
   }
   const seen = new Set<string>();
-  return result.filter(root => { if (root.tool === 'grok' && protectedPath(root.path, home)) return false; try { root.path = fs.realpathSync(root.path); } catch { return false; } const key = root.tool + ':' + root.path; if (seen.has(key)) return false; seen.add(key); return true; });
+  return result.flatMap(root => root.path.includes('*') ? globRoots(root.path, home).map(p => ({ tool: root.tool, path: p, aggregate: root.tool === 'claude_code' })) : [root])
+    .filter(root => { if (root.tool === 'grok' && protectedPath(root.path, home)) return false; try { root.path = fs.realpathSync(root.path); } catch { return false; } const key = root.tool + ':' + root.path; if (seen.has(key)) return false; seen.add(key); return true; });
 }
 function archivedRollout(name: string, since: number): boolean {
   const match = /^rollout-(\d{4}-\d{2}-\d{2})T/.exec(name);
@@ -236,7 +240,7 @@ class Projects {
   }
 }
 
-function claudeAccount(root: string, home: string, env: Record<string, string | undefined>): string {
+function claudeAccount(root: string, home: string, env: Record<string, string | undefined>, accounts: Accounts): string {
   const config = path.dirname(root);
   let defaultDirectory = path.join(home, '.claude');
   try { defaultDirectory = fs.realpathSync(defaultDirectory); } catch { /* Optional default profile. */ }
@@ -244,12 +248,20 @@ function claudeAccount(root: string, home: string, env: Record<string, string | 
   try { explicit = Boolean(env.CLAUDE_CONFIG_DIR) && fs.realpathSync(env.CLAUDE_CONFIG_DIR!) === config; } catch { /* Optional configured directory. */ }
   const candidates = config === defaultDirectory && !explicit ? [path.join(home, '.claude.json')] : [path.join(config, '.claude.json')];
   for (const file of candidates) {
-    try { if (fs.statSync(file).size > 10 * 1024 * 1024) continue; const data = JSON.parse(fs.readFileSync(file, 'utf8')); const key = accountKey(data?.oauthAccount?.accountUuid); if (key !== 'unknown') return key; } catch { /* Missing identity remains unknown. */ }
+    const account = profileAccount(file);
+    if (account.key !== 'unknown') return account.key;
+    const mapped = accounts.resolve(account.email);
+    if (mapped !== 'unknown') return mapped;
   }
-  return 'unknown';
+  let realHome = home;
+  try { realHome = fs.realpathSync(home); } catch { /* Optional home alias. */ }
+  return ['.claude-seats', '.claude-accounts'].some(parent => path.dirname(config) === path.join(realHome, parent)) ? accounts.resolve(path.basename(config)) : 'unknown';
 }
 
 function prune(state: State, cutoff: number) {
+  for (const [day, sessions] of Object.entries(state.sdk ?? {})) {
+    if (Date.parse(day) + 24 * HOUR <= cutoff && Object.values(sessions).every(row => !row[6])) delete state.sdk![day];
+  }
   for (const [key, row] of Object.entries(state.hours)) if (Date.parse(row.hour) < cutoff && !state.pending[key]) delete state.hours[key];
   for (const [key, row] of Object.entries(state.velocity ?? {})) if (Date.parse(row.hour) < cutoff && !state.velocityPending?.[key]) delete state.velocity[key];
   for (const key in state.seen) if (state.seen[key] * HOUR < cutoff) delete state.seen[key];
@@ -309,8 +321,10 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
     stateBytes({ ...state, velocityReplays }, limit);
     if (velocityOnly) stateBytes({ ...retainedState, velocity: state.velocity, velocityPending: state.velocityPending, velocityReplays }, limit);
   };
-  let admissions = 0;
-  const budgetTick = () => { if (++admissions % 256 === 0) checkBudget(); };
+  let admissions = 0, aggregate = false;
+  // Glob rows are bounded compact tuples; serializing their growing day map
+  // after every handful of files creates more garbage than capture itself.
+  const budgetTick = () => { if (++admissions % (aggregate ? 4096 : 256) === 0) checkBudget(); };
   if (options.backfill && !velocityOnly) {
     // Zero rows act as replacement tombstones if a corrected source no longer
     // contains a formerly counted hour. Never leave a stale cloud total behind.
@@ -318,6 +332,12 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
     seen.remove(hour => hour * HOUR >= startHour && hour * HOUR < endHour);
     for (const file of Object.values(state.files)) for (const key of Object.keys(file.fallback)) if (state.hours[key] && inside(state.hours[key].hour)) delete file.fallback[key];
     for (const file of Object.values(state.files)) for (const [key, row] of Object.entries(file.velocityFallback ?? {})) if (inside(row.hour)) delete file.velocityFallback![key];
+    for (const [day, sessions] of Object.entries(state.sdk ?? {})) for (const row of Object.values(sessions)) {
+      for (const [key, tokens] of Object.entries(row[5])) {
+        const [hour] = JSON.parse(key);
+        if (inside(new Date(Date.parse(day) + hour * HOUR).toISOString())) { tokens.fill(0); row[6] = true; }
+      }
+    }
   }
   if (rebuildVelocity) {
     // A velocity-only backfill replaces only the additive rows. Existing hour,
@@ -332,6 +352,9 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   // deliberately forbidden from changing the hours/sessions/seen data.
   const velocitySeen = velocityOnly ? new Set<string>() : null;
   const projects = new Projects(home), visited = new Set<string>(), visitedFiles = new Set<string>();
+  const accounts = new Accounts(home, options.env ?? process.env), launches = sdkLaunches(home, startHour);
+  const resolved = new Map<string, string>();
+  if (!velocityOnly) { accounts.save(); refreshSdk(state, launches, accounts); }
   const evidence = evidenceSeen ? new Evidence(home, state, evidenceSeen, startHour, endHour, budgetTick) : null;
   const markAction = (ctx: Context, name: unknown, tool?: Tool) => {
     if (!ctx.actions) ctx.actions = actionCounts();
@@ -401,9 +424,15 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
     budgetTick();
     if (ctx.model === '<synthetic>') return false;
     const sessionKey = ctx.session || 'unknown';
+    const tag = tool === 'claude_code' ? launches.get(sessionKey) : undefined;
+    if (tool === 'claude_code' && (ctx.account === 'unknown' || (aggregate && tag))) ctx.account = accounts.resolve(tag?.seat ?? '');
+    const hint = tag?.project ? { projectHint: tag.project, projectSource: 'launch_tag' as const, folderLabel: null } : projects.hint(ctx.cwd, tool, sessionKey);
+    if (aggregate && !velocityOnly) {
+      addSdk(state, sessionKey, ctx.account, hint.projectHint, ctx.model, time, tokens);
+      return true;
+    }
     if (!velocityOnly) {
       const key = digest(JSON.stringify([tool, ctx.account, ctx.model, sessionKey, hour]));
-      const hint = projects.hint(ctx.cwd, tool, sessionKey);
       const row = state.hours[key] ??= { ...counts(), hour: new Date(hour * HOUR).toISOString(), tool, accountKey: ctx.account, model: ctx.model, sessionKey, projectHint: hint.projectHint, projectSource: hint.projectSource };
       row.projectHint = hint.projectHint; row.projectSource = hint.projectSource;
       for (const k of fields) row[k] = Math.min(Number.MAX_SAFE_INTEGER, row[k] + tokens[k]);
@@ -428,6 +457,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   // so turns the five-second incremental pass into a historical full scan.
   const sources: Source[] = velocityOnly ? archivedSources(discoveredSources) : discoveredSources;
   for (const root of sources) {
+    aggregate = root.aggregate === true && root.tool === 'claude_code';
     let rootAccount: string | undefined;
     const getAccount = () => {
       if (rootAccount !== undefined) return rootAccount;
@@ -435,7 +465,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
         const id = grokUser(root.path, home);
         return rootAccount = id ? accountKey(id) : 'grok:unknown';
       }
-      return rootAccount = root.tool === 'claude_code' ? claudeAccount(root.path, home, options.env ?? process.env) : 'unknown';
+      return rootAccount = root.tool === 'claude_code' ? claudeAccount(root.path, home, options.env ?? process.env, accounts) : 'unknown';
     };
     for (const { file, stat: discoveredStat } of root.files ?? files(root.path, visited, startHour, root.tool, home, velocityOnly)) {
       if (root.tool === 'codex' && !path.basename(file).startsWith('rollout-')) continue;
@@ -451,8 +481,10 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       // enforce the window in the parser. Ordinary incremental scans retain
       // the mtime filter that keeps their footprint bounded.
       if (visitedFiles.has(fileIdentity) || (!velocityOnly && stat.mtimeMs < startHour)) continue;
-      visitedFiles.add(fileIdentity);
-      let tracked = state.files[file];
+      // Glob roots reread whole sessions and share reply-ID deduplication;
+      // they need no second in-memory index of every transient file inode.
+      if (!aggregate) visitedFiles.add(fileIdentity);
+      let tracked = aggregate ? undefined : state.files[file];
       const reset = !tracked || tracked.dev !== stat.dev || tracked.ino !== stat.ino ||
         (compressed ? stat.size !== tracked.size || stat.mtimeMs !== tracked.mtime : stat.size < tracked.size || stat.size < tracked.offset);
       const replay = replayProgress[file];
@@ -468,7 +500,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
         tracked.velocityFallback = recovered.state.files[file]?.velocityFallback ?? {};
         tracked.fallbackLastReplyAt = recovered.state.files[file]?.fallbackLastReplyAt;
       }
-      if (!tracked) { tracked = state.files[file] = { dev: stat.dev, ino: stat.ino, size: stat.size, offset: 0, mtime: stat.mtimeMs, context: context(getAccount()), fallback: {} }; budgetTick(); }
+      if (!tracked) { tracked = { dev: stat.dev, ino: stat.ino, size: stat.size, offset: 0, mtime: stat.mtimeMs, context: context(getAccount()), fallback: {} }; if (!aggregate) state.files[file] = tracked; budgetTick(); }
       if (reset || (options.backfill && !velocityOnly) || velocityOnly) { const records = tracked.context.records && !options.backfill && !velocityOnly; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
       const ctx = tracked.context;
       const metadata = root.tool === 'grok' ? grokSummary(file, home) : null;
@@ -490,9 +522,11 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       let evidenceContext = reset || (options.backfill && !velocityOnly) ? { cwd: '', session: '' } : tracked.evidenceContext ?? { cwd: ctx.cwd, session: ctx.session };
       // A lane marker in the session's latest folder also names rows counted
       // before it was seen. Without evidence, the usage context has that folder.
-      const remember = (at: number) => evidence
-        ? projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0)
-        : projects.rememberFolder(ctx.cwd, root.tool, ctx.session, at);
+      const remember = (at: number) => {
+        if (root.tool === 'claude_code' && !aggregate && ctx.session && ctx.account !== 'unknown') resolved.set(ctx.session, ctx.account);
+        if (evidence) projects.rememberFolder(evidenceContext.cwd, root.tool, evidenceContext.session, evidenceContext.time ?? 0);
+        else projects.rememberFolder(ctx.cwd, root.tool, ctx.session, at);
+      };
       if (root.tool === 'claude_code') ctx.account = getAccount();
       // Archived files are immutable in ordinary passes; avoid decoding them
       // again when their source metadata has not changed. A velocity replay
@@ -648,14 +682,35 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   const active = new Set(Object.values(state.hours).map(row => row.tool + ':' + row.sessionKey));
   for (const session of Object.values(state.sessions)) active.add(session.tool + ':' + session.sessionKey);
   projects.loadTags(active);
+  // Newly learned identity also repairs open unknown rows without rewinding
+  // fixed-root cursors. Zero replacements remove the old cloud account key.
+  for (const [key, row] of Object.entries(state.hours)) if (row.tool === 'claude_code' && row.accountKey === 'unknown' && row.requests) {
+    const account = resolved.get(row.sessionKey) ?? accounts.resolve(launches.get(row.sessionKey)?.seat ?? '');
+    if (account === 'unknown') continue;
+    const next = digest(JSON.stringify([row.tool, account, row.model, row.sessionKey, Math.floor(Date.parse(row.hour) / HOUR)]));
+    const target = state.hours[next] ??= { ...row, ...counts(), accountKey: account };
+    for (const field of fields) { target[field] += row[field]; row[field] = 0; }
+    state.pending[next] = state.pending[key] = true;
+  }
+  if (!velocityOnly) for (const [key, row] of Object.entries(state.velocity)) if (row.tool === 'claude_code' && row.accountKey === 'unknown' && row.replies) {
+    const account = resolved.get(row.sessionKey) ?? accounts.resolve(launches.get(row.sessionKey)?.seat ?? '');
+    if (account === 'unknown') continue;
+    const next = digest(JSON.stringify([row.tool, account, row.model, row.sessionKey, Math.floor(Date.parse(row.hour) / HOUR), row.tier, row.effort]));
+    const target = state.velocity[next] ??= { ...row, ...velocityCounts(), accountKey: account };
+    for (const field of velocityFields) { target[field] += row[field]; row[field] = 0; }
+    for (let i = 0; i < row.hist.length; i++) { target.hist[i] += row.hist[i]; row.hist[i] = 0; }
+    state.velocityPending[next] = state.velocityPending[key] = true;
+  }
   for (const [key, row] of Object.entries(state.hours)) {
-    const tagged = projects.tags.get(row.tool + ':' + row.sessionKey) ?? projects.folderTags.get(row.tool + ':' + row.sessionKey);
+    const sdk = row.tool === 'claude_code' ? launches.get(row.sessionKey) : undefined;
+    const tagged = projects.tags.get(row.tool + ':' + row.sessionKey) ?? projects.folderTags.get(row.tool + ':' + row.sessionKey) ?? (sdk?.project ? { project: sdk.project } : undefined);
     if (tagged && (row.projectHint !== tagged.project || row.projectSource !== 'launch_tag')) {
       row.projectHint = tagged.project; row.projectSource = 'launch_tag'; state.pending[key] = true;
     }
   }
   for (const session of Object.values(state.sessions)) {
-    const tagged = projects.tags.get(session.tool + ':' + session.sessionKey) ?? projects.folderTags.get(session.tool + ':' + session.sessionKey);
+    const sdk = session.tool === 'claude_code' ? launches.get(session.sessionKey) : undefined;
+    const tagged = projects.tags.get(session.tool + ':' + session.sessionKey) ?? projects.folderTags.get(session.tool + ':' + session.sessionKey) ?? (sdk?.project ? { project: sdk.project } : undefined);
     if (tagged && session.projectHint !== tagged.project) { session.projectHint = tagged.project; session.folderLabel = null; state.metadataPending = true; }
   }
   if (since < cutoff) { prune(state, cutoff); for (const ids of [seen, evidenceSeen]) ids?.remove(hour => hour * HOUR < cutoff); }
@@ -674,7 +729,9 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   checkBudget();
   const resultState = velocityOnly ? Object.assign(retainedState, { velocity: state.velocity, velocityPending: state.velocityPending }) : state;
   if (Object.keys(replayProgress).length) resultState.velocityReplays = replayProgress; else delete resultState.velocityReplays;
-  const rows = Object.values(resultState.hours).sort((a, b) => { const x = [a.hour, a.tool, a.sessionKey].join(':'), y = [b.hour, b.tool, b.sessionKey].join(':'); return x < y ? -1 : x > y ? 1 : 0; });
+  const rows = Object.values(resultState.hours);
+  for (const [day, sessions] of Object.entries(resultState.sdk ?? {})) for (const row of Object.values(sessions)) for (const hour of sdkHours(day, row)) rows.push(hour);
+  rows.sort((a, b) => a.hour < b.hour ? -1 : a.hour > b.hour ? 1 : a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : a.sessionKey < b.sessionKey ? -1 : a.sessionKey > b.sessionKey ? 1 : 0);
   stats.rows = rows.length; stats.milliseconds = performance.now() - started; stats.peakMemoryBytes = peakMemory();
   return { state: resultState, rows, stats };
 }

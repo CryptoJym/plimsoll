@@ -6,12 +6,28 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, stateDirectory, readState, runPass, install } from './system.js';
 import { nativeAccounts, outboxFile, readOutbox } from './allowance.js';
 import { expand } from './reader.js';
+import { sdkSessions } from './sdk.js';
+import { writeState } from './state-json.js';
 export { scan, roots, emptyState, accountKey } from './reader.js';
 export { readState, saveState, acquireLock, runPass, launchAgent } from './system.js';
 export { makeBatches, sendPending } from './transport.js';
 export { MAX_STATE } from './types.js';
 export { allowancePass, nativeAccounts, readOutbox } from './allowance.js';
 const print = (value: unknown, pretty = false) => process.stdout.write(JSON.stringify(value, null, pretty ? 2 : undefined) + '\n');
+function printResult(result: Awaited<ReturnType<typeof runPass>>) {
+  // --json can contain tens of thousands of sessions. Stream the same wire
+  // fields without a second complete JSON string or metadata array in memory.
+  const fd = process.stdout.fd, json = (value: unknown) => writeState(fd, value, Number.MAX_SAFE_INTEGER);
+  fs.writeSync(fd, '{"run":'); json(result.stats);
+  fs.writeSync(fd, ',"rows":'); json(result.rows);
+  fs.writeSync(fd, ',"velocity":'); json(Object.values(result.state.velocity));
+  fs.writeSync(fd, ',"sessions":[');
+  let first = true;
+  for (const collection of [Object.values(result.state.sessions), sdkSessions(result.state)]) for (const row of collection) {
+    if (!first) fs.writeSync(fd, ','); first = false; json(row);
+  }
+  fs.writeSync(fd, '],"seats":'); json(Object.values(result.state.seats)); fs.writeSync(fd, '}\n');
+}
 
 async function main() {
   const args = process.argv.slice(2), command = args.shift() ?? 'run';
@@ -59,7 +75,7 @@ async function main() {
   if (['backfill', 'velocity-backfill'].includes(command) && (!flags.has('--since') || !flags.has('--until'))) throw new Error('window_required');
   if (!['run', 'backfill', 'velocity-backfill'].includes(command)) throw new Error('invalid_command');
   const result = await runPass({ home, config, stateDir, command, velocityOnly: command === 'velocity-backfill', since: flags.get('--since') as string | undefined, until: flags.get('--until') as string | undefined, dryRun: flags.has('--dry-run') ? true : undefined });
-  print(flags.has('--json') ? { run: result.stats, rows: result.rows, velocity: Object.values(result.state.velocity), sessions: Object.values(result.state.sessions), seats: Object.values(result.state.seats) } : { ...result.stats, lastError: result.state.lastError });
+  if (flags.has('--json')) printResult(result); else print({ ...result.stats, lastError: result.state.lastError });
 }
 function isMain() {
   try { return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); }

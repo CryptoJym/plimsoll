@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { accountKey, directories, expand } from './reader.js';
+import { expand } from './reader.js';
+import { accountKey, Accounts } from './accounts.js';
 import { saveJson } from './state-json.js';
 import { openUpload, post, readerInfo, uploadError } from './transport.js';
 import { HOUR, type AccountStatusRow, type AllowanceRow, type Config, type Outbox, type StatusOutbox } from './types.js';
@@ -70,23 +71,7 @@ function snapshotAt(data: any, account: any): string | null {
 
 /** Lowercased email to account key, from the Claude profiles the reader
  * already reads for usage. An email two profiles disagree on is dropped. */
-function claudeKeys(home: string, env: Record<string, string | undefined>): Map<string, string> {
-  const files = [path.join(home, '.claude.json'),
-    ...['.claude-seats', '.claude-accounts'].flatMap(parent => directories(path.join(home, parent)).map(n => path.join(home, parent, n, '.claude.json'))),
-    ...(env.CLAUDE_CONFIG_DIR ? [path.join(env.CLAUDE_CONFIG_DIR, '.claude.json')] : [])];
-  const keys = new Map<string, string>(), conflicts = new Set<string>();
-  for (const file of files) {
-    try {
-      if (fs.statSync(file).size > 10 * 1024 * 1024) continue;
-      const account = JSON.parse(fs.readFileSync(file, 'utf8'))?.oauthAccount;
-      const email = typeof account?.emailAddress === 'string' ? account.emailAddress.trim().toLowerCase() : '', key = accountKey(account?.accountUuid);
-      if (!email || key === 'unknown') continue;
-      if (keys.has(email) && keys.get(email) !== key) conflicts.add(email); else keys.set(email, key);
-    } catch { /* A missing or unreadable profile names no account. */ }
-  }
-  for (const email of conflicts) keys.delete(email);
-  return keys;
-}
+function claudeKeys(home: string, env: Record<string, string | undefined>): Map<string, string> { return new Accounts(home, env).keys; }
 
 /** The Claude and Codex accounts in the native file, each with one row per
  * allowance window, or null when the file is absent. A Codex account is keyed

@@ -56,6 +56,10 @@ export async function discover(options: Options & { home: string; now: number })
   const until = options.until ? Date.parse(options.until) : options.now + HOUR;
   if (!Number.isFinite(since) || !Number.isFinite(until) || since >= until) throw new Error('invalid_window');
   const visited = new Set<string>(), result: Source[] = [];
-  for (const root of roots(options.home, options.env ?? process.env, options.config ?? {})) result.push({ ...root, files: await files(root.path, visited, Math.floor(since / HOUR) * HOUR, root.tool, options.home) });
+  for (const root of roots(options.home, options.env ?? process.env, options.config ?? {})) {
+    // Many short-lived SDK transcripts: enumerate one root at a time in scan,
+    // rather than retain every file's Stats until the whole pass completes.
+    result.push(root.aggregate ? root : { ...root, files: await files(root.path, visited, Math.floor(since / HOUR) * HOUR, root.tool, options.home) });
+  }
   return result;
 }
