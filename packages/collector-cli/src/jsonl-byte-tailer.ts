@@ -467,16 +467,16 @@ function loadCommitFailure(database: Database.Database, file: string): CommitFai
 
 /** Metadata and collector version fence a parked failure; committed parser
  * state and byte evidence are never replaced by the failed slice. */
-export function jsonlCommitFailureParked(database: Database.Database, file: string, signature: string, version: string) {
+export function jsonlCommitFailureParked(database: Database.Database, file: string, signature: string, version?: string) {
   const failure = loadCommitFailure(database, file);
-  return failure?.signature === signature && failure.version === version && failure.attempts >= 2 ? failure : undefined;
+  return failure?.signature === signature && (version === undefined || failure.version === version) && failure.attempts >= 2 ? failure : undefined;
 }
 
 export function rememberJsonlCommitFailure(database: Database.Database, file: string,
   failure: Omit<CommitFailure, "attempts">) {
   const prior = loadCommitFailure(database, file);
   const attempts = prior?.signature === failure.signature && prior.version === failure.version &&
-    prior.offset === failure.offset ? Math.min(2, prior.attempts + 1) : 1;
+    prior.offset === failure.offset && prior.messageHash === failure.messageHash ? Math.min(2, prior.attempts + 1) : 1;
   database.prepare(`insert into ${STATE_TABLE}(file,size,scanned_at,commit_failure_json,unresolved_kind,unresolved_offset)
     values (?,0,?,?,?,?) on conflict(file) do update set
       commit_failure_json=excluded.commit_failure_json,
@@ -495,6 +495,32 @@ export function clearJsonlCommitFailure(database: Database.Database, file: strin
 
 type PrefixHashState = { offset: number; identity: string; hash: crypto.Hash; digest: string };
 const prefixHashStates = new WeakMap<Database.Database, Map<string, PrefixHashState>>();
+const prefixRechecks = new WeakMap<Database.Database, Map<string, PrefixHashState>>();
+
+/** Re-admission uses the caller's checked, budgeted reads. A restart discards
+ * partial hashes; any cursor or precise source-snapshot change restarts them. */
+export function recheckJsonlCommittedPrefix<T>(database: Database.Database, cursorKey: string,
+  cursor: JsonlScanCursor<T>, snapshot: string, readAt: (at: number, length: number) => Buffer,
+  maxBytes: number, deadline: number): boolean | null {
+  const end = cursor.committedOffset, digest = cursor.committedPrefixHash;
+  if (end === null || !digest || !SHA256_RE.test(digest)) return false;
+  let states = prefixRechecks.get(database);
+  if (!states) { states = new Map(); prefixRechecks.set(database, states); }
+  const key = jsonlScanStateKey(cursorKey), identity = `${snapshot}:${end}`;
+  let state = states.get(key);
+  if (!state || state.identity !== identity || state.digest !== digest) {
+    if (states.size >= 64) states.delete(states.keys().next().value!);
+    state = {offset:0, identity, digest, hash:crypto.createHash("sha256")};
+    states.set(key, state);
+  }
+  while (state.offset < end && maxBytes > 0 && performance.now() < deadline) {
+    const bytes = readAt(state.offset, Math.min(64 * 1024, end - state.offset, maxBytes));
+    state.hash.update(bytes); state.offset += bytes.length; maxBytes -= bytes.length;
+  }
+  if (state.offset < end) return null;
+  states.delete(key);
+  return state.hash.digest("hex") === digest;
+}
 
 /** Prepare the digest outside the cursor/event write transaction. Each normal
  * slice extends the hash already kept for this database and file; hash.copy()

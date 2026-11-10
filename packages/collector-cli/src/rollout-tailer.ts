@@ -1014,6 +1014,7 @@ export class RolloutTailer {
       cursor: JsonlScanCursor<RolloutParserState> | undefined;
       initialOffset?: number;
       commitSignature: string;
+      retryCommittedPrefix: boolean;
     }> = [];
     const automaticFilesConsumed = new Set<string>();
     const automaticFilesPartial = new Set<string>();
@@ -1067,8 +1068,8 @@ export class RolloutTailer {
       const observation = baselineObservation(file, stat, discovered.precise);
       const commitSignature = maintenanceCandidateHash(
         `${observation.device}:${observation.inode}:${observation.birthtimeNs}:${observation.size}:${stat.mtimeMs}:${stat.ctimeMs}`);
-      const parked = jsonlCommitFailureParked(this.buffer.database, this.cursorKey(file), commitSignature, PLIMSOLL_VERSION);
-      if (parked) {
+      const parked = jsonlCommitFailureParked(this.buffer.database, this.cursorKey(file), commitSignature);
+      if (parked?.version === PLIMSOLL_VERSION) {
         result.unresolvedRecords += 1;
         result.bytesDeferred += Math.max(0, stat.size - parked.offset);
         consumeAutomaticFile(file);
@@ -1140,7 +1141,7 @@ export class RolloutTailer {
         }
         if (!cursor) initialOffset = growthStart;
       }
-      candidates.push({ file, stat, cursor, initialOffset, commitSignature });
+      candidates.push({ file, stat, cursor, initialOffset, commitSignature, retryCommittedPrefix: Boolean(parked && cursor) });
     }
 
     // Newest first on the automatic path; explicit scans retain cursor-first
@@ -1235,6 +1236,7 @@ export class RolloutTailer {
             const next = readJsonlContinuation(candidate.file, candidate.stat, cursor, limits, this.io, {
               database: this.buffer.database, provider: "codex", cursorKey: this.cursorKey(candidate.file), root: root ?? undefined,
               directory: root?.directory ?? this.sessionsDir, initialOffset: candidate.initialOffset,
+              retryCommittedPrefix: candidate.retryCommittedPrefix,
               deadline: automatic ? automatic.budget.unitDeadline() : performance.now() + 200,
               eligible: () => {
                 if (options.signal?.aborted) return false;
@@ -1334,6 +1336,8 @@ export class RolloutTailer {
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.continuation?.action === "checkpoint") {
                 read.continuation.applyCheckpoint();
+                clearJsonlCommitFailure(this.buffer.database, this.cursorKey(candidate.file));
+                candidate.retryCommittedPrefix = false;
                 return;
               }
               // Deletion and provider writes share this transaction. Failure

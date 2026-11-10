@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,10 +7,12 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { deriveCaptureRootIdentity, rootCursorKey } from "../packages/collector-cli/src/capture-root-inventory";
 import { DEFAULT_JSONL_TAILER_IO, jsonlScanStateKey, readJsonlTail as readTail, prepareJsonlCommittedPrefixHash as hashPrefix, rememberJsonlScanCursor as saveCursor } from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
+import { readJsonlContinuation } from "../packages/collector-cli/src/jsonl-continuation";
+import { loadJsonlScanCursor } from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const completion=createProofCompletion("codex-fork-identity",4), started=performance.now();
+const completion=createProofCompletion("codex-fork-identity",6), started=performance.now();
 const eq:typeof assert.deepEqual=assert.deepEqual;
 const base=fs.mkdtempSync(path.join(os.tmpdir(),"fork-")), errors:string[]=[], original=console.error;
 const parent="01990000-0000-7000-8000-000000000001", child="01990000-0000-7000-8000-000000000002";
@@ -26,7 +29,7 @@ async function fixture(name:string,body:(f:any)=>Promise<void>) {
   const scan=()=>tailer.scan({scope:"full"}), rows=()=>db.prepare("select payload_json from buffered_events order by session_id,rowid").all().map((r:any)=>JSON.parse(r.payload_json));
   const cursor=(id:string)=>db.prepare("select * from rollout_scan_state where file=?").get(jsonlScanStateKey(key(id))) as any;
   const receipt=(id:string)=>db.prepare("select * from rollout_scan_state where file=?").get(jsonlScanStateKey(`codex-commit-failure:${key(id)}`)) as any;
-  try {await body({buffer,db,io,file,key,scan,rows,cursor,receipt,put(id:string,n:number){fs.writeFileSync(file(id),meta(id)+(id===child?meta(parent):"")+count(0)+count(n));},
+  try {await body({buffer,db,io,file,key,scan,rows,cursor,receipt,root:roots[0],sessions,put(id:string,n:number){fs.writeFileSync(file(id),meta(id)+(id===child?meta(parent):"")+count(0)+count(n));},
     restart(){tailer.close();tailer=new RolloutTailer(buffer,sessions,()=>[],io,roots);}});}finally{tailer.close();buffer.close();}
 }
 async function main(){console.error=value=>errors.push(String(value));try{
@@ -61,6 +64,51 @@ async function main(){console.error=value=>errors.push(String(value));try{
     fs.appendFileSync(f.file(child),count(300));await f.scan();eq(attempts,3);await f.scan();eq(attempts,4);
     f.db.prepare("update rollout_scan_state set commit_failure_json=json_set(commit_failure_json,'$.version','0.7.55')").run();f.io.readTail=readTail;
     await f.scan();eq(f.rows().reduce((n:number,e:any)=>n+e.inputTokens,0),300);eq(f.receipt(child),undefined);
-  });completion.check("park_survives_restart_file_and_version_fences");assert.ok(performance.now()-started<60_000);completion.complete();
+  });completion.check("park_survives_restart_file_and_version_fences");
+  for(const changed of [false,true])await fixture(`static-${changed}`,async f=>{
+    f.put(child,100);fs.appendFileSync(f.file(child),line("event_msg",{type:"other",padding:"X".repeat(4096)}));await f.scan();
+    const file=f.file(child),offset=fs.statSync(file).size,oldEvents=f.rows().length;
+    fs.appendFileSync(file,count(200)+count(300));
+    if(changed){const bytes=fs.readFileSync(file);bytes[2048]=89;fs.writeFileSync(file,bytes);}
+    const stat=fs.statSync(file,{bigint:true}),snapshot=()=>{const s=fs.lstatSync(file,{bigint:true});return [s.dev,s.ino,s.birthtimeNs,s.size,s.mtimeNs,s.ctimeNs];};
+    // A durable mid-file cursor, with all bytes already present before scans.
+    f.db.prepare("update rollout_scan_state set size=?,deferred_bytes=?,work_remaining=1,mtime_ms=?,ctime_ms=? where file=?")
+      .run(Number(stat.size),Number(stat.size)-offset,Number(stat.mtimeNs)/1e6,Number(stat.ctimeNs)/1e6,jsonlScanStateKey(f.key(child)));
+    const before=snapshot(),logs=errors.length;let message="first_failure",attempts=0;
+    f.io.readTail=(...args:Parameters<typeof readTail>)=>{const read=readTail(...args);if(read)read.assertStableForCommit=()=>{attempts++;throw new Error(message);};return read;};
+    await f.scan();message="source_changed";await f.scan();eq(JSON.parse(f.receipt(child).commit_failure_json).attempts,1);
+    await f.scan();const parked=f.receipt(child);eq(JSON.parse(parked.commit_failure_json).attempts,2);
+    await f.scan();f.restart();await f.scan();eq([attempts,errors.length-logs],[3,3]);eq(f.receipt(child),parked);eq(snapshot(),before);
+    eq(f.rows().length,oldEvents);eq(f.cursor(child).committed_offset,offset);
+    f.db.prepare("update rollout_scan_state set commit_failure_json=json_set(commit_failure_json,'$.version','0.7.55') where commit_failure_json is not null").run();f.io.readTail=readTail;
+    const pending=readJsonlContinuation(file,fs.statSync(file),loadJsonlScanCursor(f.db,f.key(child),"codex-rollout-v2",2,x=>x),{maxBytes:1025},f.io,
+      {database:f.db,provider:"codex",cursorKey:f.key(child),root:f.root,directory:f.sessions,retryCommittedPrefix:true,deadline:performance.now()+200,eligible:()=>true})!;
+    eq(pending.continuation?.reason,"prefix_verification_pending");eq(pending.bytesRead,1025);pending.close();
+    await f.scan();eq(errors.length-logs,3);
+    if(changed){eq(f.cursor(child).committed_offset,offset);eq(f.rows().length,oldEvents);
+      eq(JSON.parse(f.db.prepare("select envelope_json from jsonl_continuations").get().envelope_json).reason,"prefix_changed");
+      await f.scan();eq(errors.length-logs,3);
+    }else{eq(f.cursor(child).committed_offset,Number(stat.size));eq(f.rows().reduce((n:number,e:any)=>n+e.inputTokens,0),300);eq(f.receipt(child),undefined);}
+  });completion.check("static_mid_file_identical_failures_park_and_prefix_gates_readmission");
+  await fixture("source-fence",async f=>{
+    f.put(child,100);await f.scan();const file=f.file(child),offset=fs.statSync(file).size;
+    fs.appendFileSync(file,line("event_msg",{padding:"X".repeat(180_000),type:"token_count",info:{total_token_usage:{input_tokens:200,output_tokens:20}}}));
+    const cursor=loadJsonlScanCursor(f.db,f.key(child),"codex-rollout-v2",2,x=>x);
+    const read=readJsonlContinuation(file,fs.statSync(file),cursor,{maxBytes:65536},f.io,
+      {database:f.db,provider:"codex",cursorKey:f.key(child),root:f.root,directory:f.sessions,deadline:performance.now()+200,eligible:()=>true})!;
+    read.assertStableForCommit();read.continuation!.applyCheckpoint();read.close();
+    const row=f.db.prepare("select file_key,envelope_json from jsonl_continuations").get(),body=JSON.parse(row.envelope_json);delete body.sha256;body.reason="source_changed";
+    const sealed={...body,sha256:crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")};
+    f.db.prepare("update jsonl_continuations set envelope_json=? where file_key=?").run(JSON.stringify(sealed),row.file_key);
+    await f.scan();eq(f.cursor(child).committed_offset,fs.statSync(file).size);assert(f.cursor(child).committed_offset>offset);
+    eq(f.rows().reduce((n:number,e:any)=>n+e.inputTokens,0),200);
+  });
+  await fixture("uncommitted-park",async f=>{
+    f.put(child,100);f.db.exec("create trigger fail_new before insert on buffered_events begin select raise(abort,'new_file_failure'); end");
+    await f.scan();await f.scan();assert(f.receipt(child));eq(f.cursor(child),undefined);
+    f.db.exec("drop trigger fail_new; update rollout_scan_state set commit_failure_json=json_set(commit_failure_json,'$.version','0.7.55') where commit_failure_json is not null");
+    await f.scan();eq(f.rows().reduce((n:number,e:any)=>n+e.inputTokens,0),100);eq(f.receipt(child),undefined);
+  });completion.check("source_changed_envelope_and_uncommitted_file_readmission");
+  assert.ok(performance.now()-started<60_000);completion.complete();
 }finally{console.error=original;fs.rmSync(base,{recursive:true,force:true});}}
 main().catch(error=>{console.error(error);process.exitCode=1;});

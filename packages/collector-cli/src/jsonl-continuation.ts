@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { captureRootDigest, type CaptureRoot } from "./capture-root-inventory";
-import { ABSOLUTE_MAX_READ_BYTES, jsonlScanStateKey, type JsonlScanCursor, type JsonlTailRead, type JsonlTailReadLimits, type JsonlTailerIo } from "./jsonl-byte-tailer";
+import { ABSOLUTE_MAX_READ_BYTES, jsonlScanStateKey, recheckJsonlCommittedPrefix, type JsonlScanCursor, type JsonlTailRead, type JsonlTailReadLimits, type JsonlTailerIo } from "./jsonl-byte-tailer";
 import { classifySkippedRecordWithProof, newSkippedDiscriminatorProbe, observeSkippedDiscriminators,
   proveSkippedNonUsage, type CaptureSkippedRecord, type SkippedDiscriminatorProbe,
   type SkippedPrefixClassification } from "./capture-record-loss";
@@ -39,6 +39,8 @@ export type ContinuationProposal = {
 export type ContinuationOptions = {
  database: Database.Database; provider: Provider; cursorKey: string; root?: CaptureRoot;
  directory: string; deadline: number; initialOffset?: number;
+ /** A previous collector version parked this same generation at commit. */
+ retryCommittedPrefix?: boolean;
  /** Metadata-only eligibility check. Called before every body/probe/scalar read. */
  eligible(): boolean;
 };
@@ -227,6 +229,30 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
    if (n !== length) throw new Error("source_changed");
    return bytes;
  };
+ const readmit = () => {
+   current = securePath();
+   if (!cursor || cursor.checkpointStatus !== "valid" || cursor.committedOffset === null ||
+       cursor.committedOffset > current.size || cursor.fileIdentity !== current.identity) return park("prior_cursor_invalid");
+   fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+   let verified: boolean | null;
+   try {
+     verified = recheckJsonlCommittedPrefix(db, options.cursorKey, cursor, JSON.stringify(current), readAt,
+       maxBytes - bytesRead, options.deadline);
+   } catch (error) {
+     if (error instanceof Error && error.message === "read_budget_exhausted") return park("prefix_verification_pending");
+     throw error;
+   }
+   prefixBytesRead = bytesRead;
+   if (verified === null) return park("prefix_verification_pending");
+   // Discard only uncommitted parser work. The exact committed prefix, provider
+   // state, binding and ancestry must still prove the old resume boundary.
+   initialOffset = cursor.committedOffset;
+   envelope = {version:1, rollbackVersion:"0.7.4", binding:b, priorCursor, ancestors:admittedAncestors!,
+     snapshot:current, parser:checkpoint(start(options.provider, initialOffset)),
+     prefix:fingerprint(initialOffset), verification:null, reason:null,
+     discriminatorProbe:newSkippedDiscriminatorProbe()};
+   return verified ? result("checkpoint") : refuse("prefix_changed");
+ };
  try {
    if (previousRaw === undefined && db.prepare("select 1 from jsonl_continuations where file_key=? limit 1").get(b.fileKey)) return park("binding_mismatch");
    if (previousRaw !== undefined) {
@@ -237,6 +263,8 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      if (digest(envelope.binding) !== digest(b) || envelope.priorCursor !== priorCursor ||
        (cursor && cursor.checkpointStatus !== "valid") || restore(envelope.parser).recordStart !== (cursor?.committedOffset ?? options.initialOffset ?? 0)) return park("binding_mismatch");
      initialOffset = envelope.prefix.end;
+     if (options.provider === "codex" && (envelope.reason === "source_changed" ||
+         options.retryCommittedPrefix && (!envelope.reason || envelope.reason === "incomplete_record"))) return readmit();
      if (envelope.reason && envelope.reason !== "incomplete_record") return park(envelope.reason);
      const p = envelope.verification?.prefix ?? envelope.prefix;
      const savedParser = restore(envelope.parser);
@@ -250,6 +278,7 @@ export function readJsonlContinuation<T>(file: string, stat: fs.Stats, cursor: J
      // The old reader performs its bounded head/boundary integrity checks. Its
      // unresolved result is a proposal only; never store its reset/scan fields.
      current = securePath();
+     if (options.provider === "codex" && options.retryCommittedPrefix) return readmit();
      if (!cursor && options.initialOffset && options.initialOffset > 0) {
        fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
        check();
