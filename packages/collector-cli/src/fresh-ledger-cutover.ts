@@ -20,7 +20,7 @@ import { readLiveProducerBindings, LIVE_BINDINGS_FILE } from "./codex-live-usage
 import type { CollectorConfig } from "./config";
 import { loadJsonlScanCursorByKey, ensureJsonlScanState,
   jsonlScanStateKey } from "./jsonl-byte-tailer";
-import { otherProcessesWithFilesOpen } from "./ledger-open-handles";
+import { waitForLedgerQuiescence } from "./ledger-open-handles";
 import { LifecycleMutationAuthority } from "./lifecycle-authority";
 import { acquireLedgerConnectionLock, readLedgerPublication, writeLedgerPublication,
   type LedgerConnectionLock, type LedgerPublication } from "./ledger-connection";
@@ -975,10 +975,10 @@ function switchFreshLedgerUnderBarrier(input: CutoverInput, barrier: LedgerConne
     old = new Database(input.ledgerPath, { fileMustExist: true, timeout: 0 });
     old.pragma("locking_mode = EXCLUSIVE");
     old.exec("BEGIN EXCLUSIVE; COMMIT");
-    const others = otherProcessesWithFilesOpen([input.ledgerPath,
+    const quiescent = waitForLedgerQuiescence([input.ledgerPath,
       `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`, input.archivePath,
       `${input.archivePath}-wal`, `${input.archivePath}-shm`]);
-    if (others === null || others.length) throw new Error("ledger_quiescence_unproven");
+    if (!quiescent) throw new Error("ledger_quiescence_unproven");
     if (old.pragma("journal_mode", { simple: true }) === "wal") {
       old.pragma("checkpoint_fullfsync = ON");
       const [checkpoint] = old.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
@@ -1094,10 +1094,10 @@ function switchFreshLedgerUnderBarrier(input: CutoverInput, barrier: LedgerConne
     writeLedgerPublication(barrier, publication);
     // This second check is after all inventory/carry work and before ANY
     // rename. It catches uncooperative raw SQLite openers under our old lock.
-    const lateHandles = otherProcessesWithFilesOpen([input.ledgerPath,
+    const lateQuiescent = waitForLedgerQuiescence([input.ledgerPath,
       `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`, input.archivePath,
       `${input.archivePath}-wal`, `${input.archivePath}-shm`]);
-    if (lateHandles === null || lateHandles.length) {
+    if (!lateQuiescent) {
       throw new Error("ledger_quiescence_unproven: foreign handle before rename");
     }
     for (const suffix of ["-wal", "-shm"] as const) {
@@ -1139,10 +1139,10 @@ function switchFreshLedgerUnderBarrier(input: CutoverInput, barrier: LedgerConne
     }
     // The old transaction is still held. A raw connection that opened in
     // the last-check/rename gap cannot finish a write before this inspection.
-    const remainingHandles = otherProcessesWithFilesOpen([input.archivePath,
+    const remainingQuiescent = waitForLedgerQuiescence([input.archivePath,
       `${input.archivePath}-wal`, `${input.archivePath}-shm`,
       `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`]);
-    if (remainingHandles === null || remainingHandles.length) {
+    if (!remainingQuiescent) {
       throw new Error("replacement_verification_failed: old inode or sidecar is held by another process");
     }
     activeLock.close(); activeLock = null;
@@ -1298,9 +1298,9 @@ export function recoverInvalidLedgerPublication(ledgerPath: string): void {
     const recorded = readLedgerPublication(barrier);
     if (!recorded || recorded.state !== "ready") throw new Error("replacement_recovery_state_unavailable");
     publication = recorded;
-    const others = otherProcessesWithFilesOpen([ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`,
+    const quiescent = waitForLedgerQuiescence([ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`,
       recorded.marker.archivePath, `${recorded.marker.archivePath}-wal`, `${recorded.marker.archivePath}-shm`]);
-    if (others === null || others.length) throw new Error("replacement_recovery_refused: foreign ledger handle");
+    if (!quiescent) throw new Error("replacement_recovery_refused: foreign ledger handle");
     suspect = `${ledgerPath}.verification-suspect-${Date.now()}-${crypto.randomUUID()}`;
     fs.linkSync(ledgerPath, suspect);
     fsyncDirectory(path.dirname(ledgerPath));
@@ -1453,9 +1453,9 @@ function restoreArchivedLedgerUnderBarrier(input: {
       replacement.pragma("locking_mode = EXCLUSIVE");
       replacement.exec("BEGIN EXCLUSIVE; COMMIT");
     }
-    const others = otherProcessesWithFilesOpen([input.ledgerPath,
+    const quiescent = waitForLedgerQuiescence([input.ledgerPath,
       `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`]);
-    if (others === null || others.length) throw new Error("ledger_quiescence_unproven");
+    if (!quiescent) throw new Error("ledger_quiescence_unproven");
     if (!unpublished) {
       const currentMarker = replacement!.prepare(
         "select archive_identity as archiveIdentity from collector_replacement_ledger where singleton=1")
@@ -1517,9 +1517,9 @@ function restoreArchivedLedgerUnderBarrier(input: {
     readRestoreStageJournal(stage, marker.archiveIdentity, archiveStat.size);
     assertRestoreStageImage(restoredLock, stageJournal, archiveBinding);
     heartbeat();
-    const lateHandles = otherProcessesWithFilesOpen([input.ledgerPath,
+    const lateQuiescent = waitForLedgerQuiescence([input.ledgerPath,
       `${input.ledgerPath}-wal`, `${input.ledgerPath}-shm`]);
-    if (lateHandles === null || lateHandles.length) throw new Error("ledger_quiescence_unproven: foreign handle before restore rename");
+    if (!lateQuiescent) throw new Error("ledger_quiescence_unproven: foreign handle before restore rename");
     fs.chmodSync(input.ledgerPath, 0o600);
     if (!freshExistsNow) fs.linkSync(input.ledgerPath, input.freshAttemptPath);
     for (const suffix of ["-wal", "-shm"] as const) {

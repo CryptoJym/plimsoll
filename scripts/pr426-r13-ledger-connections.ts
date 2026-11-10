@@ -44,7 +44,7 @@ function syncWait(file: string) {
   assert.ok(fs.existsSync(file), "fixture child reached its boundary");
 }
 
-async function withArchiveLsofFault(archive: string, failures: number, action: () => Promise<void>) {
+async function withArchiveLsofFault(archive: string, failures: number, action: () => Promise<void>, foreignPid?: number) {
   const children = require("node:child_process") as { spawnSync: typeof spawnSync };
   const nativeSpawnSync = children.spawnSync;
   let calls = 0, injected = 0;
@@ -53,7 +53,8 @@ async function withArchiveLsofFault(archive: string, failures: number, action: (
       calls += 1;
       if (injected < failures) {
         injected += 1;
-        return { status: 1, signal: null, stdout: "", stderr: "lsof: synthetic kernel timeout\n",
+        return { status: 1, signal: null, stdout: foreignPid ? `${foreignPid}\n` : "",
+          stderr: foreignPid ? "" : "lsof: synthetic kernel timeout\n",
           pid: process.pid, output: [null, "", ""] };
       }
     }
@@ -223,9 +224,9 @@ async function main(variant: string) {
     return;
   }
   // Keep these regressions in an existing CI proof without changing its gates.
-  if (variant === "startup-marker") await main("startup-probes");
+  if (variant === "startup-marker") { await main("startup-probes"); await main("restore-probes"); }
   assert.ok(["cli", "supervised-restart", "shared-lifetime", "old-connection", "missing-marker",
-    "integrity", "post-check-raw", "startup-marker", "startup-integrity", "worker-probes",
+    "integrity", "post-check-raw", "startup-marker", "startup-integrity", "worker-probes", "restore-probes",
     ...startupProbeCases.map(test => `startup-probe-${test}`)].includes(variant));
   const fixture = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),
     variant.startsWith("startup-probe-foreign-") ? "PRIVATE_LEDGER_PATH_443-" : "r13-connection-")));
@@ -255,7 +256,29 @@ async function main(variant: string) {
     const invoke = (args: string[]) => spawnSync(process.execPath, ["--import", loader, ...args],
       { env, encoding: "utf8", timeout: 30_000 });
 
-    if (variant === "worker-probes") {
+    if (variant === "restore-probes") {
+      switchFreshLedger(input);
+      const before = fs.statSync(ledger).ino;
+      const restore = () => restoreArchivedLedger({ ...input, freshAttemptPath: `${ledger}.saved` });
+      child = spawn(process.execPath, ["--import", loader, self, "--raw-child", ledger, fixture], { env, stdio: "ignore" });
+      await waitFor(() => fs.existsSync(path.join(fixture, "raw-ready")), "foreign live handle is open");
+      assert.throws(restore, { message: "ledger_quiescence_unproven" });
+      assert.equal(child.exitCode, null, "the foreign handle stays open through refusal");
+      assert.equal(fs.statSync(ledger).ino, before);
+      await stop(child); child = null;
+      const exhausted = await withArchiveLsofFault(ledger, Infinity, async () => {
+        assert.throws(restore, { message: "ledger_quiescence_unproven" });
+      });
+      assert.deepEqual(exhausted, { calls: 3, injected: 3 });
+      assert.equal(fs.statSync(ledger).ino, before, "inconclusive probes cannot authorize a restore");
+      const transient = await withArchiveLsofFault(ledger, 1, async () => {
+        const foreign = await withArchiveLsofFault(ledger, 1, async () => { restore(); }, process.pid + 1);
+        assert.deepEqual(foreign, { calls: 4, injected: 1 });
+      });
+      assert.deepEqual(transient, { calls: 3, injected: 1 });
+      assert.notEqual(fs.statSync(ledger).ino, before, "foreign, inconclusive, then clear allows restore");
+      console.log(JSON.stringify({ variant, exhausted, transient, persistentForeignRefused: true }));
+    } else if (variant === "worker-probes") {
       switchFreshLedger(input);
       await workerProbeChecks(ledger);
     } else if (variant.startsWith("startup-probe-")) {

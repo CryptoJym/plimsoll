@@ -51,3 +51,17 @@ export const otherProcessesWithFilesOpen: OpenHandleCheck = (files) => {
   }
   return null;
 };
+
+/** Cutover/recovery uses the lifecycle opener's three probes, 100 ms apart.
+ * A transient foreign handle can close during that pause; uncertainty never
+ * establishes quiescence. Keep the raw probe's 60-second timeout and buffer. */
+export function waitForLedgerQuiescence(files: readonly string[]): boolean {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+    const others = otherProcessesWithFilesOpen(files);
+    if (others !== null && others.length === 0) return true;
+  }
+  return false;
+}
