@@ -2087,7 +2087,23 @@ async function readDaemonState(
   }
 }
 
-async function checkCollectorConnectivity(port: number, managementToken?: string) {
+function unavailableCollectorConnectivity(port: number | null, error: string) {
+  return {
+    reachable: false,
+    error,
+    statusUrl: port === null ? null : `http://127.0.0.1:${port}/status`,
+    hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE,
+    runtimeIdentity: null,
+    homeIdentityHash: null,
+    retention: null,
+    enrollment: null,
+    signal: { verified: false, tokenAttributedEvents: null, sources: [] },
+  };
+}
+
+async function checkCollectorConnectivity(port: number | null, managementToken?: string) {
+  // A default port is not evidence that this home owns an installed collector.
+  if (port === null) return unavailableCollectorConnectivity(null, "collector_not_configured");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
 
@@ -2245,21 +2261,9 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
       },
     };
   } catch (error) {
-    return {
-      reachable: false,
-      error: error instanceof Error ? error.name : String(error),
-      statusUrl: `http://127.0.0.1:${port}/status`,
-      hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE,
-      runtimeIdentity: null,
-      homeIdentityHash: null,
-      retention: null,
-      enrollment: null,
-      signal: {
-        verified: false,
-        tokenAttributedEvents: null,
-        sources: [],
-      },
-    };
+    return unavailableCollectorConnectivity(
+      port, error instanceof Error ? error.name : String(error),
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -6217,7 +6221,7 @@ async function main() {
     const codexHookCommand = diagnoseManagedCodexHookCommand(codexPath);
     const launchAgent = readLaunchAgentState(plistPath);
     const connectivity = await checkCollectorConnectivity(
-      config.port,
+      configRead?.status === "valid" ? config.port : null,
       readLocalIngestAuth(collectorHome())?.managementRead,
     );
     const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);

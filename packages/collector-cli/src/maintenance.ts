@@ -1112,6 +1112,50 @@ export class CollectorMaintenance {
         throw error;
       } finally { saveRepairService(); }
     };
+    // Spare time in a repair turn must be usable before capture: a busy
+    // tailer can consume every post-capture allowance indefinitely. Keep the
+    // rotating stages first, their existing 75 ms share, and the shared 200 ms
+    // admission ceiling; capture-first turns retain their original priority.
+    const runProjectionCatchup = async (repairDeadline = Number.POSITIVE_INFINITY) => {
+      const catchupAt = options.projectionClock?.() ?? performance.now();
+      if (!migrationPending && catchupAt >= this.projectionCatchupAfter && !this.signal?.aborted) {
+        if (!budget.canStart(5) || repairDeadline - clock() < 5) return;
+        const backlog = this.buffer.projection.status().backlog;
+        const queuedWork = Object.values(backlog).reduce((sum, count) => sum + count, 0);
+        if (queuedWork === 0) return;
+        const pressure = () => {
+          if (this.options.projectionPressure) return this.options.projectionPressure();
+          const home = path.dirname(this.buffer.database.name);
+          return { loadPerCore: Math.max(...os.loadavg().slice(0, 2)) / os.cpus().length,
+            // Missing directories are empty; unreadable directories withhold bonus work.
+            intakeSpooling: listHookSpoolArrivals(home)?.length !== 0 ||
+              listOtlpSpoolArrivals(home)?.length !== 0 };
+        };
+        const allowance = () => {
+          const current = pressure();
+          return projectionRepairAllowance(queuedWork,
+            current.loadPerCore, current.intakeSpooling);
+        };
+        const grant = allowance();
+        const canStart = () => budget.canStart(5) && repairDeadline - clock() >= 5;
+        if (grant.maxSlices > 1 && canStart()) {
+          this.projectionCatchupAfter = catchupAt + 5_000;
+          await executeRepairStage("projection", { maxSlices: grant.maxSlices - 1,
+            maxActiveMs: Math.min(grant.maxActiveMs - 25, repairDeadline - clock()) },
+            () => allowance().maxSlices > 1 && canStart());
+          // Completing an empty session, GC day or other publication queue is
+          // progress too: retain the five-second retry even without fact rows.
+          const remaining = this.buffer.projection.status().backlog;
+          repairService.stages.projection.rowsVisited += Object.entries(backlog).reduce(
+            (sum, [queue, count]) => sum + Math.max(0, count - remaining[queue as keyof typeof remaining]), 0);
+          saveRepairService();
+          // An admitted unit (including fsync) can overrun: repay that time before
+          // another grant, even when capture requests faster maintenance ticks.
+          this.projectionCatchupAfter = Math.max(this.projectionCatchupAfter,
+            catchupAt + 5 * (drained?.drain.activeMs ?? 0));
+        }
+      }
+    };
     const runRepairs = async () => {
       const repairStarted = clock();
       // Historical Codex pairs must advance on every admitted repair turn;
@@ -1142,6 +1186,7 @@ export class CollectorMaintenance {
         }
         await executeRepairStage(stage);
       }
+      await runProjectionCatchup(repairStarted + 75);
     };
     // Every pending projection migration gets one slice per admitted tick.
     // The other stages retain the 75 ms rotating allowance after that slice.
@@ -1336,41 +1381,7 @@ export class CollectorMaintenance {
       transcript,
       grok,
     );
-    // Catch-up follows capture, coverage and the rotating repair stages, using
-    // only the admission budget they leave before the shared 200 ms ceiling.
-    const catchupAt = options.projectionClock?.() ?? performance.now();
-    if (!migrationPending && catchupAt >= this.projectionCatchupAfter && !this.signal?.aborted) {
-      const backlog = this.buffer.projection.status().backlog;
-      const pressure = () => {
-        if (this.options.projectionPressure) return this.options.projectionPressure();
-        const home = path.dirname(this.buffer.database.name);
-        return { loadPerCore: Math.max(...os.loadavg().slice(0, 2)) / os.cpus().length,
-          // Missing directories are empty; unreadable directories withhold bonus work.
-          intakeSpooling: listHookSpoolArrivals(home)?.length !== 0 ||
-            listOtlpSpoolArrivals(home)?.length !== 0 };
-      };
-      const allowance = () => {
-        const current = pressure();
-        return projectionRepairAllowance(Object.values(backlog).reduce((sum, count) => sum + count, 0),
-          current.loadPerCore, current.intakeSpooling);
-      };
-      const grant = allowance();
-      if (grant.maxSlices > 1 && budget.canStart(5)) {
-        this.projectionCatchupAfter = catchupAt + 5_000;
-        await executeRepairStage("projection", { maxSlices: grant.maxSlices - 1,
-          maxActiveMs: grant.maxActiveMs - 25 }, () => allowance().maxSlices > 1 && budget.canStart(5));
-        // Completing an empty session, GC day or other publication queue is
-        // progress too: retain the five-second retry even without fact rows.
-        const remaining = this.buffer.projection.status().backlog;
-        repairService.stages.projection.rowsVisited += Object.entries(backlog).reduce(
-          (sum, [queue, count]) => sum + Math.max(0, count - remaining[queue as keyof typeof remaining]), 0);
-        saveRepairService();
-        // An admitted unit (including fsync) can overrun: repay that time before
-        // another grant, even when capture requests faster maintenance ticks.
-        this.projectionCatchupAfter = Math.max(this.projectionCatchupAfter,
-          catchupAt + 5 * (drained?.drain.activeMs ?? 0));
-      }
-    }
+    await runProjectionCatchup();
     return {
       recentOnly: true,
       rollout,

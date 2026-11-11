@@ -982,7 +982,18 @@ async function proveProjectionRepairCatchup(root: string) {
     const loaded = (await scheduler.trigger()).at(-1)!;
     forcedLoad = 0; spooling = true;
     const spooled = (await scheduler.trigger()).at(-1)!;
-    forcedLoad = measuredRealCadence ? null : 0; spooling = false;
+    forcedLoad = 0; spooling = false;
+    // A busy source spends the aggregate wall at admission on every turn.
+    // The real queued delete repairs must still receive catch-up service.
+    let busyClock = 0;
+    const busy = await maintenance.runRecent({
+      budgetClock: () => busyClock, projectionClock: () => syntheticNow,
+      onProgress: progress => { if (progress.stage === "source_scan") busyClock = 200; return true; },
+    });
+    check("busy_capture_leaves_repair_turn_catchup_inside_existing_budget",
+      (busy.projectionDrain?.slices ?? 0) > 1 && busy.projection!.repairRowsVisited > 0,
+      {slices:busy.projectionDrain?.slices,rows:busy.projection?.repairRowsVisited});
+    forcedLoad = measuredRealCadence ? null : 0;
     const before = buffer.projection.status().backlog.repairs, startLoad = load();
     const cpu = process.cpuUsage(), started = performance.now();
     let maxSlices = 0, maxActiveMs = 0, peakLoad = startLoad;

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.66 — 2026-11-11
+
+- Read-only doctor skips the network when its collector configuration is missing
+  or invalid, so its default port cannot reach a different installation.
+
+- Dashboard catch-up can use spare time in the existing repair turn before
+  capture starts. Busy capture used to spend every post-capture allowance,
+  leaving large repair queues with only one slice. The rotating repair stages
+  still run first, the repair turn keeps its 75 ms share, and capture-first
+  turns, the shared 200 ms admission ceiling, pressure checks and cooldown
+  stay intact (plimsoll N123). Empty or exhausted turns skip spool-directory
+  inspection; the idle resource fixture drops 128 failed enumerations to zero.
+
 ## 0.7.65 — 2026-11-10
 
 - The dashboard projection catch-up allowance counts every queue that gates

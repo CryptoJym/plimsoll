@@ -445,13 +445,15 @@ esac
   const packagedBytes = fs.readFileSync(packagedCli, "utf8");
   if (!packagedBytes.includes("48271")) throw new Error("packaged default port unavailable for stand-in test");
   fs.writeFileSync(guardCli, packagedBytes.replaceAll("48271", String(standInDefaultPort)));
+  // An invalid profile must not fall back to another installation's default port.
+  fs.writeFileSync(path.join(blankPlimsoll, "collector.config.json"), "{invalid\n");
   const guardedDoctor = await command(process.execPath,
     [guardCli, "doctor", "--read-only", "--json"],
     { cwd: neutralCwd, env: blankDoctorEnv });
   const guardedReceipt = guardedDoctor.stdout.trim() ? parseJson(guardedDoctor.stdout) : null;
   check("blank_doctor_never_contacts_stand_in_default_listener",
     guardedDoctor.code !== 0 && defaultRequests === 0 &&
-      guardedReceipt?.readiness === "not_installed",
+      guardedReceipt?.readiness === "not_installed" && guardedReceipt?.config?.status === "invalid",
     { defaultRequests, standInDefaultPort, unreachablePort, code: guardedDoctor.code,
       stderr: guardedDoctor.stderr.slice(-1000), guardedReceipt });
   defaultGuard.closeAllConnections();
