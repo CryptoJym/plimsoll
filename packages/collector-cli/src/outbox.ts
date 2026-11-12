@@ -127,6 +127,7 @@ export type DeliveryStatus = {
     | "remote_rejected"
     | "auth_circuit"
     | "contract_circuit"
+    | "byte_gauge_repair_pending"
   >;
   remainingDelivery: number;
   active: {
@@ -134,6 +135,7 @@ export type DeliveryStatus = {
     retry: number;
     inFlight: number;
     bytes: number;
+    bytesVerified?: boolean;
     oldestCreatedAt: string | null;
     oldestAgeSeconds: number | null;
   };
@@ -770,7 +772,15 @@ export class DeliveryOutbox {
   private initializeSchema() {
     // Additive only: no query or index is built against the historical raw
     // ledger here. Large-ledger work happens solely in bounded migration slices.
-    this.db.exec(`
+    this.db.transaction(() => {
+      const previous = this.db.prepare(`select sql from sqlite_master
+        where type='trigger' and name='trg_upload_outbox_gauge_update'`).get() as
+        { sql: string } | undefined;
+      const columns = previous?.sql.match(/after\s+update\s+of([\s\S]*?)\bon\s+upload_outbox/i)?.[1];
+      if (previous && !columns?.includes("base_bytes")) {
+        this.db.exec(`drop trigger trg_upload_outbox_gauge_update`);
+      }
+      this.db.exec(`
       create table if not exists upload_outbox (
         delivery_id text primary key,
         raw_rowid integer,
@@ -911,7 +921,7 @@ export class DeliveryOutbox {
       end;
 
       create trigger if not exists trg_upload_outbox_gauge_update
-      after update of state, sealed_bytes, attempt_count on upload_outbox
+      after update of state, base_bytes, sealed_bytes, attempt_count on upload_outbox
       begin
         update upload_control set
           active_pending = active_pending
@@ -941,10 +951,14 @@ export class DeliveryOutbox {
             + case when new.terminal_state = 'dead' then 1 else 0 end
         where singleton = 1;
       end;
-    `);
+      `);
+    }).immediate();
     const controlColumns = this.db
       .prepare(`pragma table_info(upload_control)`)
       .all() as Array<{ name: string }>;
+    if (!controlColumns.some((column) => column.name === "byte_gauge_version")) {
+      this.db.exec(`alter table upload_control add column byte_gauge_version integer not null default 0`);
+    }
     if (!controlColumns.some((column) => column.name === "validation_probe_rows")) {
       this.db.exec(
         `alter table upload_control
@@ -1121,7 +1135,28 @@ export class DeliveryOutbox {
          privacy_migration_version = 1, updated_at = @now
        where singleton = 1 and privacy_migration_version < 1`,
      ).run({ now: this.clock().toISOString() });
+    this.repairActiveByteGauge();
    }
+
+  /** Rebase old restamp drift from active metadata only, never historical raw rows.
+   * Large queues keep their explicit pending state until ordinary delivery drains
+   * them below this bound; uploads and their leases are untouched. */
+  private repairActiveByteGauge(maxRows = 5_000) {
+    const limit = Math.max(1, Math.min(Math.trunc(maxRows), 5_000));
+    const control = this.db.prepare(`select byte_gauge_version as version,
+      active_pending+active_retry+active_in_flight as rows from upload_control where singleton=1`)
+      .get() as { version: number; rows: number };
+    if (control.version >= 1 || control.rows > limit) return;
+    this.db.transaction(() => {
+      const actual = this.db.prepare(`select count(*) as rows,
+        coalesce(sum(coalesce(sealed_bytes,base_bytes)),0) as bytes
+        from (select sealed_bytes,base_bytes from upload_outbox limit ?)`)
+        .get(limit + 1) as { rows: number; bytes: number };
+      if (actual.rows > limit) return;
+      this.db.prepare(`update upload_control set active_bytes=?,byte_gauge_version=1
+        where singleton=1`).run(actual.bytes);
+    }).immediate();
+  }
 
   /** Only dead NULL-lineage receipts ahead of the durable cursor block attestation. */
   private receiptLineageComplete() {
@@ -1877,6 +1912,7 @@ export class DeliveryOutbox {
   }
 
   migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}) {
+    this.repairActiveByteGauge(options.maxRows);
     const receiptBackfill = this.backfillLegacyReceiptLineage({
       maxRows: Math.min(options.maxRows ?? 256, 256),
       maxWriterMs: Math.min(options.maxWriterMs ?? 100, 100),
@@ -2735,7 +2771,7 @@ export class DeliveryOutbox {
            circuit_kind as circuitKind, circuit_opened_at as circuitOpenedAt,
            circuit_until as circuitUntil,
            active_pending as pending, active_retry as retry,
-           active_in_flight as inFlight, active_bytes as bytes,
+           active_in_flight as inFlight, active_bytes as bytes, byte_gauge_version as byteGaugeVersion,
            active_oldest_created_at as oldestCreatedAt,
            receipt_acknowledged as acknowledged, receipt_dead as dead,
            outbox_enqueued_total as outboxEnqueuedTotal,
@@ -2760,6 +2796,7 @@ export class DeliveryOutbox {
       retry: number;
       inFlight: number;
       bytes: number;
+      byteGaugeVersion: number;
       oldestCreatedAt: string | null;
       acknowledged: number;
       dead: number;
@@ -2778,6 +2815,7 @@ export class DeliveryOutbox {
       retry: control.retry,
       inFlight: control.inFlight,
       bytes: control.bytes,
+      bytesVerified: control.byteGaugeVersion >= 1,
       oldestCreatedAt: control.oldestCreatedAt,
     };
     const receipts = { acknowledged: control.acknowledged, dead: control.dead };
@@ -2800,6 +2838,7 @@ export class DeliveryOutbox {
     if (control.circuitKind === "auth_blocked") degradedReasons.push("auth_circuit");
     if (control.circuitKind === "contract_blocked") degradedReasons.push("contract_circuit");
     if (control.activeRemoteRejected > 0) degradedReasons.push("remote_rejected");
+    if (control.byteGaugeVersion < 1) degradedReasons.push("byte_gauge_repair_pending");
     if (control.pausedReason === "slice_budget_too_small") {
       degradedReasons.push("migration_slice_budget");
     }

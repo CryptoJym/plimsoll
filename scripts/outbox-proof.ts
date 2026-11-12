@@ -194,6 +194,33 @@ async function atomicAndDuplicateProof() {
   local.close();
 }
 
+function restampByteGaugeProof() {
+  const file = ledger();
+  let { buffer } = enabledBuffer(file);
+  buffer.append(event(3));
+  const exactBytes = () => (buffer.database.prepare(
+    `select coalesce(sum(coalesce(sealed_bytes,base_bytes)),0) as bytes from upload_outbox`,
+  ).get() as { bytes: number }).bytes;
+  buffer.delivery.restampUnsentRaw(uuid(3), JSON.stringify(event(3, { model: "model".repeat(20) })));
+  record("restamp_preserves_exact_delivery_bytes", buffer.delivery.status().active.bytes === exactBytes());
+  buffer.database.exec(`update upload_outbox set base_bytes=base_bytes+17,state='retry'`);
+  record("combined_size_state_update_counts_once", buffer.delivery.status().active.bytes === exactBytes());
+  // Model a pre-upgrade gauge, including the obsolete trigger definition.
+  const trigger = (buffer.database.prepare(`select sql from sqlite_master
+    where name='trg_upload_outbox_gauge_update'`).get() as { sql: string }).sql;
+  buffer.database.exec(`drop trigger trg_upload_outbox_gauge_update; ${trigger.replace("base_bytes, ", "")};
+    update upload_control set active_bytes=-7,byte_gauge_version=0`);
+  buffer.close();
+  ({ buffer } = enabledBuffer(file));
+  record("legacy_byte_gauge_rebuilt_from_active_rows", buffer.delivery.status().active.bytes === exactBytes());
+  buffer.database.exec(`update upload_outbox set base_bytes=base_bytes-9`);
+  record("legacy_trigger_upgraded", buffer.delivery.status().active.bytes === exactBytes());
+  buffer.database.exec(`update upload_outbox set sealed_bytes=base_bytes+25,state='in_flight';
+    delete from upload_outbox`);
+  record("seal_and_terminal_removal_leave_zero_bytes", buffer.delivery.status().active.bytes === 0);
+  buffer.close();
+}
+
 function migrationProof() {
   const file = ledger();
   let buffer = new LocalEventBuffer(file);
@@ -3986,6 +4013,7 @@ async function main() {
     suppressionReceiptContractProof();
     await suppressionReceiptProductionParityProof();
     await atomicAndDuplicateProof();
+    restampByteGaugeProof();
     migrationProof();
     await migrationReopenProof();
     await localPoisonProof();

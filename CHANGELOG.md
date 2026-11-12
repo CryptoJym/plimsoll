@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.67 — 2026-11-11
+
+- Correcting an unsent event now updates the delivery byte total as well as
+  its envelope. Previously that correction bypassed the byte-gauge trigger,
+  leaving negative totals after delivery (plimsoll N157). The trigger upgrade
+  is atomic; an active-only scan repairs existing drift when the queue fits
+  within 5,000 rows. Larger queues remain explicitly unverified and retry the
+  bounded repair during ordinary migration as delivery drains them. No raw
+  history, delivery identity, receipt, lease or backoff is changed.
+
 ## 0.7.66 — 2026-11-11
 
 - Read-only doctor skips the network when its collector configuration is missing
