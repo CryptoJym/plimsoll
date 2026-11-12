@@ -16,7 +16,7 @@ const home = fs.mkdtempSync(path.join(out, 'fixture-')); fs.chmodSync(home, 0o70
 const write = (file, value) => { fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); fs.writeFileSync(file, value, { mode: 0o600 }); };
 const day = new Date().toISOString().slice(0, 10), since = day + 'T00:00:00Z';
 const until = new Date(Date.parse(since) + 86_400_000).toISOString();
-const NODE_OPTIONS = '--jitless --max-old-space-size=128 --max-semi-space-size=1';
+const NODE_OPTIONS = '--jitless --max-old-space-size=256 --max-semi-space-size=1';
 const identity = { accountUuid: 'fixture-account-uuid', emailAddress: 'brain@example.test' };
 const accountKey = 'sha256:' + crypto.createHash('sha256').update(JSON.stringify({ stringValue: identity.accountUuid })).digest('hex').slice(0, 16);
 write(path.join(home, '.claude.json'), JSON.stringify({ oauthAccount: identity }));

@@ -67,7 +67,7 @@ export const HOUR = 3_600_000;
 export const WINDOW = 8 * 24 * HOUR;
 // The serialized state ceiling. Loading holds the file's text and its parse at once
 // (23 MB of heap for a 9.3 MB state), so the LaunchAgent's V8 heap is four times it.
-export const MAX_STATE = 32 * 1024 * 1024;
+export const MAX_STATE = 64 * 1024 * 1024;
 export const HEAP_MB = 4 * MAX_STATE / 1024 / 1024;
 export const counts = (): Counts => ({ requests: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
 export const actionCounts = (): Actions => ({ edit: 0, shell: 0, read: 0, search: 0, web: 0, browser: 0, mcp: 0, agent: 0, other: 0 });

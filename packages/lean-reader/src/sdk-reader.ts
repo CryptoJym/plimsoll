@@ -11,7 +11,7 @@ import { HOUR, MAX_STATE, string, type State, type SourceFile, type SdkCursor, t
 
 // Reading is the only charge, so a pass on a loaded hub still reads for a minute.
 // Files bound the cursors a pass adds; pending rows (a transcript can hold many
-// hour-and-model rows) bound what one upload materializes under the 128 MB heap.
+// hour-and-model rows) bound what one upload materializes under the 256 MB heap.
 const SLACK = 5 * 60_000, FILES = 4000, ROWS = 8000, BYTES = 512 * 1024 * 1024, SLICE = 1024 * 1024, READ_MS = 60_000;
 export type SdkCommit = { type: 'event_msg'; seq: number; file: string; cursor: SdkCursor; rows: [string, string, SdkSession][]; ids: Record<string, string> };
 function apply(state: State, commit: SdkCommit, ids: SdkIds): void {

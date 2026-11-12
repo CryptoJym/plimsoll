@@ -82,8 +82,8 @@ the same exact deduplication check. `sdk-journal.jsonl` fsyncs each slice's
 counts, hashes and cursor together; recovery replays only commits newer than
 the atomic state snapshot. The journal clears after that snapshot is durable.
 The job runs every 300 seconds with `NODE_OPTIONS=--jitless
---max-old-space-size=128 --max-semi-space-size=1`: a 128 MiB old-space heap and
-1 MiB semi-spaces. Its state ceiling stays 32 MiB; admission stops with room
+--max-old-space-size=256 --max-semi-space-size=1`: a 256 MiB old-space heap and
+1 MiB semi-spaces. Its state ceiling is 64 MiB; admission stops with room
 for the current slice when the serialized state approaches that ceiling.
 No prompts or tool evidence enter the glob state or journal. Their uploads contain
 the existing usage and session fields; optional velocity rows are not generated
@@ -313,11 +313,15 @@ Reads use 64 KiB chunks. Lines above 1 MiB are discarded unless their first
 512 bytes mark relevant usage/context; relevant oversized records are projected
 onto a bounded field allowlist without retaining their content. Closed delivered
 hours and expired IDs leave state. Pending data is never silently evicted: a
-32 MiB serialized state ceiling stops cursor advancement with `state_capacity`.
+64 MiB serialized state ceiling stops cursor advancement with `state_capacity`.
 Loading holds the file's text and its parse at once, so the LaunchAgent's V8 heap
-is four times the ceiling (`--max-old-space-size=128`); the two move together.
+is four times the ceiling (`--max-old-space-size=256`); the two move together.
 On 2026-11-05 Studio0's eight-day state reached the old 9 MiB ceiling and every
-pass failed from 19:51Z until the ceiling and heap were raised.
+pass failed from 19:51Z until the ceiling and heap were raised. On 2026-11-12 it
+neared 32 MiB the same way (eight days of SDK session rows, about 4.6 MB a busy
+day, were 18.4 MB of 33.2 MB): the 21:58Z pass failed and the next finished
+23.6 KB under the ceiling, so both doubled. State still grows with SDK sessions
+per window; that is the open design limit.
 Delivery failures retain pending data and retry with exponential backoff from
 one minute to one hour. `status` reports the last send/error and measured run
 footprint. Resolve a persistent capacity error before leaving the reader unattended.
