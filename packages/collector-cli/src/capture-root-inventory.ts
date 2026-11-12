@@ -9,6 +9,7 @@ import { resolveCollectorHome } from "./collector-home";
 import { workClassSchema, workComplexityBandSchema } from "../../shared/src/schemas";
 import { readPrivateStateFile, MAX_COLLECTOR_PROFILE_BYTES } from "./collector-state-io";
 import { DISPATCH_HISTORY_LIMITS, dispatchHistoryLookupStatus, dispatchHistoryPressure, dispatchHistoryRefSchema, historicalDispatchBindings } from "./dispatch-binding-index";
+import { BOUNDED_SQL_READ_PREDICATE, BoundedSqlReadError, boundedSqlRows } from "./bounded-sql-read";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 export const namespacedWorkItemIdSchema=z.string().max(256).regex(
   /^(?:beads:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|github:(?:sha256:[a-f0-9]{64}|[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?)\/pull\/[1-9][0-9]*|jira:[A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/,
@@ -324,7 +325,7 @@ export function claudeSessionRootSightings(sessionId: string): ReadonlySet<strin
   return seenClaudeSessionRoots.get(sessionId)??new Set<string>();
 }
 const claudeDispatchSkips={ conflictingBindings:0,otherRootSeen:0,ambiguousRoot:0,
-  replayTimeout:0,replayRootUnavailable:0,replayBytesUnvouched:0 };
+  replayTimeout:0,replayRootUnavailable:0,replayBytesUnvouched:0,rootLookupDeferred:0 };
 export function claudeDispatchSkipStatus() {
   return { ...claudeDispatchSkips,total:Object.values(claudeDispatchSkips).reduce((a,b)=>a+b,0) };
 }
@@ -339,7 +340,8 @@ export function countClaudeReplayBytesUnvouched(count=1) {
 }
 /** Identical fanout copies are one binding; a sighting in an unbound root vetoes it. */
 export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: string,
-  snapshot=currentDispatchBindingSnapshot(),durableSightings?: ReadonlySet<string>): DispatchBinding|null {
+  snapshot=currentDispatchBindingSnapshot(),
+  sightings?: ReadonlySet<string>|null|(()=>ReadonlySet<string>|null|undefined)): DispatchBinding|null {
   let candidate: ReturnType<typeof claudeCandidateBinding>;
   try { candidate=claudeCandidateBinding(snapshot,sessionId,observedAt); } catch { return null; }
   if(candidate.conflict) {
@@ -347,6 +349,13 @@ export function claudeBindingForUnrootedEvent(sessionId: string,observedAt: stri
     return null;
   }
   if(!candidate.binding) return null;
+  // Most intake sessions have no dispatch candidate. Do not read their raw
+  // history just to discover that there is nothing to attribute.
+  const durableSightings=typeof sightings==="function" ? sightings() : sightings;
+  if(durableSightings===null) {
+    claudeDispatchSkips.rootLookupDeferred++;
+    return null; // Incomplete evidence cannot grant a binding.
+  }
   if(claudeSessionRootSightings(sessionId).size===0 && !durableSightings?.size)
     return candidate.binding;
   const seen=new Set([...claudeSessionRootSightings(sessionId),...(durableSightings??[])]);
@@ -549,7 +558,11 @@ export function promoteClaudeRootSightingsForRaw(database: import("better-sqlite
 }
 /** Session-to-root evidence is durable even after the ordinary raw row expires. */
 export function durableClaudeRootSessionSightings(database: import("better-sqlite3").Database,
-  sessionId: string): ReadonlySet<string> {
+  sessionId: string): ReadonlySet<string>;
+export function durableClaudeRootSessionSightings(database: import("better-sqlite3").Database,
+  sessionId: string, options: { bounded: true }): ReadonlySet<string>|null;
+export function durableClaudeRootSessionSightings(database: import("better-sqlite3").Database,
+  sessionId: string, options?: { bounded: true }): ReadonlySet<string>|null {
   const version=database.pragma("data_version",{simple:true}) as number;
   let cache=sessionSightingCaches.get(database);
   if(!cache||cache.version!==version) {
@@ -560,16 +573,28 @@ export function durableClaudeRootSessionSightings(database: import("better-sqlit
   const roots=new Set<string>();
   const hasTable=(name: string) => Boolean(database.prepare(
     "select 1 from sqlite_master where type='table' and name=?").get(name));
-  if(hasTable("capture_root_session_sightings")) for(const row of database.prepare(
-    "select root_digest as digest from capture_root_session_sightings where source='claude_code' and session_id=?"
-  ).all(sessionId) as Array<{digest:string}>) roots.add(row.digest);
+  const readRoots=(sql: string) => options?.bounded
+    ? boundedSqlRows<{digest:string}>(database,
+        `${sql} and ${BOUNDED_SQL_READ_PREDICATE} limit 1025`,{sessionId},1024)
+    : database.prepare(sql).all({sessionId}) as Array<{digest:string}>;
+  try {
+  if(hasTable("capture_root_session_sightings")) for(const row of readRoots(
+    "select root_digest as digest from capture_root_session_sightings where source='claude_code' and session_id=@sessionId"
+  )) roots.add(row.digest);
   // The existing observation table is the migration source for rows captured
-  // before this compact session index existed. The session index bounds it.
-  if(hasTable("capture_root_observations")) for(const row of database.prepare(`
+  // before the compact index existed. Large sessions can make this join slow;
+  // intake uses the cooperative read budget and refuses incomplete evidence.
+  if(hasTable("capture_root_observations")) for(const row of readRoots(`
     select distinct seen.root_digest as digest from buffered_events as raw
     join capture_root_observations as seen on seen.event_id=raw.id
-    where raw.source='claude_code' and raw.session_id=?`).all(sessionId) as Array<{digest:string}>)
+    where raw.source='claude_code' and raw.session_id=@sessionId`))
     roots.add(row.digest);
+  } catch(error) {
+    // Keep capture available without caching a partial root set. The existing
+    // bounded legacy promotion continues independently of this intake read.
+    if(options?.bounded && error instanceof BoundedSqlReadError) return null;
+    throw error;
+  }
   if(cache.sessions.size>=4096) cache.sessions.clear();
   cache.sessions.set(sessionId,roots);
   return roots;

@@ -55,7 +55,8 @@ export function normalizeForwardedHook(payload: unknown, options: ForwardedHookO
     const binding = replay==="pending"||replay==="timed_out" ? null
       : claudeBindingForUnrootedEvent(normalized.event.sessionId,
         normalized.event.observedAt,options.dispatchSnapshot??currentDispatchBindingSnapshot(),
-        options.buffer ? durableClaudeRootSessionSightings(options.buffer.database,normalized.event.sessionId) : undefined);
+        options.buffer ? () => durableClaudeRootSessionSightings(options.buffer!.database,
+          normalized.event.sessionId!,{bounded:true}) : undefined);
     if (binding) normalized.event.metadata = {
       ...normalized.event.metadata, ...dispatchBindingMetadata(binding),
     };

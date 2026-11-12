@@ -4,9 +4,11 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { appendRootObservation, currentDispatchCaptureRoots, dispatchBindingMetadata,
+  claudeBindingForUnrootedEvent, durableClaudeRootSessionSightings,
   rootEventMetadata, type DispatchBinding } from "../packages/collector-cli/src/capture-root-inventory";
 import { collectorConfigSchema, rollbackCollectorDispatchHistory } from "../packages/collector-cli/src/config";
 import { bindDispatch, restampDispatch } from "../packages/collector-cli/src/dispatch-command";
@@ -134,6 +136,24 @@ async function main() {
   const binding = currentDispatchCaptureRoots()[0].dispatch?.find(row => row.sessionId === sessionId);
   assert.ok(binding);
   proof.check("bind_records_the_synthetic_session_in_every_capture_root");
+
+  const prepare=buffer.database.prepare;
+  buffer.database.prepare=(() => assert.fail("unbound OTLP must not query root history")) as typeof prepare;
+  try { assert.equal(explodeOtlpPayload(logPayload("unbound-intake",0),
+    {source:"claude_code",buffer}).events.length,1); }
+  finally { buffer.database.prepare=prepare; }
+  assert.equal(claudeBindingForUnrootedEvent(sessionId,at(0),undefined,()=>null),null);
+  const sightings=new Database(":memory:");
+  try {
+    sightings.exec(`create table capture_root_session_sightings(source,session_id,root_digest);
+      with recursive n(x) as (values(1) union all select x+1 from n where x<1025)
+      insert into capture_root_session_sightings select 'claude_code','large',cast(x as text) from n`);
+    assert.equal(durableClaudeRootSessionSightings(sightings,"large",{bounded:true}),null);
+    sightings.exec("delete from capture_root_session_sightings where root_digest!='1'");
+    assert.equal(durableClaudeRootSessionSightings(sightings,"large",{bounded:true})?.size,1,
+      "an incomplete lookup must not cache a partial root set");
+  } finally { sightings.close(); }
+  proof.check("unbound_intake_skips_history_and_incomplete_evidence_cannot_attribute");
 
   // The transcript tailer and live OTLP writer are mutually exclusive usage
   // authorities for one session, so prove both with separately bound sessions.

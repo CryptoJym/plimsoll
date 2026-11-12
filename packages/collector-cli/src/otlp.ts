@@ -331,7 +331,7 @@ function buildLogEvent(
     resolveGit?: boolean;
     onRepoLabel?: (repoHash: string, label: string) => void;
     dispatchSnapshot?: DispatchBindingSnapshot;
-    durableSightings?: (sessionId: string) => ReadonlySet<string> | undefined;
+    durableSightings?: (sessionId: string) => ReadonlySet<string> | null | undefined;
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const repoContextCwd = workdirFromRawRecord(record);
@@ -407,7 +407,7 @@ function buildLogEvent(
   const dispatchBinding = sessionId && context.dispatchSnapshot
     ? eventSource === "claude_code"
       ? claudeBindingForUnrootedEvent(sessionId,observedAt,context.dispatchSnapshot,
-          context.durableSightings?.(sessionId))
+          () => context.durableSightings?.(sessionId))
       : eventSource === "codex"
         ? dispatchBindingForSession("codex",sessionId,observedAt,context.dispatchSnapshot.roots) : null
     : null;
@@ -487,7 +487,7 @@ function buildSpanEvent(
     serviceVersion?: string;
     containerSuppressedFields?: string[];
     dispatchSnapshot?: DispatchBindingSnapshot;
-    durableSightings?: (sessionId: string) => ReadonlySet<string> | undefined;
+    durableSightings?: (sessionId: string) => ReadonlySet<string> | null | undefined;
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const repoContextCwd = workdirFromRawRecord(span);
@@ -506,7 +506,7 @@ function buildSpanEvent(
   const eventSource = eventSourceFor(context.source, context.serviceSource);
   const dispatchBinding = eventSource === "claude_code" && sessionId && context.dispatchSnapshot
     ? claudeBindingForUnrootedEvent(sessionId,observedAt,context.dispatchSnapshot,
-        context.durableSightings?.(sessionId))
+        () => context.durableSightings?.(sessionId))
     : null;
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
@@ -735,14 +735,11 @@ export function explodeOtlpPayload(
   const source = options.source ?? "unknown";
   const dispatchSnapshot = source === "codex" || source === "claude_code"
     ? currentDispatchBindingSnapshot() : undefined;
-  const seenBySession=new Map<string,ReadonlySet<string>>();
+  const seenBySession=new Map<string,ReadonlySet<string>|null>();
   const durableSightings=options.buffer ? (sessionId: string) => {
-    let seen=seenBySession.get(sessionId);
-    if(!seen) {
-      seen=durableClaudeRootSessionSightings(options.buffer!.database,sessionId);
-      seenBySession.set(sessionId,seen);
-    }
-    return seen;
+    if(!seenBySession.has(sessionId)) seenBySession.set(sessionId,
+      durableClaudeRootSessionSightings(options.buffer!.database,sessionId,{bounded:true}));
+    return seenBySession.get(sessionId);
   } : undefined;
   const root = asRecord(payload);
   const result: ExplodedOtlp = {
