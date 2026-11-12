@@ -2002,7 +2002,10 @@ async function main() {
   check(
     "upload_watermark_drains",
     before > 0 &&
-      first.markedUploaded === 4 &&
+      // The lease limit is a ceiling; an admissible slice may be shorter.
+      first.markedUploaded > 0 && first.markedUploaded <= 4 &&
+      first.markedUploaded === received[0] &&
+      received.reduce((sum,count) => sum+count,0) === before &&
       second.remainingUnuploaded === 1 &&
       second.remainingDelivery === 1 &&
       heldAtSecond.remainingDelivery === 1 &&

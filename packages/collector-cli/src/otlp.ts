@@ -736,9 +736,13 @@ export function explodeOtlpPayload(
   const dispatchSnapshot = source === "codex" || source === "claude_code"
     ? currentDispatchBindingSnapshot() : undefined;
   const seenBySession=new Map<string,ReadonlySet<string>|null>();
+  const sightingDeadlineMs=performance.now()+250;
   const durableSightings=options.buffer ? (sessionId: string) => {
-    if(!seenBySession.has(sessionId)) seenBySession.set(sessionId,
-      durableClaudeRootSessionSightings(options.buffer!.database,sessionId,{bounded:true}));
+    if(!seenBySession.has(sessionId)) {
+      // A batch cannot multiply the compatibility-read budget by its sessions.
+      seenBySession.set(sessionId,performance.now()>=sightingDeadlineMs ? null
+        : durableClaudeRootSessionSightings(options.buffer!.database,sessionId,{bounded:true}));
+    }
     return seenBySession.get(sessionId);
   } : undefined;
   const root = asRecord(payload);
