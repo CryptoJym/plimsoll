@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 14 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 15 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -178,6 +178,10 @@ export function canonicalizeDeclaredPath(
   return `<path-root:${owner.label}>`;
 }
 
+const COLLECTOR_VERSION: string = JSON.parse(fs.readFileSync(
+  new URL("../../packages/collector-cli/package.json", import.meta.url), "utf8",
+)).version;
+
 function normalizeString(
   value: string,
   key: string,
@@ -199,6 +203,10 @@ function normalizeString(
   if (/^(?:v)?22\.\d+\.\d+$/.test(value) && /^(?:node|version)$/i.test(key)) {
     return "<node-major-22>";
   }
+  // N165: the collector reports its own release in every doctor/join result, so a
+  // version-only bump moved two pins. Only this checkout's exact version is
+  // volatile; a stale or foreign collector still changes the digest.
+  if (/^(?:version|appVersion)$/.test(key) && value === COLLECTOR_VERSION) return "<collector-version>";
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) && /(?:At|Time)$/i.test(key)) {
     return "<volatile-iso-time>";
   }
