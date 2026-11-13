@@ -430,6 +430,8 @@ export type RepoEnrichmentMaintenanceResult = {
   rowsVisited: number;
   backward: number;
   forward: number;
+  /** Sessions this call took off the dirty queue. */
+  sessionsRetired?: number;
 };
 
 type RepoCandidate = {
@@ -459,6 +461,12 @@ export function runRepoEnrichmentMaintenance(
     eventLimit?: number;
     neighborLimit?: number;
     skipLegacyBackfill?: boolean;
+    /**
+     * Asked before each session after the first; false ends the call. When
+     * given, the call goes on past the event budget and retires only the
+     * sessions with nothing left to stitch.
+     */
+    shouldContinue?: () => boolean;
   } = {},
 ): RepoEnrichmentMaintenanceResult {
   const legacyBackfillLimit = Math.max(
@@ -466,7 +474,7 @@ export function runRepoEnrichmentMaintenance(
     Math.min(options.legacyBackfillLimit ?? 5_000, 25_000),
   );
   const sessionLimit = Math.max(1, Math.min(options.sessionLimit ?? 50, 500));
-  const eventLimit = Math.max(1, Math.min(options.eventLimit ?? 5_000, 25_000));
+  const eventLimit = Math.max(0, Math.min(options.eventLimit ?? 5_000, 25_000));
   const neighborLimit = Math.max(1, Math.min(options.neighborLimit ?? 50, 250));
 
   return database.transaction(() => {
@@ -570,9 +578,20 @@ export function runRepoEnrichmentMaintenance(
     let candidateRowsVisited = 0;
     let backward = 0;
     let forward = 0;
+    let sessionsRetired = 0;
     for (const session of sessions) {
-      if (remainingEvents <= 0) break;
+      if (remainingEvents <= 0 && !options.shouldContinue) break;
+      if (sessionsVisited > 0 && options.shouldContinue?.() === false) break;
       sessionsVisited += 1;
+      if (remainingEvents <= 0) {
+        const pending = selectCandidates.get({
+          sessionId: session.sessionId,
+          cursorRowid: session.cursorRowid,
+          limit: 1,
+        });
+        if (!pending) sessionsRetired += removeSession.run(session.sessionId).changes;
+        continue;
+      }
       const candidates = selectCandidates.all({
         sessionId: session.sessionId,
         cursorRowid: session.cursorRowid,
@@ -621,7 +640,7 @@ export function runRepoEnrichmentMaintenance(
       if (candidates.length < remainingEvents + candidates.length) {
         // The query drained this session. Unresolved candidates leave the
         // queue too; a later linkage mutation atomically re-adds the session.
-        removeSession.run(session.sessionId);
+        sessionsRetired += removeSession.run(session.sessionId).changes;
       } else if (candidates.length > 0) {
         // The event budget ended exactly at this boundary. Advance past every
         // candidate, including unresolved rows, so they cannot spin forever.
@@ -631,7 +650,7 @@ export function runRepoEnrichmentMaintenance(
           session.sessionId,
         );
       } else {
-        removeSession.run(session.sessionId);
+        sessionsRetired += removeSession.run(session.sessionId).changes;
       }
     }
 
@@ -643,6 +662,7 @@ export function runRepoEnrichmentMaintenance(
       rowsVisited: legacyRowsVisited + candidateRowsVisited,
       backward,
       forward,
+      sessionsRetired,
     };
   }).immediate();
 }

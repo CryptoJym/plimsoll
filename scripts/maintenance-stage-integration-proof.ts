@@ -66,12 +66,19 @@ function fixture() {
   const skipped = runEnrichmentMaintenanceJob(database, { remainingMs: 4_999 });
   assert.deepEqual({ rows: skipped.rows, skipped: skipped.skipped }, { rows: 0, skipped: true });
   const recent = "2026-09-04T00:00:00.000Z";
-  database.prepare(`insert into buffered_events
-    (id, source, event_type, data_mode, payload_json, created_at, observed_at, session_id, input_tokens)
-    values ('candidate', 'codex', 'assistant_response', 'full', '{}', ?, ?, 'session-1', 1)`).run(recent, recent);
+  for (const id of ["candidate-1", "candidate-2"]) {
+    database.prepare(`insert into buffered_events
+      (id, source, event_type, data_mode, payload_json, created_at, observed_at, session_id, input_tokens)
+      values (?, 'codex', 'assistant_response', 'full', '{}', ?, ?, 'session-1', 1)`).run(id, recent, recent);
+  }
+  // N155: a busy session at the head must not stop the empty ones behind it leaving the queue.
+  database.prepare(`update repo_enrichment_dirty set queued_at = '1999-01-01' where session_id = 'session-1'`).run();
+  const queue = database.prepare(`insert into repo_enrichment_dirty values (?, 0, '2000-01-01', '2000-01-01')`);
+  for (let index = 0; index < 1_200; index += 1) queue.run(`empty-${index}`);
   const ran = runEnrichmentMaintenanceJob(database, { remainingMs: 5_000 });
-  assert.equal(ran.rows, 1);
-  assert.equal(ran.batchSize, 1);
+  assert.deepEqual({ rows: ran.rows, sessions: ran.sessions, batchSize: ran.batchSize },
+    { rows: 1, sessions: 1_200, batchSize: 1 });
+  assert.deepEqual(database.prepare(`select session_id as id from repo_enrichment_dirty`).all(), [{ id: "session-1" }]);
   buffer.close();
 }
 

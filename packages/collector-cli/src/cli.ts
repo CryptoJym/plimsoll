@@ -3101,7 +3101,7 @@ async function main() {
         assertCollectorPrivacyMode(workerConfig, "automatic enrichment worker");
         workerBuffer = openBuffer(workerConfig, false, 900);
         const result = runEnrichmentMaintenanceJob(workerBuffer.database, { remainingMs: deadlineMs });
-        return { rows: result.rows, ms: result.ms };
+        return { rows: result.rows, ms: result.ms, sessions: result.sessions };
       },
       close: () => {
         workerBuffer?.close();
@@ -4389,9 +4389,13 @@ async function main() {
       async () => {
         const result = await enrichmentBoundary.run({ acceptPartial: true });
         if (result.outcome === "PARTIAL_OK") {
-          console.log(JSON.stringify({ status: "enrichment_partial_ok", rows: result.rows, ms: result.ms }));
-        } else if (result.rows > 0) {
-          console.log(JSON.stringify({ status: "repo_stitch", rows: result.rows, ms: result.ms }));
+          console.log(JSON.stringify({
+            status: "enrichment_partial_ok", rows: result.rows, sessions: result.sessions, ms: result.ms,
+          }));
+        } else if (result.rows > 0 || result.sessions) {
+          console.log(JSON.stringify({
+            status: "repo_stitch", rows: result.rows, sessions: result.sessions, ms: result.ms,
+          }));
         }
         return result;
       },

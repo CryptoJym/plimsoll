@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.69 — 2026-11-13
+
+- Automatic enrichment now drains its queue. Every usage event re-queues its
+  session, and a pass took at most one session off the queue (12 an hour), so
+  Studio1 held 6,816 queued sessions on 11-13 with no stitching work at the
+  head (plimsoll N155). A pass still stitches at most one event, and for the
+  rest of a 2 s budget it removes queued sessions with nothing to stitch in
+  write transactions of at most 100 ms; sessions still holding candidates stay
+  queued. The worker result and the `repo_stitch` log line report the
+  sessions removed; `/status` backlog `dirtyEnrichmentSessions` reads recovery.
+
 ## 0.7.67 — 2026-11-11
 
 - Correcting an unsent event now updates the delivery byte total as well as

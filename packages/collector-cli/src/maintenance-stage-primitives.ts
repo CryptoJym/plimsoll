@@ -300,25 +300,53 @@ export function runPendingEventLinkFillStage(
   return timer.result(rows);
 }
 
+/**
+ * Work time of one enrichment pass. The worker's 15 s deadline also covers
+ * the child's startup (up to its 10 s ready deadline on a loaded host).
+ */
+export const ENRICHMENT_PASS_BUDGET_MS = 2_000;
+/** Longest write transaction one enrichment slice may hold. */
+export const ENRICHMENT_SLICE_MS = 100;
+
+export type EnrichmentStageResult = BoundedStageResult & {
+  /** Sessions taken off the dirty queue. */
+  sessions: number;
+};
+
+/**
+ * Stitch at most one event per pass, and in the rest of the pass retire the
+ * queued sessions that have nothing to stitch, in short write transactions;
+ * sessions still holding candidates stay queued. Every usage event re-queues
+ * its session, so one session per pass (at most 12 an hour) never caught up:
+ * Studio1 held 6,816 sessions on 11-13 and the oldest 200 had no candidate
+ * (plimsoll N155).
+ */
 export function runEnrichmentStage(
   database: Database.Database,
   options: TimedOptions,
-): BoundedStageResult {
+): EnrichmentStageResult {
   ensureMaintenanceStageSchema(database);
-  const timer = budget(options);
-  if (!timer.canStart()) return timer.result(0);
-  const limit = Math.min(boundedBatchSize(options.batchSize), 1);
-  const result = database.transaction(() => {
-    const slice = runRepoEnrichmentMaintenance(database, {
-      legacyBackfillLimit: limit,
-      sessionLimit: Math.min(limit, 500),
-      eventLimit: limit,
-      skipLegacyBackfill: true,
-    });
-    advance(database, "enrichment", slice.rowsVisited, null);
-    return slice;
-  }).immediate();
-  return timer.result(result.rowsVisited);
+  const timer = budget({ ...options, remainingMs: Math.min(options.remainingMs, ENRICHMENT_PASS_BUDGET_MS) });
+  let rows = 0;
+  let sessions = 0;
+  while (timer.canStart()) {
+    const sliceStarted = timer.now();
+    const slice = database.transaction(() => {
+      const result = runRepoEnrichmentMaintenance(database, {
+        legacyBackfillLimit: 1,
+        sessionLimit: 500,
+        eventLimit: rows > 0 ? 0 : 1,
+        skipLegacyBackfill: true,
+        shouldContinue: () => timer.canStart() && timer.now() - sliceStarted < ENRICHMENT_SLICE_MS,
+      });
+      advance(database, "enrichment", result.rowsVisited, null);
+      return result;
+    }).immediate();
+    rows += slice.rowsVisited;
+    sessions += slice.sessionsRetired ?? 0;
+    if (!slice.sessionsRetired) break;
+  }
+  return { ...timer.result(rows, 1), sessions };
 }
 
 /** Wall time one maintenance job may give the context-index backfill. */
@@ -378,7 +406,7 @@ export function runSessionContextBackfillStage(
   return { ...timer.result(rows, batchSize), state, contended };
 }
 
-export type EnrichmentMaintenanceJobResult = BoundedStageResult & {
+export type EnrichmentMaintenanceJobResult = EnrichmentStageResult & {
   skipped: boolean;
   timedOut: boolean;
 };
@@ -389,7 +417,7 @@ export function runEnrichmentMaintenanceJob(
 ): EnrichmentMaintenanceJobResult {
   if (options.remainingMs < 5_000) {
     return { rows: 0, ms: 0, remaining: Math.max(0, options.remainingMs), batchSize: 1,
-      skipped: true, timedOut: false };
+      sessions: 0, skipped: true, timedOut: false };
   }
   const result = runEnrichmentStage(database, { ...options, batchSize: 1 });
   return { ...result, skipped: false, timedOut: result.ms >= options.remainingMs };

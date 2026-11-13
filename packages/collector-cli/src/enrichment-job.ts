@@ -15,10 +15,17 @@ export function lowerEnrichmentProcessPriority(
   }
 }
 
-export type EnrichmentJobResult = { rows: number; ms: number };
+/** sessions: queued sessions retired with nothing to stitch. */
+export type EnrichmentJobResult = { rows: number; ms: number; sessions?: number };
 export type EnrichmentJobOutcome =
-  | ({ outcome: "completed" } & EnrichmentJobResult)
-  | { outcome: "PARTIAL_OK"; rows: number; ms: number };
+  ({ outcome: "completed" | "PARTIAL_OK" } & EnrichmentJobResult);
+
+function jobCounts(row: Record<string, unknown>): Required<EnrichmentJobResult> | null {
+  const counts = { rows: row.rows, ms: row.ms, sessions: row.sessions ?? 0 };
+  return Object.values(counts).every((value) => Number.isSafeInteger(value) && Number(value) >= 0)
+    ? counts as Required<EnrichmentJobResult>
+    : null;
+}
 
 export type EnrichmentBoundaryChild = {
   pid?: number;
@@ -314,11 +321,8 @@ export class EnrichmentProcessBoundary {
           return void timeout("enrichment_protocol_invalid");
         }
         if (row.type === "enrichment_job_progress") {
-          if (!Number.isSafeInteger(row.rows) || Number(row.rows) < 0 ||
-              !Number.isSafeInteger(row.ms) || Number(row.ms) < 0) {
-            return void timeout("enrichment_protocol_invalid");
-          }
-          const progress = { rows: Number(row.rows), ms: Number(row.ms) };
+          const progress = jobCounts(row);
+          if (!progress) return void timeout("enrichment_protocol_invalid");
           try {
             child.send({
               schema: ENRICHMENT_PROTOCOL_SCHEMA, type: "ack", generation, nonce,
@@ -329,9 +333,9 @@ export class EnrichmentProcessBoundary {
           }
           return;
         }
-        if (row.type === "result" && Number.isSafeInteger(row.rows) && Number(row.rows) >= 0 &&
-            Number.isSafeInteger(row.ms) && Number(row.ms) >= 0) {
-          completed = { rows: Number(row.rows), ms: Number(row.ms) };
+        const result = row.type === "result" ? jobCounts(row) : null;
+        if (result) {
+          completed = result;
           return;
         }
         void timeout("enrichment_protocol_invalid");
@@ -520,7 +524,11 @@ export function runEnrichmentWorkerService(input: {
     const started = performance.now();
     try {
       const result = input.execute(Number(row.deadlineMs));
-      const progress = { rows: result.rows, ms: Math.max(result.ms, Math.round(performance.now() - started)) };
+      const progress = {
+        rows: result.rows,
+        ms: Math.max(result.ms, Math.round(performance.now() - started)),
+        sessions: result.sessions ?? 0,
+      };
       awaitingAck = {
         generation: Number(row.generation), nonce: String(row.nonce), sequence: 1, result: progress,
       };
