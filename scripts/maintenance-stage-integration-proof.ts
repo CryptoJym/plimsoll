@@ -65,20 +65,26 @@ function fixture() {
   const database = buffer.database;
   const skipped = runEnrichmentMaintenanceJob(database, { remainingMs: 4_999 });
   assert.deepEqual({ rows: skipped.rows, skipped: skipped.skipped }, { rows: 0, skipped: true });
-  const recent = "2026-09-04T00:00:00.000Z";
-  for (const id of ["candidate-1", "candidate-2"]) {
-    database.prepare(`insert into buffered_events
-      (id, source, event_type, data_mode, payload_json, created_at, observed_at, session_id, input_tokens)
-      values (?, 'codex', 'assistant_response', 'full', '{}', ?, ?, 'session-1', 1)`).run(id, recent, recent);
+  // N155: one pass stitches a busy head session's 120 events (more than two
+  // slices) and retires the 1,200 empty sessions queued behind it.
+  const recent = Date.parse("2026-09-04T00:00:00.000Z");
+  const insert = database.prepare(`insert into buffered_events
+    (id, source, event_type, data_mode, payload_json, created_at, observed_at, session_id, input_tokens, repo_hash)
+    values (?, 'codex', 'assistant_response', 'full', '{}', ?, ?, 'session-1', 1, ?)`);
+  for (let index = 0; index <= 120; index += 1) {
+    const at = new Date(recent + index * 1_000).toISOString();
+    insert.run(`event-${index}`, at, at, index === 0 ? "sha256:repo" : null);
   }
-  // N155: a busy session at the head must not stop the empty ones behind it leaving the queue.
   database.prepare(`update repo_enrichment_dirty set queued_at = '1999-01-01' where session_id = 'session-1'`).run();
   const queue = database.prepare(`insert into repo_enrichment_dirty values (?, 0, '2000-01-01', '2000-01-01')`);
   for (let index = 0; index < 1_200; index += 1) queue.run(`empty-${index}`);
   const ran = runEnrichmentMaintenanceJob(database, { remainingMs: 5_000 });
   assert.deepEqual({ rows: ran.rows, sessions: ran.sessions, batchSize: ran.batchSize },
-    { rows: 1, sessions: 1_200, batchSize: 1 });
-  assert.deepEqual(database.prepare(`select session_id as id from repo_enrichment_dirty`).all(), [{ id: "session-1" }]);
+    { rows: 120, sessions: 1_201, batchSize: 1 });
+  assert.deepEqual(database.prepare(`select
+      (select count(*) from repo_enrichment_dirty) as queued,
+      (select count(*) from buffered_events where repo_hash = 'sha256:repo') as stitched`).get(),
+    { queued: 0, stitched: 121 });
   buffer.close();
 }
 

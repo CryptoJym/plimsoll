@@ -308,8 +308,8 @@ function event(options: {
 }
 
 /**
- * Scenario 1a: a fixture batch larger than one window makes measurable,
- * disjoint progress across consecutive runs — never repeating from zero.
+ * Scenario 1a: one enrichment pass drains a 10-session fixture batch and
+ * stitches each token row once (plimsoll N155).
  */
 async function resumableBatchProgressProof(root: string) {
   const ledger = path.join(root, "resume-batch.sqlite");
@@ -317,9 +317,8 @@ async function resumableBatchProgressProof(root: string) {
   fs.mkdirSync(emptyRoot, { recursive: true });
   const buffer = new LocalEventBuffer(ledger);
 
-  // Fixture batch: 10 stitchable sessions. One automatic cycle enriches at
-  // most 4 sessions / 32 events, so the batch spans multiple windows by
-  // construction.
+  // Fixture batch: 10 stitchable sessions. Since 0.7.70 a pass stitches until
+  // its 2 s budget, so the batch drains in the first run.
   const sessions = Array.from({ length: 10 }, (_, index) =>
     `019e3000-0000-7000-8000-${String(index + 1).padStart(12, "0")}`);
   for (let index = 0; index < sessions.length; index += 1) {
@@ -394,8 +393,7 @@ async function resumableBatchProgressProof(root: string) {
     }
   }
   const firstRunCount = stitchedSessionsPerRun[0]!.length;
-  assert.ok(firstRunCount >= 1 && firstRunCount < sessions.length,
-    `first run must be bounded below the full batch (stitched ${firstRunCount})`);
+  assert.equal(firstRunCount, sessions.length, "one pass drains the fixture batch (N155)");
   assert.equal(seen.size, sessions.length);
   assert.equal(overlap, 0, "no session may be restitched across runs");
 
@@ -403,9 +401,7 @@ async function resumableBatchProgressProof(root: string) {
     `select count(*) as n from repo_enrichment_dirty`,
   ).get() as { n: number }).n;
   assert.equal(dirtyAfter, 0, "the seeded batch must fully drain");
-  assert.equal(totalStitched > firstRunCount, true,
-    "consecutive runs must make measurable progress beyond one window");
-  pass("fixture_batch_larger_than_one_window_makes_disjoint_progress_across_runs", {
+  pass("fixture_batch_drains_in_one_pass_and_stitches_each_row_once", {
     seededSessions: sessions.length,
     stitchedPerRun,
     firstRunCount,

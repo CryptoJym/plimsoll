@@ -307,6 +307,8 @@ export function runPendingEventLinkFillStage(
 export const ENRICHMENT_PASS_BUDGET_MS = 2_000;
 /** Longest write transaction one enrichment slice may hold. */
 export const ENRICHMENT_SLICE_MS = 100;
+/** Most candidate events one slice stitches before it only retires sessions. */
+export const ENRICHMENT_SLICE_EVENTS = 50;
 
 export type EnrichmentStageResult = BoundedStageResult & {
   /** Sessions taken off the dirty queue. */
@@ -314,12 +316,13 @@ export type EnrichmentStageResult = BoundedStageResult & {
 };
 
 /**
- * Stitch at most one event per pass, and in the rest of the pass retire the
- * queued sessions that have nothing to stitch, in short write transactions;
- * sessions still holding candidates stay queued. Every usage event re-queues
- * its session, so one session per pass (at most 12 an hour) never caught up:
- * Studio1 held 6,816 sessions on 11-13 and the oldest 200 had no candidate
- * (plimsoll N155).
+ * Stitch up to 50 events per write transaction of at most 100 ms, and in the
+ * rest of each slice retire the queued sessions that have nothing to stitch;
+ * the pass goes on until its 2 s budget or a slice that neither visits a
+ * candidate nor retires a session. Every usage event re-queues its session,
+ * so one session per pass never caught up (Studio1 held 6,816 on 11-13), and
+ * once 0.7.69 retired the empty ones, one event per pass held Studio1 at 2,618
+ * sessions that all still had events to stitch (plimsoll N155).
  */
 export function runEnrichmentStage(
   database: Database.Database,
@@ -335,7 +338,7 @@ export function runEnrichmentStage(
       const result = runRepoEnrichmentMaintenance(database, {
         legacyBackfillLimit: 1,
         sessionLimit: 500,
-        eventLimit: rows > 0 ? 0 : 1,
+        eventLimit: ENRICHMENT_SLICE_EVENTS,
         skipLegacyBackfill: true,
         shouldContinue: () => timer.canStart() && timer.now() - sliceStarted < ENRICHMENT_SLICE_MS,
       });
@@ -344,7 +347,7 @@ export function runEnrichmentStage(
     }).immediate();
     rows += slice.rowsVisited;
     sessions += slice.sessionsRetired ?? 0;
-    if (!slice.sessionsRetired) break;
+    if (!slice.rowsVisited && !slice.sessionsRetired) break;
   }
   return { ...timer.result(rows, 1), sessions };
 }

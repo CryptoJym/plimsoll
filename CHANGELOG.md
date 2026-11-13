@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.70 — 2026-11-13
+
+- Automatic enrichment now stitches its backlog. 0.7.69 retired the queued
+  sessions with nothing to stitch, but a pass still stitched one event (about
+  12 an hour), so Studio1 held 2,618 and Studio4 285 queued sessions that all
+  had events left (plimsoll N155). Each write transaction of at most 100 ms now
+  stitches up to 50 events, and a pass goes on until its 2 s budget or a
+  transaction that neither visits a candidate nor retires a session.
+
 ## 0.7.69 — 2026-11-13
 
 - Automatic enrichment now drains its queue. Every usage event re-queues its
