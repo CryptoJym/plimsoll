@@ -32,7 +32,7 @@ async function files(root: string, visited: Set<string>, since: number, tool: To
             const s = await fs.promises.stat(file);
             if (symlink && s.isDirectory()) entries.push({ name, directory: file });
             else if (name.endsWith('.jsonl') && s.mtimeMs >= since && (!symlink || s.isFile()) && (tool !== 'grok' || grokFile(file, home))) entries.push({ name, source: { file: symlink ? fs.realpathSync(file) : file, stat: s } });
-          } catch { if (!symlink) throw new Error('source_unreadable'); }
+          } catch (e) { if (!symlink && (e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('source_unreadable'); }
         })());
         if (pending.length === 4) await flush();
       }

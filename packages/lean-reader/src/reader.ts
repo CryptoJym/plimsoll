@@ -119,7 +119,7 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
           } catch { /* Optional alias disappeared. */ }
         } else if (entry.isFile() && (entry.name.endsWith('.jsonl') || (includeArchived && tool === 'codex' && entry.name.endsWith('.jsonl.zst') && archivedRollout(entry.name, since)))) {
           let s: fs.Stats;
-          try { s = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
+          try { s = fs.statSync(file); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw new Error('source_unreadable'); }
           if (entry.name.endsWith('.jsonl') ? s.mtimeMs >= since : archivedRollout(entry.name, since)) entries.push({ name: entry.name, file, stat: s });
         }
       }
@@ -479,7 +479,8 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       // Metadata discovery is a snapshot; refresh eligible files immediately
       // before capture so rotations and truncations still reset their context.
       let stat = discoveredStat;
-      try { stat = fs.statSync(file); } catch { throw new Error('source_unreadable'); }
+      // A file moved or deleted since discovery (Codex archiving, cleanup) is gone, not unreadable: skip it.
+      try { stat = fs.statSync(file); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; throw new Error('source_unreadable'); }
       const compressed = file.endsWith('.jsonl.zst');
       const fileIdentity = `${stat.dev}:${stat.ino}`;
       // Velocity replay admits immutable archived rollouts whose filesystem
@@ -690,7 +691,12 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
         remember(stat.mtimeMs);
         tracked.dev = stat.dev; tracked.ino = stat.ino; tracked.size = stat.size; tracked.mtime = stat.mtimeMs;
         budgetTick();
-      } catch (error) { if (error instanceof Error && error.message === 'state_capacity') throw error; throw new Error('source_unreadable'); }
+      } catch (error) {
+        if (error instanceof Error && error.message === 'state_capacity') throw error;
+        // Gone between the stat and the open: no usage from it was counted yet.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (error as NodeJS.ErrnoException).path === sourcePath) continue;
+        throw new Error('source_unreadable');
+      }
       finally { cleanup(); }
     }
   }

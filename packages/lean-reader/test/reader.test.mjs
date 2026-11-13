@@ -371,6 +371,15 @@ test('an unreadable source prevents a backfill from sending incomplete replaceme
   } finally { fs.chmodSync(file, 0o600); }
 });
 
+test('a session file gone since discovery is skipped, not fatal to the pass', t => {
+  const home = fixture(t);
+  const kept = write(home, '.claude/projects/x/a.jsonl', [claude('kept')]), gone = write(home, '.claude/projects/x/b.jsonl', [claude('gone')]);
+  const files = [kept, gone].map(file => ({ file, stat: fs.statSync(file) }));
+  fs.unlinkSync(gone);
+  const { rows } = reader.scan({ ...options(home), discovered: [{ tool: 'claude_code', path: path.dirname(kept), files }] });
+  assert.equal(totals(rows).requests, 1);
+});
+
 test('a giant Claude reply with an empty usage object still counts its request', t => {
   const home = fixture(t);
   const reply = claude('empty-usage');
