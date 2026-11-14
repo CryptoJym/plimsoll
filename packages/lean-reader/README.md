@@ -80,11 +80,11 @@ Only the current slice's session/hour deltas are accumulated before committing.
 Reply hashes use binary sorted runs and a fixed 2 MiB lookup filter, retaining
 the same exact deduplication check. `sdk-journal.jsonl` fsyncs each slice's
 counts, hashes and cursor together; recovery replays only commits newer than
-the atomic state snapshot. The journal clears after that snapshot is durable.
+the atomic state checkpoint. The journal clears after that checkpoint is durable.
 The job runs every 300 seconds with `NODE_OPTIONS=--jitless
 --max-old-space-size=256 --max-semi-space-size=1`: a 256 MiB old-space heap and
-1 MiB semi-spaces. Its state ceiling is 64 MiB; admission stops with room
-for the current slice when the serialized state approaches that ceiling.
+1 MiB semi-spaces. The JSON projection has a 64 MiB ceiling; SDK baselines,
+cursors and packed deduplication IDs live in the transactional store described below.
 No prompts or tool evidence enter the glob state or journal. Their uploads contain
 the existing usage and session fields; optional velocity rows are not generated
 for glob roots. Fixed roots continue to collect velocity as before.
@@ -295,6 +295,22 @@ counted IDs prevent repeating usage. Partial lines remain at their starting byte
 until completed. One PID/token directory lock excludes concurrent runs and recovers dead
 owners. Source-read failures abort a pass before publishing incomplete totals.
 
+When SDK capture is present, version 4 uses Node's built-in SQLite support in
+`state.json.sdk.sqlite`. Retained SDK rows are read in pages, and one transaction
+commits their totals, pending flags, cursors, deduplication IDs and the rest of
+the checkpoint together. WAL with FULL synchronization preserves the previous
+checkpoint if the process exits during a write. The JSON file is a readable
+projection; recovery uses the database if its JSON replacement was interrupted.
+SDK session growth therefore does not consume the capped JSON projection.
+The eight-day retention window and retention of all pending rows are unchanged.
+The database and its WAL are state, and must stay together during backup.
+
+Versions 1–3 migrate on the first SDK pass without recounting. For rollback to
+a version-3 reader, hold `reader.lock`, call the exported `exportLegacyState`
+with the state path, and only after that succeeds preserve the database and
+sidecars elsewhere and restore the previous bundle. Export refuses to exceed
+the previous 64 MiB cap; do not restore an older reader after a failed export.
+
 Deduplication IDs are stored as sorted 8-byte binary prefixes grouped by UTC hour,
 encoded as base64 in JSON. IDs read during a pass are held in memory and count
 toward the state ceiling at that packed size, so a backfill over a busy Mac's
@@ -320,8 +336,8 @@ On 2026-11-05 Studio0's eight-day state reached the old 9 MiB ceiling and every
 pass failed from 19:51Z until the ceiling and heap were raised. On 2026-11-12 it
 neared 32 MiB the same way (eight days of SDK session rows, about 4.6 MB a busy
 day, were 18.4 MB of 33.2 MB): the 21:58Z pass failed and the next finished
-23.6 KB under the ceiling, so both doubled. State still grows with SDK sessions
-per window; that is the open design limit.
+23.6 KB under the ceiling, so both doubled. Version 4 moves SDK growth out of
+that capped checkpoint; disk usage still reflects retained SDK history.
 Delivery failures retain pending data and retry with exponential backoff from
 one minute to one hour. `status` reports the last send/error and measured run
 footprint. Resolve a persistent capacity error before leaving the reader unattended.

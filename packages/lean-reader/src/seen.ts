@@ -13,7 +13,7 @@ const WIDTH = 8, LEGACY_WIDTH = 12;
  * sets whether or not evidence is enabled now. Prefixes of sorted IDs stay
  * sorted. A reader older than version 3 refuses the narrowed state. */
 export function narrowPacked(state: State): void {
-  if (state.version === 3) return;
+  if (state.version >= 3) return;
   for (const field of ['seenPacked', 'evidenceSeenPacked'] as const) {
     for (const [hour, packed] of Object.entries(state[field] ?? {})) {
       const data = Buffer.from(packed, 'base64');

@@ -9,6 +9,8 @@ import { saveJson } from './state-json.js';
 import { discover } from './discovery.js';
 import { allowancePass } from './allowance.js';
 import { sdkJournal } from './sdk-reader.js';
+import { attachSdkStore, hideSdkMetadata, sdkStore, storedCheckpoint, sdkRows } from './sdk-store.js';
+import { stateBytes } from './state-json.js';
 
 const execFileSync: typeof import('node:child_process').execFileSync = (...args: any[]): any => {
   return (process.getBuiltinModule('node:child_process') as any).execFileSync(...args);
@@ -16,14 +18,37 @@ const execFileSync: typeof import('node:child_process').execFileSync = (...args:
 export const stateDirectory = (home: string) => path.join(home, 'Library/Application Support/Plimsoll Lean');
 export function readState(file: string): State {
   try {
-    if (fs.statSync(file).size > MAX_STATE) throw new Error('state_capacity');
-    const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (![1, 2, 3].includes(state.version) || !state.files || !state.hours || !state.seen || !state.pending || !state.sessions || !state.seats) throw new Error('invalid_state');
-    state.velocity ??= {}; state.velocityPending ??= {};
-    return state;
+    let state = storedCheckpoint(file);
+    if (!state) {
+      if (fs.statSync(file).size > MAX_STATE) throw new Error('state_capacity');
+      state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (state!.version === 4) throw new Error('invalid_state');
+    }
+    if (![1, 2, 3, 4].includes(state!.version) || !state!.files || !state!.hours || !state!.seen || !state!.pending || !state!.sessions || !state!.seats) throw new Error('invalid_state');
+    if (state!.version === 4) attachSdkStore(state!, file);
+    state!.velocity ??= {}; state!.velocityPending ??= {};
+    return state!;
   } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return emptyState(); throw new Error('invalid_state'); }
 }
-export const saveState = (file: string, state: State): number => saveJson(file, state, MAX_STATE);
+export function saveState(file: string, state: State): number {
+  const store = sdkStore(state) ?? (state.sdk ? attachSdkStore(state, file) : undefined);
+  if (store) {
+    hideSdkMetadata(state); state.version = 4;
+    stateBytes(state, MAX_STATE); // refuse BEFORE committing either part
+    store.checkpoint(state);
+  }
+  return saveJson(file, state, MAX_STATE);
+}
+/** Guarded rollback export. The caller owns reader.lock and swaps the bundle
+ * only after this fits the old cap. The sidecar is retained, never deleted. */
+export function exportLegacyState(file: string): void {
+  const state = readState(file), store = sdkStore(state);
+  try {
+    const legacy = { ...state, version: 3, sdk: {}, sdkFiles: state.sdkFiles, sdkRoots: state.sdkRoots, seenPacked: state.seenPacked } as State;
+    for (const [day, id, row] of sdkRows(state)) (legacy.sdk![day] ??= {})[id] = row;
+    saveJson(file, legacy, MAX_STATE);
+  } finally { store?.close(); }
+}
 export function acquireLock(file: string): () => void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const token = crypto.randomBytes(16).toString('hex');
@@ -85,6 +110,7 @@ export async function runPass(options: Options = {}) {
   const dir = options.stateDir ?? stateDirectory(home), file = path.join(dir, 'state.json');
   const release = acquireLock(path.join(dir, 'reader.lock'));
   let journal: ReturnType<typeof sdkJournal> | undefined;
+  let store: ReturnType<typeof sdkStore>;
   try {
     // Allowance goes first and on its own: one small file, its own uploads and
     // its own outbox, so a slow or failing usage pass never holds it up.
@@ -98,6 +124,8 @@ export async function runPass(options: Options = {}) {
     // incremental run, so do not replace the replay traversal with it.
     const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
     const discovered = options.discovered ?? (velocityOnly ? undefined : await discover({ ...options, home, now, config }));
+    if (state.sdk || discovered?.some(root => root.aggregate)) attachSdkStore(state, file);
+    store = sdkStore(state);
     if (!velocityOnly && (discovered?.some(root => root.aggregate) || fs.existsSync(path.join(dir, 'sdk-journal.jsonl')))) journal = sdkJournal(state, dir);
     const result = scan({ ...options, home, now, config, state, discovered, sdkJournal: journal?.append, sdkReset: journal ? () => { saveState(file, state); journal!.clear(); } : undefined, backfill: options.command === 'backfill' || options.backfill });
     // Persist the outbox before attempting any network operation. Replaying an
@@ -115,7 +143,7 @@ export async function runPass(options: Options = {}) {
     const reason = error instanceof Error && ['state_capacity', 'invalid_state', 'invalid_window', 'source_unreadable'].includes(error.message) ? error.message : 'reader_error';
     try { log(home, { at: new Date(now).toISOString(), files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 1, milliseconds: performance.now() - started, peakMemoryBytes: peakMemory(), error: reason }); } catch { /* Preserve the original failure. */ }
     throw new Error(reason);
-  } finally { journal?.close(); release(); }
+  } finally { journal?.close(); store?.close(); release(); }
 }
 
 const xmlEscape = (s: string) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');

@@ -23,7 +23,7 @@ export type State = {
   sdkRoots?: Record<string, number>;
   sdkCommit?: number;
   sdk?: Record<string, Record<string, SdkSession>>;
-  version: 1 | 2 | 3; files: Record<string, FileState>; hours: Record<string, Hour>; velocity: Record<string, Velocity>; seen: Record<string, number>;
+  version: 1 | 2 | 3 | 4; files: Record<string, FileState>; hours: Record<string, Hour>; velocity: Record<string, Velocity>; seen: Record<string, number>;
   velocityPending: Record<string, boolean>;
   velocityReplays?: Record<string, { dev: number; ino: number; windows: { start: number; end: number; offset: number }[] }>;
   sessions: Record<string, Session>; seats: Record<string, Seat>; pending: Record<string, boolean>;

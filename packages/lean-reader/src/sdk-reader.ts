@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { sdkGet, sdkPut, sdkRows, hideSdkMetadata, sdkStore } from './sdk-store.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLines } from './lines.js';
@@ -19,8 +20,8 @@ function apply(state: State, commit: SdkCommit, ids: SdkIds): void {
   if (commit.seq <= (state.sdkCommit ?? 0)) return;
   if (commit.seq !== (state.sdkCommit ?? 0) + 1) throw new Error('invalid_state');
   for (const [day, id, row] of commit.rows) {
-    const sessions = (state.sdk ??= {})[day] ??= {}, previous = sessions[id];
-    if (!previous) { sessions[id] = row; continue; }
+    const previous = sdkGet(state, day, id);
+    if (!previous) { sdkPut(state, day, id, row); continue; }
     if (row[1] !== 'unknown') previous[1] = row[1];
     if (row[2]) previous[2] = row[2];
     previous[3] = Math.min(previous[3], row[3]); previous[4] = Math.max(previous[4], row[4]); previous[6] = true;
@@ -28,6 +29,7 @@ function apply(state: State, commit: SdkCommit, ids: SdkIds): void {
       const bucket = previous[5][key] ??= [0, 0, 0, 0, 0];
       for (let i = 0; i < counts.length; i++) bucket[i] = Math.min(Number.MAX_SAFE_INTEGER, bucket[i] + counts[i]);
     }
+    sdkPut(state, day, id, previous);
   }
   (state.sdkFiles ??= {})[commit.file] = commit.cursor;
   ids.add(commit.ids); state.sdkCommit = commit.seq;
@@ -79,8 +81,9 @@ export class SdkCapture {
     const closed = Math.floor(now / (24 * HOUR)) * 24 * HOUR - SLACK;
     for (const [root, start] of Object.entries(state.sdkRoots ?? {})) if (start < since) delete state.sdkRoots![root];
     for (const [file, cursor] of Object.entries(state.sdkFiles ?? {})) if (cursor[4] < since || (cursor[4] < closed && Object.entries(state.sdkRoots ?? {}).some(([root, start]) => file.startsWith(root + path.sep) && cursor[4] < start - SLACK))) delete state.sdkFiles![file];
+    if (sdkStore(state)) hideSdkMetadata(state);
     this.room = MAX_STATE - SLICE - stateBytes(state, MAX_STATE);
-    this.rows = 0; for (const sessions of Object.values(state.sdk ?? {})) for (const row of Object.values(sessions)) if (row[6]) this.rows += 1 + Object.keys(row[5]).length;
+    this.rows = 0; for (const [, , row] of sdkRows(state, true)) this.rows += 1 + Object.keys(row[5]).length;
   }
   private full(): boolean { return this.room <= 0 || this.files >= FILES || this.rows >= ROWS || this.bytes >= BYTES || this.reading >= READ_MS; }
   root(root: string, files: (since: number) => Iterable<SourceFile>): { files: number; bytes: number } {

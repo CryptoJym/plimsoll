@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { sdkGet, sdkPut, sdkRows, sdkStore } from './sdk-store.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readLines } from './lines.js';
@@ -27,13 +28,13 @@ export function sdkLaunches(home: string, since: number): Map<string, { seat: st
 
 export function addSdk(state: State, sessionKey: string, account: string, project: string | null, model: string, time: number, tokens: Counts): void {
   const day = new Date(time).toISOString().slice(0, 10), id = crypto.createHash('sha256').update(sessionKey).digest('hex').slice(0, 24);
-  const sessions = (state.sdk ??= {})[day] ??= {};
-  const row = sessions[id] ??= [sessionKey, account, project, time, time, {}, true];
+  const row: SdkSession = sdkGet(state, day, id) ?? [sessionKey, account, project, time, time, {}, true];
   if (account !== 'unknown') row[1] = account;
   if (project) row[2] = project;
   row[3] = Math.min(row[3], time); row[4] = Math.max(row[4], time); row[6] = true;
   const key = JSON.stringify([new Date(time).getUTCHours(), model]), bucket = row[5][key] ??= [0, 0, 0, 0, 0];
   for (let i = 0; i < fields.length; i++) bucket[i] = Math.min(Number.MAX_SAFE_INTEGER, bucket[i] + tokens[fields[i]]);
+  sdkPut(state, day, id, row);
 }
 export function* sdkHours(day: string, row: SdkSession): Generator<Hour> {
   for (const [key, counts] of Object.entries(row[5])) {
@@ -47,7 +48,9 @@ export function sdkSession(row: SdkSession, state?: State, id?: string): Session
   let first = row[3], last = row[4];
   if (state) {
     id ??= crypto.createHash('sha256').update(row[0]).digest('hex').slice(0, 24);
-    for (const sessions of Object.values(state.sdk ?? {})) {
+    const span = sdkStore(state)?.span(id);
+    if (span) { first = Math.min(first, span.first); last = Math.max(last, span.last); }
+    else for (const sessions of Object.values(state.sdk ?? {})) {
       const other = sessions[id];
       if (other) { first = Math.min(first, other[3]); last = Math.max(last, other[4]); }
     }
@@ -56,25 +59,26 @@ export function sdkSession(row: SdkSession, state?: State, id?: string): Session
 }
 export function* sdkSessions(state: State): Generator<Session> {
   // A session spanning UTC midnight still has one metadata row.
-  const previous: Record<string, SdkSession>[] = [];
-  for (const sessions of Object.values(state.sdk ?? {})) {
-    for (const id in sessions) if (!previous.some(day => Object.hasOwn(day, id))) yield sdkSession(sessions[id], state, id);
-    previous.push(sessions);
+  const seen = new Set<string>();
+  for (const [, id, row] of sdkRows(state)) if (!seen.has(id)) {
+    seen.add(id); yield sdkSession(row, state, id);
   }
 }
 export function refreshSdk(state: State, launches: ReturnType<typeof sdkLaunches>, accounts: Accounts): void {
-  for (const [day, sessions] of Object.entries(state.sdk ?? {})) for (const row of Object.values(sessions)) {
+  for (const [day, id, row] of sdkRows(state)) {
     const tag = launches.get(row[0]);
     if (!tag) continue;
     const account = accounts.resolve(tag.seat);
+    let changed = false;
     if (account !== 'unknown' && account !== row[1]) {
       // Replace the previously sent unknown account row, rather than add twice.
       for (const old of sdkHours(day, row)) {
         const id = crypto.createHash('sha256').update(JSON.stringify([old.tool, old.accountKey, old.model, old.sessionKey, Math.floor(Date.parse(old.hour) / HOUR)])).digest('hex').slice(0, 24);
         state.hours[id] = { ...old, requests: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 }; state.pending[id] = true;
       }
-      row[1] = account; row[6] = true;
+      row[1] = account; row[6] = true; changed = true;
     }
-    if (tag.project && tag.project !== row[2]) { row[2] = tag.project; row[6] = true; }
+    if (tag.project && tag.project !== row[2]) { row[2] = tag.project; row[6] = true; changed = true; }
+    if (changed) sdkPut(state, day, id, row);
   }
 }

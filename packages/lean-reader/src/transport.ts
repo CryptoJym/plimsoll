@@ -6,6 +6,7 @@ import type { Config, State, Hour, Session, Seat, Velocity } from './types.js';
 import { expand } from './reader.js';
 import { branchName, topRepositories } from './evidence.js';
 import { sdkHours, sdkSession } from './sdk.js';
+import { sdkRows, sdkGet, sdkPut } from './sdk-store.js';
 
 const ROUTE = '/api/work-intelligence/lean/usage';
 const MAX_BODY = 1024 * 1024;
@@ -47,7 +48,7 @@ export function makeBatches(state: State, tenantId: string, now: number, config:
     for (const session of Object.values(state.sessions)) append('sessions', session);
     for (const seat of Object.values(state.seats)) append('seats', seat);
   }
-  if (!velocityOnly) for (const [day, sessions] of Object.entries(state.sdk ?? {})) for (const [id, row] of Object.entries(sessions)) if (row[6]) {
+  if (!velocityOnly) for (const [day, id, row] of sdkRows(state, true)) {
     for (const hour of sdkHours(day, row)) append('hours', hour);
     append('sessions', sdkSession(row, state, id));
     // Clear only after every hour AND its metadata have been acknowledged.
@@ -112,7 +113,7 @@ export function uploadError(error: unknown): string {
 export async function sendPending(state: State, config: Config, options: { home: string; now: number; velocityOnly?: boolean }): Promise<number> {
   const includeVelocity = options.velocityOnly === true || config.sendVelocity === true;
   const hasPending = options.velocityOnly ? Object.keys(state.velocityPending ?? {}).length > 0 : Object.keys(state.pending).length > 0 || state.metadataPending || (includeVelocity && Object.keys(state.velocityPending ?? {}).length > 0)
-    || Object.values(state.sdk ?? {}).some(sessions => Object.values(sessions).some(row => row[6]));
+    || !sdkRows(state, true).next().done;
   if (!hasPending || options.now < state.nextSend) return 0;
   let sent = 0;
   try {
@@ -122,7 +123,9 @@ export async function sendPending(state: State, config: Config, options: { home:
       await post(upload.url, JSON.stringify(batch.body), upload.installKey, upload.secret, deadline);
       for (const key of batch.keys) delete state.pending[key];
       for (const key of batch.velocityKeys) delete state.velocityPending[key];
-      for (const [day, id] of batch.sdkKeys) state.sdk![day][id][6] = false;
+      for (const [day, id] of batch.sdkKeys) {
+        const row = sdkGet(state, day, id)!; row[6] = false; sdkPut(state, day, id, row);
+      }
       sent += batch.body.hours.length + (batch.body.velocity?.length ?? 0);
       state.lastSend = new Date(options.now).toISOString();
     }

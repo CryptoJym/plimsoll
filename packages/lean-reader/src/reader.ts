@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { readLines } from './lines.js';
 import { Evidence, genericFolder, launchProject, protectedPath, topRepositories } from './evidence.js';
 import { stateBytes } from './state-json.js';
+import { sdkRows, sdkPut, sdkStore, pruneSdk, hideSdkMetadata } from './sdk-store.js';
 import { narrowPacked, Seen } from './seen.js';
 import { grokFields, grokFile, grokSummary, grokTurn, grokUser } from './grok.js';
 import { accountKey, Accounts, profileAccount } from './accounts.js';
@@ -261,9 +262,7 @@ function claudeAccount(root: string, home: string, env: Record<string, string | 
 }
 
 function prune(state: State, cutoff: number) {
-  for (const [day, sessions] of Object.entries(state.sdk ?? {})) {
-    if (Date.parse(day) + 24 * HOUR <= cutoff && Object.values(sessions).every(row => !row[6])) delete state.sdk![day];
-  }
+  pruneSdk(state, cutoff);
   for (const [key, row] of Object.entries(state.hours)) if (Date.parse(row.hour) < cutoff && !state.pending[key]) delete state.hours[key];
   for (const [key, row] of Object.entries(state.velocity ?? {})) if (Date.parse(row.hour) < cutoff && !state.velocityPending?.[key]) delete state.velocity[key];
   for (const key in state.seen) if (state.seen[key] * HOUR < cutoff) delete state.seen[key];
@@ -337,11 +336,12 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
     seen.remove(hour => hour * HOUR >= startHour && hour * HOUR < endHour);
     for (const file of Object.values(state.files)) for (const key of Object.keys(file.fallback)) if (state.hours[key] && inside(state.hours[key].hour)) delete file.fallback[key];
     for (const file of Object.values(state.files)) for (const [key, row] of Object.entries(file.velocityFallback ?? {})) if (inside(row.hour)) delete file.velocityFallback![key];
-    for (const [day, sessions] of Object.entries(state.sdk ?? {})) for (const row of Object.values(sessions)) {
+    for (const [day, id, row] of sdkRows(state)) {
       for (const [key, tokens] of Object.entries(row[5])) {
         const [hour] = JSON.parse(key);
         if (inside(new Date(Date.parse(day) + hour * HOUR).toISOString())) { tokens.fill(0); row[6] = true; }
       }
+      sdkPut(state, day, id, row);
     }
   }
   if (rebuildVelocity) {
@@ -766,12 +766,13 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
     } else { delete session.gitBranch; delete session.reposTouched; }
   }
   seen.finish(); evidenceSeen?.finish();
-  state.version = 3;
+  if (sdkStore(state)) hideSdkMetadata(state);
+  state.version = sdkStore(state) ? 4 : 3;
   checkBudget();
   const resultState = velocityOnly ? Object.assign(retainedState, { velocity: state.velocity, velocityPending: state.velocityPending }) : state;
   if (Object.keys(replayProgress).length) resultState.velocityReplays = replayProgress; else delete resultState.velocityReplays;
   const rows = Object.values(resultState.hours);
-  for (const [day, sessions] of Object.entries(resultState.sdk ?? {})) for (const row of Object.values(sessions)) for (const hour of sdkHours(day, row)) rows.push(hour);
+  for (const [day, , row] of sdkRows(resultState)) for (const hour of sdkHours(day, row)) rows.push(hour);
   rows.sort((a, b) => a.hour < b.hour ? -1 : a.hour > b.hour ? 1 : a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : a.sessionKey < b.sessionKey ? -1 : a.sessionKey > b.sessionKey ? 1 : 0);
   stats.rows = rows.length; stats.milliseconds = performance.now() - started; stats.peakMemoryBytes = peakMemory();
   return { state: resultState, rows, stats };

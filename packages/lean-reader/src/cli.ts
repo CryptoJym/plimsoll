@@ -9,7 +9,7 @@ import { expand } from './reader.js';
 import { sdkSessions } from './sdk.js';
 import { writeState } from './state-json.js';
 export { scan, roots, emptyState, accountKey } from './reader.js';
-export { readState, saveState, acquireLock, runPass, launchAgent } from './system.js';
+export { readState, saveState, acquireLock, runPass, launchAgent, exportLegacyState } from './system.js';
 export { makeBatches, sendPending } from './transport.js';
 export { MAX_STATE } from './types.js';
 export { allowancePass, nativeAccounts, readOutbox } from './allowance.js';
