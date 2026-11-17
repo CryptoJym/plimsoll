@@ -21,7 +21,11 @@ export function branchName(s: unknown): string | null {
 // stat() still answers. Repositories there are still named from stat alone.
 const PROTECTED = ['Desktop', 'Documents', 'Downloads', 'Movies', 'Music', 'Pictures', 'Library/Mobile Documents', 'Library/CloudStorage'];
 const protectedRoots = new Map<string, string[]>();
-export function protectedPath(file: string, home: string): boolean {
+// A walker that has resolved a folder knows its plain (non-symlink) entries are
+// resolved too: it passes resolved, and only the name is checked. Re-resolving each
+// entry cost Studio0's Grok walk two realpath calls for each of ~150,000 entries.
+export const resolvedPath = (file: string): boolean => { try { return fs.realpathSync(file) === file; } catch { return false; } };
+export function protectedPath(file: string, home: string, resolved = false): boolean {
   let roots = protectedRoots.get(home);
   if (!roots) {
     const homes = [path.resolve(home)];
@@ -31,6 +35,7 @@ export function protectedPath(file: string, home: string): boolean {
   }
   const inside = (p: string) => p === '/Volumes' || p.startsWith('/Volumes/') || roots!.some(r => p === r || p.startsWith(r + path.sep));
   if (inside(path.resolve(file))) return true;
+  if (resolved) return false;
   // A symlink elsewhere may point into one; resolving the link itself never opens files there.
   try { if (inside(fs.realpathSync(file))) return true; } catch { /* A not-yet-created file can still have a symlinked parent. */ }
   try { return inside(path.join(fs.realpathSync(path.dirname(file)), path.basename(file))); } catch { return false; }

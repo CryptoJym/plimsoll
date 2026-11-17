@@ -2,14 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { roots } from './reader.js';
 import { HOUR, WINDOW, type Options, type Source, type SourceFile, type Tool } from './types.js';
-import { protectedPath } from './evidence.js';
+import { protectedPath, resolvedPath } from './evidence.js';
 import { grokFile } from './grok.js';
 
 // At most four outstanding metadata reads. libuv retains its native pool limit
 // (including any explicit UV_THREADPOOL_SIZE); no worker or daemon is launched.
-async function files(root: string, visited: Set<string>, since: number, tool: Tool, home: string): Promise<SourceFile[]> {
-  if (tool === 'grok' && protectedPath(root, home)) return [];
-  const entries: { name: string; directory?: string; source?: SourceFile }[] = [];
+async function files(root: string, visited: Set<string>, since: number, tool: Tool, home: string, resolved = resolvedPath(root)): Promise<SourceFile[]> {
+  if (tool === 'grok' && protectedPath(root, home, resolved)) return [];
+  const entries: { name: string; directory?: string; resolved?: boolean; source?: SourceFile }[] = [];
   try {
     const stat = await fs.promises.stat(root), key = `${stat.dev}:${stat.ino}`;
     if (visited.has(key)) return [];
@@ -24,8 +24,9 @@ async function files(root: string, visited: Set<string>, since: number, tool: To
       let entry;
       while ((entry = directory.readSync())) {
         const name = entry.name, file = path.join(root, name), symlink = entry.isSymbolicLink();
-        if (tool === 'grok' && (protectedPath(file, home) || (!entry.isDirectory() && !symlink && name !== 'updates.jsonl'))) continue;
-        if (entry.isDirectory()) { entries.push({ name, directory: file }); continue; }
+        // The name filter first: only folders and updates.jsonl can matter.
+        if (tool === 'grok' && ((!entry.isDirectory() && !symlink && name !== 'updates.jsonl') || protectedPath(file, home, resolved && !symlink))) continue;
+        if (entry.isDirectory()) { entries.push({ name, directory: file, resolved }); continue; }
         if (!symlink && !(entry.isFile() && name.endsWith('.jsonl'))) continue;
         pending.push((async () => {
           try {
@@ -45,7 +46,7 @@ async function files(root: string, visited: Set<string>, since: number, tool: To
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw new Error('source_unreadable'); }
   const result: SourceFile[] = [];
   for (const entry of entries) {
-    if (entry.directory) result.push(...await files(entry.directory, visited, since, tool, home));
+    if (entry.directory) result.push(...await files(entry.directory, visited, since, tool, home, entry.resolved === true));
     else result.push(entry.source!);
   }
   return result;

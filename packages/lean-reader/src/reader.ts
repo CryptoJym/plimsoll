@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readLines } from './lines.js';
-import { Evidence, genericFolder, launchProject, protectedPath, topRepositories } from './evidence.js';
+import { Evidence, genericFolder, launchProject, protectedPath, resolvedPath, topRepositories } from './evidence.js';
 import { stateBytes } from './state-json.js';
 import { sdkRows, sdkPut, sdkStore, pruneSdk, hideSdkMetadata } from './sdk-store.js';
 import { narrowPacked, Seen } from './seen.js';
@@ -89,13 +89,13 @@ function archivedRollout(name: string, since: number): boolean {
   const match = /^rollout-(\d{4}-\d{2}-\d{2})T/.exec(name);
   return Boolean(match && Date.parse(`${match[1]}T00:00:00Z`) >= since - 24 * HOUR);
 }
-function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string, includeArchived = false): Generator<{ file: string; stat: fs.Stats }> {
+function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string, includeArchived = false, resolved = resolvedPath(root)): Generator<{ file: string; stat: fs.Stats }> {
   // Any configured source can be symlinked into a macOS protected folder.
   // stat() is safe there, but opening a directory or file can block forever
   // while the OS waits for user/iCloud permission. Keep the whole traversal
   // out of those locations, including velocity-only archived roots.
-  if (protectedPath(root, home)) return;
-  const entries: { name: string; directory?: string; file?: string; stat?: fs.Stats }[] = [];
+  if (protectedPath(root, home, resolved)) return;
+  const entries: { name: string; directory?: string; resolved?: boolean; file?: string; stat?: fs.Stats }[] = [];
   try {
     const stat = fs.statSync(root), key = `${stat.dev}:${stat.ino}`;
     if (visited.has(key)) return;
@@ -108,9 +108,9 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
       let entry;
       while ((entry = directory.readSync())) {
         const file = path.join(root, entry.name);
-        if (protectedPath(file, home)) continue;
         if (tool === 'grok' && (!entry.isDirectory() && !entry.isSymbolicLink() && entry.name !== 'updates.jsonl')) continue;
-        if (entry.isDirectory()) entries.push({ name: entry.name, directory: file });
+        if (protectedPath(file, home, resolved && !entry.isSymbolicLink())) continue;
+        if (entry.isDirectory()) entries.push({ name: entry.name, directory: file, resolved });
         else if (entry.isSymbolicLink()) {
           try {
             const s = fs.statSync(file);
@@ -128,7 +128,7 @@ function* files(root: string, visited: Set<string>, since: number, tool: Tool, h
     entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('source_unreadable'); return; }
   for (const entry of entries) {
-    if (entry.directory) yield* files(entry.directory, visited, since, tool, home, includeArchived);
+    if (entry.directory) yield* files(entry.directory, visited, since, tool, home, includeArchived, entry.resolved === true);
     else yield { file: entry.file!, stat: entry.stat! };
   }
 }
