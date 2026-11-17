@@ -680,7 +680,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
             ctx.previous = current;
           }
         }, Boolean(evidence) && root.tool !== 'grok', root.tool === 'grok' ? grokFields : undefined);
-        tracked.offset = result.offset; stats.bytesRead += result.bytes; ledger.note(root.tool, file, result.bytes, from, reset ? 'reset' : fresh ? 'new' : 'append');
+        tracked.offset = result.offset; stats.bytesRead += result.bytes; ledger.note(root.tool, file, result.bytes, from, fresh ? 'new' : reset ? 'reset' : 'append');
         if (velocityOnly) {
           const normal = retainedState.files[file];
           if (!normal || normal.dev !== stat.dev || normal.ino !== stat.ino || normal.offset < result.offset) {
