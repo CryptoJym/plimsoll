@@ -11,6 +11,7 @@ import { allowancePass } from './allowance.js';
 import { sdkJournal } from './sdk-reader.js';
 import { attachSdkStore, hideSdkMetadata, sdkStore, storedCheckpoint, sdkRows } from './sdk-store.js';
 import { stateBytes } from './state-json.js';
+import { SdkWalk } from './sdk-walk.js';
 
 const execFileSync: typeof import('node:child_process').execFileSync = (...args: any[]): any => {
   return (process.getBuiltinModule('node:child_process') as any).execFileSync(...args);
@@ -109,6 +110,10 @@ export async function runPass(options: Options = {}) {
   const started = performance.now(), home = options.home ?? os.homedir(), now = options.now ?? Date.now(), config = options.config ?? {};
   const dir = options.stateDir ?? stateDirectory(home), file = path.join(dir, 'state.json');
   const release = acquireLock(path.join(dir, 'reader.lock'));
+  // Phase times for the log line: a slow pass says where its time went.
+  const timing: Record<string, number> = {};
+  let last = performance.now();
+  const mark = (phase: string) => { const at = performance.now(); timing[phase] = Math.round(at - last); last = at; };
   let journal: ReturnType<typeof sdkJournal> | undefined;
   let store: ReturnType<typeof sdkStore>;
   try {
@@ -117,23 +122,32 @@ export async function runPass(options: Options = {}) {
     if (!options.velocityOnly && (options.command ?? 'run') === 'run') {
       await allowancePass({ home, env: options.env ?? process.env, config, stateDir: dir, now, dryRun: (options.dryRun ?? config.dryRun) === true }).catch(() => 0);
     }
+    mark('allowanceMs');
     const state = options.state ?? readState(file);
+    mark('loadMs');
     // Velocity replay has its own bounded traversal in scan(): it admits
     // immutable archived Codex .jsonl.zst sources. The ordinary async
     // discovery pass intentionally filters those files for the five-second
     // incremental run, so do not replace the replay traversal with it.
     const velocityOnly = options.velocityOnly === true || options.command === 'velocity-backfill';
     const discovered = options.discovered ?? (velocityOnly ? undefined : await discover({ ...options, home, now, config }));
+    mark('discoverMs');
     if (state.sdk || discovered?.some(root => root.aggregate)) attachSdkStore(state, file);
     store = sdkStore(state);
     if (!velocityOnly && (discovered?.some(root => root.aggregate) || fs.existsSync(path.join(dir, 'sdk-journal.jsonl')))) journal = sdkJournal(state, dir);
-    const result = scan({ ...options, home, now, config, state, discovered, sdkJournal: journal?.append, sdkReset: journal ? () => { saveState(file, state); journal!.clear(); } : undefined, backfill: options.command === 'backfill' || options.backfill });
+    const walk = velocityOnly ? undefined : options.sdkWalk ?? new SdkWalk(path.join(dir, 'sdk-dirs.json'), now);
+    const result = scan({ ...options, home, now, config, state, discovered, sdkJournal: journal?.append, sdkReset: journal ? () => { saveState(file, state); journal!.clear(); } : undefined, backfill: options.command === 'backfill' || options.backfill, sdkWalk: walk });
+    mark('scanMs');
+    if (walk instanceof SdkWalk) walk.save();
     // Persist the outbox before attempting any network operation. Replaying an
     // accepted batch after a crash is safe because cloud rows replace totals.
     result.stats.stateBytes = saveState(file, result.state);
     journal?.clear();
+    mark('saveMs');
     if (!(options.dryRun ?? config.dryRun)) result.stats.sent = await sendPending(result.state, config, { home, now, velocityOnly: options.velocityOnly === true || options.command === 'velocity-backfill' });
+    mark('sendMs');
     if (result.state.lastError) result.stats.errors++;
+    result.stats.timing = timing;
     result.stats.milliseconds = performance.now() - started; result.stats.peakMemoryBytes = peakMemory();
     result.state.footprint = { milliseconds: result.stats.milliseconds, peakMemoryBytes: result.stats.peakMemoryBytes, stateBytes: result.stats.stateBytes };
     result.stats.stateBytes = saveState(file, result.state);
@@ -141,7 +155,7 @@ export async function runPass(options: Options = {}) {
     return result;
   } catch (error) {
     const reason = error instanceof Error && ['state_capacity', 'invalid_state', 'invalid_window', 'source_unreadable'].includes(error.message) ? error.message : 'reader_error';
-    try { log(home, { at: new Date(now).toISOString(), files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 1, milliseconds: performance.now() - started, peakMemoryBytes: peakMemory(), error: reason }); } catch { /* Preserve the original failure. */ }
+    try { log(home, { at: new Date(now).toISOString(), files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 1, milliseconds: performance.now() - started, peakMemoryBytes: peakMemory(), timing, error: reason }); } catch { /* Preserve the original failure. */ }
     throw new Error(reason);
   } finally { journal?.close(); store?.close(); release(); }
 }

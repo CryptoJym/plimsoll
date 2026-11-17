@@ -75,7 +75,7 @@ export class SdkCapture {
   private room: number;
   constructor(private state: State, private now: number, private since: number, private until: number,
     private identity: (session: string, cwd: string) => { account: string; project: string | null },
-    private journal?: (commit: SdkCommit) => void, private backfill = false) {
+    private journal?: (commit: SdkCommit) => void, private backfill = false, private onRead?: (file: string, bytes: number, from: number) => void) {
     this.ids = new SdkIds(state);
     // Closed days need no file cursor once their root watermark excludes them.
     const closed = Math.floor(now / (24 * HOUR)) * 24 * HOUR - SLACK;
@@ -85,6 +85,7 @@ export class SdkCapture {
     this.room = MAX_STATE - SLICE - stateBytes(state, MAX_STATE);
     this.rows = 0; for (const [, , row] of sdkRows(state, true)) this.rows += 1 + Object.keys(row[5]).length;
   }
+  get readMs(): number { return this.reading; }
   private full(): boolean { return this.room <= 0 || this.files >= FILES || this.rows >= ROWS || this.bytes >= BYTES || this.reading >= READ_MS; }
   root(root: string, files: (since: number) => Iterable<SourceFile>): { files: number; bytes: number } {
     const beforeFiles = this.files, beforeBytes = this.bytes;
@@ -125,7 +126,7 @@ export class SdkCapture {
       const commit: SdkCommit = { type: 'event_msg', seq: (this.state.sdkCommit ?? 0) + 1, file, cursor: [stat.dev, stat.ino, stat.size, result.offset, stat.mtimeMs], rows, ids: packed };
       // The commit encoding overestimates its added state (it includes existing
       // cursor/row fields too). Reserve a slice for root metadata and the save.
-      this.files++; this.bytes += result.bytes; for (const [, , row] of rows) this.rows += 1 + Object.keys(row[5]).length;
+      this.files++; this.bytes += result.bytes; this.onRead?.(file, result.bytes, offset); for (const [, , row] of rows) this.rows += 1 + Object.keys(row[5]).length;
       const growth = stateBytes(commit, MAX_STATE);
       if (growth > this.room) { this.room = 0; complete = false; break; }
       this.room -= growth;

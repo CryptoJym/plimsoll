@@ -61,8 +61,13 @@ export type Outbox = {
 export type Config = { allowanceFile?: string; credentialsFrom?: string; endpoint?: string; roots?: (string | { tool: Tool; path: string })[]; rootsOnly?: boolean; velocityAccountMapFile?: string; sendSessionTitles?: boolean; sendFolderLabels?: boolean; sendEvidence?: boolean; sendVelocity?: boolean; dryRun?: boolean };
 export type SourceFile = { file: string; stat: import('node:fs').Stats };
 export type Source = { tool: Tool; path: string; aggregate?: boolean; files?: SourceFile[] };
-export type Options = { home?: string; env?: Record<string, string | undefined>; config?: Config; state?: State; since?: string; until?: string; backfill?: boolean; velocityOnly?: boolean; now?: number; stateDir?: string; command?: string; dryRun?: boolean; discovered?: Source[]; sdkJournal?: (commit: import('./sdk-reader.js').SdkCommit) => void; sdkReset?: () => void };
-export type Stats = { files: number; bytesRead: number; rows: number; sent: number; errors: number; milliseconds: number; peakMemoryBytes: number; stateBytes: number };
+export type Options = { home?: string; env?: Record<string, string | undefined>; config?: Config; state?: State; since?: string; until?: string; backfill?: boolean; velocityOnly?: boolean; now?: number; stateDir?: string; command?: string; dryRun?: boolean; discovered?: Source[]; sdkJournal?: (commit: import('./sdk-reader.js').SdkCommit) => void; sdkReset?: () => void; sdkWalk?: SdkWalker };
+export type ReadEntry = { file: string; bytes: number; from: number; why: 'append' | 'new' | 'reset' | 'evidence' | 'replay' | 'sdk' };
+export type SdkWalkStats = { roots: number; dirs: number; indexed: number; stat: number; files: number; walkMs: number; swept: boolean };
+export type SdkWalker = { files(root: string, visited: Set<string>, since: number, home: string): Iterable<SourceFile>; stats(): SdkWalkStats };
+/** Where a pass read its bytes; reader.log carries it with every pass. */
+export type ReadSummary = { sources: Record<string, { files: number; read: number; bytes: number }>; top: ReadEntry[]; sdk?: SdkWalkStats & { readMs: number } };
+export type Stats = { files: number; bytesRead: number; rows: number; sent: number; errors: number; milliseconds: number; peakMemoryBytes: number; stateBytes: number; read?: ReadSummary; timing?: Record<string, number> };
 export const HOUR = 3_600_000;
 export const WINDOW = 8 * 24 * HOUR;
 // The serialized state ceiling. Loading holds the file's text and its parse at once

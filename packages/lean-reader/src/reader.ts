@@ -14,7 +14,8 @@ import { globRoots } from './glob.js';
 import { addSdk, sdkHours, sdkLaunches, refreshSdk } from './sdk.js';
 import { SdkCapture, activity } from './sdk-reader.js';
 import { claudeUsage } from './claude-usage.js';
-import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity } from './types.js';
+import { ReadLedger } from './ledger.js';
+import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity, type ReadSummary } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
 // Exact port of shared/src/policy.ts providerAccountKey / hashProtectedValue.
@@ -307,6 +308,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   const rebuildVelocity = velocityOnly || options.backfill === true;
   const accountMap = velocityOnly ? velocityAccountMap(home, config) : null;
   const stats: Stats = { files: 0, bytesRead: 0, rows: 0, sent: 0, errors: 0, milliseconds: 0, peakMemoryBytes: 0, stateBytes: 0 };
+  const ledger = new ReadLedger();
   prune(state, cutoff);
   narrowPacked(state);
   if (velocityOnly) narrowPacked(retainedState);
@@ -505,8 +507,10 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
         for (const key of Object.keys(tracked.fallback)) earliest = Math.min(earliest, state.hours[key] ? Date.parse(state.hours[key].hour) : startHour);
         const recovered = scanSource({ ...options, state: emptyState(), config: { ...config, sendEvidence: false }, since: new Date(earliest).toISOString(), discovered: [{ tool: root.tool, path: root.path, files: [{ file, stat }] }] }, { file, end: tracked.offset });
         tracked.velocityFallback = recovered.state.files[file]?.velocityFallback ?? {};
+        ledger.note(root.tool, file, recovered.stats.bytesRead, 0, 'replay');
         tracked.fallbackLastReplyAt = recovered.state.files[file]?.fallbackLastReplyAt;
       }
+      const fresh = !tracked;
       if (!tracked) { tracked = { dev: stat.dev, ino: stat.ino, size: stat.size, offset: 0, mtime: stat.mtimeMs, context: context(getAccount()), fallback: {} }; if (!aggregate) state.files[file] = tracked; budgetTick(); }
       if (reset || (options.backfill && !velocityOnly) || velocityOnly) { const records = tracked.context.records && !options.backfill && !velocityOnly; tracked.offset = 0; tracked.context = context(getAccount()); tracked.context.records = records; }
       const ctx = tracked.context;
@@ -523,7 +527,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
         if (before !== JSON.stringify(summary)) state.metadataPending = true;
       };
       updateGrokSummary();
-      stats.files++;
+      stats.files++; ledger.visit(root.tool);
       // Upgrading an existing state (or re-enabling evidence) replays evidence
       // alone. Usage cursors, cumulative baselines and replacement totals stay put.
       let evidenceContext = reset || (options.backfill && !velocityOnly) ? { cwd: '', session: '' } : tracked.evidenceContext ?? { cwd: ctx.cwd, session: ctx.session };
@@ -545,11 +549,13 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       try {
         if (evidence && root.tool !== 'grok' && !reset && tracked.evidenceOffset !== tracked.offset) {
           evidenceContext = { cwd: '', session: '' };
-          stats.bytesRead += readLines(sourcePath, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
+          const replayed = readLines(sourcePath, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
+          stats.bytesRead += replayed; ledger.note(root.tool, file, replayed, 0, 'evidence');
           tracked.evidenceOffset = tracked.offset; tracked.evidenceContext = evidenceContext;
         }
         if (tracked.offset === sourceSize && !velocityOnly) { remember(tracked.mtime); continue; }
-        const result = readLines(sourcePath, tracked.offset, sourceSize, (r, recordEnd) => {
+        const from = tracked.offset;
+        const result = readLines(sourcePath, from, sourceSize, (r, recordEnd) => {
           if (root.tool === 'grok') {
             const turn = grokTurn(r);
             if (!turn) return;
@@ -674,7 +680,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
             ctx.previous = current;
           }
         }, Boolean(evidence) && root.tool !== 'grok', root.tool === 'grok' ? grokFields : undefined);
-        tracked.offset = result.offset; stats.bytesRead += result.bytes;
+        tracked.offset = result.offset; stats.bytesRead += result.bytes; ledger.note(root.tool, file, result.bytes, from, reset ? 'reset' : fresh ? 'new' : 'append');
         if (velocityOnly) {
           const normal = retainedState.files[file];
           if (!normal || normal.dev !== stat.dev || normal.ino !== stat.ino || normal.offset < result.offset) {
@@ -700,6 +706,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       finally { cleanup(); }
     }
   }
+  let sdk: ReadSummary['sdk'];
   if (!velocityOnly && sources.some(root => root.aggregate && root.tool === 'claude_code')) {
     seen.finish();
     // Journal deltas from a rebuild must recover onto its zeroed baseline,
@@ -709,15 +716,16 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
     const capture = new SdkCapture(state, now, startHour, endHour, (session, cwd) => {
       const tag = launches.get(session), account = sourceAccount === 'unknown' || tag ? accounts.resolve(tag?.seat ?? '') : sourceAccount;
       return { account, project: tag?.project ?? projects.hint(cwd, 'claude_code', session).projectHint };
-    }, options.sdkJournal, options.backfill);
+    }, options.sdkJournal, options.backfill, (file, bytes, from) => ledger.note('sdk', file, bytes, from, 'sdk'));
     // Newest folder first: a freshly started brain is read in its first pass.
     const aggregates = sources.filter(root => root.aggregate && root.tool === 'claude_code').map(root => ({ root, at: activity(root.path) })).sort((a, b) => b.at - a.at);
     for (const { root } of aggregates) {
       sourceAccount = claudeAccount(root.path, home, options.env ?? process.env, accounts);
-      const captured = capture.root(root.path, since => root.files ?? files(root.path, visited, since, root.tool, home));
-      stats.files += captured.files; stats.bytesRead += captured.bytes;
+      const captured = capture.root(root.path, since => root.files ?? (options.sdkWalk ? options.sdkWalk.files(root.path, visited, since, home) : files(root.path, visited, since, root.tool, home)));
+      stats.files += captured.files; stats.bytesRead += captured.bytes; ledger.visit('sdk', captured.files);
     }
     capture.finish();
+    sdk = { ...(options.sdkWalk?.stats() ?? { roots: aggregates.length, dirs: 0, indexed: 0, stat: 0, files: 0, walkMs: 0, swept: false }), readMs: Math.round(capture.readMs) };
     seen = new Seen(state, 'seen', 'seenPacked', cutoff);
   }
   const active = new Set(Object.values(state.hours).map(row => row.tool + ':' + row.sessionKey));
@@ -774,6 +782,6 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
   const rows = Object.values(resultState.hours);
   for (const [day, , row] of sdkRows(resultState)) for (const hour of sdkHours(day, row)) rows.push(hour);
   rows.sort((a, b) => a.hour < b.hour ? -1 : a.hour > b.hour ? 1 : a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : a.sessionKey < b.sessionKey ? -1 : a.sessionKey > b.sessionKey ? 1 : 0);
-  stats.rows = rows.length; stats.milliseconds = performance.now() - started; stats.peakMemoryBytes = peakMemory();
+  stats.rows = rows.length; stats.milliseconds = performance.now() - started; stats.peakMemoryBytes = peakMemory(); stats.read = ledger.summary(sdk);
   return { state: resultState, rows, stats };
 }
