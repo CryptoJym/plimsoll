@@ -632,6 +632,146 @@ async function isolatedOtlpRun(
   }
 }
 
+// plimsoll N197: Codex sends every metric series in one periodic export.
+// Studio0 refused all of them (45–97 metrics, 436–863 data points, 1.1–3.6 MB
+// decoded) while metrics and data points shared the 512-record ceiling. The
+// shape here: alternating sums and 16-bound histograms, string int64s, some
+// token metric names, `attributesPerPoint` attributes padded to the observed
+// body sizes. Every point has its own timestamp, so every sample id is unique.
+function codexMetricExportBody(metrics: number, dataPoints: number, attributesPerPoint: number, valueBytes: number) {
+  const explicitBounds = [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1_000, 2_500, 5_000, 7_500, 10_000, 25_000];
+  let sequence = 0;
+  const point = (histogram: boolean) => {
+    sequence += 1;
+    return {
+      attributes: Array.from({ length: attributesPerPoint }, (_, index) => ({
+        key: `codex.metric_attr_${index}`,
+        value: { stringValue: `${index}:${"v".repeat(valueBytes)}` },
+      })),
+      startTimeUnixNano: CODEX_RECORD_BASE_NANOS.toString(),
+      timeUnixNano: (CODEX_RECORD_BASE_NANOS + BigInt(sequence) * 1_000_000n).toString(),
+      ...(histogram
+        ? {
+            count: "7",
+            sum: 412.5,
+            bucketCounts: Array.from({ length: explicitBounds.length + 1 }, (_, index) => String(index % 3)),
+            explicitBounds,
+          }
+        : { asInt: String(sequence) }),
+    };
+  };
+  return JSON.stringify({
+    resourceMetrics: [{
+      resource: { attributes: [{ key: "service.name", value: { stringValue: "codex_cli_rs" } }] },
+      scopeMetrics: [{
+        scope: { name: "codex_otel" },
+        metrics: Array.from({ length: metrics }, (_, index) => {
+          const points = Array.from(
+            { length: Math.floor(dataPoints / metrics) + (index < dataPoints % metrics ? 1 : 0) },
+            () => point(index % 2 === 1),
+          );
+          const name = index % 8 === 0 ? `codex.turn.token_usage_${index}` : `codex.metric_${index}`;
+          return index % 2 === 1
+            ? { name, unit: "ms", histogram: { aggregationTemporality: 2, dataPoints: points } }
+            : { name, unit: "1", sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: points } };
+        }),
+      }],
+    }],
+  });
+}
+
+async function isolatedOtlpMetricRun(body: string) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-http-metrics-"));
+  const previousHome = process.env.PLIMSOLL_HOME;
+  process.env.PLIMSOLL_HOME = home;
+  const buffer = new LocalEventBuffer(path.join(home, "ledger.sqlite"));
+  const spool = new OtlpIntakeSpool({ home });
+  const config = collectorConfigSchema.parse({});
+  const expectedIds = explodeOtlpPayload(JSON.parse(body), {
+    policy: config.policy,
+    source: "codex",
+    transportPath: "/v1/metrics",
+  }).metricSamples.map((sample) => sample.id).sort();
+  const server = createCollectorServer(config, buffer, { otlpSpool: spool });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const result = await request(
+      (server.address() as AddressInfo).port,
+      "/v1/metrics",
+      body,
+      { "x-plimsoll-source": "codex" },
+      "POST",
+      HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
+    );
+    const storedIds = () => (buffer.database.prepare("select id from metric_samples").all() as Array<{ id: string }>)
+      .map((row) => row.id).sort();
+    const committedBeforeDrain = storedIds().length;
+    const pendingBeforeDrain = spool.status().pendingFiles;
+    const spooledSamples = spool.status().spooled.metricSamples;
+    let drainPasses = 0;
+    const maxDrainPasses = Math.ceil(expectedIds.length / OTLP_COMMIT_CHUNK_SIZE) * 128;
+    while (spool.status().pendingFiles > 0 && drainPasses < maxDrainPasses) {
+      await spool.drain(buffer);
+      drainPasses += 1;
+    }
+    const stored = storedIds();
+    const spoolStatus = spool.status();
+    const outcome = result.body.status ?? (result.body.accepted === true ? "accepted" : null);
+    return {
+      status: result.status,
+      outcome,
+      reason: result.body.reason ?? null,
+      elapsedMs: Math.round(result.elapsedMs * 100) / 100,
+      bodyBytes: Buffer.byteLength(body),
+      expectedSamples: expectedIds.length,
+      uniqueExpectedSamples: new Set(expectedIds).size,
+      committedBeforeDrain,
+      spooledSamples,
+      drainPasses,
+      storedSamples: stored.length,
+      pendingAfterDrain: spoolStatus.pendingFiles,
+      exactDurability: result.status === 202 &&
+        ((outcome === "accepted" && result.body.metricSamples === expectedIds.length &&
+          pendingBeforeDrain === 0 && committedBeforeDrain === expectedIds.length) ||
+          (outcome === "otlp_spooled" && pendingBeforeDrain === 1 &&
+            committedBeforeDrain + spooledSamples === expectedIds.length)) &&
+        stored.length === expectedIds.length &&
+        stored.every((id, index) => id === expectedIds[index]) &&
+        spoolStatus.pendingFiles === 0 && spoolStatus.rejectedOnReplay === 0,
+    };
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    buffer.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = previousHome;
+  }
+}
+
+async function checkCodexMetricExports() {
+  // A typical refused export, then the largest one Studio0 refused.
+  for (const [metrics, dataPoints, attributesPerPoint, valueBytes] of [
+    [64, 600, 16, 60],
+    [97, 863, 18, 160],
+  ] as const) {
+    const run = await isolatedOtlpMetricRun(
+      codexMetricExportBody(metrics, dataPoints, attributesPerPoint, valueBytes),
+    );
+    check(
+      `codex_metric_export_${metrics}_metrics_${dataPoints}_points_is_exactly_durable_or_spooled`,
+      run.bodyBytes >= 1_100_000 && run.bodyBytes <= LOCAL_HTTP_LIMITS.decodedBodyBytes &&
+        run.expectedSamples === dataPoints && run.uniqueExpectedSamples === dataPoints &&
+        run.exactDurability,
+      { metrics, dataPoints, attributesPerPoint, ...run, deadlineMs: LOCAL_HTTP_LIMITS.requestDeadlineMs },
+    );
+  }
+}
+
 async function checkRepresentativeBatch() {
   // 1,500 ms is the wall-clock request budget in the server and documented
   // retry/spool behavior. These checks pin the count and attribute shapes and
@@ -700,6 +840,7 @@ async function checkRepresentativeBatch() {
       clientTimeoutMs: HEAVY_FIXTURE_CLIENT_TIMEOUT_MS,
     },
   );
+  await checkCodexMetricExports();
   await checkPartialDeadlineRetry();
   await checkDirectSuccessDeadline();
 }
@@ -1381,6 +1522,25 @@ async function main() {
       },
     );
 
+    // Data points have their own ceiling (N197); limit + 1 is still refused.
+    const changesBeforeHighPoints = totalChanges(buffer);
+    const highPoints = await request(port, "/v1/metrics", JSON.stringify({
+      resourceMetrics: [{
+        scopeMetrics: [{
+          metrics: [{
+            name: "codex.metric",
+            sum: { dataPoints: Array.from({ length: LOCAL_HTTP_LIMITS.otlpDataPoints + 1 }, () => ({})) },
+          }],
+        }],
+      }],
+    }), { "x-plimsoll-source": "codex" });
+    check(
+      "otlp_data_point_cardinality_rejected_before_write",
+      stableRejection(highPoints, "otlp_record_limit_exceeded", 413) &&
+        totalChanges(buffer) === changesBeforeHighPoints,
+      { status: highPoints.status, reason: highPoints.body.reason, dataPoints: LOCAL_HTTP_LIMITS.otlpDataPoints + 1 },
+    );
+
     const highAttributeEnvelope = {
       resourceSpans: [
         {
@@ -1505,6 +1665,7 @@ async function main() {
       highNodes,
       highRecords,
       highNested,
+      highPoints,
       highAttributes,
       deadline,
     ]) {
