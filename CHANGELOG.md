@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.71 — 2026-11-19
+
+- Codex metric exports reach the ledger again. A periodic Codex metric export
+  sends every series in one request, and the collector counted each metric
+  and each of its data points against the 512-record OTLP ceiling, so every
+  larger export was refused whole with 413 `otlp_record_limit_exceeded`
+  (Studio0: 45 to 97 metrics, 436 to 863 data points; Studio3, Studio4 and
+  Studio5 on 0.7.70: 73 to 77 metrics, 494 to 545 data points; plimsoll N197).
+  Data points now have their own 4,096 ceiling and a metric counts toward
+  none; log records and spans keep 512, and the byte, JSON-node and attribute
+  ceilings are unchanged.
+
 ## 0.7.70 — 2026-11-13
 
 - Automatic enrichment now stitches its backlog. 0.7.69 retired the queued
