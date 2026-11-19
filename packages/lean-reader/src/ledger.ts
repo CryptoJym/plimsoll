@@ -10,6 +10,8 @@ export class ReadLedger {
   private top: ReadEntry[] = [];
   private source(name: string) { return this.sources[name] ??= { files: 0, read: 0, bytes: 0 }; }
   visit(source: string, files = 1): void { this.source(source).files += files; }
+  /** A settled file back in the window unchanged: skipped, not read again. */
+  settle(source: string): void { const total = this.source(source); total.settled = (total.settled ?? 0) + 1; }
   note(source: string, file: string, bytes: number, from: number, why: ReadEntry['why']): void {
     if (!(bytes > 0)) return;
     const total = this.source(source); total.read++; total.bytes += bytes;

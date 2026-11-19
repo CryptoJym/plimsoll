@@ -15,7 +15,7 @@ import { addSdk, sdkHours, sdkLaunches, refreshSdk } from './sdk.js';
 import { SdkCapture, activity } from './sdk-reader.js';
 import { claudeUsage } from './claude-usage.js';
 import { ReadLedger } from './ledger.js';
-import { actionCounts, counts, fields, HOUR, WINDOW, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity, type ReadSummary } from './types.js';
+import { actionCounts, counts, fields, HOUR, WINDOW, SETTLED, MAX_STATE, integer, string, peakMemory, type ActionKind, type Actions, type Config, type Context, type FileState, type Hour, type Options, type State, type Tool, type Counts, type Stats, type Source, type Velocity, type ReadSummary } from './types.js';
 
 const digest = (x: string) => crypto.createHash('sha256').update(x).digest('hex').slice(0, 24);
 // Exact port of shared/src/policy.ts providerAccountKey / hashProtectedValue.
@@ -269,11 +269,18 @@ function prune(state: State, cutoff: number) {
   for (const key in state.seen) if (state.seen[key] * HOUR < cutoff) delete state.seen[key];
   for (const key in state.evidenceSeen ?? {}) if (state.evidenceSeen![key] * HOUR < cutoff) delete state.evidenceSeen![key];
   for (const [key, evidence] of Object.entries(state.evidence ?? {})) if (evidence.lastSeen < cutoff && !state.metadataPending) delete state.evidence![key];
+  // A plain cursor leaving the window stays as a compact settled entry, kept
+  // SETTLED past its last sighting (archives keep their own size+mtime check).
+  const hour = (cutoff + WINDOW) / HOUR;
   for (const [file, tracked] of Object.entries(state.files)) {
     for (const key of Object.keys(tracked.fallback)) if (!state.hours[key]) delete tracked.fallback[key];
     for (const key of Object.keys(tracked.velocityFallback ?? {})) if (!state.velocity[key]) delete tracked.velocityFallback![key];
-    if (tracked.mtime < cutoff && !Object.keys(tracked.fallback).some(k => state.pending[k])) delete state.files[file];
+    if (tracked.mtime < cutoff && !Object.keys(tracked.fallback).some(k => state.pending[k])) {
+      if (!file.endsWith('.jsonl.zst')) (state.settled ??= {})[file] = [tracked.dev, tracked.ino, tracked.size, hour];
+      delete state.files[file];
+    }
   }
+  for (const [file, settled] of Object.entries(state.settled ?? {})) if ((hour - settled[3]) * HOUR > SETTLED) delete state.settled![file];
   if (!state.metadataPending) {
     for (const [key, session] of Object.entries(state.sessions)) if (Date.parse(session.lastSeen) < cutoff) delete state.sessions[key];
     for (const [key, seat] of Object.entries(state.seats)) if (Date.parse(seat.observedAt) < cutoff) delete state.seats[key];
@@ -494,6 +501,12 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       // they need no second in-memory index of every transient file inode.
       if (!aggregate) visitedFiles.add(fileIdentity);
       let tracked = aggregate ? undefined : state.files[file];
+      // A settled file with its identity and size unchanged was read to its end
+      // before; only its mtime moved back into the window. Skip it instead of
+      // reading it again from byte 0. Replays and backfills reread on purpose.
+      const settled = tracked || aggregate || compressed || velocityOnly || options.backfill ? undefined : state.settled?.[file];
+      if (settled && settled[0] === stat.dev && settled[1] === stat.ino && settled[2] === stat.size) { settled[3] = (cutoff + WINDOW) / HOUR; ledger.settle(root.tool); continue; }
+      if (settled) delete state.settled![file];
       const reset = !tracked || tracked.dev !== stat.dev || tracked.ino !== stat.ino ||
         (compressed ? stat.size !== tracked.size || stat.mtimeMs !== tracked.mtime : stat.size < tracked.size || stat.size < tracked.offset);
       const replay = replayProgress[file];

@@ -11,6 +11,10 @@ export type Context = { model: string; cwd: string; session: string; account: st
 export type FileState = { dev: number; ino: number; size: number; offset: number; mtime: number; context: Context; fallback: Record<string, Counts>; velocityFallback?: Record<string, Velocity>; fallbackLastReplyAt?: number; evidenceOffset?: number; evidenceContext?: EvidenceContext };
 // Glob roots retain compact UTC-day/session totals and separately pruned cursors.
 export type SdkCursor = [dev: number, ino: number, size: number, offset: number, mtime: number];
+// A plain cursor that left the window: the file was read to its end. Claude's
+// transcript lease backdates kept sessions to seven days old, back inside the
+// window; an unchanged file then needs no second read from byte 0.
+export type SettledCursor = [dev: number, ino: number, size: number, hour: number];
 export type SdkSession = [session: string, account: string, project: string | null, first: number, last: number, hours: Record<string, number[]>, pending: boolean];
 export type Velocity = {
   hour: string; tool: Tool; accountKey: string; model: string; sessionKey: string; tier: string; effort: string;
@@ -23,6 +27,7 @@ export type State = {
   sdkRoots?: Record<string, number>;
   sdkCommit?: number;
   sdk?: Record<string, Record<string, SdkSession>>;
+  settled?: Record<string, SettledCursor>;
   version: 1 | 2 | 3 | 4; files: Record<string, FileState>; hours: Record<string, Hour>; velocity: Record<string, Velocity>; seen: Record<string, number>;
   velocityPending: Record<string, boolean>;
   velocityReplays?: Record<string, { dev: number; ino: number; windows: { start: number; end: number; offset: number }[] }>;
@@ -66,10 +71,12 @@ export type ReadEntry = { file: string; bytes: number; from: number; why: 'appen
 export type SdkWalkStats = { roots: number; dirs: number; indexed: number; stat: number; files: number; walkMs: number; swept: boolean };
 export type SdkWalker = { files(root: string, visited: Set<string>, since: number, home: string): Iterable<SourceFile>; stats(): SdkWalkStats };
 /** Where a pass read its bytes; reader.log carries it with every pass. */
-export type ReadSummary = { sources: Record<string, { files: number; read: number; bytes: number }>; top: ReadEntry[]; sdk?: SdkWalkStats & { readMs: number } };
+export type ReadSummary = { sources: Record<string, { files: number; read: number; bytes: number; settled?: number }>; top: ReadEntry[]; sdk?: SdkWalkStats & { readMs: number } };
 export type Stats = { files: number; bytesRead: number; rows: number; sent: number; errors: number; milliseconds: number; peakMemoryBytes: number; stateBytes: number; read?: ReadSummary; timing?: Record<string, number> };
 export const HOUR = 3_600_000;
 export const WINDOW = 8 * 24 * HOUR;
+// A settled cursor outlives its last sighting by Claude's 30-day transcript retention.
+export const SETTLED = 30 * 24 * HOUR;
 // The serialized state ceiling. Loading holds the file's text and its parse at once
 // (23 MB of heap for a 9.3 MB state), so the LaunchAgent's V8 heap is four times it.
 export const MAX_STATE = 64 * 1024 * 1024;

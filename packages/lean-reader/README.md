@@ -47,6 +47,14 @@ so replacing a cloud row cannot erase the rest of that hour. A dry run updates
 local state and leaves rows pending; it never reads upload credentials or sends.
 `--json` includes the computed rows and allowlisted session/seat metadata.
 
+A fixed-root cursor that leaves the eight-day window stays as a settled entry
+(device, inode, size) for 30 days past its last sighting. A file that returns
+to the window unchanged is skipped instead of read again from byte 0: Claude's
+desktop transcript lease backdates kept sessions to seven days old, and Studio0
+reread up to 9.5 GB per renewal before this. `reader.log` counts such files as
+`settled` under their source. An append, truncation or replacement reads the
+file as new; `backfill` and velocity replay reread on purpose.
+
 For an isolated measurement, use `--state-dir /tmp/plimsoll-lean-check`; this
 option also works with `run` and `status`. `PLIMSOLL_LEAN_STATE_DIR` is the
 equivalent environment override. `--config /path/to/config.json` selects an
