@@ -247,6 +247,7 @@
     "proof:pr426-r6-read-only-preflight-sidecars": "tsx scripts/pr426-r6-read-only-preflight-sidecars.ts",
     "proof:pr426-r6-archive-query-plans": "tsx scripts/pr426-r6-archive-query-plans.ts",
     "proof:pr426-r6-carry-budget": "tsx scripts/pr426-r6-carry-budget.ts",
+    "proof:fresh-ledger-carry-observed-only": "tsx scripts/fresh-ledger-carry-observed-only.ts",
     "proof:pr426-r6-crash-mid-carry": "tsx scripts/pr426-r6-crash-mid-carry.ts",
     "proof:pr426-r6-stale-generation-growth": "tsx scripts/pr426-r6-stale-generation-growth.ts",
     "proof:pr426-r7-replaced-during-switch": "tsx scripts/review-r3-replaced-during-switch.ts",

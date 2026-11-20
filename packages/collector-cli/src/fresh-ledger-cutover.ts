@@ -180,7 +180,7 @@ function cursorForCarry(db: Database.Database, row: Record<string, unknown>) {
   return cursor;
 }
 
-function inspectCursors(db: Database.Database, staleFileKeys: ReadonlySet<string>) {
+function inspectCursors(db: Database.Database, carryKeys: ReadonlySet<string>) {
   if (!hasTable(db, "rollout_scan_state")) return {
     rows: 0, bytes: 0, invalidCursorsNotCarried: 0, latest: null as string | null,
   };
@@ -209,7 +209,7 @@ function inspectCursors(db: Database.Database, staleFileKeys: ReadonlySet<string
       invalidCursorsNotCarried += 1;
       continue;
     }
-    if (!staleFileKeys.has(row.file)) {
+    if (carryKeys.has(row.file)) {
       rows += 1;
       bytes += valueBytes(row);
     }
@@ -272,7 +272,7 @@ function inspectLiveState(db: Database.Database, home: string) {
 }
 
 function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.Stats,
-  staleFileKeys: ReadonlySet<string>) {
+  carryKeys: ReadonlySet<string>) {
   const binding = hasTable(db, "collector_workspace_binding")
     ? db.prepare(`select current_workspace_id as workspaceId,current_device_id as deviceId,
         current_installation_epoch_id as epochId
@@ -283,7 +283,7 @@ function inspectArchive(db: Database.Database, input: CutoverInput, oldStat: fs.
       binding.deviceId !== input.config.deviceId) throw new Error("archive_identity_mismatch");
   if (binding.epochId !== rootEpoch(input)) throw new Error("archive_epoch_mismatch");
   if (hasTable(db, "collector_replacement_ledger")) throw new Error("replacement_ledger_already_active");
-  const cursors = inspectCursors(db, staleFileKeys);
+  const cursors = inspectCursors(db, carryKeys);
   const live = inspectLiveState(db, path.dirname(input.ledgerPath));
   const carriedRows = { rollout_scan_state: cursors.rows, ...live.carriedRows };
   const carriedBytes = { rollout_scan_state: cursors.bytes, ...live.carriedBytes };
@@ -453,14 +453,23 @@ function observedRootFiles(input: CutoverInput, heartbeat?: () => void): Array<{
   return result;
 }
 
-function untrackedRootFiles(db: Database.Database, input: CutoverInput) {
+/** Cursor keys the replacement can keep: an observed capture-root file whose
+ * current generation is the cursor's own. finalizeReplacementFileFences drops
+ * every other cursor before the rename, so the carry budget and the staged copy
+ * count only these (plimsoll N216: Studio0's 20,340 carried cursors were all for
+ * files no longer on disk, 19.8 MB against the 8 MiB budget, while every present
+ * file is fenced because APFS device numbers changed across reboots). */
+function carriedCursorKeys(db: Database.Database,
+  observed: ReturnType<typeof observedRootFiles>): Set<string> {
   const cursor = hasTable(db, "rollout_scan_state")
     ? db.prepare("select file,parser_kind,checkpoint_version from rollout_scan_state where file=?") : null;
-  return observedRootFiles(input).filter(({ fileKey, observation }) => {
+  const keys = new Set<string>();
+  for (const { fileKey, observation } of observed) {
     const row = cursor?.get(fileKey) as Record<string, unknown> | undefined;
-    return (row && cursorForCarry(db, row))?.fileIdentity !==
-      `${observation.device}:${observation.inode}:${observation.birthtimeNs}`;
-  });
+    if ((row && cursorForCarry(db, row))?.fileIdentity ===
+      `${observation.device}:${observation.inode}:${observation.birthtimeNs}`) keys.add(fileKey);
+  }
+  return keys;
 }
 
 /** Rebind the staged cursor/fence set to the final observed file generations.
@@ -634,9 +643,10 @@ export function planFreshLedgerCutover(input: CutoverInput, heldBarrier?: Ledger
     sidecarsMayAppear = opened.sidecarsMayAppear;
     try {
       if (sidecarsMayAppear) db.pragma("query_only = ON");
-      const untracked = untrackedRootFiles(db, input);
-      const inspection = inspectArchive(db, input, old,
-        new Set(untracked.map(row => row.fileKey)));
+      const observed = observedRootFiles(input);
+      const carryKeys = carriedCursorKeys(db, observed);
+      const untracked = observed.filter(entry => !carryKeys.has(entry.fileKey));
+      const inspection = inspectArchive(db, input, old, carryKeys);
       const fields = { ...base, installationEpochId: epoch,
         archiveIdentity: inspection.archiveIdentity, archiveLatestRecordedAt: inspection.latest,
         cursorRows: inspection.cursorRows, carriedRows: inspection.carriedRows,
@@ -997,10 +1007,12 @@ function switchFreshLedgerUnderBarrier(input: CutoverInput, barrier: LedgerConne
     // A clock adjustment between inspection and first open cannot move the
     // replacement's cutoff behind the archive.
     const switchNow = (input.now ?? (() => new Date()))();
-    // Copy every validated archive cursor first. The final root snapshot,
-    // taken just before the active rename, decides which generations survive.
-    const inspection = inspectArchive(old, { ...input, now: () => switchNow }, stat,
-      new Set());
+    // Copy the validated cursors whose file is present in its own generation;
+    // the final root snapshot, taken just before the active rename, still
+    // decides which of them survive. A cursor left out here is fenced, never
+    // re-read, exactly as finalization would have done.
+    const carryKeys = carriedCursorKeys(old, observedRootFiles(input, heartbeat));
+    const inspection = inspectArchive(old, { ...input, now: () => switchNow }, stat, carryKeys);
     if (inspection.totalCarriedBytes > MAX_CARRIED_VALUE_BYTES) {
       throw new Error("carried_state_exceeds_8_mib_budget");
     }
@@ -1038,7 +1050,7 @@ function switchFreshLedgerUnderBarrier(input: CutoverInput, barrier: LedgerConne
         let copied = 0;
         for (const row of old!.prepare(`select ${names} from rollout_scan_state`).iterate() as
           Iterable<Record<string, unknown>>) {
-          if (!cursorForCarry(old!, row)) continue;
+          if (!carryKeys.has(row.file as string) || !cursorForCarry(old!, row)) continue;
           insert.run(...cursorColumns.map(column => row[column]));
           mark.run(row.file, row.parser_kind === "codex-rollout-v2" ? "codex" : "claude_code",
             row.file_identity, row.committed_offset);
