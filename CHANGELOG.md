@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.72 — 2026-11-20
+
+- The epoch cutover carries only the capture cursors the fresh ledger keeps.
+  The carry budget and the staged copy counted every valid archive cursor,
+  including those for files no longer under a capture root and those whose
+  file is now another generation, which finalization drops before the rename
+  anyway. Studio0's plan carried 20,340 such cursors (19.8 MB against the
+  8 MiB budget) and refused the switch (plimsoll N216). The plan and the
+  switch now apply finalization's rule up front: an observed capture-root file
+  in the cursor's own generation. Every other file is fenced, as before, and
+  the archive keeps every cursor.
+
 ## 0.7.71 — 2026-11-19
 
 - Codex metric exports reach the ledger again. A periodic Codex metric export
