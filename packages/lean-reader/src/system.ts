@@ -173,8 +173,12 @@ export function launchAgent(home: string, script: string): string {
       if (!plist.startsWith('<?xml') && process.platform === 'darwin') plist = execFileSync('/usr/bin/plutil', ['-convert', 'xml1', '-o', '-', path.join(dir, name)], { encoding: 'utf8' });
       const args = plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1];
       const executable = args?.match(/<string>([\s\S]*?)<\/string>/)?.[1];
-      if (executable && /(?:^|\/)node(?:-\d+)?$/.test(xmlUnescape(executable))) { node = xmlUnescape(executable); break; }
-    } catch { /* Another optional agent. */ }
+      if (!executable || !/(?:^|\/)node(?:-\d+)?$/.test(xmlUnescape(executable))) continue;
+      // Take only a Node that starts: a package-manager upgrade can leave the
+      // collector's Node unable to load its libraries (plimsoll N212).
+      execFileSync(xmlUnescape(executable), ['--version'], { stdio: 'ignore', timeout: 10_000 });
+      node = xmlUnescape(executable); break;
+    } catch { /* Another optional agent, or a Node that no longer starts. */ }
   }
   const env = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GROK_HOME'].filter(k => process.env[k]).map(k => `<key>${k}</key><string>${xmlEscape(process.env[k]!)}</string>`).join('');
   return `<?xml version="1.0" encoding="UTF-8"?>

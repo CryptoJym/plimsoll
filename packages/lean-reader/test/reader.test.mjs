@@ -492,6 +492,13 @@ test('historical launch tags are streamed without retaining inactive sessions', 
   assert.ok(output.run.peakMemoryBytes < 128 * 1024 * 1024, `inactive tags must not stay resident: ${output.run.peakMemoryBytes}`);
 });
 
+test('a collector Node that no longer starts is skipped for the reader agent', t => {
+  const home = fixture(t), broken = write(home, 'broken/node', '#!/bin/sh\nexit 134\n');
+  fs.chmodSync(broken, 0o755);
+  write(home, 'Library/LaunchAgents/com.plimsoll.collector.plist', `<?xml version="1.0"?><plist><dict><key>ProgramArguments</key><array><string>${broken}</string></array></dict></plist>`);
+  const xml = reader.launchAgent(home, '/synthetic/lean.mjs');
+  assert.ok(xml.includes(`<string>${process.execPath}</string>`) && !xml.includes(broken));
+});
 test('launch tags preserve UTF-8 characters split across read chunks', t => {
   const home = fixture(t);
   write(home, '.claude/projects/x/a.jsonl', [claude('one')]);
@@ -503,7 +510,8 @@ test('launch tags preserve UTF-8 characters split across read chunks', t => {
 });
 
 test('binary collector plists resolve their Node through built-in macOS tooling', { skip: process.platform !== 'darwin' }, t => {
-  const home = fixture(t), node = '/synthetic/collector/node';
+  const home = fixture(t), node = path.join(home, 'collector/node');
+  fs.mkdirSync(path.dirname(node)); fs.symlinkSync(process.execPath, node);
   const file = write(home, 'Library/LaunchAgents/com.plimsoll.collector.plist', `<?xml version="1.0"?><plist><dict><key>ProgramArguments</key><array><string>${node}</string></array></dict></plist>`);
   const converted = spawnSync('/usr/bin/plutil', ['-convert', 'binary1', file]);
   assert.equal(converted.status, 0);
