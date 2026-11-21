@@ -5,6 +5,8 @@ import fs from 'node:fs';
 const paths = [
   'type', 'timestamp', 'sessionId', 'cwd', 'requestId', 'uuid', 'ordinal', 'summary', 'entrypoint', 'perTurnEffort', 'effort',
   'parentSessionId', 'parentSessionKey', 'parent_session_id',
+  'created_at', 'step_index', 'model', 'input_tokens', 'output_tokens', 'cache_read_tokens',
+  'tool_calls[].name', 'tool_calls[].args.Path', 'tool_calls[].args.Cwd', 'tool_calls[].args.DirectoryPath', 'tool_calls[].args.TargetFile',
   'message.id', 'message.model', 'message.content[].type', 'message.content[].name', 'message.role',
   ...['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'].map(k => `message.usage.${k}`),
   ...['type', 'model', 'input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'].map(k => `message.usage.iterations[].${k}`),
@@ -231,7 +233,7 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
     size += part.length;
     if (size <= LIMIT) { chunks.push(Buffer.from(part)); return; }
     const head = Buffer.concat(chunks, Math.min(size - part.length, 512)).subarray(0, 512).toString();
-    if (!/"(?:assistant|user|response_item|usage|session_meta|turn_context|token_usage_record|token_count|event_msg)"/.test(head)) { chunks = []; dropped = true; return; }
+    if (!/"(?:assistant|user|response_item|usage|session_meta|turn_context|token_usage_record|token_count|event_msg|PLANNER_RESPONSE|USER_INPUT)"/.test(head)) { chunks = []; dropped = true; return; }
     projector = new Projection(evidence); decoder = new TextDecoder();
     for (const chunk of chunks) projector.feed(decoder.decode(chunk, { stream: true }));
     chunks = []; projector.feed(decoder.decode(part, { stream: true }));
@@ -251,7 +253,7 @@ export function readLines(file: string, offset: number, end: number, visit: (rec
         if (completed) { completed.feed(decoder!.decode()); record = completed.finish(); }
         else if (!dropped) {
           const text = Buffer.concat(chunks).toString('utf8');
-          if (/"(?:assistant|summary|user|response_item|session_meta|turn_context|token_usage_record|token_count|event_msg)"/.test(text)) {
+          if (/"(?:assistant|summary|user|response_item|session_meta|turn_context|token_usage_record|token_count|event_msg|PLANNER_RESPONSE|USER_INPUT)"/.test(text)) {
             try { record = JSON.parse(text); } catch { /* An invalid line is not usage. */ }
           }
         }

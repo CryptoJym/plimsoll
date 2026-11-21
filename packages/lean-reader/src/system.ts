@@ -187,6 +187,7 @@ export function launchAgent(home: string, script: string): string {
 <key>Label</key><string>com.plimsoll.lean-reader</string>
 <key>ProgramArguments</key><array><string>${xmlEscape(node)}</string><string>${xmlEscape(script)}</string><string>run</string></array>
 <key>StartInterval</key><integer>300</integer><key>RunAtLoad</key><true/>
+<key>LimitLoadToSessionType</key><string>Background</string>
 <key>ProcessType</key><string>Standard</string><key>LowPriorityIO</key><false/><key>Nice</key><integer>10</integer>
 <key>EnvironmentVariables</key><dict>${env}<key>NODE_OPTIONS</key><string>--jitless --max-old-space-size=${HEAP_MB} --max-semi-space-size=1</string></dict>
 </dict></plist>\n`;
@@ -212,6 +213,6 @@ export function loadConfig(file: string): Config {
   // Velocity is additive and enabled for every installed reader. An explicit
   // false remains useful for a rollback or a local compatibility run.
   config.sendVelocity ??= true;
-  if (Array.isArray(input.roots)) config.roots = input.roots.filter((r: any) => typeof r === 'string' || (r && typeof r.path === 'string' && ['codex', 'claude_code', 'grok'].includes(r.tool))).slice(0, 256).map((r: any) => typeof r === 'string' ? r : { tool: r.tool, path: r.path });
+  if (Array.isArray(input.roots)) config.roots = input.roots.filter((r: any) => typeof r === 'string' || (r && typeof r.path === 'string' && ['codex', 'claude_code', 'grok', 'antigravity'].includes(r.tool))).slice(0, 256).map((r: any) => typeof r === 'string' ? r : { tool: r.tool, path: r.path });
   return config;
 }

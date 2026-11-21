@@ -77,10 +77,12 @@ export function roots(home: string, env: Record<string, string | undefined>, con
     { tool: 'grok', path: path.join(home, '.grok/sessions') },
     ...directories(home, '.grok-').map(n => ({ tool: 'grok' as const, path: path.join(home, n, 'sessions') })),
     ...(env.GROK_HOME ? [{ tool: 'grok' as const, path: path.join(env.GROK_HOME, 'sessions') }] : []),
+    { tool: 'antigravity', path: path.join(home, '.gemini/antigravity/brain') },
+    ...(env.ANTIGRAVITY_BRAIN_DIR ? [{ tool: 'antigravity' as const, path: env.ANTIGRAVITY_BRAIN_DIR }] : []),
   ];
   for (const root of config.roots ?? []) {
-    if (typeof root === 'string') result.push({ path: expand(root, home), tool: /grok/.test(root) ? 'grok' : /codex|sessions/.test(root) ? 'codex' : 'claude_code' });
-    else if (root && ['codex', 'claude_code', 'grok'].includes(root.tool) && typeof root.path === 'string') result.push({ tool: root.tool, path: expand(root.path, home) });
+    if (typeof root === 'string') result.push({ path: expand(root, home), tool: /antigravity/.test(root) ? 'antigravity' : /grok/.test(root) ? 'grok' : /codex|sessions/.test(root) ? 'codex' : 'claude_code' });
+    else if (root && ['codex', 'claude_code', 'grok', 'antigravity'].includes(root.tool) && typeof root.path === 'string') result.push({ tool: root.tool, path: expand(root.path, home) });
   }
   const seen = new Set<string>();
   return result.flatMap(root => root.path.includes('*') ? globRoots(root.path, home).map(p => ({ tool: root.tool, path: p, aggregate: root.tool === 'claude_code' })) : [root])
@@ -91,6 +93,18 @@ function archivedRollout(name: string, since: number): boolean {
   return Boolean(match && Date.parse(`${match[1]}T00:00:00Z`) >= since - 24 * HOUR);
 }
 function* files(root: string, visited: Set<string>, since: number, tool: Tool, home: string, includeArchived = false, resolved = resolvedPath(root)): Generator<{ file: string; stat: fs.Stats }> {
+  if (tool === 'antigravity') {
+    let names: string[];
+    try { names = fs.readdirSync(root).sort(); } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return; throw new Error('source_unreadable'); }
+    for (const name of names) {
+      const candidate = path.join(root, name, '.system_generated', 'logs', 'transcript.jsonl');
+      try {
+        const s = fs.statSync(candidate);
+        if (s.isFile() && s.mtimeMs >= since) yield { file: candidate, stat: s };
+      } catch { /* Conversation has no compact transcript yet. */ }
+    }
+    return;
+  }
   // Any configured source can be symlinked into a macOS protected folder.
   // stat() is safe there, but opening a directory or file can block forever
   // while the OS waits for user/iCloud permission. Keep the whole traversal
@@ -195,7 +209,7 @@ class Projects {
   }
   tag(r: Record<string, any>, active: Set<string>) {
     const at = Date.parse(r.at), project = string(r.project), session = string(r.sessionKey);
-    if (!['claude_code', 'codex', 'grok'].includes(r.tool) || !session || !project || !Number.isFinite(at)) return;
+    if (!['claude_code', 'codex', 'grok', 'antigravity'].includes(r.tool) || !session || !project || !Number.isFinite(at)) return;
     const key = r.tool + ':' + session;
     if (!active.has(key)) return;
     if (at >= (this.tags.get(key)?.at ?? -Infinity)) this.tags.set(key, { project, at });
@@ -476,6 +490,13 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
     let rootAccount: string | undefined;
     const getAccount = () => {
       if (rootAccount !== undefined) return rootAccount;
+      if (root.tool === 'antigravity') {
+        try {
+          const installId = fs.readFileSync(path.join(home, '.gemini/installation_id'), 'utf8').trim();
+          if (installId) return rootAccount = accountKey(`antigravity:${installId}`);
+        } catch { /* Optional installation_id. */ }
+        return rootAccount = 'antigravity:default';
+      }
       if (root.tool === 'grok') {
         const id = grokUser(root.path, home);
         return rootAccount = id ? accountKey(id) : 'grok:unknown';
@@ -560,7 +581,7 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
       if (compressed) { const decoded = materializeZstd(file); sourcePath = decoded.path; sourceSize = decoded.size; cleanup = decoded.cleanup; }
       if (prefix?.file === file) sourceSize = Math.min(sourceSize, prefix.end);
       try {
-        if (evidence && root.tool !== 'grok' && !reset && tracked.evidenceOffset !== tracked.offset) {
+        if (evidence && root.tool !== 'grok' && root.tool !== 'antigravity' && !reset && tracked.evidenceOffset !== tracked.offset) {
           evidenceContext = { cwd: '', session: '' };
           const replayed = readLines(sourcePath, 0, tracked.offset, r => evidence.observe(root.tool, evidenceContext, r), true).bytes;
           stats.bytesRead += replayed; ledger.note(root.tool, file, replayed, 0, 'evidence');
@@ -569,6 +590,40 @@ function scanSource(options: Options, prefix?: { file: string; end: number }): {
         if (tracked.offset === sourceSize && !velocityOnly) { remember(tracked.mtime); continue; }
         const from = tracked.offset;
         const result = readLines(sourcePath, from, sourceSize, (r, recordEnd) => {
+          if (root.tool === 'antigravity') {
+            ctx.session = path.basename(path.dirname(path.dirname(path.dirname(file))));
+            const stamp = typeof r.created_at === 'string' ? r.created_at : '';
+            const eventTime = stamp ? Date.parse(stamp) : NaN;
+            if (r.type === 'USER_INPUT' && Number.isFinite(eventTime)) { ctx.lastInputAt = eventTime; return; }
+            if (r.type !== 'PLANNER_RESPONSE' || !stamp || !Number.isFinite(eventTime)) return;
+            for (const tc of Array.isArray(r.tool_calls) ? r.tool_calls : []) {
+              if (!tc || typeof tc !== 'object') continue;
+              markAction(ctx, tc.name, 'antigravity');
+              const args = tc.args && typeof tc.args === 'object' ? tc.args as Record<string, unknown> : null;
+              if (args) {
+                for (const key of ['Cwd', 'DirectoryPath', 'Path', 'TargetFile']) {
+                  const raw = typeof args[key] === 'string' ? (args[key] as string).replace(/^"|"$/g, '') : '';
+                  if (raw.startsWith('/') && !raw.includes('/.gemini/') && !raw.startsWith('/tmp/')) {
+                    const candidate = key === 'Cwd' || key === 'DirectoryPath' ? raw : path.dirname(raw);
+                    if (candidate && candidate !== '/') { ctx.cwd = candidate.slice(0, 4096); break; }
+                  }
+                }
+              }
+            }
+            const model = string(r.model);
+            if (!model) return;
+            const freshInput = integer(r.input_tokens);
+            const cacheRead = integer(r.cache_read_tokens);
+            const output = integer(r.output_tokens);
+            if (freshInput + cacheRead + output === 0) return;
+            ctx.model = model;
+            const stepId = r.step_index !== undefined && r.step_index !== null ? `${ctx.session}:${r.step_index}` : `${ctx.session}:${stamp}`;
+            const base = Math.max(ctx.lastInputAt ?? -Infinity, ctx.lastReplyAt ?? -Infinity);
+            const dur = Number.isFinite(base) ? (eventTime - base) / 1000 : NaN;
+            const added = add('antigravity', ctx, stamp, stepId, { requests: 1, freshInput, cacheRead, cacheWrite: 0, output }, undefined, { tier: 'standard', effort: 'unknown', dur }, wasReplayed(eventTime, recordEnd));
+            if (added) ctx.lastReplyAt = eventTime;
+            return;
+          }
           if (root.tool === 'grok') {
             const turn = grokTurn(r);
             if (!turn) return;

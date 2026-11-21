@@ -8,6 +8,23 @@ import { grokFile } from './grok.js';
 // At most four outstanding metadata reads. libuv retains its native pool limit
 // (including any explicit UV_THREADPOOL_SIZE); no worker or daemon is launched.
 async function files(root: string, visited: Set<string>, since: number, tool: Tool, home: string, resolved = resolvedPath(root)): Promise<SourceFile[]> {
+  if (tool === 'antigravity') {
+    // Antigravity stores compact per-step JSONL transcripts directly at
+    // <brain>/<conversation-id>/.system_generated/logs/transcript.jsonl.
+    // Never walk <brain>/<id>/scratch (which may hold cloned repos or node_modules).
+    const out: SourceFile[] = [];
+    try {
+      const names = (await fs.promises.readdir(root)).sort();
+      for (const name of names) {
+        const candidate = path.join(root, name, '.system_generated', 'logs', 'transcript.jsonl');
+        try {
+          const s = await fs.promises.stat(candidate);
+          if (s.isFile() && s.mtimeMs >= since) out.push({ file: candidate, stat: s });
+        } catch { /* Conversation has no compact transcript yet. */ }
+      }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('source_unreadable'); }
+    return out;
+  }
   if (tool === 'grok' && protectedPath(root, home, resolved)) return [];
   const entries: { name: string; directory?: string; resolved?: boolean; source?: SourceFile }[] = [];
   try {
