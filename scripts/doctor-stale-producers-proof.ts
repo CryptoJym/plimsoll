@@ -10,6 +10,9 @@
  * path is under a temporary directory.
  */
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { mock } from "node:test";
 import { spawn, spawnSync } from "./lib/proof-child-process";
 import fs from "node:fs";
 import http from "node:http";
@@ -210,6 +213,36 @@ function providerFor(file: string) {
 }
 
 async function main() {
+  // Exercise the production provider without allowing a native command. The
+  // fixture parser may read synthetic environments; production must never do so.
+  const originalArgv = process.argv;
+  const commandGuard = mock.method(childProcess, "execFile", () => {
+    throw new Error("A prohibited attribution read launched a command");
+  });
+  syncBuiltinESMExports();
+  try {
+    process.argv = [process.execPath, "collector"];
+    const native = resolveProducerProcessProvider({});
+    assert.ok(native);
+    const envRead = await native.environments([123]);
+    const servicesRead = await native.launchdServices();
+    check("native_attribution_never_inspects_environments_or_raw_launchd",
+      !envRead.ok && envRead.error === "unavailable" &&
+      !servicesRead.ok && servicesRead.error === "unavailable" &&
+      commandGuard.mock.callCount() === 0);
+    const missing = await scanProducerProcesses({ collectorHome, home, provider: {
+      ...native, processTable: async () => ({ ok: true, stdout: renderTable(processes) }),
+    } });
+    check("native_missing_attribution_is_partial_and_never_claims_stale_config",
+      missing.inspection === "partial" && missing.producerRows > 0 &&
+      missing.processes.every((p) => p.home === "unknown" && !p.staleConfig && p.restartHint === null) &&
+      missing.summary?.includes("environment read unavailable") &&
+      commandGuard.mock.callCount() === 0, missing.summary);
+  } finally {
+    process.argv = originalArgv;
+    commandGuard.mock.restore();
+    syncBuiltinESMExports();
+  }
   const mainFixture = writeFixture("processes", processes);
   const scan = await scanProducerProcesses({ collectorHome, home, provider: providerFor(mainFixture) });
   const byPid = new Map(scan.processes.map((entry) => [entry.pid, entry]));

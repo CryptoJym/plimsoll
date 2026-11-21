@@ -14,18 +14,16 @@ import type { RejectionCounterRow, RejectionDiagnosticsCounters } from "./reject
 /**
  * Producer processes older than their managed config (bead eco-6hoxj.153).
  *
- * Codex, Claude Code, Gemini CLI and Grok read their config once, at process
- * start. A producer started before the collector managed (or last rewrote) its
- * config keeps sending the headers it read then, and the boundary answers
- * `source_required` / `producer_token_required` for as long as it runs — for
- * days, on 2026-09-16. The rejection diagnostics cannot name that process;
- * this scan does, read-only:
+ * A producer that retains its startup config can keep sending stale headers
+ * after the collector rewrites its settings. Rejections alone cannot identify
+ * that process. Fixture evidence can establish attribution; the native scan
+ * reports missing attribution explicitly:
  *
- *   - one `ps` read of the process table, plus one `ps -E` read restricted to
- *     the producer pids (the config home comes from the process environment
- *     when it is readable) and, only when there is a producer, one
- *     `launchctl print gui/<uid>` for service ownership. Each call is bounded
- *     by PRODUCER_PROCESS_TIMEOUT_MS; at most PRODUCER_PROCESS_ROW_LIMIT
+ *   - one bounded `ps` read of the process table. Native process environments
+ *     and raw launchd service dumps are never inspected: machine policy
+ *     prohibits those reads even when the output would be redacted. Their
+ *     provider methods return unavailable without launching a command;
+ *     at most PRODUCER_PROCESS_ROW_LIMIT
  *     producer rows are examined (a normal Mac process table is far larger
  *     than the bound, so the bound applies to producers, not to every row);
  *   - the managed-apply time of a surface comes from what the collector already
@@ -58,15 +56,15 @@ const MAX_RECONCILE_RECEIPTS_READ = 50;
 
 type CommandRead = { ok: true; stdout: string } | { ok: false; error: "timeout" | "unavailable" };
 
-/** The three native reads the scan makes; a fixture replaces all of them. */
+/** Process metadata plus optional fixture attribution; native attribution is unavailable. */
 export type ProducerProcessProvider = {
   kind: "process_table" | "fixture";
   uid: number;
   /** `ps -axo pid=,ppid=,lstart=,command=` */
   processTable(): Promise<CommandRead>;
-  /** `ps -E -o pid=,command= -p <pids>` */
+  /** Fixture only; the native provider never inspects process environments. */
   environments(pids: number[]): Promise<CommandRead>;
-  /** `launchctl print gui/<uid>` */
+  /** Fixture only; native raw launchd dumps can contain credentials. */
   launchdServices(): Promise<CommandRead>;
 };
 
@@ -135,8 +133,8 @@ export function resolveProducerProcessProvider(
     kind: "process_table",
     uid,
     processTable: () => runBounded("ps", ["-axww", "-o", "pid=,ppid=,lstart=,command="]),
-    environments: (pids) => runBounded("ps", ["-Eww", "-o", "pid=,command=", "-p", pids.join(",")]),
-    launchdServices: () => runBounded("launchctl", ["print", `gui/${uid}`]),
+    environments: async () => ({ ok: false, error: "unavailable" }),
+    launchdServices: async () => ({ ok: false, error: "unavailable" }),
   };
 }
 
