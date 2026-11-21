@@ -18,8 +18,14 @@ import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import {
+  CAPTURE_FRONTIER_SOURCES,
+  CAPTURE_WRITE_LAG_MS,
+  advanceCaptureFrontier,
+} from "../packages/collector-cli/src/capture-frontier";
+import { captureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { readLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
+import { loadOrCreateLocalIngestAuth, readLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import type * as SpoolModuleType from "../packages/collector-cli/src/otlp-spool";
 
@@ -1388,6 +1394,85 @@ async function measure() {
   }
 }
 
+async function stageIntakeLosses() {
+  if (!spoolModule) return;
+  const root = privateTempDir("intake-losses");
+  const ledger = path.join(root, "work-ledger.sqlite");
+  const auth = loadOrCreateLocalIngestAuth(root);
+  const epochStartMs = Date.now() - 2 * 3_600_000;
+  const buffer = new LocalEventBuffer(ledger, {
+    databaseBusyTimeoutMs: 0,
+    workspaceId: workspace,
+    delivery: { enabled: true },
+    enrollmentNow: () => new Date(epochStartMs),
+  });
+  const spool = new spoolModule.OtlpIntakeSpool({
+    home: root,
+    env: {},
+    onWarning: () => undefined,
+  });
+  const server = createCollectorServer(config, buffer, {
+    localAuth: auth,
+    localAuthHome: root,
+    otlpSpool: spool,
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const originalWarn = console.warn;
+  console.warn = () => undefined;
+  try {
+    // 1. Browser origin refusal must NOT create a capture gap or spool loss.
+    const browser = await post(port, "/v1/logs", usageLogs("n26-browser", 1), {
+      origin: "https://evil.example",
+      "x-plimsoll-source": "claude_code",
+    });
+    const afterBrowser = captureSpoolState(root);
+    check(
+      "n26_browser_origin_rejection_records_no_capture_loss",
+      browser.status === 403 && afterBrowser.losses.length === 0,
+      { status: browser.status, losses: afterBrowser.losses },
+    );
+
+    // 2. Non-retryable 401 producer_token_required and 401 producer_token_invalid
+    //    record dated losses into .losses.jsonl (coalesced within 10s per reason)
+    //    and surface as capture_gaps in the upload capture claim.
+    const missing1 = await post(port, "/v1/logs", usageLogs("n26-missing-1", 1), {
+      "x-plimsoll-source": "claude_code",
+    });
+    const missing2 = await post(port, "/v1/logs", usageLogs("n26-missing-2", 1), {
+      "x-plimsoll-source": "claude_code",
+    });
+    const invalid = await post(port, "/v1/logs", usageLogs("n26-invalid", 1), {
+      "x-plimsoll-source": "claude_code",
+      "x-plimsoll-token": "wrong-token",
+    });
+    const state = captureSpoolState(root);
+    buffer.delivery.migrateLegacy({ now: new Date() });
+    for (const source of CAPTURE_FRONTIER_SOURCES) {
+      advanceCaptureFrontier(
+        buffer.database,
+        source,
+        { complete: true, files: [] },
+        new Date(Date.now() + CAPTURE_WRITE_LAG_MS).toISOString(),
+      );
+    }
+    const claim = buffer.delivery.captureClaim([], state);
+    check(
+      "n26_unretryable_otlp_auth_rejections_coalesce_and_surface_as_capture_gaps",
+      missing1.status === 401 && missing2.status === 401 && invalid.status === 401 &&
+        state.losses.length === 2 &&
+        claim !== null && claim.dead === 2 && claim.gaps.length >= 1,
+      { statuses: [missing1.status, missing2.status, invalid.status], losses: state.losses, claim },
+    );
+  } finally {
+    console.warn = originalWarn;
+    spool.stopDrain();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    buffer.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 /**
  * `require`, not `import()`: under tsx a dynamic import loads a second module
  * graph, and the repository sidecar the spool counts lives in a module-level
@@ -1414,6 +1499,7 @@ async function main() {
     ["partial", stagePartialCommit],
     ["deadline", stageDeadlineAndLoopPressure],
     ["full", stageSpoolFullAndKillSwitch],
+    ["intake-losses", stageIntakeLosses],
     ["crash-ack", stageCrashBetweenWriteAndAck],
     ["crash-replay", stageCrashMidReplay],
     ["privacy", stagePrivacy],

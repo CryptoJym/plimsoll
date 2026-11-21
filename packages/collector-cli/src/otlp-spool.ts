@@ -551,6 +551,7 @@ export class OtlpIntakeSpool {
   private draining = false;
   private stopped = false;
   private ticks = 0;
+  private intakeLossLastAtMs = new Map<string, number>();
   private drainLog = {
     lastAtMs: null as number | null,
     replayed: 0,
@@ -890,6 +891,24 @@ export class OtlpIntakeSpool {
       events: input.batch.events.length,
       metricSamples: input.batch.metricSamples.length,
     };
+  }
+
+  /**
+   * Record an unspooled OTLP intake loss (non-retryable HTTP rejection or
+   * per-record parse failure) into the spool's `.losses.jsonl` so the upload
+   * capture claim reports the interval as a bounded gap rather than attesting
+   * complete capture (plimsoll-cloud N26). Coalesced per bounded reason within
+   * 10 s (well inside CAPTURE_WRITE_LAG_MS) so a rejection burst never adds
+   * per-request disk I/O to the HTTP loop.
+   */
+  recordIntakeLoss(atMs: number, reason: string) {
+    if (!this.enabled) return;
+    if (!this.ensureDirectory()) return;
+    const safeReason = /^[a-z0-9_]{1,64}$/.test(reason) ? reason : "otlp_intake_lost";
+    const last = this.intakeLossLastAtMs.get(safeReason);
+    if (last !== undefined && Math.abs(atMs - last) < 10_000) return;
+    this.intakeLossLastAtMs.set(safeReason, atMs);
+    recordSpoolLoss(this.directory, { atMs, reason: safeReason });
   }
 
   /** Quarantine a file that must never be replayed, naming why. */

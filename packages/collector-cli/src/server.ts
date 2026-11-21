@@ -75,6 +75,7 @@ import {
   readBoundedRequestBody,
   requireOtlpSource,
   retryStorageBusy,
+  type HttpBoundaryReason,
   type LocalProducerSource,
   type RequestBudget,
 } from "./http-boundary";
@@ -1056,8 +1057,37 @@ export function createCollectorServer(
   // authenticated, read whole, parsed, bounded and normalized reaches it, and
   // only for the two outcomes that mean "the ledger could not take it in
   // time": 503 `storage_busy_retry` and 408 `request_deadline_exceeded`.
+  //
+  // Non-retryable OTLP intake rejections (e.g. 401 producer_token_invalid
+  // after a rotation grace expires, 401 producer_token_required, 408 stalled
+  // body, 413 cardinality/body bounds) are never retried by OTLP exporters and
+  // therefore drop telemetry; record each such arrival in the spool's loss log
+  // so the upload capture claim reports a bounded gap (plimsoll-cloud N26).
+  // Browser/host security refusals and retryable 429/503 responses are excluded.
   // ---------------------------------------------------------------------
   const otlpSpool = options.otlpSpool;
+  const otlpIntakeLossReasons: ReadonlySet<HttpBoundaryReason> = new Set([
+    "compressed_body_too_large",
+    "compression_ratio_too_large",
+    "decoded_body_too_large",
+    "internal_rejection",
+    "invalid_compressed_body",
+    "invalid_json",
+    "json_depth_exceeded",
+    "json_node_limit_exceeded",
+    "otlp_attribute_limit_exceeded",
+    "otlp_record_limit_exceeded",
+    "otlp_resource_limit_exceeded",
+    "otlp_scope_limit_exceeded",
+    "producer_token_invalid",
+    "producer_token_required",
+    "request_deadline_exceeded",
+    "request_stream_error",
+    "source_mismatch",
+    "source_not_allowed",
+    "source_required",
+    "unsupported_content_encoding",
+  ]);
   const otlpSpoolWindows = new Map<
     RejectionClientClass,
     { firstAtMs: number; count: number; suppressed: number }
@@ -1986,6 +2016,15 @@ export function createCollectorServer(
           transportPath,
           onRepoLabel: (hash, label) => repoLabels.push({ hash, label }),
         });
+        if (exploded.parseFailures > 0) {
+          console.warn(JSON.stringify({
+            warning: "otlp_record_parse_failed",
+            source,
+            parseFailures: exploded.parseFailures,
+            recordCount: exploded.recordCount,
+          }));
+          otlpSpool?.recordIntakeLoss(receivedAtMs, "otlp_record_parse_failed");
+        }
         // From here the request is authenticated, whole, bounded and
         // normalized: a busy ledger or a spent deadline is no longer a reason
         // to lose it when the intake spool is armed.
@@ -2148,6 +2187,14 @@ export function createCollectorServer(
           String(failure.status),
           readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]),
         );
+      }
+      if (
+        request.method === "POST" &&
+        isOtlpPath(request.url) &&
+        otlpIntakeLossReasons.has(failure.reason) &&
+        !(failure.reason === "request_deadline_exceeded" && failure.status === 503)
+      ) {
+        otlpSpool?.recordIntakeLoss(receivedAtMs, failure.reason);
       }
       const clientClass = classifyRejectionClient(request);
       const rejection = {
